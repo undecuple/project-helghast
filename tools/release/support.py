@@ -6,7 +6,7 @@ launcher's support package; no code taken.
 
 Holds, all text, all through firstrun.redactor() (user names in paths become <user>, also CMake's mangled form):
 the newest 3 game logs (Killzone3-PC-*.log), the first-run logs, the setup log, launcher.log, kz3-install.ini,
-display.ini and keybinds.ini, and facts.txt (port version and commit from VERSION.txt / manifest.json, Windows version,
+display.ini and keybinds.ini (kz3-install.ini's crash-report dsn reduced to <set>), and facts.txt (port version and commit from VERSION.txt / manifest.json, Windows version,
 GPU name when a game log has it, EBOOT version from build/paths.json facts only, what was shortened).
 Never included: anything outside the install folder and the data folder (%APPDATA%\\Project Helghast, or the install
 folder when portable), saves, game files, the EBOOT, environment dumps. Only files named .log/.txt/.ini are read; a
@@ -29,6 +29,9 @@ import support_text as T  # noqa: E402
 CAP = 20 << 20                   # bytes of text in the zip (uncompressed)
 KEEP_RUNS = 3
 OK_EXT = (".log", ".txt", ".ini")
+# kz3-install.ini [crash] dsn: the crash-report address never goes into a package (players attach them to public
+# issues); the package says only whether one is set.
+DSN_RX = re.compile(r"(?im)^(\s*dsn\s*[=:][ \t]*)(.*)$")
 # game-data names, repeated from assemble_payload.DENY_NAMES (importing it pulls in the whole payload builder)
 DENY_NAMES = ("eboot.*", "eboot*.bin", "param.sfo", "*.psarc", "*.elf", "*.self", "*.sprx", "*.prx", "*.edat",
               "*.sdat", "*.pkg", "*.rap", "*.pup", "*.core", "*.corestream", "*.bik", "*.at3")
@@ -137,6 +140,8 @@ def build(root, data, out_dir, red, stamp, cap=CAP):
             continue
         try:
             texts[arc] = red(read_text(path))
+            if arc == "kz3-install.ini":
+                texts[arc] = DSN_RX.sub(lambda m: m.group(1) + ("<set>" if m.group(2).strip() else ""), texts[arc])
         except OSError:
             skipped.append(f"unreadable {arc}")
     if not texts:

@@ -52,7 +52,7 @@ name and repository slug after editing; a plain `git grep` finds every leftover.
 | Issue forms | `.github/ISSUE_TEMPLATE/`; the label script matches the forms' first headings, so edit both together (`pipeline_template.yml` is the form behind the `pipeline-template` label) |
 | `.github/workflows/release.yml` | runs on a pushed `vX.Y.Z` tag that equals `VERSION` in `tools/release/names.py`; builds the installer and portable zip, creates a draft release titled with the tag (pre-release while the major version is 0) with a `SHA256SUMS` file, and never replaces an existing release. A manual run only builds. Optional secret `KZ3_SENTRY_DSN` (tag builds only) |
 | `.github/workflows/pages.yml` | publishes `site/` and `docs/screenshots/` to GitHub Pages; both jobs run only when the repository variable `PAGES_ENABLED` is `true` |
-| Secrets | none are needed to run the shipped workflows; `KZ3_SENTRY_DSN` is optional. Add none you do not use |
+| Secrets | none are needed to run the shipped workflows; `KZ3_SENTRY_DSN` is optional (your own Sentry-compatible tracker's address for crash reports; without it the installer shows crash reports as not available). Add none you do not use |
 | Settings to check | Actions: require approval for workflows from outside collaborators (fork pull requests), and keep the default token read-only; Pages: source "GitHub Actions" if you publish `site/`; add a ruleset on the default branch (pull request required, no force push, no deleting) and on `v*` tags (no update, no delete) |
 
 ## 5. Baked-in paths and environment variables

@@ -134,3 +134,4 @@ tools/smoke/test_cam_interp.sh
 tools/release/test_licenses_match.py
 tools/release/test_uninstall_covers.py
 tools/release/test_install_dir_rule.py
+tools/release/test_crash_report.py

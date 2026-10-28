@@ -257,11 +257,12 @@ Filename: "{app}\kz3-install.ini"; Section: "online"; Key: "check_updates"; Stri
 ; firstrun.py --shaders auto reads it; also after a launcher rebuild
 Filename: "{app}\kz3-install.ini"; Section: "shaders"; Key: "prepare"; String: "1"; Tasks: shadersnow
 Filename: "{app}\kz3-install.ini"; Section: "shaders"; Key: "prepare"; String: "0"; Tasks: not shadersnow
-; Crash reports (Advanced page, opt-in): the switch, and the address only when the player said yes
+; Crash reports (Advanced page, opt-in): the switch (report=1 only when ticked)
 Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "report"; String: "1"; Check: CrashOn
 Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "report"; String: "0"; Check: not CrashOn
-Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "dsn"; String: "{#CrashDSN}"; Check: CrashOn
-Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "dsn"; String: ""; Check: not CrashOn
+; the build's address always (the launcher's "Crash reports on or off" can turn reports on later); empty in a build
+; without one, and then nothing can be turned on. report=1 is the only switch that sends.
+Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "dsn"; String: "{#CrashDSN}"
 
 [Icons]
 Name: "{group}\{#AppDirName}"; Filename: "{app}\{#LauncherExe}"; WorkingDir: "{app}"
@@ -274,6 +275,7 @@ Name: "{group}\Move saves and settings"; Filename: "{app}\{#LauncherExe}"; Param
 ; Runs the game with LD_PSO_TEMPLATE_OUT in the saves folder; the file holds only hashes and render-state numbers
 Name: "{group}\Export pipeline template"; Filename: "{app}\{#LauncherExe}"; Parameters: "--export-template"; WorkingDir: "{app}"
 ; One zip of logs and settings (user names removed) for a bug report; text in tools/release/support_text.py
+Name: "{group}\Crash reports on or off"; Filename: "{app}\{#LauncherExe}"; Parameters: "--crash-reports"; WorkingDir: "{app}"
 Name: "{group}\Make a support package"; Filename: "{app}\{#LauncherExe}"; Parameters: "--support-package"; WorkingDir: "{app}"
 Name: "{group}\Project page"; Filename: "{#SiteURL}"
 Name: "{group}\Uninstall {#AppDirName}"; Filename: "{uninstallexe}"; IconFilename: "{app}\kz3-uninstall.ico"

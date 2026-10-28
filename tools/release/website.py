@@ -463,7 +463,7 @@ def render(root, problems, feed=()):
       "Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>\n"
       f"<p>You can also build the port from source: <a href=\"{REPO}/blob/main/docs/BUILDING.md\">building</a>.</p>\n"
       "<h3>What goes online</h3>\n<p>Nothing, unless you ask for it: an optional new-version check (one anonymous "
-      "request to GitHub, only when you turn it on) and, planned, opt-in crash reports, an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server "
+      "request to GitHub, only when you turn it on), opt-in crash reports (sent by the launcher after a crash when you opt in, with your names, addresses and folders removed, never a memory dump), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server "
       f"you choose. The full list is in the <a href=\"{REPO}#what-goes-online\">README</a>.</p>\n"
       "<p class=\"small\">The original PS3 game's online play is kept running by the PS Rewired community "
       f"(<a href=\"{PSREWIRED}\">their Killzone 3 page</a>). This port is not affiliated with or endorsed by PS Rewired "

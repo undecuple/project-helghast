@@ -76,9 +76,13 @@ Nothing, unless you ask for it. Each item is off until you turn it on, and this 
 - **New-version check** (installer and portable zip): one anonymous request to GitHub for this
   repository's latest release, made only when you click "Check now" or tick "Check for new versions" (then at most
   once a day). Nothing about you, your computer or the game is sent; a new installer downloads only when you click it.
-- **Crash reports** (planned; installer, Advanced page): when ticked, a crash (or a serious warning, at most once per
-  session) sends its stack trace and the port's log, with user names, host names and addresses removed, to the
-  project's own error tracker. No usage data, never a memory dump. Off unless you tick it.
+- **Crash reports** (installer, Advanced page, or "Crash reports on or off" in the Start menu): when turned on, the
+  launcher sends one report after a crash (at most one per session): the crash reason, the stack addresses and the
+  last 200 lines of the port's log (64 KB at most), with user names, machine names, IP and e-mail addresses, online
+  ids and your install and game folders removed, to the project's own error tracker over HTTPS. No usage data, never
+  a memory dump (the minidump stays on your PC), and crashes from before you turned it on are not sent. The tracker
+  sees your IP address as part of the connection, as any web server does. Off unless you turn it on; builds without
+  a tracker address show the option as not available.
 - **Project website** (`site/`): viewing it loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit. The repository, installer and game do not.
 - **Online multiplayer** (planned): only through a self-hosted server you choose.
 - **Discord status** (optional, off unless you set `discord_presence = 1` in `kz3.ini`): the port tells the Discord

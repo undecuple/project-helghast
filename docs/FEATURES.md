@@ -12,7 +12,7 @@ What the PS3 version of Killzone 3 does and how far the port reproduces it (sect
 | declined | will not be done | 0 |
 | not applicable | has no equivalent on PC | 2 |
 
-Port-only features: 30 available now, 27 planned.
+Port-only features: 31 available now, 27 planned.
 
 **Estimated parity with the PS3 version: 65 %** (an estimate: works counts 1, partial 1/2, not yet verified 1/4, not yet 0; declined and not-applicable features are left out).
 
@@ -168,6 +168,7 @@ Non-original features are opt-in where they change gameplay; display and input i
 | Pad layouts: the game's own scheme by default, a Modern preset, or a Custom layout per action (33 groups, swap on conflict, copy Default or Modern, keybinds.ini [pad actions]); Options > Controls > Advanced Settings > Layout and Prompts page | available | opt-in (the game's own layout is the default) | The Modern preset changes gameplay buttons only (on foot), applied inside the game's own action table; menus keep Cross to confirm and Circle to go back, checked in the Options screens in one run. The Modern preset follows the Killzone Shadow Fall layout (fire R2, aim L2, grenade R1, reload Square, jump Cross); in one level fire, reload, jump and aim worked on the new buttons (2026-10-27); Modern keeps Use on Circle and its controller picture shows no L1 line; Use at a use prompt is not checked. Custom: checked on screen only; not played in a level, real-pad capture unchecked. The Layout and Prompts page has row descriptions and a picture per layout and the game's controller page shows the Xbox and keyboard prompt sets. Its full effect in a level is not yet confirmed |
 | Option pages that match the game: descriptions for the port's rows in the game's tooltip panel, the Display list scrolling inside the game's list area, Reset to defaults covering the port's rows, and a menu pointer in the game's colours | available | on | Checked under Proton by screenshot; the pointer and the menu sounds still need a check by hand |
 | HUD, menus, subtitles and movies stay 16:9 and centred on wide, ultrawide and 16:10 screens while the 3D view fills the window (display.ini hud_169; no Options row yet) | available | default on | Checked at 32:9, 21:9, 16:10 and 16:9 in Frozen Shores; world markers (objective markers, name tags) project with the 16:9 view (bot name tags seen on target in Botzone at 32:9); the Botzone HUD shows one minimap at 16:9 and 32:9 in scripted runs; objective markers on screen not yet seen |
+| Opt-in crash reports to the project's error tracker | available | off | Installer Advanced page or the Start menu's “Crash reports on or off”. Sent by the launcher after a crash when you opt in: one report per session (reason, stack addresses, the last 200 log lines with user, machine, address, online-id and folder names removed), never the minidump. Host test test_crash_report.py; not yet sent to the real tracker from a release build |
 
 ### Planned
 

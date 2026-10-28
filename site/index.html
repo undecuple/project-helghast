@@ -163,8 +163,8 @@
 <tr><td>Subtitles in movies and cutscenes</td><td>Subtitle cards and in-game subtitles</td><td><span class="st st-ok">works</span><br><span class="small">In-level (in-game) subtitles were not reached; the prenarrative text cards are part of the movie and show with either setting</span></td></tr>
 </tbody></table></div></details>
 <h3>What the port adds</h3>
-<p>30 available now, 27 planned. Changes to gameplay stay optional.</p>
-<details><summary>All 57 features</summary>
+<p>31 available now, 27 planned. Changes to gameplay stay optional.</p>
+<details><summary>All 58 features</summary>
 <div class="tw"><table>
 <thead><tr><th>Feature</th><th>State</th><th>Default</th></tr></thead>
 <tbody>
@@ -198,6 +198,7 @@
 <tr><td>Pad layouts: the game&#x27;s own scheme by default, a Modern preset, or a Custom layout per action (33 groups, swap on conflict, copy Default or Modern, keybinds.ini [pad actions]); Options &gt; Controls &gt; Advanced Settings &gt; Layout and Prompts page</td><td>available</td><td>opt-in (the game&#x27;s own layout is the default)</td></tr>
 <tr><td>Option pages that match the game: descriptions for the port&#x27;s rows in the game&#x27;s tooltip panel, the Display list scrolling inside the game&#x27;s list area, Reset to defaults covering the port&#x27;s rows, and a menu pointer in the game&#x27;s colours</td><td>available</td><td>on</td></tr>
 <tr><td>HUD, menus, subtitles and movies stay 16:9 and centred on wide, ultrawide and 16:10 screens while the 3D view fills the window (display.ini hud_169; no Options row yet)</td><td>available</td><td>default on</td></tr>
+<tr><td>Opt-in crash reports to the project&#x27;s error tracker</td><td>available</td><td>off</td></tr>
 <tr><td>Internal resolution scale (720p, 1080p, 1440p, 4K, match window)</td><td>planned</td><td>on where it looks right</td></tr>
 <tr><td>Host anti-aliasing (FXAA) in place of SPU MLAA</td><td>planned</td><td>on at scaled resolutions</td></tr>
 <tr><td>Widescreen: 16:10 and 4:3 bars, ultrawide Hor+ field of view</td><td>planned</td><td>bars on; ultrawide opt-in</td></tr>
@@ -273,7 +274,7 @@
 </article>
 <article id="about" class="news">
 <h2>About the port</h2>
-<p class="meta">by the project · how it works · 57 port features</p>
+<p class="meta">by the project · how it works · 58 port features</p>
 <div class="nb"><span class="frame pic-about" aria-hidden="true"></span><div class="nt"><p>The port is built on <a href="https://github.com/sp00nznet/ps3recomp">ps3recomp</a> (MIT): the PPU code and the game's SPU programs are lifted to C, the PS3 system libraries the game calls are reimplemented, and the game's RSX command stream is replayed on Direct3D 12. The game's archive is read in place from your dump. It is tested on Windows x64 under Proton; a native Linux build is planned. What comes next: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/ROADMAP.md">the roadmap</a>.</p>
 <p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/HOW-IT-WORKS.md">The technical overview<span aria-hidden="true"> &gt;</span></a></p>
 <p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>
@@ -329,7 +330,7 @@
 <p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.0">v0.1.0</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10-30 minutes. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
 <p>You can also build the port from source: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md">building</a>.</p>
 <h3>What goes online</h3>
-<p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on) and, planned, opt-in crash reports, an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast#what-goes-online">README</a>.</p>
+<p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on), opt-in crash reports (sent by the launcher after a crash when you opt in, with your names, addresses and folders removed, never a memory dump), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast#what-goes-online">README</a>.</p>
 <p class="small">The original PS3 game's online play is kept running by the PS Rewired community (<a href="https://psrewired.com/servers/23044">their Killzone 3 page</a>). This port is not affiliated with or endorsed by PS Rewired and does not connect to their servers.</p>
 <p class="small">Viewing this website loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit; the repository, installer and game do not.</p>
 <p class="small">Install questions: <a href="https://github.com/undecuple/project-helghast/discussions/categories/q-a">Q&amp;A discussions</a>.</p>
