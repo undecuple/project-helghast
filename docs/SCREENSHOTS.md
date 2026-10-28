@@ -7,10 +7,26 @@ shot. Each frame rate is that build's own, so the early screenshots show the ear
 screenshot was taken at the time.
 
 **Test machine:** Intel Core i7-12700KF, NVIDIA GeForce RTX 4060, Windows x64 build run under GE-Proton on Linux
-(GE-Proton11-7 for the October 14 runs); the game renders at 1280x720, and at 1920x1080 for the 2026-10-27 shot.
+(GE-Proton11-7 for the October 14 runs); the game renders at 1280x720, at 1920x1080 for the 2026-10-27 shot, and at the size each 2026-10-28 shot names.
 
 The game's imagery in these screenshots is © Sony Interactive Entertainment, shown only to document the port (see
 [NOTICE.md](../NOTICE.md)). They come from the developer's own copy of the game.
+
+## 2026-10-28 · Wide screens and display options
+
+![Frozen Shores at 21:9: the 3D view fills the wide window, subtitles and crosshair stay centred](screenshots/20261028-025213Z_kz3-frozen-shores-219.webp)
+
+![Frozen Shores at 32:9: a mounted-gun fight, subtitles and crosshair centred](screenshots/20261028-030031Z_kz3-frozen-shores-329.webp)
+
+![Botzone at 21:9: the minimap, score box and ammo counter in the 16:9 HUD area](screenshots/20261028-032438Z_kz3-botzone-minimap.webp)
+
+![Options, Display page: frame rate limit, field of view and bloom](screenshots/20261028-033208Z_kz3-display-options.webp)
+
+Wide windows: Frozen Shores at 21:9 (2560x1080) and 32:9 (3840x1080), and a Botzone match at 21:9. The 3D view
+fills the window; subtitles and crosshair stay centred, and in the Botzone match the minimap, score box and ammo
+counter sit in the 16:9 HUD area. Last, the Display page of the options at 1920x1080, with
+its frame rate limit, field of view and bloom rows. Scripted runs on the build each bar names; no frame-rate box on
+these.
 
 ## 2026-10-27 · Frozen Shores at 1920x1080
 

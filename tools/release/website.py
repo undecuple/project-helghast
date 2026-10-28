@@ -48,7 +48,8 @@ FONTS = ("https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;700&family=
 # Screenshots shown on the page: (checkpoint name, short title, caption). Our own checkpoints only (NOTICE.md); each must also be
 # in the public collection, public/docs/screenshots/ (same file name as in docs/checkpoints/, which stays private).
 SHOTS_DIR = "public/docs/screenshots"
-FILE_ONLY = ("kz3-frozen-shores-firefight",)   # shots with no checkpoint row: taken from the public collection by name
+FILE_ONLY = ("kz3-frozen-shores-firefight", "kz3-frozen-shores-219", "kz3-frozen-shores-329", "kz3-botzone-minimap",
+             "kz3-display-options")   # shots with no checkpoint row: taken from the public collection by name
 SHOTS = (
     ("kz3-k2-hammer-rides", "Hammer ride", "Pyrrhus outskirts: the Hammer ride, mounted gun"),
     ("kz3-level2-hud", "Flooded Pyrrhus", "Flooded Pyrrhus with the in-level HUD"),
@@ -57,6 +58,10 @@ SHOTS = (
     ("kz3-114-all-chapters", "Update 1.14", "Update 1.14: a level start (Space Station) on the update's own data"),
     ("kz3-main-menu", "Main menu", "Main menu, drawn by the port's Direct3D 12 renderer"),
     ("kz3-frozen-shores-firefight", "Frozen Shores: firefight", "Frozen Shores: firefight"),
+    ("kz3-frozen-shores-219", "Ultrawide 21:9", "Frozen Shores at 21:9 (2560x1080): the 3D view fills the window, subtitles and crosshair stay centred"),
+    ("kz3-frozen-shores-329", "Super ultrawide 32:9", "Frozen Shores at 32:9 (3840x1080): a mounted-gun fight, subtitles and crosshair centred"),
+    ("kz3-botzone-minimap", "Botzone at 21:9", "Botzone at 21:9: the minimap, score box and ammo counter in the 16:9 HUD area"),
+    ("kz3-display-options", "Display options", "Options > Display: frame rate limit, field of view and bloom (1920x1080)"),
 )
 # Feature rows summarised at the top of the status section, in this order.
 KEY_ROWS = (
