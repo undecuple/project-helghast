@@ -529,7 +529,7 @@ def main():
         answers = iter([os.path.join(t14, "nope.iso"), iso14, u12, "", "q"])
         a14 = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t14, "b"), portable=False)
         go = fr.interactive(a14, root12, "x.log", [], ask=lambda q: next(answers), out=io.StringIO(),
-                            check=lambda d, u, e: (picked.append(d), (1, "FAIL D1: x\n"))[1])
+                            check=lambda d, u, e, *t: (picked.append(d), (1, "FAIL D1: x\n"))[1])
         check(go is False and picked == [iso14], f"14 interactive accepts a decrypted .iso as the dump: {picked}")
         # 15 future-dated port files (an installer that kept the build machine's UTC times as local ones): found and
         # refused with the plain message before configure/compile; files at the right time pass
@@ -548,6 +548,82 @@ def main():
             check(False, "15 refuse_future_files raises")
         except fr.StepFailed as e:
             check("dated in the future" in str(e) and "time zone" in str(e), f"15 plain message: {e}")
+        # 16 (pass 63, issue #8): a failed step says why. REASON lines before RESULT ok=0, in the status file after
+        # the RESULT line (the wizard's failure box) and in the console bar; a run that passes has none.
+        why = "this EBOOT is the disc's 1.00 one (20,745,952 bytes); this release needs the EBOOT of the 1.14 update"
+        rep16 = json.dumps({"ok": False, "facts": {}, "checks": [
+            {"level": "OK", "code": "D1", "message": "disc fine"},
+            {"level": "FAIL", "code": "E1", "message": why},
+            {"level": "FAIL", "code": "U2", "message": "1.14 update: no USRDIR/EBOOT.BIN"}]})
+        chk16 = [fr.Step("check", "Checking the game files", 1,
+                         lambda c: [py(f"import sys; print({rep16!r}); sys.exit(1)")], always=True)]
+        sf16 = os.path.join(tmp, "status16.txt")
+        rc, out = run(tmp, chk16, "--build", os.path.join(tmp, "b16"), "--status-file", sf16)
+        st = open(sf16).read().splitlines()
+        check(rc == 1 and st[1].startswith("RESULT ok=0 step=check") and st[2:] == [f"REASON {why}",
+              "REASON 1.14 update: no USRDIR/EBOOT.BIN"], f"16 status file: RESULT then the FAIL messages {st}")
+        lines = out.splitlines()
+        res = next(i for i, ln in enumerate(lines) if ln.startswith("RESULT "))
+        check(lines[res - 2:res] == [f"REASON {why}", "REASON 1.14 update: no USRDIR/EBOOT.BIN"],
+              f"16 REASON lines right before RESULT: {lines[res - 3:res + 1]}")
+        lg16 = open(next(os.path.join(tmp, "dl", n) for n in sorted(os.listdir(os.path.join(tmp, "dl")))
+                         if n.endswith(".log") and why in open(os.path.join(tmp, "dl", n)).read())).read()
+        check("REASON " not in lg16 and why in lg16, "16 the log has the reason text, without the REASON tag")
+        # another step: its last error line
+        cmp16 = [fr.Step("compile", "Compiling", 1, lambda c: [py("import sys; print('a.c:1: error: boom'); "
+                                                                     "print('ninja: build stopped'); sys.exit(1)")])]
+        rc, out = run(tmp, cmp16, "--build", os.path.join(tmp, "b16c"), "--status-file", sf16)
+        st = open(sf16).read().splitlines()
+        check(rc == 1 and st[2:] == ['REASON the step "Compiling" failed (exit 1): a.c:1: error: boom'],
+              f"16 a compile failure carries its error line: {st}")
+        # a step's own StepFailed message (e.g. a missing lift table)
+        def boom(c):
+            raise fr.StepFailed("the 1.14 PPU override table is missing from this install")
+        rc, out = run(tmp, [fr.Step("lift", "Lifting", 1, boom)], "--build", os.path.join(tmp, "b16l"), "--status-file", sf16)
+        st = open(sf16).read().splitlines()
+        check(rc == 1 and st[2:] == ["REASON the 1.14 PPU override table is missing from this install"],
+              f"16 StepFailed text is the reason: {st}")
+        # negative control: a passing run leaves no REASON line anywhere
+        rc, out = run(tmp, steps, "--build", os.path.join(tmp, "b16ok"), "--status-file", sf16)
+        check(rc == 0 and "REASON" not in out and "REASON" not in open(sf16).read(), "16 control: no REASON on success")
+        # the console bar shows the reasons under "The build stopped"
+        bar = io.StringIO()
+        cb = fr.ConsoleBar(bar, chk16, tty=False)
+        cb.write(f"REASON {why}\nRESULT ok=0 step=check elapsed=3\n")
+        check("stopped at step 'check':\n  " + why in bar.getvalue(), f"16 console bar shows the reason: {bar.getvalue()!r}")
+        bar = io.StringIO()
+        fr.ConsoleBar(bar, chk16, tty=False).write("RESULT ok=0 step=check elapsed=3\n")
+        check("stopped at step 'check'.\n" in bar.getvalue(), "16 control: no reason, the old sentence")
+
+        # 17 (issue #8): --check-first with the disc's 1.00 EBOOT (the real firstrun_check): the console fails E1 at
+        # once and asks for the EBOOT again (not the folders); the 1.14 one given there passes
+        t17 = os.path.join(tmp, "t17")
+        d17, u17 = tfc.make_dump(t17), tfc.make_update(t17)
+        old17 = os.path.join(t17, "disc", "EBOOT.elf")
+        tfc.write_elf(old17, 20_745_952)
+        good17 = os.path.join(u17, "USRDIR", "EBOOT.elf")
+        a17 = types.SimpleNamespace(dump=d17, update=u17, eboot=old17, build=os.path.join(t17, "b"), portable=False,
+                                    check_first=True, font_dir="", font_dir_set=True, shaders="off", rpcs3="off")
+        asked17 = []
+        answers = iter(["", "n", "n"])     # Enter = the update's EBOOT.elf offered in brackets; no version check; no build
+
+        def ask17(q):
+            asked17.append(q)
+            return next(answers)
+        o17 = io.StringIO()
+        go = fr.interactive(a17, root12, "x.log", [], ask=ask17, out=o17)
+        o = o17.getvalue()
+        check("FAIL E1" in o and "disc's 1.00 one" in o and "not the disc's" in o, f"17 E1 FAIL shown: {o[-500:]!r}")
+        check(asked17 and asked17[0].startswith("Decrypted EBOOT of the 1.14 update [" + good17 + "]")
+              and not any("Disc dump" in q or "update folder" in q for q in asked17),
+              f"17 the EBOOT is asked again first, with the update's one offered: {asked17[:2]}")
+        check(go is False and a17.eboot == good17 and "OK   E1" in o, f"17 the new EBOOT passes: {a17.eboot}")
+        # negative control: a D1 failure keeps the old question (fix, check again, change, quit), not the EBOOT one
+        asked17.clear()
+        answers = iter(["q"])
+        fr.interactive(types.SimpleNamespace(**{**vars(a17), "eboot": good17}), root12, "x.log", [], ask=ask17,
+                       out=io.StringIO(), check=lambda *x: (1, "FAIL D1: x\n"))
+        check(asked17 and "Fix the FAIL lines" in asked17[0], f"17 control: other FAILs keep the folder question {asked17}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("test_firstrun:", "PASS" if not FAILS else f"FAIL ({len(FAILS)})")

@@ -5,7 +5,7 @@ PARAM.SFO, a 4-byte 'SCE' EBOOT.BIN, a 'PSAR' header and a 64-byte PPC64 ELF hea
     python3 tools/release/test_firstrun_check.py
 
 Cases: a complete dump + update + 1.14-sized ELF passes; wrong TITLE_ID fails; missing PARAM.SFO fails; a dump
-whose EBOOT.BIN is already an ELF passes; a v1.00-sized ELF warns; a wrong-machine ELF fails; a truncated psarc
+whose EBOOT.BIN is already an ELF passes; a v1.00-sized ELF fails E1 on the 1.14 build; a wrong-machine ELF fails; a truncated psarc
 fails; no --update warns; --json has the documented shape; H1 (EBOOT SHA-256): the shipped hashes file
 with empty values warns "unknown yet", a matching hash is OK, a mismatch warns with the size and both hashes (exit 0),
 an unreadable hashes file warns, a failed E1 gives no H1.
@@ -296,11 +296,16 @@ def main():
 
         u100 = make_update(os.path.join(tmp, "v100"), elf_size=20_745_952)
         rc, out = run(["--dump", d, "--update", u100] + small)
-        check("v1.00 ELF warns, no FAIL", rc == 0 and levels(out, "E1") == {"WARN"} and "1.00" in out, out)
+        check("v1.00 ELF on the 1.14 build fails E1 naming the update's USRDIR (issue #8)",
+              rc == 1 and levels(out, "E1") == {"FAIL"} and "disc's 1.00 one" in out
+              and os.path.join(u100, "USRDIR") in out and "not the disc's" in out, out)
+        rc, out = run(["--dump", d, "--eboot", os.path.join(u100, "USRDIR", "EBOOT.elf")] + small)
+        check("E1 without --update names the usual dev_hdd0 USRDIR", rc == 1 and
+              os.path.join("dev_hdd0", "game", "BCUS98234", "USRDIR") in out, out)
         rc, out = run(["--dump", d, "--update", u100, "--target", "1.00"] + small)
         check("v1.00 ELF on a 1.00 tree (--target 1.00) is OK", rc == 0 and levels(out, "E1") == {"OK"}, out)
         rc, out = run(["--dump", d, "--update", u, "--target", "1.00"] + small)
-        check("1.14 ELF on a 1.00 tree warns", rc == 0 and levels(out, "E1") == {"WARN"} and "for the 1.00" in out, out)
+        check("1.14 ELF on a 1.00 tree fails", rc == 1 and levels(out, "E1") == {"FAIL"} and "for the 1.00" in out, out)
 
         ux = make_update(os.path.join(tmp, "x86"), elf_size=21_228_256)
         write_elf(os.path.join(ux, "USRDIR", "EBOOT.elf"), 21_228_256, machine=0x3E, data=1)
