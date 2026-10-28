@@ -14,7 +14,7 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -30,7 +30,7 @@ jobs:
       - name: Patches apply to the pinned ps3recomp
         run: nix develop .#ci --command bash tools/ps3recomp-patched.sh
       - name: Host tests (no game data; list in tools/host-tests.txt)
-        run: nix develop .#ci --command bash tools/run-host-tests.sh --gh
+        run: nix develop .#ci --command bash tools/run-host-tests.sh --gh -j "$(nproc)"
 
   secrets:
     runs-on: ubuntu-latest

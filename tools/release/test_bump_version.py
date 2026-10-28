@@ -31,6 +31,10 @@ def check(ok, what):
 
 
 def make_copy(dst):
+    if not (REAL / "public").is_dir():   # the public export: public/ is the repo root, so copy the tree as it is
+        shutil.copytree(REAL, dst, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(".git", "third_party", "build", "work", "__pycache__"))
+        return
     for rel in COPY:
         src, out = REAL / rel, dst / rel
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +85,7 @@ def main():
 
         rc, out, err = run(root, new, "--date", "2030-01-02")
         check(rc == 0, f"bump to {new} succeeds (rc {rc}) {err[-300:]}")
-        t = lambda rel: (root / rel).read_text(encoding="utf-8")
+        t = lambda rel: bump_version.at(root, rel).read_text(encoding="utf-8")
         check(f'VERSION = "{new}"' in t("tools/release/names.py"), "names.py")
         rc_t = t("installer/launcher/launcher.rc")
         check(f"FILEVERSION {nums}" in rc_t and f"PRODUCTVERSION {nums}" in rc_t, "launcher.rc numbers")

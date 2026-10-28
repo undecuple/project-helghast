@@ -28,6 +28,13 @@ SEMVER = re.compile(r"\d+\.\d+\.\d+")
 PUBLIC_MARKER_FILES = ("public/README.md", "public/docs/BUILDING.md", "public/docs/ROADMAP.md")
 
 
+def at(root, rel):
+    """The file for a repo path: the public export puts public/ at its root (as test_version_agree.py reads it)."""
+    if rel.startswith("public/") and not (root / "public").is_dir():
+        return root / rel[len("public/"):]
+    return root / rel
+
+
 def parse(v):
     m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", v)
     return tuple(int(x) for x in m.groups()) if m else None
@@ -67,7 +74,7 @@ def edits(root, version, date):
     out = {}
 
     def edit(rel, fn):
-        p = root / rel
+        p = at(root, rel)
         old = p.read_text(encoding="utf-8")
         new = fn(old)
         if new != old:
@@ -127,7 +134,7 @@ def main(argv=None):
     if a.check:
         return 0
     for rel, text in changed.items():
-        (root / rel).write_text(text, encoding="utf-8")
+        at(root, rel).write_text(text, encoding="utf-8")
     if changed:
         r = subprocess.run([sys.executable, str(root / "tools/release/website.py"), "--root", str(root), "-q"])
         if r.returncode:
