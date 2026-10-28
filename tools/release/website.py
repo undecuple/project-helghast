@@ -211,6 +211,8 @@ def changelog(root, n=CHANGELOG_N):
     in file order, the first n; text cut at ~110 characters; items with internal wording are skipped."""
     p = root / CHANGELOG_SOURCE
     if not p.exists():
+        p = root / "CHANGELOG.md"   # the public export puts public/ at its root
+    if not p.exists():
         return []
     out, day = [], None
     for line in p.read_text(encoding="utf-8").splitlines():
