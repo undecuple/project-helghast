@@ -48,6 +48,7 @@ FONTS = ("https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;700&family=
 # Screenshots shown on the page: (checkpoint name, short title, caption). Our own checkpoints only (NOTICE.md); each must also be
 # in the public collection, public/docs/screenshots/ (same file name as in docs/checkpoints/, which stays private).
 SHOTS_DIR = "public/docs/screenshots"
+FILE_ONLY = ("kz3-frozen-shores-firefight",)   # shots with no checkpoint row: taken from the public collection by name
 SHOTS = (
     ("kz3-k2-hammer-rides", "Hammer ride", "Pyrrhus outskirts: the Hammer ride, mounted gun"),
     ("kz3-level2-hud", "Flooded Pyrrhus", "Flooded Pyrrhus with the in-level HUD"),
@@ -55,6 +56,7 @@ SHOTS = (
     ("kz3-coop-two-players", "Split-screen co-op", "Two-player co-op on one PC, one pad each (the two views still sit slightly out of place)"),
     ("kz3-114-all-chapters", "Update 1.14", "Update 1.14: a level start (Space Station) on the update's own data"),
     ("kz3-main-menu", "Main menu", "Main menu, drawn by the port's Direct3D 12 renderer"),
+    ("kz3-frozen-shores-firefight", "Frozen Shores: firefight", "Frozen Shores: firefight"),
 )
 # Feature rows summarised at the top of the status section, in this order.
 KEY_ROWS = (
@@ -185,8 +187,8 @@ def community_box(items):
 
 
 # Sixth pass, restyled in the eighth as a comms log and an objectives list: both generated, never hand-written.
-CHANGELOG_SOURCE = "docs/checkpoints/README.md"   # the checkpoint log: one row per milestone screenshot, dated by its timestamp
-CHANGELOG_N = 6
+CHANGELOG_SOURCE = "public/CHANGELOG.md"   # the public changelog (keep-a-changelog style)
+CHANGELOG_N = 8
 TODO_N = 5
 # A changelog line is the row's "What it shows" text cut at its first clause; rows with internal wording are skipped
 # (decision numbers, run names, paths, switches), so a private detail can never reach the page.
@@ -205,28 +207,24 @@ BUTTONS = (
 
 
 def changelog(root, n=CHANGELOG_N):
-    """Newest-first [(YYYY-MM-DD, text)] from CHANGELOG_SOURCE's table rows ('| 2026-10-16 14:18:13 | [name](png) | commit |
-    What it shows | how |'): the first clause of 'What it shows', at most ~72 characters, one line per distinct text."""
+    """Newest-first [(YYYY-MM-DD, text)] from CHANGELOG_SOURCE: the '- item' lines under each '## [version] - date' heading,
+    in file order, the first n; text cut at ~110 characters; items with internal wording are skipped."""
     p = root / CHANGELOG_SOURCE
     if not p.exists():
         return []
-    out, seen = [], set()
-    for line in reversed(p.read_text(encoding="utf-8").splitlines()):
-        c = [x.strip() for x in line.split("|")]
-        if len(c) < 7 or not re.match(r"\d{4}-\d\d-\d\d", c[1]):
-            continue
-        text = re.split(r"; | \(|\. ", c[4], maxsplit=1)[0].strip()
-        head, sep, rest = text.partition(": ")
-        if sep and len(head) >= 20:       # a long enough lead-in ("Options > Wireless Controller page") stands alone
-            text = head
-        if len(text) > 72:
-            text = text[:71].rsplit(" ", 1)[0].rstrip(",;:- ") + "..."
-        if not text or INTERNAL.search(text) or text.lower() in seen:
-            continue
-        seen.add(text.lower())
-        out.append((c[1][:10], text))
-        if len(out) == n:
-            break
+    out, day = [], None
+    for line in p.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"##\s+\[[^\]]+\]\s+-\s+(\d{4}-\d\d-\d\d)", line)
+        if m:
+            day = m.group(1)
+        elif day and line.startswith("- "):
+            text = line[2:].strip()
+            if len(text) > 110:
+                text = text[:109].rsplit(" ", 1)[0].rstrip(",;:- ") + "..."
+            if text and not INTERNAL.search(text):
+                out.append((day, text))
+                if len(out) == n:
+                    break
     return out
 
 
@@ -255,7 +253,7 @@ def hud_boxes(root, rows):
         o.append(f"<li><time datetime=\"{d}\">{d[5:]}</time><span>{esc(t)}</span></li>\n")
     if not log:
         o.append("<li>No dated entries yet.</li>\n")
-    o.append("</ul>\n<p class=\"small\">Newest milestone screenshots, from the project's records.</p>\n</section>\n"
+    o.append(f"</ul>\n<p class=\"small\">Newest first; the full list is in <a href=\"{REPO}/blob/main/CHANGELOG.md\">CHANGELOG.md</a>.</p>\n</section>\n"
              "<section id=\"todo\" class=\"promo obj\">\n<h2>Objectives</h2>\n<ul class=\"todo\">\n")
     for f, st in todo(rows):
         o.append(f"<li class=\"o-{esc(st.replace(' ', '-'))}\"><span class=\"box\" aria-hidden=\"true\"></span>{esc(f)} <em>({esc(st)})</em></li>\n")
@@ -326,7 +324,7 @@ def render(root, problems, feed=()):
       f"<div class=\"intro\">\n<p class=\"desc\">{esc(DESC)}</p>\n<p class=\"what\">{esc(WHAT)}</p>\n"
       f"<p class=\"headline\">Status: <strong>{esc(headline)}</strong></p>\n"
       "<p class=\"note\">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>\n"
-      f"<p class=\"note\">A first release that calls itself playable waits for the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>.</p>\n"
+      f"<p class=\"note\">v0.1.0 is a pre-release; calling a release playable waits for the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>.</p>\n"
       f"<p class=\"btns\"><a class=\"btn\" href=\"#status\">See the status</a><a class=\"btn alt\" href=\"{REPO}\">"
       "Source on GitHub</a></p>\n</div>\n</header>\n<div class=\"page wrap\">\n")
 
@@ -335,14 +333,23 @@ def render(root, problems, feed=()):
     # also gets a news entry below the status entry.
     shots = []
     for name, title, caption in SHOTS:
-        if name not in cps:
-            problems.append(f"screenshot checkpoint '{name}' not in {features.CP_README}")
-            continue
-        fname = pathlib.PurePosixPath(cps[name]).name
+        if name in cps or name not in FILE_ONLY:
+            if name not in cps:
+                problems.append(f"screenshot checkpoint '{name}' not in {features.CP_README}")
+                continue
+            fname = pathlib.PurePosixPath(cps[name]).name
+            ref = cps[name]
+        else:   # a curated shot that has no checkpoint row: found in the public collection by its name
+            hit = sorted((root / SHOTS_DIR).glob(f"*_{name}.*"))
+            if not hit:
+                problems.append(f"screenshot '{name}' is neither a checkpoint in {features.CP_README} nor a file in {SHOTS_DIR}/")
+                continue
+            fname = hit[-1].name
+            ref = "docs/checkpoints/" + fname
         if not (root / SHOTS_DIR / fname).is_file():
             problems.append(f"screenshot '{fname}' not in {SHOTS_DIR}/")
             continue
-        day = re.match(r"docs/checkpoints/(\d{4})(\d\d)(\d\d)", cps[name])
+        day = re.match(r"docs/checkpoints/(\d{4})(\d\d)(\d\d)", ref)
         shots.append((day.groups() if day else ("", "", ""), "../docs/screenshots/" + fname, title, caption))
     shots.sort(key=lambda s: s[0], reverse=True)
     w("<section id=\"shots\" class=\"gallery-pod\">\n<h2>Screens</h2>\n<div class=\"gallery\">\n")
@@ -446,13 +453,13 @@ def render(root, problems, feed=()):
     w("</ul>\n<p class=\"small\"><a href=\"#status\">Full status</a></p>\n</section>\n")
 
     w("<section id=\"install\" class=\"promo\">\n<h2>Install</h2>\n"
-      "<p class=\"headline\"><strong>Not released yet.</strong></p>\n"
-      "<p>The planned release is a Windows installer and a portable zip. They check your own disc dump and the 1.14 "
-      "update, then recompile and build the game's code on your own machine with a bundled compiler, with one "
-      "progress bar and a full install log. Nothing of the game is shipped or downloaded; your dump is read where it "
-      "is, never copied.</p>\n"
-      f"<p>Until then you can build the port from source: <a href=\"{REPO}/blob/main/docs/BUILDING.md\">"
-      f"building</a>. Releases will appear on the <a href=\"{REPO}/releases\">releases page</a>.</p>\n"
+      f"<p class=\"headline\"><strong>v0.1.0 pre-release</strong>, partly playable (see the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>).</p>\n"
+      f"<p>Download the installer (recommended) or the portable zip from the <a href=\"{REPO}/releases\">releases page</a> "
+      f"(the <a href=\"{REPO}/releases/tag/v0.1.0\">v0.1.0</a> page lists both). Check the download against SHA256SUMS on the same page. "
+      "You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your "
+      "machine with a bundled compiler, with one progress bar and a full install log; allow about 10-30 minutes. "
+      "Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>\n"
+      f"<p>You can also build the port from source: <a href=\"{REPO}/blob/main/docs/BUILDING.md\">building</a>.</p>\n"
       "<h3>What goes online</h3>\n<p>Nothing, unless you ask for it: an optional new-version check (one anonymous "
       "request to GitHub, only when you turn it on) and, planned, opt-in crash reports, an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server "
       f"you choose. The full list is in the <a href=\"{REPO}#what-goes-online\">README</a>.</p>\n"

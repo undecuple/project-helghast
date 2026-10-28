@@ -39,7 +39,7 @@ the developer's own copy of the game.
 - **Formal notices** under the DMCA go to GitHub as described in
   [GitHub's DMCA Takedown Policy](https://docs.github.com/en/site-policy/content-removal-policies/dmca-takedown-policy).
 
-**Release tooling** (installer and portable zip, not released yet): the installer bundles a C/C++ compiler
+**Release tooling** (installer and portable zip): the installer bundles a C/C++ compiler
 toolchain, unmodified, and ships each bundled component's licence text with it (the list and versions are in
 `tools/release/toolchain.json`): llvm-mingw (clang, lld, compiler-rt, libc++ and libunwind under Apache-2.0 WITH
 LLVM-exception; its build scripts under ISC; MinGW-w64 headers and CRT under ZPL-2.1 and public-domain terms, a few

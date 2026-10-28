@@ -20,7 +20,7 @@ Where each feature of the PS3 game stands today, and the port-only features with
 | 🔧 | The whole campaign, start to finish: all 9 chapters load and play for minutes; one chapter (Pyrrhus Outskirts) has been played by hand to its end (2026-10-20), the others not played through. Remaining: level streaming, scripts, physics, AI, every mission |
 | 🔧 | **Error and runtime logging:** per-run log files, crash reports with an error box, quiet by default |
 | 🔧 | Save games in your user folder (checkpoints save and reload today); local trophies (shown by the port, not synced anywhere) are planned |
-| 🔧 | **Installer and portable zip** (Windows): check your own disc dump and 1.14 update, then build the port on your machine with a bundled compiler; nothing of the game is shipped or downloaded. Not released yet; the installer has built the game and reached the menus on native Windows 11 (7 minutes, 2026-10-21) |
+| ✅ | **Installer and portable zip** (Windows): check your own disc dump and 1.14 update, then build the port on your machine with a bundled compiler; nothing of the game is shipped or downloaded. Published as the v0.1.0 pre-release |
 
 ## 2. PC display and settings  🔧
 
@@ -60,7 +60,7 @@ Where each feature of the PS3 game stands today, and the port-only features with
 
 ## 5. Platforms  📋
 
-- **Native Linux build** (no Proton needed): a Vulkan graphics path, Linux packaging (AppImage or tarball)
+- **Native Linux build** (no Proton needed): a Vulkan graphics path, Linux packaging (AppImage, Flatpak or tarball)
 - **Native macOS build** (Apple silicon), after the Linux build
 - **Android (ARM64)** build, late: you build the APK on your own PC from your own game files
 - Windows remains a first-class target

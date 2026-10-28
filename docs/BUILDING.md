@@ -5,9 +5,9 @@ decrypted EBOOT and compiled on your machine. Nothing of the game is in this rep
 
 There are two ways to get a build:
 
-- **The installer or portable zip (Windows, or Linux with Proton): not released yet.** It checks your disc dump and
+- **The installer or portable zip (Windows, or Linux with Proton), v0.1.0 pre-release.** It checks your disc dump and
   the 1.14 update, then lifts and compiles the game's code on your machine with a bundled compiler, behind one
-  progress bar, with a full install log. Releases will appear on the
+  progress bar, with a full install log. Download it from the
   [releases page](https://github.com/undecuple/project-helghast/releases).
 - **A developer build from source with Nix**, described below: on Linux (how the port is developed and tested
   today), on a Mac with Apple silicon, or on Windows inside WSL2. The build is the same `nix develop` steps on all
@@ -138,7 +138,7 @@ is tested mostly under Proton on Linux.
    double-clicking `kz3.exe` does the same (see [Running](#running)). You need an NVIDIA GPU with Direct3D 12
    and a current driver.
 
-The future installer will do all of this on Windows without WSL2 or Nix (a bundled compiler; not released yet).
+The installer does all of this on Windows without WSL2 or Nix (a bundled compiler; see the releases page).
 
 ## Running
 

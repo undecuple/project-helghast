@@ -37,6 +37,7 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 NAME_RX = re.compile(r"[a-z0-9][a-z0-9.-]*")
 MAX_DOWNLOAD = 1 << 30            # 1 GiB: llvm-mingw's Windows zip is ~200 MB (ASSUMPTION)
 REQUIRED = ("name", "group", "version", "url", "sha256", "archive", "license", "release_page")
+REPO_REQUIRED = ("name", "group", "version", "repo_path", "sha256", "archive", "license", "release_page")
 FORMAT_FIELDS = ("url", "sha256_list", "notice")
 
 
@@ -44,6 +45,14 @@ FORMAT_FIELDS = ("url", "sha256_list", "notice")
 def load(path=MANIFEST):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def repo_file(rel):
+    """Path of a file shipped in the repository, in the private layout (public/<rel>) or the export layout (<rel>)."""
+    for c in (os.path.join(REPO, "public", rel), os.path.join(REPO, rel)):
+        if os.path.isfile(c):
+            return c
+    return os.path.join(REPO, "public", rel)
 
 
 def expand(entry):
@@ -74,7 +83,7 @@ def validate(m, schemes=("https",), strict=False):
     names, groups_lic, groups_main = set(), set(), set()
     for i, raw in enumerate(comps):
         where = f"components[{i}]"
-        miss = [k for k in REQUIRED if not isinstance(raw.get(k), str) or not raw.get(k)]
+        miss = [k for k in (REPO_REQUIRED if raw.get("kind") == "repo" else REQUIRED) if not isinstance(raw.get(k), str) or not raw.get(k)]
         if miss:
             bad.append(f"{where}: missing {', '.join(miss)}")
             continue
@@ -93,6 +102,9 @@ def validate(m, schemes=("https",), strict=False):
         for k in ("url", "sha256_list", "release_page"):
             if k in e and e[k].split(":", 1)[0] not in schemes:
                 bad.append(f"{where}: {k} must use {'/'.join(schemes)}")
+        if e.get("kind") == "repo":
+            if e["archive"] != "file" or not safe_rel(e["repo_path"]):
+                bad.append(f"{where}: kind repo needs archive file and a plain relative repo_path")
         if e["sha256"] == TO_FILL:
             if strict:
                 bad.append(f"{where}: sha256 is TO-FILL (run fetch_toolchain.py --fill)")
@@ -247,14 +259,30 @@ def write_fetched(cache, data):
     os.replace(tmp, fetched_path(cache))
 
 
+def drop(e, path):
+    """Delete a refused download; never a file that lives in the repository."""
+    if e.get("kind") != "repo":
+        os.remove(path)
+
+
 def fetch_one(raw, cache, fill, manifest_path, opener=open_url, out=sys.stdout):
     """Download, verify, unpack one entry. -> True on success (problems are printed)."""
     e = expand(raw)
-    name, url = e["name"], e["url"]
-    fname = url.rstrip("/").rsplit("/", 1)[-1]
-    dl = os.path.join(cache, "downloads", name, fname)
+    name = e["name"]
+    if e.get("kind") == "repo":     # a file that ships in the repository: no network, still hash-checked
+        url = "repo:" + e["repo_path"]
+        dl = repo_file(e["repo_path"])
+        fname = os.path.basename(dl)
+    else:
+        url = e["url"]
+        fname = url.rstrip("/").rsplit("/", 1)[-1]
+        dl = os.path.join(cache, "downloads", name, fname)
     try:
-        got = download(url, dl, opener)
+        if e.get("kind") == "repo":
+            with open(dl, "rb") as f:
+                got = hashlib.sha256(f.read()).hexdigest()
+        else:
+            got = download(url, dl, opener)
     except (OSError, ValueError) as ex:
         print(f"FAIL {name}: download {url}: {ex} (check the version on {e['release_page']})", file=out)
         return False
@@ -270,19 +298,19 @@ def fetch_one(raw, cache, fill, manifest_path, opener=open_url, out=sys.stdout):
             print(f"FAIL {name}: published hash list {e['sha256_list']}: {ex}", file=out)
         if published != got:
             print(f"FAIL {name}: SHA-256 {got} is not the published one ({published})", file=out)
-            os.remove(dl)
+            drop(e, dl)
             return False
     if want == TO_FILL:
         if not fill:
             print(f"FAIL {name}: sha256 is TO-FILL; re-run with --fill to record {got}", file=out)
-            os.remove(dl)
+            drop(e, dl)
             return False
         fill_hash(manifest_path, name, got)
         print(f"FILL {name}: sha256 {got} written to {os.path.basename(manifest_path)}", file=out)
     elif got != want:
         print(f"FAIL {name}: SHA-256 mismatch: manifest {want}, download {got}; refused and deleted (a deliberate "
               "version change: set sha256 to TO-FILL and use --fill)", file=out)
-        os.remove(dl)
+        drop(e, dl)
         return False
     tree = os.path.join(cache, "trees", name)
     try:

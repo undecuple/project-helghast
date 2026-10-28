@@ -209,22 +209,19 @@ def main():
     # Sixth pass: the generated changelog and to-do boxes, the button strip, the dividers.
     with tempfile.TemporaryDirectory() as d:
         root = pathlib.Path(d)
-        expect(website.changelog(root) == [], "changelog of a tree without the checkpoint log should be empty")
-        (root / "docs/checkpoints").mkdir(parents=True)
-        log = "".join(f"| 2026-10-{day:02d} 10:00:00 | [n{day}](x.png) | abc | {what} | how |\n" for day, what in (
-            (1, "Title screen: first frame"), (2, "Options > Wireless Controller page: mapping changed; more"),
-            (3, "Update 1.14: all nine chapters load"), (4, "Secret thing, see D56 and /home/x"),
-            (5, "Update 1.14: all nine chapters load"), (6, "A " + "very long line " * 12), (7, "Brightness page (two values)")))
-        (root / "docs/checkpoints/README.md").write_text("# cps\n\n| a | b | c | d | e |\n|---|---|---|---|---|\n" + log + "not a row\n")
+        expect(website.changelog(root) == [], "changelog of a tree without CHANGELOG.md should be empty")
+        (root / "public").mkdir()
+        (root / "public/CHANGELOG.md").write_text("# Changelog\n\n## [0.2.0] - 2026-11-01\n\n### Added\n- Newer thing\n- Secret, see D56 and /home/x\n"
+            "- " + "very long line " * 12 + "\n\n## [0.1.0] - 2026-10-27 (pre-release)\n- Older thing\n- Field of view setting\n", encoding="utf-8")
         got = website.changelog(root, 10)
         texts = [t for _, t in got]
-        expect(got[0] == ("2026-10-07", "Brightness page"), f"newest first, cut before '(': {got[:1]}")
-        expect("Options > Wireless Controller page" in texts, "a long lead-in before ': ' should stand alone")
-        expect("Update 1.14: all nine chapters load" in texts and texts.count("Update 1.14: all nine chapters load") == 1,
-               "a short lead-in keeps its text and duplicates collapse")
+        expect(got[0] == ("2026-11-01", "Newer thing") and got[-1] == ("2026-10-27", "Field of view setting"), f"newest first with section dates: {got}")
         expect(not any("D56" in t or "/home" in t for t in texts), "internal wording must be skipped")
-        expect(all(len(t) <= 75 for t in texts) and any(t.endswith("...") for t in texts), "long lines must be capped")
+        expect(all(len(t) <= 112 for t in texts) and any(t.endswith("...") for t in texts), "long lines must be capped")
         expect(len(website.changelog(root, 2)) == 2, "n caps the entries")
+        real = website.changelog(pathlib.Path(__file__).resolve().parents[2], 20)
+        expect(any("Field of view" in t for _, t in real) and any("Frame rate limit" in t for _, t in real)
+               and any("Ultrawide" in t for _, t in real) and any("co-op" in t for _, t in real), f"real CHANGELOG.md lacks items: {real}")
     rows = [{"kind": "ps3", "feature": f"F{i}", "status": s} for i, s in
             enumerate(["works", "partial", "not yet", "not yet", "unverified", "not yet", "partial"])]
     rows.append({"kind": "port", "feature": "P", "status": "planned"})

@@ -106,7 +106,21 @@ def test_real_manifest():
           "--strict refuses TO-FILL / TO-CONFIRM")
     names = {c["name"] for c in m["components"]}
     check({"llvm-mingw", "cmake", "ninja", "python"} <= names, "manifest pins llvm-mingw, cmake, ninja, python", names)
+    lg = [c for c in m["components"] if c["name"] == "lgpl-2.1-text"][0]
+    check(lg.get("kind") == "repo" and "url" not in lg, "lgpl-2.1-text comes from the repository, not the network", lg)
+    check(os.path.isfile(ft.repo_file(lg["repo_path"])) and
+          sha(ft.repo_file(lg["repo_path"])) == lg["sha256"], "lgpl-2.1-text: repository file matches the pinned sha256")
+    cache = tempfile.mkdtemp()
+    def no_net(u):
+        raise AssertionError("network used for a repo entry: " + u)
+    buf = io.StringIO()
+    ok = ft.fetch_one(lg, cache, False, ft.MANIFEST, opener=no_net, out=buf)
+    check(ok and os.path.isfile(os.path.join(cache, "trees", "lgpl-2.1-text", lg["license_file"])), "repo entry fetched offline", buf.getvalue())
+    check(os.path.isfile(ft.repo_file(lg["repo_path"])), "repo file kept")
+    shutil.rmtree(cache)
     for c in m["components"]:
+        if c.get("kind") == "repo":
+            continue
         e = ft.expand(c)
         check("{" not in e["url"], f"{c['name']}: url placeholders expand", e["url"])
         if c["archive"] == "zip":

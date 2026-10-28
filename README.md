@@ -13,7 +13,7 @@
 ![Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6)
 ![Direct3D 12](https://img.shields.io/badge/graphics-Direct3D%2012-555)
 
-**[Status](#status)** · **[Features](docs/FEATURES.md)** · **[Requirements](docs/requirements.md)** · **[Getting it](#getting-it)** · **[Screenshots](docs/SCREENSHOTS.md)** · **[Building](docs/BUILDING.md)** · **[How it works](docs/HOW-IT-WORKS.md)** · **[Known issues](docs/KNOWN_ISSUES.md)** · **[Release criteria](docs/RELEASE-CRITERIA.md)** · **[AI use](#how-ai-was-used)** · **[Roadmap](docs/ROADMAP.md)** · **[Contributing](.github/CONTRIBUTING.md)**
+**[Status](#status)** · **[Features](docs/FEATURES.md)** · **[Requirements](docs/requirements.md)** · **[Getting it](#getting-it)** · **[Screenshots](docs/SCREENSHOTS.md)** · **[Building](docs/BUILDING.md)** · **[How it works](docs/HOW-IT-WORKS.md)** · **[Known issues](docs/KNOWN_ISSUES.md)** · **[Release criteria](docs/RELEASE-CRITERIA.md)** · **[AI use](#how-ai-was-used)** · **[Changelog](CHANGELOG.md)** · **[Roadmap](docs/ROADMAP.md)** · **[Contributing](.github/CONTRIBUTING.md)**
 
 *Helghast* is the name of the game's own faction; Project Helghast is a fan project, not official and not
 affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games.
@@ -71,7 +71,7 @@ repo's own records). How the port works: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORK
 
 Nothing, unless you ask for it. Each item is off until you turn it on, and this list names every one:
 
-- **New-version check** (installer and portable zip, not released yet): one anonymous request to GitHub for this
+- **New-version check** (installer and portable zip): one anonymous request to GitHub for this
   repository's latest release, made only when you click "Check now" or tick "Check for new versions" (then at most
   once a day). Nothing about you, your computer or the game is sent; a new installer downloads only when you click it.
 - **Crash reports** (planned; installer, Advanced page): when ticked, a crash (or a serious warning, at most once per
@@ -99,11 +99,13 @@ Start-menu "Open saves folder" entry say which rule decided, for example `data: 
 
 ## Getting it
 
-**Nothing is released yet.** The port will be distributed as source code plus an installer (and a portable zip)
-that checks your own disc dump and 1.14 update, then recompiles and builds the game's code on your own machine with
-a bundled compiler. No game code, assets or keys are ever shipped or downloaded. Until a release is published, the
-only way to try the port is to build it yourself (below). The conditions for a first release, and for calling it
-playable, are in [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md); there is no release date.
+**Download:** [v0.1.0](https://github.com/undecuple/project-helghast/releases/tag/v0.1.0) is a pre-release (partly
+playable). Get `Project-Helghast-setup.exe` (recommended) or the portable zip from the
+[releases page](https://github.com/undecuple/project-helghast/releases) and check it against `SHA256SUMS`. The installer
+checks your own disc dump, 1.14 update and decrypted EBOOT, then recompiles and builds the game's code on your own
+machine with a bundled compiler (about 10-30 minutes on the first start). No game code, assets or keys are ever shipped
+or downloaded. You can also build it yourself (below). What a release must meet to be called playable is in
+[docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 **Always start the game through the launcher (`Project Helghast.exe`, or the desktop and Start-menu shortcuts).**
 `kz3.exe` started directly skips the launcher's work: it does not apply the data-location rules (saves, settings and
@@ -196,6 +198,7 @@ Details: [CONTRIBUTING.md](.github/CONTRIBUTING.md). Things already known to be 
 |---|---|
 | `README.md` | This page. |
 | `LICENSE` | The licence; GitHub reads it from the root. |
+| `CHANGELOG.md` | What each release contains, newest first. |
 | `NOTICE.md` | Short credits list; the licence texts are in `licenses/`. |
 | `licenses/` | Full licence texts of what the installer and portable zip ship (see its README). |
 | `CITATION.cff` | Citation data; GitHub reads it from the root for the "Cite this repository" button. |
