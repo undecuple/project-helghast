@@ -10,6 +10,8 @@
 [![CI](https://github.com/undecuple/project-helghast/actions/workflows/ci.yml/badge.svg)](https://github.com/undecuple/project-helghast/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Status: partly playable](https://img.shields.io/badge/status-partly%20playable-orange)
+[![Release](https://img.shields.io/github/v/release/undecuple/project-helghast?include_prereleases&label=release)](https://github.com/undecuple/project-helghast/releases)
+[![Downloads](https://img.shields.io/github/downloads/undecuple/project-helghast/total)](https://github.com/undecuple/project-helghast/releases)
 ![Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6)
 ![Direct3D 12](https://img.shields.io/badge/graphics-Direct3D%2012-555)
 
