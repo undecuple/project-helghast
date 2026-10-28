@@ -20,7 +20,7 @@ From your own copy of the game (details and sizes in [requirements.md](requireme
 
 | Item | Notes |
 |---|---|
-| Killzone 3, US disc **BCUS98234**, dumped as a decrypted folder | `PS3_GAME/USRDIR/data_ps3.psarc` and the rest of the disc. Other regions are untested. |
+| Killzone 3, US disc **BCUS98234**, dumped as a decrypted folder | `PS3_GAME/USRDIR/data_ps3.psarc` and the rest of the disc. The EU disc (**BCES01007**) is accepted as an untested region (a player's report shows the same 1.14 EBOOT hash as the US version); other releases are not supported yet. The update goes under the same title id. |
 | Update **1.14** | Your own copy of the update; the port's target version. The PS3 emulator RPCS3 and its documentation are the usual place to learn how a PS3 update is installed. |
 | The **decrypted EBOOT** | `EBOOT.elf`, the decrypted form of the update's `EBOOT.BIN`, comes from your own copy of the game (this project provides no tools or instructions for it; the PS3 emulator RPCS3 and its documentation are the usual place people start). No PS3 firmware is needed. |
 

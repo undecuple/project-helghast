@@ -8,7 +8,7 @@ measured values replace them as they come in.
 
 | Item | Required | Details |
 |---|---|---|
-| **Killzone 3 disc, US release** | yes | Title ID **BCUS98234** (disc VERSION 01.01, needs PS3 system 3.55). Other regions/IDs are untested. You make your own dump (decrypted folder, as made by a PS3 or a disc dumper); the port ships none of the game. Dump size: 41.4 GiB. |
+| **Killzone 3 disc, US release** | yes | Title ID **BCUS98234** (disc VERSION 01.01, needs PS3 system 3.55). The EU disc (**BCES01007**) is accepted as an untested region (the installer and `firstrun_check.py` warn; a player's report shows the same 1.14 EBOOT hash); other IDs (e.g. Killzone Trilogy) are refused, naming the id found. The update must carry the disc's title id. You make your own dump (decrypted folder, as made by a PS3 or a disc dumper); the port ships none of the game. Dump size: 41.4 GiB. |
 | **Game update 1.14** | yes | The 1.14 update from your own console. The port is built on 1.14, the game's last version; it adds the option to turn off the mandatory SIXAXIS sections. |
 | **Decrypted 1.14 EBOOT** | yes | The game's `EBOOT.BIN` is encrypted; the port needs `EBOOT.elf`, its decrypted form, made from your own copy of the 1.14 update (this project gives no decryption tools or instructions). No firmware is needed for this step. |
 | **PS3 system firmware** | not currently (optional fonts) | Only for Chinese, Korean and Japanese text: an optional PS3 font folder from your own firmware files; Latin and Cyrillic use an open font. The port answers the PS3 system libraries itself (high-level emulation) and loads no firmware modules. If that changes (e.g. running Sony's SPURS module), the firmware file on the game disc (`PS3_UPDATE/PS3UPDAT.PUP`, 3.55) is enough. |
@@ -56,6 +56,6 @@ build it yourself" (see the end). Building needs more than playing:
 - **Online play**: the game's own network code against a self-hosted Medius-compatible server that players or
   the community run; a self-hosted Nakama server (with instructions) is the alternative. The port does not connect
   to PS Rewired, the community service that keeps the original PS3 game online. Multiplayer is in progress.
-- **Other regions** (European and other releases): untested. The EU 1.14 update's decrypted EBOOT (BCES01007) is
-  byte-identical to the US one (SHA-256 match, a playtester's first-run log 2026-10-28); EU support as "untested region"
-  is planned. Other regions' EBOOTs are unchecked.
+- **Other regions** (European and other releases): untested. The EU disc (BCES01007) is accepted as an untested
+  region: a player's first-run log (2026-10-28) shows the same 1.14 EBOOT hash as the US version. Other regions are not
+  accepted yet.

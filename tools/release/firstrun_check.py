@@ -7,8 +7,8 @@ file sizes.
     firstrun_check.py --dump DIR [--update DIR] [--eboot FILE] [--json] [--min-psarc-bytes N] [--hashes FILE]
 
   --dump    the decrypted disc dump folder (holds PS3_GAME/PARAM.SFO)
-  --update  the installed 1.14 update folder, where a PS3 or RPCS3 keeps it: .../dev_hdd0/game/BCUS98234
-            (holds PARAM.SFO and USRDIR/EBOOT.BIN)
+  --update  the installed 1.14 update folder, where a PS3 or RPCS3 keeps it: .../dev_hdd0/game/<title id>
+            (BCUS98234 or, untested, BCES01007; its TITLE_ID must be the disc's; holds PARAM.SFO and USRDIR/EBOOT.BIN)
   --eboot   the decrypted EBOOT (an ELF); default: <update>/USRDIR/EBOOT.elf, else <dump>/PS3_GAME/USRDIR/EBOOT.elf
             (next to EBOOT.BIN), else an EBOOT.BIN that is already an ELF
   --hashes  expected EBOOT SHA-256 per version; default eboot_sha256.json next to this script. H1 checks
@@ -31,7 +31,8 @@ import os
 import struct
 import sys
 
-TITLE_ID = "BCUS98234"                 # US disc (the RE notes); other regions are untested
+TITLE_ID = "BCUS98234"                 # US disc (the RE notes)
+TITLE_IDS = {"BCUS98234": "US", "BCES01007": "EU"}   # EU: accepted as an untested region (a player's report shows the same 1.14 EBOOT hash; H1 checks each copy)
 DISC_EBOOT_BIN_SIZE = 20_748_384       # PS3_GAME/USRDIR/EBOOT.BIN on the disc, encrypted SELF (the RE notes)
 EBOOT_ELF_SIZES = {                    # decrypted EBOOTs the lift fixups were made for
     20_745_952: "1.00",
@@ -168,7 +169,7 @@ class Report:
         return not any(c["level"] == "FAIL" for c in self.checks)
 
 
-def check_sfo(r, path, code, what):
+def check_sfo(r, path, code, what, expect=None):
     """Shared PARAM.SFO check for the dump and the update. Returns the fields or None."""
     if not os.path.isfile(path):
         r.fail(code, f"{what}: no PARAM.SFO at {path}")
@@ -179,8 +180,13 @@ def check_sfo(r, path, code, what):
         r.fail(code, f"{what}: PARAM.SFO unreadable ({e})")
         return None
     tid = sfo.get("TITLE_ID")
-    if tid != TITLE_ID:
-        r.fail(code, f"{what}: TITLE_ID is {tid!r}, the port needs {TITLE_ID} (US disc); other releases are untested")
+    if tid not in TITLE_IDS:
+        r.fail(code, f"{what}: TITLE_ID is {tid!r}, not Killzone 3 (US {TITLE_ID} or, untested, EU BCES01007)")
+    elif expect and tid != expect:
+        r.fail(code, f"{what}: TITLE_ID {tid} differs from the disc's {expect}: use the update of the same release")
+    elif tid != TITLE_ID:
+        r.warn(code, f"{what}: EU disc ({tid}): untested region; a player's report shows the same 1.14 EBOOT hash as the US version "
+                     f"({sfo.get('TITLE', '?')})")
     else:
         r.ok(code, f"{what}: TITLE_ID {tid} ({sfo.get('TITLE', '?')})")
     return sfo
@@ -220,8 +226,8 @@ def check_dump(r, dump, min_psarc):
             r.ok("D3", f"data_ps3.psarc present ({size / 2**30:.2f} GiB)")
 
 
-def check_update(r, upd):
-    sfo = check_sfo(r, os.path.join(upd, "PARAM.SFO"), "U1", "1.14 update")
+def check_update(r, upd, disc_id=None):
+    sfo = check_sfo(r, os.path.join(upd, "PARAM.SFO"), "U1", "1.14 update", disc_id)
     if sfo:
         ver = sfo.get("APP_VER")
         r.facts["update"] = {k: sfo.get(k) for k in ("TITLE_ID", "APP_VER", "VERSION", "CATEGORY")}
@@ -334,7 +340,7 @@ def main(argv=None):
         if not os.path.isdir(a.update):
             r.fail("U0", f"update folder not found: {a.update}")
         else:
-            check_update(r, a.update)
+            check_update(r, a.update, (r.facts.get("disc") or {}).get("TITLE_ID"))
     else:
         r.warn("U0", "no --update given: the 1.14 update is required (docs/requirements.md)")
     elf = a.eboot

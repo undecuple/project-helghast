@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rpcs3_text as T  # noqa: E402
 
 TITLE_ID = "BCUS98234"
+TITLE_IDS = ("BCUS98234", "BCES01007")    # US; EU is accepted as an untested region (firstrun_check.py)
 UPDATE_VER = "01.14"
 SAVE_USER = "00000001"       # ASSUMPTION: the port's single local user; RPCS3 uses 00000001 for its first user too
 
@@ -33,12 +34,15 @@ def discover(hint=None, locate=None):
     out = {"ok": False, "root": "", "disc": "", "update": "", "update_problem": "", "saves": []}
     try:
         L = locate or _locate()
-        res = L.locate(hint or None, {TITLE_ID: UPDATE_VER})
+        res = L.locate(hint or None, {i: UPDATE_VER for i in TITLE_IDS})
     except Exception:       # an import or read failure must never stop the wizard
         return out
     if not res.get("ok"):
         return out
-    t = res["titles"].get(TITLE_ID, {})
+    # the release RPCS3 has a disc or update for (US first); none found = the US entry, which carries the problems
+    tid = next((i for i in TITLE_IDS if ((res["titles"].get(i) or {}).get("disc") or {}).get("ok")
+                or ((res["titles"].get(i) or {}).get("update") or {}).get("ok")), TITLE_ID)
+    t = res["titles"].get(tid, {})
     out.update(ok=True, root=res["root"])
     d = t.get("disc") or {}
     if d.get("ok") and d.get("has_ps3_game"):

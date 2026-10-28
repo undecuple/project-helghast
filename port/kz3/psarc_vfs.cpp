@@ -242,6 +242,34 @@ static int stat_hook(const char* guest_path)
     return (int)0x80010006;                                /* CELL_FS_ENOENT */
 }
 
+/* The disc's TITLE_ID from PS3_GAME/PARAM.SFO next to the archive (<root>/PS3_GAME/USRDIR/<archive>): the update lives
+ * in dev_hdd0/game/<title id> (US BCUS98234, EU BCES01007 as an untested region). The same field main.cpp hands to
+ * cellGame_init_from_paramsfo a few lines later. ASSUMPTION: an unreadable SFO means the US disc, the only tested one. */
+static std::string disc_title_id(const char* archive)
+{
+    std::string def = "BCUS98234", p = archive ? archive : "";
+    for (char& c : p) if (c == '\\') c = '/';
+    size_t u = p.rfind("/USRDIR/");
+    if (u == std::string::npos) return def;
+    FILE* f = fopen((p.substr(0, u) + "/PARAM.SFO").c_str(), "rb");
+    if (!f) return def;
+    std::vector<unsigned char> d(65536);
+    d.resize(fread(d.data(), 1, d.size(), f));
+    fclose(f);
+    auto u16 = [&](size_t o) { return o + 2 <= d.size() ? (unsigned)(d[o] | d[o + 1] << 8) : 0u; };
+    auto u32 = [&](size_t o) { return o + 4 <= d.size() ? (unsigned)(u16(o) | u16(o + 2) << 16) : 0u; };
+    if (d.size() < 20 || memcmp(d.data(), "\0PSF", 4) != 0) return def;
+    const size_t kt = u32(8), dt = u32(12), n = u32(16);
+    for (size_t i = 0; i < n && 20 + 16 * (i + 1) <= d.size(); i++) {
+        const size_t e = 20 + 16 * i, ko = kt + u16(e), len = u32(e + 4), dof = dt + u32(e + 12);
+        if (ko + 9 > d.size() || memcmp(&d[ko], "TITLE_ID", 9) != 0 || dof + len > d.size()) continue;
+        std::string id;
+        for (size_t k = 0; k < len && d[dof + k]; k++) id += (char)d[dof + k];
+        return id.empty() ? def : id;
+    }
+    return def;
+}
+
 /* Open the archive, load its manifest and install the hook. Returns the number of files, or -1. */
 extern "C" int kz3_psarc_vfs_init(const char* archive, const char* cache_dir)
 {
@@ -312,7 +340,7 @@ extern "C" int kz3_psarc_vfs_init(const char* archive, const char* cache_dir)
     const char* upd = getenv("KZ3_UPDATE_DIR");
     /* static: kz3_overlay_init keeps these pointers (g_cfg = *cfg), so they must outlive this function. */
     static std::string updir, added, pdir, pdir_sp, pdir_mp, ocache;
-    updir = upd ? std::string(upd) : g_arc.cache + "/../dev_hdd0/game/BCUS98234/USRDIR";
+    updir = upd ? std::string(upd) : g_arc.cache + "/../dev_hdd0/game/" + disc_title_id(archive) + "/USRDIR";
     added = updir + "/added_data_ps3.psarc.edat";
     pdir_sp = updir + "/patch_data_ps3_sp";
     pdir_mp = updir + "/patch_data_ps3_mp";

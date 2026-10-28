@@ -19,7 +19,7 @@
 ; the latest-release JSON; a newer release opens its page in the browser only on a second click; offline = one line
 ; in the log. The finish page and the build-error dialog offer "Open log" and "Report a problem" (the issues page).
 ;
-; Silent installs: /VERYSILENT /SUPPRESSMSGBOXES [/DUMP=<dump> /UPDATE=<BCUS98234> [/EBOOT=<EBOOT.elf>]].
+; Silent installs: /VERYSILENT /SUPPRESSMSGBOXES [/DUMP=<dump> /UPDATE=<update folder> [/EBOOT=<EBOOT.elf>]].
 ; The game folders come from these parameters, else the earlier install's recorded folders, else its build\paths.json;
 ; none known = the files are installed and the first start of the launcher asks for them (one log line, exit code 0);
 ; a folder given or recorded that fails the presence check, or only some of them, = nothing installed, one log line,
@@ -220,10 +220,10 @@ Source: "art\kz3-uninstall.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; of {app}, copied next to build\kz3.exe by firstrun.py and the launcher (place_sdl3); the game loads it for native pads.
 Source: "{#FontDir}\Rajdhani-Bold.ttf"; Flags: dontcopy
 ; Advanced: "Copy the game files into the install" (opt-in, ~33 GB) with Inno's own progress, so the
-; originals may go. The update keeps RPCS3's dev_hdd0\game\BCUS98234 layout (launch.rpcs3_hdd0). Never removed
+; originals may go. The update keeps RPCS3's dev_hdd0\game\<disc title id> layout (BCUS98234, or BCES01007 for the EU disc) (launch.rpcs3_hdd0). Never removed
 ; by the uninstaller on its own: it asks (CurUninstallStepChanged), the copy may be the player's only one.
 Source: "{code:DumpSrc}\*"; DestDir: "{app}\game\disc"; Flags: external recursesubdirs createallsubdirs ignoreversion uninsneveruninstall; Check: CopyGameData
-Source: "{code:UpdateSrc}\*"; DestDir: "{app}\game\dev_hdd0\game\BCUS98234"; Flags: external recursesubdirs createallsubdirs ignoreversion uninsneveruninstall; Check: CopyGameData
+Source: "{code:UpdateSrc}\*"; DestDir: "{app}\game\dev_hdd0\game\{code:DiscTitleId}"; Flags: external recursesubdirs createallsubdirs ignoreversion uninsneveruninstall; Check: CopyGameData
 Source: "{code:EbootSrc}"; DestDir: "{app}\game"; DestName: "EBOOT.elf"; Flags: external ignoreversion uninsneveruninstall; Check: CopyEbootFile
 
 [InstallDelete]
@@ -328,6 +328,8 @@ Type: dirifempty; Name: "{userappdata}\{#AppDirName}"
 [Code]
 var
   DumpPage, UpdatePage: TInputDirWizardPage;
+  DumpInfo: TNewStaticText;
+  EuNoted: Boolean;
   { A query page with its own Browse button: Inno's dir page refuses an empty field ("You must enter a
     full path"), and this page is optional }
   FontPage: TInputQueryWizardPage;
@@ -508,11 +510,128 @@ begin
   WizardForm.PageDescriptionLabel.Top := WizardForm.PageDescriptionLabel.Top + ScaleY(2);
 end;
 
-{ Quick presence checks only; firstrun_check.py (D1-D3, U1-U3, E1) runs as the build's first step. }
-function DumpOK(Dir: String): Boolean;
+{ Quick checks only; firstrun_check.py (D1-D3, U1-U3, E1) runs as the build's first step and repeats them. }
+function EndsWithName(Dir, Name: String): Boolean;
 begin
-  Dir := AddBackslash(Dir);
-  Result := FileExists(Dir + 'PS3_GAME\PARAM.SFO') and FileExists(Dir + 'PS3_GAME\USRDIR\data_ps3.psarc');
+  Result := CompareText(ExtractFileName(RemoveBackslashUnlessRoot(Dir)), Name) = 0;
+end;
+
+{ A pick of PS3_GAME or PS3_GAME\USRDIR (one or two levels too deep) becomes the folder that holds PS3_GAME }
+function ResolveDump(Dir: String): String;
+var
+  D: String;
+begin
+  D := RemoveBackslashUnlessRoot(Trim(Dir));
+  Result := D;
+  if (D = '') or FileExists(AddBackslash(D) + 'PS3_GAME\PARAM.SFO') then Exit;
+  if EndsWithName(D, 'USRDIR') and EndsWithName(ExtractFileDir(D), 'PS3_GAME') then D := ExtractFileDir(D);
+  if EndsWithName(D, 'PS3_GAME') then begin
+    D := RemoveBackslashUnlessRoot(ExtractFileDir(D));
+    if FileExists(AddBackslash(D) + 'PS3_GAME\PARAM.SFO') then Result := D;
+  end;
+end;
+
+{ A pick of USRDIR inside the update folder becomes the update folder }
+function ResolveUpdate(Dir: String): String;
+var
+  D: String;
+begin
+  D := RemoveBackslashUnlessRoot(Trim(Dir));
+  Result := D;
+  if (D <> '') and EndsWithName(D, 'USRDIR') and FileExists(AddBackslash(ExtractFileDir(D)) + 'PARAM.SFO') then
+    Result := RemoveBackslashUnlessRoot(ExtractFileDir(D));
+end;
+
+{ Little-endian integer of Bytes bytes at the 0-based offset P of S; 0 past the end (the same reader as
+  firstrun_check.py read_sfo) }
+function SfoInt(S: AnsiString; P, Bytes: Integer): Integer;
+var
+  B: Integer;
+begin
+  Result := 0;
+  if (P < 0) or (P + Bytes > Length(S)) then Exit;
+  for B := Bytes - 1 downto 0 do Result := Result * 256 + Ord(S[P + B + 1]);
+end;
+
+{ A NUL-terminated string at the 0-based offset P of S, at most Max bytes }
+function SfoText(S: AnsiString; P, Max: Integer): String;
+var
+  I: Integer;
+begin
+  Result := '';
+  I := P + 1;
+  while (I <= Length(S)) and (I <= P + Max) and (Ord(S[I]) <> 0) do begin
+    Result := Result + Chr(Ord(S[I]));
+    I := I + 1;
+  end;
+end;
+
+{ One field of a PARAM.SFO (magic NUL P S F, key table start at 8, data table start at 12, entry count at 16, 16-byte
+  entries from 20: key offset u16, format u16, length u32, max length u32, data offset u32); '' when absent }
+function SfoField(Path, Key: String): String;
+var
+  S: AnsiString;
+  KT, DT, N, I, E: Integer;
+begin
+  Result := '';
+  if not LoadStringFromFile(Path, S) then Exit;
+  if (Length(S) < 20) or (Ord(S[1]) <> 0) or (Ord(S[2]) <> 80) or (Ord(S[3]) <> 83) or (Ord(S[4]) <> 70) then Exit;
+  KT := SfoInt(S, 8, 4);
+  DT := SfoInt(S, 12, 4);
+  N := SfoInt(S, 16, 4);
+  if N > 200 then N := 200;
+  for I := 0 to N - 1 do begin
+    E := 20 + 16 * I;
+    if SfoText(S, KT + SfoInt(S, E, 2), 32) = Key then begin
+      Result := SfoText(S, DT + SfoInt(S, E + 12, 4), SfoInt(S, E + 4, 4));
+      Exit;
+    end;
+  end;
+end;
+
+function RegionOf(Id: String): String;
+begin
+  if Id = 'BCUS98234' then Result := 'US'
+  else if Id = 'BCES01007' then Result := 'EU'
+  else Result := '';
+end;
+
+function DiscIdOf(Dump: String): String;
+begin
+  Result := SfoField(AddBackslash(Dump) + 'PS3_GAME\PARAM.SFO', 'TITLE_ID');
+end;
+
+{ The title id of the picked disc dump; the update goes under it (dev_hdd0\game\<id>) }
+function DiscTitleId(Param: String): String;
+begin
+  Result := DiscIdOf(DumpPage.Values[0]);
+  if RegionOf(Result) = '' then Result := 'BCUS98234';
+end;
+
+{ '' when the dump is Killzone 3 (US, or EU as an untested region), else the message; Id = the title id found }
+function DumpProblem(Dir: String; var Id: String): String;
+begin
+  Id := '';
+  Result := '';
+  if not FileExists(AddBackslash(Dir) + 'PS3_GAME\PARAM.SFO') then
+    Result := 'This folder does not look like a Killzone 3 disc dump: PS3_GAME\PARAM.SFO is missing. Select the ' +
+      'folder that holds PS3_GAME (picking PS3_GAME itself also works).'
+  else begin
+    Id := DiscIdOf(Dir);
+    if Id = '' then
+      Result := 'PS3_GAME\PARAM.SFO in this folder has no readable TITLE_ID, so it is not a game dump.'
+    else if RegionOf(Id) = '' then
+      Result := 'This is ' + Id + ', not Killzone 3 (US BCUS98234 or EU BCES01007).'
+    else if not FileExists(AddBackslash(Dir) + 'PS3_GAME\USRDIR\data_ps3.psarc') then
+      Result := 'This is Killzone 3 (' + Id + ') but the dump is incomplete: PS3_GAME\USRDIR\data_ps3.psarc is missing.';
+  end;
+end;
+
+function DumpOK(Dir: String): Boolean;
+var
+  Id: String;
+begin
+  Result := DumpProblem(Dir, Id) = '';
 end;
 
 function UpdateOK(Dir: String): Boolean;
@@ -520,6 +639,23 @@ begin
   Dir := AddBackslash(Dir);
   Result := FileExists(Dir + 'PARAM.SFO') and FileExists(Dir + 'USRDIR\EBOOT.BIN') and
     FileExists(Dir + 'USRDIR\added_data_ps3.psarc.edat');
+end;
+
+{ '' when the update's PARAM.SFO names the disc's TITLE_ID and APP_VER 01.14 (as firstrun_check.py U1), else the message }
+function UpdateIdProblem(Dir, DiscId: String): String;
+var
+  Id, Ver: String;
+begin
+  Result := '';
+  Id := SfoField(AddBackslash(Dir) + 'PARAM.SFO', 'TITLE_ID');
+  Ver := SfoField(AddBackslash(Dir) + 'PARAM.SFO', 'APP_VER');
+  if Id = '' then
+    Result := 'The update''s PARAM.SFO has no readable TITLE_ID.'
+  else if (DiscId <> '') and (Id <> DiscId) then
+    Result := 'This update is for ' + Id + ', but the disc dump is ' + DiscId + '. Pick the update of the same ' +
+      'release (dev_hdd0\game\' + DiscId + ').'
+  else if Ver <> '01.14' then
+    Result := 'This update is version ' + Ver + '; the port is built on 01.14.';
 end;
 
 { "key": "value" of firstrun.py's build\paths.json (json.dump, ASCII): \\ and \" unescaped; '' when absent or when
@@ -757,7 +893,7 @@ end;
 
 function BuildUpdate: String;
 begin
-  if CopyGameData then Result := ExpandConstant('{app}\game\dev_hdd0\game\BCUS98234')
+  if CopyGameData then Result := ExpandConstant('{app}\game\dev_hdd0\game\') + DiscTitleId('')
   else Result := UpdatePage.Values[0];
 end;
 
@@ -770,6 +906,20 @@ begin
   else Result := ExpandConstant('{app}\game\EBOOT.elf');
 end;
 
+{ The page names what it found in the picked folder (the title id), so a wrong pick is clear before Next }
+procedure DumpEditChange(Sender: TObject);
+var
+  D, Id: String;
+begin
+  D := ResolveDump(DumpPage.Values[0]);
+  if Trim(D) = '' then DumpInfo.Caption := ''
+  else if DumpProblem(D, Id) = '' then begin
+    if RegionOf(Id) = 'EU' then DumpInfo.Caption := 'Found: ' + Id + ' (EU disc, untested region)'
+    else DumpInfo.Caption := 'Found: ' + Id + ' (US disc)';
+  end else if Id <> '' then DumpInfo.Caption := 'Found: ' + Id + '. ' + DumpProblem(D, Id)
+  else DumpInfo.Caption := 'No Killzone 3 dump found here: PS3_GAME\PARAM.SFO is missing.';
+end;
+
 procedure InitializeWizard;
 begin
   ApplyHeadingFonts;
@@ -779,16 +929,25 @@ begin
   TypePage.Add('&Advanced: copy the game files into the install, crash reports, fonts, CPU, window, language, ' +
     'shaders, cleanup');
   DumpPage := CreateInputDirPage(wpSelectTasks, 'Your disc dump',
-    'Killzone 3, US disc (BCUS98234), decrypted.',
-    'Pick the folder that holds PS3_GAME. Setup never changes it, and reads it in place unless you choose to copy ' +
+    'Killzone 3, US disc (BCUS98234; the EU disc BCES01007 is untested), decrypted.',
+    'Pick the folder that holds PS3_GAME (picking PS3_GAME itself also works). Setup never changes it, and reads it in place unless you choose to copy ' +
     'it (Advanced).', False, '');
   DumpPage.Add('Disc dump folder (holds PS3_GAME):');
+  DumpInfo := TNewStaticText.Create(DumpPage);
+  DumpInfo.Parent := DumpPage.Surface;
+  DumpInfo.Left := 0;
+  DumpInfo.Top := DumpPage.Edits[0].Top + DumpPage.Edits[0].Height + ScaleY(10);
+  DumpInfo.AutoSize := False;
+  DumpInfo.WordWrap := True;
+  DumpInfo.Width := DumpPage.SurfaceWidth;
+  DumpInfo.Height := ScaleY(48);
+  DumpPage.Edits[0].OnChange := @DumpEditChange;
   UpdatePage := CreateInputDirPage(DumpPage.ID, 'Update 1.14',
     'The port is built on 1.14.',
-    'Pick the folder named BCUS98234 that holds the 1.14 update.' + #13#10 +
+    'Pick the folder named like your disc (BCUS98234 or BCES01007) that holds the 1.14 update.' + #13#10 +
     'RPCS3: after File > Install Packages, it is in RPCS3''s dev_hdd0\game folder.' + #13#10 +
-    'PS3: copy dev_hdd0\game\BCUS98234 from the console.', False, '');
-  UpdatePage.Add('1.14 update folder (BCUS98234):');
+    'PS3: copy dev_hdd0\game\<title id> from the console.', False, '');
+  UpdatePage.Add('1.14 update folder (named like the disc, e.g. BCUS98234):');
   EbootPage := CreateInputFilePage(UpdatePage.ID, 'Decrypted EBOOT',
     'The 1.14 EBOOT, decrypted.',
     'EBOOT.elf, the decrypted form of the update''s USRDIR\EBOOT.BIN, made from your own copy. This installer includes no decryption tools.');
@@ -1013,10 +1172,19 @@ begin
       Result := False;
     end;
   end else if CurPageID = DumpPage.ID then begin
-    if not DumpOK(DumpPage.Values[0]) then begin
-      MsgBox('This folder does not look like a Killzone 3 disc dump: PS3_GAME\PARAM.SFO and ' +
-        'PS3_GAME\USRDIR\data_ps3.psarc are needed. Select the folder that holds PS3_GAME.', mbError, MB_OK);
+    { The folder that holds PS3_GAME is used from here on, whichever level was picked }
+    DumpPage.Values[0] := ResolveDump(DumpPage.Values[0]);
+    Problem := DumpProblem(DumpPage.Values[0], D);
+    if Problem <> '' then begin
+      MsgBox(Problem, mbError, MB_OK);
       Result := False;
+    end else begin
+      Log('disc dump: ' + DumpPage.Values[0] + ', TITLE_ID ' + D + ' (' + RegionOf(D) + ')');
+      if (RegionOf(D) = 'EU') and (not EuNoted) then begin
+        EuNoted := True;
+        MsgBox('EU disc (BCES01007): untested region. A player''s report shows the same 1.14 EBOOT as the US ' +
+          'version, but nobody has played it yet. Setup goes on.', mbInformation, MB_OK);
+      end;
     end;
   end else if CurPageID = AdvPage.ID then begin
     { ~33 GB of game files + ~1 GB build + room (ASSUMPTION: the dump is the 31.2 GiB disc archive plus the update) }
@@ -1025,8 +1193,14 @@ begin
       Result := MsgBox('The install folder''s drive has less than 40 GB free; copying the game files needs about ' +
         '35 GB. Copy anyway?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
   end else if CurPageID = UpdatePage.ID then begin
+    UpdatePage.Values[0] := ResolveUpdate(UpdatePage.Values[0]);
     DefaultEboot;
-    if not UpdateOK(UpdatePage.Values[0]) then begin
+    Problem := '';
+    if UpdateOK(UpdatePage.Values[0]) then Problem := UpdateIdProblem(UpdatePage.Values[0], DiscIdOf(DumpPage.Values[0]));
+    if Problem <> '' then begin
+      MsgBox(Problem, mbError, MB_OK);
+      Result := False;
+    end else if not UpdateOK(UpdatePage.Values[0]) then begin
       { A missing 1.14 update stops here; Next again = check again. }
       MsgBox('The 1.14 update was not found in this folder (PARAM.SFO, USRDIR\EBOOT.BIN and ' +
         'USRDIR\added_data_ps3.psarc.edat are needed). The port is built on 1.14.' + #13#10 + #13#10 +
@@ -1072,6 +1246,8 @@ begin
   Result := InstallDirProblem(ExpandConstant('{app}'));
   if Result <> '' then Exit;
   if not WizardSilent then Exit;
+  DumpPage.Values[0] := ResolveDump(DumpPage.Values[0]);
+  UpdatePage.Values[0] := ResolveUpdate(UpdatePage.Values[0]);
   DefaultEboot;
   if (EbootPage.Values[0] = '') and (UpdatePage.Values[0] <> '') then
     EbootPage.Values[0] := AddBackslash(UpdatePage.Values[0]) + 'USRDIR\EBOOT.elf';
@@ -1087,12 +1263,14 @@ begin
   if Missing <> '' then
     Result := 'Silent install stopped: ' + Missing + ' is missing; give /DUMP= and /UPDATE= (and /EBOOT= when the ' +
       'decrypted EBOOT is not the update''s USRDIR\EBOOT.elf), or neither'
-  else if not DumpOK(DumpPage.Values[0]) then
-    Result := 'Silent install stopped: ' + DumpPage.Values[0] + ' is not a disc dump (PS3_GAME\PARAM.SFO and ' +
-      'PS3_GAME\USRDIR\data_ps3.psarc are needed)'
+  else if DumpProblem(DumpPage.Values[0], Missing) <> '' then
+    Result := 'Silent install stopped: ' + DumpPage.Values[0] + ': ' + DumpProblem(DumpPage.Values[0], Missing)
   else if not UpdateOK(UpdatePage.Values[0]) then
     Result := 'Silent install stopped: ' + UpdatePage.Values[0] + ' is not the 1.14 update (PARAM.SFO, ' +
       'USRDIR\EBOOT.BIN and USRDIR\added_data_ps3.psarc.edat are needed)'
+  else if UpdateIdProblem(UpdatePage.Values[0], DiscIdOf(DumpPage.Values[0])) <> '' then
+    Result := 'Silent install stopped: ' + UpdatePage.Values[0] + ': ' +
+      UpdateIdProblem(UpdatePage.Values[0], DiscIdOf(DumpPage.Values[0]))
   else if not FileExists(EbootPage.Values[0]) then
     Result := 'Silent install stopped: no decrypted EBOOT at ' + EbootPage.Values[0];
   if Result <> '' then begin
@@ -1100,7 +1278,7 @@ begin
     SaveStringToFile(InstallLogPath(''), Result + #13#10, True);
     Log(Result);
   end else
-    Log('silent install: game folders checked (dump, update, EBOOT present)');
+    Log('silent install: game folders checked (dump ' + DiscIdOf(DumpPage.Values[0]) + ', update, EBOOT present)');
 end;
 
 { "key=value" field of a PROGRESS/RESULT line }

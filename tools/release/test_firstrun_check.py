@@ -75,10 +75,10 @@ def make_dump(root, title_id="BCUS98234", eboot_magic=fc.SELF_MAGIC, psarc_bytes
     return d
 
 
-def make_update(root, app_ver="01.14", elf_size=21_228_256):
-    u = os.path.join(root, "hdd0", "game", "BCUS98234")
+def make_update(root, app_ver="01.14", elf_size=21_228_256, title_id="BCUS98234"):
+    u = os.path.join(root, "hdd0", "game", title_id)
     write_sfo(os.path.join(u, "PARAM.SFO"),
-              {"APP_VER": app_ver, "CATEGORY": "GD", "TITLE": "Synthetic", "TITLE_ID": "BCUS98234"})
+              {"APP_VER": app_ver, "CATEGORY": "GD", "TITLE": "Synthetic", "TITLE_ID": title_id})
     os.makedirs(os.path.join(u, "USRDIR"))
     open(os.path.join(u, "USRDIR", "EBOOT.BIN"), "wb").write(fc.SELF_MAGIC + b"\0" * 60)
     open(os.path.join(u, "USRDIR", fc.UPDATE_EDAT), "wb").write(b"NPD\0" + b"\0" * 60)
@@ -133,6 +133,19 @@ def main():
 
         rc, out = run(["--dump", make_dump(os.path.join(tmp, "eu"), title_id="BCES01070"), "--update", u] + small)
         check("wrong TITLE_ID fails", rc == 1 and "FAIL D1" in out, out)
+
+        check("other id names it", "BCES01070" in out, out)
+
+        eu = make_dump(os.path.join(tmp, "eu2"), title_id="BCES01007")
+        eu_u = make_update(os.path.join(tmp, "eu2"), title_id="BCES01007")
+        rc, out = run(["--dump", eu, "--update", eu_u] + small)
+        check("EU disc + EU update passes with the untested-region note",
+              rc == 0 and "WARN D1: disc dump: EU disc (BCES01007): untested region; a player's report shows the same 1.14 EBOOT hash as the US version" in out
+              and "WARN U1" in out and "FAIL" not in out, out)
+        rc, out = run(["--dump", eu, "--update", u] + small)
+        check("EU disc + US update fails U1", rc == 1 and "FAIL U1" in out and "BCES01007" in out, out)
+        rc, out = run(["--dump", d, "--update", eu_u] + small)
+        check("US disc + EU update fails U1", rc == 1 and "FAIL U1" in out, out)
 
         bad = make_dump(os.path.join(tmp, "nosfo"))
         os.remove(os.path.join(bad, "PS3_GAME", "PARAM.SFO"))

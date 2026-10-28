@@ -1121,7 +1121,7 @@ def dry_run(ctx, steps, log_path, fallback, out=sys.stdout):
 
 # ------------------------------------------------------------------------------------- portable zip: text UI
 NOTICE_TEXT = f"""{names.PRODUCT}: first run
-This checks your own Killzone 3 disc dump (BCUS98234), the 1.14 update and the decrypted EBOOT, then lifts and
+This checks your own Killzone 3 disc dump (US BCUS98234; EU BCES01007 is accepted as an untested region), the 1.14 update and the decrypted EBOOT, then lifts and
 compiles the game on this computer (5-30 minutes; Ctrl+C stops it, the next start resumes). Nothing is downloaded
 and nothing of the game is copied; the files it generates are your own and must not be shared."""
 UPDATE_HELP = """The 1.14 update is required: use the update from your own console, or the one installed in RPCS3 (see
@@ -1129,8 +1129,9 @@ RPCS3's documentation). The port also needs EBOOT.elf, the decrypted
 form of the update's USRDIR/EBOOT.BIN, made from your own copy (this project includes no decryption tools)."""
 # ASSUMPTION: RPCS3's usual game folders (Linux XDG config; Windows: RPCS3 is portable, so only a guess next to the
 # player's profile). Shown as a default only if it exists.
-RPCS3_UPDATE_GUESSES = [os.path.join("~", ".config", "rpcs3", "dev_hdd0", "game", "BCUS98234"),
-                        os.path.join("~", "RPCS3", "dev_hdd0", "game", "BCUS98234")]
+RPCS3_UPDATE_GUESSES = [os.path.join("~", base, "dev_hdd0", "game", tid)
+                        for tid in ("BCUS98234", "BCES01007")
+                        for base in (os.path.join(".config", "rpcs3"), "RPCS3")]
 
 
 def port_version(root):
@@ -1217,7 +1218,7 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
     elf = a.eboot or ""
     while True:
         dump = folder("Disc dump folder (the one holding PS3_GAME)", dump)
-        upd = folder("1.14 update folder (dev_hdd0/game/BCUS98234)", upd)
+        upd = folder("1.14 update folder (dev_hdd0/game/<title id>: BCUS98234, or BCES01007)", upd)
         auto = os.path.join(upd, "USRDIR", "EBOOT.elf")
         elf = elf or (prev.get("eboot", "") if prev.get("update") == upd else "") or \
             (auto if os.path.isfile(auto) else "")

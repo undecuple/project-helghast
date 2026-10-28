@@ -119,7 +119,7 @@ caches would land in the wrong folder) or your launch settings, and it does not 
 
 ## Requirements
 
-See [docs/requirements.md](docs/requirements.md): the US disc (BCUS98234) dumped as a folder, the 1.14 update,
+See [docs/requirements.md](docs/requirements.md): the US disc (BCUS98234) dumped as a folder (the EU disc, BCES01007, is accepted as an untested region; other releases are not supported yet), the 1.14 update,
 the decrypted EBOOT of your own copy (no firmware needed; this project doesn't provide decryption tools or instructions; the PS3 emulator RPCS3 and its documentation are the usual place people start), and a Direct3D 12 GPU. Hardware figures are provisional until
 the game runs at speed.
 
