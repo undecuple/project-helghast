@@ -92,8 +92,7 @@ if [[ -f "$ann" && "${KZ3_ALLOW_STALE_LIFT:-0}" != 1 ]]; then
     exit 3
   fi
 fi
-# Remote builds (tools/remote/remote-build.sh, 2026-10-11): it runs the guards above through this script with
-# KZ3_BUILD_GUARDS_ONLY=1 and then builds on the remote build server; nothing below runs then.
+# KZ3_BUILD_GUARDS_ONLY=1: run only the guards above and stop (used by a developer's remote build wrapper).
 [[ "${KZ3_BUILD_GUARDS_ONLY:-0}" == 1 ]] && exit 0
 # Build slots (2026-10-11): KZ3_BUILD_SLOTS builds may run at once, one slot each (slot 0 = build.lock, slot 1 =
 # build.1.lock; tools/agents/slotlock.sh); this build's job count is the free-memory formula below divided by the

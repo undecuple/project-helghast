@@ -343,7 +343,7 @@ def main():
                             vcheck=lambda cur: {"status": "newer", "current": cur, "latest": "v9.0.0",
                                                 "url": "https://example.invalid/r", "detail": ""})
         o = o12.getvalue()
-        check(go is False and "Sony" in o and "v9.0.0" in o and a12.update == u12, "12 failed check, help, retry")
+        check(go is False and "own console" in o and "v9.0.0" in o and a12.update == u12, "12 failed check, help, retry")
         check(any("version check (player asked): status=newer" in n for n in notes), f"12 version check logged {notes}")
         ini = open(os.path.join(root12, "kz3-install.ini")).read()
         check("portable = 0" in ini and "check_updates = 1" in ini and "prepare = 0" in ini,

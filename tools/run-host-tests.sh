@@ -10,11 +10,8 @@ for a in "$@"; do case "$a" in --gh) GH=1;; -q) Q=1;; *) echo "unknown option $a
 n=0; failed=()
 while read -r t; do
   [[ -z "$t" || "$t" == \#* ]] && continue
-  # The public export leaves out private tooling (tools/agents/), so its tests are skipped there; in the private repo
-  # a missing test is still a failure (2026-10-11: test_merge_tooling.py turned the public CI red).
-  # tools/remote/ is private too (2026-10-11); the export keeps tools/agents/lock.sh, so the marker is merge-lane.sh.
-  # Since 2026-10-13 any test the export leaves out is skipped there (export-public.sh EXCLUDE: test_run_stage.sh tests
-  # the private tools/spu/run.sh), not only tools/agents/ and tools/remote/.
+  # A test whose file is not in this tree is skipped when the developer-only tools are absent (merge-lane.sh is the
+  # marker); in a full developer checkout a missing test is a failure.
   if [[ ! -e "$t" && ! -e tools/agents/merge-lane.sh ]]; then
     (( Q )) || echo "skip $t (private tooling, not exported)"; continue
   fi

@@ -21,7 +21,7 @@ From your own copy of the game (details and sizes in [requirements.md](requireme
 | Item | Notes |
 |---|---|
 | Killzone 3, US disc **BCUS98234**, dumped as a decrypted folder | `PS3_GAME/USRDIR/data_ps3.psarc` and the rest of the disc. Other regions are untested. |
-| Update **1.14** (`UP9000-BCUS98234_00-KZ3DISCPATVER188`) | Your own copy of the update; the port's target version. The PS3 emulator RPCS3 and its documentation are the usual place to learn how a PS3 update is installed. |
+| Update **1.14** | Your own copy of the update; the port's target version. The PS3 emulator RPCS3 and its documentation are the usual place to learn how a PS3 update is installed. |
 | The **decrypted EBOOT** | `EBOOT.elf`, the decrypted form of the update's `EBOOT.BIN`, comes from your own copy of the game (this project provides no tools or instructions for it; the PS3 emulator RPCS3 and its documentation are the usual place people start). No PS3 firmware is needed. |
 
 To build: Linux with [Nix](https://nixos.org/) (flakes enabled), 16 GB RAM or more (32 GB recommended), about 60 GB

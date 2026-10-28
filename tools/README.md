@@ -30,3 +30,5 @@ Index of the scripts and folders in this directory. Build and test details are i
 | `agents/` | Optional build and GPU slot locking (`lock.sh`, `slotlock.sh`): sourced by the build and lift scripts so two jobs do not compete for the machine. Not needed for a single-user build. |
 
 Single-file helpers: `disc_info.py` (disc layout), `psarc.py` (archive list and extract), `elf_info.py` and `jobmods.py` (EBOOT inspection), `features.py` (generates `docs/FEATURES.md`).
+
+Comments cite internal numbering (pass, round, plan items) from the development notes; they are labels, not links.

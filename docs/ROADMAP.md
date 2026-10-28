@@ -12,7 +12,7 @@ Where each feature of the PS3 game stands today, and the port-only features with
 |---|---|
 | ✅ | Boots, menus, movies, first-boot flow, saves the profile |
 | ✅ | First level runs and renders its real scene (deferred lighting, shadows, depth of field, effects) |
-| 🔧 | **Performance:** levels run at about 16-23 frames/s today (about 22-23 in a busy Frozen Shores window); the goal is a steady 30 fps (the renderer's command walker and the SPU job code are the limits). With the shipped pipeline list (on by default) a first visit's busy minute runs at about 16.5 frames/s with little stutter |
+| 🔧 | **Performance:** levels run at about 16-22 frames/s today (about 22-23 in a busy Frozen Shores window); the goal is a steady 30 fps (the renderer's command walker and the SPU job code are the limits). With the shipped pipeline list (on by default) a first visit's busy minute runs at about 16.5 frames/s with little stutter |
 | ✅ | **In-level HUD** (ammo counter, crosshair, objectives): drawn in level 2; in the first level's opening the game itself shows only the objective marker and reticle |
 | ✅ | **In-level play by hand:** a hand-played session with a real controller walked, aimed, fired, crouched, reloaded and threw grenades; pause, quit to the menu and Continue work |
 | 🔧 | **Audio:** the engine fills its output in the level; it stutters now and then |
@@ -27,8 +27,12 @@ Where each feature of the PS3 game stands today, and the port-only features with
 - ✅ Windowed and borderless windows, Alt+Enter, exclusive fullscreen as a setting, picture stretched or kept at its own shape, bilinear or nearest filtering, VSync on/off (Options > Display); checked by hand at 1920x1080
 - ✅ Widescreen: in gameplay the view follows the window's shape (wider on ultrawide, taller on 16:10); the HUD, menus, subtitles and movies stay 16:9 and centred; world markers follow the same view
 - 📋 Internal resolution 720p up to 4K, with anti-aliasing at the higher resolution
-- 📋 Variable refresh rate, frame limiter, low-latency mode
+- ✅ Frame rate limit of 30, 60 or 120 (Options > Display)
+- 📋 Variable refresh rate, low-latency mode
 - 📋 60 fps and above (opt-in where it would change gameplay)
+- 📋 Motion blur strength setting (needs a clean way to switch the game's blur pass)
+- 📋 Temporal anti-aliasing and upscaling (TAA, DLAA, DLSS, FSR), after the Windows build matches the console
+- 📋 Ray-traced sun shadows, then ambient occlusion and reflections (off by default)
 - 🔧 A settings menu in the game's own UI style (the Display and Mouse pages exist; more pages to come)
 
 ## 3. Controls  🔧
@@ -39,6 +43,8 @@ Where each feature of the PS3 game stands today, and the port-only features with
 - ✅ **Button prompts** that follow the device in use: PlayStation, Xbox or keyboard/mouse glyphs, drawn to match the
   game's own (Options > Controls > Advanced Settings > Layout and Prompts)
 - Motion-control sections playable without motion sensors (stick or mouse)
+- 📋 Aim response (lighter stick smoothing) as an opt-in setting
+- 📋 Minimap with enemy markers (opt-in; changes gameplay)
 
 ## 4. Multiplayer and Botzone  🔧
 
@@ -50,10 +56,13 @@ Where each feature of the PS3 game stands today, and the port-only features with
 - Server choice in a settings page: a default server or any community server (address, key, TLS)
 - Goes online only when you choose online play, and only to the server you set
 - DLC map packs from your own purchased copies
+- 📋 **In-game voice chat** for multiplayer and the online co-op campaign (microphone and headset; online only when you choose online play)
 
 ## 5. Platforms  📋
 
 - **Native Linux build** (no Proton needed): a Vulkan graphics path, Linux packaging (AppImage or tarball)
+- **Native macOS build** (Apple silicon), after the Linux build
+- **Android (ARM64)** build, late: you build the APK on your own PC from your own game files
 - Windows remains a first-class target
 
 ## 6. Later  📋
@@ -63,6 +72,7 @@ Where each feature of the PS3 game stands today, and the port-only features with
 - **Mod support:** data mods as folders loaded over the game's archive (with a reader/writer for the game's data
   format), later code mods
 - PlayStation Move controllers and stereoscopic 3D output: planned, off by default, after the campaign plays at speed
+- 📋 Saves in the PS3's own format that you can copy between the port, RPCS3 and a console (the profile file is written in that format already; opening a port save elsewhere is untested)
 - **VR** (SteamVR / OpenXR), if it can be done well
 - **Going native, after feature parity and VR:** replace the run-time layers step by step: a native renderer fed by
   the engine's own draw lists, native SPU jobs, then rewritten game code where it pays off

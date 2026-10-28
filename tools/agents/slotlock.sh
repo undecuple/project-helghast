@@ -39,11 +39,18 @@ slot_est() {   # slot_est NAME: the declared minutes, or the default for NAME
   [[ "$e" =~ ^[0-9]+$ && "$e" -gt 0 ]] && { echo "$e"; return; }
   case "$1" in build) echo 20 ;; gpu) echo 30 ;; *) echo 10 ;; esac
 }
-slot_proj() {   # the waiter's project: LOCK_PROJECT, else KZ2's marker, else the checkout path
+slot_proj() {   # slot_proj DIR: the waiter's project: LOCK_PROJECT, else KZ2's marker, else DIR/projects.map, else kz3
   [[ -n "${LOCK_PROJECT:-}" ]] && { echo "$LOCK_PROJECT"; return; }
   [[ -n "${KZ2_HELD_LOCKS:-}" ]] && { echo kz2; return; }
-  case "$PWD" in */"Killzone 2"*|*/kz2-*) echo kz2 ;; */Ratchet*|*/rc-*) echo rc ;;
-    */"Toro Lets Party"*|*/tlp-*|*/toro-*) echo toro ;; *) echo kz3 ;; esac
+  # projects.map (local, not in the repository): one "<path glob><TAB><project>" per line, matched against $PWD
+  local pat proj
+  if [[ -r "$1/projects.map" ]]; then
+    while IFS=$'\t' read -r pat proj; do
+      [[ -z "$pat" || "$pat" == \#* ]] && continue
+      [[ "$PWD" == $pat ]] && { echo "$proj"; return; }
+    done < "$1/projects.map"
+  fi
+  echo kz3
 }
 slot_key() {   # slot_key DIR NAME ENTRY NOW AGE: sort key of a live queue entry
   local est join proj
@@ -59,7 +66,7 @@ slot_tok() {   # slot_tok DIR NAME: hold a free token; sets SLOT_TOK (its number
     for ((j = 0; j < 64; j++)); do
       exec {fd}>>"$1/$2.w$j"
       if flock -n "$fd"; then SLOT_TOK=$j; SLOT_TOK_FD=$fd
-        printf '%s %s %s\n' "$(slot_est "$2")" "$(date +%s)" "$(slot_proj)" > "$1/$2.w$j"; return 0; fi
+        printf '%s %s %s\n' "$(slot_est "$2")" "$(date +%s)" "$(slot_proj "$1")" > "$1/$2.w$j"; return 0; fi
       exec {fd}>&-
     done
     sleep 1
@@ -71,7 +78,7 @@ slot_tok() {   # slot_tok DIR NAME: hold a free token; sets SLOT_TOK (its number
 # readers also end a run when a later run takes its slot). Read by watchdog.sh.
 slot_hist() {   # slot_hist DIR NAME SLOT
   local pid=$$ f="$1/$2.history"
-  printf 'start %s %s %s %s %s\n' "$(date +%s)" "$3" "$(slot_est "$2")" "$(slot_proj)" "$pid" >> "$f" 2>/dev/null || return 0
+  printf 'start %s %s %s %s %s\n' "$(date +%s)" "$3" "$(slot_est "$2")" "$(slot_proj "$1")" "$pid" >> "$f" 2>/dev/null || return 0
   ( for d in /proc/$BASHPID/fd/*; do d=${d##*/}; (( d > 2 )) && eval "exec $d>&-"; done
     while kill -0 "$pid" 2>/dev/null; do sleep 5; done
     printf 'end %s %s\n' "$(date +%s)" "$pid" >> "$f" ) < /dev/null > /dev/null 2>&1 &

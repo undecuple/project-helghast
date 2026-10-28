@@ -1,9 +1,9 @@
 ; Project Helghast: Inno Setup 6 script.
 ;
-; Compiled with ISCC 6.7.3 under Proton and every wizard page walked headless (release pass 13, plan 4.12:
-; tools/release/wizard_test.sh, payload without the large toolchain parts, a demo build step). Run on native Windows
-; 11 with the full toolchain payload on 2026-10-21 (the install built the game in 422 s and the game reached the menus,
-; docs/PROGRESS.md); the wizard pages were walked headless under Proton only. Needs the release payload (plan section 3: kz3-setup\, ps3recomp\, port\,
+; Compiled with ISCC 6.7.3 under Proton and every wizard page walked headless
+; (tools/release/wizard_test.sh, payload without the large toolchain parts, a demo build step). Run on native Windows
+; 11 with the full toolchain payload on 2026-10-21 (the install built the game in 422 s and the game reached the menus);
+; the wizard pages were walked headless under Proton only. Needs the release payload (kz3-setup\, ps3recomp\, port\,
 ; toolchain\, licenses\, the launcher "Project Helghast.exe") and the headings font (FontDir, below).
 ;
 ;   iscc /DPayload=<payload dir> /DAppVersion=<x.y.z> installer\kz3.iss      (output: installer\Output\)
@@ -14,33 +14,33 @@
 ; default), Start-menu entry and "Project page" link; a "portable install" option (saves and settings in the
 ; install folder); one install log next to setup.exe with Inno's own log merged in; an uninstaller that asks before
 ; deleting saves (default keep). It downloads nothing and copies nothing of the game unless the player ticks "Copy the
-; game files into the install" on the Advanced page (plan section 8; step 9s). The welcome
-; page's "Check now" (plan 9.12) runs tools/release/version_check.py once, only on that click: one anonymous GET of
+; game files into the install" on the Advanced page. The welcome
+; page's "Check now" runs tools/release/version_check.py once, only on that click: one anonymous GET of
 ; the latest-release JSON; a newer release opens its page in the browser only on a second click; offline = one line
 ; in the log. The finish page and the build-error dialog offer "Open log" and "Report a problem" (the issues page).
 ;
-; Silent installs (pass 20, plan 4.19): /VERYSILENT /SUPPRESSMSGBOXES [/DUMP=<dump> /UPDATE=<BCUS98234> [/EBOOT=<EBOOT.elf>]].
+; Silent installs: /VERYSILENT /SUPPRESSMSGBOXES [/DUMP=<dump> /UPDATE=<BCUS98234> [/EBOOT=<EBOOT.elf>]].
 ; The game folders come from these parameters, else the earlier install's recorded folders, else its build\paths.json;
 ; none known = the files are installed and the first start of the launcher asks for them (one log line, exit code 0);
 ; a folder given or recorded that fails the presence check, or only some of them, = nothing installed, one log line,
 ; exit code 7. A silent build that does not finish logs one line and still exits 0 (the RESULT line is in the log).
-; Setup types (step 9s, plan 4.23): Recommended asks only for the dump and the update (install folder aside); the EBOOT
+; Setup types: Recommended asks only for the dump and the update (install folder aside); the EBOOT
 ; page shows only when <update>\USRDIR\EBOOT.elf is missing, the fonts come from RPCS3's folder beside the update
 ; when it has them, the tasks keep their defaults. Advanced adds the tasks page, the EBOOT and fonts pages and the
 ; "Advanced options" page (copy the game files, crash reports, font copy, FMA, window size, language). Silent:
 ; /TYPE=advanced /COPYDATA=1 /CRASHREPORTS=1 /FONTCOPY=0 /FMA=auto|on|off /LOWMEM=auto|on|off /WINDOW=<size> /LANG=<code>.
-; Look (pass 6, plan 4.9): wizard images and icons from installer\art\ (tools/release/installer_art.py, the
+; Look: wizard images and icons from installer\art\ (tools/release/installer_art.py, the
 ; site's palette and fonts; our own artwork); native controls, no skin add-on. Texts in the site's voice: short, direct.
 
 #ifndef AppVersion
   #define AppVersion "0.1.0"
 #endif
 #ifndef Payload
-  ; ASSUMPTION: where the payload assembly (plan 10.4) will put the tree
+  ; ASSUMPTION: where the payload assembly will put the tree
   #define Payload "..\build\release-payload"
 #endif
 #ifndef FontDir
-  ; Rajdhani Bold for the headings (plan 4.9): fetched and hash-checked against installer/art/art.json
+  ; Rajdhani Bold for the headings: fetched and hash-checked against installer/art/art.json
   ; by tools/release/installer_art.py --fetch-fonts (SIL OFL 1.1); never committed
   #define FontDir "..\work\release\fonts"
 #endif
@@ -150,7 +150,7 @@ WizardImageFile=art\wizard-100.bmp,art\wizard-125.bmp,art\wizard-150.bmp,art\wiz
 WizardSmallImageFile=art\header-100.bmp,art\header-125.bmp,art\header-150.bmp,art\header-200.bmp
 WizardImageStretch=yes
 ; Beyond the installed files (payload ~0.55 GB with the toolchain): the build folder, measured 1.1 GB in release round
-; 12 (plan 4.11 "Stage B result", 1.00 tree), plus 0.4 GB headroom (ASSUMPTION: the 1.14 tree and the shader cache;
+; 12 (1.00 tree), plus 0.4 GB headroom (ASSUMPTION: the 1.14 tree and the shader cache;
 ; docs/requirements.md has 1.7 GB measured for install plus build).
 ; The directory page then shows about 2.0 GB, the figure README/requirements/site use (UI review 13).
 ExtraDiskSpaceRequired=1610612736
@@ -181,7 +181,7 @@ SelectTasksLabel2=Pick what Setup does after copying the files. Everything onlin
 
 [CustomMessages]
 ; The tasks list has no spacing property: a line break before each later group label gives the gap (UI review 20)
-; Pass 18 (plan 4.17): the shortcut and the portable choice share one "Install:" group, so the whole list (the
+; The shortcut and the portable choice share one "Install:" group, so the whole list (the
 ; opt-in online box last) fits without scrolling at 100 % and 150 % DPI
 GrpInstall=Install:
 GrpBuild=%nBuild:
@@ -192,12 +192,12 @@ GrpOnline=%nOnline (opt-in):
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "{cm:GrpInstall}"
 Name: "portable"; Description: "&Portable: saves and settings in the install folder (else in %APPDATA%)"; GroupDescription: "{cm:GrpInstall}"; Flags: unchecked
 Name: "buildnow"; Description: "&Build now (else the first start builds)"; GroupDescription: "{cm:GrpBuild}"
-; Release pass 17 (plan 4.16): the warm-up takes ~17 min the first time (the opening cinematic cannot be skipped
+; The warm-up takes ~17 min the first time (the opening cinematic cannot be skipped
 ; on a first boot), but the session after it still compiled ~900 shaders in its first 3 minutes on the 1.00 build, so
 ; "while playing" is the default until a warm-up measurably shortens the next session's stalls.
 Name: "shadersplay"; Description: "&Warm it while playing (no wait; the first minutes stutter while shaders compile)"; GroupDescription: "{cm:GrpShaders}"; Flags: exclusive
 Name: "shadersnow"; Description: "Warm it &now (about 17 min the first time; the game plays itself, minimised)"; GroupDescription: "{cm:GrpShaders}"; Flags: exclusive unchecked
-; Release pass 26: the lift and the objects (~0.8 GB of a ~1 GB build, measured on the pass 17 install) are only
+; The lift and the objects (~0.8 GB of a ~1 GB build, measured on a test install) are only
 ; needed by a later rebuild; deleting them makes a port update or "Verify and rebuild" a full build. Default keep.
 Name: "cleanup"; Description: "&Delete the build's intermediate files afterwards (saves ~0.8 GB; a later update rebuilds from the start)"; GroupDescription: "{cm:GrpBuild}"; Flags: unchecked
 Name: "checkupdates"; Description: "&Check for new versions: one anonymous request to GitHub, at most once a day"; GroupDescription: "{cm:GrpOnline}"; Flags: unchecked
@@ -219,7 +219,7 @@ Source: "art\kz3-uninstall.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; The payload also carries runtime\SDL3.dll (zlib; licenses\SDL3-LICENSE.txt): installed by the line above with the rest
 ; of {app}, copied next to build\kz3.exe by firstrun.py and the launcher (place_sdl3); the game loads it for native pads.
 Source: "{#FontDir}\Rajdhani-Bold.ttf"; Flags: dontcopy
-; Advanced: "Copy the game files into the install" (step 9s, opt-in, ~33 GB) with Inno's own progress, so the
+; Advanced: "Copy the game files into the install" (opt-in, ~33 GB) with Inno's own progress, so the
 ; originals may go. The update keeps RPCS3's dev_hdd0\game\BCUS98234 layout (launch.rpcs3_hdd0). Never removed
 ; by the uninstaller on its own: it asks (CurUninstallStepChanged), the copy may be the player's only one.
 Source: "{code:DumpSrc}\*"; DestDir: "{app}\game\disc"; Flags: external recursesubdirs createallsubdirs ignoreversion uninsneveruninstall; Check: CopyGameData
@@ -227,7 +227,7 @@ Source: "{code:UpdateSrc}\*"; DestDir: "{app}\game\dev_hdd0\game\BCUS98234"; Fla
 Source: "{code:EbootSrc}"; DestDir: "{app}\game"; DestName: "EBOOT.elf"; Flags: external ignoreversion uninsneveruninstall; Check: CopyEbootFile
 
 [InstallDelete]
-; Install over an earlier version (plan 4.17): the payload's own folders are replaced whole, so a file a newer version
+; Install over an earlier version: the payload's own folders are replaced whole, so a file a newer version
 ; dropped cannot linger and be compiled or run. Inno keeps each file's own time stamp, so ninja recompiles only the
 ; sources that changed. Never listed here: build (the lift and objects; firstrun.py's markers decide what re-runs),
 ; vfs (the link to the dump), logs, gamedata, game (the copied game files), keybinds.ini, cache, kz3-install.ini.
@@ -249,7 +249,7 @@ Type: filesandordirs; Name: "{autoprograms}\{#OldDataDirName}"
 Name: "{app}\logs"
 
 [INI]
-; Read by the launcher (planned, plan 4.3). Paths go to build\paths.json, written by firstrun.py.
+; Read by the launcher (planned). Paths go to build\paths.json, written by firstrun.py.
 Filename: "{app}\kz3-install.ini"; Section: "install"; Key: "portable"; String: "1"; Tasks: portable
 Filename: "{app}\kz3-install.ini"; Section: "install"; Key: "portable"; String: "0"; Tasks: not portable
 Filename: "{app}\kz3-install.ini"; Section: "online"; Key: "check_updates"; String: "1"; Tasks: checkupdates
@@ -268,12 +268,12 @@ Name: "{group}\{#AppDirName}"; Filename: "{app}\{#LauncherExe}"; WorkingDir: "{a
 ; --repair: launch.py checks the install against manifest.json, re-runs the game-file checks, rebuilds what changed
 Name: "{group}\Verify and rebuild"; Filename: "{app}\{#LauncherExe}"; Parameters: "--repair"; WorkingDir: "{app}"
 Name: "{group}\Prepare shaders again"; Filename: "{app}\{#LauncherExe}"; Parameters: "--prepare-shaders"; WorkingDir: "{app}"
-; Pass 32: the saves folder in Explorer, and the move between the install folder and %APPDATA% (copy, check, remove)
+; The saves folder in Explorer, and the move between the install folder and %APPDATA% (copy, check, remove)
 Name: "{group}\Open saves folder"; Filename: "{app}\{#LauncherExe}"; Parameters: "--open-data"; WorkingDir: "{app}"
 Name: "{group}\Move saves and settings"; Filename: "{app}\{#LauncherExe}"; Parameters: "--switch-data"; WorkingDir: "{app}"
-; Pass 33: runs the game with LD_PSO_TEMPLATE_OUT in the saves folder; the file holds only hashes and render-state numbers
+; Runs the game with LD_PSO_TEMPLATE_OUT in the saves folder; the file holds only hashes and render-state numbers
 Name: "{group}\Export pipeline template"; Filename: "{app}\{#LauncherExe}"; Parameters: "--export-template"; WorkingDir: "{app}"
-; Pass 34: one zip of logs and settings (user names removed) for a bug report; text in tools/release/support_text.py
+; One zip of logs and settings (user names removed) for a bug report; text in tools/release/support_text.py
 Name: "{group}\Make a support package"; Filename: "{app}\{#LauncherExe}"; Parameters: "--support-package"; WorkingDir: "{app}"
 Name: "{group}\Project page"; Filename: "{#SiteURL}"
 Name: "{group}\Uninstall {#AppDirName}"; Filename: "{uninstallexe}"; IconFilename: "{app}\kz3-uninstall.ico"
@@ -286,10 +286,10 @@ Filename: "{#ProjectURL}/issues"; Description: "Report a problem (attach the ins
 Filename: "{#SiteURL}"; Description: "Open the project page ({#SiteText})"; Flags: shellexec postinstall skipifsilent unchecked
 
 [UninstallDelete]
-; The generated derivative goes with the port (plan 7); the player's dump, update and RPCS3 folder are never touched.
+; The generated derivative goes with the port; the player's dump, update and RPCS3 folder are never touched.
 Type: filesandordirs; Name: "{app}\build"
 Type: filesandordirs; Name: "{app}\logs"
-; The game's writable VFS root (launch.py ensure_vfs, plan 4.16): vfs\PS3_GAME is a directory junction to the
+; The game's writable VFS root (launch.py ensure_vfs): vfs\PS3_GAME is a directory junction to the
 ; player's dump and is removed as a link by CurUninstallStepChanged(usUninstall) before this list runs; nothing
 ; here recurses into vfs itself, so the dump is never reached even when the junction could not be removed.
 Type: filesandordirs; Name: "{app}\vfs\psarc-cache"
@@ -300,7 +300,7 @@ Type: dirifempty; Name: "{app}\vfs"
 Type: filesandordirs; Name: "{app}\cache"
 Type: files; Name: "{app}\kz3-install.ini"
 Type: files; Name: "{app}\kz3-uninstall.ico"
-; Pass 51 (uninstall left the folder, Windows 10 VM): what the launcher, firstrun.py and shaders.py write into {app}
+; What the launcher, firstrun.py and shaders.py write into {app}
 ; and Inno did not install; tools/release/test_uninstall_covers.py keeps this list complete. The first-run and setup
 ; logs with their time-stamped earlier copies, a support zip written here with --out, the portable marker, and the
 ; payload's own folders, where Python writes __pycache__ (the embedded toolchain\python as well as kz3-setup).
@@ -313,12 +313,12 @@ Type: filesandordirs; Name: "{app}\ps3recomp"
 Type: filesandordirs; Name: "{app}\re"
 Type: filesandordirs; Name: "{app}\cmake"
 Type: filesandordirs; Name: "{app}\toolchain"
-; Pass 18 uninstall run (plan 4.17): Python's byte-code caches (kz3-setup\release\__pycache__, written when the
+; Uninstall run: Python's byte-code caches (kz3-setup\release\__pycache__, written when the
 ; launcher imports firstrun.py) kept the install folder alive, and the shader caches in the data folder outlived a
 ; "keep my saves" answer. Caches are not saves: they go either way; gamedata and keybinds.ini stay unless asked.
 Type: filesandordirs; Name: "{app}\kz3-setup"
 Type: filesandordirs; Name: "{userappdata}\{#AppDirName}\cache"
-; Pass 32: caches live in %LOCALAPPDATA% now (launch.py cache_dir); the folder holds nothing else
+; Caches live in %LOCALAPPDATA% now (launch.py cache_dir); the folder holds nothing else
 Type: filesandordirs; Name: "{localappdata}\{#AppDirName}"
 Type: files; Name: "{userappdata}\{#AppDirName}\vkd3d-proton.cache*"
 Type: dirifempty; Name: "{userappdata}\{#AppDirName}"
@@ -326,8 +326,8 @@ Type: dirifempty; Name: "{userappdata}\{#AppDirName}"
 [Code]
 var
   DumpPage, UpdatePage: TInputDirWizardPage;
-  { Pass 29: a query page with its own Browse button: Inno's dir page refuses an empty field ("You must enter a
-    full path", seen in the pass 29 walk), and this page is optional }
+  { A query page with its own Browse button: Inno's dir page refuses an empty field ("You must enter a
+    full path"), and this page is optional }
   FontPage: TInputQueryWizardPage;
   TypePage: TInputOptionWizardPage;
   AdvPage: TWizardPage;
@@ -345,7 +345,7 @@ var
 
 function LogName: String;
 begin
-  { <setup name>.log, e.g. Project-Helghast-setup.log next to the started setup.exe (plan 9.11) }
+  { <setup name>.log, e.g. Project-Helghast-setup.log next to the started setup.exe }
   Result := ChangeFileExt(ExtractFileName(ExpandConstant('{srcexe}')), '.log');
 end;
 
@@ -392,7 +392,7 @@ end;
 
 procedure ReleaseClick(Sender: TObject);
 begin
-  { The download happens in the browser, from the release page, on the player's own click (plan 9.12). }
+  { The download happens in the browser, from the release page, on the player's own click. }
   if ReleaseURL <> '' then OpenURL(ReleaseURL);
 end;
 
@@ -402,7 +402,7 @@ var
   Lines: TArrayOfString;
   RC: Integer;
 begin
-  { One click = consent for one check (plan 9.12). Nothing is sent but the request (version_check.py docstring). }
+  { One click = consent for one check. Nothing is sent but the request (version_check.py docstring). }
   CheckBtn.Enabled := False;
   CheckLbl.Caption := 'Asking GitHub...';
   WizardForm.Refresh;
@@ -436,7 +436,7 @@ var
   R: Integer;
 begin
   { Shown while the build page is still up (its header, not "Installing", behind it; UI review 11). Three labels
-    for Yes/No/Cancel: the third is "Close" (wizard test 2026-10-12, release pass 14). }
+    for Yes/No/Cancel: the third is "Close" (wizard test 2026-10-12). }
   repeat
     R := TaskDialogMsgBox('The build did not finish.',
       { A path has no spaces to wrap at: it ran past the dialog's edge (wizard test 2026-10-12); "Open log" opens it }
@@ -495,7 +495,7 @@ procedure ApplyHeadingFonts;
 begin
   if HeadFontFile = '' then Exit;
   { Rajdhani is set smaller than Segoe UI at the same point size (lower x-height); a few points more keeps the
-    titles' visual size. ASSUMPTION: sizes checked in the Proton screenshots (plan 4.12), not on Windows yet. }
+    titles' visual size. ASSUMPTION: sizes checked in the Proton screenshots, not on Windows yet. }
   HeadingFont(WizardForm.WelcomeLabel1.Font, 0);
   HeadingFont(WizardForm.FinishedHeadingLabel.Font, 0);
   HeadingFont(WizardForm.PageNameLabel.Font, WizardForm.PageNameLabel.Font.Size + 2);
@@ -549,8 +549,8 @@ begin
 end;
 
 { The game folders, first found wins: /DUMP= /UPDATE= /EBOOT= on the command line, the earlier install's recorded
-  folders (RegisterPreviousData, plan 4.17), its build\paths.json (firstrun.py; installs from before pass 18 recorded
-  nothing else: the silent upgrade of pass 19 stopped at the dump page for it) }
+  folders (RegisterPreviousData), its build\paths.json (firstrun.py; older installs recorded
+  nothing else: a silent upgrade stopped at the dump page for it) }
 procedure LoadGamePaths;
 var
   JA: AnsiString;
@@ -564,7 +564,7 @@ begin
   if (FontPage.Values[0] = '') and (WizardForm.PrevAppDir <> '') and
      LoadStringFromFile(AddBackslash(WizardForm.PrevAppDir) + 'build\paths.json', JA) then
   begin
-    FontPage.Values[0] := JsonField(String(JA), 'font_src');   { pass 29: the folder the copy came from }
+    FontPage.Values[0] := JsonField(String(JA), 'font_src');   { the folder the copy came from }
     if FontPage.Values[0] = '' then FontPage.Values[0] := JsonField(String(JA), 'font_dir');
   end;
   Src := 'command line';
@@ -791,7 +791,7 @@ begin
     'The 1.14 EBOOT, decrypted.',
     'EBOOT.elf, the decrypted form of the update''s USRDIR\EBOOT.BIN, made from your own copy. This installer includes no decryption tools.');
   EbootPage.Add('EBOOT.elf:', 'ELF files (*.elf)|*.elf|All files|*.*', '.elf');
-  { Release pass 26: kz3.ini font_dir (KZ3_FONT_DIR, patch 5005); empty = the port's own font choice }
+  { The kz3.ini font_dir (KZ3_FONT_DIR, patch 5005); empty = the port's own font choice }
   FontPage := CreateInputQueryPage(EbootPage.ID, 'PS3 fonts (optional)',
     'The PS3''s own fonts for the game''s text.',
     'Your PS3 firmware''s dev_flash\data\font folder, e.g. from an emulator install (RPCS3: dev_flash\data\font ' +
@@ -808,7 +808,7 @@ begin
   FontBrowse.Caption := 'B&rowse...';
   FontBrowse.OnClick := @FontBrowseClick;
   CreateAdvancedPage;
-  { Install over an earlier version: the folders picked last time (plan 4.17); silent installs: plan 4.19 }
+  { Install over an earlier version: the folders picked last time }
   LoadGamePaths;
   LoadSetupChoices;
 
@@ -849,7 +849,7 @@ begin
   WizardForm.SelectDirLabel.Left := WizardForm.SelectDirBitmapImage.Left;
 end;
 
-{ Kept with the uninstall entry for the next install over this one (plan 4.17) }
+{ Kept with the uninstall entry for the next install over this one }
 procedure RegisterPreviousData(PreviousDataKey: Integer);
 begin
   SetPreviousData(PreviousDataKey, 'DumpDir', DumpPage.Values[0]);
@@ -1001,15 +1001,11 @@ begin
   end else if CurPageID = UpdatePage.ID then begin
     DefaultEboot;
     if not UpdateOK(UpdatePage.Values[0]) then begin
-      { a missing 1.14 update stops here with the steps; Next again = check again.
-        ASSUMPTION: the exact RPCS3/PS3 wording is to be checked against RPCS3's own docs before release. }
+      { A missing 1.14 update stops here; Next again = check again. }
       MsgBox('The 1.14 update was not found in this folder (PARAM.SFO, USRDIR\EBOOT.BIN and ' +
         'USRDIR\added_data_ps3.psarc.edat are needed). The port is built on 1.14.' + #13#10 + #13#10 +
-        'To get it from Sony''s own update server:' + #13#10 +
-        '  - on your PS3: start Killzone 3 online once and accept the update, then copy the game''s update ' +
-        'folder from dev_hdd0\game\BCUS98234; or' + #13#10 +
-        '  - with RPCS3: install the 1.14 update package (.pkg) from Sony''s update server with ' +
-        'File > Install Packages.' + #13#10 + #13#10 +
+        'Use the 1.14 update from your own console, or the one installed in RPCS3 (see RPCS3''s documentation).' +
+        #13#10 + #13#10 +
         'Then select the folder again and press Next to check again.', mbError, MB_OK);
       Result := False;
     end;
@@ -1028,7 +1024,7 @@ begin
   end;
 end;
 
-{ Silent installs (plan 4.19): the three game pages are never validated by the wizard (an empty one stopped a silent
+{ Silent installs: the three game pages are never validated by the wizard (an empty one stopped a silent
   install with Inno's "You must enter a full path"); PrepareToInstall checks them instead. }
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
@@ -1136,7 +1132,7 @@ begin
     ' --log-dir "' + ExpandConstant('{src}') + '" --log-name "' + LogName + '"' +
     ' --status-file "' + Status + '" --stop-file "' + StopFile + '"';
   if WizardIsTaskSelected('cleanup') then Params := Params + ' --cleanup yes' else Params := Params + ' --cleanup no';
-  if IsAdvanced then begin   { step 9s: the Advanced page's choices }
+  if IsAdvanced then begin   { the Advanced page's choices }
     if not FontCopyChk.Checked then Params := Params + ' --font-copy no';
     if ComboValue(FmaCombo) <> '' then Params := Params + ' --spu-fma ' + ComboValue(FmaCombo);
     if ComboValue(MemCombo) <> '' then Params := Params + ' --low-memory ' + ComboValue(MemCombo);
@@ -1221,9 +1217,9 @@ var
   I, RC: Integer;
   Home, Py: String;
 begin
-  { One file per run (plan 9.11): Inno's own log appended to firstrun.py's, user folder redacted. }
+  { One file per run: Inno's own log appended to firstrun.py's, user folder redacted. }
   if not LoadStringsFromFile(ExpandConstant('{log}'), Lines) then begin
-    { Pass 20 (plan 4.19): this never loaded (no merged section in any setup log of rounds 13-19): Inno still holds
+    { This never loaded (no merged section in any setup log of earlier versions): Inno still holds
       its log open for writing and LoadStringsFromFile does not share writes. The bundled Python opens it with
       read+write sharing and appends it the same way. }
     Py := ExpandConstant('{app}\toolchain\python\python.exe');
@@ -1282,7 +1278,7 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  { ask before removing saves, default keep (silent uninstall keeps them). A normal install keeps
+  { Ask before removing saves, default keep (silent uninstall keeps them). A normal install keeps
     saves in APPDATA, a portable one in the install folder (launch.py data_dir: gamedata + keybinds.ini). }
   if CurUninstallStep = usUninstall then begin
     { The junction to the dump: RemoveDirectory on a junction removes the link only, never the target. }

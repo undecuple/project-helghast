@@ -104,7 +104,7 @@ else()
         DEPENDS "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
                 "${PS3RECOMP_DIR}/tools/nid_database.py"
                 # The patch-set stamp (tools/ps3recomp-patched.sh) changes with port/patches, so an HLE function a
-                # patch adds is in the table without a clean build (network pass 7: three cellHttp NIDs stayed unresolved).
+                # patch adds is in the table without a clean build.
                 ${KZ3_PATCHSET_STAMP}
         COMMENT "Generating the HLE NID -> handler table")
     message(STATUS "HLE NID table:   generated (every module)")
@@ -178,7 +178,7 @@ add_executable(${PROJECT_NAME}
     ${SPU_SOURCES}
 )
 
-# KZ3 release (step 9s): the player's EBOOT.elf linked into kz3.exe. The release's first-run build
+# KZ3 release: the player's EBOOT.elf linked into kz3.exe. The release's first-run build
 # (tools/release/firstrun.py) passes -DKZ3_EMBED_EBOOT=<the EBOOT.elf it lifted>; kz3_eboot_blob.c carries its bytes
 # and the SHA-256 taken here, which main.cpp checks before loading them (kz3_embed.h). The exe is built on the
 # player's machine and never shared. Empty (developer builds): nothing embedded, the EBOOT comes from argv[1] /
@@ -252,9 +252,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 # The EBOOT version this exe is built for: psarc_vfs.cpp follows it for the default patch set (KZ3_PATCH_SET unset:
-# 1.14 -> sp, 1.00 -> none); KZ3_EBOOT_VER at run time overrides. Read from the lift itself (RE pass 149, series
-# step 6: the 1.14 lift moved to work/recomp, the 1.00 one to work/recomp-100, so the directory name alone no longer
-# tells): its .lift-stamp's elf= (tools/lift.sh: EBOOT-114.elf or EBOOT.elf), else the directory name (recomp-100 /
+# 1.14 -> sp, 1.00 -> none); KZ3_EBOOT_VER at run time overrides. Read from the lift itself, not the directory name: its .lift-stamp's elf= (tools/lift.sh: EBOOT-114.elf or EBOOT.elf), else the directory name (recomp-100 /
 # recomp-114 / recomp, tools/spu/kz3ver.py LIFT_DIRS), else kz3ver.py's DEFAULT. A relift re-runs this configure.
 set(KZ3_LIFT_VER "")
 if(EXISTS "${RECOMP_DIR}/.lift-stamp")
@@ -282,7 +280,7 @@ if(NOT KZ3_LIFT_VER MATCHES "^(100|114)$")
 endif()
 message(STATUS "KZ3: lift ${RECOMP_DIR} is EBOOT ${KZ3_LIFT_VER}")
 target_compile_definitions(${PROJECT_NAME} PRIVATE KZ3_EBOOT_VER_DEFAULT=${KZ3_LIFT_VER})
-# Patch 2121 (RSX pass 114): main.cpp defines the BuildPost override (Options > Display > Bloom) only when the lift
+# Patch 2121: main.cpp defines the BuildPost override (Options > Display > Bloom) only when the lift
 # announces it (ppu_overrides.h, or ppu_recomp.h in an old lift): 1.14 @0x00207248, 1.00 @0x001FB8F8. A lift without
 # the row builds as before and the Bloom row is not offered.
 set(_kz3_ovr_ann "${RECOMP_DIR}/ppu_overrides.h")
@@ -308,7 +306,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 # template block above would compile spu_dispatch_mt.c a second time. -DKZ3_WITH_SPU=OFF builds without it.
 option(KZ3_WITH_SPU "link the lifted KZ3 SPU images (port/spu)" ON)
 # KZ3_PORT_SPU_SRC: where port/spu is read from. Default the tree's own; a separate test build of a requested port/spu
-# change points it at a patched copy (RSX pass 65: work/rsx/r65/port/spu), so the request is run before it is filed.
+# change points it at a patched copy, so the request is run before it is filed.
 set(KZ3_PORT_SPU_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../spu" CACHE PATH "port/spu sources (test builds of a requested diff only)")
 if(KZ3_WITH_SPU)
     add_subdirectory("${KZ3_PORT_SPU_SRC}" "${CMAKE_BINARY_DIR}/kz3_spu")
@@ -329,7 +327,7 @@ if(KZ3_LOG_REDIRECT)
     set_property(SOURCE ${KZ3_REDIRECTED} APPEND PROPERTY COMPILE_OPTIONS -include "${KZ3_LOG_HEADER}")
 endif()
 
-# Discord Rich Presence (network pass 33): opt-in, always compiled; patch 4021 holds the cellFsOpen hook.
+# Discord Rich Presence: opt-in, always compiled; patch 4021 holds the cellFsOpen hook.
 set(KZ3_DISCORD_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../net/kz3_discord.c")
 target_sources(${PROJECT_NAME} PRIVATE ${KZ3_DISCORD_SRC})
 if(KZ3_LOG_REDIRECT)

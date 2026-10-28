@@ -459,6 +459,8 @@ def render(root, problems, feed=()):
       "<p class=\"small\">The original PS3 game's online play is kept running by the PS Rewired community "
       f"(<a href=\"{PSREWIRED}\">their Killzone 3 page</a>). This port is not affiliated with or endorsed by PS Rewired "
       "and does not connect to their servers.</p>\n"
+      "<p class=\"small\">Viewing this website loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit; "
+      "the repository, installer and game do not.</p>\n"
       f"<p class=\"small\">Install questions: <a href=\"{esc(DISC_QA)}\">Q&amp;A discussions</a>.</p>\n</section>\n")
 
     w("<section id=\"requirements\" class=\"promo\">\n<h2>Requirements</h2>\n")

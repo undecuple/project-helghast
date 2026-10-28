@@ -18,6 +18,8 @@
 *Helghast* is the name of the game's own faction; Project Helghast is a fan project, not official and not
 affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games.
 
+You need your own Killzone 3 disc dump, the 1.14 update and a decrypted EBOOT from your own copy. Version 0.1.0 is a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
+
 A PC port of **Killzone 3** (PS3, 2011) made by **static recompilation**: the game's PowerPC (PPU) and Cell SPU
 code is translated to C ahead of time and compiled into a native Windows x64 program, so no CPU emulator runs at
 play time. The PS3 system software the game calls is reimplemented on PC APIs. The hardware around the code is
@@ -25,7 +27,7 @@ still provided by a runtime layer, much as an emulator provides it: the game's G
 to Direct3D 12 as it runs, and SPU scheduling, DMA and the PS3's memory layout are reproduced. Those layers are
 replaced by native code step by step: [what is native today](docs/HOW-IT-WORKS.md#what-kind-of-port-is-this).
 
-> **Status: partly playable.** Levels load and play at about 16-23 frames/s (target 30), with known bugs; the campaign has not been played start to finish yet. Tested on
+> **Status: partly playable.** Levels load and play at about 16-22 frames/s (target 30), with known bugs; the campaign has not been played start to finish yet. Tested on
 > Windows x64, mostly under Proton; first runs on native Windows 11 on 2026-10-21. What works: the table under [Status](#status). A first release that calls itself playable waits for the conditions in [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 <p align="center">
@@ -42,15 +44,15 @@ Guerrilla Games.
 
 ## Status
 
-As of 2026-10-28, on Windows x64, tested mostly under Proton on Linux (first runs on native Windows 11 on 2026-10-21 and on a Windows 10 test machine on 2026-10-22):
+As of 2026-10-27, on Windows x64, tested mostly under Proton on Linux (first runs on native Windows 11 on 2026-10-21 and on a Windows 10 test machine on 2026-10-22):
 
 | | |
 |---|---|
-| Boot, intro, menus | work at the game's 30 fps; the menu background's red haze and glow match the PS3 emulator RPCS3. Chinese, Korean, Russian and Japanese text draws with the PS3 system fonts from your own firmware install (an open-font fallback covers Latin and Cyrillic) |
+| Boot, intro, menus | work at the game's 30 fps; the menu background's red haze and glow match the PS3 emulator RPCS3. Latin and Cyrillic text uses an open-font fallback; Chinese, Korean and Japanese text needs the PS3 system fonts, an optional folder you point the installer at from your own console's firmware files (no firmware is needed otherwise) |
 | First level | loads and runs for 10+ minutes (16 of 16 test runs clean). The video decoder threads are kept on performance cores of hybrid CPUs (`KZ3_SPU_PCORES=0` turns that off), because on efficiency cores they are the cause found for the loading-screen stall; no frame-rate effect was measured and the stall itself was not seen in those runs |
 | In-level HUD | drawn: level 2 shows the objective banner, ammo, grenades and crosshair; in the first level's opening the game shows only the objective marker and reticle, the same as the RPCS3 emulator at that point |
-| Input | Xbox (XInput) controllers work directly, and PlayStation pads work through Steam Input, with the game's own button layout and vibration. SDL3 input is also built in, so DualShock 4, DualSense, Switch Pro and Xbox pads work without Steam, with rumble, and the motion sections can use the sensors of a DualShock 4 or DualSense (a DualShock 4 and an Xbox pad were checked together with Steam Input off on 2026-10-22; the others are not confirmed on real hardware; a DualShock 3 on Windows needs its DsHidMini driver). Pad layouts: the game's own scheme by default, a modern-shooter preset, or a custom layout set in an in-game editor, per action (33 groups, a swap when two actions would share a button, a copy of the Default or Modern layout as a start, saved in keybinds.ini; not yet played in a level with a custom layout, and capture from a real pad is unchecked). The layout is applied inside the game's own action table, so menus keep Cross to confirm and Circle to go back. The Modern preset follows the Killzone Shadow Fall layout: fire R2, aim L2, grenade R1, use Circle, reload Square, jump Cross; fire, reload, jump and aim were seen on the new buttons in one level, the Use-versus-Crouch split at a use prompt has not been checked. Options > Controls > Advanced Settings > Layout and Prompts has row descriptions and a controller picture per layout (under Modern the picture shows no L1 line); the game's own controller page shows the Xbox and keyboard prompt sets. On-screen button prompts follow the device you last used. Keyboard play works with rebindable keys (one session saw no keyboard input, under investigation). Mouse look is on by default, with its sensitivity under Options > Mouse, and it also moves a mounted gun within the gun's own range with the simulation's look timing (one scripted run; vehicles are not covered). The pause menu has a QUIT TO DESKTOP row after the game's Quit row (checked in the campaign; the multiplayer pause menu by log only). The window title and the Task Manager name read Project Helghast, with the port's icon, and the window is DPI-aware (no bitmap scaling on displays scaled above 100 %). Esc goes back in menus, and the menus take the mouse (hover and click; a few dialogs not yet) |
-| Display | windowed or borderless, with Alt+Enter switching between them (exclusive fullscreen is a setting), the picture stretched to the window by default or kept at its own shape, bilinear or nearest filtering, VSync on or off (Options > Display); Alt+Enter saves the choice. In gameplay the view follows the window's shape: wider on an ultrawide screen, taller on 16:10, with the HUD, menus, subtitles and movies kept 16:9 and centred (`hud_169` in display.ini). World-anchored markers such as objective markers and name tags project with the same 16:9 view, so they land on target (bot name tags seen on target in Botzone at 32:9). `KZ3_ASPECT=16:9` keeps the PS3's view. Mouse look on foot: the view follows every mouse count at once, so turning is steady; where the shots go follows the game's 30 Hz simulation, about 35 ms behind the view. `KZ3_MOUSE_LATCH=0` switches to the game's own timing for the view. The mouse feel is not yet checked by hand. Checked by hand at 1920x1080; other shapes only in test runs. Also under Options > Display: a Bloom setting from 0 to 100 % (100 is the game's own look, 0 removes the glow; motion blur has no setting yet), a frame rate limit of 30, 60 or 120 (a warning appears above 30; levels run below 30, so the limit only raises the cap) and a Field of view setting for the campaign and co-op (checked under Proton, not compared by eye). The port's option rows show a help line like the game's own, and the menus use a game-style pointer (`KZ3_GAME_CURSOR=0` keeps the system arrow) |
+| Input | Xbox (XInput) controllers work directly and PlayStation pads through Steam Input, with the game's own button layout and vibration; SDL3 input (DualShock 4, DualSense, Switch Pro, Xbox pads, rumble, motion sensors) is built in and only partly confirmed on real hardware. Layouts: the game's own, a modern-shooter preset, or a custom one set in an in-game editor. Keyboard and mouse work in the menus and in levels, with rebindable keys and mouse look (sensitivity under Options > Mouse). Details and what is not yet checked: [FEATURES.md](docs/FEATURES.md) |
+| Display | windowed or borderless with Alt+Enter, exclusive fullscreen as a setting, stretched or aspect-kept picture, bilinear or nearest filtering, VSync on or off, a Bloom setting, a frame rate limit of 30, 60 or 120 and a Field of view setting (Options > Display). In gameplay the view follows the window's shape (ultrawide and 16:10); the HUD, menus, subtitles and movies stay 16:9 and centred. Checked by hand at 1920x1080, other shapes only in test runs. Details: [FEATURES.md](docs/FEATURES.md) |
 | Campaign beyond level 1 | all 9 chapters load and play for minutes with a picture (picked with Select Chapter from a finished save; about 16-22 frames/s on a first visit depending on the chapter, one scripted run each on 2026-10-27). One chapter, Pyrrhus Outskirts (level 202), has been played by hand to its end in one session (about 29 minutes from a checkpoint, with a few bugs noted); the others have not been played through |
 | Saves | checkpoints save during play, Continue reloads them in a fresh run, and quitting to the main menu from the pause menu works; the save's PARAM.SFO is in the PS3's own format (moving a save to a console or an emulator is not tested) |
 | Update 1.14 | the port is built on update 1.14; all nine chapters load and play for minutes, each reaching its level start and autosave (scripted runs) |
@@ -75,6 +77,7 @@ Nothing, unless you ask for it. Each item is off until you turn it on, and this 
 - **Crash reports** (planned; installer, Advanced page): when ticked, a crash (or a serious warning, at most once per
   session) sends its stack trace and the port's log, with user names, host names and addresses removed, to the
   project's own error tracker. No usage data, never a memory dump. Off unless you tick it.
+- **Project website** (`site/`): viewing it loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit. The repository, installer and game do not.
 - **Online multiplayer** (planned): only through a self-hosted server you choose.
 - **Discord status** (optional, off unless you set `discord_presence = 1` in `kz3.ini`): the port tells the Discord
   app on your own PC what to show on your profile (the activity text, the game's process id and the port's Discord
@@ -205,7 +208,7 @@ Details: [CONTRIBUTING.md](.github/CONTRIBUTING.md). Things already known to be 
 | `assets/` | Banner and social-preview images. |
 | `cmake/` | CMake toolchain files for the MinGW-w64 and llvm-mingw builds. |
 | `docs/` | Building, how it works, known issues, features, roadmap, glossary and screenshots. |
-| `installer/` | Inno Setup script and art for the Windows installer. |
+| `installer/` | Inno Setup script and art for the Windows installer, and `pso-template.bin`, a shader warm-up list that holds pipeline-state hashes and numeric render state only (no shader text, no game code). |
 | `port/` | The port's own code: the game glue (`kz3`), networking, patches for ps3recomp, SPU and file-system code. |
 | `re/` | Data tables the lift tools read (override and seed lists). |
 | `site/` | Source of the project web page. |

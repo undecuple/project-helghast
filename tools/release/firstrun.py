@@ -1124,8 +1124,8 @@ NOTICE_TEXT = f"""{names.PRODUCT}: first run
 This checks your own Killzone 3 disc dump (BCUS98234), the 1.14 update and the decrypted EBOOT, then lifts and
 compiles the game on this computer (5-30 minutes; Ctrl+C stops it, the next start resumes). Nothing is downloaded
 and nothing of the game is copied; the files it generates are your own and must not be shared."""
-UPDATE_HELP = """The 1.14 update is required. Install it on your PS3 (Sony's update server, then copy dev_hdd0/game/BCUS98234)
-or let RPCS3 download it (right-click the game > Check for updates). The port also needs EBOOT.elf, the decrypted
+UPDATE_HELP = """The 1.14 update is required: use the update from your own console, or the one installed in RPCS3 (see
+RPCS3's documentation). The port also needs EBOOT.elf, the decrypted
 form of the update's USRDIR/EBOOT.BIN, made from your own copy (this project includes no decryption tools)."""
 # ASSUMPTION: RPCS3's usual game folders (Linux XDG config; Windows: RPCS3 is portable, so only a guess next to the
 # player's profile). Shown as a default only if it exists.

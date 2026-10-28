@@ -7,11 +7,11 @@ picture is in the [README status table](../README.md#status); what is planned is
 
 Found something not listed here? Please open an issue with the [bug report form](../.github/ISSUE_TEMPLATE/bug_report.yml)
 (or the performance form for speed and stutter), and see [Contributing](../README.md#contributing). No issues are
-linked below yet because none has been filed for these; they are tracked in the project's own notes.
+linked below yet because none has been filed for these yet. If you hit one of them, please open an issue on GitHub.
 
 | Problem | Where it shows | Workaround | Status |
 |---|---|---|---|
-| [Frame rate about 15-20 in levels](#frame-rate) | in levels, both Proton and native Windows | none | open |
+| [Frame rate about 16-22 in levels](#frame-rate) | in levels, both Proton and native Windows | none | open |
 | [Audio stutters now and then](#audio-stutter) | in levels | none known | open |
 | [Windows and sky in far views look flat white](#flat-white) | far views in levels | none | open |
 | [Keyboard input intermittent under Steam/Proton](#keyboard-proton) | Steam with Proton | use a controller | open, cause not confirmed |
@@ -26,7 +26,7 @@ linked below yet because none has been filed for these; they are tracked in the 
 
 ## Frame rate
 
-Levels run at about 16-23 frames per second, where the game's own target is 30. One measured 50-second window of Frozen
+Levels run at about 16-22 frames per second, where the game's own target is 30. One measured 50-second window of Frozen
 Shores (131-180 s after launch) runs at about 22-23 frames/s (means of alternated runs, 2026-10-27; in-level figures, not
 menus); the slowest 1 % of frames run at about 13-14 frames/s. A loading screen before a level sometimes stalls for a few
 seconds; the cause found is the video decoder threads running on efficiency cores of hybrid CPUs, so they are kept on

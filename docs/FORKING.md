@@ -108,7 +108,9 @@ people's machines or with repository permissions.
 ## 9. What the public tree leaves out
 
 The public tree holds the port's code and patches, the build, lift and packaging tools, the data tables they read,
-host tests and these docs. It leaves out internal agent configuration, local editor and tool settings, working
-notes, run and measurement tools, and all game data. A fork does not need any of that: build from the files here
+host tests and these docs. It leaves out local editor and tool settings, working
+notes, run and measurement tools, and all game data. `tools/agents/` holds only the build and GPU slot locks that the build scripts use; `tools/sandbox.sh` can read an optional per-worktree policy file that is not part of the tree, and without it the sandbox runs its default profile. A fork does not need any of that: build from the files here
 following [BUILDING.md](BUILDING.md). If you use an AI coding tool on your fork, `AGENTS.md` describes the repository
 for it.
+
+Comments in the code and scripts cite internal numbering (pass, round and plan items) from the development notes; they are labels, not links.
