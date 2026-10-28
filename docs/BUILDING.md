@@ -16,11 +16,11 @@ There are two ways to get a build:
 
 ## What you need
 
-From your own copy of the game (details and sizes in [requirements.md](requirements.md)):
+From your own copy of the game (details and sizes in [requirements.md](requirements.md); what each folder must hold and what the first-run check prints: [GETTING-FILES.md](GETTING-FILES.md)):
 
 | Item | Notes |
 |---|---|
-| Killzone 3, US disc **BCUS98234**, as a decrypted folder (PS3_GAME) or a decrypted ISO file | `PS3_GAME/USRDIR/data_ps3.psarc` and the rest of the disc. With an ISO the setup copies its game files (about 10 GB) into the install folder once; an encrypted ISO is refused. The EU disc (**BCES01007**) is accepted as an untested region (a player's report shows the same 1.14 EBOOT hash as the US version); other releases are not supported yet. The update goes under the same title id. |
+| Killzone 3, US disc **BCUS98234**, as a decrypted folder (PS3_GAME) or a decrypted ISO file | `PS3_GAME/USRDIR/data_ps3.psarc` and the rest of the disc. With an ISO the setup copies its game files (about 10 GB) into the install folder once; an encrypted ISO is refused. The EU disc (**BCES01007**) is accepted as an untested region (a player's report shows the same 1.14 EBOOT hash as the US version); the Asian disc (**BCAS25008**) and the Japanese disc (**BCJS30066**) are accepted as untested regions too (their 1.14 updates carry the same EBOOT as the US one, checked on our copy); other releases are not supported yet. The 1.14 update of any of the four regions can go with the disc: an update from another region gave the same game data in our tests (US and EU discs), and setup says so. It is staged under the disc's title id. The setup checks the disc archive (`data_ps3.psarc`) against the known one with a SHA-256; about half a minute on an SSD, and the verdict is cached for a rerun. |
 | Update **1.14** | Your own copy of the update; the port's target version. The PS3 emulator RPCS3 and its documentation are the usual place to learn how a PS3 update is installed. |
 | The **decrypted EBOOT** | `EBOOT.elf`, the decrypted form of the update's `EBOOT.BIN`, comes from your own copy of the game (this project provides no tools or instructions for it; the PS3 emulator RPCS3 and its documentation are the usual place people start). No PS3 firmware is needed. |
 

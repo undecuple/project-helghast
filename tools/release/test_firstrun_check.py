@@ -111,7 +111,7 @@ def levels(out, code):
 def main():
     tmp = tempfile.mkdtemp(prefix="kz3-firstrun-")
     try:
-        small = ["--min-psarc-bytes", "1024"]
+        small = ["--min-psarc-bytes", "1024", "--skip-archive-hash"]
         d = make_dump(tmp)
         u = make_update(tmp)
         rc, out = run(["--dump", d, "--update", u] + small)
@@ -134,7 +134,7 @@ def main():
         rc, out = run(["--dump", make_dump(os.path.join(tmp, "eu"), title_id="BCES01070"), "--update", u] + small)
         check("wrong TITLE_ID fails", rc == 1 and "FAIL D1" in out, out)
 
-        check("other id names it", "BCES01070" in out, out)
+        check("other id names it and the four accepted ids", "BCES01070" in out and all(i in out for i in ("BCUS98234", "BCES01007", "BCAS25008", "BCJS30066")), out)
 
         eu = make_dump(os.path.join(tmp, "eu2"), title_id="BCES01007")
         eu_u = make_update(os.path.join(tmp, "eu2"), title_id="BCES01007")
@@ -142,10 +142,142 @@ def main():
         check("EU disc + EU update passes with the untested-region note",
               rc == 0 and "WARN D1: disc dump: EU disc (BCES01007): untested region; a player's report shows the same 1.14 EBOOT hash as the US version" in out
               and "WARN U1" in out and "FAIL" not in out, out)
+        mix = "update from another region (%s) than the disc (%s): it gave the same game data in our tests (US and EU discs)"
         rc, out = run(["--dump", eu, "--update", u] + small)
-        check("EU disc + US update fails U1", rc == 1 and "FAIL U1" in out and "BCES01007" in out, out)
+        check("EU disc + US update warns U1", rc == 0 and "WARN U1" in out and "FAIL" not in out
+              and mix % ("BCUS98234", "BCES01007") in out, out)
         rc, out = run(["--dump", d, "--update", eu_u] + small)
-        check("US disc + EU update fails U1", rc == 1 and "FAIL U1" in out, out)
+        check("US disc + EU update warns U1", rc == 0 and "WARN U1" in out and "FAIL" not in out
+              and mix % ("BCES01007", "BCUS98234") in out, out)
+        for tid, name in (("BCAS25008", "Asian disc"), ("BCJS30066", "Japanese disc")):
+            rd = make_dump(os.path.join(tmp, "r" + tid), title_id=tid)
+            ru = make_update(os.path.join(tmp, "r" + tid), title_id=tid)
+            rc, out = run(["--dump", rd, "--update", ru] + small)
+            check(name + " + matching update passes with the untested-region note",
+                  rc == 0 and f"WARN D1: disc dump: {name} ({tid}): untested region; its 1.14 update carries the same EBOOT as the US one (checked on our copy)" in out
+                  and "WARN U1" in out and "FAIL" not in out, out)
+        jp = rd   # the JP dump from the loop
+        rc, out = run(["--dump", jp, "--update", eu_u] + small)
+        check("JP disc + EU update warns U1 naming both", rc == 0 and "FAIL" not in out
+              and mix % ("BCES01007", "BCJS30066") in out, out)
+        odd = make_update(os.path.join(tmp, "odd"), title_id="BCES01070")
+        rc, out = run(["--dump", jp, "--update", odd] + small)
+        check("update with an unknown id fails U1 naming the four ids", rc == 1 and "FAIL U1" in out and "BCES01070" in out
+              and all(i in out for i in ("BCUS98234", "BCES01007", "BCAS25008", "BCJS30066")), out)
+
+        # A1: the archive's SHA-256 against a fake known one (psarc_sha256.json format), injected with --psarc-hashes
+        import hashlib
+        def psarc_of(dump):
+            return os.path.join(dump, "PS3_GAME", "USRDIR", "data_ps3.psarc")
+        known = os.path.join(tmp, "known.json")
+        with open(known, "w") as f:
+            json.dump({"sha256": hashlib.sha256(open(psarc_of(d), "rb").read()).hexdigest(), "size": 4096,
+                       "discs": ["BCUS98234", "BCES01007"]}, f)
+        a1 = ["--min-psarc-bytes", "1024", "--psarc-hashes", known, "--update", u]
+        rc, out = run(["--dump", d] + a1)
+        check("A1 match is OK", rc == 0 and "OK   A1: data_ps3.psarc matches the known disc archive" in out, out)
+        dmg = make_dump(os.path.join(tmp, "dmg"))
+        with open(psarc_of(dmg), "r+b") as f:
+            f.seek(100)
+            f.write(b"x")
+        rc, out = run(["--dump", dmg] + a1)
+        check("A1 mismatch on a US disc is a FAIL", rc == 1 and "FAIL A1: data_ps3.psarc differs from the known disc archive (damaged or modified copy): copy or dump the disc again" in out, out)
+        short = make_dump(os.path.join(tmp, "short"), psarc_bytes=8192)
+        rc, out = run(["--dump", short] + a1)
+        check("A1 different size is a FAIL too", rc == 1 and "FAIL A1" in out, out)
+        eu_dmg = make_dump(os.path.join(tmp, "eudmg"), title_id="BCES01007")
+        with open(psarc_of(eu_dmg), "r+b") as f:
+            f.seek(100)
+            f.write(b"x")
+        rc, out = run(["--dump", eu_dmg, "--update", make_update(os.path.join(tmp, "eudmg"), title_id="BCES01007")] + a1[:-2])
+        check("A1 mismatch on an EU disc is a FAIL", rc == 1 and "FAIL A1" in out, out)
+        asia = make_dump(os.path.join(tmp, "asia"), title_id="BCAS25008")
+        with open(psarc_of(asia), "r+b") as f:
+            f.seek(100)
+            f.write(b"x")
+        rc, out = run(["--dump", asia, "--update", make_update(os.path.join(tmp, "asia"), title_id="BCAS25008")] + a1[:-2])
+        check("A1 mismatch on an Asian disc is only a WARN (untested region)", rc == 0 and "WARN A1: data_ps3.psarc is not a known archive yet (untested region" in out and "FAIL" not in out, out)
+        # the cache: a second check reads nothing; a changed file is read again
+        calls = []
+        real = fc.hash_file
+        fc.hash_file = lambda p, progress=None: (calls.append(p), real(p, progress))[1]
+        try:
+            cdir = os.path.join(tmp, "cachedir")
+            for n in (1, 2):
+                rep = fc.Report()
+                fc.check_psarc_hash(rep, psarc_of(d), "BCUS98234", known, cdir)
+                check(f"A1 run {n} is OK", [c["level"] for c in rep.checks] == ["OK"], rep.checks)
+            check("A1 cache hit: the file was read once", len(calls) == 1, calls)
+            os.utime(psarc_of(d), ns=(1_000_000_000, 1_000_000_000))
+            rep = fc.Report()
+            fc.check_psarc_hash(rep, psarc_of(d), "BCUS98234", known, cdir)
+            check("A1 changed mtime: read again", len(calls) == 2, calls)
+            seen = []
+            fc.check_psarc_hash(fc.Report(), psarc_of(dmg), "BCUS98234", known, None, lambda dn, t: seen.append((dn, t)))
+            check("A1 progress reports done/total up to the end", seen and seen[-1] == (4096, 4096), seen)
+        finally:
+            fc.hash_file = real
+
+        # FAT32 split parts (public issue 4): data_ps3.psarc.66600, .66601, ... instead of data_ps3.psarc
+        def split_dump(name, sizes, skip=()):
+            sd = make_dump(os.path.join(tmp, name))
+            data = open(psarc_of(sd), "rb").read()
+            os.remove(psarc_of(sd))
+            off = 0
+            for i, n in enumerate(sizes):
+                if i not in skip:
+                    with open(f"{psarc_of(sd)}.{66600 + i}", "wb") as f:
+                        f.write(data[off:off + n])
+                off += n
+            return sd
+        sp = split_dump("split4", [1024, 1024, 1024, 1024])
+        rc, out = run(["--dump", sp] + a1)
+        check("split parts: D3 OK with the total size, A1 matches the hash of the joined parts",
+              rc == 0 and "OK   D3: data_ps3.psarc present" in out and "4 split parts" in out
+              and "OK   A1: data_ps3.psarc matches the known disc archive" in out, out)
+        sp2 = split_dump("split3", [2000, 2000, 96])        # uneven part sizes: nothing assumes a part size
+        rc, out = run(["--dump", sp2] + a1)
+        check("split parts of uneven sizes: A1 OK", rc == 0 and "OK   A1: data_ps3.psarc matches" in out, out)
+        cdir2 = os.path.join(tmp, "splitcache")
+        calls2 = []
+        real2 = fc.hash_file
+        fc.hash_file = lambda p, progress=None: (calls2.append(p), real2(p, progress))[1]
+        try:
+            for n in (1, 2):
+                rep = fc.Report()
+                fc.check_psarc_hash(rep, psarc_of(sp), "BCUS98234", known, cdir2)
+                check(f"split parts: A1 run {n} OK", [c["level"] for c in rep.checks] == ["OK"], rep.checks)
+            check("split parts: cache hit, the parts were read once", len(calls2) == 1 and isinstance(calls2[0], list), calls2)
+            os.utime(f"{psarc_of(sp)}.66602", ns=(1_000_000_000, 1_000_000_000))      # any one part's mtime
+            fc.check_psarc_hash(fc.Report(), psarc_of(sp), "BCUS98234", known, cdir2)
+            check("split parts: one part's changed mtime reads again", len(calls2) == 2, calls2)
+        finally:
+            fc.hash_file = real2
+        seen = []
+        fc.check_psarc_hash(fc.Report(), psarc_of(sp), "BCUS98234", known, None, lambda dn, t: seen.append((dn, t)))
+        check("split parts: progress runs over the total", seen and seen[-1] == (4096, 4096), seen[-1:])
+        with open(f"{psarc_of(sp)}.66601", "r+b") as f:
+            f.seek(5)
+            f.write(b"x")
+        rep = fc.Report()
+        fc.check_psarc_hash(rep, psarc_of(sp), "BCUS98234", known, None)
+        check("split parts: a damaged middle part fails A1", [c["level"] for c in rep.checks] == ["FAIL"], rep.checks)
+        gap = split_dump("splitgap", [1024, 1024, 1024, 1024], skip=(2,))
+        rc, out = run(["--dump", gap] + a1)
+        check("split parts with a gap name the missing part", rc == 1 and "FAIL D3" in out and "data_ps3.psarc.66602 is missing" in out, out)
+        late = split_dump("splitlate", [1024, 1024, 1024, 1024], skip=(0,))
+        rc, out = run(["--dump", late] + a1)
+        check("split parts without .66600 name it", rc == 1 and "data_ps3.psarc.66600 is missing" in out, out)
+        short = split_dump("splitshort", [1024, 1024])
+        rc, out = run(["--dump", short, "--min-psarc-bytes", "4096"] + a1[2:])
+        check("split parts too small in total fail D3 on the total", rc == 1 and "FAIL D3" in out and "2,048 bytes" in out, out)
+        nothing = make_dump(os.path.join(tmp, "nopsarc"))
+        os.remove(psarc_of(nothing))
+        rc, out = run(["--dump", nothing] + a1)
+        check("neither file nor parts: D3 names data_ps3.psarc", rc == 1 and "no PS3_GAME/USRDIR/data_ps3.psarc" in out, out)
+        check("game_files lists every part (online-only check)",
+              [os.path.basename(x) for x in fc.game_files(sp, None, None) if "psarc" in x]
+              == [f"data_ps3.psarc.{66600 + i}" for i in range(4)])
 
         bad = make_dump(os.path.join(tmp, "nosfo"))
         os.remove(os.path.join(bad, "PS3_GAME", "PARAM.SFO"))

@@ -11,12 +11,20 @@ file sizes.
             same D1-D3 checks plus an INFO line "dump: decrypted ISO <name>". I1 FAIL: the ISO is encrypted ("this ISO is
             encrypted; use a decrypted dump"); I2 FAIL: the ISO cannot be read (not an ISO, damaged, truncated).
   --update  the installed 1.14 update folder, where a PS3 or RPCS3 keeps it: .../dev_hdd0/game/<title id>
-            (BCUS98234 or, untested, BCES01007; its TITLE_ID must be the disc's; holds PARAM.SFO and USRDIR/EBOOT.BIN)
+            (BCUS98234 or, untested, BCES01007 / BCAS25008 / BCJS30066; its TITLE_ID may be another accepted region's (WARN); holds PARAM.SFO and USRDIR/EBOOT.BIN)
   --eboot   the decrypted EBOOT (an ELF); default: <update>/USRDIR/EBOOT.elf, else <dump>/PS3_GAME/USRDIR/EBOOT.elf
             (next to EBOOT.BIN), else an EBOOT.BIN that is already an ELF
   --hashes  expected EBOOT SHA-256 per version; default eboot_sha256.json next to this script. H1 checks
             the ELF's SHA-256 against it: a mismatch is a WARN with the size and both hashes (never a FAIL: the build
             only needs a 1.14 EBOOT that lifts); an empty value means "unknown yet" and also only warns.
+
+  --psarc-hashes  the known data_ps3.psarc (default psarc_sha256.json next to this script). A1: SHA-256 of the whole
+            archive (chunked; about 23 s on an SSD) against it. OK = matches; FAIL on a listed disc (US, EU) = differs
+            (damaged or modified copy); WARN on any other disc = not a known archive yet (untested region). The hash is
+            cached in <build>/psarc-sha256-cache.json by path, size and mtime (no cache without --build). A folder dump is
+            hashed here; an ISO is hashed by firstrun.py after its files are extracted (no second read of the image).
+            --progress prints "ARCHIVE-HASH done=X total=Y" lines (firstrun.py turns them into PROGRESS lines);
+            --skip-archive-hash leaves A1 out.
 
   --root / --build  the install and build folders; a FAIL O1 when either is inside OneDrive (env OneDrive,
             OneDriveConsumer, OneDriveCommercial). O2 FAIL: a game file is an online-only OneDrive placeholder
@@ -35,7 +43,13 @@ import struct
 import sys
 
 TITLE_ID = "BCUS98234"                 # US disc (the RE notes)
-TITLE_IDS = {"BCUS98234": "US", "BCES01007": "EU"}   # EU: accepted as an untested region (a player's report shows the same 1.14 EBOOT hash; H1 checks each copy)
+TITLE_IDS = {"BCUS98234": "US", "BCES01007": "EU", "BCAS25008": "Asia", "BCJS30066": "JP"}   # all but US: accepted as untested regions (H1 checks each copy)
+REGION_NAMES = {"EU": "EU disc", "Asia": "Asian disc", "JP": "Japanese disc"}
+REGION_NOTES = {                       # EU: a player's report; Asia, JP: the updates were decrypted and compared locally
+    "EU": "a player's report shows the same 1.14 EBOOT hash as the US version",
+    "Asia": "its 1.14 update carries the same EBOOT as the US one (checked on our copy)",
+    "JP": "its 1.14 update carries the same EBOOT as the US one (checked on our copy)",
+}
 DISC_EBOOT_BIN_SIZE = 20_748_384       # PS3_GAME/USRDIR/EBOOT.BIN on the disc, encrypted SELF (the RE notes)
 EBOOT_ELF_SIZES = {                    # decrypted EBOOTs the lift fixups were made for
     20_745_952: "1.00",
@@ -55,6 +69,10 @@ ATTR_RECALL_ON_OPEN = 0x40000
 ATTR_RECALL_ON_DATA_ACCESS = 0x400000
 ONLINE_ONLY_MASK = ATTR_OFFLINE | ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS
 HASHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eboot_sha256.json")
+PSARC_HASHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psarc_sha256.json")
+PSARC_CACHE_NAME = "psarc-sha256-cache.json"
+HASH_CHUNK = 8 << 20
+SPLIT_FIRST = 66600                    # a FAT32 dump cuts files over 4 GiB into <name>.66600, .66601, ... (public issue 4)
 
 
 def read_sfo(path):
@@ -114,6 +132,42 @@ def check_onedrive_tree(r, root, build, env=None):
                          "default, %LOCALAPPDATA%\\Programs\\Project Helghast, is fine) and run the setup again")
 
 
+def split_parts(path):
+    """The pieces of a file as a FAT32 dump stores it. -> (parts, missing): parts = [path] when the file exists, else
+    the consecutive <path>.66600, .66601, ... that exist (stops at the first gap); missing = the file name to ask the
+    player for ("" when nothing is missing): <name> when neither the file nor any part exists, <name>.666NN for the
+    first gap in the numbering (also when later parts exist but .66600 does not)."""
+    if os.path.isfile(path):
+        return [path], ""
+    d, name = os.path.split(path)
+    pre = name.lower() + "."
+    nums = set()
+    try:
+        for n in os.listdir(d or "."):
+            if n.lower().startswith(pre) and n[len(pre):].isdigit() and int(n[len(pre):]) >= SPLIT_FIRST \
+                    and os.path.isfile(os.path.join(d, n)):
+                nums.add(int(n[len(pre):]))
+    except OSError:
+        pass
+    parts, i = [], SPLIT_FIRST
+    while i in nums:
+        parts.append(f"{path}.{i}")
+        i += 1
+    if not parts and not nums:
+        return [], name
+    if nums and max(nums) >= i:                    # a part past the gap exists: the numbering has a hole
+        return parts, f"{name}.{i}"
+    return parts, ""
+
+
+def psarc_info(path):
+    """-> (parts, missing, total size, first four bytes) of data_ps3.psarc as a file or as FAT32 split parts."""
+    parts, missing = split_parts(path)
+    if not parts or missing:
+        return parts, missing, 0, b""
+    return parts, "", sum(os.path.getsize(p) for p in parts), head(parts[0], 4)
+
+
 def game_files(dump, update, eboot):
     """The files the build reads."""
     f = []
@@ -122,7 +176,7 @@ def game_files(dump, update, eboot):
     elif dump:
         u = os.path.join(dump, "PS3_GAME", "USRDIR")
         f += [os.path.join(dump, "PS3_GAME", "PARAM.SFO"), os.path.join(u, "EBOOT.BIN"),
-              os.path.join(u, "data_ps3.psarc")]
+              *(split_parts(os.path.join(u, "data_ps3.psarc"))[0] or [os.path.join(u, "data_ps3.psarc")])]
     if update:
         f += [os.path.join(update, "PARAM.SFO"), os.path.join(update, "USRDIR", "EBOOT.BIN"),
               os.path.join(update, "USRDIR", UPDATE_EDAT), os.path.join(update, "USRDIR", "EBOOT.elf")]
@@ -194,11 +248,13 @@ def check_sfo(r, path, code, what, expect=None):
 def sfo_report(r, sfo, code, what, expect=None):
     tid = sfo.get("TITLE_ID")
     if tid not in TITLE_IDS:
-        r.fail(code, f"{what}: TITLE_ID is {tid!r}, not Killzone 3 (US {TITLE_ID} or, untested, EU BCES01007)")
+        r.fail(code, f"{what}: TITLE_ID is {tid!r}, not Killzone 3 (US {TITLE_ID}, or, untested, EU BCES01007, Asian BCAS25008, Japanese BCJS30066)")
     elif expect and tid != expect:
-        r.fail(code, f"{what}: TITLE_ID {tid} differs from the disc's {expect}: use the update of the same release")
+        r.warn(code, f"{what}: update from another region ({tid}) than the disc ({expect}): it gave the same game data in "
+                     f"our tests (US and EU discs)")
     elif tid != TITLE_ID:
-        r.warn(code, f"{what}: EU disc ({tid}): untested region; a player's report shows the same 1.14 EBOOT hash as the US version "
+        reg = TITLE_IDS[tid]
+        r.warn(code, f"{what}: {REGION_NAMES[reg]} ({tid}): untested region; {REGION_NOTES[reg]} "
                      f"({sfo.get('TITLE', '?')})")
     else:
         r.ok(code, f"{what}: TITLE_ID {tid} ({sfo.get('TITLE', '?')})")
@@ -209,14 +265,16 @@ def check_dump(r, dump, min_psarc):
     sfo = check_sfo(r, os.path.join(dump, "PS3_GAME", "PARAM.SFO"), "D1", "disc dump")
     eboot = os.path.join(dump, "PS3_GAME", "USRDIR", "EBOOT.BIN")
     psarc = os.path.join(dump, "PS3_GAME", "USRDIR", "data_ps3.psarc")
+    parts, missing, size, magic = psarc_info(psarc)
     dump_files(r, sfo,
                (os.path.getsize(eboot), head(eboot, 4)) if os.path.isfile(eboot) else None,
-               (os.path.getsize(psarc), head(psarc, 4)) if os.path.isfile(psarc) else None, min_psarc)
+               (size, magic) if parts and not missing else None, min_psarc, psarc_parts=len(parts), psarc_missing=missing)
 
 
-def dump_files(r, sfo, eboot, psarc, min_psarc, psarc_cut=False):
+def dump_files(r, sfo, eboot, psarc, min_psarc, psarc_cut=False, psarc_parts=1, psarc_missing=""):
     """D1 facts and the D2 / D3 checks from what was read: eboot / psarc = (size, first four bytes) or None (absent).
-    psarc_cut: the file's bytes reach past the end of its (ISO) image."""
+    psarc_cut: the file's bytes reach past the end of its (ISO) image. psarc_parts: more than 1 = the archive is
+    FAT32 split parts (size = their total). psarc_missing: the part name absent from a split set (a gap)."""
     if sfo:
         r.facts["disc"] = {k: sfo.get(k) for k in ("TITLE_ID", "TITLE", "VERSION", "APP_VER", "CATEGORY")}
         if sfo.get("CATEGORY") != "DG":
@@ -234,11 +292,16 @@ def dump_files(r, sfo, eboot, psarc, min_psarc, psarc_cut=False):
             r.fail("D2", f"disc EBOOT.BIN has magic {magic!r}: neither SELF nor ELF (bad dump)")
         if magic == SELF_MAGIC and size != DISC_EBOOT_BIN_SIZE:
             r.warn("D2", f"disc EBOOT.BIN is {size:,} bytes, the US disc's is {DISC_EBOOT_BIN_SIZE:,} (another version?)")
-    if psarc is None:
+    if psarc is None and psarc_missing.lower() != "data_ps3.psarc" and psarc_missing:
+        r.fail("D3", f"disc dump: PS3_GAME/USRDIR/{psarc_missing} is missing: data_ps3.psarc is split into parts "
+                     "(data_ps3.psarc.66600, .66601, ...) and the numbering has a gap (dump incomplete)")
+    elif psarc is None:
         r.fail("D3", "disc dump: no PS3_GAME/USRDIR/data_ps3.psarc (the game's data archive)")
     else:
         size, magic = psarc
         r.facts["psarc"] = {"size": size}
+        if psarc_parts > 1:
+            r.facts["psarc"]["parts"] = psarc_parts
         if psarc_cut:
             r.fail("D3", f"data_ps3.psarc ({size:,} bytes) reaches past the end of the ISO file: the ISO looks truncated")
         elif magic != PSARC_MAGIC:
@@ -246,7 +309,82 @@ def dump_files(r, sfo, eboot, psarc, min_psarc, psarc_cut=False):
         elif size < min_psarc:
             r.fail("D3", f"data_ps3.psarc is {size:,} bytes, less than {min_psarc:,}: the dump looks truncated")
         else:
-            r.ok("D3", f"data_ps3.psarc present ({size / 2**30:.2f} GiB)")
+            r.ok("D3", f"data_ps3.psarc present ({size / 2**30:.2f} GiB"
+                       + (f", {psarc_parts} split parts .66600 ...)" if psarc_parts > 1 else ")"))
+
+
+def hash_file(path, progress=None):
+    """-> the file's SHA-256 (hex), read in HASH_CHUNK pieces; progress(done, total) after each piece. path may be a
+    list of split parts: the hash of their concatenation in list order, progress over the total."""
+    h = hashlib.sha256()
+    paths = [path] if isinstance(path, str) else list(path)
+    total = sum(os.path.getsize(p) for p in paths)
+    done = 0
+    for p in paths:
+        with open(p, "rb") as f:
+            while True:
+                b = f.read(HASH_CHUNK)
+                if not b:
+                    break
+                h.update(b)
+                done += len(b)
+                if progress:
+                    progress(done, total)
+    return h.hexdigest()
+
+
+def check_psarc_hash(r, psarc, title_id, hashes_file=PSARC_HASHES_FILE, cache_dir=None, progress=None):
+    """A1: data_ps3.psarc against the known disc archive (psarc_sha256.json). The verdict follows the disc: a mismatch
+    on a listed disc (US, EU) is a FAIL, on another disc a WARN. A different size is a mismatch without reading the
+    file. The hash is cached in <cache_dir>/psarc-sha256-cache.json keyed by path, size and mtime (for split parts,
+    .66600 ..., the hash is that of their concatenation in part order, the size their total, and the cache entry
+    holds path, size and mtime of every part)."""
+    try:
+        with open(hashes_file, encoding="utf-8") as f:
+            known = json.load(f)
+        want, want_size, discs = known["sha256"].lower(), int(known["size"]), list(known.get("discs", []))
+    except (OSError, ValueError, KeyError) as e:
+        r.warn("A1", f"known archive hash not readable ({hashes_file}: {e}); data_ps3.psarc not checked")
+        return
+    parts, missing = split_parts(psarc)
+    if not parts or missing:
+        r.warn("A1", f"data_ps3.psarc not complete ({missing or 'not found'} is missing); archive not hashed")
+        return
+    size = sum(os.path.getsize(p) for p in parts)
+    sig = [[os.path.abspath(p), os.path.getsize(p), os.stat(p).st_mtime_ns] for p in parts]
+    key = os.path.abspath(psarc)
+    cache_path = os.path.join(cache_dir, PSARC_CACHE_NAME) if cache_dir else None
+    cache = {}
+    if cache_path:
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                cache = json.load(f)
+            if not isinstance(cache, dict):
+                cache = {}
+        except (OSError, ValueError):
+            cache = {}
+    got, cached = None, False
+    ent = cache.get(key)
+    if isinstance(ent, dict) and ent.get("size") == size and ent.get("parts") == sig and ent.get("sha256"):
+        got, cached = ent["sha256"], True
+    elif size == want_size:
+        got = hash_file(parts[0] if len(parts) == 1 else parts, progress)
+        if cache_path:
+            cache[key] = {"size": size, "parts": sig, "sha256": got}
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=1)
+            except OSError:
+                pass
+    r.facts.setdefault("psarc", {})["sha256"] = got or ""
+    if got == want:
+        r.ok("A1", "data_ps3.psarc matches the known disc archive" + (" (hash cached from an earlier run)" if cached else ""))
+    elif title_id in discs:
+        r.fail("A1", f"data_ps3.psarc differs from the known disc archive (damaged or modified copy): copy or dump the "
+                     f"disc again ({size:,} bytes" + (f", SHA-256 {got}" if got else f"; the archive is {want_size:,} bytes") + ")")
+    else:
+        r.warn("A1", f"data_ps3.psarc is not a known archive yet (untested region; {title_id or 'no title id'})")
 
 
 ISO_ENCRYPTED = "this ISO is encrypted; use a decrypted dump"
@@ -383,6 +521,9 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--min-psarc-bytes", type=int, default=MIN_PSARC_BYTES)
     ap.add_argument("--hashes", default=HASHES_FILE)
+    ap.add_argument("--psarc-hashes", default=PSARC_HASHES_FILE)
+    ap.add_argument("--progress", action="store_true", help="print ARCHIVE-HASH progress lines while A1 hashes")
+    ap.add_argument("--skip-archive-hash", action="store_true", help="leave A1 (the archive's SHA-256) out")
     ap.add_argument("--root", help="the install folder; refused (O1) when inside OneDrive")
     ap.add_argument("--build", help="the build folder; refused (O1) when inside OneDrive")
     ap.add_argument("--target", choices=("1.00", "1.14"), default="1.14",
@@ -401,6 +542,13 @@ def main(argv=None):
         r.fail("D0", f"dump folder not found: {a.dump}")
     else:
         check_dump(r, a.dump, a.min_psarc_bytes)
+        psarc = os.path.join(a.dump, "PS3_GAME", "USRDIR", "data_ps3.psarc")
+        if (not a.skip_archive_hash and psarc_info(psarc)[0] and not psarc_info(psarc)[1]
+                and not any(c["code"] == "D3" and c["level"] == "FAIL" for c in r.checks)):
+            def prog(done, total):
+                print(f"ARCHIVE-HASH done={done} total={total}", flush=True)
+            check_psarc_hash(r, psarc, (r.facts.get("disc") or {}).get("TITLE_ID"), a.psarc_hashes, a.build,
+                             prog if a.progress else None)
     if a.update:
         if not os.path.isdir(a.update):
             r.fail("U0", f"update folder not found: {a.update}")

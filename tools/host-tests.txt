@@ -139,3 +139,4 @@ tools/release/test_iso9660.py
 tools/release/test_crash_report.py
 tools/release/test_bump_version.py
 tools/release/test_release_check.py
+port/vfs/test_splitfile.sh

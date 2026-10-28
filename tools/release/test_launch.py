@@ -108,10 +108,27 @@ def main():
         check(p["action"] == "first-build" and "--interactive" in p["build"] and "--portable" not in p["build"],
               f"1 print first-build {p}")
 
+        # 1b. the installer's folders in kz3-install.ini [paths]: the first build starts from them and checks first
+        ini_p = os.path.join(root, "kz3-install.ini")
+        write(ini_p, "[paths]\ndump = %s\nupdate = %s\neboot = %s\nfont_dir = auto\n" % (dump, update, eboot))
+        fb = printed(root, environ=env)["build"]
+        check("--check-first" in fb and "--interactive" in fb and fb[fb.index("--dump") + 1] == dump and
+              fb[fb.index("--update") + 1] == update and fb[fb.index("--eboot") + 1] == eboot and
+              fb[fb.index("--font-dir") + 1] == "auto" and fb[fb.index("--rpcs3") + 1] == "off",
+              f"1b first-build with ini [paths] carries the folders {fb}")
+        write(ini_p, "[paths]\ndump = \nupdate = %s\n" % update)
+        check("--check-first" not in printed(root, environ=env)["build"], "1b ini without a dump -> plain --interactive")
+        os.remove(ini_p)
+        check("--check-first" not in printed(root, environ=env)["build"], "1b no ini -> plain --interactive")
+
         c = record(root, dump, update, eboot)
         os.rename(dump, dump + ".moved")
         a, why = la.decide(root)
         check(a == "missing-inputs" and dump in why, f"2 missing dump {a} {why}")
+        write(os.path.join(root, "kz3-install.ini"), "[paths]\ndump = %s\nupdate = %s\n" % (dump, update))
+        mi = la.firstrun_cmd(root, "missing-inputs", {"dump": dump, "update": update}, False, "py")
+        check("--check-first" not in mi and "--interactive" in mi and "--dump" not in mi, f"2 missing-inputs still asks {mi}")
+        os.remove(os.path.join(root, "kz3-install.ini"))
         os.rename(dump + ".moved", dump)
 
         check(la.decide(root)[0] == "resume", "3 no stamp -> resume")
@@ -451,6 +468,14 @@ def main():
             la.names.OLD_DATA_FOLDERS = saved_old
         with open(os.path.join(root, "logs", "launcher.log"), encoding="utf-8") as f:
             logged = f.read()
+        lines = [ln.split(" ", 1)[1] for ln in logged.splitlines()]
+        check(lines[0].startswith("start: ") and lines[1].startswith(f"version: {la.names.VERSION}"),
+              f"13a launcher.log: the version line follows start ({lines[:2]})")
+        os.makedirs(os.path.join(root, "build"), exist_ok=True)
+        write(os.path.join(root, "build", "build-stamp.json"),
+              json.dumps({"version": "0.1.2-x", "patchset": "abc123", "built": "2026-10-28T10:00:00"}))
+        check(la.version_line(root) == f"version: {la.names.VERSION} (build stamp: version 0.1.2-x, patchset abc123, built 2026-10-28T10:00:00)",
+              "13b version line carries the build stamp when it exists")
         check(not os.path.exists(old) and os.path.isfile(os.path.join(new, "keybinds.ini"))
               and f"data: moved {OLD} to {la.SAVE_FOLDER}" in logged, "11 main() moves it and logs it")
         # 12: known folders (SHGetKnownFolderPath) win over the variables; no result falls back to them, then to ""

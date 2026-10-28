@@ -123,6 +123,14 @@ def write_ini(root, section, key, value):
         cp.write(f)
 
 
+def version_line(root):
+    """"version: <names.VERSION>", plus what the build recorded in build/build-stamp.json (port version, patch set,
+    build time) when that file exists; nothing is invented."""
+    stamp = load_json(os.path.join(root, "build", "build-stamp.json")) or {}
+    rec = [f"{k} {stamp[k]}" for k in ("version", "patchset", "built") if stamp.get(k)]
+    return f"version: {names.VERSION}" + (f" (build stamp: {', '.join(rec)})" if rec else "")
+
+
 def note(root, text):
     """One line in <root>/logs/launcher.log (what the launcher decided; pythonw has no console). Never fails."""
     try:
@@ -618,9 +626,28 @@ def game_argv(root, paths, extra=()):
     return [exe, paths["eboot"], *extra] if extra else [exe]
 
 
+def setup_paths(root):
+    """The folders the installer wizard resolved (kz3-install.ini [paths]: dump, update, eboot, font_dir), or {}.
+    Only a pair of dump and update counts: the wizard writes both whenever it writes any."""
+    cp = configparser.ConfigParser()
+    cp.read(os.path.join(root, "kz3-install.ini"), encoding="utf-8")
+    g = {k: cp.get("paths", k, fallback="").strip() for k in ("dump", "update", "eboot", "font_dir")}
+    return g if g["dump"] and g["update"] else {}
+
+
 def firstrun_cmd(root, action, paths, portable, python):
-    """The build command for an action other than run."""
+    """The build command for an action other than run. A first build with the installer's folders in
+    kz3-install.ini [paths] starts from them (checks them first; the console asks only after a FAIL or on c);
+    without them, and for missing-inputs (the recorded folders are gone), the console asks."""
     a = [python, os.path.join(HERE, "firstrun.py"), "--root", root, "--log-dir", root, "--log-name", FIRSTRUN_LOG]
+    given = setup_paths(root) if (action == "first-build" and not paths) else {}
+    if given:
+        a += ["--interactive", "--check-first", "--rpcs3", "off", "--dump", given["dump"], "--update", given["update"]]
+        if given["eboot"]:
+            a += ["--eboot", given["eboot"]]
+        if given["font_dir"]:
+            a += ["--font-dir", given["font_dir"]]
+        return a
     if action in ("first-build", "missing-inputs") or not paths:
         return a + ["--interactive"] + (["--portable"] if portable else [])
     a += ["--bar", "--dump", paths["dump"]]
@@ -907,6 +934,7 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
 
     logs = os.path.join(root, "logs")
     note(root, f"start: {action}" + (f" ({reason})" if reason else ""))
+    note(root, version_line(root))
     note(root, data_line(ini["portable"], ini["rule"]))
     if not ini["portable"]:
         for old in names.OLD_DATA_FOLDERS:

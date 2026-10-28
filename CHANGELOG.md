@@ -3,6 +3,19 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
+## [Unreleased]
+
+### Added
+- A disc dump whose game archive is split into parts (data_ps3.psarc.66600, .66601, and so on, as a FAT32 drive stores it) is accepted as it is, by the setup, the first-run check and the game. A missing part is named.
+- The Asian (BCAS25008) and Japanese (BCJS30066) discs are accepted as untested regions, and a 1.14 update from any of the four regions is accepted with any accepted disc (the setup shows a note when they differ; in our tests with US and EU discs it gave the same game data).
+- The first run checks the disc's game archive against the known copy (A1) and says when it differs; the launcher log starts with the version line.
+- A new page, docs/GETTING-FILES.md, shows what each of the three inputs must contain and what every first-run check code means.
+- The game window shows the project's icon in its title bar and taskbar.
+
+### Fixed
+- The game stopped a few seconds after a level started (for example after the chapter 1 movie): the setup built the game with the wrong table of replaced functions for the 1.14 update. Install this version over the old one: it lifts and builds the game again.
+- The game folders are given once: when the build is started later or a check fails, the first start checks the folders from the setup instead of asking for them again.
+
 ## [0.1.2] - 2026-10-28 (pre-release)
 
 ### Added

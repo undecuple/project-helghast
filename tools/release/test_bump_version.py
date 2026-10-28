@@ -83,6 +83,7 @@ def main():
         rc, _, _ = run(root, new, "--date", "30-01-02")
         check(rc != 0 and snapshot(root) == base, "bad --date refused")
 
+        t0_changelog = bump_version.at(root, "public/CHANGELOG.md").read_text(encoding="utf-8")
         rc, out, err = run(root, new, "--date", "2030-01-02")
         check(rc == 0, f"bump to {new} succeeds (rc {rc}) {err[-300:]}")
         t = lambda rel: bump_version.at(root, rel).read_text(encoding="utf-8")
@@ -99,8 +100,12 @@ def main():
         check(f"<!-- version -->v{new}<!-- /version --> pre-release" in t("public/docs/BUILDING.md"), "BUILDING marker")
         check(f"latest <!-- version -->v{new}<!-- /version -->" in t("public/docs/ROADMAP.md"), "ROADMAP marker")
         cl = t("public/CHANGELOG.md")
-        stub = f"## [{new}] - 2030-01-02 (pre-release)\n\n### Added\n\n## [{cur}]"
-        check(stub in cl and cl.count(f"## [{new}]") == 1, "CHANGELOG stub above the newest entry")
+        if "## [Unreleased]" in t0_changelog:   # the unreleased entries become the release's
+            check(f"## [{new}] - 2030-01-02 (pre-release)" in cl and "## [Unreleased]" not in cl
+                  and cl.count(f"## [{new}]") == 1, "CHANGELOG [Unreleased] becomes the new version")
+        else:
+            stub = f"## [{new}] - 2030-01-02 (pre-release)\n\n### Added\n\n## [{cur}]"
+            check(stub in cl and cl.count(f"## [{new}]") == 1, "CHANGELOG stub above the newest entry")
         check(new in t("public/site/index.html"), "site regenerated")
         r = os.popen(f"{sys.executable} {root}/tools/release/test_version_agree.py").read()
         check(r.strip().endswith("PASS"), "test_version_agree passes on the copy")

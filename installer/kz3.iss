@@ -228,7 +228,7 @@ Source: "art\kz3-uninstall.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; of {app}, copied next to build\kz3.exe by firstrun.py and the launcher (place_sdl3); the game loads it for native pads.
 Source: "{#FontDir}\Rajdhani-Bold.ttf"; Flags: dontcopy
 ; Advanced: "Copy the game files into the install" (opt-in, ~33 GB) with Inno's own progress, so the
-; originals may go. The update keeps RPCS3's dev_hdd0\game\<disc title id> layout (BCUS98234, or BCES01007 for the EU disc) (launch.rpcs3_hdd0). Never removed
+; originals may go. The update keeps RPCS3's dev_hdd0\game\<disc title id> layout (BCUS98234, or BCES01007 / BCAS25008 / BCJS30066 for the other regions) (launch.rpcs3_hdd0). Never removed
 ; by the uninstaller on its own: it asks (CurUninstallStepChanged), the copy may be the player's only one.
 Source: "{code:DumpSrc}\*"; DestDir: "{app}\game\disc"; Flags: external recursesubdirs createallsubdirs ignoreversion uninsneveruninstall; Check: CopyDumpFolder
 Source: "{code:UpdateSrc}\*"; DestDir: "{app}\game\dev_hdd0\game\{code:DiscTitleId}"; Flags: external recursesubdirs createallsubdirs ignoreversion uninsneveruninstall; Check: CopyGameData
@@ -336,7 +336,7 @@ Type: dirifempty; Name: "{userappdata}\{#AppDirName}"
 var
   DumpPage, UpdatePage: TInputDirWizardPage;
   DumpInfo: TNewStaticText;
-  EuNoted: Boolean;
+  EuNoted, AsiaNoted, JpNoted, MixNoted: Boolean;
   { A query page with its own Browse button: Inno's dir page refuses an empty field ("You must enter a
     full path"), and this page is optional }
   FontPage: TInputQueryWizardPage;
@@ -610,6 +610,8 @@ function RegionOf(Id: String): String;
 begin
   if Id = 'BCUS98234' then Result := 'US'
   else if Id = 'BCES01007' then Result := 'EU'
+  else if Id = 'BCAS25008' then Result := 'Asia'
+  else if Id = 'BCJS30066' then Result := 'JP'
   else Result := '';
 end;
 
@@ -630,7 +632,37 @@ begin
   if RegionOf(Result) = '' then Result := 'BCUS98234';
 end;
 
-{ '' when the dump is Killzone 3 (US, or EU as an untested region), else the message; Id = the title id found }
+{ '' when the disc archive is there, as USRDIR\data_ps3.psarc or as the parts a FAT32 dump makes of a file over 4 GiB
+  (data_ps3.psarc.66600, .66601, ... in order, no gap; the port reads them as one file), else the message naming the
+  missing file. Usr = the folder's USRDIR with a trailing backslash. As firstrun_check.py split_parts. }
+function ArchiveProblem(Usr: String): String;
+var
+  N, K: Integer;
+begin
+  Result := '';
+  if FileExists(Usr + 'data_ps3.psarc') then Exit;
+  N := 66600;
+  while FileExists(Usr + 'data_ps3.psarc.' + IntToStr(N)) do N := N + 1;
+  if N > 66600 then begin
+    { parts 66600 up to N-1 exist; a later one means the numbering has a gap at N }
+    for K := N + 1 to N + 40 do
+      if FileExists(Usr + 'data_ps3.psarc.' + IntToStr(K)) then begin
+        Result := 'the dump is incomplete: PS3_GAME\USRDIR\data_ps3.psarc.' + IntToStr(N) + ' is missing (the archive ' +
+          'is split into parts data_ps3.psarc.66600, .66601, ... that must be numbered without a gap).';
+        Exit;
+      end;
+    Exit;
+  end;
+  for K := 66601 to 66640 do
+    if FileExists(Usr + 'data_ps3.psarc.' + IntToStr(K)) then begin
+      Result := 'the dump is incomplete: PS3_GAME\USRDIR\data_ps3.psarc.66600 is missing (the archive is split into ' +
+        'parts data_ps3.psarc.66600, .66601, ... that must be numbered without a gap).';
+      Exit;
+    end;
+  Result := 'the dump is incomplete: PS3_GAME\USRDIR\data_ps3.psarc is missing.';
+end;
+
+{ '' when the dump is Killzone 3 (US, or EU, Asia, JP as untested regions), else the message; Id = the title id found }
 function DumpProblem(Dir: String; var Id: String): String;
 begin
   Id := '';
@@ -646,9 +678,11 @@ begin
     if Id = '' then
       Result := 'PS3_GAME\PARAM.SFO in this folder has no readable TITLE_ID, so it is not a game dump.'
     else if RegionOf(Id) = '' then
-      Result := 'This is ' + Id + ', not Killzone 3 (US BCUS98234 or EU BCES01007).'
-    else if not FileExists(AddBackslash(Dir) + 'PS3_GAME\USRDIR\data_ps3.psarc') then
-      Result := 'This is Killzone 3 (' + Id + ') but the dump is incomplete: PS3_GAME\USRDIR\data_ps3.psarc is missing.';
+      Result := 'This is ' + Id + ', not Killzone 3 (US BCUS98234, EU BCES01007, Asia BCAS25008 or JP BCJS30066).'
+    else begin
+      Result := ArchiveProblem(AddBackslash(Dir) + 'PS3_GAME\USRDIR\');
+      if Result <> '' then Result := 'This is Killzone 3 (' + Id + ') but ' + Result;
+    end;
   end;
 end;
 
@@ -676,11 +710,23 @@ begin
   Ver := SfoField(AddBackslash(Dir) + 'PARAM.SFO', 'APP_VER');
   if Id = '' then
     Result := 'The update''s PARAM.SFO has no readable TITLE_ID.'
-  else if (DiscId <> '') and (Id <> DiscId) then
-    Result := 'This update is for ' + Id + ', but the disc dump is ' + DiscId + '. Pick the update of the same ' +
-      'release (dev_hdd0\game\' + DiscId + ').'
+  else if RegionOf(Id) = '' then
+    Result := 'This update is for ' + Id + ', not a Killzone 3 update (US BCUS98234, EU BCES01007, Asia BCAS25008 ' +
+      'or JP BCJS30066).'
   else if Ver <> '01.14' then
     Result := 'This update is version ' + Ver + '; the port is built on 01.14.';
+end;
+
+{ '' when the update is the disc's own region, else the note for a mixed pair (as firstrun_check.py U1) }
+function UpdateMixNote(Dir, DiscId: String): String;
+var
+  Id: String;
+begin
+  Result := '';
+  Id := SfoField(AddBackslash(Dir) + 'PARAM.SFO', 'TITLE_ID');
+  if (Id <> '') and (DiscId <> '') and (Id <> DiscId) and (RegionOf(Id) <> '') then
+    Result := 'This update is from another region (' + Id + ') than your disc (' + DiscId + '). In our tests (US and EU discs) it ' +
+      'gave the same game data. Setup goes on.';
 end;
 
 { "key": "value" of firstrun.py's build\paths.json (json.dump, ASCII): \\ and \" unescaped; '' when absent or when
@@ -938,6 +984,15 @@ begin
   else Result := ExpandConstant('{app}\game\EBOOT.elf');
 end;
 
+{ The font answer firstrun.py gets: "-" = no fonts (not the last build folder), "auto" = Recommended: the RPCS3
+  dev_flash\data\font folder beside the update, if any; else the picked folder }
+function BuildFontArg: String;
+begin
+  Result := FontPage.Values[0];
+  if Result = '' then Result := '-';
+  if not IsAdvanced then Result := 'auto';
+end;
+
 { The page names what it found in the picked folder (the title id), so a wrong pick is clear before Next }
 procedure DumpIsoClick(Sender: TObject);
 var
@@ -960,6 +1015,8 @@ begin
       'then copies its game files (about 10 GB) into the install folder.'
   else if DumpProblem(D, Id) = '' then begin
     if RegionOf(Id) = 'EU' then DumpInfo.Caption := 'Found: ' + Id + ' (EU disc, untested region)'
+    else if RegionOf(Id) = 'Asia' then DumpInfo.Caption := 'Found: ' + Id + ' (Asian disc, untested region)'
+    else if RegionOf(Id) = 'JP' then DumpInfo.Caption := 'Found: ' + Id + ' (Japanese disc, untested region)'
     else DumpInfo.Caption := 'Found: ' + Id + ' (US disc)';
   end else if Id <> '' then DumpInfo.Caption := 'Found: ' + Id + '. ' + DumpProblem(D, Id)
   else DumpInfo.Caption := 'No Killzone 3 dump found here: PS3_GAME\PARAM.SFO is missing.';
@@ -974,7 +1031,7 @@ begin
   TypePage.Add('&Advanced: copy the game files into the install, crash reports, fonts, CPU, window, language, ' +
     'shaders, cleanup');
   DumpPage := CreateInputDirPage(wpSelectTasks, 'Your disc dump',
-    'Killzone 3, US disc (BCUS98234; the EU disc BCES01007 is untested), decrypted.',
+    'Killzone 3, US disc (BCUS98234; the EU BCES01007, Asian BCAS25008 and Japanese BCJS30066 discs are untested), decrypted.',
     'Pick the folder that holds PS3_GAME (picking PS3_GAME itself also works), or a decrypted .iso file. Setup never ' +
     'changes it, and reads a folder in place unless you choose to copy it (Advanced); the files of an ISO are copied ' +
     'out of it into the install folder (about 10 GB).', False, '');
@@ -998,7 +1055,7 @@ begin
   DumpPage.Edits[0].OnChange := @DumpEditChange;
   UpdatePage := CreateInputDirPage(DumpPage.ID, 'Update 1.14',
     'The port is built on 1.14.',
-    'Pick the folder named like your disc (BCUS98234 or BCES01007) that holds the 1.14 update.' + #13#10 +
+    'Pick the folder that holds the 1.14 update (named BCUS98234, BCES01007, BCAS25008 or BCJS30066; an update from another region gave the same game data in our tests).' + #13#10 +
     'RPCS3: after File > Install Packages, it is in RPCS3''s dev_hdd0\game folder.' + #13#10 +
     'PS3: copy dev_hdd0\game\<title id> from the console.', False, '');
   UpdatePage.Add('1.14 update folder (named like the disc, e.g. BCUS98234):');
@@ -1251,6 +1308,16 @@ begin
         MsgBox('EU disc (BCES01007): untested region. A player''s report shows the same 1.14 EBOOT as the US ' +
           'version, but nobody has played it yet. Setup goes on.', mbInformation, MB_OK);
       end;
+      if (RegionOf(D) = 'Asia') and (not AsiaNoted) then begin
+        AsiaNoted := True;
+        MsgBox('Asian disc (BCAS25008): untested region. Its 1.14 update carries the same EBOOT as the US one (checked on our copy), ' +
+          'but nobody has played it yet. Setup goes on.', mbInformation, MB_OK);
+      end;
+      if (RegionOf(D) = 'JP') and (not JpNoted) then begin
+        JpNoted := True;
+        MsgBox('Japanese disc (BCJS30066): untested region. Its 1.14 update carries the same EBOOT as the US ' +
+          'one (checked on our copy), but nobody has played it yet. Setup goes on.', mbInformation, MB_OK);
+      end;
     end;
   end else if CurPageID = AdvPage.ID then begin
     { ~33 GB of game files + ~1 GB build + room (ASSUMPTION: the dump is the 31.2 GiB disc archive plus the update) }
@@ -1266,6 +1333,10 @@ begin
     if Problem <> '' then begin
       MsgBox(Problem, mbError, MB_OK);
       Result := False;
+    end else if UpdateOK(UpdatePage.Values[0]) and (UpdateMixNote(UpdatePage.Values[0], DiscIdOf(DumpPage.Values[0])) <> '')
+                and (not MixNoted) then begin
+      MixNoted := True;
+      MsgBox(UpdateMixNote(UpdatePage.Values[0], DiscIdOf(DumpPage.Values[0])), mbInformation, MB_OK);
     end else if not UpdateOK(UpdatePage.Values[0]) then begin
       { A missing 1.14 update stops here; Next again = check again. }
       MsgBox('The 1.14 update was not found in this folder (PARAM.SFO, USRDIR\EBOOT.BIN and ' +
@@ -1389,9 +1460,7 @@ var
 begin
   Py := ExpandConstant('{app}\toolchain\python\python.exe');
   Script := ExpandConstant('{app}\kz3-setup\release\firstrun.py');
-  FontDirArg := FontPage.Values[0];
-  if FontDirArg = '' then FontDirArg := '-';   { firstrun: "-" = no fonts, not the last build's folder }
-  if not IsAdvanced then FontDirArg := 'auto'; { Recommended: RPCS3's dev_flash\data\font beside the update, if any }
+  FontDirArg := BuildFontArg;
   Status := ExpandConstant('{tmp}\firstrun.status');
   StopFile := ExpandConstant('{tmp}\firstrun.stop');
   Params := '"' + Script + '" --root "' + ExpandConstant('{app}') + '"' +
@@ -1516,9 +1585,25 @@ begin
   SetIniString('crash', 'dsn', '{#CrashDSN}', ExpandConstant('{app}\kz3-install.ini'));
 end;
 
+{ The folders the wizard resolved, written whether or not Build now is ticked: the launcher first start
+  (a build left for later, or one that stopped at a FAIL) checks these first instead of asking again in a console.
+  From [Code], not [INI], so the setup log does not carry them. Not written in a silent install without folders. }
+procedure WritePaths;
+var
+  Ini: String;
+begin
+  if SilentNoBuild then Exit;
+  Ini := ExpandConstant('{app}\kz3-install.ini');
+  SetIniString('paths', 'dump', BuildDump, Ini);
+  SetIniString('paths', 'update', BuildUpdate, Ini);
+  SetIniString('paths', 'eboot', BuildEboot, Ini);
+  SetIniString('paths', 'font_dir', BuildFontArg, Ini);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then WriteCrashDsn;
+  if CurStep = ssPostInstall then WritePaths;
   if (CurStep = ssPostInstall) and WizardIsTaskSelected('buildnow') then begin
     if SilentNoBuild then Log('silent install: build skipped (no game folders); the first start of {#AppDirName} builds')
     else RunBuild;

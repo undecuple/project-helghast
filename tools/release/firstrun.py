@@ -227,6 +227,7 @@ def _h16(text):
 
 LIFT_INPUTS = [   # (base: "root" | "tools" | "toolkit", glob) : what the PPU and SPU lifts read besides the EBOOT
     ("root", "port/spu/ppu_overrides.txt"), ("root", "port/spu/ppu_lift_fixups-*.txt"),
+    ("root", "re/data/overrides/ppu_overrides-*.txt"), ("root", "re/data/overrides/ppu_lift_fixups-*.txt"),
     ("root", "re/data/spu_map_114.tsv"), ("root", "re/data/spu_seeds_114.tsv"),
     ("root", "re/data/spu_coverage_seeds.tsv"),
     ("tools", "jobmods.py"), ("tools", "elf_info.py"), ("tools", "spu/lift_spu.py"),
@@ -254,7 +255,9 @@ def lift_inputs_hash(c):
 # ------------------------------------------------------------------------------------------------- the step table
 def cmd_check(c):
     a = [*c.py, c.tool("release", "firstrun_check.py"), "--dump", c.dump, "--json",
-         "--target", EBOOT_VERS[c.ver]["check"], "--root", c.root, "--build", c.build]
+         "--target", EBOOT_VERS[c.ver]["check"], "--root", c.root, "--build", c.build, "--progress"]
+    if c.iso and c.dump == c.iso:
+        a.append("--skip-archive-hash")      # an ISO's archive is hashed after its files are extracted (iso_extract)
     if c.update:
         a += ["--update", c.update]
     if c.eboot:
@@ -307,10 +310,30 @@ def tree_eboot_ver(c):
         return "114"
 
 
+def version_table(c, name):
+    """A per-version lift table: port/spu/<name>, else re/data/overrides/<name> (tools/lift.sh's order), or ""."""
+    for p in (os.path.join(c.root, "port", "spu", name), os.path.join(c.root, "re", "data", "overrides", name)):
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
 def fixups_file(c):
-    """port/spu/ppu_lift_fixups-<ver>.txt (the file tools/lift.sh uses), or "" when this tree has none."""
-    p = os.path.join(c.root, "port", "spu", f"ppu_lift_fixups-{c.ver}.txt")
-    return p if os.path.isfile(p) else ""
+    """ppu_lift_fixups-<ver>.txt (the file tools/lift.sh uses), or "" when this tree has none."""
+    return version_table(c, f"ppu_lift_fixups-{c.ver}.txt")
+
+
+def overrides_file(c):
+    """The PPU override table for this tree's EBOOT version, as tools/lift.sh picks it: port/spu/ppu_overrides.txt
+    for 1.00, ppu_overrides-<ver>.txt for the others. The tables hold function addresses, so another version's
+    table replaces the wrong functions and leaves the right ones lifted (issue #3: the 1.14 fiber scheduler ran as
+    lifted code in every installer build); a missing table stops the lift instead of falling back."""
+    p = (os.path.join(c.root, "port", "spu", "ppu_overrides.txt") if c.ver == "100"
+         else version_table(c, f"ppu_overrides-{c.ver}.txt"))
+    if not p or not os.path.isfile(p):
+        raise StepFailed(f"the {c.ver} PPU override table (ppu_overrides-{c.ver}.txt) is missing from this install; "
+                         "reinstall Project Helghast")
+    return p
 
 
 def lift_jobs(c):
@@ -331,7 +354,7 @@ def cmd_ppu_lift(c):
                     "--functions", funcs,
                     "--hle-stubs", os.path.join(an, "EBOOT.imports.json"), "--toc", EBOOT_VERS[c.ver]["toc"],
                     "--code-end", EBOOT_VERS[c.ver]["code_end"],
-                    "--overrides", os.path.join(c.root, "port", "spu", "ppu_overrides.txt"),
+                    "--overrides", overrides_file(c),
                     "-j", str(lift_jobs(c)), "--chunks", str(LIFT_CHUNKS), "--output", c.b("recomp")]]
 
 
@@ -586,11 +609,13 @@ def iso_dest(c):
     return os.path.join(c.root, "game", "disc")
 
 
-def iso_extract(c, say=print, progress=None, free=None):
+def iso_extract(c, say=print, progress=None, free=None, hash_psarc=False):
     """Copy PS3_DISC.SFB and every file under PS3_GAME out of the decrypted ISO c.iso into iso_dest(c), then point
     c.dump there. Files already there with the size the ISO says are kept (a half copy resumes; a copy is written as
     <name>.part and renamed). The runtime reads PARAM.SFO, USRDIR/data_ps3.psarc, the patch folders, the trophy files
-    (TROPDIR) and the icon from PS3_GAME; the EBOOT.BIN is the check's. Raises StepFailed with a plain message."""
+    (TROPDIR) and the icon from PS3_GAME; the EBOOT.BIN is the check's. hash_psarc: after the copy, A1 (firstrun_check)
+    hashes the extracted data_ps3.psarc, on the same progress scale (so the image is read once). Raises StepFailed with a
+    plain message."""
     import iso9660
     dest = iso_dest(c)
     try:
@@ -621,6 +646,9 @@ def iso_extract(c, say=print, progress=None, free=None):
                         f"Not enough free disk space to copy the game files out of the ISO: {(need + ISO_MARGIN) / GIB:.1f} GiB "
                         f"are needed (the copy is {need / GIB:.1f} GiB) and {avail / GIB:.1f} GiB are free on the drive of "
                         f"{dest}. Free some space, or install into a folder on a drive with more room, and run the setup again")
+            extra = 0
+            if hash_psarc:
+                extra = next((e.size for rel, e in files if rel.lower() == "ps3_game/usrdir/data_ps3.psarc"), 0)
             say(f"iso: {len(files)} files, {total / GIB:.2f} GiB from {os.path.basename(c.iso)}; "
                 f"{len(files) - len(todo)} already extracted, {need / GIB:.2f} GiB to copy into {dest}")
             done = total - need
@@ -631,10 +659,10 @@ def iso_extract(c, say=print, progress=None, free=None):
 
                 def cb(d, t, base=base):
                     if progress:
-                        progress(base + d, total)
+                        progress(base + d, total + extra)
                 im.copy(rel, p, cb)
                 done += e.size
-            if progress:
+            if progress and not extra:
                 progress(total, total)
     except iso9660.IsoEncrypted as e:
         raise StepFailed(str(e))
@@ -644,11 +672,23 @@ def iso_extract(c, say=print, progress=None, free=None):
         raise StepFailed(f"copying out of the ISO failed: {e.strerror or e} ({e.filename or dest})")
     c.dump = dest
     say(f"iso: extracted; the dump is now {dest}")
+    if hash_psarc and extra:
+        import firstrun_check as fc
+        rep = fc.Report()
+        fc.check_psarc_hash(rep, target("PS3_GAME/USRDIR/data_ps3.psarc"), (c.facts.get("disc") or {}).get("TITLE_ID"),
+                            cache_dir=c.build, progress=(lambda d, t: progress(total + d, total + extra)) if progress else None)
+        if progress:
+            progress(total + extra, total + extra)
+        for chk in rep.checks:
+            say(f"{chk['level']:4} {chk['code']}: {chk['message']}")
+        if not rep.passed:
+            raise StepFailed(next(chk["message"] for chk in rep.checks if chk["level"] == "FAIL"))
+        c.facts.setdefault("psarc", {}).update(rep.facts.get("psarc", {}))
 
 
 def after_check(c):
     if c.iso and c.dump == c.iso:
-        iso_extract(c, say=c.say or (lambda s: print(s, flush=True)), progress=c.progress)
+        iso_extract(c, say=c.say or (lambda s: print(s, flush=True)), progress=c.progress, hash_psarc=True)
     after_record(c)
 
 
@@ -1107,6 +1147,14 @@ class Runner:
         self.emit(f"PROGRESS step={i + 1}/{len(self.steps)} name={self.steps[i].name} done={done} total={total} "
                   f"elapsed={int(time.monotonic() - self.t0)} pct={pct:.1f}")
 
+    def progress_due(self, done, total):
+        """At most one hash PROGRESS line per 0.5 %, and the last one."""
+        v = int(200 * done / total)
+        if v != getattr(self, "_hash_v", -1) or done >= total:
+            self._hash_v = v
+            return True
+        return False
+
     def run_cmd(self, i, argv):
         step = self.steps[i]
         self.log.write(f"$ {subprocess.list2cmdline(argv)}")
@@ -1123,6 +1171,11 @@ class Runner:
             for line in self.proc.stdout:
                 line = line.rstrip("\r\n")
                 captured.append(line)
+                if line.startswith("ARCHIVE-HASH "):    # firstrun_check A1: the archive's SHA-256, on the check step's permille scale
+                    m = re.match(r"ARCHIVE-HASH done=(\d+) total=(\d+)", line)
+                    if m and int(m.group(2)) and self.progress_due(int(m.group(1)), int(m.group(2))):
+                        self.progress(i, int(1000 * int(m.group(1)) / int(m.group(2))), 1000)
+                    continue
                 self.emit(line)
                 m = NINJA_RE.match(line) if step.ninja else None
                 if m:
@@ -1170,7 +1223,7 @@ class Runner:
                     self.emit(str(e))
                     return self.result(False, step.name)
                 iso_copy = step.name == "check" and bool(ctx.iso) and ctx.dump == ctx.iso   # permille scale: 10 = checked
-                units = 1000 if iso_copy else (len(cmds) or 1)
+                units = 1000 if (iso_copy or step.name == "check") else (len(cmds) or 1)
                 ctx.say = self.emit
                 ctx.progress = self.iso_progress(i)
                 self.progress(i, 0, units)
@@ -1191,7 +1244,7 @@ class Runner:
                             self.emit(bad)
                             return self.result(False, step.name)
                     if not step.ninja:
-                        self.progress(i, 10 if iso_copy else k + 1, units)
+                        self.progress(i, 10 if iso_copy else 1000 if step.name == "check" else k + 1, units)
                 if step.after and not failed:
                     try:
                         step.after(ctx)
@@ -1228,7 +1281,7 @@ class Runner:
     def take_check(self, out):
         """Keep the check's facts (EBOOT size/hash) so a changed input invalidates the later markers."""
         try:
-            j = json.loads("\n".join(out))
+            j = json.loads("\n".join(ln for ln in out if not ln.startswith("ARCHIVE-HASH ")))
             self.ctx.facts = j.get("facts", {})
             if not self.ctx.eboot:   # the checker picked it (update's EBOOT.elf, else the dump's)
                 self.ctx.eboot = self.ctx.facts.get("eboot_elf", {}).get("path", "")
@@ -1275,14 +1328,19 @@ def dry_run(ctx, steps, log_path, fallback, out=sys.stdout):
     for i, s in enumerate(steps):
         state = "always" if s.always else ("done" if is_done(ctx, i, s) else "pending")
         print(f"{i + 1}/{len(steps)} {s.name:10} {100 * s.weight / tot:5.1f}%  {state:7} {s.label}", file=out)
-        for argv in s.commands(ctx):
+        try:
+            cmds = s.commands(ctx)
+        except StepFailed as e:     # e.g. a missing lift table: the real run stops at this step with the same text
+            print(f"    STOP: {e}", file=out)
+            continue
+        for argv in cmds:
             print("    " + subprocess.list2cmdline(argv), file=out)
     return 0
 
 
 # ------------------------------------------------------------------------------------- portable zip: text UI
 NOTICE_TEXT = f"""{names.PRODUCT}: first run
-This checks your own Killzone 3 disc dump (US BCUS98234; EU BCES01007 is accepted as an untested region), the 1.14 update and the decrypted EBOOT, then lifts and
+This checks your own Killzone 3 disc dump (US BCUS98234; EU BCES01007, Asian BCAS25008 and Japanese BCJS30066 are accepted as untested regions), the 1.14 update and the decrypted EBOOT, then lifts and
 compiles the game on this computer (5-30 minutes; Ctrl+C stops it, the next start resumes). Nothing is downloaded
 and nothing of the game is copied; the files it generates are your own and must not be shared."""
 UPDATE_HELP = """The 1.14 update is required: use the update from your own console, or the one installed in RPCS3 (see
@@ -1291,7 +1349,7 @@ form of the update's USRDIR/EBOOT.BIN, made from your own copy (this project inc
 # ASSUMPTION: RPCS3's usual game folders (Linux XDG config; Windows: RPCS3 is portable, so only a guess next to the
 # player's profile). Shown as a default only if it exists.
 RPCS3_UPDATE_GUESSES = [os.path.join("~", base, "dev_hdd0", "game", tid)
-                        for tid in ("BCUS98234", "BCES01007")
+                        for tid in ("BCUS98234", "BCES01007", "BCAS25008", "BCJS30066")
                         for base in (os.path.join(".config", "rpcs3"), "RPCS3")]
 
 
@@ -1330,7 +1388,7 @@ def _check_files(dump, update, eboot):
     sys.path.insert(0, HERE)
     import firstrun_check
     buf = io.StringIO()
-    args = ["--dump", dump] + (["--update", update] if update else []) + (["--eboot", eboot] if eboot else [])
+    args = ["--dump", dump, "--skip-archive-hash"] + (["--update", update] if update else []) + (["--eboot", eboot] if eboot else [])
     with contextlib.redirect_stdout(buf):
         rc = firstrun_check.main(args)
     return rc, buf.getvalue()
@@ -1378,13 +1436,21 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
     dump = a.dump or rp.get("disc", "") or prev.get("dump", "")
     upd = a.update or rp.get("update", "") or prev.get("update", "") or guess
     elf = a.eboot or ""
+    skip = bool(getattr(a, "check_first", False) and a.dump and a.update)   # the folders from setup: check them first
+    if skip:
+        dump, upd = os.path.abspath(a.dump), os.path.abspath(a.update)
+        elf = os.path.abspath(a.eboot) if a.eboot else ""
+        notes.append("# folders from setup: checked first")
     while True:
-        dump = folder("Disc dump: the folder holding PS3_GAME, or a decrypted .iso file", dump, iso=True)
-        upd = folder("1.14 update folder (dev_hdd0/game/<title id>: BCUS98234, or BCES01007)", upd)
+        if not skip:
+            dump = folder("Disc dump: the folder holding PS3_GAME, or a decrypted .iso file", dump, iso=True)
+        if not skip:
+            upd = folder("1.14 update folder (dev_hdd0/game/<title id>: BCUS98234, BCES01007, BCAS25008 or BCJS30066; an update from another region gave the same game data in our tests)", upd)
         auto = os.path.join(upd, "USRDIR", "EBOOT.elf")
         elf = elf or (prev.get("eboot", "") if prev.get("update") == upd else "") or \
             (auto if os.path.isfile(auto) else "")
-        elf = folder("Decrypted EBOOT (EBOOT.elf; Enter = find it)", elf, need_dir=False)
+        if not skip:
+            elf = folder("Decrypted EBOOT (EBOOT.elf; Enter = find it)", elf, need_dir=False)
         while True:
             rc, text = check(dump, upd, elf)
             say(text.rstrip())
@@ -1405,6 +1471,8 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
             if r.startswith("q"):
                 return False
             if r.startswith("c"):
+                skip = False       # change the folders: the prompts come back, starting from these answers
+                elf = ""
                 break
         if rc == 0:
             break
@@ -1417,7 +1485,9 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
         notes.append(f"# RPCS3 saves: copied {c}, kept {k}")
         say("")
     fd = getattr(a, "font_dir", "") or prev.get("font_dir", "") or font_guess(upd)
-    while True:
+    given_font = bool(getattr(a, "check_first", False) and getattr(a, "font_dir_set", False))
+    r = a.font_dir if given_font else ""      # setup's font answer ("-", auto or a folder) is kept
+    while not given_font:
         r = ask("Your PS3 firmware's dev_flash/data/font folder, e.g. from an emulator install (optional: the game's "
                 "text then uses the PS3's own fonts; Enter = " + (f"{fd}" if fd else "skip") + ", - = none): ")
         r = r.strip().strip('"')
@@ -1660,6 +1730,9 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     ap.add_argument("--stop-file", default="")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--interactive", action="store_true")
+    ap.add_argument("--check-first", action="store_true",
+                    help="with --interactive and --dump/--update (the folders from setup): check them first and ask "
+                         "for folders only after a FAIL or when c is pressed")
     ap.add_argument("--rpcs3", default="auto", metavar="DIR|auto|off",
                     help="with --interactive: look in the player's RPCS3 folder (auto = the usual places) for the disc, "
                          "the 1.14 update and saves, and offer them as the answers; off = the plain prompts")

@@ -276,6 +276,7 @@ def test_firstrun(tmp, payload_dir):
     for rel in (f"toolchain/llvm-mingw/bin/x86_64-w64-mingw32-clang{exe}", f"toolchain/cmake/bin/cmake{exe}",
                 f"toolchain/ninja/ninja{exe}", "toolchain/python/python.exe"):
         tap.put(root, rel, "x")
+    tap.put(root, "re/data/overrides/ppu_overrides-114.txt", "x")   # the 1.14 lift's table (firstrun.overrides_file)
     found = fr.payload_tools(root)
     check(set(found) >= {"llvm_mingw", "cmake", "ninja"}, "payload_tools finds compiler, cmake, ninja", found)
     check(("python" in found) == (os.name == "nt"), "bundled python used on Windows only")

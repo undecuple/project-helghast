@@ -59,7 +59,9 @@ def main():
     tmp = tempfile.mkdtemp(prefix="kz3-firstrun-test-")
     try:
         os.makedirs(os.path.join(tmp, "dump"))
-        os.makedirs(os.path.join(tmp, "root"))
+        os.makedirs(os.path.join(tmp, "root", "re", "data", "overrides"))
+        with open(os.path.join(tmp, "root", "re", "data", "overrides", "ppu_overrides-114.txt"), "w") as f:
+            f.write("000C59F4  # fiber run_all\n")   # the 1.14 lift needs its table (overrides_file)
         cnt = os.path.join(tmp, "count.txt")
         gate = os.path.join(tmp, "gate")
 
@@ -223,7 +225,7 @@ def main():
         o = out.getvalue()
         check(rc == 0 and not os.path.exists(b10) and os.listdir(dl10) == [], "10 dry-run writes nothing")
         check(all(f" {s.name} " in o for s in fr.STEPS) and "firstrun_check.py" in o and "ppu_lifter.py" in o
-              and "--build" in o and "-j 2" in o, "10 plan lists steps and commands")
+              and "--build" in o and "-j 2" in o and "ppu_overrides-114.txt" in o, "10 plan lists steps and commands")
         check(sum(float(m) for m in re.findall(r"(\d+\.\d)%", o)) > 99.9, "10 plan weights add to 100%")
         nolog = os.path.join(tmp, "nolog", "sub")
         fr.main(["--dump", os.path.join(tmp, "dump"), "--build", b10, "--log-dir", nolog, "--dry-run"], out=io.StringIO())
@@ -235,6 +237,10 @@ def main():
         check([fr.jobs_for(x) for x in (None, 4 * G, 9 * G, 11.5 * G, 64 * G)] == [1, 1, 1, 2, 8], "11 jobs rule (64 chunks)")
         check([fr.jobs_for(x, clang=True, cores=12) for x in (None, 2 * G, 4 * G, 8.5 * G, 64 * G)] == [1, 1, 1, 5, 12]
               and fr.jobs_for(64 * G, clang=True, cores=32) == 16, "11 clang jobs rule (pass 12 measurements)")
+        for rel in ("re/data/overrides/ppu_overrides-114.txt", "port/spu/ppu_overrides.txt"):
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w") as f:
+                f.write("000C59F4  # fiber run_all\n")
         cj = fr.Ctx(root=tmp, build=os.path.join(tmp, "bj"), jobs=12)
         check(" -j 4 " in " ".join(fr.cmd_ppu_lift(cj)[-1]) + " " and "-j 4" in " ".join(fr.cmd_spu_lift(cj)[0])
               and fr.cmd_compile(cj)[0][-1] == "12", "11 lifts capped at 4 workers, compile uses all jobs")
@@ -251,6 +257,25 @@ def main():
         fr.main(["--dump", os.path.join(tmp, "dump"), "--root", os.path.join(tmp, "root"), "--low-memory", "on",
                  "--build", os.path.join(tmp, "blm"), "--log-dir", os.path.join(tmp, "dlm"), "--dry-run"], out=lo)
         check("# low-memory build: ON" in lo.getvalue() or "-j 1" in lo.getvalue(), f"11a dry run shows it: {lo.getvalue()[:300]!r}")
+        # 11d. the PPU lift tables follow the EBOOT version (issue #3: the 1.14 lift was given the 1.00 table)
+        tr = os.path.join(tmp, "tabroot")
+        ct = fr.Ctx(root=tr, build=os.path.join(tr, "b"))
+        try:
+            fr.cmd_ppu_lift(ct)
+            check(False, "11d 1.14 tree without its override table: the lift stops")
+        except fr.StepFailed as e:
+            check("ppu_overrides-114.txt" in str(e), f"11d 1.14 tree without its override table: the lift stops ({e})")
+        for rel in ("port/spu/ppu_overrides.txt", "re/data/overrides/ppu_overrides-114.txt",
+                    "re/data/overrides/ppu_lift_fixups-114.txt"):
+            os.makedirs(os.path.dirname(os.path.join(tr, rel)), exist_ok=True)
+            with open(os.path.join(tr, rel), "w") as f:
+                f.write("x\n")
+        cmds = fr.cmd_ppu_lift(ct)
+        lift = cmds[-1]
+        check(lift[lift.index("--overrides") + 1] == os.path.join(tr, "re", "data", "overrides", "ppu_overrides-114.txt"),
+              f"11d 1.14 lift uses ppu_overrides-114.txt, not the 1.00 table: {lift}")
+        check(len(cmds) == 2 and os.path.join(tr, "re", "data", "overrides", "ppu_lift_fixups-114.txt") in cmds[0]
+              and "PPU_JT_HINTS" in ct.env(), "11d 1.14 lift fixups found in re/data/overrides (jump-table hints set)")
         # 11b. EBOOT version of the tree (pass 12): kz3ver.py's DEFAULT picks the lift constants and the env
         vr = os.path.join(tmp, "verroot")
         c = fr.Ctx(root=vr, build=os.path.join(vr, "b"))
@@ -259,7 +284,11 @@ def main():
         with open(os.path.join(vr, "kz3-setup", "spu", "kz3ver.py"), "w") as f:
             f.write('DEFAULT = "100"\n')
         c = fr.Ctx(root=vr, build=os.path.join(vr, "b"))
+        os.makedirs(os.path.join(vr, "port", "spu"))
+        with open(os.path.join(vr, "port", "spu", "ppu_overrides.txt"), "w") as f:
+            f.write("000C3A54  # fiber run_all (1.00)\n")
         lift = " ".join(fr.cmd_ppu_lift(c)[-1])
+        check(os.path.join(vr, "port", "spu", "ppu_overrides.txt") in lift, "11b 1.00 lift uses port/spu/ppu_overrides.txt")
         check(c.ver == "100" and "--toc 0x132c960 --code-end 0xdfbbd4" in lift and c.env()["KZ3_EBOOT_VER"] == "100",
               "11b kz3ver DEFAULT 100: 1.00 constants and env")
         r = fr.Runner(c, [], None, out=io.StringIO())
@@ -353,6 +382,30 @@ def main():
                             check=lambda *x: (1, "FAIL D1: x\n"))
         check(go is False, "12 quit after a failed check")
 
+        # 12b. --check-first: the folders from setup are checked before any folder question
+        a12b = types.SimpleNamespace(dump=d12, update=u12, eboot="", build=os.path.join(t12, "b"), portable=False,
+                                     check_first=True, font_dir="auto-resolved", font_dir_set=True, shaders="off")
+        seen, asked, notes12b = [], [], []
+        res = iter([(1, "FAIL U0: x\n"), (0, "OK   D1: fine\n")])
+
+        def chk12b(*x):
+            seen.append(x)
+            return next(res)
+        answers = iter(["", "n", "n"])     # Enter = check again; version check n; start build n
+        go = fr.interactive(a12b, root12, "x.log", notes12b, ask=lambda q: (asked.append(q), next(answers))[1],
+                            out=io.StringIO(), check=chk12b)
+        check(len(seen) == 2 and seen[0][0] == os.path.abspath(d12) and seen[0][1] == os.path.abspath(u12) and
+              not any("Disc dump" in q or "update folder" in q or "font folder" in q for q in asked) and
+              a12b.font_dir == os.path.abspath("auto-resolved") and any("checked first" in n for n in notes12b),
+              f"12b check-first checks the given folders first, asks only after the FAIL: {asked}")
+        answers = iter(["c", d12, u12, "", "n", "n", "n", "n"])
+        asked.clear()
+        res = iter([(1, "FAIL U0: x\n"), (0, "OK\n")])
+        a12b.dump, a12b.update = d12, u12
+        fr.interactive(a12b, root12, "x.log", [], ask=lambda q: (asked.append(q), next(answers))[1], out=io.StringIO(),
+                       check=chk12b)
+        check(any("Disc dump" in q for q in asked), "12b c = change the folders brings the folder prompts back")
+
         bar = io.StringIO()
         cb = fr.ConsoleBar(bar, tty=False)
         for ln in ("LOG path=/x/y.log", "some tool output",
@@ -420,6 +473,19 @@ def main():
         said = []
         fr.iso_extract(c14, say=said.append)
         check(open(victim, "rb").read() == files14["PS3_GAME/USRDIR/data_ps3.psarc"] and c14.dump == dest14, "14 a short file is copied again")
+        # A1 on the extracted archive (hash_psarc): a US disc whose archive is not the known one fails, an Asian one warns
+        c14.facts = {"disc": {"TITLE_ID": "BCUS98234"}}
+        prog14 = []
+        try:
+            fr.iso_extract(c14, say=said.append, progress=lambda d, t: prog14.append((d, t)), hash_psarc=True)
+            check(False, "14 A1 US mismatch refused")
+        except fr.StepFailed as e:
+            check("differs from the known disc archive" in str(e), f"14 A1 US mismatch message: {e}")
+        check(prog14 and prog14[-1][0] == prog14[-1][1], f"14 A1 progress ends at its total: {prog14[-1:]}")
+        c14.facts = {"disc": {"TITLE_ID": "BCJS30066"}}
+        said.clear()
+        fr.iso_extract(c14, say=said.append, hash_psarc=True)
+        check(any("WARN A1" in x and "untested region" in x for x in said), f"14 A1 JP mismatch only warns: {said[-2:]}")
         # not enough room
         import collections
         shutil.rmtree(dest14)

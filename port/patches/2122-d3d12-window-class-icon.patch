@@ -1,0 +1,32 @@
+diff -ruN a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -698,6 +698,12 @@
+     wc.hInstance = GetModuleHandle(NULL);
+     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+     wc.lpszClassName = "ps3recomp_d3d12";
++    /* KZ3 patch 2122: the host exe's first icon resource (id 1) is the window and taskbar icon. No such resource:
++     * LoadImage returns NULL and Windows keeps its default icon. */
++    wc.hIcon   = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
++                                   GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
++    wc.hIconSm = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
++                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+     RegisterClassExA(&wc);
+ 
+     int cw, ch;
+diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -543,6 +543,12 @@
+     wc.hInstance = GetModuleHandle(NULL);
+     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
++    /* KZ3 patch 2122: the host exe's first icon resource (id 1) is the window and taskbar icon. No such resource:
++     * LoadImage returns NULL and Windows keeps its default icon. */
++    wc.hIcon   = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
++                                   GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
++    wc.hIconSm = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
++                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+     wc.lpszClassName = "ps3recomp_null";
+     RegisterClassExA(&wc);
+ 

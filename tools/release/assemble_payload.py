@@ -7,7 +7,7 @@ a scrub and a manifest. Standard library only, Python 3.8+.
     assemble_payload.py --dry-run [--repo DIR] [--toolchain CACHE] [--fonts DIR]
 
 What goes in (the allowlist, RULES below; nothing else is ever copied):
-  kz3-setup/      tools/release/{firstrun,firstrun_check,iso9660,version_check,crash_report,launch,lift_fixups,names}.py, eboot_sha256.json and the lift tools
+  kz3-setup/      tools/release/{firstrun,firstrun_check,iso9660,version_check,crash_report,launch,lift_fixups,names}.py, eboot_sha256.json, psarc_sha256.json and the lift tools
                   firstrun.py calls
                   (tools/jobmods.py, tools/elf_info.py, tools/spu/{lift_spu,gen_spu_register,kz3ver}.py)
   re/data/        the three SPU seed/map tables the SPU lift reads (recovered numbers)
@@ -75,6 +75,7 @@ RULES = [
     ("tools/smoke/pso_template.py", "kz3-setup/pso_template.py", "file", {}),   # the launcher's export check
     ("tools/release/lift_fixups.py", "kz3-setup/release/lift_fixups.py", "file", {}),
     ("tools/release/eboot_sha256.json", "kz3-setup/release/eboot_sha256.json", "file", {}),
+    ("tools/release/psarc_sha256.json", "kz3-setup/release/psarc_sha256.json", "file", {}),   # firstrun_check A1: the known disc archive
     ("tools/release/shaders.py", "kz3-setup/release/shaders.py", "file", {}),
     ("tools/release/names.py", "kz3-setup/release/names.py", "file", {}),
     ("tools/release/support.py", "kz3-setup/release/support.py", "file", {}),
@@ -95,6 +96,9 @@ RULES = [
     ("re/data/spu_map_114.tsv", "re/data/spu_map_114.tsv", "file", {}),
     ("re/data/spu_seeds_114.tsv", "re/data/spu_seeds_114.tsv", "file", {}),
     ("re/data/spu_coverage_seeds.tsv", "re/data/spu_coverage_seeds.tsv", "file", {}),
+    # the per-version PPU lift tables firstrun.py picks by EBOOT version (overrides_file, fixups_file; tools/lift.sh's order)
+    ("re/data/overrides/ppu_overrides-114.txt", "re/data/overrides/ppu_overrides-114.txt", "file", {}),
+    ("re/data/overrides/ppu_lift_fixups-114.txt", "re/data/overrides/ppu_lift_fixups-114.txt", "file", {}),
     ("port/kz3", "port/kz3", "tree", {"skip_tests": True}),
     ("port/spu", "port/spu", "tree", {"skip_tests": True}),
     ("port/vfs", "port/vfs", "tree", {"skip_tests": True}),

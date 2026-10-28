@@ -45,6 +45,7 @@
 extern "C" void (*g_ps3_vfs_miss_hook)(char* path, size_t cap);   /* runtime/syscalls/sys_fs.c (patch 0004) */
 extern "C" int (*g_ps3_fs_stat_hook)(const char* guest_path);     /* runtime/ppu/ppu_fs.cpp (patch 3008) */
 extern "C" int stbi_zlib_decode_buffer(char* obuffer, int olen, const char* ibuffer, int ilen); /* stb_image, in the runtime */
+#include "kz3_splitfile.h"                               /* port/vfs: data_ps3.psarc.666NN parts read as one file (issue 4) */
 #include "kz3_overlay.h"                                   /* port/vfs: 1.14 update layers */
 extern "C" const char* edat_resolve(const char* host_path, char* buf, size_t cap);   /* libs/filesystem/edat.c */
 extern "C" void edat_set_cache_dir(const char* dir);                                 /* patch 5002 */
@@ -81,7 +82,7 @@ namespace {
 struct Entry { uint32_t block; uint64_t size, offset; };
 
 struct Psarc {
-    FILE* f = nullptr;
+    kz3_sf* f = nullptr;
     uint32_t block_size = 0;
     std::vector<Entry> entries;
     std::vector<uint32_t> blocks;
@@ -109,7 +110,7 @@ bool read_entry(size_t idx, std::vector<uint8_t>& out)
     const Entry& e = g_arc.entries[idx];
     out.clear();
     out.reserve((size_t)e.size);
-    if (kz3_fseek(g_arc.f, (int64_t)e.offset, SEEK_SET) != 0) return false;
+    if (kz3_sf_seek(g_arc.f, (int64_t)e.offset) != 0) return false;
     std::vector<uint8_t> in(g_arc.block_size);
     std::vector<uint8_t> blk(g_arc.block_size);
     uint32_t b = e.block;
@@ -119,7 +120,7 @@ bool read_entry(size_t idx, std::vector<uint8_t>& out)
         uint64_t want = e.size - out.size();
         if (want > g_arc.block_size) want = g_arc.block_size;
         if (csize > in.size()) in.resize(csize);
-        if (fread(in.data(), 1, csize, g_arc.f) != csize) return false;
+        if (kz3_sf_read(g_arc.f, in.data(), csize) != csize) return false;
         if (csize == want) {
             out.insert(out.end(), in.begin(), in.begin() + csize);              /* stored */
         } else {
@@ -275,17 +276,18 @@ extern "C" int kz3_psarc_vfs_init(const char* archive, const char* cache_dir)
 {
     const char* off = getenv("KZ3_PSARC_VFS");
     if (off && off[0] == '0') { fprintf(stderr, "[psarc] VFS disabled (KZ3_PSARC_VFS=0)\n"); return -1; }
-    FILE* f = fopen(archive, "rb");
-    if (!f) { fprintf(stderr, "[psarc] cannot open %s\n", archive); return -1; }
+    kz3_sf* f = kz3_sf_open(archive);                     /* the file, or its FAT32 parts .66600... (issue 4) */
+    if (!f) { fprintf(stderr, "[psarc] cannot open %s (nor %s.66600)\n", archive, archive); return -1; }
+    if (f->nparts > 1) fprintf(stderr, "[psarc] %s: %d split parts, %llu bytes\n", archive, f->nparts, (unsigned long long)kz3_sf_size(f));
     uint8_t h[32];
-    if (fread(h, 1, 32, f) != 32 || memcmp(h, "PSAR", 4) != 0 || memcmp(h + 8, "zlib", 4) != 0 || (be32(h + 28) & 4)) {
-        fprintf(stderr, "[psarc] %s: not a zlib PSARC with a plain TOC\n", archive); fclose(f); return -1;
+    if (kz3_sf_read(f, h, 32) != 32 || memcmp(h, "PSAR", 4) != 0 || memcmp(h + 8, "zlib", 4) != 0 || (be32(h + 28) & 4)) {
+        fprintf(stderr, "[psarc] %s: not a zlib PSARC with a plain TOC\n", archive); kz3_sf_close(f); return -1;
     }
     uint32_t toc_len = be32(h + 12), esz = be32(h + 16), count = be32(h + 20);
     g_arc.block_size = be32(h + 24);
     std::vector<uint8_t> toc(toc_len - 32);
-    if (esz < 30 || fread(toc.data(), 1, toc.size(), f) != toc.size() || (uint64_t)count * esz > toc.size()) {
-        fprintf(stderr, "[psarc] %s: bad TOC\n", archive); fclose(f); return -1;
+    if (esz < 30 || kz3_sf_read(f, toc.data(), toc.size()) != toc.size() || (uint64_t)count * esz > toc.size()) {
+        fprintf(stderr, "[psarc] %s: bad TOC\n", archive); kz3_sf_close(f); return -1;
     }
     g_arc.f = f;
     for (uint32_t i = 0; i < count; i++) {

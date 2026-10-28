@@ -91,6 +91,8 @@ def main():
         # firstrun's ppu-lift and spu-lift commands
         root = os.path.join(tmp, "root")
         os.makedirs(os.path.join(root, "port", "spu"))
+        with open(os.path.join(root, "port", "spu", "ppu_overrides-114.txt"), "w") as f:
+            f.write("000C59F4  # fiber run_all\n")   # the 1.14 lift needs its override table (firstrun.overrides_file)
         c = fr.Ctx(root=root, build=os.path.join(root, "build"), dump="d", eboot=os.path.join(tmp, "EBOOT.elf"))
         cmds = fr.cmd_ppu_lift(c)
         check(len(cmds) == 1 and cmds[0][cmds[0].index("--functions") + 1].endswith("functions.json")

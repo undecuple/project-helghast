@@ -19,7 +19,10 @@ EXE="${KZ3_STAGE_EXE:-build/kz3-win/kz3.exe}"
 VER="$(python3 tools/spu/kz3ver.py ver)" || exit 2
 case "$VER" in 100) EB=work/bin/EBOOT.elf ;; 114) EB=work/bin/EBOOT-114.elf ;; *) echo "KZ3_EBOOT_VER must be 100 or 114" >&2; exit 2 ;; esac
 for f in "$EXE" "$EB" "$G/USRDIR/data_ps3.psarc"; do
-  [[ -e "$f" ]] || { echo "missing $f" >&2; exit 1; }
+  [[ -e "$f" ]] && continue
+  # a FAT32 dump stores the archive as data_ps3.psarc.66600, .66601, ... (the runtime reads them as one file)
+  [[ "$f" == */data_ps3.psarc && -e "$f.66600" ]] && continue
+  echo "missing $f" >&2; exit 1
 done
 if [[ -e "$S" ]]; then "$ROOT/tools/safe_rm.sh" "$S"; fi
 mkdir -p "$S/PS3_GAME/USRDIR"
@@ -40,7 +43,7 @@ for f in "$G"/USRDIR/*; do [[ "$(basename "$f")" == EBOOT.BIN ]] || ln -s "$f" "
 # 1.14: the installed update, read by the data overlay (psarc_vfs.cpp, port/vfs; wired on main in series step 4).
 if [[ "$VER" == 114 ]]; then
   [[ -e GameUpdate ]] || { echo "missing GameUpdate (install the 1.14 update, see docs/requirements.md)" >&2; exit 1; }
-  # the update sits under the disc's title id (US BCUS98234, EU BCES01007: untested region), read from its PARAM.SFO
+  # the update sits under the disc's title id (US BCUS98234; EU BCES01007, Asia BCAS25008, JP BCJS30066: untested regions); staged under $G's own id (the runtime reads <disc id>), whatever region the update is from
   TID="$(python3 -c 'import sys,re;d=open(sys.argv[1],"rb").read(65536);m=re.search(rb"TITLE_ID.*?BC[A-Z]{2}[0-9]{5}",d,re.S);print(m.group(0)[-9:].decode() if m else "BCUS98234")' "$G/PARAM.SFO" 2>/dev/null || echo BCUS98234)"
   mkdir -p "$S/dev_hdd0/game" && ln -s "$(readlink -f GameUpdate)" "$S/dev_hdd0/game/$TID"
 fi

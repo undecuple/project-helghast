@@ -1,0 +1,9 @@
+{
+ "comment": "Known data_ps3.psarc of the disc, checked on our copies: the US disc (BCUS98234) and the EU disc (BCES01007) carry the byte-identical archive. firstrun_check.py A1: a mismatch on a disc listed here is a FAIL; on any other disc (Asia, Japan) only a WARN, their archives are unchecked.",
+ "sha256": "f25f2467e787f39bf0bc5a599f86b18ce05f3bfa76a3b2a9e5f402f90fe429b1",
+ "size": 9678449456,
+ "discs": [
+  "BCUS98234",
+  "BCES01007"
+ ]
+}

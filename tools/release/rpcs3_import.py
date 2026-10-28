@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rpcs3_text as T  # noqa: E402
 
 TITLE_ID = "BCUS98234"
-TITLE_IDS = ("BCUS98234", "BCES01007")    # US; EU is accepted as an untested region (firstrun_check.py)
+TITLE_IDS = ("BCUS98234", "BCES01007", "BCAS25008", "BCJS30066")    # US; EU, Asia, JP are accepted as untested regions (firstrun_check.py)
 UPDATE_VER = "01.14"
 SAVE_USER = "00000001"       # ASSUMPTION: the port's single local user; RPCS3 uses 00000001 for its first user too
 

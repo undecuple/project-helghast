@@ -1,5 +1,6 @@
 /* Killzone 3 port: 1.14 update overlay (see kz3_overlay.h and the RE notes section 10). */
 #include "kz3_overlay.h"
+#include "kz3_splitfile.h"   /* data_ps3.psarc.666NN parts read as one file (public issue 4) */
 #include "../net/kz3_host_composed.h"   /* the host-composed set (network pass 40) */
 
 #include <stdio.h>
@@ -158,7 +159,7 @@ static void strmap_free(strmap* m)
 typedef struct { uint8_t md5[16]; uint32_t block; uint64_t size, offset; } ovl_entry;
 
 typedef struct {
-    FILE* f;
+    kz3_sf* f;
     uint32_t block_size, count;
     ovl_entry* e;
     uint32_t* blocks; size_t nblocks;
@@ -191,14 +192,14 @@ static uint8_t* psarc_read(ovl_psarc* a, uint32_t idx, size_t* len)
     const ovl_entry* e = &a->e[idx];
     uint8_t* out = (uint8_t*)malloc(e->size ? (size_t)e->size : 1);
     uint8_t* in = (uint8_t*)malloc(a->block_size);
-    if (!out || !in || ovl_fseek(a->f, (int64_t)e->offset, SEEK_SET) != 0) goto fail;
+    if (!out || !in || kz3_sf_seek(a->f, (int64_t)e->offset) != 0) goto fail;
     size_t got = 0;
     for (uint32_t b = e->block; got < e->size; b++) {
         if (b >= a->nblocks) goto fail;
         uint32_t cs = a->blocks[b] ? a->blocks[b] : a->block_size;
         uint64_t want = e->size - got;
         if (want > a->block_size) want = a->block_size;
-        if (cs > a->block_size || fread(in, 1, cs, a->f) != cs) goto fail;
+        if (cs > a->block_size || kz3_sf_read(a->f, in, cs) != cs) goto fail;
         if (cs == want) { memcpy(out + got, in, cs); got += cs; continue; }       /* stored */
         int n = g_cfg.inflate((char*)out + got, (int)want, (const char*)in, (int)cs);
         if (n < 0) { if (cs > want) goto fail; memcpy(out + got, in, cs); n = (int)cs; }  /* raw short block */
@@ -217,19 +218,19 @@ static void psarc_close(ovl_psarc* a);
 static int psarc_open(ovl_psarc* a, const char* path, int want_dirs)
 {
     memset(a, 0, sizeof *a);
-    FILE* f = fopen(path, "rb");
+    kz3_sf* f = kz3_sf_open(path);
     if (!f) return -1;
     uint8_t h[32];
-    if (fread(h, 1, 32, f) != 32 || memcmp(h, "PSAR", 4) || memcmp(h + 8, "zlib", 4) || (be32(h + 28) & 4)) {
-        fprintf(stderr, "[overlay] %s: not a zlib PSARC with a plain TOC\n", path); fclose(f); return -1;
+    if (kz3_sf_read(f, h, 32) != 32 || memcmp(h, "PSAR", 4) || memcmp(h + 8, "zlib", 4) || (be32(h + 28) & 4)) {
+        fprintf(stderr, "[overlay] %s: not a zlib PSARC with a plain TOC\n", path); kz3_sf_close(f); return -1;
     }
     uint32_t toc_len = be32(h + 12), esz = be32(h + 16);
     a->count = be32(h + 20); a->block_size = be32(h + 24);
-    if (toc_len < 32 || esz < 30 || a->block_size == 0) { fclose(f); return -1; }
+    if (toc_len < 32 || esz < 30 || a->block_size == 0) { kz3_sf_close(f); return -1; }
     size_t tn = toc_len - 32;
     uint8_t* toc = (uint8_t*)malloc(tn);
-    if (!toc || fread(toc, 1, tn, f) != tn || (uint64_t)a->count * esz > tn || a->count == 0) {
-        fprintf(stderr, "[overlay] %s: bad TOC\n", path); free(toc); fclose(f); return -1;
+    if (!toc || kz3_sf_read(f, toc, tn) != tn || (uint64_t)a->count * esz > tn || a->count == 0) {
+        fprintf(stderr, "[overlay] %s: bad TOC\n", path); free(toc); kz3_sf_close(f); return -1;
     }
     a->f = f;
     a->e = (ovl_entry*)calloc(a->count, sizeof(ovl_entry));
@@ -278,7 +279,7 @@ static int psarc_open(ovl_psarc* a, const char* path, int want_dirs)
 
 static void psarc_close(ovl_psarc* a)
 {
-    if (a->f) fclose(a->f);
+    if (a->f) kz3_sf_close(a->f);
     if (a->names) for (uint32_t i = 0; i < a->count; i++) free(a->names[i]);
     free(a->names); free(a->e); free(a->blocks);
     strmap_free(&a->by_key); strmap_free(&a->dirs);

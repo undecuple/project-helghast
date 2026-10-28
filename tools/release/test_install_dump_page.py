@@ -42,17 +42,23 @@ check("LoadStringFromFile" in f and "SfoInt(S, 8, 4)" in f and "SfoInt(S, 12, 4)
       "20 + 16 * I" in f and "SfoInt(S, E, 2)" in f and "SfoInt(S, E + 4, 4)" in f and "SfoInt(S, E + 12, 4)" in f,
       "SfoField reads the header and the 16-byte entries like read_sfo")
 f = func("DumpProblem")
-check("not Killzone 3 (US BCUS98234 or EU BCES01007)" in f and "'This is ' + Id" in f and "RegionOf(Id) = ''" in f,
+check("not Killzone 3 (US BCUS98234, EU BCES01007, Asia BCAS25008 or JP BCJS30066)" in f and "'This is ' + Id" in f and "RegionOf(Id) = ''" in f,
       "DumpProblem refuses other ids naming the id found")
 f = func("RegionOf")
-check("'BCUS98234'" in f and "'BCES01007'" in f, "RegionOf knows exactly the US and EU ids")
+check(all(("'%s'" % i) in f for i in ("BCUS98234", "BCES01007", "BCAS25008", "BCJS30066")) and f.count("Result := '") == 5,
+      "RegionOf knows exactly the four ids")
 f = func("UpdateIdProblem")
-check("Id <> DiscId" in f and "'01.14'" in f and "'APP_VER'" in f and "'TITLE_ID'" in f,
-      "UpdateIdProblem: same TITLE_ID as the disc, APP_VER 01.14")
+check("'01.14'" in f and "'APP_VER'" in f and "'TITLE_ID'" in f,
+      "UpdateIdProblem: a known region's TITLE_ID, APP_VER 01.14")
+check("Id <> DiscId" not in f and "RegionOf(Id) = ''" in f, "UpdateIdProblem refuses only unknown ids, not a mixed pair")
+f = func("UpdateMixNote")
+check("another region (" in f and "than your disc (" in f and "same game data" in f and "our tests" in f,
+      "UpdateMixNote words the mixed pair as a tested note")
 m = re.search(r"function NextButtonClick.*?\nend;", code, re.S)
 nb = m.group(0) if m else ""
 check("DumpPage.Values[0] := ResolveDump(DumpPage.Values[0])" in nb and "UpdatePage.Values[0] := ResolveUpdate(UpdatePage.Values[0])" in nb
-      and "EU disc (BCES01007): untested region" in nb and "UpdateIdProblem(" in nb,
+      and "EU disc (BCES01007): untested region" in nb and "UpdateIdProblem(" in nb and "Asian disc (BCAS25008): untested region" in nb
+      and "Japanese disc (BCJS30066): untested region" in nb and "UpdateMixNote(" in nb,
       "NextButtonClick resolves both pages in place, notes EU, checks the update's id")
 m = re.search(r"function PrepareToInstall.*?\nend;", code, re.S)
 pt = m.group(0) if m else ""
@@ -70,8 +76,8 @@ check("IsIsoPick(D) then Exit" in func("ResolveDump"), "ResolveDump leaves an IS
 check("IsIsoPick(Dir) then Exit" in func("DumpProblem") and "was not found" in func("DumpProblem"),
       "DumpProblem accepts an ISO file, names a missing .iso")
 check("IsIsoPick(Dump) then Exit" in func("DiscIdOf"), "DiscIdOf is empty for an ISO (the id is read inside by firstrun)")
-check("UpdateIdProblem" in func("UpdateIdProblem") and "(DiscId <> '')" in func("UpdateIdProblem"),
-      "the update's id is compared only when the disc's id is known")
+check("(DiscId <> '')" in func("UpdateMixNote"),
+      "the mixed-pair note is given only when the disc's id is known")
 check("CopyGameData and not IsIsoPick(DumpPage.Values[0])" in func("CopyDumpFolder"), "an ISO is not copied by [Files]")
 check(re.search(r'Source: "\{code:DumpSrc\}\\\*";[^\n]*Check: CopyDumpFolder', t), "[Files] dump copy uses CopyDumpFolder")
 check("not IsIsoPick(DumpPage.Values[0])" in func("BuildDump"), "BuildDump passes the ISO itself to firstrun.py")
@@ -123,11 +129,58 @@ def make_sfo(fields):
     return struct.pack("<4sIIII", b"\0PSF", 0x101, kt, kt + len(keys), len(fields)) + ents + keys + data
 
 
+f = func("WritePaths")
+check(all(("SetIniString('paths', '%s'" % k) in f for k in ("dump", "update", "eboot", "font_dir")) and
+      "kz3-install.ini" in f and "BuildDump" in f and "BuildUpdate" in f and "BuildEboot" in f and "BuildFontArg" in f,
+      "WritePaths writes the wizard folders to kz3-install.ini [paths]")
+f = func("CurStepChanged")
+check("ssPostInstall then WritePaths" in f and "buildnow" not in f.split("WritePaths")[0].splitlines()[-1],
+      "WritePaths runs at ssPostInstall whether or not buildnow is ticked")
+check("[INI]" not in t or "Section: \"paths\"" not in t, "no [INI] entry for [paths] (the setup log would show it)")
+check("FontDirArg := BuildFontArg" in func("RunBuild"), "RunBuild and WritePaths share BuildFontArg")
 if fc:
     with tempfile.TemporaryDirectory() as tmp:
         p = os.path.join(tmp, "PARAM.SFO")
-        for tid in ("BCUS98234", "BCES01007", "BCES00227"):
+        for tid in ("BCUS98234", "BCES01007", "BCAS25008", "BCJS30066", "BCES00227"):
             open(p, "wb").write(make_sfo({"APP_VER": "01.14", "TITLE_ID": tid, "VERSION": "01.01"}))
             check(sfo_field(open(p, "rb").read(), "TITLE_ID") == tid == fc.read_sfo(p)["TITLE_ID"] and
                   sfo_field(open(p, "rb").read(), "APP_VER") == "01.14", "SFO reader algorithm agrees with read_sfo: " + tid)
+
+# FAT32 split archive (public issue 4): data_ps3.psarc.66600, .66601, ... accepted like the single file
+f = func("ArchiveProblem")
+check("'data_ps3.psarc'" in f and "66600" in f and "IntToStr(N)" in f and "FileExists(Usr + 'data_ps3.psarc.' + IntToStr(N))" in f
+      and "66601 to 66640" in f and "data_ps3.psarc.66600 is missing" in f and "data_ps3.psarc is missing" in f,
+      "ArchiveProblem takes the file or consecutive parts from .66600 and names the missing file")
+check("ArchiveProblem(AddBackslash(Dir) + 'PS3_GAME\\USRDIR\\')" in func("DumpProblem"),
+      "DumpProblem asks ArchiveProblem instead of looking for data_ps3.psarc only")
+check("FileExists(AddBackslash(Dir) + 'PS3_GAME\\USRDIR\\data_ps3.psarc')" not in func("DumpProblem"),
+      "no single-file-only archive check is left in DumpProblem")
+
+
+def archive_problem(usr):
+    """ArchiveProblem transcribed: -> the name of the missing file, '' when the archive is there."""
+    ex = lambda n: os.path.isfile(os.path.join(usr, "data_ps3.psarc" + n))
+    if ex(""):
+        return ""
+    n = 66600
+    while ex("." + str(n)):
+        n += 1
+    if n > 66600:
+        return "data_ps3.psarc." + str(n) if any(ex("." + str(k)) for k in range(n + 1, n + 41)) else ""
+    if any(ex("." + str(k)) for k in range(66601, 66641)):
+        return "data_ps3.psarc.66600"
+    return "data_ps3.psarc"
+
+
+if fc:
+    with tempfile.TemporaryDirectory() as tmp:
+        cases = {"single": [""], "all": [".66600", ".66601", ".66602"], "gap": [".66600", ".66601", ".66603"],
+                 "no first": [".66601", ".66602"], "first only": [".66600"], "none": [], "other": [".bak"]}
+        for name, sufs in cases.items():
+            usr = os.path.join(tmp, name.replace(" ", "_"))
+            os.makedirs(usr)
+            for s in sufs:
+                open(os.path.join(usr, "data_ps3.psarc" + s), "wb").write(b"x")
+            parts, missing = fc.split_parts(os.path.join(usr, "data_ps3.psarc"))
+            check(archive_problem(usr) == missing, "ArchiveProblem and firstrun_check.split_parts agree: %s (%r)" % (name, missing))
 sys.exit(1 if bad else 0)

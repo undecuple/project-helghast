@@ -46,7 +46,7 @@ Guerrilla Games.
 
 ## Status
 
-As of 2026-10-27, on Windows x64, tested mostly under Proton on Linux (first runs on native Windows 11 on 2026-10-21 and on a Windows 10 test machine on 2026-10-22):
+As of 2026-10-28, on Windows x64, tested mostly under Proton on Linux (first runs on native Windows 11 on 2026-10-21 and on a Windows 10 test machine on 2026-10-22):
 
 | | |
 |---|---|
@@ -61,7 +61,7 @@ As of 2026-10-27, on Windows x64, tested mostly under Proton on Linux (first run
 | Split-screen co-op | the game's own two-player campaign co-op works on one PC with two controllers (vertical split, about 26 frames/s); the two views sit slightly out of place and the right-hand view can flicker (both under investigation); keyboard and mouse as one of the two players is planned |
 | Botzone | with the game's own patch layer applying the 1.14 update (`KZ3_NATIVE_PATCH`, on by default), Botzone reaches Career Selection (Corinth Highway) and the campaign levels 200-208 all load (scripted runs, 2026-10-27); no full Botzone match has been played by hand |
 | Online | the game's own client signs in to a local test server and reaches the MULTIPLAYER menu; joining a game is not built; online co-op campaign is on the wanted list |
-| Installer and portable zip | both work end to end in testing under Proton; on native Windows 11 the installer builds the game in about 7 minutes and the game reaches the menus (checked 2026-10-21) |
+| Installer and portable zip | both work end to end in testing under Proton; on native Windows 11 the installer builds the game in about 7 minutes and the game reaches the menus (checked 2026-10-21); a game built the way the installer builds it plays the first level from a new profile in our tests (2026-10-28). Disc dumps as a folder, as a folder whose archive is split into parts, or as a decrypted ISO are accepted: see [GETTING-FILES.md](docs/GETTING-FILES.md) |
 | Performance | a pipeline list from all eight chapters ships with the game, so shaders build in the background while a level loads (about 16.5 frames/s in the busy first minute of a level's first visit, with little stutter); the shader cache carries over between sessions (a warm start builds about 15 shaders instead of about 1,200). Planned: the game builds every shader in the shipped list at its first launch; until then the installer offers an optional shader warm-up step (about 17 minutes, off by default) |
 | Speed | about 22-23 frames/s in a busy Frozen Shores window (131-180 s after launch; in-level figures, means of alternated runs on 2026-10-27), target 30; the slowest 1 % of frames run at about 13-14 frames/s; menus and cutscenes hold 30. The renderer's command walker and the SPU job code are the limits, and the PS3 emulator RPCS3 holds 30 on the same scene and machine, so 30 is reachable |
 | Known bugs | the full list is in [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md); audio stutters now and then in levels (the audio mixing code is about 1.2 % short of real time); windows and sky in far views look flat white |
@@ -110,7 +110,7 @@ playable). Get `Project-Helghast-setup.exe` (recommended) or the portable zip fr
 [releases page](https://github.com/undecuple/project-helghast/releases) and check it against `SHA256SUMS`. The installer
 checks your own disc dump, 1.14 update and decrypted EBOOT, then recompiles and builds the game's code on your own
 machine with a bundled compiler (about 10-30 minutes on the first start). No game code, assets or keys are ever shipped
-or downloaded. You can also build it yourself (below). Do not install into a OneDrive folder (it would sync the build's thousands of files while they are written), and keep your game files on this device (in OneDrive: "Always keep on this device"); the installer refuses a OneDrive folder, and the first-run check refuses game files that are only online. What a release must meet to be called playable is in
+or downloaded. You can also build it yourself (below). Do not install into a OneDrive folder (it would sync the build's thousands of files while they are written), and keep your game files on this device (in OneDrive: "Always keep on this device"); the installer refuses a OneDrive folder, and the first-run check refuses game files that are only online. How to prepare the three inputs: [docs/GETTING-FILES.md](docs/GETTING-FILES.md). What a release must meet to be called playable is in
 [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 **Always start the game through the launcher (`Project Helghast.exe`, or the desktop and Start-menu shortcuts).**
@@ -119,7 +119,7 @@ caches would land in the wrong folder) or your launch settings, and it does not 
 
 ## Requirements
 
-See [docs/requirements.md](docs/requirements.md): the US disc (BCUS98234) as a decrypted dump, a folder (PS3_GAME) or an ISO file (the EU disc, BCES01007, is accepted as an untested region; other releases are not supported yet), the 1.14 update,
+See [docs/requirements.md](docs/requirements.md) (and [Getting your files ready](docs/GETTING-FILES.md) for what each folder must hold): the US disc (BCUS98234) as a decrypted dump, a folder (PS3_GAME) or an ISO file (the EU disc BCES01007, the Asian disc BCAS25008 and the Japanese disc BCJS30066 are accepted as untested regions; other releases are not supported yet; a 1.14 update from any of the four regions can go with your disc, see requirements). A dump whose data_ps3.psarc is cut into .66600, .66601, ... parts (a FAT32 drive) works as it is. The setup checks the disc archive against the known one (our copy's); about half a minute, the 1.14 update,
 the decrypted EBOOT of your own copy (no firmware needed; this project doesn't provide decryption tools or instructions; the PS3 emulator RPCS3 and its documentation are the usual place people start), and a Direct3D 12 GPU. Hardware figures are provisional until
 the game runs at speed.
 
