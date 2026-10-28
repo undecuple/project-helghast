@@ -107,11 +107,34 @@ Start-menu "Open saves folder" entry say which rule decided, for example `data: 
 
 **Download:** <!-- version -->[v0.1.4](https://github.com/undecuple/project-helghast/releases/tag/v0.1.4)<!-- /version --> is a pre-release (partly
 playable). Get `Project-Helghast-setup.exe` (recommended) or the portable zip from the
-[releases page](https://github.com/undecuple/project-helghast/releases) and check it against `SHA256SUMS`. The installer
-checks your own disc dump, 1.14 update and decrypted EBOOT, then recompiles and builds the game's code on your own
-machine with a bundled compiler (about 10-30 minutes on the first start). No game code, assets or keys are ever shipped
-or downloaded. You can also build it yourself (below). Do not install into a OneDrive folder (it would sync the build's thousands of files while they are written), and keep your game files on this device (in OneDrive: "Always keep on this device"); the installer refuses a OneDrive folder, and the first-run check refuses game files that are only online. How to prepare the three inputs: [docs/GETTING-FILES.md](docs/GETTING-FILES.md). What a release must meet to be called playable is in
+[releases page](https://github.com/undecuple/project-helghast/releases) and check it against `SHA256SUMS`. No game
+code, assets or keys are ever shipped or downloaded: the setup builds the game's code on your own machine from your
+own copy, with a bundled compiler. What a release must meet to be called playable is in
 [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
+
+### Windows quick start
+
+1. **Have your three inputs ready**, all from your own copy of the game
+   ([docs/GETTING-FILES.md](docs/GETTING-FILES.md) says what each must hold):
+   - the disc dump: the folder that holds `PS3_GAME`, or a decrypted `.iso` file;
+   - the 1.14 update folder (the one that holds `PARAM.SFO` and `USRDIR`);
+   - the decrypted 1.14 EBOOT, `EBOOT.elf`.
+2. **Run `Project-Helghast-setup.exe`.** It installs for your user only and needs no administrator rights.
+3. **Answer its pages:** the setup type, the install folder, the tasks (desktop shortcut, "Build now"), the disc dump
+   (a folder, or "Browse for ISO"), the 1.14 update folder, the decrypted EBOOT, and optionally the PS3 fonts and the
+   advanced options. Pages the setup can fill in itself may be skipped. The game pages check your pick before Next
+   and say what is wrong with it.
+4. **Let it build.** With "Build now" ticked (the default) the setup lifts and compiles the game's code behind one
+   progress bar; otherwise the first start of the game does it. It takes about 10 to 30 minutes (a player reported
+   about 8 minutes on native Windows 11). If a check fails, the message says which input, the path, what was found
+   there and what it must hold; the full log is next to the installer.
+5. **If the build stops** (you close it, or the PC restarts), start the game again: the build resumes at the first
+   step that did not finish.
+6. **Keep it local and fast:** install on a local drive (an SSD helps), not in a OneDrive folder (it would sync the
+   build's thousands of files while they are written), and keep your game files on this device (in OneDrive:
+   "Always keep on this device"). The setup refuses a OneDrive install folder, and the first-run check refuses game
+   files that are only online.
+7. **Always start the game through the launcher** (below).
 
 **Always start the game through the launcher (`Project Helghast.exe`, or the desktop and Start-menu shortcuts).**
 `kz3.exe` started directly skips the launcher's work: it does not apply the data-location rules (saves, settings and
@@ -123,9 +146,9 @@ See [docs/requirements.md](docs/requirements.md) (and [Getting your files ready]
 the decrypted EBOOT of your own copy (no firmware needed; this project doesn't provide decryption tools or instructions; the PS3 emulator RPCS3 and its documentation are the usual place people start), and a Direct3D 12 GPU. Hardware figures are provisional until
 the game runs at speed.
 
-## Building
+## Building from source (contributors)
 
-The port is built on [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT), pinned as a submodule at v0.18.0 (commit 4e8f3ca), with the
+Players use the setup above. This section is for contributors. The port is built on [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT), pinned as a submodule at v0.18.0 (commit 4e8f3ca), with the
 patches in [port/patches/](port/patches/) applied on top. The toolchain is a Nix flake (MinGW-w64 cross build on
 Linux); Windows builds are tested mostly under Proton, plus first runs on native Windows 11 and Windows 10.
 

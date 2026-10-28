@@ -9,7 +9,7 @@ place to read. Nothing here is shipped or downloaded by this project.
 
 | Input | What to pick in the setup | The folder or file must contain | Also accepted | Quick self-check |
 |---|---|---|---|---|
-| Disc dump | The folder that holds `PS3_GAME`, or a decrypted `.iso` file | `PS3_GAME/PARAM.SFO`, `PS3_GAME/USRDIR/EBOOT.BIN`, and the game archive `PS3_GAME/USRDIR/data_ps3.psarc` (or its parts `data_ps3.psarc.66600`, `.66601`, ... with no gap) | The `PS3_GAME` folder itself, or `PS3_GAME/USRDIR`, picked one or two levels too deep (the setup steps up to the folder above `PS3_GAME`) | Open the folder: you should see `PS3_GAME`, and in it `PARAM.SFO` and `USRDIR`. The archive is about 9.6 GB |
+| Disc dump | A folder dump: the folder that holds `PS3_GAME`. Or a decrypted disc ISO: the `.iso` file, picked as a file. Not a drive root such as `E:\` unless `PS3_GAME` sits directly on it | `PS3_GAME/PARAM.SFO`, `PS3_GAME/USRDIR/EBOOT.BIN`, and the game archive `PS3_GAME/USRDIR/data_ps3.psarc` (or its parts `data_ps3.psarc.66600`, `.66601`, ... with no gap) | The `PS3_GAME` folder itself, or `PS3_GAME/USRDIR`, picked one or two levels too deep (the setup steps up to the folder above `PS3_GAME`) | Open the folder: you should see `PS3_GAME`, and in it `PARAM.SFO` and `USRDIR`. The archive is about 9.6 GB |
 | 1.14 update | The update folder | `PARAM.SFO`, `USRDIR/EBOOT.BIN` and `USRDIR/added_data_ps3.psarc.edat` | Its `USRDIR` folder picked by mistake (the setup steps up to the folder above) | Open the folder: `PARAM.SFO` sits next to `USRDIR`. Its `APP_VER` must be 01.14 |
 | Decrypted 1.14 EBOOT | The file `EBOOT.elf` made from the 1.14 update's `USRDIR/EBOOT.BIN` (in the update folder, for example `dev_hdd0/game/BCUS98234/USRDIR`), not the disc's `PS3_GAME/USRDIR/EBOOT.BIN` | A 64-bit PowerPC ELF file, not the encrypted `EBOOT.BIN`. The disc's EBOOT is version 1.00: the setup refuses it on the EBOOT page and the first build stops on it (E1) | If `USRDIR/EBOOT.elf` is already inside the update folder, the setup uses it and does not ask. When the console asks for it, give the file or the folder that holds it, or press Enter to use the path shown in brackets | The file starts with the letters `ELF`; an encrypted file starts with `SCE`. Its size is 21,228,256 bytes for 1.14 (the disc's 1.00 one is 20,745,952 bytes) |
 
@@ -47,7 +47,7 @@ A `WARN` lets it go on. The full log is next to the installer.
 | I1 | FAIL | The ISO is encrypted | Use a decrypted dump |
 | I2 | FAIL | The ISO cannot be read | Check that the file is complete and is a disc image |
 | U0 | WARN / FAIL | No update folder was given (WARN), or it was not found (FAIL) | Pick the update folder |
-| U1 | OK / WARN / FAIL | FAIL: the update's `PARAM.SFO` is missing or is not Killzone 3. WARN: an untested region, an update from another region than the disc, or a version other than 01.14 | Pick the right update. A mixed-region WARN can be ignored |
+| U1 | OK / WARN / FAIL | FAIL: the update's `PARAM.SFO` is missing or is not Killzone 3, or it is the disc's (the disc's `PS3_GAME` folder was given as the update). WARN: an untested region, an update from another region than the disc, or a version other than 01.14 | Pick the right update. A mixed-region WARN can be ignored |
 | U2 | OK / FAIL | `USRDIR/EBOOT.BIN` is missing in the update folder | Pick the folder that holds `PARAM.SFO` and `USRDIR` |
 | U3 | OK / WARN | `USRDIR/added_data_ps3.psarc.edat` is missing: the update's data layer would be missing | Use a complete update folder |
 | E1 | OK / WARN / FAIL | FAIL: no `EBOOT.elf` was found, it is not a 64-bit PowerPC ELF, or it is the disc's 1.00 EBOOT (or another known version). WARN: an unknown size | Pick the decrypted EBOOT of the 1.14 update, from the update's `USRDIR` folder |
@@ -55,6 +55,12 @@ A `WARN` lets it go on. The full log is next to the installer.
 | O1 | FAIL | The install folder or the build folder is inside OneDrive | Choose a folder outside OneDrive and run the setup again |
 | O2 | FAIL | A game file exists only online in OneDrive | See the OneDrive section below |
 | O3 | OK | Information only: a game folder is inside OneDrive but its files are on this device | Nothing |
+
+When a check fails, the setup's message box and the console show one line per input that failed, labelled
+`Disc dump`, `1.14 update` or `EBOOT`: the path it looked at, what is there, and what that folder or file must hold.
+They also say when the folder looks like the other input (the update given as the disc, or the disc as the update),
+and, for a drive root, which folders on its top two levels look like the disc dump or the update. A last line says
+which inputs passed.
 
 ## OneDrive
 

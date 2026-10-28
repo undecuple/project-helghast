@@ -29,7 +29,7 @@ Overview: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md). Status: [docs/FEATURES.m
 | `docs/` | public documentation; `docs/features.tsv` is the data behind `docs/FEATURES.md` |
 | `cmake/`, `flake.nix` | the MinGW-w64 toolchain file; the Nix shells |
 
-## Hard rules
+## Rules for everyone
 
 - **No game material, ever.** Never commit, attach, paste, request or link to: files from the disc or the update,
   decrypted binaries (`EBOOT.elf`, SPU images), lifted or decompiled game code (`work/recomp/`, `work/spu/`),
@@ -64,7 +64,26 @@ Overview: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md). Status: [docs/FEATURES.m
 
 ## Build and test
 
-Everything comes from the Nix flake; nothing is installed system-wide. Full steps: [docs/BUILDING.md](docs/BUILDING.md).
+Wherever you work: **never write into the game dump**, and **keep the game's files out of the repository**. That is
+what the maintainers' sandbox enforces; without it, keep to both by hand. CI is the gate for everyone:
+`.github/workflows/ci.yml` runs the full list on every pull request, with no game data and no GPU. Build steps:
+[docs/BUILDING.md](docs/BUILDING.md).
+
+- **Before every pull request** run what CI runs, if you can (it needs no game data, no GPU):
+  `nix develop .#ci --command bash -c 'git ls-files "*.sh" | xargs shellcheck -S warning && tools/ps3recomp-patched.sh && tools/run-host-tests.sh'`.
+  Without Nix, open the pull request and let CI run it.
+- **Host tests are self-contained.** A runtime fix comes with a focused host test (examples in `tools/upstream/`,
+  `tools/smoke/`, `tools/spu/`) that fails on the unpatched code and passes with the patch; list it in
+  `tools/host-tests.txt`. A test builds from the patched ps3recomp alone, defines the runtime globals it needs, and
+  prints SKIP (not FAIL) when it truly needs game data. When a patch changes what an old test checks, update that
+  test in the same change.
+- Agents without the game can still work on the tools, patches with host tests, docs and the installer; say in the
+  pull request that game runs were not done.
+
+### The maintainers' setup (Linux with Nix; not a requirement)
+
+How the maintainers run things; one way, not a requirement. Everything comes from the Nix flake; nothing is
+installed system-wide.
 
 ```sh
 nix develop .#re     # analysis and lifting
@@ -73,22 +92,29 @@ nix develop          # everything, plus Xvfb and steam-run for Proton runs
 nix develop .#ci     # lint and host tests, as CI runs them
 ```
 
-- **Before every pull request** run what CI runs (needs no game data, no GPU):
-  `nix develop .#ci --command bash -c 'git ls-files "*.sh" | xargs shellcheck -S warning && tools/ps3recomp-patched.sh && tools/run-host-tests.sh'`.
-- **Host tests are self-contained.** A runtime fix comes with a focused host test (examples in `tools/upstream/`,
-  `tools/smoke/`, `tools/spu/`) that fails on the unpatched code and passes with the patch; list it in
-  `tools/host-tests.txt`. A test builds from the patched ps3recomp alone, defines the runtime globals it needs, and
-  prints SKIP (not FAIL) when it truly needs game data. When a patch changes what an old test checks, update that
-  test in the same change.
-- **Anything that reads the game** runs inside `tools/sandbox.sh [--gpu] -- CMD` (game and repository read-only,
-  only `work/` and `build/` writable, no network). Build the exe with `tools/build-kz3.sh build/DIR`: it caps
-  compiler jobs by free memory (a lifted chunk takes up to about 1.5 GB to compile); do not run `cmake --build -jN`
-  on the lifted code.
+- **Anything that reads the game** runs inside `tools/sandbox.sh [--gpu] -- CMD` (bubblewrap, Linux only: game and
+  repository read-only, only `work/` and `build/` writable, no network). Build the exe with
+  `tools/build-kz3.sh build/DIR`: it caps compiler jobs by free memory (a lifted chunk takes up to about 1.5 GB to
+  compile); do not run `cmake --build -jN` on the lifted code.
 - **Windows runs** on Linux go through `tools/proton-test.sh` (hidden Xvfb display, audio drivers off); output in
   `work/proton/NAME/app/app_stdout.txt`, a screenshot in `work/shots/NAME.png`. Look at the screenshot before you
   claim anything about the picture.
-- Agents without the game can still work on the tools, patches with host tests, docs and the installer; say in the
-  pull request that game runs were not done.
+
+### Without Nix (for example native Windows)
+
+- **A native Windows build goes through the installer** (or the portable zip): it brings the patched toolkit, the
+  port's sources and a bundled toolchain (llvm-mingw, CMake, Ninja, an embeddable Python), and `firstrun.py` is the
+  route it runs. Players and testers use that; see the README's Windows quick start.
+- **A rebuild from a checkout with that toolchain is not a tested route.** `firstrun.py --root <checkout>` looks
+  for the patched toolkit in `work/ps3recomp-patched`, which only `tools/ps3recomp-patched.sh` (a shell script,
+  run in the maintainers' setup) makes, and the toolkit must come from the checkout's own `port/patches/` (the
+  installer's copy matches the release it came with, not your branch). The lift and build scripts (`lift.sh`,
+  `tools/spu/lift_spu.sh`, `build-kz3.sh`) expect the Nix shells.
+- **Works without the game and without Nix:** the release tools and their tests use Python 3 with the standard
+  library only, run one file at a time, e.g. `python3 tools/release/test_firstrun_check.py` (CI runs them in the
+  Nix shell; they have not been run on Windows). Docs, `docs/features.tsv` and the installer script
+  (`installer/kz3.iss`, needs Inno Setup to compile) can be worked on the same way.
+- Keep the dump outside the repository and read-only; do not run anything that writes to it.
 
 ## Docs travel with code
 

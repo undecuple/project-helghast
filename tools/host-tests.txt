@@ -137,6 +137,7 @@ tools/release/test_game_ini_keep.py
 tools/release/test_install_dir_rule.py
 tools/release/test_install_dump_page.py
 tools/release/test_install_eboot_page.py
+tools/release/test_input_reasons.py
 tools/release/test_iso9660.py
 tools/release/test_crash_report.py
 tools/release/test_bump_version.py

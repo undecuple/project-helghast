@@ -3,16 +3,24 @@
 The port's executable is generated from **your own copy** of the game: the game's code is lifted to C from your
 decrypted EBOOT and compiled on your machine. Nothing of the game is in this repository, and nothing is downloaded.
 
+**Players use the installer** (or the portable zip) from the
+[releases page](https://github.com/undecuple/project-helghast/releases); the README's
+[Windows quick start](../README.md#windows-quick-start) walks through it. The installer builds natively on Windows
+with its bundled toolchain (compiler, CMake, Ninja, Python): no WSL2, no Nix. Who checked it: the maintainers ran it
+on native Windows 11 (2026-10-21; the installer's build took 422 s, then the game ran to the menus) and a player
+built and ran the port with it on native Windows 11 (issue #10). On Windows 10 the maintainers checked, in a test VM
+without a GPU, install, uninstall and portable mode (2026-10-27), and a `kz3.exe` built on Linux starting to the menus
+on Windows' software renderer (2026-10-22); a full first-run build on Windows 10 has not been reported yet. The rest of this page is for contributors.
+
 There are two ways to get a build:
 
 - **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.4<!-- /version --> pre-release.** It checks your disc dump and
   the 1.14 update, then lifts and compiles the game's code on your machine with a bundled compiler, behind one
-  progress bar, with a full install log. Download it from the
-  [releases page](https://github.com/undecuple/project-helghast/releases).
+  progress bar, with a full install log.
 - **A developer build from source with Nix**, described below: on Linux (how the port is developed and tested
   today), on a Mac with Apple silicon, or on Windows inside WSL2. The build is the same `nix develop` steps on all
   three; only setup and running differ (see [Building on macOS](#building-on-macos) and
-  [Building on Windows](#building-on-windows)).
+  [Building from source on Windows (WSL2)](#building-from-source-on-windows-wsl2)).
 
 ## What you need
 
@@ -105,7 +113,7 @@ Environment switches for logging and diagnostics are documented in the source wh
   cross-compiler is built by Nix the first time, which can take a while if the binary cache has no macOS copy.
 - **Running:** `kz3.exe` is a Windows program and Proton does not run on macOS. The tested way is to copy
   `work/kz3-stage/` to a Windows PC with an NVIDIA GPU and run it there (copy with links resolved, as in step 5 of
-  [Building on Windows](#building-on-windows), which includes the game data).
+  [Building from source on Windows (WSL2)](#building-from-source-on-windows-wsl2), which includes the game data).
 - **Trying it on the Mac itself (untested):** Apple's [Game Porting Toolkit](https://developer.apple.com/games/game-porting-toolkit/)
   and the tools built on its D3DMetal layer (CodeWeavers' CrossOver, commercial; [Mythic](https://github.com/MythicApp/Mythic),
   free, macOS 14 or newer) run Windows x86-64 programs on Apple silicon with
@@ -116,12 +124,12 @@ Environment switches for logging and diagnostics are documented in the source wh
   and how far the game got (the log in the game's folder helps).
 - **Native macOS build:** on the wanted list (a native Apple-silicon build, no translation layers); not started.
 
-## Building on Windows
+## Building from source on Windows (WSL2)
 
-Nix does not run on Windows itself, so the build runs inside **WSL2** (a Linux system that Windows runs), and the
-result runs on Windows directly. **Status: the WSL2 build follows the Linux steps unchanged but has not been run
-on WSL2 yet.** The port itself has run on native Windows 11 (built by the installer's first run, 2026-10-21); it
-is tested mostly under Proton on Linux.
+Players on Windows do not need this: the installer builds natively (see the top of this page). This section is for
+a source build from a checkout. Nix does not run on Windows itself, so the source build runs inside **WSL2** (a Linux
+system that Windows runs), and the result runs on Windows directly. **Status: the WSL2 source build follows the Linux
+steps unchanged but has not been run on WSL2 yet.**
 
 1. **Install WSL2 with Ubuntu** in an administrator terminal: `wsl --install -d Ubuntu`, then restart. In the
    Ubuntu terminal, install [Nix](https://nixos.org/download/) (multi-user install) and enable flakes as above.

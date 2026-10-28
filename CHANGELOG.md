@@ -9,6 +9,7 @@ project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEA
 - Settings you add to `kz3.ini` by hand (for example `discord_presence = 1`) are kept when the game starts. Comments in the file are not kept.
 - When the game opens a file to create, truncate or append to it, the request is read with the PS3's flag values. No visible change from this has been seen yet.
 - When the setup stops, its message box says why (the same reason the log has), and the next start asks again for the file that was wrong. The EBOOT page refuses the disc's 1.00 EBOOT and names the update's USRDIR folder, where the 1.14 one is (#8, thanks @genericuser001).
+- When a game-file check fails, the setup and the first start say which input failed (disc dump, 1.14 update or EBOOT), the path, what is there and what it must hold. They spot a swapped disc and update, or a drive root, and say which inputs passed. An ISO dump works without copying any file by hand. The README starts with a Windows quick start (#10, #12, #13, thanks @Tzeentchnet and @Jayinem).
 
 ### Added
 - Options > Display > Discord status (On/Off, off by default): shows "Playing Killzone 3" and your chapter on your Discord profile through the Discord app on this PC; the choice is saved in kz3.ini (discord_presence).

@@ -551,6 +551,57 @@ begin
   Result := (Path <> '') and (CompareText(ExtractFileExt(Path), '.iso') = 0) and FileExists(Path) and not DirExists(Path);
 end;
 
+{ What a wrong folder holds, for the page messages (pass 64, issues #8 and #10): 'it holds 3 folders and 1 files',
+  'it is empty' or 'there is no such folder' }
+function FolderSummary(Dir: String): String;
+var
+  FR: TFindRec;
+  NDirs, NFiles: Integer;
+begin
+  if not DirExists(Dir) then begin
+    Result := 'there is no such folder';
+    Exit;
+  end;
+  NDirs := 0;
+  NFiles := 0;
+  if FindFirst(AddBackslash(Dir) + '*', FR) then begin
+    try
+      repeat
+        if (FR.Name <> '.') and (FR.Name <> '..') then begin
+          if (FR.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then NDirs := NDirs + 1 else NFiles := NFiles + 1;
+        end;
+      until not FindNext(FR);
+    finally
+      FindClose(FR);
+    end;
+  end;
+  if NDirs + NFiles = 0 then Result := 'it is empty'
+  else Result := 'it holds ' + IntToStr(NDirs) + ' folders and ' + IntToStr(NFiles) + ' files';
+end;
+
+{ The first subfolder of Dir that holds Rel (PS3_GAME\PARAM.SFO, PARAM.SFO), else '': a pick one level too high }
+function SubWith(Dir, Rel: String): String;
+var
+  FR: TFindRec;
+  More: Boolean;
+begin
+  Result := '';
+  if not DirExists(Dir) then Exit;
+  if FindFirst(AddBackslash(Dir) + '*', FR) then begin
+    try
+      More := True;
+      while More and (Result = '') do begin
+        if (FR.Name <> '.') and (FR.Name <> '..') and ((FR.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+           FileExists(AddBackslash(Dir) + FR.Name + '\' + Rel) then
+          Result := AddBackslash(Dir) + FR.Name;
+        More := FindNext(FR);
+      end;
+    finally
+      FindClose(FR);
+    end;
+  end;
+end;
+
 { A pick of PS3_GAME or PS3_GAME\USRDIR (one or two levels too deep) becomes the folder that holds PS3_GAME }
 function ResolveDump(Dir: String): String;
 var
@@ -683,13 +734,25 @@ end;
 
 { '' when the dump is Killzone 3 (US, or EU, Asia, JP as untested regions), else the message; Id = the title id found }
 function DumpProblem(Dir: String; var Id: String): String;
+var
+  Sub: String;
 begin
   Id := '';
   Result := '';
   if IsIsoPick(Dir) then Exit
   else if (CompareText(ExtractFileExt(Dir), '.iso') = 0) and not DirExists(Dir) then
     Result := 'The ISO file ' + Dir + ' was not found.'
-  else if not FileExists(AddBackslash(Dir) + 'PS3_GAME\PARAM.SFO') then
+  else if not DirExists(AddBackslash(Dir) + 'PS3_GAME') then begin
+    { pass 64: say what is there (a drive root given as the dump read as an EBOOT problem) }
+    Result := Dir + ' holds no PS3_GAME folder (' + FolderSummary(Dir) + ')';
+    Sub := SubWith(Dir, 'PS3_GAME\PARAM.SFO');
+    if Sub <> '' then Result := Result + '; PS3_GAME is one folder down: pick ' + Sub;
+    { issue #12: the update folder given as the dump (PARAM.SFO and USRDIR\EBOOT.BIN, no PS3_GAME) }
+    if FileExists(AddBackslash(Dir) + 'PARAM.SFO') and FileExists(AddBackslash(Dir) + 'USRDIR\EBOOT.BIN') then
+      Result := Result + '. It looks like the 1.14 update folder: give it as the update, and the disc dump here';
+    Result := Result + '. Select the folder that holds PS3_GAME (picking PS3_GAME itself also works), or a ' +
+      'decrypted .iso file (picked as a file).';
+  end else if not FileExists(AddBackslash(Dir) + 'PS3_GAME\PARAM.SFO') then
     Result := 'This folder does not look like a Killzone 3 disc dump: PS3_GAME\PARAM.SFO is missing. Select the ' +
       'folder that holds PS3_GAME (picking PS3_GAME itself also works), or a decrypted .iso file.'
   else begin
@@ -717,6 +780,42 @@ begin
   Dir := AddBackslash(Dir);
   Result := FileExists(Dir + 'PARAM.SFO') and FileExists(Dir + 'USRDIR\EBOOT.BIN') and
     FileExists(Dir + 'USRDIR\added_data_ps3.psarc.edat');
+end;
+
+{ Why a folder is not the update (pass 64, issues #8 and #10): the path, what is missing or what is there instead;
+  '' when UpdateOK }
+function UpdateProblem(Dir: String): String;
+var
+  D, Miss, Sub: String;
+begin
+  Result := '';
+  if UpdateOK(Dir) then Exit;
+  D := AddBackslash(Dir);
+  if not DirExists(Dir) then
+    Result := Dir + ': there is no such folder.'
+  else if DirExists(D + 'PS3_GAME') then
+    Result := Dir + ' holds PS3_GAME: that is a disc dump, not the update.'
+  else begin
+    Miss := '';
+    if not FileExists(D + 'PARAM.SFO') then Miss := 'PARAM.SFO';
+    if not FileExists(D + 'USRDIR\EBOOT.BIN') then begin
+      if Miss <> '' then Miss := Miss + ', ';
+      Miss := Miss + 'USRDIR\EBOOT.BIN';
+    end;
+    if not FileExists(D + 'USRDIR\added_data_ps3.psarc.edat') then begin
+      if Miss <> '' then Miss := Miss + ', ';
+      Miss := Miss + 'USRDIR\added_data_ps3.psarc.edat';
+    end;
+    Result := Dir + ' does not hold ' + Miss;
+    if FileExists(D + 'PARAM.SFO') or FileExists(D + 'USRDIR\EBOOT.BIN') then
+      Result := Result + '.'
+    else begin
+      Result := Result + ' (' + FolderSummary(Dir) + ')';
+      Sub := SubWith(Dir, 'PARAM.SFO');
+      if Sub <> '' then Result := Result + '; PARAM.SFO is one folder down: pick ' + Sub;
+      Result := Result + '.';
+    end;
+  end;
 end;
 
 { '' when the update's PARAM.SFO names the disc's TITLE_ID and APP_VER 01.14 (as firstrun_check.py U1), else the message }
@@ -1461,8 +1560,9 @@ begin
       MsgBox(UpdateMixNote(UpdatePage.Values[0], DiscIdOf(DumpPage.Values[0])), mbInformation, MB_OK);
     end else if not UpdateOK(UpdatePage.Values[0]) then begin
       { A missing 1.14 update stops here; Next again = check again. }
-      MsgBox('The 1.14 update was not found in this folder (PARAM.SFO, USRDIR\EBOOT.BIN and ' +
-        'USRDIR\added_data_ps3.psarc.edat are needed). The port is built on 1.14.' + #13#10 + #13#10 +
+      MsgBox('The 1.14 update was not found in this folder: ' + UpdateProblem(UpdatePage.Values[0]) + #13#10 + #13#10 +
+        'The update folder is the installed update (dev_hdd0\game\BCUS98234, or your region''s id) and holds ' +
+        'PARAM.SFO, USRDIR\EBOOT.BIN and USRDIR\added_data_ps3.psarc.edat. The port is built on 1.14.' + #13#10 + #13#10 +
         'Use the 1.14 update from your own console, or the one installed in RPCS3 ' +
         '(see RPCS3''s documentation).' + #13#10 + #13#10 +
         'Then select the folder again and press Next to check again.', mbError, MB_OK);
@@ -1476,8 +1576,9 @@ begin
     end;
   end else if CurPageID = EbootPage.ID then begin
     if not FileExists(EbootPage.Values[0]) then begin
-      MsgBox('No decrypted EBOOT here. Pick EBOOT.elf, the decrypted form of the update''s ' +
-        'USRDIR\EBOOT.BIN made from your own copy.', mbError, MB_OK);
+      MsgBox('No file at ' + EbootPage.Values[0] + ': EBOOT.elf is missing. Pick EBOOT.elf, the decrypted form of ' +
+        'the update''s USRDIR\EBOOT.BIN made from your own copy (how to get your files ready: ' +
+        'https://github.com/undecuple/project-helghast/blob/main/docs/GETTING-FILES.md).', mbError, MB_OK);
       Result := False;
     end else begin
       Problem := EbootProblem(EbootPage.Values[0]);
@@ -1531,7 +1632,7 @@ begin
   else if DumpProblem(DumpPage.Values[0], Missing) <> '' then
     Result := 'Silent install stopped: ' + DumpPage.Values[0] + ': ' + DumpProblem(DumpPage.Values[0], Missing)
   else if not UpdateOK(UpdatePage.Values[0]) then
-    Result := 'Silent install stopped: ' + UpdatePage.Values[0] + ' is not the 1.14 update (PARAM.SFO, ' +
+    Result := 'Silent install stopped: not the 1.14 update: ' + UpdateProblem(UpdatePage.Values[0]) + ' (PARAM.SFO, ' +
       'USRDIR\EBOOT.BIN and USRDIR\added_data_ps3.psarc.edat are needed)'
   else if UpdateIdProblem(UpdatePage.Values[0], DiscIdOf(DumpPage.Values[0])) <> '' then
     Result := 'Silent install stopped: ' + UpdatePage.Values[0] + ': ' +

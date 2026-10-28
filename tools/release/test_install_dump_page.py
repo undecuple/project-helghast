@@ -32,6 +32,12 @@ def func(name):
     return m.group(0) if m else ""
 
 
+g = func("DumpProblem")
+check("It looks like the 1.14 update folder: give it as the update, and the disc dump here" in g and
+      "FileExists(AddBackslash(Dir) + 'USRDIR\\EBOOT.BIN')" in g,
+      "DumpProblem names an update folder given as the dump (issue #12)")
+check(g.index("one folder down") < g.index("It looks like the 1.14 update folder") < g.index("Select the folder"),
+      "the update hint sits after the one-folder-down hint and before the accepted forms")
 f = func("ResolveDump")
 check("'PS3_GAME\\PARAM.SFO'" in f and "EndsWithName(D, 'USRDIR')" in f and "EndsWithName(D, 'PS3_GAME')" in f and
       "ExtractFileDir" in f, "ResolveDump walks up from PS3_GAME and PS3_GAME\\USRDIR")
@@ -183,4 +189,19 @@ if fc:
                 open(os.path.join(usr, "data_ps3.psarc" + s), "wb").write(b"x")
             parts, missing = fc.split_parts(os.path.join(usr, "data_ps3.psarc"))
             check(archive_problem(usr) == missing, "ArchiveProblem and firstrun_check.split_parts agree: %s (%r)" % (name, missing))
+# pass 64 (issues #8, #10, #12, #13): the page messages name the path and what is there
+fs, sw, dp, up = func("FolderSummary"), func("SubWith"), func("DumpProblem"), func("UpdateProblem")
+check("FindFirst" in fs and "FindClose" in fs and "FILE_ATTRIBUTE_DIRECTORY" in fs and "'it is empty'" in fs,
+      "FolderSummary counts the folder's entries")
+check("FindFirst" in sw and "FileExists(AddBackslash(Dir) + FR.Name + '\\' + Rel)" in sw, "SubWith looks one folder down")
+check(code.find("function FolderSummary") < code.find("function DumpProblem") and
+      code.find("function SubWith") < code.find("function DumpProblem") and
+      code.find("function UpdateProblem") > code.find("function UpdateOK"), "helpers are declared before their users")
+check("Dir + ' holds no PS3_GAME folder (' + FolderSummary(Dir)" in dp and "SubWith(Dir, 'PS3_GAME\\PARAM.SFO')" in dp
+      and "not DirExists(AddBackslash(Dir) + 'PS3_GAME')" in dp, "DumpProblem says what a folder without PS3_GAME holds")
+check("that is a disc dump, not the update" in up and "' does not hold ' + Miss" in up and "SubWith(Dir, 'PARAM.SFO')" in up
+      and "UpdateOK(Dir) then Exit" in up, "UpdateProblem names the path, the missing files or the disc dump")
+check(code.count("UpdateProblem(UpdatePage.Values[0])") == 2, "the update page and the silent install show UpdateProblem")
+check("'No file at ' + EbootPage.Values[0] + ': EBOOT.elf is missing." in code and "No decrypted EBOOT here." not in code,
+      "the EBOOT page names the path (control: the old pathless text is gone)")
 sys.exit(1 if bad else 0)

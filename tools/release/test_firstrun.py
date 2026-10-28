@@ -569,6 +569,17 @@ def main():
         lg16 = open(next(os.path.join(tmp, "dl", n) for n in sorted(os.listdir(os.path.join(tmp, "dl")))
                          if n.endswith(".log") and why in open(os.path.join(tmp, "dl", n)).read())).read()
         check("REASON " not in lg16 and why in lg16, "16 the log has the reason text, without the REASON tag")
+        # pass 64 (issues #8, #10): firstrun_check's facts.reasons (per failing input: path, what is there, what it
+        # must hold; which inputs passed) replace the raw FAIL messages; the control above (no reasons) keeps them
+        rs16 = ["The disc dump failed: E:\\ holds no PS3_GAME folder (3 folders, 1 files). It must be ...",
+                "Passed: the 1.14 update and the decrypted EBOOT."]
+        rep16r = json.dumps({"ok": False, "facts": {"reasons": rs16}, "checks": [
+            {"level": "FAIL", "code": "D1", "message": "disc dump: no PARAM.SFO at E:\\PS3_GAME\\PARAM.SFO"}]})
+        chk16r = [fr.Step("check", "Checking the game files", 1,
+                          lambda c: [py(f"import sys; print({rep16r!r}); sys.exit(1)")], always=True)]
+        rc, out = run(tmp, chk16r, "--build", os.path.join(tmp, "b16r"), "--status-file", sf16)
+        st = open(sf16).read().splitlines()
+        check(rc == 1 and st[2:] == [f"REASON {x}" for x in rs16], f"16 facts.reasons become the REASON lines {st}")
         # another step: its last error line
         cmp16 = [fr.Step("compile", "Compiling", 1, lambda c: [py("import sys; print('a.c:1: error: boom'); "
                                                                      "print('ninja: build stopped'); sys.exit(1)")])]

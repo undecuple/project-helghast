@@ -95,7 +95,8 @@ DEFAULT_LOG_NAME = names.SETUP_LOG
 MARKER_DIR = ".firstrun"
 KEEP_LOG_COPIES = 5                      # the install's logs\ keeps the last five (plan 9.11)
 NINJA_RE = re.compile(r"^\[(\d+)/(\d+)\]")
-REASON_MAX = 400       # characters of one REASON line (a message box line, not a log dump)
+REASON_MAX = 900       # characters of one REASON line (a message box paragraph, not a log dump; pass 64: an input's
+                       # line names its path, what is there and what it must hold)
 
 # Lift constants per EBOOT version (tools/lift.sh: kz3ver.py DEFAULT, 114 on main since 2026-10-22; KZ3_EBOOT_VER=100 selects 1.00). The tree being built
 # decides which one (tree_eboot_ver, pass 12): its runtime glue (port/) is written for one EBOOT's addresses, so a
@@ -1306,7 +1307,9 @@ class Runner:
         if step.name == "check":
             try:
                 j = json.loads("\n".join(ln for ln in out if not ln.startswith("ARCHIVE-HASH ")))
-                fails = [c["message"] for c in j.get("checks", []) if c.get("level") == "FAIL"]
+                # issues #8, #10: per failing input its path, what is there, what it must hold; which inputs passed
+                fails = (j.get("facts") or {}).get("reasons") or \
+                    [c["message"] for c in j.get("checks", []) if c.get("level") == "FAIL"]
                 if fails:
                     return fails
             except (ValueError, AttributeError, KeyError, TypeError):
@@ -1855,6 +1858,8 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     if a.interactive and not a.dry_run:
         if not interactive(a, root, pick_log(a.log_dir or None, a.log_name)[0], notes, ask=ask, out=out):
             quit_early = True
+    import firstrun_check as fc   # a pick of PS3_GAME, PS3_GAME/USRDIR or the update's USRDIR: the folder above (pass 64)
+    a.dump, a.update = fc.resolve_dump(a.dump), fc.resolve_update(a.update)
     is_iso = bool(a.dump) and os.path.isfile(a.dump)      # a decrypted disc ISO instead of a dump folder
     steps = steps_for(root, a.shaders, iso=is_iso) if steps is None else steps
     if (a.interactive or a.bar) and not a.dry_run:
