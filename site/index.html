@@ -22,7 +22,7 @@
 <p class="what">A Windows x64 port of the 2011 PS3 game, made by static recompilation: the game&#x27;s PowerPC and SPU code is translated to C ahead of time and compiled into a native PC program, so no CPU emulator runs at play time. The GPU is still translated as it runs (RSX to Direct3D 12); native replacements come step by step.</p>
 <p class="headline">Status: <strong>Partly playable</strong></p>
 <p class="note">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>
-<p class="note">v0.1.2 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
+<p class="note">v0.1.3 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
 <p class="btns"><a class="btn" href="#status">See the status</a><a class="btn alt" href="https://github.com/undecuple/project-helghast">Source on GitHub</a></p>
 </div>
 </header>
@@ -313,14 +313,14 @@
 <section id="changelog" class="promo term">
 <h2>Changelog</h2>
 <ul class="clog">
+<li><time datetime="2026-10-28">10-28</time><span>A disc dump whose game archive is split into parts (data_ps3.psarc.66600, .66601, and so on, as a FAT32...</span></li>
+<li><time datetime="2026-10-28">10-28</time><span>The Asian (BCAS25008) and Japanese (BCJS30066) discs are accepted as untested regions, and a 1.14 update...</span></li>
+<li><time datetime="2026-10-28">10-28</time><span>The first run checks the disc&#x27;s game archive against the known copy (A1) and says when it differs; the...</span></li>
+<li><time datetime="2026-10-28">10-28</time><span>The game window shows the project&#x27;s icon in its title bar and taskbar.</span></li>
+<li><time datetime="2026-10-28">10-28</time><span>The game stopped a few seconds after a level started (for example after the chapter 1 movie): the setup...</span></li>
+<li><time datetime="2026-10-28">10-28</time><span>The game folders are given once: when the build is started later or a check fails, the first start checks...</span></li>
 <li><time datetime="2026-10-28">10-28</time><span>A decrypted disc ISO works as the game source, next to a folder dump: the setup copies the game files it...</span></li>
 <li><time datetime="2026-10-28">10-28</time><span>The EU disc (BCES01007) is accepted as an untested region, with its own 1.14 update.</span></li>
-<li><time datetime="2026-10-28">10-28</time><span>The disc page reads the disc&#x27;s title id and names it; picking PS3_GAME or USRDIR instead of the dump folder...</span></li>
-<li><time datetime="2026-10-28">10-28</time><span>Installing into a OneDrive folder is refused, and game files that are only online in OneDrive are named with...</span></li>
-<li><time datetime="2026-10-28">10-28</time><span>On PCs in time zones west of UTC (the Americas) the build stopped with &quot;manifest &#x27;build.ninja&#x27; still dirty...</span></li>
-<li><time datetime="2026-10-28">10-28</time><span>The setup log no longer lists the crash-report address.</span></li>
-<li><time datetime="2026-10-27">10-27</time><span>Opt-in crash reports: when turned on (installer, Advanced page, or &quot;Crash reports on or off&quot; in the Start...</span></li>
-<li><time datetime="2026-10-27">10-27</time><span>Windows installer and portable zip with a bundled compiler, one progress bar, a full install log, a desktop...</span></li>
 </ul>
 <p class="small">Newest first; the full list is in <a href="https://github.com/undecuple/project-helghast/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
 </section>
@@ -354,8 +354,8 @@
 </section>
 <section id="install" class="promo">
 <h2>Install</h2>
-<p class="headline"><strong>v0.1.2 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
-<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.2">v0.1.2</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10-30 minutes. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
+<p class="headline"><strong>v0.1.3 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
+<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.3">v0.1.3</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10-30 minutes. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
 <p>You can also build the port from source: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md">building</a>.</p>
 <h3>What goes online</h3>
 <p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on), opt-in crash reports (sent by the launcher after a crash when you opt in, with your names, addresses and folders removed, never a memory dump), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast#what-goes-online">README</a>.</p>

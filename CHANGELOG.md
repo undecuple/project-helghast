@@ -3,7 +3,7 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
-## [Unreleased]
+## [0.1.3] - 2026-10-28 (pre-release)
 
 ### Added
 - A disc dump whose game archive is split into parts (data_ps3.psarc.66600, .66601, and so on, as a FAT32 drive stores it) is accepted as it is, by the setup, the first-run check and the game. A missing part is named.

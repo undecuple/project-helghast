@@ -219,7 +219,7 @@ def main():
         expect(not any("D56" in t or "/home" in t for t in texts), "internal wording must be skipped")
         expect(all(len(t) <= 112 for t in texts) and any(t.endswith("...") for t in texts), "long lines must be capped")
         expect(len(website.changelog(root, 2)) == 2, "n caps the entries")
-        real = website.changelog(pathlib.Path(__file__).resolve().parents[2], 20)
+        real = website.changelog(pathlib.Path(__file__).resolve().parents[2], 1000)   # the whole file: newer entries push the 0.1.0 items down
         expect(any("Field of view" in t for _, t in real) and any("Frame rate limit" in t for _, t in real)
                and any("Ultrawide" in t for _, t in real) and any("co-op" in t for _, t in real), f"real CHANGELOG.md lacks items: {real}")
     rows = [{"kind": "ps3", "feature": f"F{i}", "status": s} for i, s in

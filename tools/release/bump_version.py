@@ -62,8 +62,8 @@ def sub1(text, pattern, repl, what):
 def changelog_stub(text, version, date):
     if re.search(rf"^## \[{re.escape(version)}\]", text, re.M):
         return text
-    if re.search(r"^## \[Unreleased\]\s*$", text, re.M):   # Keep a Changelog: the release takes the unreleased entries
-        return re.sub(r"^## \[Unreleased\]\s*$", f"## [{version}] - {date} (pre-release)", text, count=1, flags=re.M)
+    if re.search(r"^## \[Unreleased\][ \t]*$", text, re.M):   # Keep a Changelog: the release takes the unreleased entries
+        return re.sub(r"^## \[Unreleased\][ \t]*$", f"## [{version}] - {date} (pre-release)", text, count=1, flags=re.M)
     m = re.search(r"^## \[", text, re.M)
     if not m:
         raise SystemExit("bump_version: no '## [' entry in CHANGELOG.md to put the stub above")

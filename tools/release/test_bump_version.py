@@ -101,7 +101,7 @@ def main():
         check(f"latest <!-- version -->v{new}<!-- /version -->" in t("public/docs/ROADMAP.md"), "ROADMAP marker")
         cl = t("public/CHANGELOG.md")
         if "## [Unreleased]" in t0_changelog:   # the unreleased entries become the release's
-            check(f"## [{new}] - 2030-01-02 (pre-release)" in cl and "## [Unreleased]" not in cl
+            check(f"## [{new}] - 2030-01-02 (pre-release)\n\n" in cl and "## [Unreleased]" not in cl
                   and cl.count(f"## [{new}]") == 1, "CHANGELOG [Unreleased] becomes the new version")
         else:
             stub = f"## [{new}] - 2030-01-02 (pre-release)\n\n### Added\n\n## [{cur}]"
