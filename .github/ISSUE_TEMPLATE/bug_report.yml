@@ -28,7 +28,7 @@ body:
     id: version
     attributes:
       label: Port build
-      description: "Release number, or the commit (`git rev-parse --short HEAD`) of the build you ran."
+      description: "The version in the file you downloaded, for example 0.1.2 from Project-Helghast-0.1.2-portable.zip; or the commit (`git rev-parse --short HEAD`) if you built it yourself."
     validations:
       required: true
   - type: input
@@ -47,4 +47,4 @@ body:
     id: logs
     attributes:
       label: Log file
-      description: "Attach the newest file from `logs/` next to the exe (and the crash file there, if any). Before attaching, open the log and remove your Windows or Linux user name, home folder paths and any host name (search for your user name). Never attach game files, decrypted binaries, saves or keys."
+      description: "Install or build problems: attach Project-Helghast-setup.log (next to the setup.exe you ran) and the newest firstrun-*.log from the install's `logs` folder. Game problems: attach the newest file from `build\\logs` in the install (and the crash file there, if any). Before attaching, open the log and remove your Windows or Linux user name, home folder paths and any host name (search for your user name). Never attach game files, decrypted binaries, saves or keys."
