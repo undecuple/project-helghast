@@ -37,4 +37,13 @@ m = re.search(r"function PrepareToInstall.*?DefaultEboot;", t, re.S)
 check(m and "InstallDirProblem(ExpandConstant('{app}'))" in m.group(0) and
       m.group(0).index("InstallDirProblem") < m.group(0).index("if not WizardSilent"),
       "PrepareToInstall checks the folder before the silent-only branch")
+# OneDrive (playtester's log, 2026-10-28): the install folder inside OneDrive is refused, silent installs too
+m = re.search(r"function InOneDrive.*?\nend;", t, re.S)
+check(m and all(v in m.group(0) for v in ("'OneDrive'", "'OneDriveConsumer'", "'OneDriveCommercial'")) and
+      "GetEnv(" in m.group(0) and "Lowercase(" in m.group(0) and "Pos(B + '\\', D) = 1" in m.group(0),
+      "InOneDrive reads the three OneDrive env vars, case-insensitive whole-component prefix match")
+m = re.search(r"function InstallDirProblem.*?\nend;", t, re.S)
+check(m and "else if InOneDrive(D) then" in m.group(0) and "inside OneDrive" in m.group(0) and
+      "outside OneDrive" in m.group(0) and "%LOCALAPPDATA%" in m.group(0),
+      "InstallDirProblem refuses OneDrive with the plain message (also reached by PrepareToInstall for /DIR=)")
 sys.exit(1 if bad else 0)

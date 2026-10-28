@@ -196,6 +196,49 @@ def main():
         check("H1 unreadable hashes file warns", rc == 0 and levels(out, "H1") == {"WARN"}, out)
         rc, out = run(["--dump", d, "--update", ux] + small + hashes(got))
         check("no H1 when E1 failed", "H1" not in out, out)
+
+        # OneDrive (O1 install/build folder, O2 online-only files, O3 INFO): fake env vars and fake attributes
+        env = {"OneDrive": "C:\\Users\\someone\\OneDrive", "OneDriveCommercial": "D:\\Work\\OneDrive - Corp"}
+        check("O1 prefix match, case-insensitive",
+              fc.onedrive_root_of("c:\\users\\SOMEONE\\onedrive\\Desktop\\Project Helghast", env) == env["OneDrive"]
+              and fc.onedrive_root_of("D:/Work/OneDrive - Corp/x", env) == env["OneDriveCommercial"])
+        check("O1 whole components only, empty env is nothing",
+              fc.onedrive_root_of("C:\\Users\\someone\\OneDrive2\\x", env) == ""
+              and fc.onedrive_root_of("C:\\Users\\someone\\Programs", {}) == "")
+        r = fc.Report()
+        fc.check_onedrive_tree(r, "C:\\Users\\someone\\OneDrive\\Desktop\\Project Helghast", "C:\\b\\build", env)
+        check("O1 fails for a root inside OneDrive only", [(c["code"], c["level"]) for c in r.checks] == [("O1", "FAIL")]
+              and "outside OneDrive" in r.checks[0]["message"], r.checks)
+        r = fc.Report()
+        fc.check_onedrive_tree(r, "C:\\ok\\Project Helghast", "D:\\Work\\OneDrive - Corp\\build", env)
+        check("O1 fails for a build dir inside OneDrive", len(r.checks) == 1 and "build folder" in r.checks[0]["message"])
+        old = os.environ.get("OneDrive")
+        os.environ["OneDrive"] = os.path.join(tmp, "hdd0")      # the update folder sits inside the fake OneDrive
+        real = fc.file_attributes
+        try:
+            rc, out = run(["--dump", d, "--update", u] + small + hashes(got))
+            check("O3 INFO only when inside OneDrive but local", rc == 0 and levels(out, "O3") == {"OK"} and "INFO" in out
+                  and "O2" not in out, out)
+            fc.file_attributes = lambda p: 0x400000 if p.endswith("data_ps3.psarc") else 0
+            rc, out = run(["--dump", d, "--update", u, "--json"] + small + hashes(got))
+            j = json.loads(out)
+            o2 = [c for c in j["checks"] if c["code"] == "O2"]
+            check("O2 fails for an online-only psarc, with the fix, and reads nothing else",
+                  rc == 1 and not j["ok"] and len(o2) == 1 and o2[0]["level"] == "FAIL"
+                  and "Always keep on this device" in o2[0]["message"] and "data_ps3.psarc" in o2[0]["message"]
+                  and not any(c["code"] in ("D1", "D3", "E1") for c in j["checks"]), out)
+            for bit in (0x40000, 0x1000):
+                fc.file_attributes = lambda p, b=bit: b if p.endswith("PARAM.SFO") else 0
+                rc, out = run(["--dump", d, "--update", u] + small)
+                check(f"O2 fails for attribute 0x{bit:x}", rc == 1 and levels(out, "O2") == {"FAIL"}, out)
+        finally:
+            fc.file_attributes = real
+            if old is None:
+                del os.environ["OneDrive"]
+            else:
+                os.environ["OneDrive"] = old
+        rc, out = run(["--dump", d, "--update", u] + small + hashes(got) + ["--root", "/x/OneDrive/p", "--build", "/x/b"])
+        check("--root without OneDrive env passes", rc == 0 and "O1" not in out, out)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"firstrun_check: {'PASS' if not FAILS else 'FAIL ' + ', '.join(FAILS)}")

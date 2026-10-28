@@ -20,7 +20,7 @@
 *Helghast* is the name of the game's own faction; Project Helghast is a fan project, not official and not
 affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games.
 
-You need your own Killzone 3 disc dump, the 1.14 update and a decrypted EBOOT from your own copy. Version 0.1.1 is a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
+You need your own Killzone 3 disc dump, the 1.14 update and a decrypted EBOOT from your own copy. Version <!-- version -->0.1.1<!-- /version --> is a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 A PC port of **Killzone 3** (PS3, 2011) made by **static recompilation**: the game's PowerPC (PPU) and Cell SPU
 code is translated to C ahead of time and compiled into a native Windows x64 program, so no CPU emulator runs at
@@ -105,12 +105,12 @@ Start-menu "Open saves folder" entry say which rule decided, for example `data: 
 
 ## Getting it
 
-**Download:** [v0.1.1](https://github.com/undecuple/project-helghast/releases/tag/v0.1.1) is a pre-release (partly
+**Download:** <!-- version -->[v0.1.1](https://github.com/undecuple/project-helghast/releases/tag/v0.1.1)<!-- /version --> is a pre-release (partly
 playable). Get `Project-Helghast-setup.exe` (recommended) or the portable zip from the
 [releases page](https://github.com/undecuple/project-helghast/releases) and check it against `SHA256SUMS`. The installer
 checks your own disc dump, 1.14 update and decrypted EBOOT, then recompiles and builds the game's code on your own
 machine with a bundled compiler (about 10-30 minutes on the first start). No game code, assets or keys are ever shipped
-or downloaded. You can also build it yourself (below). What a release must meet to be called playable is in
+or downloaded. You can also build it yourself (below). Do not install into a OneDrive folder (it would sync the build's thousands of files while they are written), and keep your game files on this device (in OneDrive: "Always keep on this device"); the installer refuses a OneDrive folder, and the first-run check refuses game files that are only online. What a release must meet to be called playable is in
 [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 **Always start the game through the launcher (`Project Helghast.exe`, or the desktop and Start-menu shortcuts).**

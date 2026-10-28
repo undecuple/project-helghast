@@ -15,6 +15,11 @@ file sizes.
             the ELF's SHA-256 against it: a mismatch is a WARN with the size and both hashes (never a FAIL: the build
             only needs a 1.14 EBOOT that lifts); an empty value means "unknown yet" and also only warns.
 
+  --root / --build  the install and build folders; a FAIL O1 when either is inside OneDrive (env OneDrive,
+            OneDriveConsumer, OneDriveCommercial). O2 FAIL: a game file is an online-only OneDrive placeholder
+            (file attributes 0x400000, 0x40000 or 0x1000); checked before any file is read, so nothing downloads.
+            O3 (OK, INFO): the dump or update is inside OneDrive but fully local.
+
 One line per check: OK / WARN / FAIL <code>: <message>. Exit 0 = no FAIL, 1 = at least one FAIL, 2 = usage.
 --json prints {"ok": bool, "checks": [{"code", "level", "message"}], "facts": {...}} instead. Numbers come from
 the RE notes and a known-good dump (ASSUMPTION where marked); no game content is embedded.
@@ -39,6 +44,12 @@ PSARC_MAGIC = b"PSAR"
 SELF_MAGIC = b"SCE\0"
 ELF_MAGIC = b"\x7fELF"
 EM_PPC64 = 0x15
+ONEDRIVE_VARS = ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
+# st_file_attributes bits of a OneDrive "files on demand" placeholder (online-only file)
+ATTR_OFFLINE = 0x1000
+ATTR_RECALL_ON_OPEN = 0x40000
+ATTR_RECALL_ON_DATA_ACCESS = 0x400000
+ONLINE_ONLY_MASK = ATTR_OFFLINE | ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS
 HASHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eboot_sha256.json")
 
 
@@ -55,6 +66,79 @@ def read_sfo(path):
         v = d[dt + do:dt + do + ln]
         out[k] = struct.unpack("<I", v)[0] if fmt == 0x404 else v.rstrip(b"\0").decode(errors="replace")
     return out
+
+
+def _norm(p):
+    return os.path.abspath(p).replace("/", "\\").rstrip("\\").lower()
+
+
+def onedrive_root_of(path, env=None):
+    """The OneDrive folder (from OneDrive, OneDriveConsumer, OneDriveCommercial) that holds `path`, else ''.
+    Prefix match on whole path components, case-insensitive; the same rule as installer/kz3.iss."""
+    env = os.environ if env is None else env
+    p = _norm(path)
+    for var in ONEDRIVE_VARS:
+        base = (env.get(var) or "").strip().strip('"')
+        if not base:
+            continue
+        b = _norm(base)
+        if b and (p == b or p.startswith(b + "\\")):
+            return base
+    return ""
+
+
+def file_attributes(path):
+    """Windows st_file_attributes of `path` (0 elsewhere or when unreadable). Reads no file content."""
+    try:
+        return getattr(os.stat(path), "st_file_attributes", 0)
+    except OSError:
+        return 0
+
+
+def check_onedrive_tree(r, root, build, env=None):
+    """O1 (FAIL): the install root or the build folder is inside OneDrive: it would sync the build's thousands of
+    files while the compiler writes them (locked files, a churning build). Silent when fine."""
+    for what, path in (("install folder", root), ("build folder", build)):
+        od = onedrive_root_of(path, env) if path else ""
+        if od:
+            r.fail("O1", f"the {what} {path} is inside OneDrive ({od}), which syncs the build's thousands of files "
+                         "while it runs and locks them. Choose a folder outside OneDrive (for the installer the "
+                         "default, %LOCALAPPDATA%\\Programs\\Project Helghast, is fine) and run the setup again")
+
+
+def game_files(dump, update, eboot):
+    """The files the build reads."""
+    f = []
+    if dump:
+        u = os.path.join(dump, "PS3_GAME", "USRDIR")
+        f += [os.path.join(dump, "PS3_GAME", "PARAM.SFO"), os.path.join(u, "EBOOT.BIN"),
+              os.path.join(u, "data_ps3.psarc")]
+    if update:
+        f += [os.path.join(update, "PARAM.SFO"), os.path.join(update, "USRDIR", "EBOOT.BIN"),
+              os.path.join(update, "USRDIR", UPDATE_EDAT), os.path.join(update, "USRDIR", "EBOOT.elf")]
+    if eboot:
+        f.append(eboot)
+    return f
+
+
+def check_online_only(r, dump, update, eboot, env=None, attrs=None):
+    """O2 (FAIL): a game file is a OneDrive online-only placeholder (RECALL_ON_DATA_ACCESS, RECALL_ON_OPEN or
+    OFFLINE): reading the 9 GB archive would download it or fail with a cloud-provider error. O3 (OK, an INFO
+    line): a folder inside OneDrive whose files are all local. Runs before any content is read; returns True if O2
+    failed."""
+    attrs = attrs or file_attributes
+    online = [p for p in game_files(dump, update, eboot) if os.path.exists(p) and attrs(p) & ONLINE_ONLY_MASK]
+    if online:
+        names = ", ".join(os.path.basename(p) for p in online[:4]) + (" ..." if len(online) > 4 else "")
+        r.fail("O2", f"{len(online)} game file(s) exist only online in OneDrive ({names}; first: {online[0]}). "
+                     "Right-click the game folder (the disc dump, the update and the EBOOT's folder), choose "
+                     "\"Always keep on this device\", wait until OneDrive has downloaded it, then run the setup again")
+        return True
+    for what, path in (("disc dump", dump), ("1.14 update", update)):
+        od = onedrive_root_of(path, env) if path else ""
+        if od:
+            r.ok("O3", f"INFO: the {what} folder is inside OneDrive ({od}) but its files are on this device")
+    return False
 
 
 def head(path, n):
@@ -231,10 +315,17 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--min-psarc-bytes", type=int, default=MIN_PSARC_BYTES)
     ap.add_argument("--hashes", default=HASHES_FILE)
+    ap.add_argument("--root", help="the install folder; refused (O1) when inside OneDrive")
+    ap.add_argument("--build", help="the build folder; refused (O1) when inside OneDrive")
     ap.add_argument("--target", choices=("1.00", "1.14"), default="1.14",
                     help="the EBOOT version the build is for (firstrun.py passes its tree's; pass 12)")
     a = ap.parse_args(argv)
     r = Report()
+    check_onedrive_tree(r, a.root, a.build)
+    # before anything is read: opening an online-only placeholder would start a download of the 9 GB archive
+    if check_online_only(r, a.dump if os.path.isdir(a.dump) else "", a.update if a.update and os.path.isdir(a.update) else "",
+                         a.eboot or ""):
+        return finish(r, a)
     if not os.path.isdir(a.dump):
         r.fail("D0", f"dump folder not found: {a.dump}")
     else:
@@ -254,6 +345,10 @@ def main(argv=None):
         elf = next((c for c in cand if os.path.isfile(c) and head(c, 4) == ELF_MAGIC), cand[0])
     check_eboot_elf(r, elf, a.target)
     check_eboot_hash(r, elf, a.hashes)
+    return finish(r, a)
+
+
+def finish(r, a):
     if a.json:
         print(json.dumps({"ok": r.passed, "checks": r.checks, "facts": r.facts}, indent=2))
     else:

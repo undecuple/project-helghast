@@ -245,7 +245,7 @@ def lift_inputs_hash(c):
 # ------------------------------------------------------------------------------------------------- the step table
 def cmd_check(c):
     a = [*c.py, c.tool("release", "firstrun_check.py"), "--dump", c.dump, "--json",
-         "--target", EBOOT_VERS[c.ver]["check"]]
+         "--target", EBOOT_VERS[c.ver]["check"], "--root", c.root, "--build", c.build]
     if c.update:
         a += ["--update", c.update]
     if c.eboot:

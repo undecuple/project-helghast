@@ -1,0 +1,68 @@
+# Read-only check of a published release: fails when the release and the repository at its tag disagree.
+#
+# Triggers: a published release, and workflow_dispatch (input: tag). Nothing is written: no release edit, no push, no
+# tag, no artefact (the log is the output). Checks (logic in tools/release/release_check.py, host-tested):
+#   tag = v + names.VERSION at the tagged commit; published, pre-release while 0.x, title = tag, body names the version;
+#   assets are exactly the setup, the portable zip, their .sha256 files and SHA256SUMS (names from names.py);
+#   sha256sum -c SHA256SUMS passes and every .sha256 matches its file and SHA256SUMS;
+#   test_version_agree.py passes at the tag, and README.md and site/index.html link releases/tag/<tag>.
+# Third-party: actions/checkout (GitHub, MIT), the gh CLI (MIT, on the image).
+name: release-check
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to check (vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-check-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Tag shape
+        run: |
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tag '$TAG' is not vMAJOR.MINOR.PATCH"; exit 1 ;;
+          esac
+          case "$TAG" in *[!0-9v.]*) echo "::error::tag '$TAG' has odd characters"; exit 1 ;; esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      - name: Release JSON
+        run: gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$RUNNER_TEMP/release.json"
+
+      - name: Download the assets
+        run: |
+          mkdir -p "$RUNNER_TEMP/assets"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/assets"
+          ls -l "$RUNNER_TEMP/assets"
+
+      - name: sha256sum -c SHA256SUMS
+        run: cd "$RUNNER_TEMP/assets" && sha256sum -c SHA256SUMS
+
+      - name: Release against the repository (tag, pre-release, assets, hashes, README and site links)
+        run: |
+          python3 tools/release/release_check.py --tag "$TAG" --release "$RUNNER_TEMP/release.json" \
+            --assets "$RUNNER_TEMP/assets" --root .
+
+      - name: Version mirrors and mentions at the tag
+        run: python3 tools/release/test_version_agree.py

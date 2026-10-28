@@ -5,7 +5,7 @@ decrypted EBOOT and compiled on your machine. Nothing of the game is in this rep
 
 There are two ways to get a build:
 
-- **The installer or portable zip (Windows, or Linux with Proton), v0.1.1 pre-release.** It checks your disc dump and
+- **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.1<!-- /version --> pre-release.** It checks your disc dump and
   the 1.14 update, then lifts and compiles the game's code on your machine with a bundled compiler, behind one
   progress bar, with a full install log. Download it from the
   [releases page](https://github.com/undecuple/project-helghast/releases).
@@ -139,6 +139,7 @@ is tested mostly under Proton on Linux.
    and a current driver.
 
 The installer does all of this on Windows without WSL2 or Nix (a bundled compiler; see the releases page).
+Do not install or build inside a OneDrive folder (it syncs the build's thousands of files while they are written), and keep your game files on this device (in OneDrive: "Always keep on this device"); the installer and the first-run check refuse both.
 
 ## Running
 

@@ -1,11 +1,14 @@
 # CodeQL code scanning (Python tools, C/C++ port code, workflows). Code scanning on a private repository needs
-# GitHub Advanced Security, so the job runs only once the repository is public.
+# GitHub Advanced Security, so the job runs only once the repository is public. Pushes and pull requests that change
+# only docs, the site or screenshots skip it (nothing it analyses changed); the weekly run covers the whole tree.
 name: CodeQL
 on:
   push:
     branches: [main]
+    paths-ignore: ["docs/**", "site/**", "**/*.md"]
   pull_request:
     branches: [main]
+    paths-ignore: ["docs/**", "site/**", "**/*.md"]
   schedule:
     - cron: "17 4 * * 1"
 permissions:
@@ -14,6 +17,7 @@ jobs:
   analyze:
     if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write

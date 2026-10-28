@@ -954,6 +954,27 @@ begin
     ((Prof <> '') and ((D = Lowercase(Prof)) or (D = Lowercase(Prof + '\Downloads'))));
 end;
 
+{ True when Dir is OneDrive's folder or inside it (the OneDrive, OneDriveConsumer and OneDriveCommercial
+  environment variables, case-insensitive prefix match on whole path components; the same for silent installs) }
+function InOneDrive(Dir: String): Boolean;
+var
+  D, B: String;
+  I: Integer;
+  Vars: array of String;
+begin
+  Result := False;
+  D := Lowercase(RemoveBackslashUnlessRoot(Dir));
+  SetArrayLength(Vars, 3);
+  Vars[0] := 'OneDrive';
+  Vars[1] := 'OneDriveConsumer';
+  Vars[2] := 'OneDriveCommercial';
+  for I := 0 to 2 do begin
+    B := Lowercase(RemoveBackslashUnlessRoot(GetEnv(Vars[I])));
+    if (B <> '') and ((D = B) or (Pos(B + '\', D) = 1)) then
+      Result := True;
+  end;
+end;
+
 { '' when Dir (the final install folder) is acceptable, else the reason }
 function InstallDirProblem(Dir: String): String;
 var
@@ -963,6 +984,9 @@ begin
   D := RemoveBackslashUnlessRoot(Dir);
   if CompareText(ExtractFileName(D), '{#AppDirName}') <> 0 then
     Result := 'The install folder must be called "{#AppDirName}" (it is: ' + D + ').'
+  else if InOneDrive(D) then
+    Result := 'The folder ' + D + ' is inside OneDrive, which syncs the build''s thousands of files while it runs ' +
+      'and locks them. Choose a folder outside OneDrive (the default, %LOCALAPPDATA%\Programs\{#AppDirName}, is fine).'
   else if IsProtectedFolder(D) then
     Result := 'This folder cannot be used as the install folder: ' + D
   else if DirExists(D) and DirHasFiles(D) and (not FileExists(AddBackslash(D) + 'unins000.exe')) then

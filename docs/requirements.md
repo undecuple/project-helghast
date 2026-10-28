@@ -56,4 +56,6 @@ build it yourself" (see the end). Building needs more than playing:
 - **Online play**: the game's own network code against a self-hosted Medius-compatible server that players or
   the community run; a self-hosted Nakama server (with instructions) is the alternative. The port does not connect
   to PS Rewired, the community service that keeps the original PS3 game online. Multiplayer is in progress.
-- **Other regions** (European and other releases): untested; their EBOOTs differ.
+- **Other regions** (European and other releases): untested. The EU 1.14 update's decrypted EBOOT (BCES01007) is
+  byte-identical to the US one (SHA-256 match, a playtester's first-run log 2026-10-28); EU support as "untested region"
+  is planned. Other regions' EBOOTs are unchecked.
