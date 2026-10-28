@@ -331,7 +331,7 @@ def render(root, problems, feed=()):
       f"<div class=\"intro\">\n<p class=\"desc\">{esc(DESC)}</p>\n<p class=\"what\">{esc(WHAT)}</p>\n"
       f"<p class=\"headline\">Status: <strong>{esc(headline)}</strong></p>\n"
       "<p class=\"note\">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>\n"
-      f"<p class=\"note\">v0.1.0 is a pre-release; calling a release playable waits for the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>.</p>\n"
+      f"<p class=\"note\">v{names.VERSION} is a pre-release; calling a release playable waits for the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>.</p>\n"
       f"<p class=\"btns\"><a class=\"btn\" href=\"#status\">See the status</a><a class=\"btn alt\" href=\"{REPO}\">"
       "Source on GitHub</a></p>\n</div>\n</header>\n<div class=\"page wrap\">\n")
 
@@ -460,9 +460,9 @@ def render(root, problems, feed=()):
     w("</ul>\n<p class=\"small\"><a href=\"#status\">Full status</a></p>\n</section>\n")
 
     w("<section id=\"install\" class=\"promo\">\n<h2>Install</h2>\n"
-      f"<p class=\"headline\"><strong>v0.1.0 pre-release</strong>, partly playable (see the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>).</p>\n"
+      f"<p class=\"headline\"><strong>v{names.VERSION} pre-release</strong>, partly playable (see the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>).</p>\n"
       f"<p>Download the installer (recommended) or the portable zip from the <a href=\"{REPO}/releases\">releases page</a> "
-      f"(the <a href=\"{REPO}/releases/tag/v0.1.0\">v0.1.0</a> page lists both). Check the download against SHA256SUMS on the same page. "
+      f"(the <a href=\"{REPO}/releases/tag/v{names.VERSION}\">v{names.VERSION}</a> page lists both). Check the download against SHA256SUMS on the same page. "
       "You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your "
       "machine with a bundled compiler, with one progress bar and a full install log; allow about 10-30 minutes. "
       "Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>\n"
