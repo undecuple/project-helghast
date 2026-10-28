@@ -160,3 +160,4 @@
 # 0xAD1E4, 0xB92B8 at lj.b = r1+0x74, lj.status = r1+0x294: status=0x220 from the jmp_buf argument; longjmp from 0x9EE30).
 setjmp  00ABBC68 status=0x220   # libc setjmp (aligns r3 to 16, saves r1/r2/r13-r31/f14-f31/v20-v31/LR/CR)
 longjmp 00ABBD8C                # libc longjmp (restores them, r3 = val ? val : 1, blr)
+001FB8F8  # BuildPost: Bloom strength (patch 2121, vp+0x230 scaled after the original; KZ3_BLOOM / display.ini bloom), RSX pass 114 [114=00207248 high]

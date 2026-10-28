@@ -4,6 +4,7 @@
  * patches a real displaysettings.gum when given). Platform-free; run by test_display_mode.sh. */
 #include "rsx_display_mode.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -296,12 +297,12 @@ static void test_gum(void)
         const char* gam = strstr(out, "<listitem id=\"lst_gamma_screen\"");
         const char* cd = strstr(out, "]]>");
         const char* fv = strstr(out, "slc_kz3_fov");
-        CHECK(fv && fv < gam && fv > strstr(out, "slc_kz3_mblur") && strstr(out, "label=\"Field of view\"") &&
+        CHECK(fv && fv < gam && fv < strstr(out, "slc_kz3_mblur") && strstr(out, "label=\"Field of view\"") &&
                   strstr(out, "default-value=\"default\"") && strstr(out, ">Default</selectitem>") &&
                   strstr(out, "<selectitem value=\"70\">70</selectitem>") && strstr(out, "<selectitem value=\"110\">110</selectitem>") &&
                   strstr(out, "function KZ3FovOn") && strstr(out, "function KZ3FovOn") < cd && strstr(out, "\"fov \"..e") &&
                   strstr(out, "KZ3DisplayCmd(\"fov\")"),
-              "2109: Field of view row after Motion blur, Default and 70..110, with its functions");
+              "2109/2121: Field of view row before Motion blur, Default and 70..110, with its functions");
         CHECK(strstr(out, "<list id=\"lst_options\" class=\"PEDS\" height=\"400\"") != NULL,
               "2109: the 12-row list gets a height (scrolls instead of running into the legend)");
         free(out);
@@ -320,6 +321,90 @@ static void test_gum(void)
               "2109: fov 70..110 or default/off; others refused");
         CHECK(!strcmp(rsx_dm_fov_name(0, fb, sizeof fb), "default") && !strcmp(rsx_dm_fov_name(105, fb, sizeof fb), "105"),
               "2109: names");
+    }
+    /* patch 2121 (RSX pass 114): Motion blur and Bloom as 0..100 % rows after Field of view, display.ini numbers */
+    out = rsx_dm_patch_gum_opts(page, sizeof page - 1, &n, RSX_DM_GUM_MBLUR | RSX_DM_GUM_FOV | RSX_DM_GUM_BLOOM);
+    CHECK(out && n == strlen(out), "2121: page with Field of view, Motion blur and Bloom rows patched");
+    if (out) {
+        const char* gam = strstr(out, "<listitem id=\"lst_gamma_screen\"");
+        const char* cd = strstr(out, "]]>");
+        const char* fv = strstr(out, "<select id=\"slc_kz3_fov\"");
+        const char* mb = strstr(out, "<select id=\"slc_kz3_mblur\"");
+        const char* bl = strstr(out, "<select id=\"slc_kz3_bloom\"");
+        CHECK(fv && mb && bl && fv < mb && mb < bl && bl < gam, "2121: order Field of view, Motion blur, Bloom (right after Field of view)");
+        char want[64];
+        int ok = bl != NULL && mb != NULL;
+        for (int v = 0; v <= 100 && ok; v += 10) {
+            snprintf(want, sizeof want, "<selectitem value=\"%d\">%d%%</selectitem>", v, v);
+            const char* a = strstr(mb, want);
+            const char* b = strstr(bl, want);
+            ok = a && a < bl && b && b < gam;   /* 11 values 0,10..100 in each row */
+        }
+        CHECK(ok && !strstr(out, "<selectitem value=\"5\">") && !strstr(out, "value=\"on\">On</selectitem>\n\t\t\t\t<selectitem value=\"off\">Off</selectitem>\n\t\t\t</select>\n\n\t\t\t<select id=\"slc_kz3_fov\""),
+              "2121: both rows offer exactly 0, 10 .. 100 percent (no on / off)");
+        CHECK(mb && bl && strstr(mb, "default-value=\"100\"") && strstr(mb, "default-value=\"100\"") < bl &&
+                  strstr(bl, "default-value=\"100\"") && strstr(bl, "label=\"Bloom\"") && strstr(mb, "label=\"Motion blur\"") &&
+                  strstr(out, "function KZ3BloomOn") && strstr(out, "function KZ3BloomOn") < cd && strstr(out, "\"bloom \"..e") &&
+                  strstr(out, "KZ3DisplayCmd(\"bloom\")") && strstr(out, "if (KZ3BloomOn) then KZ3BloomOn() end"),
+              "2121: default 100, Bloom functions and OnPageOn refresh");
+        const char* rf = strstr(out, "function KZ3ResetDisplay()");
+        CHECK(rf && strstr(rf, "\"bloom 100\"") && strstr(rf, "\"motionblur 100\"") && strstr(out, "slc_kz3_bloom = \"") &&
+                  strstr(out, "slc_kz3_mblur = \"Strength"),
+              "2121: Reset to defaults sets both to 100, tooltips for both rows");
+        free(out);
+    }
+    out = rsx_dm_patch_gum_opts(page, sizeof page - 1, &n, RSX_DM_GUM_MBLUR | RSX_DM_GUM_FOV);
+    CHECK(out && !strstr(out, "<select id=\"slc_kz3_bloom\"") && !strstr(out, "function KZ3BloomOn") && strstr(out, "if (KZ3BloomOn) then"),
+          "2121: no Bloom row without the BuildPost hook");
+    free(out);
+    {
+        char ib[2048];
+        CHECK(rsx_dm_parse_pct("0") == 0 && rsx_dm_parse_pct("100") == 100 && rsx_dm_parse_pct("50") == 50 &&
+                  rsx_dm_parse_pct(" 70 ") == 70 && rsx_dm_parse_pct("30%") == 30 && rsx_dm_parse_pct("on") == 100 &&
+                  rsx_dm_parse_pct("OFF") == 0 && rsx_dm_parse_pct("true") == 100 && rsx_dm_parse_pct("no") == 0,
+              "2121: parse 0..100, percent sign, on/off words");
+        CHECK(rsx_dm_parse_pct("55") == 60 && rsx_dm_parse_pct("54") == 50 && rsx_dm_parse_pct("4") == 0 &&
+                  rsx_dm_parse_pct("5") == 10 && rsx_dm_parse_pct("95") == 100 && rsx_dm_parse_pct("94") == 90,
+              "2121: step rounding to the nearest 10, half up");
+        CHECK(rsx_dm_parse_pct("101") == 100 && rsx_dm_parse_pct("250") == 100 && rsx_dm_parse_pct("99999") == 100 &&
+                  rsx_dm_parse_pct("-5") == 0 && rsx_dm_parse_pct("1234567") == -1,
+              "2121: out of range clamps to 0..100 (huge numbers unreadable)");
+        CHECK(rsx_dm_parse_pct("") == -1 && rsx_dm_parse_pct("  ") == -1 && rsx_dm_parse_pct("5x") == -1 && rsx_dm_parse_pct("%") == -1 &&
+                  rsx_dm_parse_pct("maybe") == -1 && rsx_dm_parse_pct("-") == -1 && rsx_dm_parse_pct("1.5") == -1,
+              "2121: unreadable values are -1 (the key is ignored)");
+        CHECK(rsx_dm_pct_round(-3) == 0 && rsx_dm_pct_round(0) == 0 && rsx_dm_pct_round(44) == 40 && rsx_dm_pct_round(45) == 50 &&
+                  rsx_dm_pct_round(100) == 100 && rsx_dm_pct_round(400) == 100,
+              "2121: rsx_dm_pct_round");
+        {
+            const float v = 0.0123f;
+            uint32_t b1, b2;
+            const float s100 = rsx_dm_pct_scale(v, 100), s50 = rsx_dm_pct_scale(v, 50);
+            memcpy(&b1, &v, 4); memcpy(&b2, &s100, 4);
+            CHECK(b1 == b2 && rsx_dm_pct_scale(v, 0) == 0.0f && rsx_dm_pct_scale(v, 150) == v && s50 == v * 0.5f &&
+                      rsx_dm_pct_scale(v, 10) > 0.0f && rsx_dm_pct_scale(v, 10) < rsx_dm_pct_scale(v, 20),
+                  "2121: bloom scale: 100 leaves the float bit for bit, 0 gives 0, 50 halves it, monotonic");
+        }
+        CHECK(rsx_dm_ini_motion_blur("[display]\nmotion_blur = on\n") == 100 && rsx_dm_ini_motion_blur("[display]\nmotion_blur = off\n") == 0 &&
+                  rsx_dm_ini_motion_blur("[display]\nmotion_blur = 40\n") == 40 && rsx_dm_ini_motion_blur("[display]\nmotion_blur = zzz\n") == -1 &&
+                  rsx_dm_ini_motion_blur("[display]\nvsync = on\n") == -1,
+              "2121: an old file's motion_blur on / off reads as 100 / 0, a number as itself");
+        CHECK(rsx_dm_ini_bloom("[display]\nbloom = 0\n") == 0 && rsx_dm_ini_bloom("[display]\nbloom=100\n") == 100 &&
+                  rsx_dm_ini_bloom("[display]\nbloom = 33\n") == 30 && rsx_dm_ini_bloom("[display]\nbloom = 999\n") == 100 &&
+                  rsx_dm_ini_bloom("[display]\nbloom = on\n") == 100 && rsx_dm_ini_bloom("[display]\nmotion_blur = 50\n") == -1,
+              "2121: bloom key read (rounded, clamped), missing -> -1");
+        int k = rsx_dm_ini_write_ext4(ib, sizeof ib, RSX_DM_FULLSCREEN, RSX_DM_FIT, RSX_DM_NEAREST, 0, 30, RSX_DM_FPS_60, 95, 1, 70);
+        CHECK(k > 0 && k < (int)sizeof ib && (size_t)k == strlen(ib) && strstr(ib, "motion_blur = 30\n") && strstr(ib, "bloom = 70\n") &&
+                  rsx_dm_ini_motion_blur(ib) == 30 && rsx_dm_ini_bloom(ib) == 70 && rsx_dm_ini_fov(ib) == 95 &&
+                  rsx_dm_ini_fps(ib) == 60 && rsx_dm_ini_hud169(ib) == 1 && rsx_dm_ini_parse(ib) == RSX_DM_FULLSCREEN &&
+                  rsx_dm_ini_vsync(ib) == 0,
+              "2121: ini round trip motion_blur 30, bloom 70, the other keys kept; the number is always written");
+        rsx_dm_ini_write_ext4(ib, sizeof ib, RSX_DM_WINDOWED, RSX_DM_FIT, RSX_DM_BILINEAR, 1, 100, RSX_DM_FPS_30, 0, 1, 100);
+        CHECK(strstr(ib, "motion_blur = 100\n") && !strstr(ib, "motion_blur = on") && strstr(ib, "bloom = 100\n"),
+              "2121: defaults are written as 100, never on / off");
+        rsx_dm_ini_write_ext4(ib, sizeof ib, RSX_DM_WINDOWED, RSX_DM_FIT, RSX_DM_BILINEAR, 1, 55, RSX_DM_FPS_30, 0, 1, 12);
+        CHECK(strstr(ib, "motion_blur = 60\n") && strstr(ib, "bloom = 10\n"), "2121: the writer rounds to the step too");
+        rsx_dm_ini_write_ext3(ib, sizeof ib, RSX_DM_WINDOWED, RSX_DM_FIT, RSX_DM_BILINEAR, 1, 100, RSX_DM_FPS_30, 0, 1);
+        CHECK(rsx_dm_ini_bloom(ib) == -1, "2121: a file from before the Bloom row has no bloom key (default 100 applies)");
     }
     /* patch 2110 (RSX pass 104): row tooltips in the game's tooltip panel, Reset to defaults resets the port's rows,
      * the shorter frame rate warning */
@@ -342,11 +427,11 @@ static void test_gum(void)
         CHECK(rc && rc < strstr(sd, "end") && rf && rf < cd, "2110: the game's reset calls KZ3ResetDisplay right after SetDefaultDisplay");
         CHECK(rf && strstr(rf, "KZ3DisplayCmd(\"display windowed\")") && strstr(rf, "KZ3DisplayCmd(\"fps 30\")") &&
               strstr(rf, "KZ3DisplayCmd(\"vsync on\")") && strstr(rf, "KZ3DisplayCmd(\"scaling stretch\")") &&
-              strstr(rf, "KZ3DisplayCmd(\"filter bilinear\")") && strstr(rf, "\"motionblur on\"") && strstr(rf, "\"fov default\"") &&
+              strstr(rf, "KZ3DisplayCmd(\"filter bilinear\")") && strstr(rf, "\"motionblur 100\"") && strstr(rf, "\"fov default\"") &&
               strstr(rf, "OnPageOn()"), "2110: the reset sets every port row to its default and shows the values");
         CHECK(rsx_dm_parse(RSX_DM_DEF_MODE) == RSX_DM_WINDOWED && rsx_dm_parse_scaling(RSX_DM_DEF_SCALING) == RSX_DM_STRETCH &&
               rsx_dm_parse_filter(RSX_DM_DEF_FILTER) == RSX_DM_BILINEAR && rsx_dm_parse_vsync(RSX_DM_DEF_VSYNC) == RSX_DM_VSYNC_ON &&
-              rsx_dm_parse_fps(RSX_DM_DEF_FPS) == RSX_DM_FPS_30 && rsx_dm_parse_vsync(RSX_DM_DEF_MBLUR) == 1 &&
+              rsx_dm_parse_fps(RSX_DM_DEF_FPS) == RSX_DM_FPS_30 && rsx_dm_parse_pct(RSX_DM_DEF_MBLUR) == 100 && rsx_dm_parse_pct(RSX_DM_DEF_BLOOM) == 100 &&
               rsx_dm_parse_fov(RSX_DM_DEF_FOV) == 0, "2110: the reset values parse to the port's defaults");
         CHECK(strstr(out, "label=\"A frame rate limit above 30 can make the game run wrong. Are you sure?\"") != NULL,
               "2110: the warning is one line, like the game's own confirm dialogs");

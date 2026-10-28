@@ -1,0 +1,210 @@
+diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -277,10 +277,48 @@
+     return -1;
+ }
+ static inline const char* rsx_dm_fps_name(int v) { return v == RSX_DM_FPS_120 ? "120" : v == RSX_DM_FPS_60 ? "60" : "30"; }
+-static inline int rsx_dm_ini_motion_blur(const char* t)    /* 1 on, 0 off, -1 missing or unreadable */
++/* KZ3 patch 2121 (RSX pass 114): Motion blur and Bloom are strengths, 0..100 percent in steps of 10 (0 = off, 100 = the
++ * game's own look, the default). display.ini: motion_blur = 0..100 (an old file's on = 100 and off = 0 still read),
++ * bloom = 0..100. A hand-edited number is clamped to 0..100 and rounded to the nearest step (55 -> 60), a trailing %
++ * is allowed; anything else is unreadable (-1) and the key is ignored. */
++#define RSX_DM_PCT_STEP 10
++static inline int rsx_dm_pct_round(int v)
++{
++    return v <= 0 ? 0 : v >= 100 ? 100 : ((v + RSX_DM_PCT_STEP / 2) / RSX_DM_PCT_STEP) * RSX_DM_PCT_STEP;
++}
++static inline int rsx_dm_parse_pct(const char* s)   /* 0, 10 .. 100, -1 unreadable */
++{
++    size_t n;
++    if (!rsx_dm_trim(&s, &n)) return -1;
++    if (rsx_dm_ieq(s, n, "on") || rsx_dm_ieq(s, n, "true") || rsx_dm_ieq(s, n, "yes")) return 100;
++    if (rsx_dm_ieq(s, n, "off") || rsx_dm_ieq(s, n, "false") || rsx_dm_ieq(s, n, "no")) return 0;
++    if (n && s[n - 1] == '%') n--;
++    size_t i = 0;
++    int neg = 0;
++    long v = 0;
++    if (i < n && s[i] == '-') { neg = 1; i++; }
++    if (i >= n || n - i > 6) return -1;
++    for (; i < n; i++) {
++        if (s[i] < '0' || s[i] > '9') return -1;
++        v = v * 10 + (s[i] - '0');
++    }
++    return neg ? 0 : rsx_dm_pct_round(v > 1000 ? 1000 : (int)v);
++}
++/* A strength value scaled by a percentage (Bloom: the post parameter vp+0x230, main.cpp's BuildPost override): 100 and above
++ * leave it exactly as it is (the game's own value, bit for bit), 0 gives 0, in between v * pct / 100. */
++static inline float rsx_dm_pct_scale(float v, int pct)
++{
++    return pct >= 100 ? v : pct <= 0 ? 0.0f : v * ((float)pct / 100.0f);
++}
++static inline int rsx_dm_ini_motion_blur(const char* t)    /* 0..100 (steps of 10), -1 missing or unreadable */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "motion_blur", v, sizeof v) ? rsx_dm_parse_pct(v) : -1;
++}
++static inline int rsx_dm_ini_bloom(const char* t)          /* 0..100 (steps of 10), -1 missing or unreadable */
+ {
+     char v[32];
+-    return rsx_dm_ini_value(t, "motion_blur", v, sizeof v) ? rsx_dm_parse_vsync(v) : -1;
++    return rsx_dm_ini_value(t, "bloom", v, sizeof v) ? rsx_dm_parse_pct(v) : -1;
+ }
+ static inline int rsx_dm_ini_fps(const char* t)            /* 30 | 60 | 120, -1 missing or unreadable */
+ {
+@@ -325,11 +363,11 @@
+     return snprintf(buf, n,
+                     "# Project Helghast display settings (Options > Display; Alt+Enter toggles the mode).\n"
+                     "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest, vsync = on | off.\n"
+-                    "# motion_blur = on | off. fps_limit = 30 | 60 | 120: 30 is the game's own; above 30 can break gameplay timing.\n"
++                    "# motion_blur = 0..100 (percent, steps of 10; 100 = the game, on / off of older files still read). fps_limit = 30 | 60 | 120: 30 is the game's own; above 30 can break gameplay timing.\n"
+                     "# KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER, KZ3_MOTION_BLUR, KZ3_FPS_LIMIT override them for one run.\n"
+-                    "[display]\nmode = %s\nscaling = %s\nfilter = %s\nvsync = %s\nmotion_blur = %s\nfps_limit = %s\n",
++                    "[display]\nmode = %s\nscaling = %s\nfilter = %s\nvsync = %s\nmotion_blur = %d\nfps_limit = %s\n",
+                     rsx_dm_name(mode), rsx_dm_scaling_name(scaling), rsx_dm_filter_name(filter), rsx_dm_vsync_name(vsync),
+-                    rsx_dm_vsync_name(motion_blur != 0), rsx_dm_fps_name(fps));
++                    rsx_dm_pct_round(motion_blur), rsx_dm_fps_name(fps));
+ }
+ 
+ /* patch 2109: the file with the fov key too */
+@@ -377,9 +415,11 @@
+ #define RSX_DM_DEF_FILTER  "bilinear"
+ #define RSX_DM_DEF_VSYNC   "on"
+ #define RSX_DM_DEF_FPS     "30"
+-#define RSX_DM_DEF_MBLUR   "on"
++#define RSX_DM_DEF_MBLUR   "100"
++#define RSX_DM_DEF_BLOOM   "100"
+ #define RSX_DM_DEF_FOV     "default"
+ #define RSX_DM_GUM_MBLUR 1   /* rsx_dm_patch_gum_opts: add the Motion blur row (patch 2107) */
++#define RSX_DM_GUM_BLOOM 4   /* patch 2121: add the Bloom row */
+ #define RSX_DM_GUM_FOV   2   /* rsx_dm_patch_gum_opts: add the Field of view row (patch 2109) */
+ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_n, unsigned opts)
+ {
+@@ -414,10 +454,42 @@
+         "\t\t\t</select>\n\n\t\t\t";
+     static const char rsx_dm_gum_row_mb[] =   /* patch 2107: only when the MotionBlur hook is in the exe */
+         "<select id=\"slc_kz3_mblur\" label=\"Motion blur\" onchange=\"script(settingscript,KZ3ChangeMBlur)\"\n"
+-        "\t\t\t\tdefault-value=\"on\">\n"
+-        "\t\t\t\t<selectitem value=\"on\">On</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"off\">Off</selectitem>\n"
++        "\t\t\t\tdefault-value=\"100\">\n"
++        "\t\t\t\t<selectitem value=\"0\">0%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"10\">10%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"20\">20%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"30\">30%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"40\">40%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"50\">50%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"60\">60%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"70\">70%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"80\">80%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"90\">90%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"100\">100%</selectitem>\n"
++        "\t\t\t</select>\n\n\t\t\t";
++    static const char rsx_dm_gum_row_bloom[] =   /* patch 2121: only when the BuildPost hook is in the exe */
++        "<select id=\"slc_kz3_bloom\" label=\"Bloom\" onchange=\"script(settingscript,KZ3ChangeBloom)\"\n"
++        "\t\t\t\tdefault-value=\"100\">\n"
++        "\t\t\t\t<selectitem value=\"0\">0%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"10\">10%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"20\">20%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"30\">30%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"40\">40%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"50\">50%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"60\">60%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"70\">70%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"80\">80%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"90\">90%</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"100\">100%</selectitem>\n"
+         "\t\t\t</select>\n\n\t\t\t";
++    static const char rsx_dm_gum_lua_bloom[] =   /* patch 2121: with the Bloom row only */
++        "\t\tfunction KZ3BloomOn()\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_bloom\"):SetValue(KZ3DisplayCmd(\"bloom\"))\n"
++        "\t\tend\n\n"
++        "\t\tfunction KZ3ChangeBloom(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"bloom \"..e:GetSender():GetValue()) end\n"
++        "\t\tend\n";
+     static const char rsx_dm_gum_row_fov[] =   /* patch 2109: only when the camera hook is installed */
+         "<select id=\"slc_kz3_fov\" label=\"Field of view\" onchange=\"script(settingscript,KZ3ChangeFov)\"\n"
+         "\t\t\t\tdefault-value=\"default\">\n"
+@@ -473,7 +545,8 @@
+         "\t\t\tslc_kz3_vsync = \"Waits for the display's refresh to stop tearing. Off can lower input delay.\",\n"
+         "\t\t\tslc_kz3_fps = \"Killzone 3 was made for 30 frames per second. Higher limits can make physics, animation and "
+         "scripted events run wrong.\",\n"
+-        "\t\t\tslc_kz3_mblur = \"Blurs the picture during fast camera movement.\",\n"
++        "\t\t\tslc_kz3_mblur = \"Strength of the blur during fast camera movement. 100 is the game's own look, 0 is off.\",\n"
++        "\t\t\tslc_kz3_bloom = \"Strength of the glow around bright areas. 100 is the game's own look, 0 is off.\",\n"
+         "\t\t\tslc_kz3_fov = \"Horizontal field of view in the campaign. Default is the game's own 80.\"\n"
+         "\t\t}\n\n"
+         "\t\tfunction KZ3Tooltip(e)\n"
+@@ -494,6 +567,7 @@
+         "\t\t\tKZ3DisplayCmd(\"fps " RSX_DM_DEF_FPS "\")\n"
+         "\t\t\tif (KZ3MBlurOn) then KZ3DisplayCmd(\"motionblur " RSX_DM_DEF_MBLUR "\") end\n"
+         "\t\t\tif (KZ3FovOn) then KZ3DisplayCmd(\"fov " RSX_DM_DEF_FOV "\") end\n"
++        "\t\t\tif (KZ3BloomOn) then KZ3DisplayCmd(\"bloom " RSX_DM_DEF_BLOOM "\") end\n"
+         "\t\t\tOnPageOn()\n"
+         "\t\tend\n";
+     static const char rsx_dm_gum_lua[] =
+@@ -509,6 +583,7 @@
+         "\t\t\tgRoot:GetTag(\"slc_kz3_fps\"):SetValue(KZ3DisplayCmd(\"fps\"))\n"
+         "\t\t\tif (KZ3MBlurOn) then KZ3MBlurOn() end\n"
+         "\t\t\tif (KZ3FovOn) then KZ3FovOn() end\n"
++        "\t\t\tif (KZ3BloomOn) then KZ3BloomOn() end\n"
+         "\t\t\tgKz3Dm = 1\n"
+         "\t\tend\n\n"
+         "\t\tgKz3FpsWant = \"30\"\n"
+@@ -561,6 +636,7 @@
+     at_scr = (size_t)(scr - in);
+     at_lua = (size_t)(cd - in);
+     size_t nlm = nm ? sizeof rsx_dm_gum_lua_mb - 1 : 0;
++    const size_t nb = (opts & RSX_DM_GUM_BLOOM) ? sizeof rsx_dm_gum_row_bloom - 1 : 0, nlb = nb ? sizeof rsx_dm_gum_lua_bloom - 1 : 0;
+     const size_t nf = (opts & RSX_DM_GUM_FOV) ? sizeof rsx_dm_gum_row_fov - 1 : 0, nlf = nf ? sizeof rsx_dm_gum_lua_fov - 1 : 0;
+     /* patch 2110: the tooltip after the list, its Lua, the list's onchange and the reset call */
+     static const char rsx_dm_list_on[] = " onchange=\"script(settingscript,KZ3Tooltip)\"";
+@@ -570,7 +646,7 @@
+     const char* rs = rsx_dm_find(in, n, (size_t)(scr - in), rsx_dm_reset_at);
+     const size_t nt = sizeof rsx_dm_gum_tip - 1, nlt = sizeof rsx_dm_gum_lua_tip - 1;
+     if (!le || le > scr || (rs && rs > cd)) return NULL;
+-    out = (char*)malloc(n + nr + nm + nf + nd + nl + nlm + nlf + nt + nlt + 128 + 1);
++    out = (char*)malloc(n + nr + nm + nb + nf + nd + nl + nlm + nlb + nlf + nt + nlt + 128 + 1);
+     if (!out) return NULL;
+     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend (run r103-dpage3):
+      * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead.
+@@ -589,8 +665,9 @@
+         memcpy(out + o, in, at_row); o += at_row;
+     }
+     memcpy(out + o, rsx_dm_gum_row, nr); o += nr;
+-    memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;
+     memcpy(out + o, rsx_dm_gum_row_fov, nf); o += nf;                  /* patch 2109 */
++    memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;                   /* patch 2121: Motion blur and Bloom after Field of view */
++    memcpy(out + o, rsx_dm_gum_row_bloom, nb); o += nb;
+     {   /* patch 2110: the tooltip panel right after the list */
+         const size_t at_le = (size_t)(le - in) + 7;
+         memcpy(out + o, in + at_row, at_le - at_row); o += at_le - at_row;
+@@ -609,6 +686,7 @@
+     memcpy(out + o, rsx_dm_gum_lua, nl); o += nl;
+     memcpy(out + o, rsx_dm_gum_lua_mb, nlm); o += nlm;
+     memcpy(out + o, rsx_dm_gum_lua_fov, nlf); o += nlf;
++    memcpy(out + o, rsx_dm_gum_lua_bloom, nlb); o += nlb;              /* patch 2121 */
+     memcpy(out + o, rsx_dm_gum_lua_tip, nlt); o += nlt;               /* patch 2110 */
+     memcpy(out + o, in + at_lua, n - at_lua); o += n - at_lua;
+     out[o] = 0;
+@@ -638,6 +716,19 @@
+     return k < 0 ? k : o + k;
+ }
+ 
++/* patch 2121: the file with the bloom key too (motion_blur in ext..ext3 is a percentage now) */
++static inline int rsx_dm_ini_write_ext4(char* buf, size_t n, int mode, int scaling, int filter, int vsync, int motion_blur,
++                                        int fps, int fov, int hud169, int bloom)
++{
++    int o = rsx_dm_ini_write_ext3(buf, n, mode, scaling, filter, vsync, motion_blur, fps, fov, hud169);
++    if (o < 0 || (size_t)o >= n) return o;
++    const int k = snprintf(buf + o, n - (size_t)o,
++                           "# bloom = 0..100 (percent, steps of 10): strength of the glow around bright areas; 100 = the game, 0 = off.\n"
++                           "# KZ3_BLOOM and KZ3_MOTION_BLUR (on | off | 0..100) override the two for one run.\n"
++                           "bloom = %d\n", rsx_dm_pct_round(bloom));
++    return k < 0 ? k : o + k;
++}
++
+ /* KZ3 patch 2096: view aspect (KZ3_ASPECT, ENHANCEMENT, default screen). Screen = the game's camera is set up for the
+  * window's (or the screen's) own aspect (port/kz3/main.cpp hooks GameViewGame::vf22 @0x007E5908: Hor+ above 16:9,
+  * Vert+ below) and every frame drawn with that camera is stretched to the whole client (the guest image stays

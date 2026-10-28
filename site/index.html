@@ -162,8 +162,8 @@
 <tr><td>Subtitles in movies and cutscenes</td><td>Subtitle cards and in-game subtitles</td><td><span class="st st-ok">works</span><br><span class="small">In-level (in-game) subtitles were not reached; the prenarrative text cards are part of the movie and show with either setting</span></td></tr>
 </tbody></table></div></details>
 <h3>What the port adds</h3>
-<p>30 available now, 26 planned. Changes to gameplay stay optional.</p>
-<details><summary>All 56 features</summary>
+<p>30 available now, 27 planned. Changes to gameplay stay optional.</p>
+<details><summary>All 57 features</summary>
 <div class="tw"><table>
 <thead><tr><th>Feature</th><th>State</th><th>Default</th></tr></thead>
 <tbody>
@@ -191,9 +191,9 @@
 <tr><td>VSync on or off (display.ini vsync = on|off, or Options &gt; Display &gt; VSync); with it off, frames may tear where the system allows it; the game&#x27;s own 60 Hz clock is unchanged</td><td>available</td><td>on</td></tr>
 <tr><td>Options &gt; Mouse page: mouse sensitivity, zoomed-in sensitivity and invert Y, applied at once and saved</td><td>available</td><td>-</td></tr>
 <tr><td>Esc goes back in menus on the keyboard, as Circle does on a pad (Backspace still works)</td><td>available</td><td>on</td></tr>
-<tr><td>Motion blur on or off (Options &gt; Display &gt; Motion blur, display.ini motion_blur); off skips only the game&#x27;s motion blur pass</td><td>available</td><td>on</td></tr>
 <tr><td>Frame rate limit 30, 60 or 120 (Options &gt; Display &gt; Frame rate limit, display.ini fps_limit); above 30 a warning says game logic tied to the frame rate may misbehave</td><td>available</td><td>on</td></tr>
 <tr><td>Field of view setting for the campaign and co-op (Options &gt; Display &gt; Field of view, Default or 70-110; display.ini fov); aiming down sights stays relative</td><td>available</td><td>opt-in</td></tr>
+<tr><td>Bloom strength setting (Options &gt; Display &gt; Bloom, 0-100 % in steps of 10; display.ini bloom); 100 is the game&#x27;s own look, 0 removes the glow</td><td>available</td><td>100</td></tr>
 <tr><td>Pad layouts: the game&#x27;s own scheme by default, a Modern preset, or a Custom layout per action (33 groups, swap on conflict, copy Default or Modern, keybinds.ini [pad actions]); Options &gt; Controls &gt; Advanced Settings &gt; Layout and Prompts page</td><td>available</td><td>opt-in (the game&#x27;s own layout is the default)</td></tr>
 <tr><td>Option pages that match the game: descriptions for the port&#x27;s rows in the game&#x27;s tooltip panel, the Display list scrolling inside the game&#x27;s list area, Reset to defaults covering the port&#x27;s rows, and a menu pointer in the game&#x27;s colours</td><td>available</td><td>on</td></tr>
 <tr><td>HUD, menus, subtitles and movies stay 16:9 and centred on wide, ultrawide and 16:10 screens while the 3D view fills the window (display.ini hud_169; no Options row yet)</td><td>available</td><td>default on</td></tr>
@@ -222,6 +222,7 @@
 <tr><td>Saves in the PS3&#x27;s own format: copy a save between the port, RPCS3 and a PS3</td><td>planned</td><td>2026-10-14: the port writes PARAM.SFO as a binary PSF (checked by a host test with an independent reader, and written by a real checkpoint save in a hand-played session); older text files still load; opening a port save in RPCS3 or on a console is untested</td></tr>
 <tr><td>Online co-op campaign: the second player joins the host&#x27;s split-screen co-op from another PC (their input to the host, their half of the picture streamed back)</td><td>planned</td><td>off (opt-in)</td></tr>
 <tr><td>In-game voice chat for multiplayer and the online co-op campaign (microphone and headset on the PC; online only when the player picks it)</td><td>planned</td><td>opt-in</td></tr>
+<tr><td>Motion blur strength (Options &gt; Display &gt; Motion blur, 0-100 %); no clean off yet: skipping the game&#x27;s motion blur pass garbles the picture, so the row is not offered</td><td>planned</td><td>100 (the game&#x27;s own)</td></tr>
 <tr><td>Minimap with enemy markers, using the game&#x27;s own radar where possible</td><td>planned</td><td>-</td></tr>
 </tbody></table></div></details>
 <p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md">Every feature, with evidence<span aria-hidden="true"> &gt;</span></a></p>
@@ -265,7 +266,7 @@
 </article>
 <article id="about" class="news">
 <h2>About the port</h2>
-<p class="meta">by the project · how it works · 56 port features</p>
+<p class="meta">by the project · how it works · 57 port features</p>
 <div class="nb"><span class="frame pic-about" aria-hidden="true"></span><div class="nt"><p>The port is built on <a href="https://github.com/sp00nznet/ps3recomp">ps3recomp</a> (MIT): the PPU code and the game's SPU programs are lifted to C, the PS3 system libraries the game calls are reimplemented, and the game's RSX command stream is replayed on Direct3D 12. The game's archive is read in place from your dump. It is tested on Windows x64 under Proton; a native Linux build is planned. What comes next: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/ROADMAP.md">the roadmap</a>.</p>
 <p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/HOW-IT-WORKS.md">The technical overview<span aria-hidden="true"> &gt;</span></a></p>
 <p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>

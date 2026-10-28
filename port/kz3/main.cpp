@@ -704,8 +704,38 @@ extern "C" int  rsx_display_get_vsync(void);
  * settings. The window's thread saves through kz3_display_save (its four values); the two rows here save through it
  * too, with the last saved window values. *_eff = in force this run (KZ3_MOTION_BLUR / KZ3_FPS_LIMIT win for one run),
  * *_saved = what the file holds. */
-static volatile LONG s_mb_eff = 1, s_fps_eff = RSX_DM_FPS_30;
-static int s_mb_saved = 1, s_fps_saved = RSX_DM_FPS_30;
+/* Patch 2121 (RSX pass 114): Motion blur and Bloom are percentages, 0..100 in steps of 10 (100 = the game's look; the
+ * values the rows hold are s_mb_* / s_bloom_*; KZ3_MOTION_BLUR on|off|0..100 and KZ3_BLOOM 0..100 win for one run). */
+static volatile LONG s_mb_eff = 100, s_fps_eff = RSX_DM_FPS_30, s_bloom_eff = 100;
+static int s_mb_saved = 100, s_fps_saved = RSX_DM_FPS_30, s_bloom_saved = 100;
+/* Test aid (patch 2121): KZ3_BLOOM_SEQ / KZ3_MOTION_BLUR_SEQ = "T:V,T:V,..." switch the strength to V (0..100) from T seconds
+ * after the process start (the pad script's clock), so one run, with the game paused, shows one frozen frame at several
+ * strengths. Only read when set; the rows and the ini are not touched. */
+struct Kz3Seq { int n; double t[12]; int v[12]; };
+static Kz3Seq s_bloom_seq, s_mb_seq;
+static ULONGLONG s_seq_t0;
+static int s_mb_diag;   /* KZ3_MOTION_BLUR set: the MotionBlur job follows it (off garbles the picture) */
+static void kz3_seq_parse(const char* e, Kz3Seq* q)
+{
+    q->n = 0;
+    while (e && *e && q->n < 12) {
+        char* end = nullptr;
+        const double t = strtod(e, &end);
+        if (end == e || *end != ':') break;
+        const long v = strtol(end + 1, &end, 10);
+        q->t[q->n] = t; q->v[q->n] = v < 0 ? 0 : v > 100 ? 100 : (int)v; q->n++;
+        if (*end != ',') break;
+        e = end + 1;
+    }
+}
+static int kz3_seq_now(const Kz3Seq* q, int dflt)
+{
+    if (!q->n) return dflt;
+    const double now = (double)(GetTickCount64() - s_seq_t0) / 1000.0;
+    int r = dflt;
+    for (int i = 0; i < q->n; i++) if (now >= q->t[i]) r = q->v[i];
+    return r;
+}
 /* Patch 2109 (RSX pass 103): Field of view, display.ini fov (0 = default = the game's own; KZ3_FOV for one run). */
 static volatile LONG s_fov_deg;   /* in force */
 static int s_fov_saved;
@@ -724,17 +754,17 @@ static void kz3_display_save(int mode, int scaling, int filter, int vsync)
     InitOnceExecuteOnce(&s_dm_save_once, kz3_dm_lock_init, NULL, NULL);
     EnterCriticalSection(&s_dm_save_lock);
     s_dm_saved[0] = mode; s_dm_saved[1] = scaling; s_dm_saved[2] = filter; s_dm_saved[3] = vsync;
-    const int n = rsx_dm_ini_write_ext3(t, sizeof t, mode, scaling, filter, vsync, s_mb_saved, s_fps_saved, s_fov_saved,
-                                        s_h169_saved);
+    const int n = rsx_dm_ini_write_ext4(t, sizeof t, mode, scaling, filter, vsync, s_mb_saved, s_fps_saved, s_fov_saved,
+                                        s_h169_saved, s_bloom_saved);
     char fb[16];
     bool ok = false;
     if (pad_kb_sibling_path(L"display.ini", p, 1100)) {
         FILE* f = _wfopen(p, L"wb");
         ok = f && fwrite(t, 1, (size_t)n, f) == (size_t)n;
         if (f) fclose(f);
-        printf("[display] %ls: mode %s, scaling %s, filter %s, vsync %s, motion blur %s, fps limit %s, fov %s %s\n", p,
+        printf("[display] %ls: mode %s, scaling %s, filter %s, vsync %s, motion blur %d, bloom %d, fps limit %s, fov %s %s\n", p,
                rsx_dm_name(mode), rsx_dm_scaling_name(scaling), rsx_dm_filter_name(filter), rsx_dm_vsync_name(vsync),
-               rsx_dm_vsync_name(s_mb_saved), rsx_dm_fps_name(s_fps_saved), rsx_dm_fov_name(s_fov_saved, fb, sizeof fb),
+               s_mb_saved, s_bloom_saved, rsx_dm_fps_name(s_fps_saved), rsx_dm_fov_name(s_fov_saved, fb, sizeof fb),
                ok ? "saved" : "NOT saved");
     }
     LeaveCriticalSection(&s_dm_save_lock);
@@ -763,15 +793,17 @@ static void kz3_display_load(void)
             vsync = rsx_dm_ini_vsync(t);
             const int mb = rsx_dm_ini_motion_blur(t), fps = rsx_dm_ini_fps(t);
             if (mb >= 0) s_mb_saved = mb;
+            const int bl = rsx_dm_ini_bloom(t);   /* patch 2121 */
+            if (bl >= 0) s_bloom_saved = bl;
             if (fps > 0) s_fps_saved = fps;
             const int fv = rsx_dm_ini_fov(t);   /* patch 2109 */
             if (fv >= 0) s_fov_saved = fv;
             const int hv = rsx_dm_ini_hud169(t);   /* patch 2113 */
             if (hv >= 0) s_h169_saved = hv;
-            printf("[display] %ls: mode %s, scaling %s, filter %s, vsync %s, motion blur %s, fps limit %s\n", p,
+            printf("[display] %ls: mode %s, scaling %s, filter %s, vsync %s, motion blur %d, fps limit %s\n", p,
                    mode >= 0 ? rsx_dm_name(mode) : "(none)", scaling >= 0 ? rsx_dm_scaling_name(scaling) : "(none)",
                    filter >= 0 ? rsx_dm_filter_name(filter) : "(none)", vsync >= 0 ? rsx_dm_vsync_name(vsync) : "(none)",
-                   mb >= 0 ? rsx_dm_vsync_name(mb) : "(none)", fps > 0 ? rsx_dm_fps_name(fps) : "(none)");
+                   mb, fps > 0 ? rsx_dm_fps_name(fps) : "(none)");
         }
     }
     if (mode >= 0) s_dm_saved[0] = mode;
@@ -780,16 +812,28 @@ static void kz3_display_load(void)
     if (vsync >= 0) s_dm_saved[3] = vsync;
     /* patch 2107: one-run overrides (tests); the rows still save their own choice */
     const char* e = getenv("KZ3_MOTION_BLUR");
-    const int mbe = e && *e ? rsx_dm_parse_vsync(e) : -1;
+    const int mbe = e && *e ? rsx_dm_parse_pct(e) : -1;
+    e = getenv("KZ3_BLOOM");
+    const int ble = e && *e ? rsx_dm_parse_pct(e) : -1;
+    s_seq_t0 = GetTickCount64();
+    kz3_seq_parse(getenv("KZ3_BLOOM_SEQ"), &s_bloom_seq);
+    kz3_seq_parse(getenv("KZ3_MOTION_BLUR_SEQ"), &s_mb_seq);
+    if (s_bloom_seq.n || s_mb_seq.n) printf("[display] test sequence: bloom %d steps, motion blur %d steps\n", s_bloom_seq.n, s_mb_seq.n);
+    InterlockedExchange(&s_bloom_eff, ble >= 0 ? ble : s_bloom_saved);
     e = getenv("KZ3_FPS_LIMIT");
     const int fpe = e && *e ? rsx_dm_parse_fps(e) : -1;
-    InterlockedExchange(&s_mb_eff, mbe >= 0 ? mbe : s_mb_saved);
+    /* Patch 2121: the saved motion_blur value is kept (read and written back) but does not act: skipping the post chain's
+     * MotionBlur job garbles the picture (RSX pass 114, K4: 2 of 2 runs with the skip show false-colour frames, 2 of 2
+     * without it are normal), so there is no row and only the diagnostic KZ3_MOTION_BLUR / KZ3_MOTION_BLUR_SEQ switch it. */
+    s_mb_diag = mbe >= 0;
+    InterlockedExchange(&s_mb_eff, mbe >= 0 ? mbe : 100);
     InterlockedExchange(&s_fps_eff, fpe > 0 ? fpe : s_fps_saved);
     e = getenv("KZ3_FOV");
     const int fve = e && *e ? rsx_dm_parse_fov(e) : -1;
     InterlockedExchange(&s_fov_deg, fve >= 0 ? fve : s_fov_saved);
     { char fb[16]; printf("[display] field of view %s%s\n", rsx_dm_fov_name((int)s_fov_deg, fb, sizeof fb), fve >= 0 ? " (KZ3_FOV)" : ""); }
-    printf("[display] motion blur %s%s, fps limit %s%s\n", rsx_dm_vsync_name((int)s_mb_eff), mbe >= 0 ? " (KZ3_MOTION_BLUR)" : "",
+    printf("[display] motion blur %s%s, bloom %d%s, fps limit %s%s\n", mbe >= 0 ? (mbe ? "on" : "OFF (diagnostic: garbles the picture)") : "always on (no row)", mbe >= 0 ? " (KZ3_MOTION_BLUR)" : "",
+           (int)s_bloom_eff, ble >= 0 ? " (KZ3_BLOOM)" : "",
            rsx_dm_fps_name((int)s_fps_eff), fpe > 0 ? " (KZ3_FPS_LIMIT)" : "");
     rsx_live_draw_set_hud169(s_h169_saved);   /* patch 2113; KZ3_HUD_169 wins for one run (rsx_live_draw.c) */
     rsx_display_configure(mode, scaling, filter, vsync, kz3_display_save);
@@ -800,15 +844,56 @@ static void kz3_display_load(void)
  * MotionBlur wrapper's override (@0x001FDA60, 1.14 @0x002093B0; port/spu/kz3_ppu_overrides.cpp), which also calls
  * kz3_motion_blur_override_register from a static initialiser, so the Options row appears only in an exe that has it. */
 static int s_mb_override = 0;
-extern "C" void kz3_motion_blur_override_register(void) { s_mb_override = 1; }
+/* Patch 2121: called by the MotionBlur wrapper override's static initialiser (SPU's file). It no longer shows the
+ * Options row: no clean off exists yet (see kz3_display_load). Set s_mb_override = 1 here once there is one. */
+extern "C" void kz3_motion_blur_override_register(void) { }
 extern "C" int kz3_motion_blur_on(void)
 {
 #ifdef _WIN32
-    return (int)s_mb_eff;
+    return !s_mb_diag && !s_mb_seq.n ? 1 : kz3_seq_now(&s_mb_seq, (int)s_mb_eff) != 0;   /* patch 2121: diagnostics only */
 #else
     return 1;
 #endif
 }
+
+/* Patch 2121: Bloom strength. BuildPost (1.14 @0x00207248, 1.00 @0x001FB8F8; the RE notes s.51.2) stores
+ * vp+0x230 = BloomSettings.Strength / 9 per view per frame (vp = r5); the SPU job BloomIntegrate reads that float by
+ * address when it runs. The override (CMake defines KZ3_BLOOM_OVERRIDE when the lift announces it; the lift's override
+ * table needs the BuildPost row) calls the original and scales the stored float by bloom / 100; nothing at 100. */
+static int s_bloom_override = 0;
+extern "C" void kz3_bloom_override_register(void) { s_bloom_override = 1; }
+#ifdef KZ3_BLOOM_OVERRIDE
+[[maybe_unused]] static const int s_kz3_bloom_reg = (kz3_bloom_override_register(), 1);
+static void kz3_bloom_body(ppu_context* ctx, void (*orig)(ppu_context*), uint32_t addr)
+{
+    const uint32_t vp = (uint32_t)ctx->gpr[5];
+    orig(ctx);
+#ifdef _WIN32
+    const int k = kz3_seq_now(&s_bloom_seq, (int)s_bloom_eff);
+#else
+    const int k = 100;
+#endif
+    if (k >= 100 || !vp) return;
+    uint8_t* q = vm_base + vp + 0x230;   /* big-endian guest float */
+    uint32_t w = (uint32_t)q[0] << 24 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 8 | q[3];
+    float f;
+    memcpy(&f, &w, 4);
+    const float before = f;
+    f = rsx_dm_pct_scale(f, k);
+    memcpy(&w, &f, 4);
+    q[0] = (uint8_t)(w >> 24); q[1] = (uint8_t)(w >> 16); q[2] = (uint8_t)(w >> 8); q[3] = (uint8_t)w;
+    static int s_logged = 0;
+    if (s_logged++ < 3) fprintf(stderr, "[bloom] vp 0x%08X +0x230 %g -> %g (%d %%, @0x%08X)\n", vp, before, f, k, addr);
+}
+#ifdef KZ3_BLOOM_OVERRIDE_114
+void func_00207248__lifted(ppu_context* ctx);
+void func_00207248(ppu_context* ctx) { kz3_bloom_body(ctx, func_00207248__lifted, 0x00207248u); }
+#endif
+#ifdef KZ3_BLOOM_OVERRIDE_100
+void func_001FB8F8__lifted(ppu_context* ctx);
+void func_001FB8F8(ppu_context* ctx) { kz3_bloom_body(ctx, func_001FB8F8__lifted, 0x001FB8F8u); }
+#endif
+#endif
 
 static int kz3_rsx_init(uint32_t w, uint32_t h, const char* title)
 {
@@ -1255,13 +1340,25 @@ static void kz3_kb_set(ppu_context* ctx)
             return;
         }
         if (!strncmp(cmd, "motionblur", 10) && (cmd[10] == 0 || cmd[10] == ' ')) {   /* Motion blur row (patch 2107) */
-            const int v = cmd[10] ? rsx_dm_parse_vsync(cmd + 11) : -1;
+            const int v = cmd[10] ? rsx_dm_parse_pct(cmd + 11) : -1;
             if (v >= 0) {
                 InterlockedExchange(&s_mb_eff, v);
                 s_mb_saved = v;
                 kz3_display_save_extra();
             }
-            snprintf(s_kb_reply, sizeof s_kb_reply, "%s", rsx_dm_vsync_name((int)s_mb_eff));
+            snprintf(s_kb_reply, sizeof s_kb_reply, "%d", (int)s_mb_eff);
+            s_kb_pending = 1;
+            printf("[kb-page] '%s' -> '%s'\n", cmd, s_kb_reply);
+            return;
+        }
+        if (!strncmp(cmd, "bloom", 5) && (cmd[5] == 0 || cmd[5] == ' ')) {   /* Bloom row (patch 2121) */
+            const int v = cmd[5] ? rsx_dm_parse_pct(cmd + 6) : -1;
+            if (v >= 0) {
+                InterlockedExchange(&s_bloom_eff, v);
+                s_bloom_saved = v;
+                kz3_display_save_extra();
+            }
+            snprintf(s_kb_reply, sizeof s_kb_reply, "%d", (int)s_bloom_eff);
             s_kb_pending = 1;
             printf("[kb-page] '%s' -> '%s'\n", cmd, s_kb_reply);
             return;
@@ -1832,6 +1929,7 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
                 char* pg = text.empty() ? nullptr
                                         : rsx_dm_patch_gum_opts(text.data(), text.size(), &pn,
                                                                 (s_mb_override ? RSX_DM_GUM_MBLUR : 0u) |   /* 2107 */
+                                                                (s_bloom_override ? RSX_DM_GUM_BLOOM : 0u) |   /* 2121 */
                                                                 (s_fov_ok ? RSX_DM_GUM_FOV : 0u));          /* 2109 */
                 if (pg) { patched.assign(pg, pn); free(pg); added = 1; }
             } else

@@ -282,6 +282,22 @@ if(NOT KZ3_LIFT_VER MATCHES "^(100|114)$")
 endif()
 message(STATUS "KZ3: lift ${RECOMP_DIR} is EBOOT ${KZ3_LIFT_VER}")
 target_compile_definitions(${PROJECT_NAME} PRIVATE KZ3_EBOOT_VER_DEFAULT=${KZ3_LIFT_VER})
+# Patch 2121 (RSX pass 114): main.cpp defines the BuildPost override (Options > Display > Bloom) only when the lift
+# announces it (ppu_overrides.h, or ppu_recomp.h in an old lift): 1.14 @0x00207248, 1.00 @0x001FB8F8. A lift without
+# the row builds as before and the Bloom row is not offered.
+set(_kz3_ovr_ann "${RECOMP_DIR}/ppu_overrides.h")
+if(NOT EXISTS "${_kz3_ovr_ann}")
+    set(_kz3_ovr_ann "${RECOMP_DIR}/ppu_recomp.h")
+endif()
+file(STRINGS "${_kz3_ovr_ann}" _kz3_bloom_ann REGEX "^#define PPU_OVERRIDE_(00207248|001FB8F8) ")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_kz3_ovr_ann}")
+foreach(_kz3_l IN LISTS _kz3_bloom_ann)
+    if(_kz3_l MATCHES "PPU_OVERRIDE_00207248")
+        target_compile_definitions(${PROJECT_NAME} PRIVATE KZ3_BLOOM_OVERRIDE KZ3_BLOOM_OVERRIDE_114)
+    elseif(_kz3_l MATCHES "PPU_OVERRIDE_001FB8F8")
+        target_compile_definitions(${PROJECT_NAME} PRIVATE KZ3_BLOOM_OVERRIDE KZ3_BLOOM_OVERRIDE_100)
+    endif()
+endforeach()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ps3recomp_runtime
