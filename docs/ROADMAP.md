@@ -20,7 +20,7 @@ Where each feature of the PS3 game stands today, and the port-only features with
 | 🔧 | The whole campaign, start to finish: all 9 chapters load and play for minutes; one chapter (Pyrrhus Outskirts) has been played by hand to its end (2026-10-20), the others not played through. Remaining: level streaming, scripts, physics, AI, every mission |
 | 🔧 | **Error and runtime logging:** per-run log files, crash reports with an error box, quiet by default |
 | 🔧 | Save games in your user folder (checkpoints save and reload today); local trophies (shown by the port, not synced anywhere) are planned |
-| ✅ | **Installer and portable zip** (Windows): check your own disc dump and 1.14 update, then build the port on your machine with a bundled compiler; nothing of the game is shipped or downloaded. Published as pre-releases (latest <!-- version -->v0.1.4<!-- /version -->) |
+| ✅ | **Installer and portable zip** (Windows): check your own disc dump and 1.14 update, then build the port on your machine with a bundled compiler; nothing of the game is shipped or downloaded. Published as pre-releases (latest <!-- version -->v0.1.5<!-- /version -->) |
 
 ## 2. PC display and settings  🔧
 
