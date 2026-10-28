@@ -1,0 +1,149 @@
+--- a/runtime/diag/kz3_wait_acct.c
++++ b/runtime/diag/kz3_wait_acct.c
+@@ -25,6 +25,7 @@
+     int depth;
+     volatile uint64_t top_ns[KZ3_WA_NKIND], top_n[KZ3_WA_NKIND];
+     int job_img; uint64_t job_t0;
++    void* hthr;   /* patch 1033: duplicated thread handle when the profiler samples this thread */
+     wa_slot tab[WA_SLOTS];
+     /* printer-owned snapshot */
+     uint64_t p_ns[WA_SLOTS], p_n[WA_SLOTS], p_top_ns[KZ3_WA_NKIND], p_top_n[KZ3_WA_NKIND];
+@@ -127,6 +128,8 @@
+     if (image) add(t, KZ3_WA_JOB, (uint32_t)image, 0, 1);
+ }
+ 
++static void prof_attach(wa_thr* t);   /* patch 1033 */
++
+ /* Names this host thread. If a record of that name exists already, this thread takes
+  * it over: short-lived threads that run one after another (the per-pass policy-module
+  * workers) then share one record instead of using one each. The previous owner must
+@@ -140,12 +143,13 @@
+     for (long i = 0; i < nt; i++)
+         if (s_thr[i] && strncmp(s_thr[i]->name, name, sizeof s_thr[i]->name - 1) == 0) {
+             s_thr[i]->ostid = os_tid(); tls_set(s_thr[i]);
++            prof_attach(s_thr[i]);
+             __sync_lock_release(&lock);
+             return;
+         }
+     wa_thr* t = tls_get();
+     if (!t) t = me();
+-    if (t) strncpy(t->name, name, sizeof t->name - 1);
++    if (t) { strncpy(t->name, name, sizeof t->name - 1); prof_attach(t); }
+     __sync_lock_release(&lock);
+ }
+ 
+@@ -297,6 +301,106 @@
+     return 0;
+ }
+ 
++
++/* ---- KZ3 patch 1033: host sampling profiler (Windows only, needs KZ3_WAIT_ACCT) ------------------
++ * KZ3_PROF=FROM,TO (seconds since start): from FROM to TO a sampler thread suspends every profiled
++ * thread about once per ms, reads its RIP and counts (RIP, resident job module) pairs; at TO it prints
++ * every pair once ("[prof] rva=0x... job=N n=..."; rva relative to the exe's load address, "ext" for
++ * code outside the exe) and stops. tools/spu/prof_resolve.py maps the RVAs to function names.
++ * Profiled threads: those named through kz3_wacct_name whose name contains KZ3_PROF_FILTER
++ * (default: the SPURS kernel threads "spurs-kern" and the lane workers "pm-worker"). */
++#ifdef _WIN32
++enum { PR_SLOTS = 1 << 16 };
++typedef struct { uint64_t rip; int job; uint32_t n; } pr_ent;
++static pr_ent* s_pr;
++static volatile long s_pr_lock = 0;
++static int s_prof_on = -1;
++static double s_prof_from = 0, s_prof_to = 0;
++static const char* s_prof_filter = 0;
++
++static void pr_add(uint64_t rip, int job)
++{
++    uint64_t key = rip ^ ((uint64_t)(uint32_t)job << 40);
++    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 40) & (PR_SLOTS - 1);
++    for (int p = 0; p < 64; p++) {
++        pr_ent* e = &s_pr[(h + p) & (PR_SLOTS - 1)];
++        if (e->n && e->rip == rip && e->job == job) { e->n++; return; }
++        if (!e->n) { e->rip = rip; e->job = job; e->n = 1; return; }
++    }
++}
++
++static DWORD WINAPI prof_thread(LPVOID p)
++{
++    (void)p;
++    const uint64_t base = (uint64_t)(uintptr_t)GetModuleHandleA(NULL);
++    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(uintptr_t)(base + ((const IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
++    const uint64_t size = nt->OptionalHeader.SizeOfImage;
++    uint64_t samples = 0, miss = 0;
++    for (;;) {
++        Sleep(1);
++        double t = (double)(kz3_wacct_now() - s_t0) / 1e9;
++        if (t < s_prof_from) continue;
++        if (t >= s_prof_to) break;
++        while (__sync_lock_test_and_set(&s_pr_lock, 1)) { }
++        long nt2 = s_nthr; if (nt2 > WA_THREADS) nt2 = WA_THREADS;
++        for (long i = 0; i < nt2; i++) {
++            wa_thr* w = s_thr[i];
++            if (!w || !w->hthr) continue;
++            HANDLE h = (HANDLE)w->hthr;
++            if (SuspendThread(h) == (DWORD)-1) { miss++; continue; }
++            CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL;
++            if (GetThreadContext(h, &c)) { pr_add((uint64_t)c.Rip, w->job_img); samples++; } else miss++;
++            ResumeThread(h);
++        }
++        __sync_lock_release(&s_pr_lock);
++    }
++    fprintf(stderr, "[prof] done t=%.1f..%.1fs samples=%llu miss=%llu base=0x%llx size=0x%llx\n", s_prof_from, s_prof_to,
++            (unsigned long long)samples, (unsigned long long)miss, (unsigned long long)base, (unsigned long long)size);
++    for (int i = 0; i < PR_SLOTS; i++) {
++        const pr_ent* e = &s_pr[i];
++        if (!e->n) continue;
++        if (e->rip >= base && e->rip < base + size)
++            fprintf(stderr, "[prof] rva=0x%llx job=%d n=%u\n", (unsigned long long)(e->rip - base), e->job, e->n);
++        else
++            fprintf(stderr, "[prof] ext=0x%llx job=%d n=%u\n", (unsigned long long)e->rip, e->job, e->n);
++    }
++    fflush(stderr);
++    return 0;
++}
++
++static void prof_init(void)
++{
++    const char* e = getenv("KZ3_PROF");
++    s_prof_on = 0;
++    if (!e || sscanf(e, "%lf,%lf", &s_prof_from, &s_prof_to) != 2 || s_prof_to <= s_prof_from) return;
++    s_prof_filter = getenv("KZ3_PROF_FILTER");
++    s_pr = (pr_ent*)calloc(PR_SLOTS, sizeof *s_pr);
++    if (!s_pr) return;
++    s_prof_on = 1;
++    fprintf(stderr, "[prof] on: %.0f..%.0f s, threads matching %s (KZ3 patch 1033)\n", s_prof_from, s_prof_to,
++            s_prof_filter ? s_prof_filter : "spurs-kern|pm-worker");
++    CreateThread(NULL, 1u << 18, prof_thread, NULL, 0, NULL);
++}
++
++static void prof_attach(wa_thr* t)
++{
++    if (s_prof_on <= 0 || !t) return;
++    int m = s_prof_filter ? strstr(t->name, s_prof_filter) != NULL
++                          : (strstr(t->name, "spurs-kern") || strstr(t->name, "pm-worker"));
++    if (!m) return;
++    HANDLE h = NULL;
++    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
++                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0)) return;
++    while (__sync_lock_test_and_set(&s_pr_lock, 1)) { }
++    if (t->hthr) CloseHandle((HANDLE)t->hthr);
++    t->hthr = h;
++    __sync_lock_release(&s_pr_lock);
++}
++#else
++static void prof_init(void) { }
++static void prof_attach(wa_thr* t) { (void)t; }
++#endif
++
+ int kz3_wacct_init(void)
+ {
+     static volatile long once = 0;
+@@ -316,6 +420,7 @@
+     if (ms) {
+         fprintf(stderr, "[wacct] on: %d ms windows (KZ3 patch 1032)\n", ms);
+         g_kz3_wacct = ms;
++        prof_init();   /* patch 1033 */
+ #ifdef _WIN32
+         CreateThread(NULL, 1u << 18, printer, NULL, 0, NULL);
+ #else

@@ -1,0 +1,7 @@
+# PPU lift fixups for the 1.14 EBOOT (tools/lift.sh and tools/release/lift_fixups.py apply them; KZ3_EBOOT_VER=114).
+#   end  FUNC NEW_END              function boundary find_functions got wrong
+#   jt   DISPATCHER BASE COUNT [abs|rel]   jump table the lifter's scan cannot resolve (patch 3004, PPU_JT_HINTS)
+# RE pass 59 (the RE notes section 31.8): func_00E67F48 ends in a switch whose table base is spilled to the
+# stack; find_functions stopped at the bctr (0xE68050) although the 32 cases run on to the next function 0xE69AF8.
+end 0x00E67F48 0x00E69AF8
+jt  0x00E6804C 0x00E68050 32 rel

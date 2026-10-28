@@ -1,0 +1,312 @@
+KZ3 patch 3006: PAD_SCRIPT v2 (gameplay test plan B1). Scripted pad input with per-event holds,
+analog stick and trigger segments, a file form with comments, a raised event limit and one log line per fired
+event. v1 was digital only, kept at most 32 events (pad-r12 has 47; the rest were dropped silently) and held
+each 40 polls. Old "sec:mask" scripts behave exactly as before.
+
+Grammar (PAD_SCRIPT="..." and PAD_SCRIPT_FILE=path take the same text and add up; events need not be sorted):
+  script := event { sep event }        sep = ',' | space | tab | newline; '#' comments to end of line
+  event  := T ':' body [ '/' SECONDS ] T = wall-clock seconds since the first pad poll (float)
+  body   := MASK                       digital press, C number (0x4000 or 16384); held 40 polls,
+                                       or SECONDS when '/' is given
+          | LX ',' LY ',' RX ',' RY [ ',' L2 ',' R2 ]
+                                       analog hold: sticks -1..1 (0 centred; LY/RY -1 = up, +1 = down),
+                                       triggers 0..1 (pressure; above 0.5 the digital L2/R2 bit is set too);
+                                       held SECONDS, default 1 s
+Examples:  10:0x4000  (CROSS, 40 polls)   300:0x0100/3  (L2 held 3 s)   430:0,-1,0,0/10  (left stick up 10 s)
+           440:0,0,1,0,0,1/2  (right stick right + R2 for 2 s)
+Masks: (DIGITAL2 << 8) | DIGITAL1: SELECT 0x0001 L3 0x0002 R3 0x0004 START 0x0008 UP 0x0010 RIGHT 0x0020
+DOWN 0x0040 LEFT 0x0080 L2 0x0100 R2 0x0200 L1 0x0400 R1 0x0800 TRIANGLE 0x1000 CIRCLE 0x2000 CROSS 0x4000
+SQUARE 0x8000.
+
+Events latch (fire at the first poll at or after T, a loading screen stops polling) and hold from then; digital
+bits of overlapping events OR together, the latest-fired analog hold wins and the sticks return to centre after
+it. Log: "[cellPad] PAD_SCRIPT: N event(s)" plus a WARNING line for dropped (> PAD_SCRIPT_MAX = 1024) or
+unparsable events at start, then "[cellPad] script t=Ts press 0xMMMM for ..." / "... sticks l=(x,y) r=(x,y)
+l2=.. r2=.. for ..s" per fired event, at most 20 per wall second. Host test: tools/upstream/test_pad_script_v2.py.
+Upstream candidate (general: any title's headless test driving).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index af86881..51b8873 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -901,6 +901,195 @@ void cellPad_poll(void)
+     }
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 3006: PAD_SCRIPT v2 -- scripted pad input with per-event holds,
++ * analog stick/trigger segments and a file form. v1 (PAD_SCRIPT="sec:mask,...")
++ * was digital only, 32 events at most (the rest dropped silently), 40 polls each.
++ *
++ * Grammar (PAD_SCRIPT="..." and PAD_SCRIPT_FILE=path take the same text and add up;
++ * events need not be in time order):
++ *   script := event { sep event }        sep = ',' | space | tab | newline; '#' comments to end of line
++ *   event  := T ':' body [ '/' SECONDS ] T = wall-clock seconds since the first pad poll (float)
++ *   body   := MASK                       digital press, C number (0x4000 or 16384); held 40 polls,
++ *                                        or SECONDS when '/' is given
++ *           | LX ',' LY ',' RX ',' RY [ ',' L2 ',' R2 ]
++ *                                        analog hold: sticks -1..1 (0 centred; LY/RY -1 = up, +1 = down),
++ *                                        triggers 0..1 (pressure; above 0.5 the digital L2/R2 bit is set
++ *                                        too); held SECONDS, default 1 s
++ * Examples:  10:0x4000            CROSS at 10 s for 40 polls (v1, unchanged)
++ *            300:0x0100/3         L2 held 3 s
++ *            430:0,-1,0,0/10      left stick full up for 10 s
++ *            440:0,0,1,0,0,1/2    right stick right and R2 fully pressed for 2 s
++ * Events latch: each fires at the first poll at or after T (a loading screen stops polling) and holds from
++ * then. Digital bits of overlapping events OR together; of overlapping analog holds the latest to fire wins,
++ * and the sticks return to centre when none is active. One log line per fired event ("[cellPad] script
++ * t=..."), at most PAD_SCRIPT_LOG_PER_SEC per wall second. Up to PAD_SCRIPT_MAX events; a WARNING line names
++ * anything dropped past that or unparsable.
++ * -----------------------------------------------------------------------*/
++#define PAD_SCRIPT_MAX         1024
++#define PAD_SCRIPT_HOLD_POLLS  40
++#define PAD_SCRIPT_LOG_PER_SEC 20
++
++typedef struct {
++    double t;              /* fire at the first poll at or after this second */
++    double hold_s;         /* < 0: digital for PAD_SCRIPT_HOLD_POLLS polls; else seconds */
++    unsigned mask;         /* digital: (DIGITAL2 << 8) | DIGITAL1 */
++    int analog;            /* 1: ax[] = lx ly rx ry l2 r2 as 0..255 */
++    unsigned char ax[6];
++    int fired; double fired_at; int polls_left;
++} PadScriptEvent;
++
++typedef struct {
++    PadScriptEvent ev[PAD_SCRIPT_MAX];
++    int n, dropped, bad;
++    int log_sec, log_n, log_suppressed;
++} PadScript;
++
++static const char* pad_script_skip(const char* p)          /* separators and comments */
++{
++    for (;;) {
++        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
++        if (*p != '#') return p;
++        while (*p && *p != '\n') p++;
++    }
++}
++
++static const char* pad_script_blank(const char* p) { while (*p == ' ' || *p == '\t') p++; return p; }
++
++/* A number at p: hex through strtoul (MSVCRT's strtod has no hex form), else strtod. 0 = no number. */
++static int pad_script_number(const char* p, const char** end, double* out)
++{
++    const char* q = (*p == '+' || *p == '-') ? p + 1 : p;
++    char* e;
++    if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) {
++        unsigned long v = strtoul(p, &e, 16);
++        if (e == p) return 0;
++        *out = (double)v; *end = e; return 1;
++    }
++    double v = strtod(p, &e);
++    if (e == p) return 0;
++    *out = v; *end = e; return 1;
++}
++
++static unsigned char pad_script_axis(double v, int trigger)
++{
++    double b = trigger ? v * 255.0 : 128.0 + v * 128.0;
++    if (b < 0) b = 0;
++    if (b > 255) b = 255;
++    return (unsigned char)(b + 0.5);
++}
++
++/* Parse `text` (an env value or a file's contents) and append its events to s. Returns the number added;
++ * s->bad counts tokens it could not read, s->dropped the events past PAD_SCRIPT_MAX. */
++static int pad_script_parse(PadScript* s, const char* text)
++{
++    const char* p = pad_script_skip(text);
++    int added = 0;
++    while (*p) {
++        const char* end; const char* tok0 = 0;
++        double t = 0, dur = -1, v[6];
++        int nv = 0, ok = 1;
++        if (!pad_script_number(p, &end, &t)) ok = 0;
++        else { p = pad_script_blank(end); if (*p != ':') ok = 0; else p = pad_script_blank(p + 1); }
++        while (ok) {   /* p ends right after the last number read, so the terminator check below sees it */
++            const char* q;
++            if (nv == 6 || !pad_script_number(p, &end, &v[nv])) { ok = 0; break; }
++            if (nv == 0) tok0 = p;
++            nv++; p = end;
++            q = pad_script_blank(p);
++            if (*q != ',') break;
++            /* a comma continues the list unless the next number is a time (followed by ':') */
++            q = pad_script_blank(q + 1);
++            { double peek; const char* e2;
++              if (!pad_script_number(q, &e2, &peek) || *pad_script_blank(e2) == ':') break; }
++            p = q;
++        }
++        if (ok) {
++            const char* q = pad_script_blank(p);
++            if (*q == '/') {
++                q = pad_script_blank(q + 1);
++                if (!pad_script_number(q, &end, &dur) || dur < 0) ok = 0; else p = end;
++            }
++        }
++        if (ok && nv != 1 && nv != 4 && nv != 6) ok = 0;
++        if (ok && *p && *p != ',' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && *p != '#') ok = 0;
++        if (!ok) {   /* skip the token and count it */
++            s->bad++;
++            while (*p && *p != ',' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
++            p = pad_script_skip(p);
++            continue;
++        }
++        if (s->n >= PAD_SCRIPT_MAX) { s->dropped++; p = pad_script_skip(p); continue; }
++        { PadScriptEvent* e = &s->ev[s->n++];
++          memset(e, 0, sizeof *e);
++          e->t = t; e->hold_s = dur;
++          if (nv == 1) e->mask = (unsigned)strtoul(tok0, 0, 0);      /* as v1: base 0 */
++          else { int i; e->analog = 1; if (dur < 0) e->hold_s = 1.0;
++                 for (i = 0; i < nv; i++) e->ax[i] = pad_script_axis(v[i], i >= 4); }
++          added++; }
++        p = pad_script_skip(p);
++    }
++    return added;
++}
++
++/* One poll at wall time `now` (seconds): OR the digital bits of the active events into *mask, copy the latest
++ * active analog hold into ax[6] (*ax_set = 1). Returns the number of events that fired at this poll. */
++static int pad_script_poll(PadScript* s, double now, unsigned* mask, unsigned char ax[6], int* ax_set)
++{
++    int i, fired = 0; double ax_t = -1;
++    *ax_set = 0;
++    for (i = 0; i < s->n; i++) {
++        PadScriptEvent* e = &s->ev[i];
++        int active;
++        if (!e->fired) {
++            int sec;
++            if (now < e->t) continue;
++            e->fired = 1; e->fired_at = now; e->polls_left = PAD_SCRIPT_HOLD_POLLS; fired++;
++            sec = (int)now;
++            if (sec != s->log_sec) {
++                if (s->log_suppressed)
++                    printf("[cellPad] script t=%ds: %d more event(s) fired (log limit)\n", s->log_sec, s->log_suppressed);
++                s->log_sec = sec; s->log_n = 0; s->log_suppressed = 0;
++            }
++            if (s->log_n++ < PAD_SCRIPT_LOG_PER_SEC) {
++                if (e->analog)
++                    printf("[cellPad] script t=%.1fs sticks l=(%u,%u) r=(%u,%u) l2=%u r2=%u for %.2fs (at %.1fs)\n",
++                           e->t, e->ax[0], e->ax[1], e->ax[2], e->ax[3], e->ax[4], e->ax[5], e->hold_s, now);
++                else if (e->hold_s < 0)
++                    printf("[cellPad] script t=%.1fs press 0x%04X for %d polls (at %.1fs)\n",
++                           e->t, e->mask, PAD_SCRIPT_HOLD_POLLS, now);
++                else
++                    printf("[cellPad] script t=%.1fs press 0x%04X for %.2fs (at %.1fs)\n", e->t, e->mask, e->hold_s, now);
++                fflush(stdout);
++            } else s->log_suppressed++;
++        }
++        if (e->hold_s < 0) { active = e->polls_left > 0; if (active) e->polls_left--; }
++        else active = (now - e->fired_at) <= e->hold_s;
++        if (!active) continue;
++        if (!e->analog) *mask |= e->mask;
++        else if (e->fired_at >= ax_t) { ax_t = e->fired_at; memcpy(ax, e->ax, 6); *ax_set = 1; }
++    }
++    if (*ax_set) { if (ax[4] > 127) *mask |= 0x0100; if (ax[5] > 127) *mask |= 0x0200; }
++    return fired;
++}
++
++static char* pad_script_read_file(const char* path)        /* malloc'd, NUL-terminated; NULL if unreadable */
++{
++    FILE* f = fopen(path, "rb");
++    size_t cap = 1 << 16, len = 0; char* buf;
++    if (!f) return NULL;
++    buf = (char*)malloc(cap);
++    while (buf) {
++        size_t r = fread(buf + len, 1, cap - len - 1, f);
++        len += r;
++        if (len < cap - 1) break;
++        { char* nb = (char*)realloc(buf, cap * 2); if (!nb) { free(buf); buf = NULL; break; } buf = nb; cap *= 2; }
++    }
++    fclose(f);
++    if (buf) buf[len] = 0;
++    return buf;
++}
++
+ /* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. The
+  * vm_write helpers from ppu_memory.h translate + byte-swap. (cellPad was
+  * written for host pointers and was never actually invoked until its NIDs
+@@ -1014,53 +1203,44 @@ skip_inject: ;
+               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= 0x08;   /* START */
+       } }
+ 
+-    /* PAD_SCRIPT="<sec>:<mask>,<sec>:<mask>,..." -- press a NAMED button at a
+-     * given wall-clock second (or flip, under PAD_CLOCK=flips), each held ~250 ms. PAD_AUTOPRESS only pulses
+-     * CROSS and START, which is enough to clear a "press start" screen but not
+-     * to navigate a menu: You Don't Know Jack needs DOWN to move off its name
+-     * field before CROSS means anything. Masks are CELL_PAD_CTRL_* packed as
+-     * (DIGITAL2 << 8) | DIGITAL1: START 0x0008, UP 0x0010, DOWN 0x0040,
+-     * LEFT 0x0080, RIGHT 0x0020, CROSS 0x4000, CIRCLE 0x2000, TRIANGLE 0x1000.
+-     * Legit input simulation on the same footing as PAD_AUTOPRESS/PAD_STICK. */
+-    { static int s_sc = -1;
+-      static struct { double t; unsigned mask; } ev[256]; static int n_ev = 0;
++    /* PAD_SCRIPT (KZ3 patch 3006, v2; grammar above pad_script_parse): press buttons and hold the sticks at
++     * given wall-clock seconds. PAD_AUTOPRESS only pulses CROSS and START, which is enough to clear a "press
++     * start" screen but not to navigate a menu or play a level. PAD_SCRIPT="..." and PAD_SCRIPT_FILE=path add
++     * up. Legit input simulation on the same footing as PAD_AUTOPRESS/PAD_STICK. */
++    { static int s_sc = -1; static PadScript s_script; static int s_ax_was = 0;
+       static unsigned long long t0 = 0;   /* not ULONGLONG: this builds on POSIX too */
+       if (s_sc < 0) {
++          const char* e = getenv("PAD_SCRIPT"); const char* pf = getenv("PAD_SCRIPT_FILE");
+           s_sc = 0;
+-          const char* e = getenv("PAD_SCRIPT");
+-          if (e && *e) {
++          if (e && *e) pad_script_parse(&s_script, e);
++          if (pf && *pf) {
++              char* txt = pad_script_read_file(pf);
++              if (txt) { pad_script_parse(&s_script, txt); free(txt); }
++              else printf("[cellPad] PAD_SCRIPT_FILE: WARNING cannot read '%s'\n", pf);
++          }
++          if ((e && *e) || (pf && *pf)) {
+               s_sc = 1; t0 = GetTickCount64();
+-              const char* p = e;
+-              while (*p && n_ev < 256) {
+-                  double t = strtod(p, (char**)&p);
+-                  if (*p == ':') p++;
+-                  unsigned m = (unsigned)strtoul(p, (char**)&p, 0);
+-                  ev[n_ev].t = t; ev[n_ev].mask = m; n_ev++;
+-                  while (*p == ',' || *p == ' ') p++;
+-              }
+-              printf("[cellPad] PAD_SCRIPT: %d event(s)%s\n", n_ev,
+-                     *p ? " -- TRUNCATED at 256, the rest are ignored" : "");
++              printf("[cellPad] PAD_SCRIPT: %d event(s)\n", s_script.n);
++              if (s_script.dropped)
++                  printf("[cellPad] PAD_SCRIPT: WARNING %d event(s) dropped over the limit of %d\n", s_script.dropped, PAD_SCRIPT_MAX);
++              if (s_script.bad)
++                  printf("[cellPad] PAD_SCRIPT: WARNING %d unparsable event(s) skipped\n", s_script.bad);
++              fflush(stdout);
+           }
+       }
+       if (s_sc && port_no == 0) {
+-          double now = pad_clock(t0);
+-          /* Latch, do not window. A fixed time window is missed whenever the
+-           * title stops polling the pad for longer than the window (it does
+-           * exactly that on a loading screen), so the press silently never
+-           * happens. Fire on the first poll at or after the event time and
+-           * hold it for a fixed number of polls, which is what a real press
+-           * looks like regardless of poll rate. */
+-          static int fired[256], held[256];
+-          for (int i = 0; i < n_ev; i++) {
+-              if (!fired[i] && now >= ev[i].t) { fired[i] = 1; held[i] = 40; }
+-              if (held[i] > 0) {
+-                  held[i]--;
+-                  data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);
+-                  data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((ev[i].mask >> 8) & 0xFF);
+-                  static int said[256];
+-                  if (!said[i]) { said[i] = 1;
+-                      printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
+-              }
++          double now = pad_clock(t0);   /* PR #344: PAD_CLOCK=flips counts guest flips (3006's v2 grammar unchanged) */
++          unsigned m = 0; unsigned char ax[6]; int ax_set = 0;
++          pad_script_poll(&s_script, now, &m, ax, &ax_set);
++          data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(m & 0xFF);
++          data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((m >> 8) & 0xFF);
++          if (ax_set) {
++              hs->analog_lx = ax[0]; hs->analog_ly = ax[1]; hs->analog_rx = ax[2]; hs->analog_ry = ax[3];
++              hs->trigger_l2 = ax[4]; hs->trigger_r2 = ax[5]; hs->connected = 1; s_ax_was = 1;
++          } else if (s_ax_was) {   /* hold over: back to centre (with no pad attached the host state keeps it) */
++              s_ax_was = 0;
++              hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
++              hs->trigger_l2 = hs->trigger_r2 = 0;
+           }
+       } }
+ 

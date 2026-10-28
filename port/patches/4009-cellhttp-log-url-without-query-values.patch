@@ -1,0 +1,46 @@
+KZ3 4009: the cellHttp log lines (CreateTransaction, SendRequest) print the URL without its query values: names and
+separators stay ("?sig=&sigclass=&timeZone=..."), values and any fragment are dropped. t->url is only read by the
+logs; the request line still carries the full path and query. Killzone 3's SVO login puts the open PSID in "sig".
+Upstream candidate. Test: tools/net/test_net.sh (test_cellhttp_gate: the CreateTransaction line of a URL with a
+query, captured from stdout, has no value).
+
+diff --git a/libs/network/cellHttp.c b/libs/network/cellHttp.c
+--- a/libs/network/cellHttp.c
++++ b/libs/network/cellHttp.c
+@@ -380,6 +380,22 @@
+     return CELL_OK;
+ }
+ 
++/* Drops every query value of a URL in place, keeping the names and separators: "/a?x=1&y=2#f" -> "/a?x=&y=". */
++static void http_url_redact_query(char* url)
++{
++    char* q = strchr(url, '?');
++    if (!q) return;
++    char* o = ++q;
++    int in_v = 0;
++    for (char* p = q; *p && *p != '#'; p++) {
++        if (*p == '&') in_v = 0;
++        else if (in_v) continue;
++        else if (*p == '=') in_v = 1;
++        *o++ = *p;
++    }
++    *o = '\0';
++}
++
+ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientId,
+                               const char* method, const CellHttpUri* uri)
+ {
+@@ -437,10 +453,12 @@
+ 
+             t->port = uri_port ? uri_port : 80;
+ 
+-            /* Build URL string for logging */
++            /* Build URL string for logging (only the logs read t->url). Query values are dropped, names kept
++             * ("?sig=&sigclass=..."): a title may put an identifier or a signature there. */
+             snprintf(t->url, sizeof(t->url), "%s://%s:%u%s",
+                      uri_scheme   ? uri_scheme   : "http",
+                      t->hostname, t->port, t->path);
++            http_url_redact_query(t->url);
+ 
+             vm_write32((u32)(uintptr_t)transId, (u32)i);
+             printf("[cellHttp] CreateTransaction(client=%u, %s %s) -> trans=%u\n",

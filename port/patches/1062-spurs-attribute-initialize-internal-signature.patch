@@ -1,0 +1,101 @@
+KZ3 patch 1062 (SPU pass 47, finding RE pass 104; DEFAULT ON since SPU pass 60 with patches 1074 + 1077, KZ3_SPURS_ATTR_SDK=0 = the old 2/2 mapping): the HLE _cellSpursAttributeInitialize (NID 0x95180230, the SDK's internal entry behind the cellSpursAttributeInitialize() macro) takes (attr, revision, sdkVersion, nSpus, spuPriority, ppuPriority, exitIfNoWork); the public five-argument prototype reads r4 (revision = 2) as nSpus, so KZ3's HiPrio (nSpus 5) and LoPrio (nSpus 1) instances both get 2 virtual SPUs. Mapping in libs/spurs/kz3_spurs_attr.h, OPT-IN KZ3_SPURS_ATTR_SDK=1: with the real counts this port's HiPrio kernel threads never see a ready workload and the boot hangs in the menu movie (runs spu-47n-a1/a2c), so the default stays the old mapping until the kernel-thread/lane model works with 5. Host test tools/spu/test_spurs_attr.sh. Upstream: on hold.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): absorbed by PR310 in its default, kept for kz3_spurs_attr.h (used by 1064, 1074, test_spurs_attr) and the KZ3_SPURS_ATTR_SDK switch, drop later with them.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 7b7518cc..b0921d66 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -14,6 +14,7 @@
+ #include "../../runtime/ps3_log.h"
+ #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+ #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
++#include "kz3_spurs_attr.h" /* KZ3 patch 1062: the internal AttributeInitialize signature */
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+ #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
+ #include "../../runtime/ppu/ppu_context.h"  /* g_active_ctx: 9th argument on the guest stack */
+@@ -672,19 +673,19 @@ s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
+     return CELL_OK;
+ }
+ 
+-/* The SDK's cellSpursAttributeInitialize() is an inline wrapper over this
+- * internal export (NID 0x95180230), whose arguments are (attr, revision,
+- * sdkVersion, nSpus, spuPriority, ppuPriority, exitIfNoWork). Reading them with
+- * the public five-argument prototype took the revision (2) as nSpus, the SDK
+- * version as spuPriority and the real nSpus as ppuPriority. */
+-s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, u32 revision,
+-                                  u32 sdkVersion, s32 nSpus, s32 spuPriority,
+-                                  s32 ppuPriority, u8 exitIfNoWork)
++/* The SDK's cellSpursAttributeInitialize() macro imports this internal name
++ * (NID 0x95180230). KZ3 patch 1062: its signature is (attr, revision, sdkVersion,
++ * nSpus, spuPriority, ppuPriority, exitIfNoWork), not the public five-argument one
++ * (kz3_spurs_attr.h; default on since SPU pass 60, KZ3_SPURS_ATTR_SDK=0 = the old 2/2 mapping). */
++s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, uint64_t r4, uint64_t r5,
++                                  uint64_t r6, uint64_t r7, uint64_t r8, uint64_t r9)
+ {
+-    (void)revision;
+-    (void)sdkVersion;
+-    return cellSpursAttributeInitialize(attr, nSpus, spuPriority,
+-                                        ppuPriority, exitIfNoWork);
++    kz3_spurs_attr_args a = kz3_spurs_attr_map(r4, r5, r6, r7, r8, r9);
++    printf("[cellSpurs] _AttributeInitialize(revision=%u sdk=0x%X nSpus=%d spuPrio=%d ppuPrio=%d exitIfNoWork=%u)%s\n",
++           a.revision, a.sdkVersion, a.nSpus, a.spuPriority, a.ppuPriority, a.exitIfNoWork,
++           kz3_spurs_attr_sdk() ? " [KZ3_SPURS_ATTR_SDK: SDK argument order]" : " [r4 read as nSpus: KZ3_SPURS_ATTR_SDK=0, the old mapping]");
++    return cellSpursAttributeInitialize(attr, a.nSpus, a.spuPriority,
++                                        a.ppuPriority, a.exitIfNoWork);
+ }
+ 
+ s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
+diff --git a/libs/spurs/kz3_spurs_attr.h b/libs/spurs/kz3_spurs_attr.h
+new file mode 100644
+index 00000000..25186ad8
+--- /dev/null
++++ b/libs/spurs/kz3_spurs_attr.h
+@@ -0,0 +1,45 @@
++/* KZ3 patch 1062 (SPU pass 47, from RE pass 104): the SDK's internal
++ * _cellSpursAttributeInitialize (NID 0x95180230, what the cellSpursAttributeInitialize()
++ * macro imports) takes (attr, revision, sdkVersion, nSpus, spuPriority, ppuPriority,
++ * exitIfNoWork). The HLE used the public five-argument prototype, so it read r4 (the
++ * revision, 2) as nSpus, r5 (the SDK version) as spuPriority and r6 (the real nSpus) as
++ * ppuPriority. KZ3 asks for 5 SPUs (HiPrio) and 1 (LoPrio); the HLE made both 2.
++ * The register-to-argument mapping lives here so a host test can check it without the
++ * Windows-only cellSpurs.c. ON by default since SPU pass 60 (with the per-SPU kernel 1074 and the PM
++ * argument fix 1077 the real 5/1 counts reach K4; before, the boot hung: spu rounds 47, 58-59);
++ * KZ3_SPURS_ATTR_SDK=0 selects the old mapping (r4 read as nSpus, 2/2). */
++#ifndef KZ3_SPURS_ATTR_H
++#define KZ3_SPURS_ATTR_H
++#include <stdint.h>
++#include <stdlib.h>
++
++typedef struct {
++    uint32_t revision, sdkVersion;
++    int32_t  nSpus, spuPriority, ppuPriority;
++    uint8_t  exitIfNoWork;
++} kz3_spurs_attr_args;
++
++static inline int kz3_spurs_attr_sdk(void)
++{
++    static int s = -1;
++    if (s < 0) { const char* e = getenv("KZ3_SPURS_ATTR_SDK"); s = (e && *e == '0') ? 0 : 1; }
++    return s;
++}
++
++/* r4..r9 as the generic HLE adapter hands them over (r3 = attr). */
++static inline kz3_spurs_attr_args kz3_spurs_attr_map(uint64_t r4, uint64_t r5, uint64_t r6,
++                                                     uint64_t r7, uint64_t r8, uint64_t r9)
++{
++    kz3_spurs_attr_args a;
++    if (!kz3_spurs_attr_sdk()) {         /* KZ3_SPURS_ATTR_SDK=0: the public prototype on the internal NID (2/2) */
++        a.revision = 0; a.sdkVersion = 0;
++        a.nSpus = (int32_t)r4; a.spuPriority = (int32_t)r5; a.ppuPriority = (int32_t)r6;
++        a.exitIfNoWork = (uint8_t)r7;
++    } else {
++        a.revision = (uint32_t)r4; a.sdkVersion = (uint32_t)r5;
++        a.nSpus = (int32_t)r6; a.spuPriority = (int32_t)r7; a.ppuPriority = (int32_t)r8;
++        a.exitIfNoWork = (uint8_t)r9;
++    }
++    return a;
++}
++#endif

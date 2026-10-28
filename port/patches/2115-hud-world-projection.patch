@@ -1,0 +1,46 @@
+KZ3 patch 2115 (RSX pass 108; ENHANCEMENT, display, with 2113): the frustum helper for the world-anchored HUD
+kept on target under the 16:9 squeeze (port/kz3/main.cpp hooks Camera::vf17 at the HUD getter's call). Design:
+the RE notes Pass 169; notes the RE notes Pass 108.
+
+--- a/libs/video/rsx_hud169.h
++++ b/libs/video/rsx_hud169.h
+@@ -14,6 +14,7 @@
+ #define RSX_HUD169_H
+ 
+ #include <math.h>
++#include <string.h>   /* memcpy (patch 2115) */
+ 
+ /* Factors for a client of w x h pixels: 1 when the squeeze is active (some factor differs from 1 by >= 1e-3). */
+ static inline int rsx_h169_factors(unsigned w, unsigned h, float* kx, float* ky)
+@@ -69,4 +70,31 @@
+     return *gx >= 0.0f && *gy >= 0.0f && *gx < wv && *gy < hv;
+ }
+ 
++/* KZ3 patch 2115 (RSX pass 108): the HUD's world projection in the 16:9 box. While the 2D layer is squeezed, the
++ * world-anchored HUD (objective markers and arrows, name tags, spot marks, lock-on brackets, crosshair spread) must be
++ * projected with the frustum of the box, not the window's Hor+/Vert+ one (patch 2096), or the squeeze moves each mark
++ * off its target by kx (the RE notes Pass 169). The frustum Camera::vf17 returns to the HUD getter holds
++ * big-endian floats; left/right at +0x0C/+0x10 and top/bottom at +0x14/+0x18 (the extents at unit distance): x by kx,
++ * y by ky (the squeeze factors of rsx_h169_factors), so Hor+ gets back the 16:9 width and Vert+ the 16:9 height. */
++static inline float rsx_h169_bef(const unsigned char* p)
++{
++    const unsigned u = (unsigned)p[0] << 24 | (unsigned)p[1] << 16 | (unsigned)p[2] << 8 | (unsigned)p[3];
++    float f;
++    memcpy(&f, &u, 4);
++    return f;
++}
++static inline void rsx_h169_setbef(unsigned char* p, float f)
++{
++    unsigned u;
++    memcpy(&u, &f, 4);
++    p[0] = (unsigned char)(u >> 24); p[1] = (unsigned char)(u >> 16); p[2] = (unsigned char)(u >> 8); p[3] = (unsigned char)u;
++}
++static inline void rsx_h169_frustum(unsigned char* f, float kx, float ky)
++{
++    rsx_h169_setbef(f + 0x0C, rsx_h169_bef(f + 0x0C) * kx);
++    rsx_h169_setbef(f + 0x10, rsx_h169_bef(f + 0x10) * kx);
++    rsx_h169_setbef(f + 0x14, rsx_h169_bef(f + 0x14) * ky);
++    rsx_h169_setbef(f + 0x18, rsx_h169_bef(f + 0x18) * ky);
++}
++
+ #endif /* RSX_HUD169_H */

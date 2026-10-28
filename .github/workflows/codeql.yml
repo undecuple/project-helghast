@@ -1,0 +1,32 @@
+# CodeQL code scanning (Python tools, C/C++ port code, workflows). Code scanning on a private repository needs
+# GitHub Advanced Security, so the job runs only once the repository is public.
+name: CodeQL
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+permissions:
+  contents: read
+jobs:
+  analyze:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, c-cpp, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: github/codeql-action/init@9f759ee644a3e7c15c1390abf49868036c00067b  # v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@9f759ee644a3e7c15c1390abf49868036c00067b  # v3
+        with:
+          category: /language:${{ matrix.language }}

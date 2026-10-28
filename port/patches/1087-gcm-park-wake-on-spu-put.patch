@@ -1,0 +1,84 @@
+KZ3 patch 1087 (SPU pass 66): the GCM walker waits for an SPU-patched park on an event instead of ending its pass
+and leaving the next pass to the present loop's 4 ms sleep. KZ3 ends each frame's FIFO at a JUMP-to-self park that
+SPURS job 36 (Gfx.Post.Unlock, job image 244) overwrites with a 4-byte PUT (patch 1007 waits for it): the PUT ->
+walker hand-off took 0-4 ms (K4 run spu-66-trace2, KZ3_FRAME_TRACE: p50 1.64 ms, max 4.0 ms after the job's end,
+once per frame, on the main thread's path through label 75). Now patch 1007's park-wait publishes the park's IO
+offset and waits on an auto-reset event that the SPU PUT hook (gcm_note_spu_put) sets when a PUT covers that word,
+in 1 ms slices (a park patched by a PPU store is still seen within ~1 ms), for at most KZ3_PARK_WAKE_MS per pass
+(default 4, the present loop's sleep, so no park is seen later than before; 0 = the old path), then re-reads the
+word. Recorded GPU work is submitted before the first slice (patch 2029's submit, as at the end of a pass). The wait
+runs under the FIFO lock (only the walker takes it) and counts as walk time in RSX_PERF. Upstream candidate (with a
+present loop that sleeps between passes).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ours + the f8255191 re-read.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 97495254..40038c29 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1621,12 +1621,54 @@ void gcm_forget_spu_blocks(void)
+     s_spu_blk_w = 0;
+ }
+ 
++/* KZ3 patch 1087 (SPU pass 66): the walker waits for an SPU-patched park on an event.
++ *
++ * KZ3 ends each frame's FIFO at a JUMP-to-self park that SPU job 36 (Gfx.Post.Unlock, image 244) overwrites with a
++ * PUT (patch 1007 waits for it). The drain used to end its pass on the park and the port's present loop slept 4 ms
++ * before the next pass, so the PUT -> walker hand-off took 0-4 ms (K4, spu-66-trace2: p50 1.64 ms, max 4.0 ms after
++ * the job's end, once per frame on the main thread's path through label 75); the real RSX sees the patched word on
++ * its next fetch. Now the park-wait publishes the park's IO offset and waits on an event that the SPU PUT hook
++ * (gcm_note_spu_put) sets when a PUT covers that word, in 1 ms slices (a park patched by a PPU store is still seen
++ * within ~1 ms), at most KZ3_PARK_WAKE_MS per pass (default 4 = the present loop's sleep, so no park is seen later
++ * than before; 0 = the old path), then re-reads the word. The GPU gets the recorded work before the wait (patch
++ * 2029's submit, as at the end of a pass). */
++static volatile u32 s_park_wake_io = 0xFFFFFFFFu;
++static HANDLE s_park_wake_ev = NULL;
++static int gcm_park_wake_wait(u32 park_io)
++{
++    static int s_ms = -1;
++    static u32 s_slices, s_last_io = 0xFFFFFFFFu, s_word;
++    if (s_ms < 0) {
++        const char* e = getenv("KZ3_PARK_WAKE_MS");
++        s_ms = e ? atoi(e) : 4;
++        if (s_ms < 0) s_ms = 0;
++        if (s_ms > 50) s_ms = 50;
++        if (s_ms) s_park_wake_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
++        if (!s_park_wake_ev) s_ms = 0;
++        fprintf(stderr, "[cellGcmSys] park wake (KZ3_PARK_WAKE_MS, patch 1087): %d ms\n", s_ms);
++    }
++    if (!s_ms) return 0;
++    const u32 ea = gcm_io2ea(park_io);
++    if (!ea) return 0;
++    if (park_io != s_last_io) { s_last_io = park_io; s_slices = 0; s_word = vm_read32(ea); }
++    if (s_slices >= (u32)s_ms) { s_slices = 0; return 0; }   /* this pass's budget is spent: end it as before */
++    if (s_slices == 0 && rsx_live_draw_enabled()) rsx_live_draw_submit_pending();
++    s_slices++;
++    __atomic_store_n(&s_park_wake_io, park_io, __ATOMIC_RELEASE);
++    if (vm_read32(ea) == s_word) WaitForSingleObject(s_park_wake_ev, 1);   /* not patched between fetch and publish */
++    __atomic_store_n(&s_park_wake_io, 0xFFFFFFFFu, __ATOMIC_RELEASE);
++    return 1;
++}
++
+ void gcm_note_spu_put(u32 ea, u32 size)
+ {
+     if (!size || size > 0x40000u) return;
+     u32 room = 0;
+     u32 io = gcm_ea2io_range(ea, &room);
+     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
++    /* KZ3 patch 1087: this PUT patches the park the walker waits on: wake it (gcm_park_wake_wait) */
++    { const u32 pw = __atomic_load_n(&s_park_wake_io, __ATOMIC_ACQUIRE);
++      if (pw != 0xFFFFFFFFu && pw - io < size && s_park_wake_ev) SetEvent(s_park_wake_ev); }
+ 
+     /* Coalesce with the previous block when an SPU emits one buffer in several
+      * transfers -- otherwise only the last fragment is remembered and the
+@@ -2457,7 +2499,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                           if (kz3_ft_on()) fprintf(stderr, "[ft] %llu park io=0x%08X ea=0x%08X put=0x%08X\n", ps3_ms_now(),
+                                                    s_fifo_getoff, gcm_io2ea(s_fifo_getoff), put); }
+                       else if (put != s_park_put) { s_park_put = put; s_park_putchg++; }
+-                      if (pw > 0 && now - s_park_t0 < (u64)pw * 1000000ull) { why = "park-wait"; s_park_pass = 1; break; }
++                      if (pw > 0 && now - s_park_t0 < (u64)pw * 1000000ull) {
++                          if (gcm_park_wake_wait(s_fifo_getoff)) continue;   /* KZ3 patch 1087: re-read the park */
++                          why = "park-wait"; s_park_pass = 1; break; }
+                       /* v0.18.0 (upstream f8255191): read the park again before giving up on it; an SPU job
+                        * filling a command-buffer hole may land between this pass's read and the resync. */
+                       if (vm_read32(gcm_io2ea(s_fifo_getoff)) != w) { why = "park-wait"; s_park_pass = 1; break; }

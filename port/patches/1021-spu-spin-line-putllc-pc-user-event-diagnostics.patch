@@ -1,0 +1,52 @@
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 73605eb7..954ca6f5 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -809,6 +809,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                               " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
+                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
++              /* The whole line and the waiter's state: which word is the stuck one (a semaphore at
++               * ea+(x & 0x7C) is usually in r3..r6), and whether it loops on the lost-reservation
++               * event (evmask 0x400) or on failed PUTLLCs (atomic_stat 1). */
++              fprintf(stderr, "[spu-spin]   stat=%u evmask=0x%X evstat=0x%X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X line:",
++                      ctx->atomic_stat, ctx->event_mask, ctx->event_status, ctx->gpr[3]._u32[0],
++                      ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0]);
++              for (int _w = 0; _w < 32; _w++)
++                  fprintf(stderr, " %02X%02X%02X%02X", m[4*_w], m[4*_w+1], m[4*_w+2], m[4*_w+3]);
++              fprintf(stderr, "\n");
+           } }
+         if (!llar_fast) spu_lockline_unlock();
+         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
+@@ -907,9 +916,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                             memcpy(&t, (const unsigned char*)ctx->ls + ((lsa + _i*4) & SPU_LS_MASK), 4);
+                             w[_i] = __builtin_bswap32(t);
+                         }
+-                        fprintf(stderr, "[putllc-ok] %llu: img=%d ctx=%p ea=0x%08X"
++                        fprintf(stderr, "[putllc-ok] %llu: img=%d ctx=%p pc=0x%05X lr=0x%05X ea=0x%08X"
+                                         " line=%08X %08X %08X %08X %08X %08X %08X %08X\n",
+-                                n, ctx->image_id, (void*)ctx, ea,
++                                n, ctx->image_id, (void*)ctx, (unsigned)(ctx->pc & SPU_LS_MASK),
++                                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
+                                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); } } }
+             spu_coh_notify_write(ea);
+             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 96266731..54f6ec04 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1709,6 +1709,12 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
+                 spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
+             result = rc == 0 ? CELL_OK : CELL_EBUSY;
+         }
++        /* Which SPU user events reach which queue: the first 48, then every 1024th. A PPU thread
++         * blocked in sys_event_queue_receive on a queue no SPU ever sends to is the question. */
++        { static unsigned long n_ue;
++          if (++n_ue <= 48 || (n_ue & 1023) == 0)
++              fprintf(stderr, "[spu-evt] #%lu img=%d port %u -> queue %u data1=0x%06X data2=0x%08X rc=0x%X\n",
++                      n_ue, spu->image_id, port, queue, value & 0xFFFFFFu, data, result); }
+     }
+     if (code < 64) spu_channel_write(&spu->ch_in_mbox, result);
+     return 1;

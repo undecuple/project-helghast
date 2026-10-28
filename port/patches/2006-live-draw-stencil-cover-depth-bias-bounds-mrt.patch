@@ -1,0 +1,512 @@
+rsx_live_draw: scissored clears, per-face stencil masks/reference, polygon offset, depth bounds, MRT blend/mask.
+
+For KZ3's stencil-then-cover text (512x512 glyph cache at 0x3A00000) and the deferred renderer:
+- CLEAR_SURFACE is limited to the surface clip and the scissor rectangle (ClearRenderTargetView /
+  ClearDepthStencilView with one rect), as on RSX (RPCS3 clears the scissor region). An unscissored clear of
+  one glyph-cache cell wiped every glyph rendered before it. LD_CLEAR_NO_SCISSOR=1 restores the old clears.
+  The z/stencil clear value counts as unwritten by seen[], not by being zero.
+- Two-sided stencil: back read/write masks (0x358/0x34C) through D3D12_DEPTH_STENCIL_DESC2 in a pipeline
+  state stream and back reference (0x354) through ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef,
+  when D3D12_OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported; otherwise the front values for both
+  faces (logged once). MinGW-w64 14 lacks both declarations; they are declared locally with the SDK layout.
+- Polygon offset (fill enable 0xA68, factor 0xA78, units 0xA7C) -> rasterizer SlopeScaledDepthBias/DepthBias.
+- Depth bounds (0x380 enable, 0x384/0x388 min/max) -> DEPTH_STENCIL1/2 DepthBoundsTestEnable in the PSO and
+  ID3D12GraphicsCommandList1::OMSetDepthBounds per draw, when D3D12_OPTIONS2.DepthBoundsTestSupported.
+- Blend colour (SET_BLEND_COLOR 0x31C, BLEND_COLOR2 0x368 for FP16 surfaces) -> OMSetBlendFactor per draw
+  (never set before); CONSTANT_ALPHA factors use D3D12_BLEND_ALPHA_FACTOR when D3D12_OPTIONS13 allows.
+- LD_RS_LOG lines also print blend factors/equation, blend colour and alpha-test enable.
+- MRT: IndependentBlendEnable with the per-target blend enable (0x36C bits 1-3) and colour mask (0x370
+  nibbles 1-3); targets 1-3 used to mirror target 0.
+All new state is in the PSO key. LD_NO_PSO_STREAM=1 turns the stream path (depth bounds, per-face masks) off.
+KZ3 port RSX, 2026-10-08.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): PR282 z16 clear overlaps, ours kept since 2041 builds the same decode on it (seen-count default, clear rects).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1283,7 +1283,24 @@ int rsx_live_draw_enabled(void)
+ #define M_SCISSOR_HORIZONTAL  0x08C0
+ #define M_SCISSOR_VERTICAL    0x08C4
+ #define M_ZSTENCIL_CLEAR      0x1D8C
+-
++/* Back-face stencil masks and reference (two-sided stencil), polygon offset, depth bounds and the MRT
++ * blend-enable / colour-mask words (raw NV4097 offsets; numbering checked against RPCS3 gcm_enums.h as a
++ * read-only oracle; field layouts as libgcm's CELL_GCM_COLOR_MASK_MRT* / cellGcmSetBlendEnableMrt). */
++#define M_BACK_STENCIL_MASK      0x034C
++#define M_BACK_STENCIL_FUNC_REF  0x0354
++#define M_BACK_STENCIL_FUNC_MASK 0x0358
++#define M_BLEND_COLOR            0x031C   /* A8R8G8B8, or R16 | G16 << 16 (half) on FP16 surfaces */
++#define M_BLEND_COLOR2           0x0368   /* B16 | A16 << 16 (half), FP16 surfaces */
++#define M_BLEND_ENABLE_MRT       0x036C   /* bit n (1..3): blend on for colour target n */
++#define M_COLOR_MASK_MRT         0x0370   /* nibble n (1..3): A=bit 4n, R=4n+1, G=4n+2, B=4n+3 */
++#define M_DEPTH_BOUNDS_ENABLE    0x0380
++#define M_DEPTH_BOUNDS_MIN       0x0384   /* float */
++#define M_DEPTH_BOUNDS_MAX       0x0388   /* float */
++#define M_POLY_OFFSET_FILL_ENABLE 0x0A68
++#define M_POLY_OFFSET_SCALE      0x0A78   /* float, slope factor */
++#define M_POLY_OFFSET_BIAS       0x0A7C   /* float, units */
++
++static int g_ld_alpha_factor;   /* D3D12_OPTIONS13.AlphaBlendFactorSupported (patch 2006) */
+ static D3D12_COMPARISON_FUNC gcm_cmp(u32 f)
+ {
+     switch (f) {
+@@ -1313,8 +1330,10 @@ static D3D12_BLEND gcm_blend_factor(u32 f, int alpha)
+     case 0x0308: return D3D12_BLEND_SRC_ALPHA_SAT;
+     case 0x8001: return D3D12_BLEND_BLEND_FACTOR;
+     case 0x8002: return D3D12_BLEND_INV_BLEND_FACTOR;
+-    case 0x8003: return D3D12_BLEND_BLEND_FACTOR;
+-    case 0x8004: return D3D12_BLEND_INV_BLEND_FACTOR;
++    /* CONSTANT_ALPHA: the blend colour's alpha on every channel (D3D12_OPTIONS13 ALPHA_FACTOR; without
++     * it the full blend factor, as before patch 2006). For the alpha channel both are the same. */
++    case 0x8003: return (!alpha && g_ld_alpha_factor) ? D3D12_BLEND_ALPHA_FACTOR : D3D12_BLEND_BLEND_FACTOR;
++    case 0x8004: return (!alpha && g_ld_alpha_factor) ? D3D12_BLEND_INV_ALPHA_FACTOR : D3D12_BLEND_INV_BLEND_FACTOR;
+     default:     return D3D12_BLEND_ONE;
+     }
+ }
+@@ -1361,8 +1380,26 @@ typedef struct {
+     u32 stencil_enable, stencil_two_sided;
+     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
+     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
++    /* KZ3 (patch 2006): back-face read/write masks (two-sided only; equal to the front ones otherwise),
++     * whether the PSO needs per-face masks (D3D12_DEPTH_STENCIL_DESC2), depth bounds enable, polygon
++     * offset (raw float bits, zero when the fill enable is off) and the MRT blend/colour-mask words
++     * (zero when one target). */
++    u32 bs_func_mask, bs_write_mask, stencil_per_face;
++    u32 depth_bounds;
++    u32 poly_scale_bits, poly_bias_bits;
++    u32 blend_mrt, color_mask_mrt;
+ } render_state_t;
+ 
++/* Device capabilities used by patch 2006 (filled at init). */
++static struct {
++    int depth_bounds;        /* D3D12_OPTIONS2.DepthBoundsTestSupported + ID3D12GraphicsCommandList1 */
++    int per_face_stencil;    /* D3D12_OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported + list 8 */
++    ID3D12Device2* dev2;     /* pipeline state streams (DEPTH_STENCIL1/2) */
++    ID3D12GraphicsCommandList1* list1;
++    void* list8;             /* ID3D12GraphicsCommandList8 (no MinGW declaration; see ld_set_stencil_refs) */
++    int logged_face_fallback;
++} g_ld_caps;
++
+ static void decode_render_state(render_state_t* rs)
+ {
+     memset(rs, 0, sizeof(*rs));
+@@ -1408,6 +1445,46 @@ static void decode_render_state(render_state_t* rs)
+     rs->bs_fail      = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_OP_FAIL);
+     rs->bs_zfail     = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_OP_ZFAIL);
+     rs->bs_zpass     = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_OP_ZPASS);
++    /* Two-sided stencil: the back face has its own read mask, write mask and reference (0x34C-0x358).
++     * Never-written back registers read as 0 (the dispatcher seeds no default), so fall back to the
++     * front values until the game writes them. */
++    rs->bs_func_mask  = rs->s_func_mask;
++    rs->bs_write_mask = rs->s_write_mask;
++    if (rs->stencil_enable && rs->stencil_two_sided) {
++        if (g.rsx.seen[M_BACK_STENCIL_FUNC_MASK >> 2])
++            rs->bs_func_mask = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_FUNC_MASK) & 0xFF;
++        if (g.rsx.seen[M_BACK_STENCIL_MASK >> 2])
++            rs->bs_write_mask = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_MASK) & 0xFF;
++        if (rs->bs_func_mask != rs->s_func_mask || rs->bs_write_mask != rs->s_write_mask) {
++            if (g_ld_caps.per_face_stencil) {
++                rs->stencil_per_face = 1;
++            } else {
++                /* No per-face masks on this device: the front masks are used for both faces. */
++                if (!g_ld_caps.logged_face_fallback++)
++                    fprintf(stderr, "[stencil] per-face masks front %02X/%02X back %02X/%02X not supported "
++                            "by the device; using the front masks for both faces\n",
++                            rs->s_func_mask, rs->s_write_mask, rs->bs_func_mask, rs->bs_write_mask);
++                rs->bs_func_mask = rs->s_func_mask;
++                rs->bs_write_mask = rs->s_write_mask;
++            }
++        }
++    }
++    if (!rs->stencil_per_face) { rs->bs_func_mask = 0; rs->bs_write_mask = 0; }   /* keep the PSO key small */
++    /* Depth bounds: dynamic min/max (OMSetDepthBounds), enable is PSO state. */
++    rs->depth_bounds = g_ld_caps.depth_bounds && (rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_ENABLE) & 1u);
++    /* Polygon offset for filled triangles (live-draw draws everything as triangles; point/line offset
++     * enables 0xA60/0xA64 do not apply). */
++    if (rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_FILL_ENABLE) & 1u) {
++        rs->poly_scale_bits = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_SCALE);
++        rs->poly_bias_bits  = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_BIAS);
++    }
++    if (rs->rt_count > 1) {
++        const u32 keep = (rs->rt_count >= 4) ? 0xEu : (rs->rt_count == 3) ? 0x6u : 0x2u;
++        rs->blend_mrt = rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE_MRT) & keep;
++        /* Never written: all channels on, as before this patch. ASSUMPTION: matches the reset state. */
++        const u32 cm = g.rsx.seen[M_COLOR_MASK_MRT >> 2] ? rsx_dsp_reg(&g.rsx, M_COLOR_MASK_MRT) : 0xFFF0u;
++        rs->color_mask_mrt = cm & ((rs->rt_count >= 4) ? 0xFFF0u : (rs->rt_count == 3) ? 0x0FF0u : 0x00F0u);
++    }
+ }
+ 
+ /* GL stencil-op enums (the NV4097 payload) -> D3D12. Zero (never seeded by
+@@ -1447,6 +1524,43 @@ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+         b->DestBlendAlpha= gcm_blend_factor(rs->df_a, 1);
+         b->BlendOpAlpha  = gcm_blend_op(rs->eq_a);
+     }
++    /* MRT (patch 2006): RSX has one set of blend factors/equations for all targets, but a blend enable
++     * (0x36C bit n) and a colour mask (0x370 nibble n) per target 1..3. Targets beyond the first used to
++     * mirror target 0 (D3D12 IndependentBlendEnable off). */
++    if (rs->rt_count > 1) {
++        pd->BlendState.IndependentBlendEnable = TRUE;
++        for (u32 r = 1; r < rs->rt_count && r < 4; r++) {
++            D3D12_RENDER_TARGET_BLEND_DESC* br = &pd->BlendState.RenderTarget[r];
++            *br = *b;
++            br->BlendEnable = ((rs->blend_mrt >> r) & 1u) ? TRUE : FALSE;
++            if (br->BlendEnable && !rs->blend_enable) {
++                br->SrcBlend       = gcm_blend_factor(rs->sf_rgb, 0);
++                br->DestBlend      = gcm_blend_factor(rs->df_rgb, 0);
++                br->BlendOp        = gcm_blend_op(rs->eq_rgb);
++                br->SrcBlendAlpha  = gcm_blend_factor(rs->sf_a, 1);
++                br->DestBlendAlpha = gcm_blend_factor(rs->df_a, 1);
++                br->BlendOpAlpha   = gcm_blend_op(rs->eq_a);
++            }
++            const u32 m = rs->color_mask_mrt >> (4u * r);
++            br->RenderTargetWriteMask =
++                ((m & 1u) ? D3D12_COLOR_WRITE_ENABLE_ALPHA : 0) |
++                ((m & 2u) ? D3D12_COLOR_WRITE_ENABLE_RED   : 0) |
++                ((m & 4u) ? D3D12_COLOR_WRITE_ENABLE_GREEN : 0) |
++                ((m & 8u) ? D3D12_COLOR_WRITE_ENABLE_BLUE  : 0);
++        }
++    }
++    /* Polygon offset (patch 2006). GL/RSX: offset = factor * max_slope + units * r, with r = 2^-24 for a
++     * 24-bit depth buffer. D3D12 on a float DSV: DepthBias * 2^(e - 23) with e the exponent of the
++     * largest depth in the primitive, which is 2^-24 for depths in [0.5, 1) -- where scene geometry sits.
++     * ASSUMPTION: KZ3 uses Z24S8 zeta (Z16 would want units * 256); nearer depths get a smaller bias. */
++    if (rs->poly_scale_bits || rs->poly_bias_bits) {
++        float scale, bias;
++        memcpy(&scale, &rs->poly_scale_bits, 4);
++        memcpy(&bias, &rs->poly_bias_bits, 4);
++        if (scale == scale) pd->RasterizerState.SlopeScaledDepthBias = scale;
++        if (bias == bias && bias > -2.0e9f && bias < 2.0e9f)
++            pd->RasterizerState.DepthBias = (INT)(bias < 0.0f ? bias - 0.5f : bias + 0.5f);
++    }
+     pd->RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+     if (rs->cull_enable && rs->cull_face) {
+         const u32 f = rs->cull_face;
+@@ -1488,6 +1602,185 @@ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+     }
+ }
+ 
++/* --- patch 2006: pipeline state streams for depth bounds and per-face stencil masks ---------------------
++ * D3D12_GRAPHICS_PIPELINE_STATE_DESC cannot express either: depth bounds needs DEPTH_STENCIL1
++ * (DepthBoundsTestEnable), per-face read/write masks need DEPTH_STENCIL2 (Agility SDK 1.606+,
++ * D3D12_OPTIONS14). MinGW-w64 14 headers lack DEPTH_STENCIL2 and ID3D12GraphicsCommandList8, so the two
++ * are declared here with the SDK layout. */
++typedef struct {
++    D3D12_STENCIL_OP StencilFailOp, StencilDepthFailOp, StencilPassOp;
++    D3D12_COMPARISON_FUNC StencilFunc;
++    UINT8 StencilReadMask, StencilWriteMask;
++} ld_depth_stencilop_desc1;
++typedef struct {
++    BOOL DepthEnable;
++    D3D12_DEPTH_WRITE_MASK DepthWriteMask;
++    D3D12_COMPARISON_FUNC DepthFunc;
++    BOOL StencilEnable;
++    ld_depth_stencilop_desc1 FrontFace, BackFace;
++    BOOL DepthBoundsTestEnable;
++} ld_depth_stencil_desc2;
++typedef struct { DXGI_FORMAT RTFormats[8]; UINT NumRenderTargets; } ld_rt_format_array;   /* D3D12_RT_FORMAT_ARRAY */
++#define LD_SUBOBJECT_DEPTH_STENCIL2 26   /* D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2 */
++/* ID3D12GraphicsCommandList8 {ee936ef9-599d-4d28-938e-23c4ad05ce51} (GUID checked in vkd3d-proton's
++ * d3d12core.dll); its one new method follows the ID3D12GraphicsCommandList7 vtable. */
++static const GUID ld_IID_ID3D12GraphicsCommandList8 =
++    { 0xee936ef9, 0x599d, 0x4d28, { 0x93, 0x8e, 0x23, 0xc4, 0xad, 0x05, 0xce, 0x51 } };
++typedef void (STDMETHODCALLTYPE* ld_om_set_front_back_ref_fn)(void* self, UINT front, UINT back);
++
++/* Pipeline state stream subobject: type tag, then the payload at its natural alignment; each subobject
++ * pointer-aligned (the d3dx12 CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT layout). */
++#define LD_PSS(T) struct { __attribute__((aligned(8))) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; T inner; }
++
++static void ld_caps_init(void)
++{
++    memset(&g_ld_caps, 0, sizeof(g_ld_caps));
++    if (getenv("LD_NO_PSO_STREAM")) {
++        fprintf(stderr, "[caps] LD_NO_PSO_STREAM: depth bounds and per-face stencil masks off\n");
++        return;
++    }
++    if (FAILED(g.dev->lpVtbl->QueryInterface(g.dev, &IID_ID3D12Device2, (void**)&g_ld_caps.dev2)))
++        g_ld_caps.dev2 = NULL;
++    D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2;
++    memset(&o2, 0, sizeof(o2));
++    const int have_o2 = SUCCEEDED(g.dev->lpVtbl->CheckFeatureSupport(
++        g.dev, D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof(o2)));
++    D3D12_FEATURE_DATA_D3D12_OPTIONS14 o14;
++    memset(&o14, 0, sizeof(o14));
++    const int have_o14 = SUCCEEDED(g.dev->lpVtbl->CheckFeatureSupport(
++        g.dev, D3D12_FEATURE_D3D12_OPTIONS14, &o14, sizeof(o14)));
++    if (FAILED(g.list->lpVtbl->QueryInterface(g.list, &IID_ID3D12GraphicsCommandList1,
++                                                 (void**)&g_ld_caps.list1)))
++        g_ld_caps.list1 = NULL;
++    if (FAILED(g.list->lpVtbl->QueryInterface(g.list, &ld_IID_ID3D12GraphicsCommandList8,
++                                                 &g_ld_caps.list8)))
++        g_ld_caps.list8 = NULL;
++    g_ld_caps.depth_bounds = g_ld_caps.dev2 && g_ld_caps.list1 && have_o2 && o2.DepthBoundsTestSupported;
++    g_ld_caps.per_face_stencil = g_ld_caps.dev2 && g_ld_caps.list8 && have_o14 &&
++                                 o14.IndependentFrontAndBackStencilRefMaskSupported;
++    D3D12_FEATURE_DATA_D3D12_OPTIONS13 o13;
++    memset(&o13, 0, sizeof(o13));
++    g_ld_alpha_factor = SUCCEEDED(g.dev->lpVtbl->CheckFeatureSupport(
++        g.dev, D3D12_FEATURE_D3D12_OPTIONS13, &o13, sizeof(o13))) && o13.AlphaBlendFactorSupported;
++    fprintf(stderr, "[caps] alpha-blend-factor=%d\n", g_ld_alpha_factor);
++    fprintf(stderr, "[caps] device2=%d list1=%d list8=%d depth-bounds=%d per-face-stencil=%d\n",
++            g_ld_caps.dev2 != NULL, g_ld_caps.list1 != NULL, g_ld_caps.list8 != NULL,
++            g_ld_caps.depth_bounds, g_ld_caps.per_face_stencil);
++}
++
++static float ld_half(u32 h)
++{
++    const u32 e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
++    float v;
++    if (e == 0) v = (float)m / 16777216.0f;              /* subnormal: m * 2^-24 */
++    else if (e == 31) v = 65504.0f;                      /* inf/NaN: clamp */
++    else { const u32 bits = ((e + 112u) << 23) | (m << 13); memcpy(&v, &bits, 4); }
++    return (h & 0x8000u) ? -v : v;
++}
++
++/* Blend colour (CONSTANT_COLOR / CONSTANT_ALPHA factors). Live-draw never set it, so D3D12 used the
++ * command list default. Patch 2006: from SET_BLEND_COLOR (and BLEND_COLOR2 on FP16 surfaces). */
++static void ld_set_blend_factor(int fp16)
++{
++    const u32 c = rsx_dsp_reg(&g.rsx, M_BLEND_COLOR);
++    float f[4];
++    if (fp16) {
++        const u32 c2 = rsx_dsp_reg(&g.rsx, M_BLEND_COLOR2);
++        f[0] = ld_half(c & 0xFFFFu); f[1] = ld_half(c >> 16);
++        f[2] = ld_half(c2 & 0xFFFFu); f[3] = ld_half(c2 >> 16);
++    } else {
++        f[0] = (float)((c >> 16) & 0xFFu) / 255.0f; f[1] = (float)((c >> 8) & 0xFFu) / 255.0f;
++        f[2] = (float)(c & 0xFFu) / 255.0f;         f[3] = (float)(c >> 24) / 255.0f;
++    }
++    g.list->lpVtbl->OMSetBlendFactor(g.list, f);
++}
++
++/* Front and back stencil reference. Two-sided stencil has its own back reference (0x354); without
++ * ID3D12GraphicsCommandList8 both faces use the front one. */
++static void ld_set_stencil_refs(void)
++{
++    const u32 front = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu;
++    u32 back = front;
++    if ((rsx_dsp_reg(&g.rsx, M_TWO_SIDED_STENCIL) & 1u) && g.rsx.seen[M_BACK_STENCIL_FUNC_REF >> 2])
++        back = rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_FUNC_REF) & 0xFFu;
++    if (back != front && g_ld_caps.per_face_stencil && g_ld_caps.list8) {
++        enum { LD_LIST7_SLOTS = sizeof(ID3D12GraphicsCommandList7Vtbl) / sizeof(void*) };
++        void** vtbl = *(void***)g_ld_caps.list8;
++        ((ld_om_set_front_back_ref_fn)vtbl[LD_LIST7_SLOTS])(g_ld_caps.list8, front, back);
++        return;
++    }
++    if (back != front && !g_ld_caps.logged_face_fallback++)
++        fprintf(stderr, "[stencil] back reference %02X != front %02X; device has no per-face reference, "
++                "using the front one\n", back, front);
++    g.list->lpVtbl->OMSetStencilRef(g.list, front);
++}
++
++/* Create the PSO; through a pipeline state stream when depth bounds or per-face stencil masks are on. */
++static HRESULT ld_create_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const render_state_t* rs,
++                             ID3D12PipelineState** out)
++{
++    if (!(rs->depth_bounds || rs->stencil_per_face) || !g_ld_caps.dev2 || !pd->DSVFormat)
++        return g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, pd, &IID_ID3D12PipelineState, (void**)out);
++    struct {
++        LD_PSS(ID3D12RootSignature*) root;
++        LD_PSS(D3D12_SHADER_BYTECODE) vs;
++        LD_PSS(D3D12_SHADER_BYTECODE) ps;
++        LD_PSS(D3D12_INPUT_LAYOUT_DESC) il;
++        LD_PSS(D3D12_BLEND_DESC) blend;
++        LD_PSS(UINT) sample_mask;
++        LD_PSS(D3D12_RASTERIZER_DESC) rast;
++        LD_PSS(D3D12_PRIMITIVE_TOPOLOGY_TYPE) topo;
++        LD_PSS(ld_rt_format_array) rtv;
++        LD_PSS(DXGI_FORMAT) dsv;
++        LD_PSS(DXGI_SAMPLE_DESC) sample;
++        LD_PSS(ld_depth_stencil_desc2) ds;   /* DEPTH_STENCIL2, or DEPTH_STENCIL1 (a prefix of it) */
++    } st;
++    memset(&st, 0, sizeof(st));
++    st.root.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;   st.root.inner = pd->pRootSignature;
++    st.vs.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;                 st.vs.inner = pd->VS;
++    st.ps.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;                 st.ps.inner = pd->PS;
++    st.il.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT;       st.il.inner = pd->InputLayout;
++    st.blend.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND;           st.blend.inner = pd->BlendState;
++    st.sample_mask.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK; st.sample_mask.inner = pd->SampleMask;
++    st.rast.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;       st.rast.inner = pd->RasterizerState;
++    st.topo.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY; st.topo.inner = pd->PrimitiveTopologyType;
++    st.rtv.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
++    st.rtv.inner.NumRenderTargets = pd->NumRenderTargets;
++    for (u32 r = 0; r < 8; r++) st.rtv.inner.RTFormats[r] = pd->RTVFormats[r];
++    st.dsv.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT; st.dsv.inner = pd->DSVFormat;
++    st.sample.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC;     st.sample.inner = pd->SampleDesc;
++    const D3D12_DEPTH_STENCIL_DESC* d = &pd->DepthStencilState;
++    ld_depth_stencil_desc2* o = &st.ds.inner;
++    o->DepthEnable = d->DepthEnable; o->DepthWriteMask = d->DepthWriteMask; o->DepthFunc = d->DepthFunc;
++    o->StencilEnable = d->StencilEnable;
++    size_t size = sizeof(st);
++    if (rs->stencil_per_face && g_ld_caps.per_face_stencil) {
++        st.ds.type = (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)LD_SUBOBJECT_DEPTH_STENCIL2;
++        const D3D12_DEPTH_STENCILOP_DESC* f[2] = { &d->FrontFace, &d->BackFace };
++        ld_depth_stencilop_desc1* t[2] = { &o->FrontFace, &o->BackFace };
++        for (int i = 0; i < 2; i++) {
++            t[i]->StencilFailOp = f[i]->StencilFailOp; t[i]->StencilDepthFailOp = f[i]->StencilDepthFailOp;
++            t[i]->StencilPassOp = f[i]->StencilPassOp; t[i]->StencilFunc = f[i]->StencilFunc;
++        }
++        o->FrontFace.StencilReadMask = (UINT8)rs->s_func_mask;   o->FrontFace.StencilWriteMask = (UINT8)rs->s_write_mask;
++        o->BackFace.StencilReadMask  = (UINT8)rs->bs_func_mask;  o->BackFace.StencilWriteMask  = (UINT8)rs->bs_write_mask;
++        o->DepthBoundsTestEnable = rs->depth_bounds ? TRUE : FALSE;
++    } else {
++        /* DEPTH_STENCIL1: D3D12_DEPTH_STENCIL_DESC + DepthBoundsTestEnable. */
++        st.ds.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
++        D3D12_DEPTH_STENCIL_DESC1 d1;
++        memset(&d1, 0, sizeof(d1));
++        memcpy(&d1, d, sizeof(*d));
++        d1.DepthBoundsTestEnable = rs->depth_bounds ? TRUE : FALSE;
++        memcpy(&st.ds.inner, &d1, sizeof(d1));
++        size = offsetof(__typeof__(st), ds) + ((offsetof(__typeof__(st.ds), inner) + sizeof(d1) + 7u) & ~(size_t)7u);
++    }
++    D3D12_PIPELINE_STATE_STREAM_DESC sd;
++    sd.SizeInBytes = size;
++    sd.pPipelineStateSubobjectStream = &st;
++    return g_ld_caps.dev2->lpVtbl->CreatePipelineState(g_ld_caps.dev2, &sd, &IID_ID3D12PipelineState, (void**)out);
++}
++
+ static D3D12_TEXTURE_ADDRESS_MODE gcm_wrap(u32 w)
+ {
+     switch (w & 0xF) {
+@@ -3788,6 +4081,14 @@ static u64 ld_hash_structural_render_state(
+     LD_HASH_RENDER_FIELD(bs_fail);
+     LD_HASH_RENDER_FIELD(bs_zfail);
+     LD_HASH_RENDER_FIELD(bs_zpass);
++    LD_HASH_RENDER_FIELD(bs_func_mask);
++    LD_HASH_RENDER_FIELD(bs_write_mask);
++    LD_HASH_RENDER_FIELD(stencil_per_face);
++    LD_HASH_RENDER_FIELD(depth_bounds);
++    LD_HASH_RENDER_FIELD(poly_scale_bits);
++    LD_HASH_RENDER_FIELD(poly_bias_bits);
++    LD_HASH_RENDER_FIELD(blend_mrt);
++    LD_HASH_RENDER_FIELD(color_mask_mrt);
+ #undef LD_HASH_RENDER_FIELD
+     return hash;
+ }
+@@ -4206,8 +4507,7 @@ static ID3D12PipelineState* build_pso(
+     g_ld_profile.total.create_pso_calls++;
+     const LONGLONG create_begin = ld_profile_qpc();
+ #endif
+-    HRESULT hr = g.dev->lpVtbl->CreateGraphicsPipelineState(
+-        g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
++    HRESULT hr = ld_create_pso(&pd, rs, &pso);
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.create_pso_qpc +=
+         (u64)(ld_profile_qpc() - create_begin);
+@@ -7343,7 +7643,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+           n++;
+           fprintf(stderr, "[rs-log] f=%u verts=%u prim=%u dsv=%d zeta=%u:0x%X clip=%ux%u cmask=0x%08X "
+                   "st=%u/2s%u func=%X ref=%X rmask=%X wmask=%X ops=%X/%X/%X back=%X/%X/%X/%X bmask=%X bref=%X "
+-                  "bfmask=%X z=%u/%u/%X cull=%u/%X front=%X blend=%u\n",
++                  "bfmask=%X z=%u/%u/%X cull=%u/%X front=%X blend=%u sf=%X df=%X eq=%X bc=%08X at=%u\n",
+                   g_ld_frames, n_tri * 3u, prim, have_dsv, sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h,
+                   rsx_dsp_reg(&g.rsx, M_COLOR_MASK),
+                   rsx_dsp_reg(&g.rsx, M_STENCIL_TEST_ENABLE) & 1u, rsx_dsp_reg(&g.rsx, M_TWO_SIDED_STENCIL) & 1u,
+@@ -7356,7 +7656,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                   rsx_dsp_reg(&g.rsx, 0x0358),
+                   rsx_dsp_reg(&g.rsx, 0x0A74) & 1u, rsx_dsp_reg(&g.rsx, 0x0A70) & 1u, rsx_dsp_reg(&g.rsx, 0x0A6C),
+                   rsx_dsp_reg(&g.rsx, 0x183C) & 1u, rsx_dsp_reg(&g.rsx, 0x1830), rsx_dsp_reg(&g.rsx, 0x1834),
+-                  rsx_dsp_reg(&g.rsx, 0x0310) & 1u);
++                  rsx_dsp_reg(&g.rsx, 0x0310) & 1u, rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR),
++                  rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR), rsx_dsp_reg(&g.rsx, M_BLEND_EQUATION),
++                  rsx_dsp_reg(&g.rsx, M_BLEND_COLOR), rsx_dsp_reg(&g.rsx, M_ALPHA_TEST_ENABLE) & 1u);
+       } }
+     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+@@ -7441,9 +7743,26 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     }
+     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
+     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+-    /* Dynamic stencil reference (kept out of the PSO key on purpose). */
+-    g.list->lpVtbl->OMSetStencilRef(
+-        g.list, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
++    /* Dynamic stencil reference (kept out of the PSO key on purpose); back reference for two-sided. */
++    ld_set_stencil_refs();
++    {
++        rsx_dsp_surface bsf;
++        rsx_dsp_get_surface(&g.rsx, &bsf);
++        ld_set_blend_factor(bsf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16);
++    }
++    /* Depth bounds range (dynamic; the enable is in the PSO). Patch 2006. */
++    if (g_ld_caps.depth_bounds && (rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_ENABLE) & 1u)) {
++        const u32 lo_bits = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MIN);
++        const u32 hi_bits = g.rsx.seen[M_DEPTH_BOUNDS_MAX >> 2] ? rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MAX)
++                                                                : 0x3F800000u;
++        float lo, hi;
++        memcpy(&lo, &lo_bits, 4); memcpy(&hi, &hi_bits, 4);
++        if (!(lo >= 0.0f)) lo = 0.0f;
++        if (lo > 1.0f) lo = 1.0f;
++        if (!(hi <= 1.0f)) hi = 1.0f;
++        if (hi < lo) hi = lo;
++        g_ld_caps.list1->lpVtbl->OMSetDepthBounds(g_ld_caps.list1, lo, hi);
++    }
+ 
+     D3D12_VERTEX_BUFFER_VIEW vbv;
+     vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
+@@ -7621,6 +7940,30 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+         fflush(s_csv_file);
+     }
+     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
++    /* Patch 2006: CLEAR_SURFACE is limited to the surface clip and the scissor rectangle (RPCS3 clears
++     * the scissor region too). KZ3 clears one cell of its 512x512 glyph cache (0x3A00000) at a time;
++     * an unscissored clear wiped every glyph rendered before. LD_CLEAR_NO_SCISSOR=1 restores the old
++     * full-surface clears. */
++    D3D12_RECT crect; UINT n_crect = 0;
++    { static int off = -1; if (off < 0) off = getenv("LD_CLEAR_NO_SCISSOR") ? 1 : 0;
++      rsx_dsp_surface csf;
++      rsx_dsp_get_surface(&g.rsx, &csf);
++      if (!off && csf.clip_w && csf.clip_h) {
++          LONG l = 0, t = 0, r = (LONG)csf.clip_w, b = (LONG)csf.clip_h;
++          if (g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] || g.rsx.seen[M_SCISSOR_VERTICAL >> 2]) {
++              const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
++              const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
++              const LONG sx = (LONG)(sh & 0xFFFFu), sw = (LONG)(sh >> 16);
++              const LONG sy = (LONG)(sv & 0xFFFFu), svh = (LONG)(sv >> 16);
++              if (sx > l) l = sx;
++              if (sy > t) t = sy;
++              if (sx + sw < r) r = sx + sw;
++              if (sy + svh < b) b = sy + svh;
++          }
++          if (r <= l || b <= t) return;   /* empty rectangle: the clear writes nothing */
++          crect.left = l; crect.top = t; crect.right = r; crect.bottom = b;
++          n_crect = 1;
++      } }
+     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
+         const u32 c = rsx_dsp_clear_color(&g.rsx);
+         float col[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+@@ -7636,7 +7979,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+         { static int ct = -1;
+           if (ct < 0) ct = getenv("LD_CLEAR_TEST") ? 1 : 0;
+           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
+-        g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
++        g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, n_crect, n_crect ? &crect : NULL);
+         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
+     }
+     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
+@@ -7658,13 +8001,12 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+          * 0xFFFFFF00 seeded by rsx_dispatch_init clears to 1.0 / 0. Same
+          * decode as the draw engine's clear. */
+         {
+-            const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
+-            const int z16 = sf.depth_format == 1u;
+-            const float cd = !zs ? 1.0f
+-                           : z16 ? (float)(zs & 0xFFFFu) / 65535.0f
+-                                 : (float)(zs >> 8) / 16777215.0f;
++            /* Patch 2006: "never written" is the seen[] count, not a zero value (0 = depth 0, stencil 0). */
++            const u32 zs = g.rsx.seen[M_ZSTENCIL_CLEAR >> 2] ? rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR)
++                                                            : 0xFFFFFF00u;
++            const float cd = (float)(zs >> 8) / 16777215.0f;
+             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
+-                clear_flags, cd, z16 ? (UINT8)0 : (UINT8)(zs & 0xFFu), 0, NULL);
++                clear_flags, cd, (UINT8)(zs & 0xFFu), n_crect, n_crect ? &crect : NULL);
+         }
+         if (zslot) {
+             g.zdepths[zslot - 1].cleared = 1;
+@@ -7999,6 +8341,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+                                      &IID_ID3D12GraphicsCommandList, (void**)&g.list);
+     if (g.queue) g.queue->lpVtbl->SetName(g.queue, L"rsx-live-queue");
+     if (g.list) g.list->lpVtbl->SetName(g.list, L"rsx-live-list");
++    if (g.list) ld_caps_init();
+     g.dev->lpVtbl->CreateFence(g.dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&g.fence);
+     g.fence_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+ 

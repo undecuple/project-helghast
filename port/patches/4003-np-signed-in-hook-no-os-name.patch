@@ -1,0 +1,117 @@
+KZ3 4003: the NP manager reports ONLINE (GetStatus, the RegisterCallback event) also when a port signs the player in
+through its own server (ps3_net_np_signed_in, set only while online), not only through psnr. np_psnr's online id no
+longer falls back to the OS login name (USERNAME/USER), which a server would see: "PS3Player" instead. np_manager_callback_get() exposes the registered callback for a port's own NP calls. Upstream
+candidate. test_np_identity updated for it; test_score_init includes net_policy.c.
+
+diff --git a/libs/network/np_psnr.c b/libs/network/np_psnr.c
+index 0d32655..7ac4e9f 100644
+--- a/libs/network/np_psnr.c
++++ b/libs/network/np_psnr.c
+@@ -66,8 +66,9 @@ void np_psnr_setup(const char* username, const char* server)
+         ps3_net_set_online(1);   /* KZ3 4001: --psnr is the online choice */
+         set_env("PSNR_SERVER", server);
+     }
+-    /* The first valid one of: --username, PS3_NP_ONLINE_ID, and -- online
+-     * only -- the OS login name. */
++    /* The first valid one of: --username, PS3_NP_ONLINE_ID; online with
++     * neither, "PS3Player". KZ3 4003: never the OS login name, which a server
++     * would then see (it is the player's Windows account). */
+     const char* named[2] = { username, getenv("PS3_NP_ONLINE_ID") };
+     int found = 0;
+     for (int i = 0; i < 2 && !found; i++) {
+@@ -79,12 +80,7 @@ void np_psnr_setup(const char* username, const char* server)
+     }
+     if (!found) {
+         if (!np_psnr_enabled()) { s_id_state = 2; return; }   /* offline: "PS3Player" */
+-#ifdef _WIN32
+-        const char* os = getenv("USERNAME");
+-#else
+-        const char* os = getenv("USER");
+-#endif
+-        if (!clean_online_id(os, s_id)) strcpy(s_id, "PS3Player");
++        strcpy(s_id, "PS3Player");
+     }
+     s_id_state = 1;
+     printf("[psnr] player \"%s\"%s\n", s_id, np_psnr_enabled() ? "" : " (offline)");
+diff --git a/libs/network/sceNp.c b/libs/network/sceNp.c
+index 8bb66db..dd92aba 100644
+--- a/libs/network/sceNp.c
++++ b/libs/network/sceNp.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "sceNp.h"
++#include "net_policy.h"   /* ps3_net_np_signed_in (KZ3 4003) */
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdint.h>
+@@ -232,7 +233,9 @@ s32 sceNpManagerGetStatus(s32* status)
+      * writes to whatever host address shares that number. Same trap as
+      * cellGcmSys had. Tokyo Jungle calls this during its online init. */
+     /* Signed in when there is a psnr server to be signed in to. */
+-    s32 st = np_psnr_enabled() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
++    /* KZ3 4003: signed in through psnr, or through a port's own server (ps3_net_np_signed_in). */
++    s32 st = (np_psnr_enabled() || ps3_net_np_signed_in()) ? SCE_NP_MANAGER_STATUS_ONLINE
++                                                         : SCE_NP_MANAGER_STATUS_OFFLINE;
+     vm_write32((uint32_t)(uintptr_t)status, (uint32_t)st);
+     { static s32 last = -2;
+       if (st != last) printf("[sceNp] ManagerGetStatus() -> %s\n", st < 0 ? "OFFLINE" : "ONLINE");
+@@ -249,7 +252,7 @@ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
+     printf("[sceNp] ManagerRegisterCallback()\n");
+     /* Online: tell the title it is signed in, as the console does once the
+      * manager reaches ONLINE. Delivered on its next cellSysutilCheckCallback. */
+-    if (np_psnr_enabled() && callback) {
++    if ((np_psnr_enabled() || ps3_net_np_signed_in()) && callback) {   /* KZ3 4003 */
+         const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_STATUS_ONLINE, 0,
+                               (u64)(u32)(uintptr_t)arg, 0, 0, 0, 0, 0 };
+         cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, args);
+@@ -264,6 +267,14 @@ s32 sceNpManagerUnregisterCallback(void)
+     return CELL_OK;
+ }
+ 
++/* KZ3 4003: the registered manager callback (guest OPD) and its argument, for a port's own NP calls that report
++ * through it (sceNpManagerRequestTicket2's GOT_TICKET event). 0 if none is registered. */
++u32 np_manager_callback_get(u32* arg)
++{
++    if (arg) *arg = (u32)(uintptr_t)s_npmgr_cb_arg;
++    return (u32)(uintptr_t)s_npmgr_cb;
++}
++
+ /* Identity getters: reuse the fake-profile implementations (offline-with-account). */
+ s32 sceNpManagerGetNpId(SceNpId* npId)               { return sceNpGetNpId(0, npId); }
+ s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId) { return sceNpGetOnlineId(0, onlineId); }
+diff --git a/libs/network/tests/test_np_identity.c b/libs/network/tests/test_np_identity.c
+index 012f49f..09272d6 100644
+--- a/libs/network/tests/test_np_identity.c
++++ b/libs/network/tests/test_np_identity.c
+@@ -50,14 +50,15 @@ int main(void)
+     assert(strcmp(resolve("x!", NULL), "marge") == 0);
+     assert(strcmp(resolve("1abc", NULL), "marge") == 0);
+ 
+-    /* --psnr goes online; with no name, the OS login name is used. */
++    /* --psnr goes online; with no name, "PS3Player" -- never the OS login
++     * name, which the server would see (KZ3 4003). */
+     set_env("PS3_NP_ONLINE_ID", "");
+     set_env(OS_USER, "Lisa S.");
+-    assert(strcmp(resolve(NULL, "127.0.0.1:36100"), "LisaS") == 0);
++    assert(strcmp(resolve(NULL, "127.0.0.1:36100"), "PS3Player") == 0);
+     assert(np_psnr_enabled());
+     assert(strcmp(getenv("PSNR_SERVER"), "127.0.0.1:36100") == 0);
+ 
+-    /* An OS name that can't be an online ID falls back to "PS3Player". */
++    /* Whatever the OS name is, it is not used. */
+     set_env(OS_USER, "42");
+     assert(strcmp(resolve(NULL, NULL), "PS3Player") == 0);
+ 
+diff --git a/libs/network/tests/test_score_init.c b/libs/network/tests/test_score_init.c
+index 9656b4e..9004d8f 100644
+--- a/libs/network/tests/test_score_init.c
++++ b/libs/network/tests/test_score_init.c
+@@ -2,6 +2,7 @@
+  *   -Wl,-dead_strip -o /tmp/test_score_init && /tmp/test_score_init
+  */
+ #include "../sceNp.c"
++#include "../net_policy.c"   /* KZ3 4003 */
+ #include <assert.h>
+ #include <stdlib.h>
+ uint8_t* vm_base;

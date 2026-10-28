@@ -1,0 +1,288 @@
+Per-unit guest sampler state in the D3D12 backend, for all 16 fragment texture units.
+
+The guest-FP root signature had 4 fixed static samplers (s0 point/clamp, s1-s3 linear/wrap) and a 4-wide SRV
+window, so NV4097_SET_TEXTURE_FILTER / ADDRESS / CONTROL0 / BORDER_COLOR never reached a sampler and units 4-15
+were not bound at all. Now: a shader-visible sampler heap holds one descriptor per distinct guest sampler state
+(deduplicated, never overwritten); bind_texture computes the unit's heap index from its registers; each draw
+record carries 16 indices; the replay binds s0-s15 as 16 one-descriptor root tables (root params 3..18) and the
+SRV window is 16 wide (t0-t15). Draws on the built-in atlas/colour PSs keep the old defaults.
+Mapped: min/mag/mip filter, anisotropy (1..16x), LOD bias (signed 4.8), min/max LOD (4.8), wrap/mirror/clamp/
+border/mirror-once per axis, border colour (ARGB8). Not mapped: convolution kernels (linear), signed channels,
+gamma, aniso bias, depth compare. Vertex texture units are not bound by this backend at all (separate gap).
+Test: tools/smoke/host_kz3.c (four quads, units 0/9/15), KZ3 port RSX, 2026-10-07.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): shrunk: upstream 21c14a65's per-unit sampler design (cur_texs addr/filter/ctrl0/border, vp_sampler, samp_key) widened from 4 to 16 units (RSX_D3D_TEX_UNITS, root params 3..18, SRV window 16 from DRAW_SRV_BASE 40); 2001's samp_get hash, samp_bind and its LOD-mapping rsx_sampler_desc dropped (upstream's maps filter/address/aniso/border, not min/max LOD); KZ3 draws through rsx_live_draw, not this path.
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index bc05a308..65027cfe 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -74,6 +74,9 @@
+  * = 69 float4 = 1104 B, rounded to D3D12's 256-byte CBV alignment. */
+ #define VP_FPCB_STRIDE    1280
+ #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
++/* Fragment texture units bound per guest-FP draw (t0-t15 / s0-s15): all 16 RSX
++ * fragment units (NV4097_SET_TEXTURE_* 0x1A00 + unit*0x20). Was 4. */
++#define RSX_D3D_TEX_UNITS  16
+ 
+ typedef struct {
+     u32 vb_byte_offset; /* offset into vb_mapped where this draw's verts live */
+@@ -96,8 +99,8 @@ typedef struct {
+     u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
+                          * (wave's sim passes write single lanes of the height
+                          * maps; ignoring the mask stomped persistent state) */
+-    /* Per-unit textures (t0-t3): decompiled FPs sample up to 4 units
+-     * (demosaic's interpolation passes read 3). Captured at draw time. */
++    /* Per-unit textures (t0-t15): decompiled FPs sample any of the 16 RSX
++     * fragment texture units. Captured at draw time. */
+     struct {
+         u32 off;        /* resolved vm offset (guest upload source), 0 = none */
+         u32 raw;        /* raw RSX offset (offscreen-RT matching) */
+@@ -112,8 +115,8 @@ typedef struct {
+                          * surface come out with black patches and banding. */
+         int set;
+         u32 addr, filter, ctrl0, border;   /* TEXTURE_ADDRESS/FILTER/CONTROL0/BORDER_COLOR */
+-    } tex[4];
+-    int tex_rt[4];      /* pre-pass: OffRT index sampled by unit, -1 = none */
++    } tex[RSX_D3D_TEX_UNITS];
++    int tex_rt[RSX_D3D_TEX_UNITS]; /* pre-pass: OffRT index sampled by unit, -1 = none */
+     int tex_slot;       /* legacy single-slot path (atlas); -1 = none */
+     int vs_idx;         /* VPVSEntry slot for this draw's vertex program (-1 = primary) */
+     int blend;          /* guest blend enable at draw time */
+@@ -135,7 +138,7 @@ typedef struct {
+     u32 rt_fmt;         /* RSX surface colour format (SET_SURFACE_FORMAT [4:0]) */
+     u32 zeta_off;       /* depth surface (SET_SURFACE_ZETA_OFFSET) when the surface has one */
+     int no_color;       /* colour target NONE with a depth surface: a depth-only pass */
+-    int tex_ds[4];      /* pre-pass: OffDS read through unit u (its colour copy is tex_rt), -1 = none */
++    int tex_ds[RSX_D3D_TEX_UNITS]; /* pre-pass: OffDS read through unit u (its colour copy is tex_rt), -1 = none */
+     /* Guest viewport rect at draw time (target pixels). Sub-viewport layouts
+      * (wave's debug tiles) position quads with this, not with constants --
+      * forcing full-target viewports drew every tile window-sized. */
+@@ -188,7 +191,7 @@ typedef struct {
+  * so multi-unit fragment programs see all their textures (demosaic's
+  * interpolation passes sample 3 units). */
+ #define DRAW_SRV_BASE 40
+-#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * 4)
++#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * RSX_D3D_TEX_UNITS)
+ 
+ /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
+  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
+@@ -369,7 +372,7 @@ typedef struct {
+     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
+     /* VP path: latest texture bound per unit (t0-t3). */
+     struct { u32 off, raw, w, h, fmt, ctrl1, mips; int cube; int set;
+-             u32 addr, filter, ctrl0, border; } cur_texs[4];
++             u32 addr, filter, ctrl0, border; } cur_texs[RSX_D3D_TEX_UNITS];
+     /* Guest sampler states, one shader-visible descriptor each (samp_key[i]
+      * describes descriptor i; 0 and 1 are the defaults for units with none). */
+     ID3D12DescriptorHeap* samp_heap;
+@@ -415,6 +418,7 @@ typedef struct {
+ } D3D12State;
+ 
+ static D3D12State s_d3d;
++
+ char g_rsx_title_base[128] = "ps3recomp";
+ static u32 s_dbg_last_draws = 0;
+ static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
+@@ -1318,16 +1322,19 @@ static int init_d3d12(u32 width, u32 height)
+      * game uploads its VP microcode (render_frame).
+      * ---------------------------------------------------------------*/
+     {
+-        /* 4-descriptor SRV table (t0-t3) so decompiled fragment programs can
+-         * sample up to 4 texture units; the hardcoded atlas/colour PSs use only
+-         * t0 and are unaffected. Matching 4 static samplers s0-s3. */
++        /* 16-descriptor SRV table (t0-t15) so decompiled fragment programs can
++         * sample all 16 texture units; the hardcoded atlas/colour PSs use only
++         * t0 and are unaffected. Samplers s0-s15 are 16 one-descriptor tables
++         * into the sampler heap (root params 3..18), set per draw from the
++         * guest's filter/address/control registers: a unit's state is then one
++         * heap index, deduplicated across draws and frames (vp_sampler). */
+         D3D12_DESCRIPTOR_RANGE srv_range = {0};
+         srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-        srv_range.NumDescriptors = 4;
++        srv_range.NumDescriptors = RSX_D3D_TEX_UNITS;
+         srv_range.BaseShaderRegister = 0;
+         srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+ 
+-        D3D12_ROOT_PARAMETER rp[7] = {0};
++        D3D12_ROOT_PARAMETER rp[3 + RSX_D3D_TEX_UNITS] = {0};
+         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   /* b0 = vp_c bank */
+         rp[0].Descriptor.ShaderRegister = 0;
+         rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+@@ -1346,8 +1353,8 @@ static int init_d3d12(u32 width, u32 height)
+          * title asked for: God of War HD's soldiers wrap their texture atlas
+          * (v up to ~2) and drew transparent-black from its clamped bottom row.
+          * Units without guest state keep those two defaults. */
+-        D3D12_DESCRIPTOR_RANGE samp_range[4] = {0};
+-        for (int _s = 0; _s < 4; _s++) {
++        D3D12_DESCRIPTOR_RANGE samp_range[RSX_D3D_TEX_UNITS] = {0};
++        for (int _s = 0; _s < RSX_D3D_TEX_UNITS; _s++) {
+             samp_range[_s].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+             samp_range[_s].NumDescriptors = 1;
+             samp_range[_s].BaseShaderRegister = (UINT)_s;
+@@ -1358,7 +1365,7 @@ static int init_d3d12(u32 width, u32 height)
+         }
+ 
+         D3D12_ROOT_SIGNATURE_DESC rd = {0};
+-        rd.NumParameters = 7; rd.pParameters = rp;
++        rd.NumParameters = 3 + RSX_D3D_TEX_UNITS; rd.pParameters = rp;
+         rd.NumStaticSamplers = 0; rd.pStaticSamplers = NULL;
+         rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+ 
+@@ -1722,7 +1729,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+                         r->vp_x, r->vp_y, r->vp_w, r->vp_h,
+                         r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend, r->blend_key,
+                         r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw);
+-                for (int u = 0; u < 4; u++)
++                for (int u = 0; u < RSX_D3D_TEX_UNITS; u++)
+                     if (r->tex[u].set)
+                         fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X\n", u,
+                                 r->tex[u].off, r->tex[u].fmt,
+@@ -2320,7 +2327,7 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
+     if (en < 0) { const char* e = getenv("RSX_CUBE_TEX"); en = e ? atoi(e) : 1; }
+     if (!en) return 0;
+     u32 m = 0;
+-    for (int u = 0; u < 4; u++) if (dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
++    for (int u = 0; u < RSX_D3D_TEX_UNITS; u++) if (dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
+     return m;
+ }
+ 
+@@ -2554,7 +2561,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+      * and no texel-scale, and the emitted coordinate always ends in the fixed
+      * tail ".xy * rsx_texscale[N].xy", so both edits are exact replacements. */
+     if (cube_mask) {
+-        for (int _u = 0; _u < 4; _u++) {
++        for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
+             if (!(cube_mask & (1u << _u))) continue;
+             char f1[64], r1[64], f2[64], r2[64];
+             snprintf(f1, sizeof f1, "Texture2D    rsx_tex%d", _u);
+@@ -4704,11 +4711,11 @@ static void render_frame(void)
+                 off_rt_get(dr->rt_mrt[_m], dr->rt_w, dr->rt_h, dr->rt_fmt);
+         if (dr->is_vp && dr->zeta_off && (dr->rt_off || dr->no_color))
+             off_ds_get(dr->zeta_off, dr->rt_w, dr->rt_h);
+-        for (int _u = 0; _u < 4; _u++) dr->tex_ds[_u] = -1;   /* set below for draws */
++        for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) dr->tex_ds[_u] = -1;   /* set below for draws */
+     }
+     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+         const D3D12DrawRecord* dr = &s_d3d.draws[_d];
+-        for (int _u = 0; _u < 4 && dr->is_vp && !dr->is_clear; _u++) {
++        for (int _u = 0; _u < RSX_D3D_TEX_UNITS && dr->is_vp && !dr->is_clear; _u++) {
+             const int ds = dr->tex[_u].set ? off_ds_find(dr->tex[_u].raw) : -1;
+             if (ds < 0) continue;
+             s_d3d.off_ds[ds].last_frame = s_d3d.frame_count;
+@@ -4747,7 +4754,7 @@ static void render_frame(void)
+         { static int ed = -1;
+           if (ed < 0) { const char* e = getenv("EMPTYTEX"); ed = e ? atoi(e) : 0; }
+           extern uint8_t* vm_base;
+-          if (ed && vm_base) for (int _u = 0; _u < 4; _u++) {
++          if (ed && vm_base) for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
+               if (!dr->tex[_u].set || !dr->tex[_u].off) continue;
+               u32 nz = 0, sz = dr->tex[_u].w * dr->tex[_u].h * 4u;
+               for (u32 i2 = 0; i2 < sz && i2 < 0x20000u; i2 += 997)
+@@ -4790,7 +4797,7 @@ static void render_frame(void)
+           } }
+         { static int sd = -1;
+           if (sd < 0) { const char* e = getenv("SCREENTEX"); sd = e ? atoi(e) : 0; }
+-          if (sd) for (int _u = 0; _u < 4; _u++)
++          if (sd) for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++)
+               if (dr->tex[_u].set && dr->tex[_u].w == s_d3d.width &&
+                   dr->tex[_u].h == s_d3d.height) {
+                   static u32 seen[16]; static int ns = 0; int known = 0;
+@@ -4806,8 +4813,8 @@ static void render_frame(void)
+          * resolves to an offscreen RT (sampled directly), an uploaded guest
+          * texture, or a null SRV. */
+         double _sv0 = perf_on() ? perf_now() : 0.0;
+-        for (int _u = 0; _u < 4; _u++) {
+-            u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
++        for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
++            u32 wslot = DRAW_SRV_BASE + _d * RSX_D3D_TEX_UNITS + (u32)_u;
+             dr->tex_rt[_u] = -1;
+             /* A depth surface read as a texture: its colour copy (made in the
+              * RT pre-pass), refreshed from the depth buffer just before this
+@@ -5100,7 +5107,8 @@ static void render_frame(void)
+             D3D12_GPU_DESCRIPTOR_HANDLE gh;
+             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
+             s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+-            int samp_bound[4] = { -1, -1, -1, -1 };
++            int samp_bound[RSX_D3D_TEX_UNITS];
++            for (int _s = 0; _s < RSX_D3D_TEX_UNITS; _s++) samp_bound[_s] = -1;
+             D3D12_VERTEX_BUFFER_VIEW vbv;
+             vbv.BufferLocation = s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb)
+                                + (u64)s_d3d.vp_parity * MAX_VERTICES * 256;
+@@ -5121,7 +5129,7 @@ static void render_frame(void)
+             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
+                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
+                 if (!dr->is_vp) continue;
+-                for (int _u = 0; _u < 4; _u++) {
++                for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
+                     const int ds = dr->tex_ds[_u];
+                     if (ds < 0 || ds == cur_z || s_d3d.off_ds[ds].conv_gen == s_d3d.off_ds[ds].gen)
+                         continue;
+@@ -5129,7 +5137,7 @@ static void render_frame(void)
+                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
+                     { ID3D12DescriptorHeap* hp2[] = { s_d3d.srv_heap, s_d3d.samp_heap };
+                       s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, s_d3d.samp_heap ? 2 : 1, hp2); }
+-                    for (int _s = 0; _s < 4; _s++) samp_bound[_s] = -1;
++                    for (int _s = 0; _s < RSX_D3D_TEX_UNITS; _s++) samp_bound[_s] = -1;
+                     force_rebind = 1;
+                 }
+                 /* The reduced-viewport passes (this title's reflection, drawn
+@@ -5334,19 +5342,19 @@ static void render_frame(void)
+                 /* Per-draw textures: bind this draw's t0-t3 SRV window.
+                  * Any sampled offscreen RT transitions to PSR first (never
+                  * one of the currently-bound colour targets). */
+-                for (int _u = 0; _u < 4; _u++) {
++                for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
+                     int rt = dr->tex_rt[_u];
+                     if (rt >= 0 && rt != cur_rt &&
+                         rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2])
+                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                 }
+                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
+-                gh.ptr += (u64)(DRAW_SRV_BASE + d * 4) * s_d3d.srv_inc;
++                gh.ptr += (u64)(DRAW_SRV_BASE + d * RSX_D3D_TEX_UNITS) * s_d3d.srv_inc;
+                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+                 if (s_d3d.samp_heap) {
+                     D3D12_GPU_DESCRIPTOR_HANDLE sb;
+                     s_d3d.samp_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &sb);
+-                    for (int _u = 0; _u < 4; _u++) {
++                    for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
+                         const int si = vp_sampler(dr, _u);
+                         if (si == samp_bound[_u]) continue;
+                         samp_bound[_u] = si;
+@@ -7076,7 +7084,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+                     dr->alpha_ctl = ((s_d3d.current_rsx_state->alpha_test_enable ? 1u : 0u) << 16)
+                                   | ((s_d3d.current_rsx_state->alpha_func & 0xFFu) << 8)
+                                   | (s_d3d.current_rsx_state->alpha_ref & 0xFFu);
+-                for (int _u = 0; _u < 4; _u++) {
++                for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
+                     dr->tex[_u].off = s_d3d.cur_texs[_u].off;
+                     dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
+                     dr->tex[_u].w   = s_d3d.cur_texs[_u].w;
+@@ -7197,7 +7205,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+                 dr->alpha_ctl = ((s_d3d.current_rsx_state->alpha_test_enable ? 1u : 0u) << 16)
+                               | ((s_d3d.current_rsx_state->alpha_func & 0xFFu) << 8)
+                               | (s_d3d.current_rsx_state->alpha_ref & 0xFFu);
+-            for (int _u = 0; _u < 4; _u++) {
++            for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
+                 dr->tex[_u].off = s_d3d.cur_texs[_u].off;
+                 dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
+                 dr->tex[_u].w   = s_d3d.cur_texs[_u].w;
+@@ -7364,7 +7372,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
+             dr->alpha_ctl = ((s_d3d.current_rsx_state->alpha_test_enable ? 1u : 0u) << 16)
+                           | ((s_d3d.current_rsx_state->alpha_func & 0xFFu) << 8)
+                           | (s_d3d.current_rsx_state->alpha_ref & 0xFFu);
+-        for (int _u = 0; _u < 4; _u++) {
++        for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
+             dr->tex[_u].off = s_d3d.cur_texs[_u].off;
+             dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
+             dr->tex[_u].w   = s_d3d.cur_texs[_u].w;
+@@ -7469,7 +7477,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
+     /* VP path: record the latest bound texture (any supported format) so draws
+      * can carry it per-draw. Location bits (format[1:0]): 1 = LOCAL, 2 = MAIN. */
+     extern u32 cellGcmResolveLocated(int local, u32 offset);
+-    if (unit < 4 &&
++    if (unit < RSX_D3D_TEX_UNITS &&
+         (base_fmt == 0x81 /* B8 */ || base_fmt == 0x85 /* A8R8G8B8 */ ||
+          base_fmt == 0x8B /* G8B8: LBP's font atlas */ ||
+          (base_fmt >= 0x86 && base_fmt <= 0x88) /* DXT1/23/45 */ ||

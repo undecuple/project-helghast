@@ -1,0 +1,93 @@
+KZ3 patch 2102 (RSX pass 100): diagnostics for upstream PRs 504, 508 and the plain DEPTH16/X16 binds (LD_FEAT_LOG=1).
+
+[vtx-wrap]: vertex base + array offset at or above 2^28; kind-6 surfmatch rows: texture formats the colour-surface match took; [z16-plain]: guest bytes under a DEPTH16/X16 bind that is not a host zeta.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): [vtx-wrap] diagnostic dropped: upstream #504 merged (rsx_dsp_resolve_vertex_offset); rest kept.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 6ce0f45c..1d7aa98f 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -4554,6 +4554,29 @@ static ID3D12Resource* decode_guest_texture_profiled(
+     return result;
+ }
+ 
++/* Patch 2102 (diagnostic, LD_FEAT_LOG=1): a DEPTH16 / DEPTH16_F / X16 texture that is not a host zeta never reaches
++ * decode_texel (decode_guest_texture has no texel size for them: it fails and the cache binds SRV_WHITE). Log what
++ * the guest memory under such a bind holds, so a 16-bit decode can be judged against real data. */
++static int zdepth_index_at(u32 location, u32 offset);
++static void ld_z16_plain_note(const rsx_dsp_texture* t)
++{
++    static int on = -1; static u32 n;
++    if (on < 0) on = getenv("LD_FEAT_LOG") ? 1 : 0;
++    const u32 bf = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
++    if (!on || (bf != TEX_FMT_DEPTH16 && bf != TEX_FMT_DEPTH16_F && bf != TEX_FMT_X16) || n >= 48) return;
++    n++;
++    const u32 w = t->width, h = t->height;
++    unsigned long long nz = 0, tot = 0, sum = 0; u32 mn = 0xFFFF, mx = 0;
++    const u8* p = (w && h && w <= 4096 && h <= 4096) ? guest_ptr(t->location, t->offset, w * h * 2u) : NULL;
++    if (p) for (u32 i = 0; i < w * h; i++) {
++        const u32 v = (u32)(p[i * 2] << 8 | p[i * 2 + 1]);
++        tot++; if (v) nz++; sum += v; if (v < mn) mn = v; if (v > mx) mx = v;
++    }
++    fprintf(stderr, "[z16-plain] f=%u %u:0x%08X fmt=0x%02X %ux%u remap=0x%04X dim=%u zeta_at=%d bytes=%s nonzero=%llu/%llu min=0x%04X max=0x%04X mean=%llu\n",
++            g_ld_frames, t->location, t->offset, t->format, w, h, t->remap & 0xFFFFu, t->dimension,
++            zdepth_index_at(t->location, t->offset), p ? "mapped" : "unmapped", nz, tot, p ? mn : 0, mx, tot ? sum / tot : 0);
++}
++
+ static void write_texture_srv(u32 index, const texcache_t* entry)
+ {
+     const u32 base_fmt = entry->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+@@ -5420,6 +5443,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+             ld_tex_index_insert(index);   /* patch 2033: the evicted key was removed above; re-index the old entry */
+         }
+         g_ld_texture_decode_fail++;
++        ld_z16_plain_note(t);   /* patch 2102 diagnostic */
+         if (g_ld_texture_decode_fail <= 16 ||
+             (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
+             fprintf(stderr,
+@@ -9377,7 +9401,7 @@ static void ld_feat_row_add(u32 kind, u32 fmt, u32 remap, u32 aux, u32 zalias, u
+ }
+ static void ld_feat_dump(void)
+ {
+-    static const char* kn[] = {"onech-remap", "gamma", "gamma-alpha", "gamma-signed", "packer", "volume"};
++    static const char* kn[] = {"onech-remap", "gamma", "gamma-alpha", "gamma-signed", "packer", "volume", "surfmatch"};
+     fprintf(stderr, "[feat] draws=%llu packer1FEC=%llu packer1FBC=%llu volume=%llu frames=%u (rows %u)\n",
+             g_ld_feat_draws, g_ld_feat_pk_fec, g_ld_feat_pk_fbc, g_ld_feat_vol, (unsigned)g_ld_frames, g_ld_feat_n);
+     for (u32 i = 0; i < g_ld_feat_n; i++) {
+@@ -10177,6 +10201,10 @@ static int fetch_attr(u32 i, u32 base, u32 vertex_id, u32 base_index,
+         if (at + elem_size > dc.inl_bytes) return 0;
+         p = dc.inl + at;
+     } else {
++        if (ld_feat_on() && (u64)base + a.offset >= 0x10000000ull) {   /* patch 2102 diagnostic, upstream PR 504 */
++            static u32 nw;
++            if (nw++ < 8) fprintf(stderr, "[vtx-wrap] fetch_attr base=0x%X offset=0x%X loc=%u\n", base, a.offset, a.location);
++        }
+         p = guest_ptr(
+             a.location,
+             rsx_dsp_resolve_vertex_offset(base, a.offset) + source_element * stride,
+@@ -13812,6 +13840,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                   best_gen = sf_i->last_draw_generation;
+               }
+           } }
++        /* Patch 2102 (diagnostic, LD_FEAT_LOG=1): which texture formats the colour-surface match above took
++         * (upstream PR 508: a DXT texture is never a render target); kind 6 rows, aux = the surface's format. */
++        if (ld_feat_on() && sampled >= 0) {
++            const u32 mb = t.format & 0x9Fu;
++            ld_feat_row_add(6, mb, t.remap & 0xFFFFu, (u32)g.surfaces[sampled].fmt, (u32)zeta_pref, t.offset, 0);
++        }
+         /* LD_UVDBG=1: the texture coordinates of the draw that samples the PS1
+          * framebuffer. Placed here rather than in fetch_batches because that
+          * function is not on this draw's path -- probing it printed nothing at
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index cc0e4196..91248c4d 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -3,6 +3,7 @@
+ #include "rsx_vertex_formats.h"
+ 
+ #include <limits.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 

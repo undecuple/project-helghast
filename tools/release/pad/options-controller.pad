@@ -1,0 +1,25 @@
+# Options list (row Audio) -> Wireless Controller (3 DOWN) -> page: Control Mapping RIGHT, Y-axis RIGHT, then Advanced Settings.
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key X
+wait controllersettings.gum
+sleep 3
+mark controller page default
+key RIGHT
+sleep 2.5
+mark control mapping changed
+key DOWN
+sleep 1.5
+key RIGHT
+sleep 2.5
+mark y-axis changed
+key DOWN
+sleep 1.5
+key X
+wait advancedcontroller.gum
+sleep 3
+mark advanced settings page

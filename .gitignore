@@ -1,0 +1,29 @@
+# The game never enters git: no disc dump, update, decrypted binaries or extracted assets.
+/Game/
+/Game
+/GameUpdate
+# /assets/ is ours here (cover images, public/assets); extracted game data stays out by the patterns below
+*.psarc
+*.BIK
+*.bik
+*.elf
+*.self
+*.sprx
+*.prx
+*.core
+*.corestream
+EBOOT.BIN
+*.PUP
+
+# Ghidra project databases (they contain the decrypted binary)
+*.gpr
+*.rep/
+
+# Lifted code, builds and run output
+/work/
+/build/
+result
+result-*
+__pycache__/
+*.pyc
+.direnv/

@@ -1,0 +1,420 @@
+KZ3 patch 4022 (stage 3 fix, network pass 34): the pad layouts (4013 Modern / Custom) move gameplay actions in the
+game's own action table instead of remapping the pad's buttons, so every menu keeps Cross = confirm, Circle = back.
+
+Bug: under Modern, menus showed Square instead of Circle as back. 4013 remapped the buttons before the game
+read them, so menus, legends and vehicles followed the gameplay layout. Now the remap of the host report is off,
+the prompt atlas cells are no longer swapped (pad_remap_sig() = 0), and cellPadGetData (port 0, the game's thread)
+writes the layout into the PlayerProfile's action table that ControlScheme::GetActionBinding (v1.00 0x4C79B4,
+1.14 0x4D40B8) reads for every action and every action prompt. Modern is now per action (pad_actions.h): on-foot
+actions move, vehicles / exo / turrets keep the scheme's own. KZ3_PAD_ACTIONS=0 turns the table writes off.
+Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
+
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1251,9 +1251,11 @@
+ /* ---------------------------------------------------------------------------
+  * KZ3 patch 4013 (stage 3): pad presets and custom mapping (ENHANCEMENT, opt-in; pad_remap.h)
+  * -----------------------------------------------------------------------*/
++#include "pad_actions.h"   /* 4022: the layouts in the game's action table */
+ static PadRemap s_remap[2];        /* per pad family (PRM_FAM_*) */
+ static int      s_remap_set = 0;
+ static uint32_t s_remap_sig[2];    /* 0 = identity (the game's own scheme) */
++static int      s_remap_preset = PRM_DEFAULT_PRESET;   /* 4022: the layout in use, for the action table (pad_actions.h) */
+ 
+ /* The modern preset's table depends on the pad: PlayStation pads (and a port with no host pad, i.e. a scripted one)
+  * get the PS table, every other pad the Xbox one. KZ3_PAD_FAMILY=ps|xbox forces it (tests). */
+@@ -1336,24 +1338,25 @@
+     if (!s_remap_set || sig[0] != s_remap_sig[0] || sig[1] != s_remap_sig[1]) {
+         int g;
+         printf("[pad] layout: %s%s\n", preset >= 0 && preset < PRM_N_PRESETS ? prm_preset_names[preset] : "?",
+-               sig[0] || sig[1] ? "" : " (the game's own)");
+-        for (f = 0; f < 2; f++)
++               sig[0] || sig[1] ? " (gameplay actions only, menus keep the pad as it is)" : " (the game's own)");
++        for (f = 0; preset == PRM_CUSTOM && f < 1; f++)   /* 4022: modern is per action (pad_actions.h); custom is one table */
+             for (g = 0; sig[f] && g < PRM_N; g++)
+-                if (m[f].src[g] != g) printf("[pad]   %s pads: game %s <- pad %s\n", f ? "Xbox" : "PS", prm_names[g],
++                if (m[f].src[g] != g) printf("[pad]   actions of game button %s <- pad %s\n", prm_names[g],
+                                              m[f].src[g] < PRM_N ? prm_names[m[f].src[g]] : "none");
+         fflush(stdout);
+     }
+     s_remap[0] = m[0]; s_remap[1] = m[1];
+     s_remap_sig[0] = sig[0]; s_remap_sig[1] = sig[1];
++    s_remap_preset = preset;
+     s_remap_set = 1;
+ }
+ 
+ /* The remap on every connected host pad (a fresh report each poll, so it is applied once). */
+ static void pad_remap_apply_all(void)
+ {
++    /* 4022: the layout no longer remaps the pad's buttons (menus must keep Cross/Circle): it rewrites the game's
++     * action table instead (pad_actions_sync, from cellPadGetData). */
+     pad_remap_refresh();
+-    if (!s_remap_sig[0] && !s_remap_sig[1]) return;
+-    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) pad_host_remap(&s_remap[pad_remap_family(s_port_dev[p])], &s_host_state[p]);
+ }
+ 
+ /* The family the prompts describe: the pad last used; with no pad (keys, nothing) the glyph set's. */
+@@ -1367,7 +1370,8 @@
+ /* For the prompt atlases (rsx_live_draw.c, patch 4013): 0 = identity, else a hash of the table. */
+ unsigned pad_remap_sig(void)
+ {
+-    return s_remap_sig[pad_remap_prompt_family()];
++    (void)pad_remap_prompt_family;
++    return 0;   /* 4022: the game's prompts follow its action table (pad_actions.h); legends keep their own buttons */
+ }
+ 
+ /* The host button (PS3 name) that presses game button `game_input` ("r1", "cross" ...), "" when none, NULL for a name
+@@ -1376,12 +1380,75 @@
+ {
+     int g;
+     const int f = pad_remap_prompt_family();
+-    if (!s_remap_sig[f] || !game_input) return NULL;
++    if (!pad_remap_sig() || !s_remap_sig[f] || !game_input) return NULL;   /* 4022: always NULL now */
+     g = prm_button_by_name(game_input, strlen(game_input));
+     if (g < 0) return NULL;
+     return s_remap[f].src[g] < PRM_N ? prm_names[s_remap[f].src[g]] : "";
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 4022: the pad layout in the game's own action table (pad_actions.h). Runs on the game's thread in
++ * cellPadGetData (port 0), so the profile is never written while the game reads it from another place in this
++ * thread. KZ3_PAD_ACTIONS=0 turns it off (the game's table is then never touched).
++ * -----------------------------------------------------------------------*/
++static uint32_t pab_rd32(uint32_t ea) { return vm_read32(ea); }
++static uint8_t  pab_rd8(uint32_t ea) { return vm_read8(ea); }
++static void     pab_wr32(uint32_t ea, uint32_t v) { vm_write32(ea, v); }
++
++static void pad_actions_sync(void)
++{
++    static int ver = -2, off = -1;
++    static int32_t last[2][PAB_N] = { { INT32_MIN }, { INT32_MIN } };
++    static int said[2][3];
++    unsigned char cust[16];
++    uint32_t prof;
++    int p, kbd;
++    if (off < 0) { const char* e = getenv("KZ3_PAD_ACTIONS"); off = e && !strcmp(e, "0"); }
++    if (off || !s_remap_set) return;
++    if (ver == -2) {
++        ver = pab_detect(pab_rd32);
++        printf("[pad] action table: %s\n", ver < 0 ? "EBOOT not recognised, pad layouts stay off" : pab_versions[ver].name);
++        fflush(stdout);
++    }
++    if (ver < 0) return;
++    prof = vm_read32(pab_versions[ver].profile_ptr);
++    if (!prof || prof >= 0x40000000u) return;
++    for (p = 0; p < 16; p++) cust[p] = s_remap[0].src[p];
++    kbd = pad_prompt_device() == PAD_DEV_KEYBOARD;
++    for (p = 0; p < 2; p++) {
++        int32_t id = 0;
++        const uint32_t blk = prof + PAB_BLOCK_STRIDE * (uint32_t)p;
++        const int fam = pad_remap_family(s_port_dev[p]);
++        int r;
++        if (!said[p][0] && p == 0) {   /* once: is the game's table the one this file knows? (ASSUMPTION check for 1.14) */
++            const int32_t sid = (int32_t)vm_read32(blk + PAB_OFF_ID);
++            const signed char* b = pab_base(sid);
++            if (b) {
++                int32_t t[PAB_N];
++                for (int a = 0; a < PAB_N; a++) t[a] = (int32_t)vm_read32(blk + PAB_OFF_TABLE + 4u * (uint32_t)a);
++                printf("[pad] action table of player 1: scheme %d, %d entries differ from the port's copy of %s\n", (int)sid,
++                       pab_diffs(t, b), sid == 1 ? "Standard" : "Alternate");
++                fflush(stdout);
++                said[p][0] = 1;
++            }
++        }
++        r = pab_sync_block(blk, s_remap_preset, fam, kbd, s_remap_preset == PRM_CUSTOM ? cust : NULL, last[p], pab_rd32,
++                           pab_rd8, pab_wr32, &id);
++        if (r == PAB_WROTE || r == PAB_RESTORED) {
++            printf("[pad] player %d: %s (scheme %d, %s%s)\n", p + 1,
++                   r == PAB_RESTORED ? "the scheme's own action table back" : "action table set", (int)id,
++                   kbd ? "keyboard in use" : prm_preset_names[s_remap_preset < PRM_N_PRESETS ? s_remap_preset : 0],
++                   kbd || r == PAB_RESTORED ? "" : fam ? ", Xbox pad" : ", PlayStation pad");
++            fflush(stdout);
++        } else if ((r == PAB_FOREIGN || r == PAB_BAD) && !said[p][r - 2]) {
++            said[p][r - 2] = 1;
++            printf("[pad] player %d: %s, not changed\n", p + 1,
++                   r == PAB_BAD ? "the action table does not look like one" : "an action table the port did not write");
++            fflush(stdout);
++        }
++    }
++}
++
+ static void pad_poll_backend(void)
+ {
+     static unsigned long long s_last_ms = 0;
+@@ -1688,6 +1755,7 @@
+ 
+     /* Poll fresh state */
+     pad_poll_backend();
++    if (port_no == 0) pad_actions_sync();   /* 4022 */
+ 
+     /* YDKJ_INJECT_PAD: the game's wait loop polls the pad (cellPadSetActDirect /
+      * GetData) -- if it's parked on a "press button" prompt after loading, no
+@@ -1819,7 +1887,6 @@
+           double now = pad_clock(t0);   /* PR #344: PAD_CLOCK=flips counts guest flips (3006's v2 grammar unchanged) */
+           unsigned m = 0; unsigned char ax[6]; int ax_set = 0;
+           pad_script_poll(&s_script, now, &m, ax, &ax_set);
+-          if (s_remap_sig[0] || s_remap_sig[1]) m = prm_apply_mask(&s_remap[pad_remap_family(s_port_dev[0])], m);   /* 4013: a scripted pad is a pad (digital part only) */
+           data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(m & 0xFF);
+           data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((m >> 8) & 0xFF);
+           if (ax_set) {
+@@ -1868,7 +1935,7 @@
+           }
+           if (held_n > 0) {
+               if (data->len > 0) held_n--;   /* upstream #570: holds survive empty drain reads */
+-              const unsigned hm = (s_remap_sig[0] || s_remap_sig[1]) ? prm_apply_mask(&s_remap[pad_remap_family(s_port_dev[0])], held_mask) : held_mask;   /* 4013 */
++              const unsigned hm = held_mask;   /* 4022: a scripted pad presses the buttons as written (the layout is in the action table) */
+               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(hm & 0xFF);
+               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((hm >> 8) & 0xFF); }
+       } }
+--- /dev/null
++++ b/libs/input/pad_actions.h
+@@ -0,0 +1,249 @@
++/*
++ * KZ3 patch 4022 (stage 3, ENHANCEMENT, opt-in): the pad layouts on the game's own action table, pure
++ * (guest memory through two callbacks, host-testable: tools/net/test_pad_actions.c).
++ *
++ * Why: patch 4013 remapped the pad BUTTONS before the game read them, so menus saw the remap too
++ * (Modern put Back on Square, Circle crouched in menus) and vehicles, jetpack, exo and turrets got buttons nobody
++ * chose (Modern: jetpack climb on R3, vehicle reverse on Circle). The game has its own layer for this: every
++ * gameplay action asks ControlScheme::GetActionBinding (v1.00 0x4C79B4, 1.14 0x4D40B8) for its button, and that
++ * reads the active control scheme's action table in the PlayerProfile (the RE notes 5.3-5.4):
++ *   profile = *(u32*)(Game + 0x76C) (v1.00 Game 0x1587880 -> 0x1587FEC; 1.14 Game 0x15FCF80 -> 0x15FD6FC, read by
++ *             the prompt resolver 0x82B588 `lwz r4,0x77c(r25)`),
++ *   block p = profile + 0x1D0 * player, +0xD4 s32 active ControllerConfig ID (1 Standard, 2 Alternate, 3/4 Move/AGP),
++ *             +0xE0 u8 IsMotionControl, +0xE4 s32[84] action -> EButton (0 Tri 1 Circle 2 Cross 3 Square 4 L2 5 R2
++ *             6 L1 7 R1 8 Start 9 Select 10 L3 11 R3 12 Up 13 Right 14 Down 15 Left, 16/17 Move, 20 AGP, -1 none).
++ * Menus read the pad slot directly (not the table), and the game's prompt resolver (0x808D00 / 0x82B4D8) asks the same
++ * GetActionBinding: so a layout written into this table moves gameplay actions and their prompts and leaves every menu
++ * (Cross confirm, Circle back) alone. The swap options (swap sticks, L1/L2, R1/R2) still apply after the table.
++ *
++ * The tables below are the engine's own for Standard and Alternate (the 0x4C2A80 default table with each scheme's
++ * ButtonMappings, the RE notes 5.3; Standard cross-checked byte for byte against a v1.00 PROFILE.DAT).
++ * ASSUMPTION: unchanged in 1.14 (same lump); pab_note_game_table() logs the comparison the first time a block is seen.
++ *
++ * Presets (the [pad] preset of keybinds.ini, pad_remap.h):
++ *   default = the game's table, untouched (a table this file wrote earlier is put back).
++ *   modern  = Killzone Shadow Fall's PS4 default layout (network pass 35), on-foot actions only:
++ *             vehicles / exo / mounted and AA guns keep the scheme's own (they are laid out for the triggers already).
++ *             In PS3 terms; one table for every pad (the host layer reports an Xbox pad as RT = R2, LT = L2, RB = R1,
++ *             LB = L1, A/B/X/Y = Cross/Circle/Square/Triangle, so Xbox gets RT fire, LT aim, RB grenade):
++ *               action                                                  button   Shadow Fall
++ *               PrimaryFire, SecondaryFire, GrabRightHand               R2       R2 fire
++ *               ZoomSwitch (aim), GrabLeftHand                          L2       L2 aim
++ *               QuickThrow (grenade)                                    R1       R1 grenade
++ *               Crouch, Slide, Cover, JetpackClimb                      Circle   Circle crouch (Use, DoItNow stay there:
++ *                                                                                Circle interact)
++ *               CloseCombat (melee), TriggerC4                          R3       R3 melee (ToggleFlashlight stays R3)
++ *             Unchanged: Reload / PickupWeapon Square, Jump / Vault / JetpackBoost Cross, NextWeapon Triangle, Sprint L3,
++ *             d-pad Up = Direction (PlanPath) / Sniper zoom (the game's own objective pointer; MP: objectives), Select =
++ *             Objectives.
++ *             No KZ3 equivalent (the RE notes s.29): Shadow Fall's d-pad down alt-fire toggle (KZ3's SecondaryFire is
++ *             a second action on the fire button in every scheme of the game, and d-pad Down is its Sidearm quick
++ *             select, so SecondaryFire stays with fire). JetpackClimb joins crouch as in the game's Alternate scheme
++ *             (L2 there), not aim. L1 has no on-foot action left.
++ *             pab_modern_r34 is network pass 34's Modern (kept only to recognise a table saved under it).
++ *   custom  = keybinds.ini's per-button table (src[g] = the pad button that does what game button g did): an action
++ *             the scheme puts on button g goes to src[g] (none -> unbound).
++ * Suicide (22) and StandUp (23) are never written (the game's own ApplyControllerConfig skips them too).
++ */
++#ifndef PAD_ACTIONS_H
++#define PAD_ACTIONS_H
++
++#include <stdint.h>
++#include <string.h>
++
++#define PAB_N 84
++#define PAB_BLOCK_STRIDE 0x1D0u
++#define PAB_OFF_ID 0xD4u
++#define PAB_OFF_MOTION 0xE0u
++#define PAB_OFF_TABLE 0xE4u
++
++/* EButton ids */
++enum { PAB_TRI = 0, PAB_CIRCLE, PAB_CROSS, PAB_SQUARE, PAB_L2, PAB_R2, PAB_L1, PAB_R1, PAB_START, PAB_SELECT, PAB_L3,
++       PAB_R3, PAB_UP, PAB_RIGHT, PAB_DOWN, PAB_LEFT };
++
++/* Standard (ID 1) and Alternate (ID 2), EDeviceFunction 0..83. */
++static const signed char pab_std[PAB_N] = {
++    7, 7, 11, 12, 10, 2, 1, 3, -1, 5, 3, 20, 4, 4, 4, 2, -1, 0, 1, 11, 6, 6, 2, 3, 12, -1, -1, -1, 2, 16, 6, 7, -1, 5,
++    7, 6, 7, 2, 3, 1, 15, 13, 1, 11, 10, 5, 4, 2, 3, 6, 7, 6, 4, 5, 6, 4, 6, 7, 11, 0, 2, 10, 6, 0, 7, 6, 7, 6, 11, 6,
++    2, 12, 14, 15, 13, 9, 8, 9, 15, 14, 13, 12, -1, -1 };
++static const signed char pab_alt[PAB_N] = {
++    7, 7, 6, 12, 10, 2, 1, 3, -1, 5, 3, 20, 4, 4, 4, 2, -1, 0, 1, 11, 11, 6, 2, 3, 12, -1, -1, -1, 2, 16, 6, 7, -1, 5,
++    7, 5, 7, 2, 3, 1, 15, 13, 1, 6, 10, 5, 4, 2, 3, 6, 7, 6, 4, 5, 6, 4, 5, 7, 6, 0, 2, 10, 5, 0, 5, 7, 5, 7, 6, 4, 2,
++    12, 14, 15, 13, 9, 8, 9, 15, 14, 13, 12, -1, -1 };
++
++/* EDeviceFunction ids the presets name */
++enum { PAB_A_PRIMARYFIRE = 0, PAB_A_SECONDARYFIRE = 1, PAB_A_ZOOMSWITCH = 2, PAB_A_USE = 6, PAB_A_QUICKTHROW = 9,
++       PAB_A_CROUCH = 12, PAB_A_SLIDE = 13, PAB_A_COVER = 14, PAB_A_DOITNOW = 18, PAB_A_FLASHLIGHT = 19,
++       PAB_A_CLOSECOMBAT = 20, PAB_A_TRIGGERC4 = 21, PAB_A_SUICIDE = 22, PAB_A_STANDUP = 23, PAB_A_GRABLEFT = 30,
++       PAB_A_GRABRIGHT = 31, PAB_A_JETPACKCLIMB = 69 };
++
++static int pab_skip(int a) { return a == PAB_A_SUICIDE || a == PAB_A_STANDUP; }
++
++/* The scheme's own table; NULL for Move/AGP schemes and unknown ids (left alone). */
++static const signed char* pab_base(int32_t id)
++{
++    return id == 1 ? pab_std : id == 2 ? pab_alt : (const signed char*)0;
++}
++
++/* Shadow Fall's PS4 default layout (network pass 35). `family` (PRM_FAM_*) is kept in the signature for the callers:
++ * the layout is the same for every pad (Xbox RT/LT/RB arrive as R2/L2/R1). */
++static void pab_modern(const signed char* base, int family, int32_t out[PAB_N])
++{
++    int a;
++    (void)family;
++    for (a = 0; a < PAB_N; a++) out[a] = base[a];
++    out[PAB_A_PRIMARYFIRE] = out[PAB_A_SECONDARYFIRE] = out[PAB_A_GRABRIGHT] = PAB_R2;
++    out[PAB_A_ZOOMSWITCH] = out[PAB_A_GRABLEFT] = PAB_L2;
++    out[PAB_A_QUICKTHROW] = PAB_R1;
++    out[PAB_A_CROUCH] = out[PAB_A_SLIDE] = out[PAB_A_COVER] = out[PAB_A_JETPACKCLIMB] = PAB_CIRCLE;
++    out[PAB_A_USE] = out[PAB_A_DOITNOW] = PAB_CIRCLE;
++    out[PAB_A_CLOSECOMBAT] = out[PAB_A_TRIGGERC4] = PAB_R3;
++}
++
++/* Net pass 34's Modern (family 0 PS: fire R1, aim L1, grenade L2; 1 Xbox: fire R2, aim L2, grenade L1; crouch Circle,
++ * use Square, melee R3). Not offered any more: only recognised, so Default can put the scheme's own table back over a
++ * profile saved while it was in use. */
++static void pab_modern_r34(const signed char* base, int family, int32_t out[PAB_N])
++{
++    const int fire = family ? PAB_R2 : PAB_R1, aim = family ? PAB_L2 : PAB_L1, nade = family ? PAB_L1 : PAB_L2;
++    int a;
++    for (a = 0; a < PAB_N; a++) out[a] = base[a];
++    out[PAB_A_PRIMARYFIRE] = out[PAB_A_SECONDARYFIRE] = out[PAB_A_GRABRIGHT] = fire;
++    out[PAB_A_ZOOMSWITCH] = out[PAB_A_FLASHLIGHT] = out[PAB_A_GRABLEFT] = out[PAB_A_JETPACKCLIMB] = aim;
++    out[PAB_A_QUICKTHROW] = nade;
++    out[PAB_A_CROUCH] = out[PAB_A_SLIDE] = out[PAB_A_COVER] = PAB_CIRCLE;
++    out[PAB_A_USE] = out[PAB_A_DOITNOW] = PAB_SQUARE;
++    out[PAB_A_CLOSECOMBAT] = out[PAB_A_TRIGGERC4] = PAB_R3;
++}
++
++/* src[g] = the pad button (0..15, CELL_PAD_CTRL bit order of pad_remap.h) that does game button g's job, >= 16 none.
++ * pad_remap.h numbers buttons by CELL_PAD_CTRL bit (select l3 r3 start up right down left l2 r2 l1 r1 tri circle cross
++ * square), EButton by icon id: convert both ways. */
++static const signed char pab_eb_to_bit[16] = { 12, 13, 14, 15, 8, 9, 10, 11, 3, 0, 1, 2, 4, 5, 6, 7 };
++static const signed char pab_bit_to_eb[16] = { 9, 10, 11, 8, 12, 13, 14, 15, 4, 5, 6, 7, 0, 1, 2, 3 };
++
++static void pab_custom(const signed char* base, const unsigned char src[16], int32_t out[PAB_N])
++{
++    int a;
++    for (a = 0; a < PAB_N; a++) {
++        const int b = base[a];
++        out[a] = b;
++        if (b >= 0 && b < 16) {
++            const unsigned s = src[pab_eb_to_bit[b]];
++            out[a] = s < 16 ? pab_bit_to_eb[s] : -1;
++        }
++    }
++}
++
++static void pab_from_base(const signed char* base, int32_t out[PAB_N])
++{
++    int a;
++    for (a = 0; a < PAB_N; a++) out[a] = base[a];
++}
++
++/* Equal on every action a preset may write. */
++static int pab_same(const int32_t* x, const int32_t* y)
++{
++    int a;
++    for (a = 0; a < PAB_N; a++) if (!pab_skip(a) && x[a] != y[a]) return 0;
++    return 1;
++}
++
++static int pab_diffs(const int32_t* x, const signed char* base)
++{
++    int a, n = 0;
++    for (a = 0; a < PAB_N; a++) if (!pab_skip(a) && x[a] != base[a]) n++;
++    return n;
++}
++
++/* A table the game could hold: every entry -1..20 (a block that is not one, e.g. a player slot the profile does not
++ * have, is never written). */
++static int pab_plausible(const int32_t* t)
++{
++    int a;
++    for (a = 0; a < PAB_N; a++) if (t[a] < -1 || t[a] > 20) return 0;
++    return 1;
++}
++
++/* Which EBOOT is loaded: GetActionBinding's code words identify it (no build-time version needed). */
++typedef uint32_t (*pab_rd32_fn)(uint32_t ea);
++typedef uint8_t (*pab_rd8_fn)(uint32_t ea);
++typedef void (*pab_wr32_fn)(uint32_t ea, uint32_t v);
++
++typedef struct { const char* name; uint32_t fn, w0, w_tab, off_tab, w_mot, off_mot, profile_ptr; } PabVersion;
++static const PabVersion pab_versions[2] = {
++    /* v1.00: sldi r6,r5,5 ... addic r5,r3,0xd4 ... lbz r6,0xe0(r3) */
++    { "1.00", 0x004C79B4u, 0x78A62EA4u, 0x30A300D4u, 0x1Cu, 0x88C300E0u, 0x2Cu, 0x01587FECu },
++    /* 1.14: ori r6,r4,0 ... addic r7,r3,0xd4 ... lbz r8,0xe0(r3) */
++    { "1.14", 0x004D40B8u, 0x60860000u, 0x30E300D4u, 0x28u, 0x890300E0u, 0x38u, 0x015FD6FCu },
++};
++
++/* -1 = neither (another game or a changed EBOOT: the layouts stay off). */
++static int pab_detect(pab_rd32_fn rd32)
++{
++    int v;
++    for (v = 0; v < 2; v++) {
++        const PabVersion* p = &pab_versions[v];
++        if (rd32(p->fn) == p->w0 && rd32(p->fn + p->off_tab) == p->w_tab && rd32(p->fn + p->off_mot) == p->w_mot) return v;
++    }
++    return -1;
++}
++
++/* What one block should hold. kbd = the keyboard is the device in use (keys name game buttons: they keep the game's
++ * table). Returns 0 when the block is left alone. */
++static int pab_want(int preset, int family, int kbd, const signed char* base, const unsigned char custom_src[16],
++                    int32_t out[PAB_N])
++{
++    if (!base) return 0;
++    if (kbd || preset == 0) pab_from_base(base, out);
++    else if (preset == 1) pab_modern(base, family, out);
++    else if (preset == 2 && custom_src) pab_custom(base, custom_src, out);
++    else pab_from_base(base, out);
++    return 1;
++}
++
++/* A table this file could have written for this scheme (so putting the scheme's own back is safe). */
++static int pab_ours(const int32_t* cur, const signed char* base, const unsigned char custom_src[16], const int32_t* last)
++{
++    int32_t t[PAB_N];
++    int f;
++    pab_modern(base, 0, t);
++    if (pab_same(cur, t)) return 1;
++    for (f = 0; f < 2; f++) { pab_modern_r34(base, f, t); if (pab_same(cur, t)) return 1; }
++    if (custom_src) { pab_custom(base, custom_src, t); if (pab_same(cur, t)) return 1; }
++    return last && pab_same(cur, last);
++}
++
++/* Result of one block's sync */
++enum { PAB_NONE = 0, PAB_WROTE = 1, PAB_RESTORED = 2, PAB_FOREIGN = 3, PAB_BAD = 4 };
++
++/* One block: read, decide, write. `last` (PAB_N, may hold anything; last[0] == INT32_MIN = none) is what this file
++ * wrote last into this block and is updated. */
++static int pab_sync_block(uint32_t blk, int preset, int family, int kbd, const unsigned char custom_src[16],
++                          int32_t* last, pab_rd32_fn rd32, pab_rd8_fn rd8, pab_wr32_fn wr32, int32_t* id_out)
++{
++    int32_t cur[PAB_N], want[PAB_N];
++    const signed char* base;
++    int a;
++    const int32_t id = (int32_t)rd32(blk + PAB_OFF_ID);
++    if (id_out) *id_out = id;
++    if (rd8(blk + PAB_OFF_MOTION) != 0) return PAB_NONE;
++    base = pab_base(id);
++    if (!base) return PAB_NONE;
++    for (a = 0; a < PAB_N; a++) cur[a] = (int32_t)rd32(blk + PAB_OFF_TABLE + 4u * (uint32_t)a);
++    if (!pab_plausible(cur)) return PAB_BAD;
++    if (!pab_want(preset, family, kbd, base, custom_src, want)) return PAB_NONE;
++    if (pab_same(cur, want)) return PAB_NONE;
++    {
++        int32_t b[PAB_N];
++        pab_from_base(base, b);
++        if (pab_same(want, b) && !pab_ours(cur, base, custom_src, last[0] == INT32_MIN ? (const int32_t*)0 : last))
++            return PAB_FOREIGN;   /* the game's own table (or one we do not know): leave it */
++        for (a = 0; a < PAB_N; a++)
++            if (!pab_skip(a) && cur[a] != want[a]) wr32(blk + PAB_OFF_TABLE + 4u * (uint32_t)a, (uint32_t)want[a]);
++        memcpy(last, want, sizeof want);
++        return pab_same(want, b) ? PAB_RESTORED : PAB_WROTE;
++    }
++}
++
++#endif

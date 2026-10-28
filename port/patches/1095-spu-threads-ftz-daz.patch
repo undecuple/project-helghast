@@ -1,0 +1,147 @@
+KZ3 patch 1095 (SPU pass 70): host threads that run SPU code get the SPU's single-precision denormal rule
+(MXCSR FTZ|DAZ). SPU ISA v1.2 s.9.1 p.195: denorms are not supported and are treated as zero; an operation that
+would generate a denorm generates zero, a denorm operand is treated as zero. The helpers run the host's SSE ops
+under the thread's MXCSR, which stayed at the IEEE default, so results differed from the SPU (a denormal where the
+SPU gives 0) and every op with a denormal operand or result took a microcode assist (26.5 vs 1.5 ns per dependent
+mul+add pair on an i7-12700KF; a decaying tail y *= 0.99 settles on a denormal fixed point under IEEE rounding and
+runs ~20x slower than under FTZ, host test). spu_fpmode.h (new,
+header-only) holds the rule; spu_drain.c exports spu_host_fp_init(), called at the start of the SPURS kernel, lane,
+PM worker and job-chain threads (cellSpurs.c), SPU thread groups/tasks (spu_async_run) and raw SPUs.
+Opt-in: KZ3_SPU_FTZ=1 (the K2 pair of pass 70, spu-70-k2ftz vs spu-70-k2old, showed no change in the audio
+jobs' times or the holes: the hot mixer loops see normal values in the game, so denormals are not why the audio
+SPU falls behind; the semantic change waits for its own A/B before a default flip). Residual deviations: x86 FTZ keeps the sign of an underflowed result (the SPU
+gives +0); FTZ/DAZ also act on double precision (the ISA allows forcing DP denormal operands to zero, s.9.2, but
+keeps DP denormal results). Host test tools/spu/test_spu_ftz.sh. Upstream candidate.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): `spu_host_fp_init` in upstream's `raw_spu_run`.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index cb2b44fb..b62cca5a 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2123,6 +2123,7 @@ struct spurs_pm_worker_arg {
+ 
+ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+ {
++    { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+ #endif
+@@ -2313,6 +2314,7 @@ struct kz3_lane {
+ };
+ static DWORD WINAPI kz3_lane_thread(LPVOID p)
+ {
++    { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+ #endif
+@@ -2465,6 +2467,7 @@ __attribute__((constructor)) static void kz3_kern_poll_init(void)
+ 
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ {
++    { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+ #endif
+@@ -3771,6 +3774,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+ 
+ static DWORD WINAPI jc_thread(LPVOID p)
+ {
++    { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+     int slot = (int)(intptr_t)p;
+     ps3_thread_name("spurs jc %d", slot);
+     /* TIMING PROBE (SPURS_JC_DELAY=ms): the real jm2 chain walker is async and
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 852f4e9b..5d42b459 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -23,6 +23,15 @@
+ /* KZ3 patch 1038: A/B switch for the pshufb quadword byte shifts/rotates in spu_helpers.h.
+  * KZ3_SPU_FASTCG=0 keeps the old byte loops (default: the pshufb path). Read once before main. */
+ int g_kz3_spu_slowcg = 0;
++
++/* KZ3 patch 1095 (SPU pass 70): SPU denormal rule on SPU host threads; see spu_fpmode.h. Opt-in: KZ3_SPU_FTZ=1. */
++#include "spu_fpmode.h"
++int g_kz3_spu_ftz = -1;
++void spu_host_fp_init(void)
++{
++    if (g_kz3_spu_ftz < 0) g_kz3_spu_ftz = spu_fpmode_env_on(getenv("KZ3_SPU_FTZ"));
++    if (g_kz3_spu_ftz) spu_fpmode_set_spu();
++}
+ /* KZ3 patch 1039: KZ3_SPU_FASTCG=N turns on the fast paths of patches <= N (unset: all; 0: none; 1038: only
+  * patch 1038's; any other value starting with a digit is the patch number). */
+ int g_kz3_spu_fastcg_level = 1 << 30;
+diff --git a/runtime/spu/spu_fpmode.h b/runtime/spu/spu_fpmode.h
+new file mode 100644
+index 00000000..c7114e36
+--- /dev/null
++++ b/runtime/spu/spu_fpmode.h
+@@ -0,0 +1,44 @@
++/* KZ3 patch 1095 (SPU pass 70): the SPU's single-precision denormal rule for host threads that run SPU code.
++ *
++ * SPU ISA v1.2 s.9.1 (p.195): "Denorms are not supported and are treated as zero. Thus, an operation that would
++ * generate a denorm under IEEE rules instead generates a positive zero. If a denorm is used as an operand, it is
++ * treated as a zero." The SPU helpers use the host's SSE ops under the thread's MXCSR, which stayed at the default
++ * (IEEE gradual underflow): results differed from the SPU (a denormal where the SPU gives 0) and every SSE op with
++ * a denormal operand or result took a microcode assist (26.5 vs 1.5 ns per dependent mul+add pair on an
++ * i7-12700KF, SPU pass 70). Audio DSP produces denormals by design: decaying filter, envelope and reverb tails
++ * settle on a subnormal fixed point under IEEE rounding (SPU pass 28), so KZ3's audio SPU ran its mixer jobs on
++ * assists. MXCSR.FTZ (bit 15) flushes underflowing results to zero, DAZ (bit 6) reads denormal operands as zero.
++ * Residual deviations: x86 FTZ keeps the sign of an underflowed result (-0 for a negative one; the SPU gives +0),
++ * and FTZ/DAZ also act on double precision, where the ISA allows denormal operands to be forced to zero (s.9.2,
++ * DENORM) but keeps denormal results. Header-only so the host test (tools/spu/test_spu_ftz.sh) uses this code.
++ * Opt-in (KZ3_SPU_FTZ=1): in SPU pass 70's K2 pair the audio SPU's job times did not change (the hot mixer loops
++ * see normal values in the game), so the semantic change waits for its own A/B before a default flip. */
++#ifndef SPU_FPMODE_H
++#define SPU_FPMODE_H
++#if defined(__SSE__) || defined(_M_X64) || defined(_M_IX86)
++#include <xmmintrin.h>
++#define SPU_FPMODE_X86 1
++#endif
++
++#define SPU_FPMODE_FTZ_DAZ 0x8040u
++
++/* KZ3_SPU_FTZ: on only when set to a value starting with '1' (opt-in, SPU pass 70: no throughput change measured). */
++static inline int spu_fpmode_env_on(const char* e) { return (e && *e == '1') ? 1 : 0; }
++
++/* This thread's MXCSR gets FTZ|DAZ (rounding mode and exception masks untouched). */
++static inline void spu_fpmode_set_spu(void)
++{
++#ifdef SPU_FPMODE_X86
++    _mm_setcsr(_mm_getcsr() | SPU_FPMODE_FTZ_DAZ);
++#endif
++}
++
++static inline unsigned spu_fpmode_get(void)
++{
++#ifdef SPU_FPMODE_X86
++    return _mm_getcsr();
++#else
++    return 0;
++#endif
++}
++#endif
+diff --git a/runtime/spu/spu_raw.c b/runtime/spu/spu_raw.c
+index be77bfdc..75170110 100644
+--- a/runtime/spu/spu_raw.c
++++ b/runtime/spu/spu_raw.c
+@@ -252,6 +252,7 @@ static inline long raw_cas(volatile long* p, long v, long c)
+ static void raw_spu_run(raw_spu* s)
+ {
+     ps3_thread_name("raw spu");
++    { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+     spu_context* c = s->ctx;
+ 
+     c->status = SPU_STATUS_RUNNING;
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 292061ae..ca0e297b 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -1014,6 +1014,7 @@ int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image,
+ SPU_THREAD_LOCAL uint32_t g_kz3_cur_taskset, g_kz3_cur_taskid;
+ static void spu_async_run(spu_async_job* j)
+ {
++    { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+     g_kz3_cur_taskset = j->taskset_ea; g_kz3_cur_taskid = j->taskid;   /* KZ3 patch 1081 */
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     spu_taskset_bind_thread(j->taskset_ea);   /* KZ3 patch 1066 */

@@ -1,0 +1,13 @@
+# Gameplay tests T2 + T3 (the gameplay test plan): walk forward, turn, zoom at the scanner gate
+# of mission_0. Appended to the fast menu script (tools/pad/menu-fast.pad through tools/level-run.sh): level load at
+# ~38 s, level start ~111-120 s, the player stands at the gate from the level start; the segments start at
+# load+307 = 345 s (the old pad-r12 timing was 430 s with the load at 122.7 s: same offset).
+#   tools/level-run.sh gp-t2 --pad tools/pad/t2-walk.pad     (KZ3_VIDEO=340:50 for the clip)
+# Grammar: port/patches/3006-cellpad-script-v2.patch. Analog: LX,LY,RX,RY in -1..1, Y -1 = up (forward).
+# Move = left stick (GetLeftStick 0x4D0030 -> UpdateMoveInput), look = right stick (UpdateLook -> SetViewAngles),
+# R3 0x0004 = zoom toggle.
+345:0,-1,0,0/10      # T2: left stick full up for 10 s (the gate approaches, later streaming lumps open)
+360:0,0,1,0/5        # T3: right stick full right for 5 s (the view pans right, then stops)
+370:0x0004           # R3: zoom in
+380:0x0004           # R3: zoom out
+385:0,1,0,0/5        # left stick back for 5 s (returns toward the start spot)

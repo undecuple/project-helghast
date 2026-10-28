@@ -1,0 +1,47 @@
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1897,10 +1897,43 @@
+     static int s_lane_pool = -1;
+     if (s_lane_pool < 0) { const char* e = getenv("KZ3_SPURS_LANE_POOL"); s_lane_pool = (e && *e == '0') ? 0 : 1; }
+     const int lane_pool = s_lane_pool;
++    /* KZ3 patch 1037 (KZ3_SPURS_LINGER_US, default 0 = off): for that long after a busy pass, an idle pass
++     * yields (SwitchToThread) instead of sleeping 1 ms, so a job that becomes ready a few us later (a barrier
++     * on the other kernel thread, the next audio mix half) is picked up at once. A thread that has had no busy
++     * pass never lingers, so idle kernels keep sleeping. KZ3_SPURS_CPU=1 prints each kernel thread's CPU time
++     * (GetThreadTimes) every 10 s as [spurs-cpu]. */
++    static int s_linger_us = -1, s_cpu_rep = -1;
++    if (s_linger_us < 0) { const char* e = getenv("KZ3_SPURS_LINGER_US"); int v = e ? atoi(e) : 0;
++        s_linger_us = v > 0 ? v : 0; printf("[spurs-kern] linger after a busy pass: %d us (KZ3_SPURS_LINGER_US)\n", s_linger_us); }
++    if (s_cpu_rep < 0) { const char* e = getenv("KZ3_SPURS_CPU"); s_cpu_rep = (e && *e == '1') ? 1 : 0; }
++    LARGE_INTEGER kz3_lf; QueryPerformanceFrequency(&kz3_lf);
++    const int64_t kz3_linger_ticks = (int64_t)((double)s_linger_us * (double)kz3_lf.QuadPart / 1e6);
++    int64_t kz3_last_busy = 0, kz3_cpu_t0 = 0; uint64_t kz3_cpu_c0 = 0; unsigned kz3_yields = 0, kz3_sleeps = 0;
+     for (;;) {
++        if (kz3_linger_ticks || s_cpu_rep) {
++            LARGE_INTEGER now; QueryPerformanceCounter(&now);
++            if (kz3_busy_prev) kz3_last_busy = now.QuadPart;
++            if (s_cpu_rep) {
++                FILETIME c_, e_, k_, u_; uint64_t cpu = 0;
++                if (GetThreadTimes(GetCurrentThread(), &c_, &e_, &k_, &u_))
++                    cpu = (((uint64_t)k_.dwHighDateTime << 32) | k_.dwLowDateTime) + (((uint64_t)u_.dwHighDateTime << 32) | u_.dwLowDateTime);
++                if (!kz3_cpu_t0) { kz3_cpu_t0 = now.QuadPart; kz3_cpu_c0 = cpu; }
++                else if (now.QuadPart - kz3_cpu_t0 >= 10 * kz3_lf.QuadPart) {
++                    double secs = (double)(now.QuadPart - kz3_cpu_t0) / (double)kz3_lf.QuadPart;
++                    printf("[spurs-cpu] %s k%d cpu=%.0f ms/s yields=%.0f/s sleeps=%.0f/s\n", si->prefix, kt,
++                           (double)(cpu - kz3_cpu_c0) / 1e4 / secs, kz3_yields / secs, kz3_sleeps / secs);
++                    kz3_cpu_t0 = now.QuadPart; kz3_cpu_c0 = cpu; kz3_yields = kz3_sleeps = 0;
++                }
++            }
++            if (!kz3_busy_prev && kz3_linger_ticks && kz3_last_busy && now.QuadPart - kz3_last_busy < kz3_linger_ticks) {
++                const uint64_t wa0 = kz3_wacct_begin(); SwitchToThread(); kz3_wacct_end(KZ3_WA_KSLEEP, 1, wa0);
++                kz3_yields++; kz3_busy_prev = 0; goto kz3_pass;
++            }
++        }
+         if (!(s_busy_nosleep && kz3_busy_prev))
+-        { const uint64_t wa0 = kz3_wacct_begin(); Sleep(1); kz3_wacct_end(KZ3_WA_KSLEEP, 0, wa0); }   /* patch 1032 */
++        { const uint64_t wa0 = kz3_wacct_begin(); Sleep(1); kz3_wacct_end(KZ3_WA_KSLEEP, 0, wa0); kz3_sleeps++; }   /* patch 1032 */
+         kz3_busy_prev = 0;
++    kz3_pass:;
+         u32 ea = si->ea;
+         if (!ea || s_pm_off) continue;
+         /* KZ3 patch 1013: the [spurs-stuck] check moved to spurs_watch_thread. */

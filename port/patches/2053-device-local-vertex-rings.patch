@@ -1,0 +1,209 @@
+KZ3 patch 2053 (RSX pass 55): device-local vertex and index rings (opt-in: LD_VB_DEVICE=1; default off).
+
+The walker writes vertices and indices into UPLOAD-heap rings and the GPU read them from system memory over
+PCIe. Patch 2052's timestamps showed the main pass's 700 position-only depth draws of one PSO costing 16 ms of
+GPU per frame. Each draw now reads from a DEFAULT-heap mirror of the ring (same offsets, per frame slot,
+LD_VB_DEVICE_MB = 128 MB vertex / a quarter of that index) and every submit first executes a small copy list
+that copies the byte range the list's draws used. Draws whose range does not fit the mirror keep reading the
+upload ring. Mirrors rest in COMMON between lists (copy list: COMMON -> COPY_DEST -> COMMON).
+Measured in pass 55 (K4 level): draw GPU time 65 -> 35 ms/frame but the copy lists cost 22-25 ms/frame
+(50 MB/frame at ~2 GB/s on a GPU the driver keeps at P5/P8 with PCIe gen 1-2), so no net gain: default off.
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -355,6 +355,7 @@
+         ID3D12CommandAllocator* alloc;
+         ID3D12Resource*         upload; u8* upload_mapped;
+         ID3D12Resource*         vb;     u8* vb_mapped;
++        ID3D12Resource *vbd, *ibd; ID3D12CommandAllocator* calloc;   /* patch 2053 */
+         ID3D12Resource*         ib;     u32* ib_mapped;
+         ID3D12Resource*         cb;     u8* cb_mapped;
+         ID3D12Resource*         ps_cb;  u8* ps_cb_mapped;
+@@ -442,6 +443,9 @@
+     ID3D12Resource*            ib;
+     u32*                       ib_mapped;
+     u32                        ib_used;
++    ID3D12Resource *vbd, *ibd; u32 vbd_size, ibd_size;   /* patch 2053: device-local mirrors of vb/ib */
++    ID3D12CommandAllocator* calloc; ID3D12GraphicsCommandList* clist;
++    u32 vb_lo, vb_hi, ib_lo, ib_hi;   /* byte ranges of the open list to copy */
+ 
+     u32                        width, height;
+     rsx_live_guest_ptr_fn      guest_ptr;
+@@ -2196,6 +2200,7 @@
+     g.alloc = f->alloc;
+     g.upload = f->upload; g.upload_mapped = f->upload_mapped;
+     g.vb = f->vb; g.vb_mapped = f->vb_mapped;
++    g.vbd = f->vbd; g.ibd = f->ibd; g.calloc = f->calloc;   /* patch 2053 */
+     g.ib = f->ib; g.ib_mapped = f->ib_mapped;
+     g.cb = f->cb; g.cb_mapped = f->cb_mapped;
+     g.ps_cb = f->ps_cb; g.ps_cb_mapped = f->ps_cb_mapped;
+@@ -2208,6 +2213,7 @@
+     f->alloc = g.alloc;
+     f->upload = g.upload; f->upload_mapped = g.upload_mapped;
+     f->vb = g.vb; f->vb_mapped = g.vb_mapped;
++    f->vbd = g.vbd; f->ibd = g.ibd; f->calloc = g.calloc;   /* patch 2053 */
+     f->ib = g.ib; f->ib_mapped = g.ib_mapped;
+     f->cb = g.cb; f->cb_mapped = g.cb_mapped;
+     f->ps_cb = g.ps_cb; f->ps_cb_mapped = g.ps_cb_mapped;
+@@ -2525,6 +2531,101 @@
+ /* Patch 2029: draws recorded since the last submit (chunked submits). */
+ static u32 g_ld_unsubmitted;
+ static u64 g_ld_chunk_submits;
++/* Patch 2053: device-local vertex/index rings. The walker writes vertices and indices into UPLOAD-heap rings
++ * (system memory); the GPU then fetched every vertex over PCIe (patch 2052's timestamps: the 700 position-only
++ * depth draws per frame of one PSO took 16 ms, 23 us each). Now each draw reads its vertex/index data from a
++ * DEFAULT-heap mirror (same offsets), and every submit first executes a small copy list that copies the byte
++ * range the list's draws used (min..max offset per list) from the upload ring into the mirror. A draw whose
++ * range does not fit the mirror (LD_VB_DEVICE_MB, default 128 / index 32) keeps reading the upload ring.
++ * Default OFF (LD_VB_DEVICE=1 enables): pass 55 measured the copy list costing as much as the draws saved. The mirrors sit in COMMON between lists; the copy list
++ * moves them COMMON -> COPY_DEST -> COMMON, draws promote them implicitly. */
++static int ld_vbd_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_VB_DEVICE"); on = e && e[0] == '1'; }   /* default off: pass 55 measured no gain */
++    return on;
++}
++static ID3D12Resource* ld_vbd_make(u64 bytes)
++{
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes; bd.Height = 1; bd.DepthOrArraySize = 1;
++    bd.MipLevels = 1; bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    ID3D12Resource* r = NULL;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON,
++                                                      NULL, &IID_ID3D12Resource, (void**)&r)))
++        return NULL;
++    return r;
++}
++/* Slot i (0/1) mirrors + copy allocator; called once per slot after the rings exist. */
++static int ld_vbd_slot_init(struct ld_frame_slot* f)
++{
++    static u32 vb_mb, ib_mb;
++    if (!vb_mb) {
++        const char* e = getenv("LD_VB_DEVICE_MB"); vb_mb = e ? (u32)atoi(e) : 128u; if (vb_mb < 4) vb_mb = 128;
++        if (vb_mb > VERT_BUFFER_SIZE / (1024u * 1024u)) vb_mb = VERT_BUFFER_SIZE / (1024u * 1024u);
++        ib_mb = vb_mb / 4u; if (ib_mb < 1) ib_mb = 1;
++        if (ib_mb > INDEX_BUFFER_SIZE / (1024u * 1024u)) ib_mb = INDEX_BUFFER_SIZE / (1024u * 1024u);
++        g.vbd_size = vb_mb * 1024u * 1024u; g.ibd_size = ib_mb * 1024u * 1024u;
++    }
++    f->vbd = ld_vbd_make(g.vbd_size); f->ibd = ld_vbd_make(g.ibd_size);
++    g.dev->lpVtbl->CreateCommandAllocator(g.dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&f->calloc);
++    return f->vbd && f->ibd && f->calloc;
++}
++static void ld_vbd_init(void)
++{
++    g.vbd = NULL; g.ibd = NULL; g.clist = NULL;
++    if (!ld_vbd_on()) return;
++    int ok = ld_vbd_slot_init(&g.fr[0]);
++    if (ok && g.fif_n > 1) ok = ld_vbd_slot_init(&g.fr[1]);
++    if (ok) {
++        g.dev->lpVtbl->CreateCommandList(g.dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.fr[0].calloc, NULL,
++                                         &IID_ID3D12GraphicsCommandList, (void**)&g.clist);
++        if (g.clist) g.clist->lpVtbl->Close(g.clist); else ok = 0;
++    }
++    if (!ok) { fprintf(stderr, "[live-draw] device vertex rings failed; upload-heap vertex reads\n"); return; }
++    g.vbd = g.fr[g.fr_cur].vbd; g.ibd = g.fr[g.fr_cur].ibd; g.calloc = g.fr[g.fr_cur].calloc;
++    fprintf(stderr, "[live-draw] device vertex rings: vb %u MB, ib %u MB per frame slot\n", g.vbd_size >> 20, g.ibd_size >> 20);
++}
++/* Called by every submit before the draw list executes: copies the byte ranges the list's draws read. */
++static void ld_vbd_submit(void)
++{
++    if (!g.vbd) return;
++    const int vb = g.vb_hi > g.vb_lo, ib = g.ib_hi > g.ib_lo;
++    if (!vb && !ib) return;
++    g.clist->lpVtbl->Reset(g.clist, g.calloc, NULL);
++    ld_gt_copy_stamp(g.clist, 0);   /* patch 2052 timestamps */
++    g_gt.c_bytes += (double)(vb ? g.vb_hi - g.vb_lo : 0) + (double)(ib ? g.ib_hi - g.ib_lo : 0);
++    D3D12_RESOURCE_BARRIER b[2]; memset(b, 0, sizeof b);
++    u32 n = 0;
++    if (vb) { b[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[n].Transition.pResource = g.vbd; b[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[n].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST; n++; }
++    if (ib) { b[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[n].Transition.pResource = g.ibd; b[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[n].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST; n++; }
++    g.clist->lpVtbl->ResourceBarrier(g.clist, n, b);
++    if (vb) g.clist->lpVtbl->CopyBufferRegion(g.clist, g.vbd, g.vb_lo, g.vb, g.vb_lo, (u64)(g.vb_hi - g.vb_lo));
++    if (ib) g.clist->lpVtbl->CopyBufferRegion(g.clist, g.ibd, g.ib_lo, g.ib, g.ib_lo, (u64)(g.ib_hi - g.ib_lo));
++    for (u32 i = 0; i < n; i++) { D3D12_RESOURCE_STATES t = b[i].Transition.StateBefore; b[i].Transition.StateBefore = b[i].Transition.StateAfter; b[i].Transition.StateAfter = t; }
++    g.clist->lpVtbl->ResourceBarrier(g.clist, n, b);
++    ld_gt_copy_stamp(g.clist, 1);
++    g.clist->lpVtbl->Close(g.clist);
++    ID3D12CommandList* cl[] = {(ID3D12CommandList*)g.clist};
++    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, cl);
++    g.vb_lo = g.vb_hi = g.ib_lo = g.ib_hi = 0;
++}
++/* Draw side: the vertex/index range [off, off+bytes) is read from the mirror when it fits. */
++static ID3D12Resource* ld_vbd_vb(u32 off, u64 bytes)
++{
++    if (!g.vbd || (u64)off + bytes > g.vbd_size) return g.vb;
++    if (g.vb_hi <= g.vb_lo) { g.vb_lo = off; g.vb_hi = off + (u32)bytes; }
++    else { if (off < g.vb_lo) g.vb_lo = off; if (off + (u32)bytes > g.vb_hi) g.vb_hi = off + (u32)bytes; }
++    return g.vbd;
++}
++static ID3D12Resource* ld_vbd_ib(u32 off, u64 bytes)
++{
++    if (!g.ibd || (u64)off + bytes > g.ibd_size) return g.ib;
++    if (g.ib_hi <= g.ib_lo) { g.ib_lo = off; g.ib_hi = off + (u32)bytes; }
++    else { if (off < g.ib_lo) g.ib_lo = off; if (off + (u32)bytes > g.ib_hi) g.ib_hi = off + (u32)bytes; }
++    return g.ibd;
++}
+ static void ld_flush_body(ld_flush_reason reason)
+ {
+     g_ld_unsubmitted = 0;
+@@ -2548,6 +2649,7 @@
+         return;
+     }
+     ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
++    ld_vbd_submit();   /* patch 2053 */
+     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+     const u64 v = ++g.fence_value;
+     ld_gm_note(v);   /* patch 2051 */
+@@ -2579,6 +2681,7 @@
+         ld_fr_release_retired(nxt);
+         ld_fr_load(nxt);
+         g.alloc->lpVtbl->Reset(g.alloc);
++        if (g.calloc) g.calloc->lpVtbl->Reset(g.calloc);   /* patch 2053 */
+         g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE(); ld_gt_begin();   /* patches 2045, 2052 */
+         g.upload_used = 0;
+         g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
+@@ -2625,6 +2728,7 @@
+     ld_fr_release_retired(0);
+     ld_fr_release_retired(1);
+     g.alloc->lpVtbl->Reset(g.alloc);
++    if (g.calloc) g.calloc->lpVtbl->Reset(g.calloc);   /* patch 2053 */
+     g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE(); ld_gt_begin();   /* patches 2045, 2052 */
+     g.upload_used = 0;
+     ld_rb_drain();   /* patch 2027 */
+@@ -10898,6 +11002,7 @@
+         return;
+     }
+     ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
++    ld_vbd_submit();   /* patch 2053 */
+     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+     const u64 v = ++g.fence_value;
+     ld_gm_note(v);   /* patch 2051 */
+@@ -11825,7 +11930,8 @@
+     }
+ 
+     D3D12_VERTEX_BUFFER_VIEW vbv;
+-    vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
++    ID3D12Resource* vb_src = vertex_stride ? ld_vbd_vb(g.vb_used, draw_vb_bytes) : g.vb;   /* patch 2053 */
++    vbv.BufferLocation = vb_src->lpVtbl->GetGPUVirtualAddress(vb_src) + g.vb_used;
+     vbv.StrideInBytes = vertex_stride;
+     vbv.SizeInBytes = (u32)draw_vb_bytes;
+     if (vertex_stride)
+@@ -11874,8 +11980,9 @@
+         /* conditional render: the report says 0 samples, the RSX skips the draw */
+     } else if (indexed) {
+         D3D12_INDEX_BUFFER_VIEW ibv;
++        ID3D12Resource* ib_src = ld_vbd_ib(g.ib_used, draw_ib_bytes);   /* patch 2053 */
+         ibv.BufferLocation =
+-            g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
++            ib_src->lpVtbl->GetGPUVirtualAddress(ib_src) + g.ib_used;
+         ibv.SizeInBytes = (u32)draw_ib_bytes;
+         ibv.Format = DXGI_FORMAT_R32_UINT;
+         g.list->lpVtbl->IASetIndexBuffer(g.list, &ibv);
+@@ -12634,6 +12741,7 @@
+             g.fif_n = 1;
+         }
+     }
++    ld_vbd_init();   /* patch 2053 */
+     fprintf(stderr, "[live-draw] frames in flight: %u\n", g.fif_n);
+     {
+         D3D12_SAMPLER_DESC def = {0};

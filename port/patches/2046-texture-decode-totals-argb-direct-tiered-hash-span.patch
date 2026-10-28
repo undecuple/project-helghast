@@ -1,0 +1,455 @@
+KZ3 patch 2046 (RSX pass 46): exact texture decode diagnostics, direct A8R8G8B8 uploads, separable swizzle tables
+and the size-tiered quiet-texture hashing default.
+Diagnostics (RSX_PERF=1 + RSX_PERF_PROF=A,B): [perf-redecode|hash|newtex] print exact totals ("total n= bytes= ms")
+next to the 128-source tables (which drop every source that arrives once they are full) and a by-shape table
+[perf-<tag>-shape] (location, size, format, mips, linear, count, bytes, time, offset range; 48 shapes + other).
+[tex-untracked] names the first 64 hash changes with no tracked write; [tex-hash] adds big=, wr-unchanged= (tracked
+page flag, no change), dyn-forced= (hashed only because the texture changed once) and argb-direct=.
+LD_ARGB_DIRECT (default on, =0 off): pitch-linear A8R8G8B8 textures upload their guest bytes as R8G8B8A8_UNORM with
+the RSX remap in the SRV component mapping (output R,G,B,A = comp 1,2,3,0; a select of channel k = resource
+component k; op 0/1 = FORCE_0/FORCE_1: decode_texel's default case + remap_comp, bit-exact). KZ3's SPU post chain
+rewrites a 1280x720 one (1:0x01310400) and a 160x90 one every frame; the per-texel decode of the big one was 3.4 ms
+a frame (run r46-prof: 814 re-decodes, 2,796 ms in the 80 s window).
+Swizzle: morton_index(x, y) == morton_index(x, 0) | morton_index(0, y) (each bit's position depends only on lw, lh
+and the bit index), so the 2D decode loops (RGBA8, cube, FP16) build one table per axis per level and OR them.
+LD_TEX_HASH_SPAN default 4 (was 0) with LD_TEX_HASH_BIG (default 65536, 0 = the untiered 2033 rule): a texture of
+at least BIG guest bytes whose content never changed since it was cached and whose hash came back unchanged N
+times is re-hashed every N frames; smaller textures and textures that changed once (dyn) every frame. A tracked
+write (page bitmap) still forces the next bind's hash in every mode (patch 2033 guarantee); the dyn flag follows
+content changes, not page flags (64 KB pages flag neighbours). Host test tools/smoke/test_guest_write.c runs in
+three modes (KZ3_GW_TIER=0/1/2) with the new case Q5.
+
+--- a/libs/video/rsx_live_draw.c	2026-10-13 05:30:20.280342334 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-13 06:02:02.318270906 -0500
+@@ -147,7 +147,10 @@
+ #define MAX_TEXTURES     8192   /* patch 2033: was 1024; the level binds ~2,500 distinct textures a frame and the
+                                  * LRU evicted ~243 of them per frame (RE pass 72), each decoded again */
+ #define TEX_INDEX_SIZE   (4u * MAX_TEXTURES)   /* patch 2033: hash index over g.textures, power of two */
+-#define LD_TEX_HASH_SPAN_DEFAULT 0   /* patch 2033: LD_TEX_HASH_SPAN default (frames; 0 = hash every frame) */
++#define LD_TEX_HASH_SPAN_DEFAULT 4   /* patch 2033: LD_TEX_HASH_SPAN default (frames; 0 = hash every frame); patch 2046:
++                                      * 4, tiered by LD_TEX_HASH_BIG (was 0 = every frame) */
++#define LD_TEX_HASH_BIG_DEFAULT 65536u   /* patch 2046: LD_TEX_HASH_BIG default (bytes): only textures at least this big
++                                          * and never written since load are rate-limited; 0 = the untiered 2033 rule */
+ #define MAX_RETIRED_TEXTURES 4096
+ #define MAX_VTEX         64
+ #define MAX_SAMPLERS     128
+@@ -292,6 +295,8 @@
+     u32 quiet;  /* patch 2033: consecutive hashes that found the same bytes (saturating) */
+     u32 written;   /* patch 2033: a tracked writer touched the span since the last hash */
+     u32 skip_frame;   /* patch 2033: frame of the last counted skip */
++    u32 dyn;          /* patch 2046: a content change was seen since caching: hashed every frame from then on */
++    u32 raw_argb;     /* patch 2046: the resource holds the guest's A,R,G,B bytes as R8G8B8A8 (LD_ARGB_DIRECT) */
+     int kc_kind;      /* patch 2039: KC_HUD / KC_MENU when this is a prompt atlas */
+     u32 kc_sig;       /* patch 2039: rsx_keycaps_sig() its upload was made for */
+ } texcache_t;
+@@ -302,6 +307,7 @@
+     u32 last_hash_frame;
+     u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
+     u32 quiet, written, skip_frame;   /* patch 2033, as texcache_t */
++    u32 dyn;   /* patch 2046, as texcache_t (content change seen) */
+ } vtexcache_t;
+ typedef struct { u64 key; ID3D12PipelineState* pso; u8 preloaded; } psocache_t;   /* patch 2031: preloaded until first use */
+ typedef struct {
+@@ -2405,6 +2411,16 @@
+     }
+     return idx;
+ }
++/* KZ3 patch 2046: the swizzle separates into one table per axis. morton_index gives every bit of x and of y a
++ * position that depends only on (lw, lh) and the bit's index, never on the other coordinate, so
++ * morton_index(x, y) == morton_index(x, 0) | morton_index(0, y). The per-texel loop (one iteration per address bit,
++ * 16 for a 256x256 level) becomes one OR; the tables are built per level from morton_index itself. Walker only. */
++static u32 g_ld_mx[4096], g_ld_my[4096];
++static void ld_morton_tables(u32 mw, u32 mh, u32 lw, u32 lh)
++{
++    for (u32 x = 0; x < mw && x < 4096u; x++) g_ld_mx[x] = morton_index(x, 0, lw, lh);
++    for (u32 y = 0; y < mh && y < 4096u; y++) g_ld_my[y] = morton_index(0, y, lw, lh);
++}
+ /* Patch 2011: swizzled 3D textures interleave x, y and z bits in that order
+  * while each axis still has bits left (the 2D order extended by one axis).
+  * ASSUMPTION: from the 2D layout; KZ3's one 3D texture (pass 11 capture) is
+@@ -2529,6 +2545,8 @@
+ }
+ static unsigned long long g_ld_tex_inplace_n;
+ static unsigned long long g_ld_b8_direct_n;   /* patch 2036 */
++static unsigned long long g_ld_argb_direct_n;   /* patch 2046 */
++static u32 g_ld_tex_raw;   /* patch 2046: what the last decode_guest_texture made (1 = raw A,R,G,B bytes) */
+ static int ld_tex_inplace_on(void)
+ {
+     static int on = -1;
+@@ -2790,7 +2808,7 @@
+ static volatile LONG g_ld_td[2][LD_TD_WORDS];   /* pages written since the last flip (any thread) */
+ static u32 g_ld_td_prev[2][LD_TD_WORDS];        /* pages written during the previous frame (walker) */
+ static int g_ld_tex_hash_span = -1;
+-static struct { u64 hashes, skipped, changes, tracked, untracked, hashed_bytes, flip_flags; } g_ld_th;
++static struct { u64 hashes, skipped, changes, tracked, untracked, hashed_bytes, flip_flags, dyn_forced, wr_unchanged; } g_ld_th;
+ 
+ static int ld_tex_hash_span(void)
+ {
+@@ -2801,6 +2819,20 @@
+     }
+     return g_ld_tex_hash_span;
+ }
++/* patch 2046: the size tier. Textures of at least this many guest bytes, never written since they were cached
++ * (no tracked write, no content change) and quiet for N hashes are hashed every N frames; smaller or dynamic ones
++ * every frame. 0 = the untiered patch-2033 rule (every quiet texture rate-limited, no dyn flag). */
++static u32 ld_tex_hash_big(void)
++{
++    static long long big = -1;
++    if (big < 0) {
++        const char* e = getenv("LD_TEX_HASH_BIG");
++        big = e ? atoll(e) : (long long)LD_TEX_HASH_BIG_DEFAULT;
++        if (big < 0) big = 0;
++        if (big > 0xFFFFFFFFll) big = 0xFFFFFFFFll;
++    }
++    return (u32)big;
++}
+ 
+ /* Any thread. Marks the 64 KB pages of [offset, offset+size) in `location`. */
+ static void ld_td_mark(u32 location, u32 offset, u32 size)
+@@ -2832,32 +2864,45 @@
+ 
+ /* Walker, at a hash decision: hash now, or keep the cached decode for this frame? */
+ static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_frame, u32 quiet, u32* written,
+-                           u32* skip_frame)
++                           u32* skip_frame, u32* dyn)
+ {
+     const int n = ld_tex_hash_span();
++    const u32 big = ld_tex_hash_big();   /* patch 2046 */
+     if (location > 1u || !span) return 1;   /* never rate-limited; `written` stays as it is for the stat */
+     if (*written) return 1;
+     if (ld_td_test((const u32*)g_ld_td[location], offset, span)) { *written = 1; return 1; }
+-    const int due = !n || quiet < (u32)n || g_ld_frames - last_hash_frame >= (u32)n;
++    const int due = !n || (big && (span < big || *dyn)) || quiet < (u32)n || g_ld_frames - last_hash_frame >= (u32)n;
++    if (due && n && big && *dyn && span >= big && quiet >= (u32)n && g_ld_frames - last_hash_frame < (u32)n)
++        g_ld_th.dyn_forced++;   /* patch 2046 stat: hashed only because the texture changed once */
+     { static int dbg = -1;   /* LD_TEX_HASH_DBG=1: every decision (host tests) */
+       if (dbg < 0) dbg = getenv("LD_TEX_HASH_DBG") ? 1 : 0;
+-      if (dbg) fprintf(stderr, "[tex-hash-dbg] frame=%u src=%u:0x%08X span=%u quiet=%u last=%u due=%d\n",
+-                       g_ld_frames, location, offset, span, quiet, last_hash_frame, due); }
++      if (dbg) fprintf(stderr, "[tex-hash-dbg] frame=%u src=%u:0x%08X span=%u quiet=%u last=%u dyn=%u due=%d\n",
++                       g_ld_frames, location, offset, span, quiet, last_hash_frame, *dyn, due); }
+     if (due) return 1;
+     if (*skip_frame != g_ld_frames) { *skip_frame = g_ld_frames; g_ld_th.skipped++; }   /* once per entry per frame */
+     return 0;
+ }
+ 
+ /* Walker, at a hash result: keep the quiet counter and the statistics. */
+-static void ld_tex_hash_note(int readable, int changed, u32* quiet, u32* written)
++static void ld_tex_hash_note(int readable, int changed, u32* quiet, u32* written, u32* dyn, u32 location,
++                             u32 offset, u32 w, u32 h, u32 fmt, u32 span)
+ {
+     g_ld_th.hashes++;
+     if (readable && changed) {
+         g_ld_th.changes++;
+-        if (*written) g_ld_th.tracked++; else g_ld_th.untracked++;
++        if (ld_tex_hash_big()) *dyn = 1;   /* patch 2046: a change means a writer: every frame from now on */
++        if (*written) g_ld_th.tracked++;
++        else {
++            static u32 n_untracked = 0;   /* patch 2046: who the untracked writers are (the evidence for the tier) */
++            g_ld_th.untracked++;
++            if (++n_untracked <= 64 || (n_untracked & 1023u) == 0)
++                fprintf(stderr, "[tex-untracked] n=%u frame=%u src=%u:0x%08X %ux%u fmt=0x%02X span=%u quiet=%u\n",
++                        n_untracked, g_ld_frames, location, offset, w, h, fmt, span, *quiet);
++        }
+         *quiet = 0;
+     } else if (readable && *quiet < 0xFFFFu) {
+         (*quiet)++;
++        if (*written) g_ld_th.wr_unchanged++;   /* patch 2046 stat: a tracked page flag with no change (64 KB pages) */
+     }
+     *written = 0;
+ }
+@@ -2885,27 +2930,55 @@
+         }
+     }
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) {
+-        fprintf(stderr, "[tex-hash] span=%d frame=%u hashes=%llu skipped=%llu bytes=%.1fMB changes=%llu tracked=%llu"
+-                        " untracked=%llu flip-flags=%llu inplace=%llu b8-direct=%llu\n",
+-                ld_tex_hash_span(), g_ld_frames, (unsigned long long)g_ld_th.hashes,
++        fprintf(stderr, "[tex-hash] span=%d big=%u frame=%u hashes=%llu skipped=%llu bytes=%.1fMB changes=%llu tracked=%llu"
++                        " untracked=%llu flip-flags=%llu wr-unchanged=%llu dyn-forced=%llu inplace=%llu b8-direct=%llu"
++                        " argb-direct=%llu\n",
++                ld_tex_hash_span(), ld_tex_hash_big(), g_ld_frames, (unsigned long long)g_ld_th.hashes,
+                 (unsigned long long)g_ld_th.skipped, (double)g_ld_th.hashed_bytes / 1048576.0,
+                 (unsigned long long)g_ld_th.changes, (unsigned long long)g_ld_th.tracked,
+-                (unsigned long long)g_ld_th.untracked, (unsigned long long)g_ld_th.flip_flags, g_ld_tex_inplace_n,
+-                g_ld_b8_direct_n);
++                (unsigned long long)g_ld_th.untracked, (unsigned long long)g_ld_th.flip_flags,
++                (unsigned long long)g_ld_th.wr_unchanged, (unsigned long long)g_ld_th.dyn_forced, g_ld_tex_inplace_n,
++                g_ld_b8_direct_n, g_ld_argb_direct_n);
+         memset(&g_ld_th, 0, sizeof g_ld_th);
+         g_ld_tex_inplace_n = 0;
+         g_ld_b8_direct_n = 0;
++        g_ld_argb_direct_n = 0;
+     }
+ }
+ 
+-/* KZ3 patch 2045 diagnostic (RSX_PERF window only): which textures get re-decoded, by source. */
++/* KZ3 patch 2045 diagnostic (RSX_PERF window only): which textures get re-decoded, by source. Patch 2046: exact
++ * totals (the 128-source tables drop every source that arrives once they are full, so their n= undercounts), a
++ * by-shape table (location, size, format, mips, linear; 48 shapes + `other`) with the time spent (decode for
++ * re-decodes and new entries, the hash for hashes) and the offset range, printed as [perf-<tag>-shape]. */
+ #define LD_RD_N 128
++#define LD_RS_N 48
+ typedef struct { u32 location, offset, w, h, fmt, span; u64 n, bytes; } ld_rd_t;
++typedef struct { u32 location, w, h, fmt, mips, linear, span, lo, hi; u64 n, bytes; long long ticks; } ld_rs_t;
+ static ld_rd_t g_ld_rd[3][LD_RD_N];   /* 0 = re-decodes, 1 = hashes, 2 = new cache entries */
+ static u32 g_ld_rd_n[3];
+-static void ld_redecode_note(int which, const rsx_dsp_texture* t, u32 span)
++static struct { u64 n, bytes; long long ticks; } g_ld_rd_tot[3];
++static ld_rs_t g_ld_rs[3][LD_RS_N + 1];   /* [LD_RS_N] = the shapes that found no slot */
++static u32 g_ld_rs_n[3];
++static void ld_redecode_note(int which, const rsx_dsp_texture* t, u32 span, long long ticks)
+ {
+     if (!rsx_perf_walk_on()) return;
++    g_ld_rd_tot[which].n++; g_ld_rd_tot[which].bytes += span; g_ld_rd_tot[which].ticks += ticks;
++    {   /* by shape */
++        ld_rs_t* r = g_ld_rs[which]; u32* n = &g_ld_rs_n[which]; u32 i;
++        const u32 linear = (t->format & TEX_FMT_LINEAR) ? 1u : 0u, mips = t->mipmaps;
++        for (i = 0; i < *n; i++)
++            if (r[i].location == t->location && r[i].w == t->width && r[i].h == t->height && r[i].fmt == t->format &&
++                r[i].mips == mips && r[i].linear == linear) break;
++        if (i == *n) {
++            if (*n < LD_RS_N) { (*n)++; memset(&r[i], 0, sizeof r[i]); r[i].location = t->location; r[i].w = t->width;
++                                r[i].h = t->height; r[i].fmt = t->format; r[i].mips = mips; r[i].linear = linear;
++                                r[i].span = span; r[i].lo = r[i].hi = t->offset; }
++            else i = LD_RS_N;
++        }
++        r[i].n++; r[i].bytes += span; r[i].ticks += ticks;
++        if (t->offset < r[i].lo) r[i].lo = t->offset;
++        if (t->offset > r[i].hi) r[i].hi = t->offset;
++    }
+     ld_rd_t* r = g_ld_rd[which]; u32* n = &g_ld_rd_n[which];
+     for (u32 i = 0; i < *n; i++)
+         if (r[i].location == t->location && r[i].offset == t->offset) { r[i].n++; r[i].bytes += span; return; }
+@@ -2916,13 +2989,17 @@
+ }
+ void rsx_live_draw_perf_dump(void)   /* the reporter, when the RSX_PERF_PROF window closes */
+ {
++    LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
++    const double tick_ms = 1000.0 / (double)(qf.QuadPart ? qf.QuadPart : 1);
+     for (int which = 0; which < 3; which++) {
+         ld_rd_t* r = g_ld_rd[which]; const u32 n = g_ld_rd_n[which];
+         const char* tag = which == 0 ? "redecode" : which == 1 ? "hash" : "newtex";
+         u64 total = 0, bytes = 0;
+         for (u32 i = 0; i < n; i++) { total += r[i].n; bytes += r[i].bytes; }
+-        fprintf(stderr, "[perf-%s] sources=%u%s n=%llu bytes=%.1fMB (top 16 by bytes)\n", tag, n,
+-                n >= LD_RD_N ? "+" : "", (unsigned long long)total, (double)bytes / 1048576.0);
++        fprintf(stderr, "[perf-%s] sources=%u%s n=%llu bytes=%.1fMB | total n=%llu bytes=%.1fMB %.1fms (top 16 by bytes)\n",
++                tag, n, n >= LD_RD_N ? "+" : "", (unsigned long long)total, (double)bytes / 1048576.0,
++                (unsigned long long)g_ld_rd_tot[which].n, (double)g_ld_rd_tot[which].bytes / 1048576.0,
++                (double)g_ld_rd_tot[which].ticks * tick_ms);
+         for (int k = 0; k < 16; k++) {
+             int b = -1;
+             for (u32 i = 0; i < n; i++) if (r[i].n && (b < 0 || r[i].bytes > r[b].bytes)) b = (int)i;
+@@ -2933,6 +3010,23 @@
+             r[b].n = 0;
+         }
+         g_ld_rd_n[which] = 0;
++        memset(&g_ld_rd_tot[which], 0, sizeof g_ld_rd_tot[which]);
++        {   /* patch 2046: the shapes, by time */
++            ld_rs_t* q = g_ld_rs[which]; const u32 m = g_ld_rs_n[which];
++            fprintf(stderr, "[perf-%s-shape] shapes=%u%s (by time)\n", tag, m, q[LD_RS_N].n ? "+" : "");
++            for (u32 k = 0; k <= LD_RS_N; k++) {
++                int b = -1;
++                for (u32 i = 0; i <= LD_RS_N; i++) if (q[i].n && (b < 0 || q[i].ticks > q[b].ticks)) b = (int)i;
++                if (b < 0) break;
++                fprintf(stderr, "[perf-%s-shape]   %s%u: %ux%u fmt=0x%02X mips=%u lin=%u span=%u n=%llu %.1fMB %.2fms"
++                                " off=0x%08X..0x%08X\n", tag, b == LD_RS_N ? "other " : "", q[b].location, q[b].w,
++                        q[b].h, q[b].fmt, q[b].mips, q[b].linear, q[b].span, (unsigned long long)q[b].n,
++                        (double)q[b].bytes / 1048576.0, (double)q[b].ticks * tick_ms, q[b].lo, q[b].hi);
++                q[b].n = 0;
++            }
++            memset(q, 0, sizeof(ld_rs_t) * (LD_RS_N + 1));
++            g_ld_rs_n[which] = 0;
++        }
+     }
+ }
+ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+@@ -3135,11 +3229,12 @@
+             if (!buf[n]) { oom = 1; break; }
+             const u32 lw = log2_u32(mw), lh = log2_u32(mh);
+             const u8* level_src = src + (size_t)face * face_span + off;
++            if (!linear) ld_morton_tables(mw, mh, lw, lh);   /* patch 2046 */
+             for (u32 y = 0; y < mh; y++)
+                 for (u32 x = 0; x < mw; x++) {
+                     const u8* px = linear
+                         ? level_src + (size_t)y * pitch + (size_t)x * texel
+-                        : level_src + (size_t)morton_index(x, y, lw, lh) * texel;
++                        : level_src + (size_t)(g_ld_mx[x] | g_ld_my[y]) * texel;
+                     u8* d = buf[n] + ((size_t)y * mw + x) * texel;
+                     for (u32 k = 0; k < texel; k += 2) { d[k] = px[k + 1]; d[k + 1] = px[k]; }
+                 }
+@@ -3207,11 +3302,36 @@
+     }
+     return m;
+ }
++/* KZ3 patch 2046: pitch-linear A8R8G8B8 textures are uploaded as they are (the guest's A,R,G,B bytes into an
++ * R8G8B8A8_UNORM resource) and the RSX remap goes into the SRV component mapping: output R = comp 1 (R), G = 2,
++ * B = 3, A = 0 (A), a select of source channel k = resource component k, op 0 / op 1 = FORCE_0 / FORCE_1,
++ * exactly decode_texel's default case + remap_comp. In the KZ3 level the SPU post chain rewrites a 1280x720 one
++ * (1:0x01310400) and a 160x90 one every frame; the per-texel decode of the big one was 3.4 ms a frame (pass 46
++ * run r46-prof). LD_ARGB_DIRECT=0 restores the RGBA8 decode. */
++static int ld_argb_direct_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_ARGB_DIRECT"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++static u32 ld_argb_raw_mapping(u32 remap)
++{
++    static const u32 out2comp[4] = { 1, 2, 3, 0 };
++    u32 m = 1u << 12;
++    for (u32 out = 0; out < 4; out++) {
++        const u32 comp = out2comp[out];
++        const u32 op = (remap >> (8 + comp * 2)) & 3;
++        const u32 sel = (remap >> (comp * 2)) & 3;
++        m |= (op == 0 ? 4u : op == 1 ? 5u : sel) << (3 * out);
++    }
++    return m;
++}
+ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+ {
+     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+     const int linear = (t->format & TEX_FMT_LINEAR) != 0;
+     const u32 w = t->width, h = t->height;
++    g_ld_tex_raw = 0;
+     if (t->dimension == 3)
+         return decode_guest_texture_3d(t, remap, base_fmt, linear);
+     if (!w || !h || w > 4096 || h > 4096 || t->dimension != 2)
+@@ -3252,6 +3372,28 @@
+         }
+     }
+ 
++    if (base_fmt == TEX_FMT_A8R8G8B8 && linear && !t->cubemap && ld_argb_direct_on()) {   /* patch 2046 */
++        const u32 pitch = t->pitch ? t->pitch : w * 4u;
++        if (pitch >= w * 4u) {
++            const u8* src = guest_ptr(t->location, t->offset, pitch * (h - 1) + w * 4u);
++            if (src) {
++                u8* tmp = NULL;
++                if (pitch != w * 4u) {
++                    tmp = (u8*)malloc((size_t)w * h * 4u);
++                    if (!tmp) return NULL;
++                    for (u32 y = 0; y < h; y++) memcpy(tmp + (size_t)y * w * 4u, src + (size_t)y * pitch, (size_t)w * 4u);
++                }
++                tex_level_t lv;
++                lv.w = w; lv.h = h; lv.data = tmp ? tmp : src; lv.row_bytes = w * 4u; lv.rows = h;
++                ID3D12Resource* r = create_texture_mipped(DXGI_FORMAT_R8G8B8A8_UNORM, &lv, 1);
++                free(tmp);
++                g_ld_argb_direct_n++;
++                g_ld_tex_raw = 1;
++                return r;
++            }
++        }
++    }
++
+     if (base_fmt == TEX_FMT_DXT1 || base_fmt == TEX_FMT_DXT23 ||
+         base_fmt == TEX_FMT_DXT45) {
+         const DXGI_FORMAT dxgi = base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
+@@ -3367,13 +3509,14 @@
+                 const u32 lw = log2_u32(mw), lh = log2_u32(mh);
+                 const u8* level_src =
+                     src + (size_t)face * face_span + off;
++                if (!linear) ld_morton_tables(mw, mh, lw, lh);   /* patch 2046 */
+                 for (u32 y = 0; y < mh; y++)
+                     for (u32 x = 0; x < mw; x++) {
+                         const u8* pixel = linear
+                             ? level_src + (size_t)y * pitch +
+                                 (size_t)x * texel_size
+                             : level_src +
+-                                (size_t)morton_index(x, y, lw, lh) *
++                                (size_t)(g_ld_mx[x] | g_ld_my[y]) *
+                                     texel_size;
+                         decode_texel(
+                             base_fmt, pixel, remap,
+@@ -3429,11 +3572,12 @@
+               }
+               pdn++;
+           } }
++        if (!linear) ld_morton_tables(mw, mh, lw, lh);   /* patch 2046 */
+         for (u32 y = 0; y < mh; y++)
+             for (u32 x = 0; x < mw; x++) {
+                 const u8* pixel = linear
+                     ? level_src + (size_t)y * pitch + (size_t)x * texel_size
+-                    : level_src + (size_t)morton_index(x, y, lw, lh) * texel_size;
++                    : level_src + (size_t)(g_ld_mx[x] | g_ld_my[y]) * texel_size;
+                 decode_texel(base_fmt, pixel, remap,
+                              rgba[n] + ((size_t)y * mw + x) * 4);
+             }
+@@ -3588,6 +3732,13 @@
+         desc.Texture2D.MipLevels = (UINT)-1;
+         ld_create_srv(
+             g.dev, entry->tex, &desc, srv_cpu(SRV_TEXTURE_BASE + index));
++    } else if (entry->raw_argb) {   /* patch 2046: the guest's A,R,G,B bytes, remap in the mapping */
++        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
++        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++        desc.Shader4ComponentMapping = ld_argb_raw_mapping(entry->remap);
++        desc.Texture2D.MipLevels = (UINT)-1;
++        ld_create_srv(g.dev, entry->tex, &desc, srv_cpu(SRV_TEXTURE_BASE + index));
+     } else {
+         D3D12_RESOURCE_DESC rd;   /* patch 2036: an R8 resource is a direct B8 upload */
+         entry->tex->lpVtbl->GetDesc(entry->tex, &rd);
+@@ -4123,13 +4274,14 @@
+         if (refresh_enabled && entry->tex &&
+             entry->last_hash_frame != g_ld_frames &&
+             ld_tex_hash_due(entry->location, entry->offset, entry->span, entry->last_hash_frame,
+-                            entry->quiet, &entry->written, &entry->skip_frame)) {   /* patch 2033 */
++                            entry->quiet, &entry->written, &entry->skip_frame, &entry->dyn)) {   /* patch 2033 */
+             int readable = 0;
+             LDW_T0(th_t0);
+             const u64 hash = texture_content_hash(t, &readable);
+             LDW_ADD(RSX_PERF_W_TEX_HASH_T, th_t0);
+-            ld_redecode_note(1, t, entry->span);   /* patch 2045 diagnostic */
+-            ld_tex_hash_note(readable, hash != entry->content_hash, &entry->quiet, &entry->written);
++            ld_redecode_note(1, t, entry->span, th_t0 ? rsx_perf_now() - th_t0 : 0);   /* patch 2045 diagnostic */
++            ld_tex_hash_note(readable, hash != entry->content_hash, &entry->quiet, &entry->written, &entry->dyn,
++                             t->location, t->offset, t->width, t->height, t->format, entry->span);
+             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
+              * reads are microseconds apart, so they can only disagree if a
+              * guest thread is writing this texture right now -- i.e. we are
+@@ -4176,14 +4328,16 @@
+               } }
+             entry->last_hash_frame = g_ld_frames;
+             if (readable && hash != entry->content_hash) {
+-                ld_redecode_note(0, t, entry->span);   /* patch 2045 diagnostic */
+                 /* patch 2035: offer the current resource for an in-place update */
+                 g_ld_tex_reuse = ld_tex_inplace_on() ? entry->tex : NULL;
+                 g_ld_kc_kind = 0;
++                LDW_T0(rd_t0);
+                 ID3D12Resource* replacement =
+                     decode_guest_texture_profiled(t, remap);
+                 g_ld_tex_reuse = NULL;
++                ld_redecode_note(0, t, entry->span, rd_t0 ? rsx_perf_now() - rd_t0 : 0);   /* patch 2045 diagnostic */
+                 if (replacement) { entry->kc_kind = g_ld_kc_kind; entry->kc_sig = g_ld_kc_sig; }   /* patch 2039 */
++                if (replacement) entry->raw_argb = g_ld_tex_raw;   /* patch 2046 (constant per format in practice) */
+                 if (replacement && replacement == entry->tex) {
+                     entry->content_hash = hash;   /* same resource, same SRV: nothing to rewrite or retire */
+                     g_ld_tex_inplace_n++;
+@@ -4260,10 +4414,12 @@
+         replacement.content_hash = texture_content_hash(t, &readable);
+     }
+     g_ld_kc_kind = 0;
+-    ld_redecode_note(2, t, texture_source_span(t));   /* patch 2045 diagnostic: new cache entries */
++    LDW_T0(nw_t0);
+     replacement.tex = decode_guest_texture_profiled(t, remap);
++    ld_redecode_note(2, t, replacement.span, nw_t0 ? rsx_perf_now() - nw_t0 : 0);   /* patch 2045 diagnostic: new entries */
+     replacement.kc_kind = g_ld_kc_kind;   /* patch 2039 */
+     replacement.kc_sig = g_ld_kc_sig;
++    replacement.raw_argb = g_ld_tex_raw;   /* patch 2046 */
+     if (replacement.tex) {
+         texcache_t* entry = &g.textures[index];
+         if (evicted)
+@@ -4462,9 +4618,11 @@
+             e->height != vt->height || e->pitch != vt->pitch)
+             continue;
+         if (e->tex && e->last_hash_frame != g_ld_frames &&
+-            ld_tex_hash_due(e->location, e->offset, e->span, e->last_hash_frame, e->quiet, &e->written, &e->skip_frame)) {
++            ld_tex_hash_due(e->location, e->offset, e->span, e->last_hash_frame, e->quiet, &e->written, &e->skip_frame,
++                            &e->dyn)) {
+             const u64 hash = vertex_texture_hash(vt, NULL, NULL);
+-            ld_tex_hash_note(hash != 0, hash && hash != e->content_hash, &e->quiet, &e->written);
++            ld_tex_hash_note(hash != 0, hash && hash != e->content_hash, &e->quiet, &e->written, &e->dyn, e->location,
++                             e->offset, e->width, e->height, e->format, e->span);
+             e->last_hash_frame = g_ld_frames;
+             if (hash && hash != e->content_hash) {
+                 u64 replacement_hash = 0;

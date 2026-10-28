@@ -1,0 +1,196 @@
+KZ3 patch 2070 (RSX pass 66): scan-out gamma (cellVideoOutSetGamma), the RE notes "Pass 66".
+1. The PS3 ABI passes a float argument in f1, but the generic HLE call hands a handler only r3..r10, so
+   cellVideoOutSetGamma received register garbage (the game's LEFT press logged 0.00). a ctx handler (cellAvconfExt.c, NID 0xC7020F62) reads f1 from the
+   calling thread's context, so no other HLE call pays anything.
+2. The gamma was only stored. rsx_live_draw.c now applies it at scan-out: a compute pass writes out = in^gamma of the
+   presented surface into the host-AA scratch texture, which the present copies to the back buffer (the surface itself is
+   untouched). Gamma 1.0 skips the pass (bit-identical output); LD_GAMMA=0 turns it off. gamma > 1 darkens: the game's own Brightness page (DECREASE = LEFT) raises the value 1.04 -> 1.16 and INCREASE lowers it to 0.84.
+
+diff --git a/libs/misc/cellAvconfExt.c b/libs/misc/cellAvconfExt.c
+index 2ab88b8..41bdd3a 100644
+--- a/libs/misc/cellAvconfExt.c
++++ b/libs/misc/cellAvconfExt.c
+@@ -27,6 +27,23 @@ extern u8* vm_base;
+  * -----------------------------------------------------------------------*/
+ 
+ static float s_gamma = 1.0f;
++/* KZ3 patch 2070: the scan-out gamma the present path applies (rsx_live_draw.c); 1.0 = untouched. */
++float g_ps3_display_gamma = 1.0f;
++
++/* KZ3 patch 2070: the PS3 ABI passes `gamma` in f1, but the generic HLE call hands a handler only r3..r10, so
++ * cellVideoOutSetGamma got register garbage (0.00). A ctx handler (dispatched before the generic table) reads f1 from
++ * the calling thread's context and calls the real function: no extra work on any other HLE call. NID 0xC7020F62 =
++ * the SHA-1 NID of "cellVideoOutSetGamma" in the byte order of the other ctx handlers. */
++#include "../../runtime/ppu/ppu_context.h"
++extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
++static void hle_cellVideoOutSetGamma(ppu_context* ctx)
++{
++    ctx->gpr[3] = (uint64_t)(int64_t)cellVideoOutSetGamma((u32)ctx->gpr[3], (float)ctx->fpr[1]);
++}
++static void __attribute__((constructor)) kz3_register_gamma_handler(void)
++{
++    ps3_hle_register_ctx(0xC7020F62u, "cellVideoOutSetGamma", hle_cellVideoOutSetGamma);
++}
+ 
+ /* ---------------------------------------------------------------------------
+  * API implementations
+@@ -185,6 +202,7 @@ s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
+     printf("[cellAvconfExt] VideoOutSetGamma(%.2f)\n", gamma);
+     if (gamma < 0.8f || gamma > 1.2f) return (s32)0x8002b223;   /* PARAMETER_OUT_OF_RANGE */
+     s_gamma = gamma;
++    if (gamma >= 0.1f && gamma <= 4.0f) g_ps3_display_gamma = gamma;
+     return CELL_OK;
+ }
+ 
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index ba2aedf..74b7f04 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -14564,6 +14564,130 @@ static int ld_host_aa(u32 i)
+     return 1;
+ }
+ 
++
++/* KZ3 patch 2070: scan-out gamma. cellVideoOutSetGamma sets the display's output gamma on the PS3 (applied at scan-out,
++ * after the game's render targets): the presented image goes through out = in^gamma. gamma > 1 darkens
++ * (measured: the game's Brightness page raises the value on DECREASE; the slider spans 0.84..1.16 in 0.04 steps). The pass reads the
++ * presented surface and writes a copy (g_aa_tex, same size, RGBA8), which the present then copies to the back buffer; the
++ * surface itself is never altered. LD_GAMMA=0 turns it off; gamma 1.0 is skipped, so the default output is bit-identical. */
++extern float g_ps3_display_gamma;
++extern float cellAvconfExt_display_gamma(void);   /* the title's gamma, or PS3_DISPLAY_GAMMA (PR #355) */
++static ID3D12PipelineState* g_gm_pso;
++static u32 g_gm_failed, g_gm_logged;
++
++static int ld_gamma_enabled(void)
++{
++    static int en = -1;
++    if (en < 0) { const char* e = getenv("LD_GAMMA"); en = e ? atoi(e) : 1; }
++    return en;
++}
++
++static int ld_gamma_pipeline(void)
++{
++    if (g_gm_pso) return 1;
++    if (g_gm_failed) return 0;
++    if (!ld_host_aa_pipeline()) { g_gm_failed = 1; return 0; }   /* shares the AA root signature (SRV, UAV, 4 constants) */
++    g_gm_failed = 1;
++    static const char source[] =
++        "Texture2D<float4> src : register(t0);\n"
++        "RWTexture2D<float4> dst : register(u0);\n"
++        "cbuffer gm : register(b0) { uint W; uint H; float gamma_exp; float pad; };\n"
++        "[numthreads(8, 8, 1)]\n"
++        "void main(uint3 id : SV_DispatchThreadID) {\n"
++        "  if (id.x >= W || id.y >= H) return;\n"
++        "  float4 c = src.Load(int3(int2(id.xy), 0));\n"
++        "  dst[int2(id.xy)] = float4(pow(max(c.rgb, 0.0), gamma_exp), c.a);\n"
++        "}\n";
++    ID3DBlob* cs = NULL; ID3DBlob* err = NULL;
++    HRESULT hr = D3DCompile(source, sizeof(source) - 1u, "scanout_gamma", NULL, NULL, "main", "cs_5_0",
++                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[gamma] compile failed hr=0x%08lX: %s\n", (unsigned long)hr,
++                err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "<no diagnostics>");
++        if (err) err->lpVtbl->Release(err);
++        return 0;
++    }
++    if (err) err->lpVtbl->Release(err);
++    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {0};
++    pd.pRootSignature = g_aa_rootsig;
++    pd.CS.pShaderBytecode = cs->lpVtbl->GetBufferPointer(cs);
++    pd.CS.BytecodeLength = cs->lpVtbl->GetBufferSize(cs);
++    hr = g.dev->lpVtbl->CreateComputePipelineState(g.dev, &pd, &IID_ID3D12PipelineState, (void**)&g_gm_pso);
++    cs->lpVtbl->Release(cs);
++    if (FAILED(hr) || !g_gm_pso) { fprintf(stderr, "[gamma] pipeline failed hr=0x%08lX\n", (unsigned long)hr); return 0; }
++    g_gm_failed = 0;
++    return 1;
++}
++
++/* Returns the gamma-corrected copy (state COPY_SOURCE) of presented surface i, or NULL when no correction applies.
++ * The surface is left in RENDER_TARGET state. Recorded into the open list. */
++static ID3D12Resource* ld_gamma_present(u32 i)
++{
++    const float gm = cellAvconfExt_display_gamma();
++    if (!ld_gamma_enabled() || !(gm > 0.0f) || gm == 1.0f || i >= MAX_SURFACES) return NULL;
++    surface_t* sf = &g.surfaces[i];
++    if (!sf->tex || sf->fmt != DXGI_FORMAT_R8G8B8A8_UNORM) return NULL;
++    if (!ld_gamma_pipeline() || !ld_host_aa_target(sf->w, sf->h)) return NULL;
++    if (g.srv_ring_used >= SRV_RING_TABLES) return NULL;
++    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
++    g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
++    cpu.ptr += (size_t)base * g.srv_step;
++    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(SRV_SURFACE_BASE + i),
++                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    cpu.ptr += g.srv_step;
++    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(UAV_HOST_AA),
++                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
++    g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.srv_heap, &gpu);
++    gpu.ptr += (u64)base * g.srv_step;
++    D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu; gpu_uav.ptr += g.srv_step;
++
++    D3D12_RESOURCE_BARRIER b[2] = {0};
++    u32 nb = 0;
++    b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[nb].Transition.pResource = sf->tex;
++    b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    nb++;
++    if (g_aa_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
++        b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[nb].Transition.pResource = g_aa_tex;
++        b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[nb].Transition.StateBefore = g_aa_state;
++        b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++        nb++;
++    }
++    g.list->lpVtbl->ResourceBarrier(g.list, nb, b);
++    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
++    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
++    g.list->lpVtbl->SetPipelineState(g.list, g_gm_pso); LD_SM_INVALIDATE();
++    g.list->lpVtbl->SetComputeRootSignature(g.list, g_aa_rootsig);
++    g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 0, gpu);
++    g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 1, gpu_uav);
++    {
++        const float inv = gm, pad = 0.0f;
++        UINT k[4] = { sf->w, sf->h, 0, 0 };
++        memcpy(&k[2], &inv, 4); memcpy(&k[3], &pad, 4);
++        g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 4, k, 0);
++    }
++    g.list->lpVtbl->Dispatch(g.list, (sf->w + 7u) / 8u, (sf->h + 7u) / 8u, 1);
++    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[1].Transition.pResource = g_aa_tex;
++    b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    g_aa_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    if (g_gm_logged++ < 3)
++        fprintf(stderr, "[gamma] scan-out gamma %.3f on surface %u:0x%08X %ux%u (frame %u)\n", gm, sf->location, sf->offset,
++                sf->w, sf->h, g_ld_frames);
++    return g_aa_tex;
++}
++
+ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+ {
+     static int en = -1;
+@@ -14974,6 +15098,7 @@ static void ld_present_body(u32 buffer_id)
+           last_present_target = target;
+       } }
+     ID3D12Resource* srcimg = presented_surface->tex;
++    ID3D12Resource* gm_copy = ld_gamma_present(target);   /* patch 2070 */
+     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+     ID3D12Resource* bb = g.backbuf[bbi];
+ 
+@@ -14990,7 +15115,7 @@ static void ld_present_body(u32 buffer_id)
+     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+ 
+-    g.list->lpVtbl->CopyResource(g.list, bb, srcimg);
++    g.list->lpVtbl->CopyResource(g.list, bb, gm_copy ? gm_copy : srcimg);
+ 
+     bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+     bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;

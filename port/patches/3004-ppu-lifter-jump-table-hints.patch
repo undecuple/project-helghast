@@ -1,0 +1,43 @@
+PPU lifter: jump-table hints (PPU_JT_HINTS) for switch dispatchers the automatic scan cannot resolve.
+
+Symptom: KZ3 1.14 func_00E67F48 (a large vector function) ends in a switch whose table base is spilled to the
+stack (`std r11,0x2D0(r1)` ... `ld r27,0x2D0(r1); lwzx r0,r9,r27; extsw r0,r0; add r27,r0,r27; mtctr r27; bctr`).
+discover_jump_tables follows register definitions, not stack spills, so the dispatcher was not found; the lift
+log said "func_00E67F48 has no continuation at 0x00E68050; emitting halt" and the first call needing a later case
+died with cia=0, leaving its outputs unwritten (RE pass 59; the level later fails on corrupted memory).
+Fix: PPU_JT_HINTS=<file> with "DISPATCHER BASE COUNT [abs|rel]" lines; the lifter reads the table from the image
+and uses those case targets. Without the variable nothing changes. General (upstream candidate as a hint
+mechanism; the better fix teaches the scan stack spills).
+
+--- a/tools/ppu_lifter.py	2026-10-09 17:24:55.625472514 -0500
++++ b/tools/ppu_lifter.py	2026-10-09 17:24:55.641112312 -0500
+@@ -4033,6 +4033,29 @@
+                     best, best_key = targets, _key
+         if best:
+             tables[all_insns[i].addr] = sorted(set(best))
++    # KZ3 patch 3004: hand-supplied jump tables for dispatchers the scan above cannot resolve, e.g. a table base
++    # spilled to the stack and reloaded before the dispatch (KZ3 1.14 func_00E67F48: `std r11,0x2D0(r1)` ...
++    # `ld r27,0x2D0(r1); lwzx r0,r9,r27; extsw; add r27,r0,r27; mtctr r27; bctr`). PPU_JT_HINTS names a file with
++    # one "DISPATCHER BASE COUNT [abs|rel]" per line (hex or decimal, '#' comments): COUNT 32-bit entries at BASE,
++    # each a case address (abs) or a signed offset from BASE (rel, the default). A hint replaces any table found.
++    _hp = _os.environ.get("PPU_JT_HINTS")
++    if _hp:
++        for _ln in open(_hp):
++            _f = _ln.split('#')[0].split()
++            if len(_f) < 3:
++                continue
++            _d, _b, _c = (int(x, 0) for x in _f[:3])
++            _rel = len(_f) < 4 or _f[3] == 'rel'
++            _ts = []
++            for _k in range(_c):
++                _w = read_u32(_b + 4 * _k)
++                if _w is None:
++                    break
++                _ts.append((_b + (_w - (1 << 32) if _w & 0x80000000 else _w)) & 0xFFFFFFFF if _rel else _w)
++            _ok = [t for t in _ts if text_lo <= t < text_hi and t % 4 == 0]
++            print(f"  jump-table hint 0x{_d:X}: {len(_ok)}/{_c} case targets from 0x{_b:X}")
++            if _ok:
++                tables[_d] = sorted(set(_ok))
+     return tables
+ 
+ 

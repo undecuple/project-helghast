@@ -1,0 +1,157 @@
+sys_lwcond: lv2 layout (u32 lwmutex EA at +0, u32 queue id at +4) and real wait/signal with the
+lv2 timeout and ETIMEDOUT. KZ3 FIOS reads +0 and spun on "wait for invalid cond" with the old 64-bit store.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, layout from PR277 same offsets, per-waiter wait/signal kept.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): #577 replaced the lwmutex semaphore with a state word: the lwcond wait releases/retakes through `lwm_release`/`lwm_acquire`, `ppu_thread_note_block` kept (1059 and 1122 then replace it).
+
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 9cb50400..6b4ef916 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -391,49 +391,120 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
+ }
+ 
+ /* sys_lwcond (sysPrxForUser) — guest-side condition variable, paired with an
+- * lwmutex. The CRT and (newly) libsre's cellSpurs create/wait/signal these. Like
+- * sys_lwmutex above, model it directly in guest memory so the args stay GUEST
+- * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
+- * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
+- * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
+- * handshakes, not long-term blocking. sys_lwcond_t is 8 bytes: +0x00 u32
+- * lwmutex EA, +0x04 u32 lwcond queue id. Titles read +0x00 themselves (an
+- * lwcond whose lwmutex reads 0 is treated as invalid). */
++ * lwmutex. Modelled directly in guest memory so the args stay GUEST EAs (the
++ * generic adapter would pass them raw and the C sysPrxForUser impl deref'd them
++ * as host pointers -> AV during cellSpurs init).
++ *
++ * sys_lwcond_t (big-endian, 8 bytes, as lv2 and RPCS3 lay it out):
++ *   +0x00 lwmutex EA (u32)   +0x04 lwcond_queue id (u32)
++ * Games read +0x00 themselves: Killzone 3's FIOS checks it before every wait
++ * and logs "wait for invalid cond" and retries when it is 0. Writing the EA as
++ * a 64-bit value left that word 0 (and the id store ran past the struct), so
++ * the FIOS media thread spun forever holding its lwmutex.
++ *
++ * Wait/signal are real on Windows: a counting semaphore per lwcond plus a
++ * waiter count. The waiter registers before it drops the lwmutex, so a signal
++ * sent under the mutex is never lost; the semaphore keeps it if it lands
++ * between the unlock and the wait. r4 is the timeout in microseconds (0 =
++ * forever) and expiry returns ETIMEDOUT (0x8001000B), which callers test.
++ * A signal that races a timeout counts as the wakeup. */
++#define LWC_MUTEX  0x00
++#define LWC_QUEUE  0x04
++#define LWC_ID_BASE 0x4C000000u
++#ifdef _WIN32
++#define LWC_SLOTS 8192u
++static struct LwcSlot { HANDLE sem; volatile long waiters; } g_lwc[LWC_SLOTS];
++static volatile long g_lwc_next = 0;
++static struct LwcSlot* lwc_slot(uint32_t lwcond)
++{
++    uint32_t id = vm_read32(lwcond + LWC_QUEUE);
++    if (id <= LWC_ID_BASE || id - LWC_ID_BASE > LWC_SLOTS) return nullptr;
++    return &g_lwc[(id - LWC_ID_BASE - 1u) % LWC_SLOTS];
++}
++#endif
+ static void sys_lwcond_create(ppu_context* ctx)
+ {
+-    static uint32_t s_lwcond_id = 0x4C000000u;
+     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+     uint32_t lwmutex = (uint32_t)ctx->gpr[4];
+-    vm_write32(lwcond + 0x00, lwmutex);
+-    vm_write32(lwcond + 0x04, ++s_lwcond_id);
++#ifdef _WIN32
++    long n = _InterlockedIncrement(&g_lwc_next);
++    if ((uint32_t)n > LWC_SLOTS) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005u; return; } /* EAGAIN */
++    struct LwcSlot* sl = &g_lwc[n - 1];
++    sl->waiters = 0;
++    if (!sl->sem) sl->sem = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
++    uint32_t id = LWC_ID_BASE + (uint32_t)n;
++#else
++    static uint32_t s_lwcond_id = LWC_ID_BASE;
++    uint32_t id = ++s_lwcond_id;
++#endif
++    vm_write32(lwcond + LWC_MUTEX, lwmutex);
++    vm_write32(lwcond + LWC_QUEUE, id);
+     ctx->gpr[3] = 0;
+ }
+ static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
+- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
+- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
+- * common single (non-recursive) hold. */
++static void lwcond_wake(uint32_t lwcond, int all)
++{
++#ifdef _WIN32
++    struct LwcSlot* sl = lwc_slot(lwcond);
++    if (!sl || !sl->sem) return;
++    if (all) {
++        long n = _InterlockedExchange(&sl->waiters, 0);
++        if (n > 0) ReleaseSemaphore(sl->sem, n, NULL);
++        return;
++    }
++    for (;;) {
++        long w = sl->waiters;
++        if (w <= 0) return;                         /* nobody waiting: lv2 drops it */
++        if (_InterlockedCompareExchange(&sl->waiters, w - 1, w) == w) {
++            ReleaseSemaphore(sl->sem, 1, NULL);
++            return;
++        }
++    }
++#else
++    (void)lwcond; (void)all;
++#endif
++}
++static void sys_lwcond_signal(ppu_context* ctx)     { lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_all(ppu_context* ctx) { lwcond_wake((uint32_t)ctx->gpr[3], 1); ctx->gpr[3] = 0; }
++/* signal_to(lwcond, ppu_thread_id): wakes one waiter; which one is not modelled. */
++static void sys_lwcond_signal_to(ppu_context* ctx)  { lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
+ static void sys_lwcond_wait(ppu_context* ctx)
+ {
+     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+-    uint32_t lwmutex = vm_read32(lwcond + 0x00);
+-    struct LwmSlot* sl = lwm_slot(lwmutex);
+-    if (sl) {
++    uint64_t timeout_us = ctx->gpr[4];
++    uint32_t lwmutex = vm_read32(lwcond + LWC_MUTEX);
++    uint32_t result = 0;
++#ifdef _WIN32
++    struct LwmSlot* ms = lwm_slot(lwmutex);
++    struct LwcSlot* sl = lwc_slot(lwcond);
++    if (ms && sl && sl->sem) {
+         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
++        _InterlockedIncrement(&sl->waiters);
+         vm_write32(lwmutex + LWM_RECUR, 0);
+         vm_write32(lwmutex + LWM_OWNER, 0);
+         ppu_thread_note_block(ctx->thread_id);
+-        lwm_release(sl);
+-        Sleep(1);
+-        lwm_acquire(sl, 0);
++        lwm_release(ms);
++        DWORD wms = INFINITE;
++        if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; wms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
++        if (WaitForSingleObject(sl->sem, wms) == WAIT_TIMEOUT) {
++            /* Withdraw our registration. If a signaller already took it, its
++             * count is on the way: consume it and report the wakeup. */
++            int withdrawn = 0;
++            for (;;) {
++                long w = sl->waiters;
++                if (w <= 0) break;
++                if (_InterlockedCompareExchange(&sl->waiters, w - 1, w) == w) { withdrawn = 1; break; }
++            }
++            if (withdrawn) result = 0x8001000Bu;
++            else WaitForSingleObject(sl->sem, INFINITE);
++        }
++        lwm_acquire(ms, 0);
+         vm_write32(lwmutex + LWM_OWNER, own);
+         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+     }
+-    ctx->gpr[3] = 0;
++#endif
++    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
+ }
+ 
+ /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.

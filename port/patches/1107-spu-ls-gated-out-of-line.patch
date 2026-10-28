@@ -1,0 +1,56 @@
+KZ3 patch 1107 (SPU pass 79): the gated LS accessors out of line.
+
+spu_ls_read128/write128 are always_inline (patch 1035), so every LS access of a lifted function (spu_ls_read128_l /
+spu_ls_write128_l, patches 1082 and 1100) carried an inlined copy of the full accessor on the cold side of its debug
+gate, and GCC kept the masked address once for each side: on the hot path of job 255's 0x5868 loop every load was
+mov, lea, mov, mov, and, and, test, jne, vmovdqu, vpshufb (10 instructions). The cold side is now one call to a
+noinline, cold copy of the same accessor with the same raw address, so every probe sees what it saw before; the hot
+path is mov, lea, test, jne, and, vmovdqu, vpshufb (7). The byte swap was already one vpshufb with a constant.
+Bit-identical by construction (same accessor on both sides); host tests tools/spu/test_spu_lscold.sh (randomised LS
+images, addresses at the mask, alignment and WWS-probe boundaries, gate on and off) and, with game data,
+work/spu/r79/hb.sh (job 255's lifted loop, same hashes). Compile-time switch: -DSPU_LS_COLD=0 (C flags) = old.
+Upstream candidate (with 1082/1100).
+
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -816,9 +816,30 @@
+     uint8_t* const spu__ls = ctx->ls;                                                                  \
+     const int spu__lsdbg = spu_ls_dbg_armed();                                                         \
+     (void)spu__ls; (void)spu__lsdbg;
++/* KZ3 patch 1107 (SPU pass 79): the gated accessors out of line. spu_ls_read128/write128 are always_inline (1035),
++ * so every LS access of a lifted function carried its own inlined copy of the full accessor on the cold side of the
++ * 1100 gate, and GCC kept the masked address twice (one for each side): 2 instructions per load more on the hot path
++ * (job 255's 0x5868 loop: `mov`, `and` per load) and a large cold tail. The cold side is now one call to these
++ * noinline copies: same accessor, same raw lsa, same probes. -DSPU_LS_COLD=0 = old (inlined). */
++#ifndef SPU_LS_COLD
++#  define SPU_LS_COLD 1
++#endif
++#if SPU_LS_COLD
++static __attribute__((noinline, cold)) u128 spu_ls_read128_gated(const spu_context* ctx, uint32_t lsa)
++{
++    return spu_ls_read128(ctx, lsa);
++}
++static __attribute__((noinline, cold)) void spu_ls_write128_gated(spu_context* ctx, uint32_t lsa, u128 val)
++{
++    spu_ls_write128(ctx, lsa, val);
++}
++#else
++#  define spu_ls_read128_gated spu_ls_read128
++#  define spu_ls_write128_gated spu_ls_write128
++#endif
+ SPU_HOT u128 spu_ls_read128_l(const spu_context* ctx, const uint8_t* ls, int dbg, uint32_t lsa)
+ {
+-    if (__builtin_expect(dbg & 1, 0)) return spu_ls_read128(ctx, lsa);   /* KZ3 patch 1100: read gate */
++    if (__builtin_expect(dbg & 1, 0)) return spu_ls_read128_gated(ctx, lsa);   /* KZ3 patch 1100: read gate */
+     const uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~0xFu));
+     u128 v;
+     uint32_t w0, w1, w2, w3;
+@@ -830,7 +851,7 @@
+ }
+ SPU_HOT void spu_ls_write128_l(spu_context* ctx, uint8_t* ls, int dbg, uint32_t lsa, u128 val)
+ {
+-    if (__builtin_expect(dbg & 2, 0)) { spu_ls_write128(ctx, lsa, val); return; }   /* KZ3 patch 1100: write gate */
++    if (__builtin_expect(dbg & 2, 0)) { spu_ls_write128_gated(ctx, lsa, val); return; }   /* KZ3 patch 1100: write gate */
+     lsa &= SPU_LS_MASK & ~0xFu;
+     uint8_t* p = ls + lsa;
+     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);

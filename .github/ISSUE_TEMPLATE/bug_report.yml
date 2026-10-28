@@ -1,0 +1,50 @@
+name: Bug report
+description: Something in the port does not work as it should
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. Please do **not** attach game files, decrypted binaries, saves or keys: only logs and screenshots.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, in order.
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game version
+      options: ["1.14 (update installed)", "1.00 (disc only)", "Not sure"]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Port build
+      description: "Release number, or the commit (`git rev-parse --short HEAD`) of the build you ran."
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: "OS (Windows version, or Linux distribution and Proton version), CPU, GPU and driver version."
+    validations:
+      required: true
+  - type: input
+    id: level
+    attributes:
+      label: Chapter or menu
+      description: "Which chapter (for example Flooded Pyrrhus) or menu, and how long after the start."
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log file
+      description: "Attach the newest file from `logs/` next to the exe (and the crash file there, if any). Before attaching, open the log and remove your Windows or Linux user name, home folder paths and any host name (search for your user name). Never attach game files, decrypted binaries, saves or keys."

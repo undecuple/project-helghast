@@ -1,0 +1,59 @@
+KZ3 patch 1118 (SPU pass 103): upstream ps3recomp PR #445, the LS read/write diagnostics gate (MIT; author: tekulvw, https://github.com/sp00nznet/ps3recomp/pull/445). spu_ls_read128/write128 test one gate per direction
+(g_spu_ls_rdiag / g_spu_ls_wdiag: -1 until the first access settles them, then nonzero only while SPU_LS_LOWREAD,
+SPU_LS_WATCH, SPU_SMC_WATCH or SPU_WWS_PROBE is armed); the WWS buffer/code probes are opt-in (SPU_WWS_PROBE=1, they
+were always on); the diagnostics run out of line (spu_ls_read_diag / spu_ls_write_diag); NEON quadword swap.
+Merged with ours at the root: patch 1035's WWS range pre-test is replaced by the read gate; patch 1100's per-function
+snapshot spu_ls_dbg_armed() becomes the two gates (2 loads per lifted function entry instead of 5, and the fast path
+from the first settled access instead of after the WWS print caps); the new gates are SPU_READ_MOSTLY (1102); 1107's
+out-of-line gated copies are unchanged. Not taken: the PR's spu_helpers.h NEON float rewrite and its
+test_spu_float_exact.c (+CMake entry): our spu_helpers.h is KZ3's own (patch 1000 keeps it, no NEON section exists to
+patch, and the test calls spu_*_ref helpers ours does not have); NEON is ARM only. SPU_LS_DIAG_GATES marks the patch
+for the host tests (test_spu_ls_gate.c, test_spu_hot_helpers.c updated). Notes the RE notes Pass 103.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream gates (#445 merged upstream) + 1100's cap macros.
+
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 7a7a3f17..633e9c5f 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -696,16 +696,17 @@ SPU_GATE SPU_READ_MOSTLY int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_L
+ SPU_GATE SPU_READ_MOSTLY int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
+ SPU_GATE SPU_READ_MOSTLY int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
+ SPU_GATE SPU_READ_MOSTLY int g_wws_read_probe = 0;
+-#define SPU_WWS_READ_CAP 48   /* KZ3 patch 1100: the WWS probes' print caps (their only effect), see spu_ls_dbg_armed */
+-#define SPU_WWS_CODE_CAP 6
+-SPU_GATE int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
+-SPU_GATE int g_spu_ls_wdiag   = -1;  /* any write diagnostic armed              */
+-SPU_GATE int g_spu_wws_probe  = -1;  /* SPU_WWS_PROBE: the WWS buffer/code logs */
++#define SPU_LS_DIAG_GATES 1   /* KZ3 patch 1118 (PR #445): host tests key on it */
++SPU_GATE SPU_READ_MOSTLY int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
++SPU_GATE SPU_READ_MOSTLY int g_spu_ls_wdiag   = -1;  /* any write diagnostic armed              */
++SPU_GATE SPU_READ_MOSTLY int g_spu_wws_probe  = -1;  /* SPU_WWS_PROBE: the WWS buffer/code logs */
+ static inline int spu_ls_wws_probe_on(void)
+ {
+     if (g_spu_wws_probe < 0) g_spu_wws_probe = getenv("SPU_WWS_PROBE") ? 1 : 0;
+     return g_spu_wws_probe;
+ }
++#define SPU_WWS_READ_CAP 48   /* KZ3 patch 1100: the WWS probes' print caps (their only effect), see spu_ls_dbg_armed */
++#define SPU_WWS_CODE_CAP 6
+ static SPU_NOINLINE_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
+ {
+     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
+@@ -914,11 +915,14 @@ SPU_HOT void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+  * read probe below its cap), bit 1 for stores (a watchpoint, SPU_SMC_WATCH, or the code probe below its cap). A
+  * set bit sends that kind of access through the full accessor (which keeps every probe); a clear bit takes the
+  * fast path, now without the range tests: the probes they guarded would have done nothing. */
++/* KZ3 patch 1118 (SPU pass 103, upstream PR #445): the snapshot is the two per-direction gates of the full accessor.
++ * g_spu_ls_rdiag / g_spu_ls_wdiag are -1 until the first access through the full accessor settles them and then count
++ * exactly what the five tests above counted (watchpoints, SPU_LS_LOWREAD, SPU_SMC_WATCH), with the WWS probes now
++ * opt-in (SPU_WWS_PROBE) instead of armed until their print caps: 2 loads per lifted function entry instead of 5, and
++ * the fast path from the first settled access instead of after the WWS caps. */
+ static inline int spu_ls_dbg_armed(void)
+ {
+-    const int w = g_spu_ls_watch_n != 0;
+-    return (w | (g_spu_ls_probe != 0) | (g_wws_read_probe < SPU_WWS_READ_CAP)) |
+-           ((w | (g_spu_smc_watch != 0) | (g_wws_code_probe < SPU_WWS_CODE_CAP)) << 1);
++    return (g_spu_ls_rdiag != 0) | ((g_spu_ls_wdiag != 0) << 1);
+ }
+ #define SPU_LS_LOCALS                                                                                  \
+     uint8_t* const spu__ls = ctx->ls;                                                                  \

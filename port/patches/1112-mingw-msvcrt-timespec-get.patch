@@ -1,0 +1,70 @@
+KZ3 patch 1112 (SPU pass 95): C11 timespec_get for MinGW on msvcrt. ps3recomp v0.17.0 times SPU_INTERP_STATS
+(spu_interp.c, c08d1d89) and SPU_JOBPROF (spu_workload.c) with timespec_get(TIME_UTC). UCRT and POSIX declare it; the
+msvcrt runtime of the nixpkgs MinGW cross toolchain (__MSVCRT_VERSION__ 0x600) does not, so both TUs failed to compile
+for the Windows build (stack_syntax_check). New include/ps3emu/timespec_compat.h maps it to QueryPerformanceCounter
+there (monotonic; both callers use differences only). Upstream candidate (MinGW/msvcrt builds).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): both includes.
+
+diff --git a/include/ps3emu/timespec_compat.h b/include/ps3emu/timespec_compat.h
+new file mode 100644
+index 00000000..cbbdbb54
+--- /dev/null
++++ b/include/ps3emu/timespec_compat.h
+@@ -0,0 +1,32 @@
++#ifndef PS3RECOMP_TIMESPEC_COMPAT_H
++#define PS3RECOMP_TIMESPEC_COMPAT_H
++/* KZ3 patch 1112: C11 timespec_get for MinGW on msvcrt. UCRT (__MSVCRT_VERSION__ >= 0x1400) and POSIX libcs
++ * declare it in <time.h>; the msvcrt runtime (nixpkgs' MinGW cross toolchain: __MSVCRT_VERSION__ 0x600) does
++ * not, so SPU_INTERP_STATS and SPU_JOBPROF did not compile there. Include after <time.h>. The fallback reads
++ * QueryPerformanceCounter: monotonic, not UTC. Every caller here takes differences only. */
++#include <time.h>
++#if defined(__MINGW32__) && !defined(TIME_UTC)
++#define TIME_UTC 1
++/* No <windows.h> here: spu_interp.c declares the two counters itself as long long* (1028). After <windows.h>
++ * (spu_workload.c includes this header after it) use its LARGE_INTEGER prototypes. */
++#if defined(_WINBASE_) || defined(_PROFILEAPI_H_)
++static inline long long ps3_qpc_(int freq) { LARGE_INTEGER v;
++    if (freq) QueryPerformanceFrequency(&v); else QueryPerformanceCounter(&v); return v.QuadPart; }
++#else
++__declspec(dllimport) int __stdcall QueryPerformanceCounter(long long* c);
++__declspec(dllimport) int __stdcall QueryPerformanceFrequency(long long* f);
++static inline long long ps3_qpc_(int freq) { long long v;
++    if (freq) QueryPerformanceFrequency(&v); else QueryPerformanceCounter(&v); return v; }
++#endif
++static inline int ps3_timespec_get_qpc(struct timespec* ts, int base)
++{
++    static long long f;
++    if (!f) f = ps3_qpc_(1);
++    const long long c = ps3_qpc_(0);
++    ts->tv_sec = (time_t)(c / f);
++    ts->tv_nsec = (long)((c % f) * 1000000000LL / f);
++    return base;
++}
++#define timespec_get ps3_timespec_get_qpc
++#endif
++#endif /* PS3RECOMP_TIMESPEC_COMPAT_H */
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index a34aee66..951e4e48 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -6,6 +6,7 @@
+  * bit-identical. Uncommon opcodes trap loudly (never silently wrong).
+  */
+ #include <time.h>
++#include "ps3emu/timespec_compat.h"   /* KZ3 patch 1112: msvcrt MinGW */
+ #include "spu_interp.h"
+ #include "spu_helpers.h"
+ #include <stdio.h>
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index a0636cd2..e6db40b5 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -24,6 +24,7 @@
+ 
+ static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
+                                      uint32_t owner_ea);   /* below */
++#include "ps3emu/timespec_compat.h"   /* KZ3 patch 1112: msvcrt MinGW */
+ 
+ /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
+  * real video-payload GET (>256B from a non-context EA) = it actually decoded,

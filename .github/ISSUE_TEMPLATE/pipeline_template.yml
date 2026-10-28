@@ -1,0 +1,47 @@
+name: Pipeline template
+description: Share the pipeline template your copy of the game exported, so first starts get faster for everyone
+labels: [performance, pipeline-template, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The port can prepare the graphics pipelines the game uses before you reach them, from a template file. Your copy of the game can export one: **Start menu > Export pipeline template** (or run the launcher with `--export-template`), play for a few minutes, then quit. The launcher tells you where the file went (`pso-template-export.bin` in your saves folder).
+
+        **The file holds no game data.** It holds only hashes of shader programs and numeric render-state values, no shader text, no textures, no code. Open it in a hex viewer if you want to check.
+
+        GitHub does not accept `.bin` files: put it in a `.zip` first, then drag the zip into the box below.
+  - type: textarea
+    id: file
+    attributes:
+      label: Template file (zipped)
+      description: "Drag the zip with pso-template-export.bin here."
+    validations:
+      required: true
+  - type: textarea
+    id: played
+    attributes:
+      label: What you played
+      description: "Chapters or menus you visited before quitting (a template covers only what was drawn)."
+    validations:
+      required: true
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game version
+      options: ["1.14 (update installed)", "1.00 (disc only)", "Not sure"]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Port build
+      description: "Release number, or the commit of the build you ran."
+    validations:
+      required: true
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Confirm
+      options:
+        - label: I understand the file holds only hashes and render-state numbers, and I agree it may be merged into the shared template shipped with releases.
+          required: true

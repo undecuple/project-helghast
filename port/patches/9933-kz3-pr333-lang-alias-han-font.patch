@@ -1,0 +1,61 @@
+KZ3 layer over upstream PR #333 (patch 9333, PS3_LANG): restores what dropping patch 5006 lost.
+- KZ3_LANG is accepted as an alias of PS3_LANG (PS3_LANG wins when both are set; "auto"/"default" = unset, the host
+  language). KZ3_LANG is the name in docs/features.tsv, the public FEATURES page and the launcher.
+- Japanese / Korean / Chinese S / Chinese T call the font patch's kz3_font_set_han_pref (jp / kr / sc / tc, patch
+  5005) so Han glyphs come from the matching font; KZ3_FONT_HAN still wins inside the font library.
+Host test: tools/spu/test_lang_layer.py.
+
+diff --git a/libs/system/cellSysutil.c b/libs/system/cellSysutil.c
+--- a/libs/system/cellSysutil.c
++++ b/libs/system/cellSysutil.c
+@@ -360,6 +360,9 @@
+ #endif
+ }
+
++/* KZ3 layer over PR #333 (patch 9933): the font library's Han preference (patch 5005); weak, so a build without
++ * libs/font links. */
++extern void kz3_font_set_han_pref(const char* lang) __attribute__((weak));
+ static s32 sysutil_language(void)
+ {
+     static s32 lang = -1;
+@@ -380,16 +383,23 @@
+     lang = CELL_SYSUTIL_LANG_ENGLISH_US;
+     const char* e = getenv("PS3_LANG");
+     const char* from = "default";
++    /* KZ3 layer (patch 9933): KZ3_LANG (patch 5006's name, kept by the launcher and docs/features.tsv) is an alias of
++     * PS3_LANG; PS3_LANG wins when both are set. "auto" / "default" mean unset (the host language). */
++    const char* var = "PS3_LANG";
++    if (!(e && *e)) {
++        const char* k3 = getenv("KZ3_LANG");
++        if (k3 && *k3 && !sysutil_ieq(k3, "auto") && !sysutil_ieq(k3, "default")) { e = k3; var = "KZ3_LANG"; }
++    }
+     if (e && *e) {
+         char* end = NULL;
+         long n = strtol(e, &end, 10);
+-        if (end && *end == '\0' && n >= 0 && n <= CELL_SYSUTIL_LANG_TURKISH) { lang = (s32)n; from = "PS3_LANG"; }
++        if (end && *end == '\0' && n >= 0 && n <= CELL_SYSUTIL_LANG_TURKISH) { lang = (s32)n; from = var; }
+         else {
+             unsigned i;
+             for (i = 0; i < sizeof k / sizeof k[0]; i++)
+-                if (sysutil_ieq(e, k[i].code)) { lang = k[i].id; from = "PS3_LANG"; break; }
++                if (sysutil_ieq(e, k[i].code)) { lang = k[i].id; from = var; break; }
+             if (i == sizeof k / sizeof k[0])
+-                printf("[cellSysutil] PS3_LANG=%s not recognised, using English\n", e);
++                printf("[cellSysutil] %s=%s not recognised, using English\n", var, e);
+         }
+     } else {
+         char host[8];
+@@ -397,7 +407,12 @@
+         for (unsigned i = 0; host[0] && i < sizeof k / sizeof k[0]; i++)
+             if (sysutil_ieq(host, k[i].code)) { lang = k[i].id; from = "host"; break; }
+     }
+-    printf("[cellSysutil] system language %d (%s)\n", (int)lang, from);
++    /* KZ3 layer (patch 9933, from 5006): Japanese / Korean / Chinese take their Han glyphs from the matching font
++     * first; KZ3_FONT_HAN still wins inside the font library. */
++    const char* han = lang == CELL_SYSUTIL_LANG_JAPANESE ? "jp" : lang == CELL_SYSUTIL_LANG_KOREAN ? "kr"
++                    : lang == CELL_SYSUTIL_LANG_CHINESE_S ? "sc" : lang == CELL_SYSUTIL_LANG_CHINESE_T ? "tc" : NULL;
++    if (han && kz3_font_set_han_pref) kz3_font_set_han_pref(han);
++    printf("[cellSysutil] system language %d (%s, Han font %s)\n", (int)lang, from, han ? han : "-");
+     return lang;
+ }
+

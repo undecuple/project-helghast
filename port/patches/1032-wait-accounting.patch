@@ -1,0 +1,621 @@
+KZ3 patch 1032 (diagnostic, opt-in): per-thread wait accounting, new runtime/diag/kz3_wait_acct.{c,h} (see the header there)
+and its hooks. Pass 93: the second copy of the two new files (the patch created them twice since the v0.15.0 move, which
+GNU patch refuses) is removed.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index c69e2f67..0976cd5e 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1812,14 +1812,21 @@ struct spurs_pm_worker_arg {
+     const uint8_t* pm; uint32_t pm_size;
+     uint64_t arg; uint32_t wid, ea, spu_num;
+ };
++/* KZ3 patch 1032 (KZ3_WAIT_ACCT): wait accounting, runtime/diag/kz3_wait_acct.h */
++#include "../../runtime/diag/kz3_wait_acct.h"
++
+ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+ {
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+ #endif
+     struct spurs_pm_worker_arg* a = (struct spurs_pm_worker_arg*)p;
++    if (kz3_wacct_on()) { char nm[40]; snprintf(nm, sizeof nm, "pm-worker:wid%u/spu%u", (unsigned)a->wid, (unsigned)a->spu_num); kz3_wacct_name(nm); }
++    const uint64_t wa0 = kz3_wacct_begin();
+     spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
+                           a->arg, a->wid, a->ea, a->spu_num);
++    kz3_wacct_job(0);
++    kz3_wacct_end(KZ3_WA_PMRUN, a->wid, wa0);
+     return 0;
+ }
+ 
+@@ -1908,6 +1915,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+     fprintf(stderr, "[spurs-kern] \"%s\" poll thread %d/%d live: ea=0x%08X pm=%s\n",
+             si->prefix, kt + 1, si->nthreads, si->ea, s_pm_off ? "DISABLED (PS3_NO_SPURS_PM)" : "enabled");
+     fflush(stderr);
++    if (kz3_wacct_on()) { char nm[40]; snprintf(nm, sizeof nm, "spurs-kern%d:%s", kt, si->prefix); kz3_wacct_name(nm); }
+ 
+     /* Instance change detector (SPURS_KERN_WATCH=1).
+      *
+@@ -1922,8 +1930,15 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+     int watch = (getenv("SPURS_KERN_WATCH") && kt == 0) ? 1 : 0;
+     int changes_logged = 0;
+ 
++    /* KZ3_SPURS_BUSY_NOSLEEP=1 (patch 1032): skip the 1 ms pass sleep after a pass in which a policy
++     * module found work (Sleep(1) costs ~1.05 ms under Wine, ~20 % of a busy kernel thread in the level). */
++    static int s_busy_nosleep = -1;
++    if (s_busy_nosleep < 0) { const char* e = getenv("KZ3_SPURS_BUSY_NOSLEEP"); s_busy_nosleep = (e && *e == '1') ? 1 : 0; }
++    int kz3_busy_prev = 0;
+     for (;;) {
+-        Sleep(1);
++        if (!(s_busy_nosleep && kz3_busy_prev))
++        { const uint64_t wa0 = kz3_wacct_begin(); Sleep(1); kz3_wacct_end(KZ3_WA_KSLEEP, 0, wa0); }   /* patch 1032 */
++        kz3_busy_prev = 0;
+         u32 ea = si->ea;
+         if (!ea || s_pm_off) continue;
+         /* KZ3 patch 1013: the [spurs-stuck] check moved to spurs_watch_thread. */
+@@ -2019,7 +2034,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 if (wid == 0) s_pass_no++;
+                 if (kicked) s_idle[wid] = 0;
+                 u32 cad = 1u << (s_idle[wid] > 4 ? 4 : s_idle[wid]);
+-                if (!kicked && (s_pass_no & (cad - 1)) != 0) goto kz3_next_wid;
++                if (!kicked && (s_pass_no & (cad - 1)) != 0) { kz3_wacct_note(KZ3_WA_KSKIP, wid, 0); goto kz3_next_wid; }
+                 extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+                 u32 polls_before = g_spurs_pm_polls;   /* heuristic only */
+                 (void)polls_before;
+@@ -2071,6 +2086,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
+                 uint32_t sz = s_workloads[wid].sizePm;
+                 s_run_wid[si - s_inst] = wid; s_run_t0[si - s_inst] = GetTickCount64();   /* patch 1011 */
++                /* KZ3 patch 1032: run time per wid, and the gap since this wid's last run ended */
++                static uint64_t s_wa_wend[CELL_SPURS_MAX_WORKLOAD];
++                const uint64_t wa0 = kz3_wacct_begin();
++                if (wa0 && s_wa_wend[wid]) kz3_wacct_note(KZ3_WA_KGAP, wid, wa0 - s_wa_wend[wid]);
+                 if (maxcont <= 1) {
+                     spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                 } else {
+@@ -2093,6 +2112,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                         for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);
+                     }
+                 }
++                kz3_wacct_job(0);
++                kz3_wacct_end(KZ3_WA_PMRUN, wid, wa0);
++                if (wa0) s_wa_wend[wid] = kz3_wacct_now();
+             }
+             s_run_t0[si - s_inst] = 0;   /* patch 1011 */
+             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+@@ -2101,7 +2123,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+              * an idle module exits immediately with polls==0. Grow the idle
+              * streak on the latter, reset on the former. */
+             if (g_spurs_pm_polls == 0) { if (s_idle[wid] < 8) s_idle[wid]++; }
+-            else s_idle[wid] = 0;
++            else { s_idle[wid] = 0; kz3_busy_prev = 1; }
+             }
+         kz3_next_wid:
+             if (claimed) wkl_release(wid);
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index fa36290a..e5d6b0f9 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2533,6 +2533,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                       fprintf(stderr, "[park-late] park 0x%08X patched after %llu ms (put moved %u times) -> 0x%08X\n",
+                               s_fifo_getoff, (unsigned long long)ms, s_park_putchg, tgt);
+                   if (ms > s_pmax) s_pmax = ms;
++                  { extern void kz3_wacct_note(int, uint32_t, uint64_t);   /* patch 1032: KZ3_WA_PARK = 9 */
++                    extern int g_kz3_wacct; if (g_kz3_wacct > 0) kz3_wacct_note(9, 0, get_timestamp_ns() - s_park_t0); }
+                   if (kz3_ft_on()) fprintf(stderr, "[ft] %llu unpark io=0x%08X after %llu ms -> 0x%08X\n", ps3_ms_now(),
+                                            s_fifo_getoff, (unsigned long long)ms, tgt);
+               }
+@@ -3236,6 +3238,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+               fprintf(stderr, "[flip] %llu at %llu ms%c", n, now - t0, 10);
+       } }
+ 
++    { extern void kz3_wacct_flip(void); kz3_wacct_flip(); }   /* KZ3 patch 1032: flips per accounting window */
+     /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips
+      * around n. When a title renders correctly for a while and then stops
+      * submitting -- no error, no unresolved import, no overflow -- the only
+diff --git a/runtime/diag/kz3_wait_acct.c b/runtime/diag/kz3_wait_acct.c
+new file mode 100644
+index 00000000..b8cb8164
+--- /dev/null
++++ b/runtime/diag/kz3_wait_acct.c
+@@ -0,0 +1,326 @@
++/* KZ3 patch 1032 (diagnostic, opt-in): per-thread wait accounting. See kz3_wait_acct.h.
++ *
++ * Each host thread owns one record; only that thread writes its slots (no locks on the
++ * hot path), the printer thread reads them racily and prints differences against its own
++ * snapshot. A torn read can misplace one sample in one window; the totals stay right. */
++#include "kz3_wait_acct.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#ifdef _WIN32
++#  include <windows.h>
++#else
++#  include <pthread.h>
++#  include <time.h>
++#  include <unistd.h>
++#endif
++
++int g_kz3_wacct = -1;
++
++enum { WA_SLOTS = 1024, WA_THREADS = 96 };
++typedef struct { volatile uint64_t key; volatile uint64_t ns; volatile uint64_t n; } wa_slot;
++typedef struct {
++    char name[40];
++    unsigned long ostid;
++    int depth;
++    volatile uint64_t top_ns[KZ3_WA_NKIND], top_n[KZ3_WA_NKIND];
++    int job_img; uint64_t job_t0;
++    wa_slot tab[WA_SLOTS];
++    /* printer-owned snapshot */
++    uint64_t p_ns[WA_SLOTS], p_n[WA_SLOTS], p_top_ns[KZ3_WA_NKIND], p_top_n[KZ3_WA_NKIND];
++} wa_thr;
++
++static wa_thr* s_thr[WA_THREADS];
++static volatile long s_nthr = 0;
++static volatile long s_flips = 0;
++static uint64_t s_t0;
++
++#ifdef _WIN32
++static DWORD s_tls = TLS_OUT_OF_INDEXES;
++static LARGE_INTEGER s_qf;
++uint64_t kz3_wacct_now(void)
++{
++    LARGE_INTEGER c; QueryPerformanceCounter(&c);
++    return (uint64_t)((double)c.QuadPart * 1e9 / (double)s_qf.QuadPart);
++}
++static wa_thr* tls_get(void) { return (wa_thr*)TlsGetValue(s_tls); }
++static void tls_set(wa_thr* t) { TlsSetValue(s_tls, t); }
++static unsigned long os_tid(void) { return (unsigned long)GetCurrentThreadId(); }
++#else
++static __thread wa_thr* s_me;
++uint64_t kz3_wacct_now(void)
++{
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++static wa_thr* tls_get(void) { return s_me; }
++static void tls_set(wa_thr* t) { s_me = t; }
++static unsigned long os_tid(void) { return (unsigned long)pthread_self(); }
++#endif
++
++static wa_thr* me(void)
++{
++    wa_thr* t = tls_get();
++    if (t) return t;
++    long i = __sync_fetch_and_add(&s_nthr, 1);
++    if (i >= WA_THREADS) return NULL;
++    t = (wa_thr*)calloc(1, sizeof *t);
++    if (!t) return NULL;
++    t->ostid = os_tid();
++    s_thr[i] = t;
++    tls_set(t);
++    return t;
++}
++
++static wa_slot* slot(wa_thr* t, int kind, uint32_t site)
++{
++    uint64_t key = ((uint64_t)(kind + 1) << 32) | site;
++    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 54) & (WA_SLOTS - 1);
++    for (int p = 0; p < WA_SLOTS - 1; p++) {
++        wa_slot* s = &t->tab[(h + p) & (WA_SLOTS - 1)];
++        if (s->key == key) return s;
++        if (!s->key) { s->key = key; return s; }
++    }
++    return NULL;
++}
++
++static void add(wa_thr* t, int kind, uint32_t site, uint64_t ns, uint64_t n)
++{
++    wa_slot* s = slot(t, kind, site);
++    if (s) { s->ns += ns; s->n += n; }
++}
++
++uint64_t kz3_wacct_begin_slow(void)
++{
++    wa_thr* t = me();
++    if (!t) return 0;
++    t->depth++;
++    uint64_t v = kz3_wacct_now();
++    return v ? v : 1;
++}
++
++void kz3_wacct_end(int kind, uint32_t site, uint64_t t0)
++{
++    if (!t0) return;
++    wa_thr* t = tls_get();
++    if (!t) return;
++    uint64_t d = kz3_wacct_now() - t0;
++    add(t, kind, site, d, 1);
++    if (--t->depth == 0) { t->top_ns[kind] += d; t->top_n[kind]++; }
++}
++
++void kz3_wacct_note(int kind, uint32_t site, uint64_t ns)
++{
++    if (!kz3_wacct_on()) return;
++    wa_thr* t = me();
++    if (t) add(t, kind, site, ns, 1);
++}
++
++void kz3_wacct_job(int image)
++{
++    if (!kz3_wacct_on()) return;
++    wa_thr* t = me();
++    if (!t || t->job_img == image) return;
++    uint64_t now = kz3_wacct_now();
++    if (t->job_img) add(t, KZ3_WA_JOB, (uint32_t)t->job_img, now - t->job_t0, 0);
++    t->job_img = image; t->job_t0 = now;
++    if (image) add(t, KZ3_WA_JOB, (uint32_t)image, 0, 1);
++}
++
++/* Names this host thread. If a record of that name exists already, this thread takes
++ * it over: short-lived threads that run one after another (the per-pass policy-module
++ * workers) then share one record instead of using one each. The previous owner must
++ * be finished (true for the workers: the kernel joins them each pass). */
++void kz3_wacct_name(const char* name)
++{
++    if (!kz3_wacct_on()) return;
++    static volatile long lock = 0;
++    while (__sync_lock_test_and_set(&lock, 1)) { }
++    long nt = s_nthr; if (nt > WA_THREADS) nt = WA_THREADS;
++    for (long i = 0; i < nt; i++)
++        if (s_thr[i] && strncmp(s_thr[i]->name, name, sizeof s_thr[i]->name - 1) == 0) {
++            s_thr[i]->ostid = os_tid(); tls_set(s_thr[i]);
++            __sync_lock_release(&lock);
++            return;
++        }
++    wa_thr* t = tls_get();
++    if (!t) t = me();
++    if (t) strncpy(t->name, name, sizeof t->name - 1);
++    __sync_lock_release(&lock);
++}
++
++void kz3_wacct_flip(void) { if (g_kz3_wacct > 0) __sync_fetch_and_add(&s_flips, 1); }
++
++/* ---- names ---------------------------------------------------------------------- */
++/* Set by ppu_hle.cpp when it registers its first import: programs that link the runtime without the HLE
++ * module (native unit tests, host smoke tests) leave it NULL and print NIDs. */
++const char* (*g_kz3_wacct_hle_name)(uint32_t nid) = 0;
++#ifdef _WIN32
++const char* ppu_thread_name_for_os_tid(unsigned long os_tid);   /* sys_ppu_thread.c */
++#endif
++
++static const char* sc_name(uint32_t n)
++{
++    switch (n) {
++    case 43: return "ppu_thread_yield";  case 44: return "ppu_thread_join";
++    case 85: return "event_flag_wait";   case 87: return "event_flag_set";
++    case 92: return "semaphore_wait";    case 94: return "semaphore_post";
++    case 97: return "lwmutex_lock";      case 98: return "lwmutex_unlock";
++    case 102: return "mutex_lock";       case 104: return "mutex_unlock";
++    case 107: return "cond_wait";        case 108: return "cond_signal";
++    case 113: return "lwcond_queue_wait";
++    case 130: return "event_queue_receive"; case 134: return "event_port_send";
++    case 138: return "event_port_send";  case 141: return "timer_usleep";
++    case 142: return "timer_sleep";
++    default: return NULL;
++    }
++}
++
++static const char* kind_name[KZ3_WA_NKIND] = {
++    "hle", "sc", "usleep", "label", "ksleep", "pmrun", "job", "kgap", "kskip", "park" };
++
++static void site_str(int kind, uint32_t site, char* o, size_t n)
++{
++    const char* nm = NULL;
++    switch (kind) {
++    case KZ3_WA_HLE:
++        if (g_kz3_wacct_hle_name) nm = g_kz3_wacct_hle_name(site);
++        if (nm) snprintf(o, n, "%s", nm); else snprintf(o, n, "nid%08X", site);
++        return;
++    case KZ3_WA_SC:
++        nm = sc_name(site);
++        if (nm) snprintf(o, n, "%s", nm); else snprintf(o, n, "sc%u", site);
++        return;
++    case KZ3_WA_USLEEP: snprintf(o, n, "lr%08X", site); return;
++    case KZ3_WA_LABEL:  snprintf(o, n, "label%u", site); return;
++    case KZ3_WA_PMRUN: case KZ3_WA_KGAP: case KZ3_WA_KSKIP: snprintf(o, n, "wid%u", site); return;
++    case KZ3_WA_JOB:    snprintf(o, n, "ovl%u", site); return;
++    default:            snprintf(o, n, "%u", site); return;
++    }
++}
++
++static void thr_name(wa_thr* t, char* o, size_t n)
++{
++    if (t->name[0]) { snprintf(o, n, "%s", t->name); return; }
++#ifdef _WIN32
++    const char* g = ppu_thread_name_for_os_tid(t->ostid);
++    if (g && *g) { snprintf(o, n, "ppu:%s", g); return; }
++#endif
++    snprintf(o, n, "host%lu", t->ostid);
++}
++
++/* ---- printer ---------------------------------------------------------------------- */
++static void print_window(double t_s, long flips)
++{
++    fprintf(stderr, "[wacct] ---- t=%.1fs window=%dms flips=%ld\n", t_s, g_kz3_wacct, flips);
++    long nt = s_nthr; if (nt > WA_THREADS) nt = WA_THREADS;
++    for (long i = 0; i < nt; i++) {
++        wa_thr* t = s_thr[i];
++        if (!t) continue;
++        uint64_t dtop[KZ3_WA_NKIND], dtopn[KZ3_WA_NKIND], tot = 0;
++        for (int k = 0; k < KZ3_WA_NKIND; k++) {
++            uint64_t a = t->top_ns[k], b = t->top_n[k];
++            dtop[k] = a - t->p_top_ns[k]; dtopn[k] = b - t->p_top_n[k];
++            t->p_top_ns[k] = a; t->p_top_n[k] = b; tot += dtop[k];
++        }
++        enum { TOPN = 12 };
++        int best[TOPN]; uint64_t bns[TOPN], bn[TOPN]; int nb = 0;
++        uint64_t any = 0, skips = 0;
++        uint32_t gs[6]; uint64_t gns[6], gn[6]; int ng = 0;
++        for (int s = 0; s < WA_SLOTS; s++) {
++            uint64_t key = t->tab[s].key;
++            if (!key) continue;
++            uint64_t a = t->tab[s].ns, b = t->tab[s].n;
++            uint64_t dn = a - t->p_ns[s], dc = b - t->p_n[s];
++            t->p_ns[s] = a; t->p_n[s] = b;
++            if (!dn && !dc) continue;
++            any += dn + dc;
++            if ((int)(key >> 32) - 1 == KZ3_WA_KSKIP) { skips += dc; continue; }
++            if ((int)(key >> 32) - 1 == KZ3_WA_KGAP) {   /* gaps: own field, by count */
++                if (ng < 6) { gs[ng] = (uint32_t)key; gns[ng] = dn; gn[ng] = dc; ng++; }
++                else { int lo = 0; for (int q = 1; q < 6; q++) if (gn[q] < gn[lo]) lo = q;
++                       if (dc > gn[lo]) { gs[lo] = (uint32_t)key; gns[lo] = dn; gn[lo] = dc; } }
++                continue;
++            }
++            /* insertion into the top list by ns (count as tie-break) */
++            int pos = nb;
++            while (pos > 0 && (bns[pos - 1] < dn || (bns[pos - 1] == dn && bn[pos - 1] < dc))) pos--;
++            if (pos >= TOPN) continue;
++            int last = nb < TOPN ? nb : TOPN - 1;
++            for (int q = last; q > pos; q--) { best[q] = best[q - 1]; bns[q] = bns[q - 1]; bn[q] = bn[q - 1]; }
++            best[pos] = s; bns[pos] = dn; bn[pos] = dc;
++            if (nb < TOPN) nb++;
++        }
++        if (!any && !tot) continue;
++        char nm[64], line[2000]; int o = 0;
++        thr_name(t, nm, sizeof nm);
++        o += snprintf(line + o, sizeof line - o, "[wacct] thr=%s wait=%llums", nm, (unsigned long long)(tot / 1000000ull));
++        for (int k = 0; k < KZ3_WA_NKIND; k++)
++            if (dtop[k] >= 500000ull || (dtopn[k] && k == KZ3_WA_PMRUN))
++                o += snprintf(line + o, sizeof line - o, " %s=%llu/%llu", kind_name[k],
++                              (unsigned long long)(dtop[k] / 1000000ull), (unsigned long long)dtopn[k]);
++        if (skips) o += snprintf(line + o, sizeof line - o, " kskip=%llu", (unsigned long long)skips);
++        for (int g = 0; g < ng; g++)
++            o += snprintf(line + o, sizeof line - o, " gap:wid%u=%.1fms*%llu", gs[g],
++                          gn[g] ? (double)gns[g] / 1e6 / (double)gn[g] : 0.0, (unsigned long long)gn[g]);
++        o += snprintf(line + o, sizeof line - o, " |");
++        for (int b = 0; b < nb && o < (int)sizeof line - 80; b++) {
++            uint64_t key = t->tab[best[b]].key;
++            int kind = (int)(key >> 32) - 1; char st[48];
++            site_str(kind, (uint32_t)key, st, sizeof st);
++            o += snprintf(line + o, sizeof line - o, " %s:%s=%.1fms/%llu", kind_name[kind], st,
++                          (double)bns[b] / 1e6, (unsigned long long)bn[b]);
++        }
++        fprintf(stderr, "%s\n", line);
++    }
++    fflush(stderr);
++}
++
++#ifdef _WIN32
++static DWORD WINAPI printer(LPVOID p)
++#else
++static void* printer(void* p)
++#endif
++{
++    (void)p;
++    long last_flips = 0;
++    for (;;) {
++#ifdef _WIN32
++        Sleep((DWORD)g_kz3_wacct);
++#else
++        usleep((useconds_t)g_kz3_wacct * 1000u);
++#endif
++        long f = s_flips;
++        print_window((double)(kz3_wacct_now() - s_t0) / 1e9, f - last_flips);
++        last_flips = f;
++    }
++    return 0;
++}
++
++int kz3_wacct_init(void)
++{
++    static volatile long once = 0;
++    if (__sync_val_compare_and_swap(&once, 0, 1) != 0) {
++        while (*(volatile int*)&g_kz3_wacct < 0) { /* another thread is initialising */ }
++        return g_kz3_wacct;
++    }
++    const char* e = getenv("KZ3_WAIT_ACCT");
++    int ms = e ? atoi(e) : 0;
++    if (ms < 0) ms = 0;
++    if (ms > 0 && ms < 100) ms = 1000;   /* KZ3_WAIT_ACCT=1 means "on, 1 s windows" */
++#ifdef _WIN32
++    QueryPerformanceFrequency(&s_qf);
++    if (ms) { s_tls = TlsAlloc(); if (s_tls == TLS_OUT_OF_INDEXES) ms = 0; }
++#endif
++    s_t0 = kz3_wacct_now();
++    if (ms) {
++        fprintf(stderr, "[wacct] on: %d ms windows (KZ3 patch 1032)\n", ms);
++        g_kz3_wacct = ms;
++#ifdef _WIN32
++        CreateThread(NULL, 1u << 18, printer, NULL, 0, NULL);
++#else
++        pthread_t th; pthread_create(&th, NULL, printer, NULL);
++#endif
++    } else g_kz3_wacct = 0;
++    return g_kz3_wacct;
++}
+diff --git a/runtime/diag/kz3_wait_acct.h b/runtime/diag/kz3_wait_acct.h
+new file mode 100644
+index 00000000..777bbede
+--- /dev/null
++++ b/runtime/diag/kz3_wait_acct.h
+@@ -0,0 +1,48 @@
++/* KZ3 patch 1032 (diagnostic, opt-in): per-thread wait accounting.
++ *
++ * KZ3_WAIT_ACCT=<ms> (unset/0 = off): every host thread that runs guest work keeps
++ * cumulative host time per (kind, site); a printer thread prints the deltas every <ms>
++ * ms (`[wacct]` lines). Kinds: HLE import calls (site = NID), lv2 syscalls (site =
++ * number), sys_timer_usleep (site = guest lr), GPU label waits, SPURS kernel sleeps,
++ * policy-module runs (site = wid), resident job modules (site = overlay image), GCM
++ * FIFO parks. Only outermost brackets count towards a thread's "wait" total (a usleep
++ * inside a label wait is listed but not added twice). */
++#ifndef KZ3_WAIT_ACCT_H
++#define KZ3_WAIT_ACCT_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum {
++    KZ3_WA_HLE = 0,   /* HLE import, site = NID              */
++    KZ3_WA_SC,        /* lv2 syscall, site = number          */
++    KZ3_WA_USLEEP,    /* sys_timer_usleep, site = guest lr   */
++    KZ3_WA_LABEL,     /* wait_label 0x640E0, site = index    */
++    KZ3_WA_KSLEEP,    /* SPURS kernel pass sleep, site = 0   */
++    KZ3_WA_PMRUN,     /* policy module run, site = wid       */
++    KZ3_WA_JOB,       /* job module resident, site = image   */
++    KZ3_WA_KGAP,      /* kernel: end of a run -> next run of the same wid, site = wid (not a wait of this thread) */
++    KZ3_WA_KSKIP,     /* kernel: idle-backoff skip, site = wid (count only) */
++    KZ3_WA_PARK,      /* GCM FIFO park, walker waited for the patch (site 0) */
++    KZ3_WA_NKIND
++};
++
++extern int g_kz3_wacct;                     /* -1 = not read yet, 0 = off, else window ms */
++int      kz3_wacct_init(void);
++uint64_t kz3_wacct_now(void);               /* ns */
++uint64_t kz3_wacct_begin_slow(void);
++void     kz3_wacct_end(int kind, uint32_t site, uint64_t t0);
++void     kz3_wacct_note(int kind, uint32_t site, uint64_t ns);   /* not a bracket: listed, not summed */
++void     kz3_wacct_job(int image);          /* SPU host thread: job module now resident (0 = none) */
++void     kz3_wacct_name(const char* name);  /* name this host thread */
++void     kz3_wacct_flip(void);
++
++static inline int kz3_wacct_on(void) { return g_kz3_wacct < 0 ? kz3_wacct_init() : g_kz3_wacct; }
++/* Returns 0 when off; kz3_wacct_end ignores t0 == 0. */
++static inline uint64_t kz3_wacct_begin(void) { return kz3_wacct_on() ? kz3_wacct_begin_slow() : 0; }
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 15d4ef60..3769778f 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -19,7 +19,8 @@
+ #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
+ #include <chrono>
+ #include "ppu_recomp.h"   /* ppu_context */
+-#include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
++#include "ps3emu/nid.h"
++#include "../diag/kz3_wait_acct.h"   /* KZ3 patch 1032 */   /* ps3_nid_table, ps3_nid_entry */
+ #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+ #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: spans of HLE import calls */
+ #include <stdlib.h>       /* getenv */
+@@ -34,9 +35,12 @@ static ps3_nid_entry  g_hle_storage[HLE_NID_CAP];
+ static ps3_nid_table  g_hle_nids;
+ static int            g_hle_inited = 0;
+ 
++extern "C" const char* (*g_kz3_wacct_hle_name)(uint32_t);   /* kz3_wait_acct.c */
++extern "C" const char* ps3_hle_name(uint32_t nid);
+ extern "C" void ps3_hle_register(uint32_t nid, const char* name, void* handler)
+ {
+-    if (!g_hle_inited) { ps3_nid_table_init(&g_hle_nids, g_hle_storage, HLE_NID_CAP); g_hle_inited = 1; }
++    if (!g_hle_inited) { ps3_nid_table_init(&g_hle_nids, g_hle_storage, HLE_NID_CAP); g_hle_inited = 1;
++                         g_kz3_wacct_hle_name = ps3_hle_name; }   /* KZ3 patch 1032 */
+     ps3_nid_table_add(&g_hle_nids, nid, name, handler);
+ }
+ 
+@@ -52,6 +56,7 @@ static uint32_t g_ctx_count = 0;
+ 
+ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
+ {
++    g_kz3_wacct_hle_name = ps3_hle_name;   /* KZ3 patch 1032 */
+     if (g_ctx_count < HLE_CTX_CAP) {
+         g_ctx[g_ctx_count].nid = nid; g_ctx[g_ctx_count].fn = fn;
+         g_ctx[g_ctx_count].name = name ? name : "?";   /* named in the milestone log */
+@@ -102,6 +107,16 @@ extern "C" int ps3_hle_has(uint32_t nid)
+     return (e && e->handler) ? 1 : 0;
+ }
+ 
++/* KZ3 patch 1032: name of an HLE NID for the wait accounting printer (NULL if unknown). */
++extern "C" const char* ps3_hle_name(uint32_t nid)
++{
++    for (uint32_t i = 0; i < g_ctx_count; i++)
++        if (g_ctx[i].nid == nid) return g_ctx[i].name;
++    if (!g_hle_inited) return NULL;
++    ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
++    return e ? e->name : NULL;
++}
++
+ /* Generic PPC integer/pointer ABI adapter. */
+ typedef uint64_t (*hle_generic)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                 uint64_t, uint64_t, uint64_t, uint64_t);
+@@ -323,6 +338,9 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
+     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+     g_last_hle_nid = nid;
++    /* KZ3 patch 1032 (KZ3_WAIT_ACCT): host time of this import, keyed by NID. */
++    struct kz3_wa_guard { uint32_t nid; uint64_t t0; ~kz3_wa_guard() { kz3_wacct_end(KZ3_WA_HLE, nid, t0); } };
++    kz3_wa_guard kz3_wa_g = { nid, kz3_wacct_begin() };
+     /* Stamp the NAME here too, not only where a handler is found below.
+      *
+      * These are read as a pair -- the watchdog prints "last HLE call = <nid>
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index ce044ce4..e04080b6 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1333,6 +1333,7 @@ static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
+  * problem-state half of each window needs hooking; local store is ordinary
+  * memory and stays on the fast path (spu_raw_is_reg excludes it). */
+ #include "../spu/spu_raw.h"
++#include "../diag/kz3_wait_acct.h"   /* KZ3 patch 1032 */
+ 
+ static int vm_oob_report(uint32_t a, uint32_t n)
+ {
+@@ -3513,7 +3514,9 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+             static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
+             uint32_t _a3=(uint32_t)ctx->gpr[3], _a4=(uint32_t)ctx->gpr[4], _a5=(uint32_t)ctx->gpr[5];
+             ULONGLONG _t0 = GetTickCount64();
++            const uint64_t _wa0 = kz3_wacct_begin();   /* KZ3 patch 1032 */
+             int _ok = lv2_try_syscall(ctx);
++            kz3_wacct_end(num == 141 ? KZ3_WA_USLEEP : KZ3_WA_SC, num == 141 ? (uint32_t)ctx->lr : (uint32_t)num, _wa0);
+             ULONGLONG _dt = GetTickCount64() - _t0;
+             uint32_t _rv=(uint32_t)ctx->gpr[3];
+             if (num < 1024) { s_acc[num]+=_dt; s_cnt[num]++; }
+@@ -3540,7 +3543,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+              * first argument column -- and the first argument is the object id for
+              * most of lv2, which is exactly what a trace is being read for. */
+             uint64_t _pre3 = ctx->gpr[3];
+-            if (lv2_try_syscall(ctx)) {
++            /* KZ3 patch 1032 (KZ3_WAIT_ACCT): host time per syscall; usleep keyed by its guest caller. */
++            const uint64_t _wa0 = kz3_wacct_begin();
++            const int _wok = lv2_try_syscall(ctx);
++            kz3_wacct_end(num == 141 ? KZ3_WA_USLEEP : KZ3_WA_SC, num == 141 ? (uint32_t)ctx->lr : (uint32_t)num, _wa0);
++            if (_wok) {
+                 sc_trace(num, ctx, _pre3, ctx->gpr[4], ctx->gpr[5], ctx->gpr[6]);
+                 return;
+             }
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index f4ffe6cd..2a0944ac 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2298,6 +2298,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                 return;
+             }
++            { extern void kz3_wacct_job(int); extern int g_kz3_wacct; if (g_kz3_wacct > 0) kz3_wacct_job(o->image_id); }   /* patch 1032 */
+             if (ctx->resident_ovl != o->image_id) {
+                 ctx->resident_ovl = o->image_id;
+                 { static int _n = 0; if (PS3_LOG_FIRST(_n, 32))
+@@ -3024,6 +3025,7 @@ void spu_indirect_branch(spu_context* ctx)
+             extern int spu_overlay_match_sig(const uint8_t hdr[16]);
+             int img = spu_overlay_match_sig(&ctx->ls[codeBase]);
+             if (img) {
++                { extern void kz3_wacct_job(int); extern int g_kz3_wacct; if (g_kz3_wacct > 0) kz3_wacct_job(img); }   /* patch 1032 */
+                 if (ctx->resident_ovl != img) {
+                     ctx->resident_ovl = img;
+                     static int _n = 0; if (PS3_LOG_FIRST(_n, 32))

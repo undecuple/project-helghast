@@ -1,0 +1,130 @@
+KZ3 patch 2064 (RSX pass 63): NV40 half/full register aliasing in the fragment decompiler (LD_FP_ALIAS=0 = old).
+rsx_fp_decompiler.c: the half and full temp files are one register file: h[2k] is the low 64 bits of r[k] (h.x/h.y
+= the low/high halves of r[k].x, h.z/h.w those of r[k].y), h[2k+1] the high 64 bits. KZ3's G-buffer programs write
+the view normal to h0.xy and read r0.x (the two halves as one word) for UPB into the bytes of the normals target
+0x16C0000; the decompiler kept r[] and h[] apart, so r0.x read 0 and every light saw the normal (0,0,1): flat,
+overbright lit surfaces. fp_alias_scan pre-scans the program for registers read through the other view (plus the
+colour exports of the selected file); after each write, fp_alias_mirror refreshes exactly those aliased
+components (asfloat(f32tof16 pack) of the halves, or f16tof32 of the word's halves). Programs that never read
+across the views are byte-identical. A text scan of the 145 K2 programs dumped in pass 63 flags up to 99 that read across (an upper bound). Host test
+tools/smoke/test_fp_alias.sh. As RPCS3's fragment decompiler (register gather/split), read for reference.
+Upstream candidate (general NV40 semantics).
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream gamma-unit scan inserted at the same spot, pack flag from upstream.
+
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index c77a933..e1fe7f0 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -647,6 +647,94 @@ static void fp_expand_helper(Out* out)
+         "                  (mask & 8u) ? e.a : v.a);\n}\n");
+ }
+ 
++/* Patch 2064 (KZ3 RSX pass 63): NV40 register aliasing. The half and full temp files are one register file:
++ * h[2k] is the low 64 bits of r[k] (h.x/h.y = the low/high halves of r[k].x, h.z/h.w those of r[k].y) and
++ * h[2k+1] the high 64 bits (r[k].z, r[k].w). Compiled programs rely on it: KZ3's G-buffer shaders write the
++ * view normal to h0.xy and read r0.x to get the two halves as one 32-bit word, which UPB splits into the bytes
++ * of the normals target (0x16C0000). The decompiler kept two separate arrays, so r0.x read 0 and every
++ * lighting pass got the normal (0,0,1). A pre-scan finds which registers a program reads through the other
++ * view; after each write the aliased components that are read somewhere get the exact bits (pack/unpack
++ * of IEEE halves, as the hardware stores them). Programs that never read across the views are unchanged,
++ * byte for byte. LD_FP_ALIAS=0 turns it off (old output). As RPCS3's fragment decompiler (register file
++ * gather/split), read for reference. */
++typedef struct { u8 rread[64], hread[64], rwrite[64], hwrite[64]; int on; } fp_alias_t;
++static int fp_alias_enabled(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_FP_ALIAS"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++static void fp_alias_note_src(fp_alias_t* a, u32 w)
++{
++    if (((w & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) != FP_REG_TYPE_TEMP) return;
++    const u32 idx = (w & FP_SRC_REG_MASK) >> FP_SRC_REG_SHIFT;
++    if (idx >= 64) return;
++    if (w & FP_SRC_HALF) { a->hread[idx] = 1; return; }
++    for (int i = 0; i < 4; i++) a->rread[idx] |= (u8)(1u << ((w >> (FP_SRC_SWZ_SHIFT + 2 * i)) & 3u));
++}
++static void fp_alias_scan(fp_alias_t* a, const u8* ucode, u32 max_bytes, u32 ctrl)
++{
++    memset(a, 0, sizeof *a);
++    a->on = fp_alias_enabled();
++    if (!a->on) return;
++    for (u32 off = 0; off + 16 <= max_bytes;) {
++        const u32 w0 = rsx_fp_read_word(ucode + off), w1 = rsx_fp_read_word(ucode + off + 4);
++        const u32 w2 = rsx_fp_read_word(ucode + off + 8), w3 = rsx_fp_read_word(ucode + off + 12);
++        off += 16;
++        if (!(w2 & FP_BRANCH)) {
++            fp_alias_note_src(a, w1); fp_alias_note_src(a, w2); fp_alias_note_src(a, w3);
++            if (!(w0 & FP_OUT_NONE)) {
++                const u32 d = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
++                if (d < 64) { if (w0 & FP_OUT_HALF) a->hwrite[d] = 1; else a->rwrite[d] = 1; }
++            }
++        }
++        if (fp_instruction_has_constant(w1, w2, w3)) off += 16;
++        if (w0 & FP_END) break;
++    }
++    /* The colour exports read the selected file at the end of the program. */
++    const int half_exports = (ctrl == RSX_FP_CTRL_AUTO) ? -1 : !(ctrl & FP_CTRL_32BIT_EXPORTS);
++    for (int t = 0; t < FP_MAX_COLOR_TARGETS; t++) {
++        if (half_exports != 0) a->hread[fp_export_reg[1][t]] = 1;
++        if (half_exports != 1) a->rread[fp_export_reg[0][t]] = 0xF;
++    }
++}
++/* After a write of `mask` to h[idx] (half) or r[idx]: refresh the aliased components the program reads. */
++static void fp_alias_mirror(Out* o, const fp_alias_t* a, int half, u32 idx, const char* mask)
++{
++    if (!a->on || idx >= 64) return;
++    char line[256];
++    const int has_xy = strchr(mask, 'x') || strchr(mask, 'y');
++    const int has_zw = strchr(mask, 'z') || strchr(mask, 'w');
++    if (half) {
++        const u32 k = idx >> 1, hi = idx & 1u;
++        if (k >= 32 || !a->hwrite[idx]) return;
++        static const char rc[2][2] = { { 'x', 'y' }, { 'z', 'w' } };
++        if (has_xy && (a->rread[k] & (1u << (hi ? 2 : 0)))) {
++            snprintf(line, sizeof line, "    r[%u].%c = asfloat(f32tof16(h[%u].x) | (f32tof16(h[%u].y) << 16));   /* alias */\n",
++                     k, rc[hi][0], idx, idx);
++            out_puts(o, line);
++        }
++        if (has_zw && (a->rread[k] & (1u << (hi ? 3 : 1)))) {
++            snprintf(line, sizeof line, "    r[%u].%c = asfloat(f32tof16(h[%u].z) | (f32tof16(h[%u].w) << 16));   /* alias */\n",
++                     k, rc[hi][1], idx, idx);
++            out_puts(o, line);
++        }
++    } else {
++        if (idx >= 32) return;
++        static const char* hp[4] = { "xy", "zw", "xy", "zw" };
++        for (u32 c = 0; c < 4; c++) {
++            const char cc = "xyzw"[c];
++            if (!strchr(mask, cc)) continue;
++            const u32 hn = 2 * idx + (c >= 2);
++            if (!a->hread[hn]) continue;
++            snprintf(line, sizeof line,
++                     "    h[%u].%s = float2(f16tof32(asuint(r[%u].%c)), f16tof32(asuint(r[%u].%c) >> 16));   /* alias */\n",
++                     hn, hp[c], idx, cc, idx, cc);
++            out_puts(o, line);
++        }
++    }
++}
++
+ static int rsx_fp_decompile_internal(
+     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
+     int buffered, const rsx_fp_shadow_desc* shadow, const u8 gamma_masks[16],
+@@ -752,6 +840,8 @@ static int rsx_fp_decompile_internal(
+     u32 blk_else[FP_MAX_BLOCKS], blk_end[FP_MAX_BLOCKS];
+     int blk_loop[FP_MAX_BLOCKS];
+     int n_blk = 0, n_loop = 0, loops_open = 0;
++    fp_alias_t alias;   /* patch 2064 */
++    fp_alias_scan(&alias, ucode, max_bytes, ctrl);
+ 
+     while (off + 16 <= max_bytes) {
+         /* Close blocks ending here, innermost first, then open an else. Ends
+@@ -1200,6 +1290,7 @@ static int rsx_fp_decompile_internal(
+                 out_puts(&o, "    }\n");
+             }
+ 
++            if (has_dest && !is_never) fp_alias_mirror(&o, &alias, dst_half, dst_idx, m);   /* patch 2064 */
+             if (has_dest) {
+                 const int target = fp_export_target(dst_idx, dst_half);
+                 if (target >= 0) wrote[dst_half][target] = 1;

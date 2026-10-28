@@ -1,0 +1,664 @@
+Live-draw: 3D textures and zeta-aliased DEPTH16 (shadow compare), X16 and A8R8G8B8 textures.
+
+Killzone 3's first level (pass 11 RPCS3 capture, the RE notes) uses texture paths live-draw
+did not have:
+- TEXTURE_FORMAT dimension 3: one A8R8G8B8 linear 3D texture in the final composite (ASSUMPTION: colour-grading
+  LUT). It decoded to nothing and read SRV_WHITE. Now: decode_guest_texture_3d (uncompressed formats, base level,
+  slices pitch*height apart or 3D-swizzled), a TEXTURE3D resource and SRV, cache key with dimension and depth, and
+  the fragment-program decompiler's tex_cube_mask carries 3D units in bits 16..31 (Texture3D declaration, .xyz
+  sampling, TXP .xyz / .w). The mask is part of the PSO key and HLSL hash through cube_mask.
+- DEPTH16 (0x92/0x93) at a host-rendered Z16 zeta, zfunc GEQUAL on every bind: shadow compare. The unit binds the
+  R32_FLOAT depth snapshot and rsx_fp_apply_shadow_compare rewrites its Sample call to SampleCmpLevelZero against
+  texcoord.z; the root signature gains eight static comparison samplers at s16+F (F = RSX zfunc, reversed as
+  RPCS3 does: GEQUAL -> LESS_EQUAL; linear, clamp).
+- X16 (0x94) at a Z16 zeta: depth read as a value; binds the snapshot like DEPTH24_D8 (depth in RGB, alpha 1).
+- A8R8G8B8 at a Z24S8 zeta (remap 0xAA93, point sampled): the game reads the depth bytes. Binds the snapshot and
+  rsx_fp_apply_depth_argb rebuilds A=depth[23:16] R=depth[15:8] G=depth[7:0] B=stencil(0) and applies the remap
+  (0xAA93 gives RGB = depth bytes high to low). zdepth_t records the zeta's depth format; Z16 zetas are excluded.
+tex_zalias_kind() decides all three for both the PSO key and the bind; LD_NO_ZALIAS=1 turns them off for an A/B.
+Gamma decode is not applied to shadow or depth-byte units.
+Verified: tools/smoke/test_fp_d3d12.c under Proton (D3D12 device, decompiled programs + these post-passes):
+tex3d 4/4 voxels, shadow-cmp 3/3, depth-argb 1/1 (remap 0xAAE4) and 1/1 (0xAA93). Not yet seen on KZ3's level (the port does not reach it).
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream shadow-compare branch (PR302) kept before the 3D test.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): unnorm scale: upstream 00c2999d's volume path (dim[][3], volume_mask); 2012's 3D bits (cube_mask 16..31) folded into volume_mask there too (no depth passed: skipped as before).
+
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 7f87d76c..680dd13d 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -627,6 +627,10 @@ static int rsx_fp_decompile_internal(
+     if (!ucode || !out || out_size == 0) return -1;
+     /* Cube and volume units are declared on their own t-register; with none
+      * the 2D array keeps every 2D-only program byte-identical. */
++    /* KZ3 patch 2012: live-draw names 3D units in tex_cube_mask bits 16..31
++     * (bit 16 + N = unit N is 3D); fold them into upstream's tex_vol_mask. */
++    tex_vol_mask |= tex_cube_mask >> 16;
++    tex_cube_mask &= 0xFFFFu;
+     const u32 tex_sep_mask = tex_cube_mask | tex_vol_mask;
+     const u32 gamma_units = rsx_fp_texture_gamma_units(ucode, max_bytes, gamma_masks);
+     const u32 expand_units = rsx_fp_texture_expand_units(ucode, max_bytes, expand_masks);
+@@ -1715,6 +1719,188 @@ int rsx_fp_apply_gamma(char* hlsl, u32 hlsl_size, u64 gamma_mask)
+     return patched;
+ }
+ 
++/*
++ * Patch 2011: textures that read a zeta buffer (Killzone 3's first level,
++ * pass 11 RPCS3 capture). live-draw binds its R32_FLOAT depth snapshot for
++ * them; these post-passes turn the generic Sample call into what the RSX
++ * texture unit returns for that format.
++ *
++ * Shadow compare (DEPTH16 / DEPTH16_FLOAT, and DEPTH24_D8 if a caller asks):
++ * the RSX compares texcoord.z (TXP: z / w) against the stored depth with the
++ * TEXTURE_ADDRESS zfunc and returns the (filtered) pass fraction in all four
++ * channels. RPCS3 (VKDraw.cpp, read for reference) enables the compare for
++ * every depth format and reverses the function (zfunc GEQUAL -> LESS_OR_EQUAL).
++ * The call becomes SampleCmpLevelZero with SamplerComparisonState
++ * rsx_cmpF at register s(16 + F), F = RSX zfunc; live-draw's root signature
++ * carries the eight static comparison samplers (linear, clamp).
++ * ASSUMPTION: no LOD / bias on shadow lookups (level 0); unnormalised shadow
++ * coordinates are not scaled.
++ */
++static char* fp_match_paren(char* open)
++{
++    int depth = 0;
++    for (char* p = open; *p; p++) {
++        if (*p == '(') depth++;
++        else if (*p == ')') { depth--; if (!depth) return p; }
++    }
++    return NULL;
++}
++
++/* Copy [b, e) to dst (size n). */
++static void fp_copy_span(char* dst, u32 n, const char* b, const char* e)
++{
++    u32 len = (u32)(e - b);
++    if (len >= n) len = n - 1;
++    memcpy(dst, b, len);
++    dst[len] = '\0';
++}
++
++int rsx_fp_apply_shadow_compare(char* hlsl, u32 hlsl_size, u32 shadow_mask,
++                                const u8 zfunc[16])
++{
++    if (!hlsl || !shadow_mask) return 0;
++    int patched = 0;
++    u32 used_funcs = 0;
++    for (u32 u = 0; u < 16; u++) {
++        if (!((shadow_mask >> u) & 1u)) continue;
++        const u32 f = zfunc[u] & 7u;
++        char needles[2][24];
++        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].", u);
++        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.", u);
++        for (int nidx = 0; nidx < 2; nidx++) {
++            for (;;) {
++                char* at = strstr(hlsl, needles[nidx]);
++                if (!at) break;
++                char* open = strchr(at, '(');
++                char* close = open ? fp_match_paren(open) : NULL;
++                if (!close) return -1;
++                /* Arguments: sampler, coordinate[, bias/lod]. */
++                char* args[3] = { open + 1, NULL, NULL };
++                char* ends[3] = { close, close, close };
++                int na = 1, depth = 0;
++                for (char* q = open + 1; q < close; q++) {
++                    if (*q == '(') depth++;
++                    else if (*q == ')') depth--;
++                    else if (*q == ',' && depth == 0 && na < 3) {
++                        ends[na - 1] = q;
++                        args[na++] = q + 1;
++                    }
++                }
++                if (na < 2) return -1;
++                char coord[640], ref[640];
++                fp_copy_span(coord, sizeof coord, args[1], ends[1]);
++                /* Reference: the coordinate with its top-level .xy -> .z. */
++                strcpy(ref, coord);
++                int found = 0;
++                depth = 0;
++                for (char* q = ref; *q; q++) {
++                    if (*q == '(') depth++;
++                    else if (*q == ')') depth--;
++                    else if (depth == 0 && q[0] == '.' && q[1] == 'x' && q[2] == 'y' &&
++                             !(q[3] >= 'a' && q[3] <= 'z')) {
++                        q[1] = 'z';
++                        memmove(q + 2, q + 3, strlen(q + 3) + 1);
++                        found = 1;
++                        break;
++                    }
++                }
++                if (!found) snprintf(ref, sizeof ref, "(%s).z", coord);
++                char repl[1500];
++                snprintf(repl, sizeof repl, "%s%u%s.SampleCmpLevelZero(rsx_cmp%u, %s, %s)",
++                         nidx == 0 ? "rsx_TEX[" : "rsx_TEX", u, nidx == 0 ? "]" : "",
++                         f, coord, ref);
++                const u32 rlen = (u32)strlen(repl), olen = (u32)(close + 1 - at);
++                const u32 used = (u32)strlen(hlsl);
++                if (used - olen + rlen + 1 > hlsl_size) return -1;
++                memmove(at + rlen, close + 1, used - (u32)(close + 1 - hlsl) + 1);
++                memcpy(at, repl, rlen);
++                used_funcs |= 1u << f;
++                patched++;
++            }
++        }
++    }
++    for (char* q = hlsl; (q = strstr(q, "rsx_TEX")) != NULL; )
++        memcpy(q, "rsx_tex", 7);
++    if (patched) {
++        char* at = strstr(hlsl, "SamplerState rsx_samp[16] : register(s0);\n");
++        if (!at) return -1;
++        at += strlen("SamplerState rsx_samp[16] : register(s0);\n");
++        for (u32 f = 0; f < 8; f++) {
++            if (!((used_funcs >> f) & 1u)) continue;
++            char decl[80];
++            snprintf(decl, sizeof decl, "SamplerComparisonState rsx_cmp%u : register(s%u);\n",
++                     f, 16u + f);
++            if (fp_insert(hlsl, hlsl_size, at, decl) < 0) return -1;
++            at += strlen(decl);
++        }
++    }
++    return patched;
++}
++
++/*
++ * A8R8G8B8 read from a Z24S8 zeta (patch 2011): the game reinterprets the
++ * depth buffer's bytes. In guest memory a Z24S8 texel is the big-endian word
++ * depth24 << 8 | stencil, so as A8R8G8B8 it reads A = depth[23:16],
++ * R = depth[15:8], G = depth[7:0], B = stencil. The bound SRV is live-draw's
++ * R32_FLOAT snapshot, so the shader rebuilds the bytes from .x and applies
++ * the unit's remap (CONTROL1, the same encoding as live-draw's remap_comp).
++ * ASSUMPTION: stencil reads 0 (the snapshot has no stencil); the bytes come
++ * from the filtered depth, exact only with point sampling.
++ */
++int rsx_fp_apply_depth_argb(char* hlsl, u32 hlsl_size, u32 argb_mask,
++                            const u16 remap[16])
++{
++    if (!hlsl || !argb_mask) return 0;
++    int patched = 0;
++    char helpers[2048];
++    u32 hl = 0;
++    hl += (u32)snprintf(helpers + hl, sizeof helpers - hl,
++        "float4 rsx_zargb(float d) { uint z = (uint)round(saturate(d) * 16777215.0);\n"
++        "    return float4((z >> 16) & 0xFF, (z >> 8) & 0xFF, z & 0xFF, 0) / 255.0; }\n");
++    for (u32 u = 0; u < 16; u++) {
++        if (!((argb_mask >> u) & 1u)) continue;
++        /* s = (A, R, G, B) = .xyzw; output D3D r,g,b,a = remap comps 1,2,3,0. */
++        static const char* sel_txt[4] = { "s.x", "s.y", "s.z", "s.w" };
++        const char* c[4];
++        for (u32 comp = 0; comp < 4; comp++) {
++            const u32 op = (remap[u] >> (8 + comp * 2)) & 3u;
++            const u32 sel = (remap[u] >> (comp * 2)) & 3u;
++            c[comp] = op == 0 ? "0.0" : op == 1 ? "1.0" : sel_txt[sel];
++        }
++        hl += (u32)snprintf(helpers + hl, sizeof helpers - hl,
++            "float4 rsx_zargb%u(float4 t) { float4 s = rsx_zargb(t.x); return float4(%s, %s, %s, %s); }\n",
++            u, c[1], c[2], c[3], c[0]);
++        if (hl >= sizeof helpers) return -1;
++        char needles[2][24];
++        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].", u);
++        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.", u);
++        char head[24];
++        snprintf(head, sizeof head, "rsx_zargb%u(", u);
++        for (int nidx = 0; nidx < 2; nidx++) {
++            for (;;) {
++                char* at = strstr(hlsl, needles[nidx]);
++                if (!at) break;
++                char* open = strchr(at, '(');
++                char* close = open ? fp_match_paren(open) : NULL;
++                if (!close) return -1;
++                if (fp_insert(hlsl, hlsl_size, close + 1, ")") < 0) return -1;
++                if (fp_insert(hlsl, hlsl_size, at, head) < 0) return -1;
++                memcpy(at + strlen(head), "rsx_TEX", 7);
++                patched++;
++            }
++        }
++    }
++    for (char* q = hlsl; (q = strstr(q, "rsx_TEX")) != NULL; )
++        memcpy(q, "rsx_tex", 7);
++    if (patched) {
++        char* at = strstr(hlsl, "SamplerState rsx_samp[16] : register(s0);\n");
++        if (!at) return -1;
++        at += strlen("SamplerState rsx_samp[16] : register(s0);\n");
++        if (fp_insert(hlsl, hlsl_size, at, helpers) < 0) return -1;
++    }
++    return patched;
++}
++
+ /* Scale texel-space coordinates to the 0..1 range HLSL sampling expects.
+  *
+  * An RSX texture whose format carries RSX_TEX_FMT_UNNORM (0x40) is addressed in
+@@ -1748,6 +1934,10 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+ {
+     if (!hlsl || !unnorm_mask) return 0;
+     int patched = 0;
++    /* KZ3 patch 2012: live-draw names 3D units in cube_mask bits 16..31; with no
++     * depth in dim[u][2] upstream's loop below skips them (as 2012 did). */
++    volume_mask |= cube_mask >> 16;
++    cube_mask &= 0xFFFFu;
+ 
+     for (u32 u = 0; u < 16; u++) {
+         if (!((unnorm_mask >> u) & 1u)) continue;
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index 16c89fcc..a0d28191 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -96,6 +96,19 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
+  * per unit (unit u at bits 3u..3u+2: R, G, B). Returns the number of sample
+  * sites wrapped, or -1 if the buffer is too small. */
+ int rsx_fp_apply_gamma(char* hlsl, u32 hlsl_size, u64 gamma_mask);
++
++/* Patch 2011: zeta-aliased texture units (see rsx_fp_decompiler.c).
++ * Shadow compare: units in shadow_mask sample with SampleCmpLevelZero against
++ * texcoord.z through SamplerComparisonState rsx_cmpF : register(s16 + F),
++ * F = zfunc[unit] (RSX TEXTURE_ADDRESS [31:28]); the root signature must
++ * provide those samplers. Run before rsx_fp_apply_unnorm_scale.
++ * Depth as A8R8G8B8: units in argb_mask rebuild the Z24S8 bytes from the
++ * sampled depth (.x) and apply remap[unit]. Return the number of call sites
++ * patched, or -1 if the buffer is too small. */
++int rsx_fp_apply_shadow_compare(char* hlsl, u32 hlsl_size, u32 shadow_mask,
++                                const u8 zfunc[16]);
++int rsx_fp_apply_depth_argb(char* hlsl, u32 hlsl_size, u32 argb_mask,
++                            const u16 remap[16]);
+ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+                               const u32 dim[][3], u32 cube_mask, u32 volume_mask);
+ 
+@@ -121,6 +134,9 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
+  *                   and a.xy sampling. Pass 0 for the legacy all-2D behavior
+  *                   (rsx_fp_decompile forwards 0, so its output is unchanged
+  *                   byte-for-byte).
++ *                   Bits 16..31: bit 16 + N set => unit N is a 3D texture,
++ *                   declared `Texture3D` and sampled with a.xyz (TXP:
++ *                   a.xyz / a.w). Both masks feed the per-unit declaration.
+  *
+  * The mask must match what the backend actually binds: a cube unit needs a
+  * TextureCube SRV at register tN, and a 2D unit a Texture2D SRV. See the
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index fef94121..a298e1e3 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -197,6 +197,9 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ #define TEX_FMT_DXT45      0x88
+ #define TEX_FMT_G8B8       0x8B
+ #define TEX_FMT_DEPTH24_D8 0x90
++#define TEX_FMT_DEPTH16    0x92   /* patch 2011 */
++#define TEX_FMT_DEPTH16_F  0x93
++#define TEX_FMT_X16        0x94
+ #define TEX_FMT_LINEAR     0x20
+ #define TEX_FMT_UNNORM     0x40
+ #define TEX_FMT_BASE_MASK  0x9F
+@@ -246,10 +249,12 @@ typedef struct {
+     u64 depth_write_draws;
+     u64 depth_both_draws;
+     int reject_logged;
++    u32 depth_format;   /* patch 2012: SURFACE_FORMAT depth of the last draw into it (1 Z16, 2 Z24S8) */
+ } zdepth_t;
+ typedef struct {
+     u32 location, offset, format, width, height, pitch, remap;
+     u32 cubemap;
++    u32 dimension, depth;   /* patch 2011: 3D textures get a TEXTURE3D SRV */
+     ID3D12Resource* tex;
+     u64 content_hash;
+     u32 last_hash_frame;
+@@ -2251,6 +2256,20 @@ static u32 morton_index(u32 x, u32 y, u32 lw, u32 lh)
+     }
+     return idx;
+ }
++/* Patch 2011: swizzled 3D textures interleave x, y and z bits in that order
++ * while each axis still has bits left (the 2D order extended by one axis).
++ * ASSUMPTION: from the 2D layout; KZ3's one 3D texture (pass 11 capture) is
++ * linear, so this path is untested against real data. */
++static u32 morton_index3(u32 x, u32 y, u32 z, u32 lw, u32 lh, u32 ld)
++{
++    u32 idx = 0, shift = 0;
++    while (lw || lh || ld) {
++        if (lw) { idx |= (x & 1) << shift; x >>= 1; shift++; lw--; }
++        if (lh) { idx |= (y & 1) << shift; y >>= 1; shift++; lh--; }
++        if (ld) { idx |= (z & 1) << shift; z >>= 1; shift++; ld--; }
++    }
++    return idx;
++}
+ static u8 remap_comp(const u8 s[4], u32 remap, u32 comp)
+ {
+     const u32 op  = (remap >> (8 + comp * 2)) & 3;
+@@ -2475,6 +2494,16 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
+     case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
+     default: return 0;
+     }
++    if (t->dimension == 3) {
++        /* Patch 2011: 3D texture, base level only (the decoder uploads one
++         * level). Depth from TEX_SIZE1 [20:31]. */
++        const u32 d = t->depth ? t->depth : 1;
++        if (block_size || !t->width || !t->height || t->width > 512 ||
++            t->height > 512 || d > 512 || t->cubemap)
++            return 0;
++        const u32 pitch = (linear && t->pitch) ? t->pitch : t->width * texel_size;
++        return pitch * t->height * d;
++    }
+     if (!t->width || !t->height || t->width > 4096 || t->height > 4096 ||
+         t->dimension != 2)
+         return 0;
+@@ -2594,11 +2623,100 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+     return hash;
+ }
+ 
++/* Patch 2011: one TEXTURE3D resource, base level, from RGBA8 slices. */
++static ID3D12Resource* create_texture_3d(const u8* rgba, u32 w, u32 h, u32 d)
++{
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC rd = {0};
++    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
++    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = (u16)d;
++    rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
++    const u32 pitch = (w * 4 + 255) & ~255u;
++    const u32 start = (g.upload_used + 511) & ~511u;
++    if ((u64)start + (u64)pitch * h * d > UPLOAD_SIZE) return NULL;
++    ID3D12Resource* tex = NULL;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
++                                                      D3D12_RESOURCE_STATE_COPY_DEST, NULL,
++                                                      &IID_ID3D12Resource, (void**)&tex)))
++        return NULL;
++    for (u32 z = 0; z < d; z++)
++        for (u32 y = 0; y < h; y++)
++            memcpy(g.upload_mapped + start + ((size_t)z * h + y) * pitch,
++                   rgba + ((size_t)z * h + y) * w * 4, (size_t)w * 4);
++    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
++    src.pResource = g.upload; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    src.PlacedFootprint.Offset = start;
++    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    src.PlacedFootprint.Footprint.Width = w;
++    src.PlacedFootprint.Footprint.Height = h;
++    src.PlacedFootprint.Footprint.Depth = d;
++    src.PlacedFootprint.Footprint.RowPitch = pitch;
++    dst.pResource = tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
++    g.upload_used = start + pitch * h * d;
++    ld_profile_note_ring_highwater();
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = tex;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    return tex;
++}
++
++/* Patch 2011: TEXTURE_FORMAT dimension 3. KZ3's first level binds one
++ * A8R8G8B8 linear 3D texture in the final 1280x720 composite (pass 11
++ * capture, draw 576 unit 3; ASSUMPTION: colour-grading LUT). Before this it
++ * decoded to nothing and the unit read SRV_WHITE. Uncompressed formats only,
++ * base level only; slices are `pitch * height` apart (linear) or 3D-swizzled. */
++static ID3D12Resource* decode_guest_texture_3d(const rsx_dsp_texture* t, u32 remap,
++                                               u32 base_fmt, int linear)
++{
++    const u32 w = t->width, h = t->height, d = t->depth ? t->depth : 1;
++    u32 texel_size;
++    switch (base_fmt) {
++    case TEX_FMT_B8: texel_size = 1; break;
++    case TEX_FMT_A4R4G4B4:
++    case TEX_FMT_A1R5G5B5:
++    case TEX_FMT_R5G6B5:
++    case TEX_FMT_G8B8: texel_size = 2; break;
++    case TEX_FMT_A8R8G8B8: texel_size = 4; break;
++    case RSX_TEX_FMT_W16Z16Y16X16_FLOAT: texel_size = 8; break;
++    default: return NULL;
++    }
++    if (!linear && ((w & (w - 1)) || (h & (h - 1)) || (d & (d - 1)))) return NULL;
++    const u32 span = texture_source_span(t);
++    const u8* src = span ? guest_ptr(t->location, t->offset, span) : NULL;
++    if (!src) return NULL;
++    const u32 pitch = (linear && t->pitch) ? t->pitch : w * texel_size;
++    u8* rgba = (u8*)malloc((size_t)w * h * d * 4);
++    if (!rgba) return NULL;
++    const u32 lw = log2_u32(w), lh = log2_u32(h), ld = log2_u32(d);
++    for (u32 z = 0; z < d; z++)
++        for (u32 y = 0; y < h; y++)
++            for (u32 x = 0; x < w; x++) {
++                const u8* pixel = linear
++                    ? src + ((size_t)z * h + y) * pitch + (size_t)x * texel_size
++                    : src + (size_t)morton_index3(x, y, z, lw, lh, ld) * texel_size;
++                decode_texel(base_fmt, pixel, remap, rgba + (((size_t)z * h + y) * w + x) * 4);
++            }
++    ID3D12Resource* tex = create_texture_3d(rgba, w, h, d);
++    free(rgba);
++    { static u32 n_log = 0;
++      if (n_log++ < 8)
++          fprintf(stderr, "[tex3d] src=%u:0x%08X fmt=0x%02X %ux%ux%u pitch=%u %s -> %s\n",
++                  t->location, t->offset, t->format, w, h, d, t->pitch,
++                  linear ? "linear" : "swizzled", tex ? "ok" : "FAILED"); }
++    return tex;
++}
++
+ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+ {
+     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+     const int linear = (t->format & TEX_FMT_LINEAR) != 0;
+     const u32 w = t->width, h = t->height;
++    if (t->dimension == 3)
++        return decode_guest_texture_3d(t, remap, base_fmt, linear);
+     if (!w || !h || w > 4096 || h > 4096 || t->dimension != 2)
+         return NULL;
+     u32 n_mips = t->mipmaps ? t->mipmaps : 1;
+@@ -2863,7 +2981,16 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
+     const int compressed = base_fmt == TEX_FMT_DXT1 ||
+                            base_fmt == TEX_FMT_DXT23 ||
+                            base_fmt == TEX_FMT_DXT45;
+-    if (entry->cubemap) {
++    if (entry->dimension == 3) {
++        /* Patch 2011: decoded to RGBA8 with the remap applied. */
++        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
++        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
++        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        desc.Texture3D.MipLevels = 1;
++        g.dev->lpVtbl->CreateShaderResourceView(
++            g.dev, entry->tex, &desc, srv_cpu(SRV_TEXTURE_BASE + index));
++    } else if (entry->cubemap) {
+         static const u32 sel2d3d[4] = { 3, 0, 1, 2 };
+         static const u32 out2comp[4] = { 1, 2, 3, 0 };
+         u32 mapping[4];
+@@ -2913,6 +3040,44 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
+     }
+ }
+ 
++/* Patch 2011: texture units that read a zeta buffer live-draw renders on the
++ * host. Killzone 3's first level (pass 11 RPCS3 capture) binds DEPTH16 at
++ * its Z16 shadow-map zetas with zfunc GEQUAL (shadow compare, 138 binds), X16
++ * at Z16 zetas (depth read as a value, 110) and A8R8G8B8 at the Z24S8 zeta
++ * (depth bytes, 126). Guest VRAM under a host-rendered zeta is never written,
++ * so these bind the R32_FLOAT depth snapshot (as DEPTH24_D8 already did) and
++ * the fragment program gets a shadow-compare or byte-rebuild post-pass. Both
++ * the PSO key and the bind use this test, so they agree. */
++enum { ZALIAS_NONE = 0, ZALIAS_VALUE, ZALIAS_SHADOW, ZALIAS_ARGB };
++static int zdepth_index_at(u32 location, u32 offset)
++{
++    for (u32 i = 0; i < g.n_zdepths; i++)
++        if (g.zdepths[i].location == location && g.zdepths[i].offset == offset &&
++            (g.zdepths[i].had_write || g.zdepths[i].snapshot_valid))
++            return (int)i;
++    return -1;
++}
++static int tex_zalias_kind(const rsx_dsp_texture* t)
++{
++    const u32 base = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
++    if (base == TEX_FMT_DEPTH24_D8) return ZALIAS_VALUE;   /* unchanged path */
++    if (base != TEX_FMT_DEPTH16 && base != TEX_FMT_DEPTH16_F &&
++        base != TEX_FMT_X16 && base != TEX_FMT_A8R8G8B8)
++        return ZALIAS_NONE;
++    const int zi = zdepth_index_at(t->location, t->offset);
++    if (t->dimension != 2 || t->cubemap || zi < 0)
++        return ZALIAS_NONE;
++    static int off = -1;
++    if (off < 0) off = getenv("LD_NO_ZALIAS") ? 1 : 0;   /* A/B switch */
++    if (off) return ZALIAS_NONE;
++    if (base == TEX_FMT_X16) return ZALIAS_VALUE;
++    /* The byte rebuild is the Z24S8 layout; a Z16 zeta read as A8R8G8B8 (one
++     * 640x360 bind in the capture) packs two depths per texel: not handled. */
++    if (base == TEX_FMT_A8R8G8B8)
++        return g.zdepths[zi].depth_format == 1 ? ZALIAS_NONE : ZALIAS_ARGB;
++    return ZALIAS_SHADOW;
++}
++
+ /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
+  * descriptor-only cache, re-hash the source once per frame and refresh the
+  * D3D resource when the game rewrites the same guest address. */
+@@ -2928,7 +3093,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+         if (entry->location != t->location || entry->offset != t->offset ||
+             entry->format != t->format || entry->width != t->width ||
+             entry->height != t->height || entry->pitch != t->pitch ||
+-            entry->remap != remap || entry->cubemap != t->cubemap)
++            entry->remap != remap || entry->cubemap != t->cubemap ||
++            entry->dimension != t->dimension || entry->depth != t->depth)
+             continue;
+         if (refresh_enabled && entry->tex &&
+             entry->last_hash_frame != g_ld_frames) {
+@@ -3044,6 +3210,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+     replacement.pitch = t->pitch;
+     replacement.remap = remap;
+     replacement.cubemap = t->cubemap;
++    replacement.dimension = t->dimension;
++    replacement.depth = t->depth;
+     replacement.last_hash_frame = g_ld_frames;
+     replacement.last_use_serial = ++g_ld_texture_use_serial;
+     {
+@@ -5210,11 +5378,23 @@ static ID3D12PipelineState* get_pso(
+     static int no_gamma = -1;
+     if (no_gamma < 0) no_gamma = getenv("LD_NO_GAMMA") ? 1 : 0;
+     u64 gamma_mask = 0;
++    u32 shadow_mask = 0, argb_mask = 0;          /* patch 2011 */
++    u8 shadow_zfunc[16] = {0};
++    u16 argb_remap[16] = {0};
+     for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
+         rsx_dsp_texture texture;
+         rsx_dsp_get_texture(&g.rsx, unit, &texture);
+         if (texture.enabled || unit == 0) ld_gamma_log(unit, &texture);
+-        if (texture.enabled && !no_gamma && ((texture.wrap >> 20) & 7u)) {
++        const int zalias = texture.enabled ? tex_zalias_kind(&texture) : ZALIAS_NONE;
++        if (zalias == ZALIAS_SHADOW) {
++            shadow_mask |= 1u << unit;
++            shadow_zfunc[unit] = (u8)((texture.wrap >> 28) & 7u);
++        } else if (zalias == ZALIAS_ARGB) {
++            argb_mask |= 1u << unit;
++            argb_remap[unit] = (u16)(texture.remap & 0xFFFFu);
++        }
++        if (texture.enabled && !no_gamma && ((texture.wrap >> 20) & 7u) &&
++            zalias != ZALIAS_SHADOW && zalias != ZALIAS_ARGB) {
+             /* LD_GAMMA_NO_SURF=1 (diagnostic A/B): no decode on units that
+              * sample a render surface (same location + offset). */
+             static int no_surf = -1;
+@@ -5234,6 +5414,10 @@ static ID3D12PipelineState* get_pso(
+         }
+         if (texture.enabled && texture.cubemap)
+             cube_mask |= 1u << unit;
++        /* Patch 2011: 3D units in bits 16..31 (Texture3D declaration; part of
++         * the PSO key and the HLSL hash through cube_mask). */
++        else if (texture.enabled && texture.dimension == 3)
++            cube_mask |= 1u << (16 + unit);
+     }
+     const u32 vtex_mask = vertex_texture_mask();
+     const u32 txl_mask = vp_txl_unit_mask(vp_uc, vp_instrs);
+@@ -5292,6 +5476,14 @@ static ID3D12PipelineState* get_pso(
+     if (vp_branch_bits_used)
+         key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
+     if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
++    if (shadow_mask) {
++        key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
++        key = fnv1a(shadow_zfunc, sizeof(shadow_zfunc), key);
++    }
++    if (argb_mask) {
++        key = fnv1a(&argb_mask, sizeof(argb_mask), key);
++        key = fnv1a(argb_remap, sizeof(argb_remap), key);
++    }
+     /* Texel-addressed (RSX_TEX_FMT_UNNORM) units need their coordinates divided
+      * by the texture size in the shader -- D3D12 has no unnormalised addressing
+      * mode. The divisor is baked into the HLSL, so the sizes are part of the
+@@ -5426,6 +5618,9 @@ static ID3D12PipelineState* get_pso(
+             rsx_fp_apply_alpha_test_buffered(
+                 ps_hlsl, sizeof(ps_hlsl), rs.alpha_func) < 0)
+             fi = -1;
++        if (fi > 0 && rsx_fp_apply_shadow_compare(
++                ps_hlsl, sizeof(ps_hlsl), shadow_mask, shadow_zfunc) < 0)
++            fi = -1;
+         if (fi > 0) {
+             const int np = rsx_fp_apply_unnorm_scale(
+                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask, 0u);
+@@ -5446,6 +5641,9 @@ static ID3D12PipelineState* get_pso(
+                 ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
+                 g.fp_alpha_ref) < 0)
+             fi = -1;
++        if (fi > 0 && rsx_fp_apply_shadow_compare(
++                ps_hlsl, sizeof(ps_hlsl), shadow_mask, shadow_zfunc) < 0)
++            fi = -1;
+         if (fi > 0 && rsx_fp_apply_unnorm_scale(
+                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask,
+                 unnorm_dim, cube_mask, 0u) < 0)
+@@ -5453,6 +5651,13 @@ static ID3D12PipelineState* get_pso(
+     }
+     if (fi > 0 && rsx_fp_apply_gamma(ps_hlsl, sizeof(ps_hlsl), gamma_mask) < 0)
+         fi = -1;
++    if (fi > 0 && rsx_fp_apply_depth_argb(ps_hlsl, sizeof(ps_hlsl), argb_mask, argb_remap) < 0)
++        fi = -1;
++    if (fi > 0 && (shadow_mask || argb_mask)) {
++        static u32 n_log = 0;
++        if (n_log++ < 8)
++            fprintf(stderr, "[zalias] pso shadow=0x%04X argb=0x%04X\n", shadow_mask, argb_mask);
++    }
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.decompile_qpc +=
+         (u64)(ld_profile_qpc() - decompile_begin);
+@@ -7894,6 +8099,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     const u32 current_zslot = g.depth
+         ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h)
+         : 0;
++    if (current_zslot) g.zdepths[current_zslot - 1].depth_format = sf.depth_format;
+     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
+     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
+     u32 zdepth_used[SRV_TABLE_SIZE], n_zdepth_used = 0;
+@@ -8134,7 +8340,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             /* Mirror the replay-proven depth-RT contract: address and format
+              * must match, and the pass must have executed a depth-writing draw.
+              * Clear-only zetas intentionally fall through to guest VRAM. */
+-            if (texture_base_fmt == TEX_FMT_DEPTH24_D8)
++            /* Patch 2011: also DEPTH16 / X16 / A8R8G8B8 at a host zeta. */
++            (void)texture_base_fmt;
++            if (tex_zalias_kind(&t) != ZALIAS_NONE)
+                 for (u32 i = 0; i < g.n_zdepths; i++)
+                     if (g.zdepths[i].location == t.location &&
+                         g.zdepths[i].offset == t.offset &&
+@@ -8692,7 +8900,7 @@ static int make_root_signature(void)
+     xp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+     xp[4].Descriptor.ShaderRegister = 1;
+     xp[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+-    D3D12_STATIC_SAMPLER_DESC vsmp[RSX_DSP_NUM_VERTEX_TEXTURES] = {0};
++    D3D12_STATIC_SAMPLER_DESC vsmp[RSX_DSP_NUM_VERTEX_TEXTURES + 8] = {0};
+     for (u32 i = 0; i < RSX_DSP_NUM_VERTEX_TEXTURES; i++) {
+         vsmp[i].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+         vsmp[i].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+@@ -8704,7 +8912,26 @@ static int make_root_signature(void)
+     }
+     D3D12_ROOT_SIGNATURE_DESC rsd = {0};
+     rsd.NumParameters = 5; rsd.pParameters = xp;
+-    rsd.NumStaticSamplers = RSX_DSP_NUM_VERTEX_TEXTURES;
++    /* Patch 2011: comparison samplers for shadow-compare units at s16 + F,
++     * F = RSX texture zfunc. RPCS3 reverses the function (VKDraw.cpp
++     * get_compare_func(..., true)): GEQUAL -> LESS_EQUAL. Linear (PCF),
++     * clamp. ASSUMPTION: KZ3's shadow binds want linear filtering and clamp;
++     * the bound sampler's own state is not used for them. */
++    static const D3D12_COMPARISON_FUNC zf_rev[8] = {
++        D3D12_COMPARISON_FUNC_NEVER, D3D12_COMPARISON_FUNC_GREATER,
++        D3D12_COMPARISON_FUNC_EQUAL, D3D12_COMPARISON_FUNC_GREATER_EQUAL,
++        D3D12_COMPARISON_FUNC_LESS, D3D12_COMPARISON_FUNC_NOT_EQUAL,
++        D3D12_COMPARISON_FUNC_LESS_EQUAL, D3D12_COMPARISON_FUNC_ALWAYS };
++    for (u32 f = 0; f < 8; f++) {
++        D3D12_STATIC_SAMPLER_DESC* c = &vsmp[RSX_DSP_NUM_VERTEX_TEXTURES + f];
++        c->Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
++        c->AddressU = c->AddressV = c->AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++        c->ComparisonFunc = zf_rev[f];
++        c->MaxLOD = D3D12_FLOAT32_MAX;
++        c->ShaderRegister = 16 + f;
++        c->ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    }
++    rsd.NumStaticSamplers = RSX_DSP_NUM_VERTEX_TEXTURES + 8;
+     rsd.pStaticSamplers = vsmp;
+     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+     ID3DBlob* sig = NULL; ID3DBlob* err = NULL;

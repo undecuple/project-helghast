@@ -1,0 +1,32 @@
+KZ3 patch 2116 (RSX pass 110; ENHANCEMENT, display, with 2108/2112): the render-rate fill helper for the mouse
+look (port/kz3/main.cpp kz3_cam_latch, KZ3_MOUSE_LATCH=2). Notes the RE notes Pass 110.
+
+diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+--- a/libs/input/pad_mouse.h
++++ b/libs/input/pad_mouse.h
+@@ -277,6 +277,25 @@
+     *dyaw = y - y0;
+     *dpitch = p - p0;
+ }
++/* Patch 2116 (RSX pass 110), ENHANCEMENT (display only): the render-rate fill. KZ3's first-person camera Rep shows
++ * the body at the FRAME's game time: Rep yaw = logic yaw - (1 - alpha) x the last look update's yaw delta (alpha =
++ * the Rep's slot fraction, Rep+0x124; measured on 7 K2 runs of RSX pass 107: the model matches the counts taken + pending
++ * within 1.3 ms sd at a 200 counts/s turn, the RE notes "Pass 110"). So the drawn view lags the counts by the
++ * consumed-but-not-shown part (1 - alpha) x take plus the counts not taken yet (the slot clock keeps them for the next
++ * update). The fill adds both: drawn = logic + pending = every count that arrived by the writer call, each count shown
++ * once (a take moves counts from "pending" to "logic"; alpha moves them from the (1 - alpha) term into the Rep). Patch
++ * 2112's latch added only the pending part, so its error was the alpha-dependent (1 - alpha) x take (worse than none on
++ * the slot clock, pass 107). take_dyaw/take_dpitch = the last update's applied deltas (0 when it took nothing);
++ * pend_* = pad_look_latch_delta for the peeked counts. alpha outside [0, 1] is clamped (NaN = 1: nothing consumed is
++ * added). */
++static inline void pad_look_fill_delta(float alpha, float take_dyaw, float take_dpitch, float pend_dyaw, float pend_dpitch,
++                                       float* dyaw, float* dpitch)
++{
++    if (!(alpha >= 0.0f)) alpha = alpha < 0.0f ? 0.0f : 1.0f;
++    if (alpha > 1.0f) alpha = 1.0f;
++    *dyaw = (1.0f - alpha) * take_dyaw + pend_dyaw;
++    *dpitch = (1.0f - alpha) * take_dpitch + pend_dpitch;
++}
+ static inline void pad_look_rot_axis(float v[3], const float ax[3], float c, float s)
+ {
+     /* Rodrigues: v c + (ax x v) s + ax (ax.v)(1 - c) */

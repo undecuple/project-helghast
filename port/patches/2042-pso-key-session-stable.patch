@@ -1,0 +1,192 @@
+KZ3 patch 2042 (RSX pass 42): PSO keys and HLSL depend only on the texture units the fragment program samples.
+rsx_fp_decompiler.c/.h: rsx_fp_texture_unit_mask(ucode, size) = units of TEX/TXP/TXD/TXL/TXB.
+rsx_live_draw.c: the per-unit loops that build cube/gamma/shadow/ARGB-alias masks and the unnormalised-size table
+skip units the program does not sample. State left bound on unused units made new PSO keys and new HLSL (one level
+session: 1,281 PSOs from 248 fragment programs, 78 distinct cube masks, 139 gamma masks, 869 pixel-shader
+sources), so the pso_keys.bin / shader blobs of an earlier session rarely matched (release pass 17: 54 of 4,933
+keys used, 897 compiles). LD_PSO_ALL_UNITS=1 restores the old key; pso_keys.bin version 2 (old files restart).
+Diagnostics: LD_PSO_KEYLOG=<file> (one line per PSO built: key components, HLSL hashes); LD_GAMMA_ORDER=rgb|argb
+(which channels TEXTURE_ADDRESS gamma bits decode; rgb = patch 2009, default). Log: [pso-key], [gamma] order.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 680dd13d..1b31c6dd 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -236,6 +236,29 @@ u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed)
+     return 0;
+ }
+ 
++u32 rsx_fp_texture_unit_mask(const u8* ucode, u32 max_bytes)
++{
++    if (!ucode)
++        return 0;
++    u32 mask = 0, off = 0;
++    while (off + 16 <= max_bytes) {
++        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
++        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
++        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
++        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
++        off += 16;
++        const u32 opcode = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
++        if (!(w2 & FP_BRANCH) &&
++            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXD || opcode == OP_TXL || opcode == OP_TXB))
++            mask |= 1u << ((w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT);
++        if (fp_instruction_has_constant(w1, w2, w3))
++            off += 16;
++        if (w0 & FP_END)
++            return mask;
++    }
++    return 0;
++}
++
+ u64 rsx_fp_literal_source_hash(
+     const u8* ucode, u32 max_bytes, u64 seed)
+ {
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index a0d28191..5f6d1634 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -186,6 +186,11 @@ int rsx_fp_collect_constants(
+  * malformed input. */
+ u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed);
+ 
++/* Patch 2042: bit u set when the program samples texture unit u (TEX, TXP, TXD, TXL, TXB). The PSO key and
++ * the HLSL depend on per-unit state (cube, gamma, shadow, ARGB alias, unnormalised size) only for these units;
++ * state left bound on other units must not make a new pipeline. Returns 0 for malformed input. */
++u32 rsx_fp_texture_unit_mask(const u8* ucode, u32 max_bytes);
++
+ /* Hash the exact legacy HLSL literal spellings (%g) for a program while also
+  * retaining structural identity. This is intended for aggregate diagnostics;
+  * PSO identity should use rsx_fp_structural_hash in buffered mode. */
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 04a22d45..7d35b451 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -6223,7 +6223,7 @@ static ID3DBlob* ld_pstat_disk_load(u32 stage, const char* source, u32 source_le
+  * Recording is first-build-wins like the in-memory cache: the DSV format of a PSO follows the depth surface bound
+  * at its first build (apply_render_state's g.depth test), which the key does not include, so the record keeps it. */
+ #define LD_PL_MAGIC   0x4C505350u   /* "PSPL" */
+-#define LD_PL_VERSION 1u
++#define LD_PL_VERSION 2u   /* patch 2042: keys hash only the sampled texture units */
+ #define LD_PL_FLAG_LAYOUT 1u
+ #define LD_PL_FLAG_PACKED 2u
+ #define LD_PL_FLAG_DEPTH  4u
+@@ -6835,6 +6835,23 @@ static void ld_pso_bail(int* said, const char* reason)
+ #define LD_PSO_BAIL(reason) \
+     do { static int _said_ = 0; ld_pso_bail(&_said_, (reason)); } while (0)
+ 
++/* Patch 2042: which channels a TEXTURE_ADDRESS gamma field [23:20] decodes, as the R/G/B mask
++ * rsx_fp_apply_gamma takes (bit 0 R, 1 G, 2 B). LD_GAMMA_ORDER=rgb (the patch 2009 reading: field
++ * bit 0 = R, 1 = G, 2 = B) or argb (field bit 0 = A, 1 = R, 2 = G, 3 = B; A is not decoded).
++ * ASSUMPTION until the A/B against RPCS3 decides; see the RE notes pass 42. */
++static int ld_gamma_order_argb(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("LD_GAMMA_ORDER"); v = (e && !strcmp(e, "argb")) ? 1 : 0;
++                 fprintf(stderr, "[gamma] order %s (LD_GAMMA_ORDER=%s)\n", v ? "argb" : "rgb", e ? e : "unset"); }
++    return v;
++}
++static u32 ld_gamma_bits(u32 wrap)
++{
++    const u32 g = (wrap >> 20) & 0xFu;
++    if (!ld_gamma_order_argb()) return g & 7u;
++    return ((g >> 1) & 1u) | (((g >> 2) & 1u) << 1) | (((g >> 3) & 1u) << 2);
++}
+ /* Patch 2009 (diagnostic, off by default): LD_GAMMA_LOG=1 prints each new
+  * (unit, format, gamma) combination of an enabled fragment texture whose
+  * TEXTURE_ADDRESS gamma bits [23:20] are set, and every new value of
+@@ -6959,6 +6976,15 @@ static ID3D12PipelineState* get_pso(
+     }
+     LDW_ADD(RSX_PERF_W_PSO_PRE_T, gp_t0);
+     LDW_T0(gp_t1);
++    /* Patch 2042: per-unit texture state enters the key and the HLSL only for the units this program samples.
++     * Before, cube/gamma/shadow/ARGB/unnormalised state left bound on unused units made new keys and new HLSL
++     * (one level session: 1,281 PSOs from 248 programs, 869 pixel-shader sources), so keys and shader blobs
++     * from an earlier session rarely matched (release pass 17: 54 of 4,933 stored keys used).
++     * LD_PSO_ALL_UNITS=1 restores the old key (all units). */
++    static int all_units = -1;
++    if (all_units < 0) { const char* e = getenv("LD_PSO_ALL_UNITS"); all_units = (e && e[0] == '1') ? 1 : 0;
++                         fprintf(stderr, "[pso-key] %s\n", all_units ? "all texture units (LD_PSO_ALL_UNITS=1)" : "sampled units only"); }
++    const u32 fp_units = all_units ? 0xFFFFu : rsx_fp_texture_unit_mask(fp_uc, fp_size);
+ 
+     /* Fragment output register mode (fp16 h0 vs fp32 r0) is driven by the
+      * SHADER_CONTROL word bit 0x40 (same fix as the replay harness — the
+@@ -6980,6 +7006,7 @@ static ID3D12PipelineState* get_pso(
+     u8 shadow_zfunc[16] = {0};
+     u16 argb_remap[16] = {0};
+     for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
++        if (!((fp_units >> unit) & 1u)) continue;   /* patch 2042 */
+         rsx_dsp_texture texture;
+         rsx_dsp_get_texture(&g.rsx, unit, &texture);
+         if (texture.enabled || unit == 0) ld_gamma_log(unit, &texture);
+@@ -6991,7 +7018,7 @@ static ID3D12PipelineState* get_pso(
+             argb_mask |= 1u << unit;
+             argb_remap[unit] = (u16)(texture.remap & 0xFFFFu);
+         }
+-        if (texture.enabled && !no_gamma && ((texture.wrap >> 20) & 7u) &&
++        if (texture.enabled && !no_gamma && ld_gamma_bits(texture.wrap) &&
+             zalias != ZALIAS_SHADOW && zalias != ZALIAS_ARGB) {
+             /* LD_GAMMA_NO_SURF=1 (diagnostic A/B): no decode on units that
+              * sample a render surface (same location + offset). */
+@@ -7010,7 +7037,7 @@ static ID3D12PipelineState* get_pso(
+                           unit, texture.offset, texture.format, texture.width, texture.height);
+               } }
+             if (!(no_surf && is_surf))
+-                gamma_mask |= (u64)((texture.wrap >> 20) & 7u) << (unit * 3);
++                gamma_mask |= (u64)ld_gamma_bits(texture.wrap) << (unit * 3);
+         }
+         if (texture.enabled && texture.cubemap)
+             cube_mask |= 1u << unit;
+@@ -7089,7 +7116,8 @@ static ID3D12PipelineState* get_pso(
+         LD_PSO_BAIL("shader hash collapsed to zero");
+         return NULL;
+     }
+-    const u32 fp_ctrl_key = fp_ctrl & 0x4Eu;   /* 32-bit exports, depth export */
++    const u64 kl_fp = key;   /* patch 2042: LD_PSO_KEYLOG component */
++    const u32 fp_ctrl_key = fp_ctrl & 0x4Eu;   /* patch 2021: + depth export */
+     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
+     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
+     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+@@ -7114,6 +7142,7 @@ static ID3D12PipelineState* get_pso(
+     u32 unnorm_mask = 0;
+     u32 unnorm_dim[16][3] = {{0}};
+     for (u32 uu = 0; uu < 16; uu++) {
++        if (!((fp_units >> uu) & 1u)) continue;   /* patch 2042 */
+         rsx_dsp_texture ut; rsx_dsp_get_texture(&g.rsx, uu, &ut);
+         if (!ut.enabled || !(ut.format & TEX_FMT_UNNORM)) continue;
+         if (!ut.width || !ut.height) continue;
+@@ -7152,6 +7181,7 @@ static ID3D12PipelineState* get_pso(
+         key = fnv1a(
+             &packed_payload, sizeof(packed_payload), key);
+     }
++    const u64 kl_pre_rs = key;   /* patch 2042 */
+     if (ld_fp_constants_buffered())
+         key = ld_hash_structural_render_state(&rs, key);
+     else
+@@ -7343,6 +7373,22 @@ static ID3D12PipelineState* get_pso(
+         pso = build_pso(
+             vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key);
+         if (pso) ld_pl_record(key, &rs, masked_layout, packed_payload, g.depth != NULL);   /* patch 2031 */
++        /* Patch 2042 (diagnostic): LD_PSO_KEYLOG=<file> writes one line per PSO built this session with
++         * the key's components and the HLSL hashes, so two sessions' lines show which component
++         * keeps the keys from repeating (release pass 17: 54 of 4,933 stored keys used). */
++        { static FILE* kf = (FILE*)-1;
++          if (kf == (FILE*)-1) { const char* e = getenv("LD_PSO_KEYLOG"); kf = (e && *e) ? fopen(e, "w") : NULL; }
++          if (kf) {
++              fprintf(kf, "key=%016llx vp=%016llx vpn=%u fp=%016llx fpn=%u ctl=%02x cube=%08x vtex=%08x gam=%012llx"
++                          " shadow=%04x argb=%04x unn=%04x lay=%04x/%u/%d pre_rs=%016llx vs=%016llx/%u ps=%016llx/%u f=%u\n",
++                      (unsigned long long)key, (unsigned long long)vp_h, vp_instrs, (unsigned long long)kl_fp, fp_size,
++                      fp_ctrl_key, cube_mask, vtex_mask, (unsigned long long)gamma_mask, shadow_mask, argb_mask,
++                      unnorm_mask, masked_layout ? masked_layout->mask : 0xFFFFu,
++                      masked_layout && packed_payload ? masked_layout->stride : VERT_STRIDE, packed_payload,
++                      (unsigned long long)kl_pre_rs, (unsigned long long)g_ld_pl_last_vs_hash, g_ld_pl_last_vs_len,
++                      (unsigned long long)g_ld_pl_last_ps_hash, g_ld_pl_last_ps_len, g_ld_frames);
++              fflush(kf);
++          } }
+         if (bp_t0) { LDW_ADD(RSX_PERF_W_PSO_NEW_T, bp_t0); rsx_perf_add(RSX_PERF_W_PSO_NEW_N, 1); }
+     }
+ 

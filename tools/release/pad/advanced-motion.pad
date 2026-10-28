@@ -1,0 +1,30 @@
+# On Controller > Advanced Settings (advancedcontroller.gum). v1.00 rows: X-axis, Y-axis sensitivity, X-axis sensitivity, Zoom, Crouch,
+# Swap stick functions, Swap L1 and L2, Swap R1 and R2; 1.14 adds a Motion Sensor row. Row 1 (Y sensitivity) RIGHT changes a value;
+# then DOWN x7 to the last row, RIGHT to change it, LEFT back.
+key DOWN
+sleep 2
+key RIGHT
+sleep 2.5
+mark advanced y-sensitivity changed
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+sleep 1
+mark advanced last row
+key RIGHT
+sleep 3
+mark advanced last row changed
+key LEFT
+sleep 3
+mark advanced last row changed back

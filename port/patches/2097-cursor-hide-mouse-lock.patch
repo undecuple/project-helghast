@@ -1,0 +1,340 @@
+KZ3 patch 2097 (RSX pass 92): cursor hiding and mouse lock; native mouse look default on (the RE notes "Pass 92").
+ENHANCEMENT. libs/input/pad_mouse.h: pad_cursor_decide (pure; host test tools/smoke/test_cursor_gate.sh): hide =
+focused, not minimised, no title-bar drag/resize or menu loop, not closing, over the client area (any position in
+borderless/fullscreen), KZ3_CURSOR_HIDE (default 1); clip = the same and mouse look on. libs/input/pad_mouse.c: the
+window procedure hook answers WM_SETCURSOR with SetCursor(NULL) instead of patch 2069's ShowCursor count, ClipCursor
+to the client rect re-applied on WM_SIZE/WM_MOVE/WM_DISPLAYCHANGE/clicks/mode changes, released on WM_ACTIVATE
+inactive, WM_ACTIVATEAPP off, WM_KILLFOCUS, minimise, WM_ENTERSIZEMOVE/WM_ENTERMENULOOP and WM_CLOSE/WM_DESTROY;
+cursor handling no longer needs mouse look; pad_mouse_attach posts itself to the window's thread when called off it.
+KZ3_MOUSE_LOOK default on (=0 off). libs/video/rsx_null_backend.c: rsx_dm_apply reports each display mode
+(pad_mouse_set_mode), the exclusive re-take on activation re-applies (pad_mouse_refresh).
+
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+--- a/libs/input/pad_mouse.c	2026-10-21 12:13:16.219769700 -0500
++++ b/libs/input/pad_mouse.c	2026-10-21 12:15:25.190927654 -0500
+@@ -39,8 +39,9 @@
+ static void pm_init(void)
+ {
+     if (s_on >= 0) return;
+-    const char* e = getenv("KZ3_MOUSE_LOOK");
+-    int on = e && atoi(e) > 0;
++    const char* look = getenv("KZ3_MOUSE_LOOK");
++    const char* e;
++    int on = look && *look ? atoi(look) > 0 : 1;   /* patch 2097: default on (KZ3_MOUSE_LOOK=0 / kz3.ini mouse_look = 0 off) */
+     s_cfg.sens = pm_envf("KZ3_MOUSE_SENS", PAD_MOUSE_SENS_DEFAULT);
+     s_cfg.zoom_sens = pm_envf("KZ3_MOUSE_ZOOM_SENS", 1.0f);
+     e = getenv("KZ3_MOUSE_INVERT");
+@@ -54,8 +55,10 @@
+         if (bad) fprintf(stderr, "[mouse] WARNING: KZ3_MOUSE_SCRIPT: %d token(s) not read\n", bad);
+     }
+     if (on)
+-        fprintf(stderr, "[mouse] look on: sens=%.5f rad/count zoom=%.3f invert=%d script=%d event(s)\n",
+-                s_cfg.sens, s_cfg.zoom_sens, s_cfg.invert, s_nev);
++        fprintf(stderr, "[mouse] look on%s: sens=%.5f rad/count zoom=%.3f invert=%d script=%d event(s)\n",
++                look && *look ? " (KZ3_MOUSE_LOOK)" : " (default)", s_cfg.sens, s_cfg.zoom_sens, s_cfg.invert, s_nev);
++    else
++        fprintf(stderr, "[mouse] look off (KZ3_MOUSE_LOOK=%s)\n", look);
+     s_on = on;
+ }
+ 
+@@ -87,69 +90,173 @@
+ }
+ 
+ #ifdef _WIN32
+-static HWND s_hwnd;
+-static int  s_captured;
++/* Patch 2097 (RSX pass 92): cursor hiding and mouse lock by pad_cursor_decide (pad_mouse.h), on the window's thread
++ * only. The cursor is hidden by answering WM_SETCURSOR over the client area with SetCursor(NULL) (no ShowCursor:
++ * its display count is per thread and was unbalanced when the hide and the show ran on different threads); the lock
++ * is ClipCursor to the client rect, re-applied on every size, move, mode change and click, and released (only if
++ * we set it) on focus loss, minimise, title-bar drag/resize, the system menu and close. */
++#define PAD_MOUSE_WM_ATTACH (WM_APP + 0x69)
++static HWND           s_hwnd;        /* the game window (set with or without mouse look) */
++static int            s_raw;         /* Raw Input registered */
++static int            s_clipped;     /* our ClipCursor is in force */
++static PadCursorState s_cs = { 0, 0, 0, 0, 0, 0, 1 };
++static PadCursorDo    s_last = { -1, -1 };
++
++static int pm_cursor_over_client(HWND hwnd)
++{
++    POINT pt;
++    RECT rc;
++    if (!GetCursorPos(&pt) || WindowFromPoint(pt) != hwnd) return 0;
++    ScreenToClient(hwnd, &pt);
++    GetClientRect(hwnd, &rc);
++    return PtInRect(&rc, pt);
++}
+ 
+-static void pm_capture(HWND hwnd, int on)
++static void pm_apply(HWND hwnd, const char* why)
+ {
+-    if (on) {
++    const int over = pm_cursor_over_client(hwnd);
++    const PadCursorDo d = pad_cursor_decide(&s_cs, over);
++    if (d.clip) {
+         RECT rc;
+         POINT tl = {0, 0}, br;
+         GetClientRect(hwnd, &rc);
+         br.x = rc.right; br.y = rc.bottom;
+         ClientToScreen(hwnd, &tl);
+         ClientToScreen(hwnd, &br);
+-        RECT clip = { tl.x, tl.y, br.x, br.y };
+-        ClipCursor(&clip);
+-        if (!s_captured) ShowCursor(FALSE);
+-        s_captured = 1;
+-    } else if (s_captured) {
++        if (br.x > tl.x && br.y > tl.y) {
++            RECT clip = { tl.x, tl.y, br.x, br.y };
++            s_clipped = ClipCursor(&clip) ? 1 : s_clipped;
++        }
++    } else if (s_clipped) {
+         ClipCursor(NULL);
+-        ShowCursor(TRUE);
+-        s_captured = 0;
++        s_clipped = 0;
++    }
++    /* WM_SETCURSOR only comes when the mouse moves: set the cursor now when it is over the client area. */
++    if (over) SetCursor(d.hide ? NULL : LoadCursor(NULL, IDC_ARROW));
++    if (d.hide != s_last.hide || d.clip != s_last.clip) {
++        fprintf(stderr, "[mouse] cursor %s, %s (%s: mode %d focus %d min %d sizemove %d closing %d look %d)\n",
++                d.hide ? "hidden" : "shown", d.clip ? "locked to the client area" : "free", why, s_cs.mode,
++                s_cs.focused, s_cs.minimized, s_cs.sizemove, s_cs.closing, s_cs.look_on);
++        s_last = d;
+     }
+ }
+ 
++static void pm_attach_here(HWND hwnd)
++{
++    const char* e = getenv("KZ3_CURSOR_HIDE");
++    s_cs.hide_opt = !(e && *e && atoi(e) <= 0);
++    s_cs.look_on = pad_mouse_enabled();
++    s_hwnd = hwnd;
++    if (s_cs.look_on && !s_raw) {
++        RAWINPUTDEVICE rid;
++        rid.usUsagePage = 0x01;   /* generic desktop */
++        rid.usUsage = 0x02;       /* mouse */
++        rid.dwFlags = 0;          /* only while the window has the focus */
++        rid.hwndTarget = hwnd;
++        if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
++            s_raw = 1;
++            fprintf(stderr, "[mouse] raw input registered\n");
++        } else {
++            fprintf(stderr, "[mouse] RegisterRawInputDevices failed (%lu): no mouse look\n", GetLastError());
++            s_cs.look_on = 0;
++        }
++    }
++    s_cs.focused = GetForegroundWindow() == hwnd;
++    s_cs.minimized = IsIconic(hwnd) ? 1 : 0;
++    fprintf(stderr, "[mouse] cursor gate: hide %s (KZ3_CURSOR_HIDE), lock %s (mouse look)\n",
++            s_cs.hide_opt ? "on" : "off", s_cs.look_on ? "on" : "off");
++    pm_apply(hwnd, "attach");
++}
++
+ void pad_mouse_attach(HWND hwnd)
+ {
+-    if (!pad_mouse_enabled() || !hwnd) return;
+-    RAWINPUTDEVICE rid;
+-    rid.usUsagePage = 0x01;   /* generic desktop */
+-    rid.usUsage = 0x02;       /* mouse */
+-    rid.dwFlags = 0;          /* only while the window has the focus */
+-    rid.hwndTarget = hwnd;
+-    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+-        fprintf(stderr, "[mouse] RegisterRawInputDevices failed (%lu): no mouse look\n", GetLastError());
++    if (!hwnd) return;
++    if (GetWindowThreadProcessId(hwnd, NULL) != GetCurrentThreadId()) {
++        PostMessageA(hwnd, PAD_MOUSE_WM_ATTACH, 0, 0);   /* the window's thread attaches (pad_mouse_wndmsg) */
+         return;
+     }
+-    s_hwnd = hwnd;
+-    if (GetForegroundWindow() == hwnd) pm_capture(hwnd, 1);
+-    fprintf(stderr, "[mouse] raw input registered\n");
++    pm_attach_here(hwnd);
++}
++
++void pad_mouse_set_mode(HWND hwnd, int mode)
++{
++    if (!s_hwnd || hwnd != s_hwnd) return;
++    s_cs.mode = mode;
++    pm_apply(hwnd, "display mode");
++}
++
++void pad_mouse_refresh(HWND hwnd)
++{
++    if (s_hwnd && hwnd == s_hwnd) pm_apply(hwnd, "refresh");
+ }
+ 
+ int pad_mouse_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
+ {
+-    (void)res;
++    if (msg == PAD_MOUSE_WM_ATTACH) { pm_attach_here(hwnd); *res = 0; return 1; }
+     if (!s_hwnd || hwnd != s_hwnd) return 0;
+     switch (msg) {
+     case WM_INPUT: {
+         RAWINPUT ri;
+         UINT size = sizeof(ri);
+-        if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
++        if (s_cs.look_on &&
++            GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+             ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
+             (ri.data.mouse.lLastX || ri.data.mouse.lLastY))
+             pad_mouse_add((int)ri.data.mouse.lLastX, (int)ri.data.mouse.lLastY);
+         return 0;   /* DefWindowProc cleans up */
+     }
++    case WM_SETCURSOR:
++        if ((HWND)wp == hwnd) {
++            const PadCursorDo d = pad_cursor_decide(&s_cs, LOWORD(lp) == HTCLIENT);
++            if (d.hide) { SetCursor(NULL); *res = TRUE; return 1; }
++        }
++        return 0;   /* DefWindowProc: the class arrow, the frame's resize arrows */
+     case WM_ACTIVATE:
+-        pm_capture(hwnd, LOWORD(wp) != WA_INACTIVE);
++        s_cs.focused = LOWORD(wp) != WA_INACTIVE;
++        s_cs.minimized = HIWORD(wp) != 0;
++        pm_apply(hwnd, "WM_ACTIVATE");
++        return 0;
++    case WM_ACTIVATEAPP:
++        if (!wp) { s_cs.focused = 0; pm_apply(hwnd, "WM_ACTIVATEAPP"); }   /* Alt+Tab; activation: WM_ACTIVATE */
++        return 0;
++    case WM_SETFOCUS:
++        s_cs.focused = 1;
++        pm_apply(hwnd, "WM_SETFOCUS");
++        return 0;
++    case WM_KILLFOCUS:
++        s_cs.focused = 0;
++        pm_apply(hwnd, "WM_KILLFOCUS");
+         return 0;
+     case WM_SIZE:
++        s_cs.minimized = wp == SIZE_MINIMIZED;
++        pm_apply(hwnd, "WM_SIZE");
++        return 0;
+     case WM_MOVE:
+-        if (s_captured) pm_capture(hwnd, 1);
++    case WM_DISPLAYCHANGE:
++        pm_apply(hwnd, msg == WM_MOVE ? "WM_MOVE" : "WM_DISPLAYCHANGE");
+         return 0;
+-    case WM_KILLFOCUS:
+-        pm_capture(hwnd, 0);
++    case WM_ENTERSIZEMOVE:
++    case WM_ENTERMENULOOP:
++        s_cs.sizemove = 1;
++        pm_apply(hwnd, "size/move or menu");
++        return 0;
++    case WM_EXITSIZEMOVE:
++    case WM_EXITMENULOOP:
++        s_cs.sizemove = 0;
++        pm_apply(hwnd, "size/move or menu done");
++        return 0;
++    case WM_LBUTTONDOWN:
++    case WM_RBUTTONDOWN:
++    case WM_MBUTTONDOWN:
++    case WM_XBUTTONDOWN:
++        /* A click into the window re-locks (another program may have reset the clip while we kept the focus). */
++        if (!s_cs.focused && GetForegroundWindow() == hwnd) s_cs.focused = 1;
++        pm_apply(hwnd, "click");
++        return 0;
++    case WM_CLOSE:
++    case WM_DESTROY:
++        s_cs.closing = 1;
++        pm_apply(hwnd, msg == WM_CLOSE ? "WM_CLOSE" : "WM_DESTROY");
+         return 0;
+     }
+     return 0;
+diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+--- a/libs/input/pad_mouse.h	2026-10-21 12:13:16.220769722 -0500
++++ b/libs/input/pad_mouse.h	2026-10-21 12:13:34.269638052 -0500
+@@ -14,7 +14,10 @@
+  * Sensitivity model from KAMI (isJuhn/KAMI, MIT): radians per count, default 0.003 (about 0.17 degrees per count).
+  *
+  * Switches (read once; pad_mouse.c):
+- *   KZ3_MOUSE_LOOK=1        on (default off: opt-in until the owner has tried it).
++ *   KZ3_MOUSE_LOOK=0        off (default on since patch 2097, project decision 2026-10-21; kz3.ini
++ *                           `mouse_look = 0` does the same, the environment wins). A pad works the same either way:
++ *                           no counts = the game's own look values untouched.
++ *   KZ3_CURSOR_HIDE=0       keep the cursor visible over the game window (patch 2097; default hidden, below).
+  *   KZ3_MOUSE_SENS=<f>      radians per count (0.003).
+  *   KZ3_MOUSE_ZOOM_SENS=<f> extra factor while zoomed (1.0; the weapon's own factor already applies).
+  *   KZ3_MOUSE_INVERT=1      inverted Y.
+@@ -61,6 +64,36 @@
+     return 1;
+ }
+ 
++/* KZ3 patch 2097 (RSX pass 92), ENHANCEMENT: cursor hiding and mouse lock. Pure decision; pad_mouse.c applies it on
++ * the window's thread (WM_SETCURSOR -> SetCursor(NULL) on the client area, ClipCursor to the client rect).
++ *   hide: the game window has the focus, is not minimised, no title-bar drag/resize or system menu is running, the
++ *         window is not closing, and the cursor is over the client area (borderless/fullscreen: the whole window is
++ *         client). Display improvement: on even with mouse look off (KZ3_CURSOR_HIDE=0 keeps the arrow).
++ *   clip: the same conditions (minus the cursor position) and mouse look on. With mouse look off nothing reads the
++ *         mouse, so the pointer stays free to leave the window.
++ * Modes use rsx_display_mode.h's numbers (0 windowed, 1 borderless, 2 fullscreen). */
++typedef struct {
++    int mode;        /* 0 windowed, 1 borderless, 2 exclusive fullscreen */
++    int focused;     /* window active and has the keyboard focus */
++    int minimized;
++    int sizemove;    /* WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE or a menu loop (title-bar drag, frame resize, Alt+Space) */
++    int closing;     /* WM_CLOSE / WM_DESTROY seen */
++    int look_on;     /* KZ3_MOUSE_LOOK */
++    int hide_opt;    /* KZ3_CURSOR_HIDE (1 default) */
++} PadCursorState;
++
++typedef struct { int hide, clip; } PadCursorDo;
++
++/* over_client: the cursor is over the client area (WM_SETCURSOR's HTCLIENT); ignored outside windowed mode. */
++static inline PadCursorDo pad_cursor_decide(const PadCursorState* s, int over_client)
++{
++    PadCursorDo d = {0, 0};
++    const int live = s->focused && !s->minimized && !s->sizemove && !s->closing;
++    d.hide = live && s->hide_opt && (s->mode != 0 || over_client);
++    d.clip = live && s->look_on;
++    return d;
++}
++
+ /* KZ3_MOUSE_SCRIPT */
+ typedef struct {
+     double t;
+@@ -117,10 +150,16 @@
+ #ifdef _WIN32
+ #include <windows.h>
+ /* Window glue for the backends' window procedures: registers Raw Input for the mouse on the game window (when
+- * KZ3_MOUSE_LOOK is on) and hides/clips the cursor while the window is active. pad_mouse_wndmsg returns 1 when the
+- * message is fully handled (*res set); WM_INPUT is never fully handled (DefWindowProc does the cleanup). */
++ * KZ3_MOUSE_LOOK is on) and hides/clips the cursor by pad_cursor_decide (patch 2097). pad_mouse_wndmsg returns 1
++ * when the message is fully handled (*res set: WM_SETCURSOR while hidden); WM_INPUT is never fully handled
++ * (DefWindowProc does the cleanup). pad_mouse_attach may be called from any thread: off the window's thread it posts
++ * itself to the window (cursor and clip calls belong to the window's thread). pad_mouse_set_mode: the display mode
++ * the window is in now (rsx_null_backend.c after every mode change); pad_mouse_refresh re-applies the clip and the
++ * cursor (after an exclusive fullscreen re-take). */
+ void pad_mouse_attach(HWND hwnd);
+ int  pad_mouse_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res);
++void pad_mouse_set_mode(HWND hwnd, int mode);
++void pad_mouse_refresh(HWND hwnd);
+ #endif
+ 
+ #ifdef __cplusplus
+diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c	2026-10-21 12:13:16.221769744 -0500
++++ b/libs/video/rsx_null_backend.c	2026-10-21 12:14:21.677736157 -0500
+@@ -160,6 +160,7 @@
+             if (r < 0 && s_present_suppressed) {           /* live draw not up yet: retry at the next pump */
+                 s_dm_pending = RSX_DM_FULLSCREEN;
+                 s_dm_applied = RSX_DM_BORDERLESS;
++                pad_mouse_set_mode(h, s_dm_applied);   /* patch 2097: re-hide / re-clip for the new window */
+                 rsx_dm_log_client("exclusive fullscreen waits for the swap chain");
+                 return;
+             }
+@@ -172,6 +173,7 @@
+         }
+     }
+     s_dm_applied = m;
++    pad_mouse_set_mode(h, m);   /* patch 2097: re-hide / re-clip for the new window */
+     rsx_dm_log_client(why);
+ }
+ 
+@@ -231,6 +233,7 @@
+     }
+     if (msg == WM_ACTIVATEAPP && wp && s_dm_applied == RSX_DM_FULLSCREEN && !rsx_live_draw_is_fullscreen()) {
+         if (rsx_live_draw_set_fullscreen(1) > 0) rsx_dm_log_client("exclusive fullscreen taken back on activation");
++        pad_mouse_refresh(hwnd);   /* patch 2097: the clip follows the re-taken output */
+     }
+     return 0;
+ }

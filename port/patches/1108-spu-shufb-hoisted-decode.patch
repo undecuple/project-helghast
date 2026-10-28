@@ -1,0 +1,121 @@
+KZ3 patch 1108 (SPU pass 79): shufb with a loop-invariant control decodes the control once per function.
+
+Patch 1082's one-source shufb (spu_shufb1, ra == rb) costs 7 vector ops, 5 of them decoding the control (the byte index
+and the special selectors 0x80/0xC0/0xE0). In job 255's 0x5868 loop 54 of the 63 shufb1 use r11, r13 or r21 as the
+control, and no statement of that function writes them. The lifter (emit_source, _shufb1_hoist) now finds functions
+with a loop (a goto back to an earlier label) whose only uses of ctx are gpr reads/writes, the LS accessors and
+SPU_RET (no call, channel, hop or halt that could change a register), and for each shufb1 control the function never
+writes it emits SPU_SHUFB1_DEC(n) at entry and spu_shufb1_h(a, spu__sdN, c) at the uses. Decode: idx = (c & 0x8F) ^ 3
+(1082's index with bit 7 kept, so pshufb zeroes a special selector's lane) and sp = the special byte per lane (0x00
+for 0x80..0xBF and for every normal selector, 0xFF for 0xC0..0xDF, 0x80 for 0xE0..0xFF); a use is
+pshufb(a, idx) | sp, 2 ops. All lifted images: 1,386 of 17,324 shufb1 in 154 functions. Bit-identical to
+spu_shufb(a, a, c): host tests tools/spu/test_spu_shufh.sh (all 256 control bytes in every lane position, random
+vectors, plus the lifter pass on synthetic functions) and, with game data, work/spu/r79/hb.sh (job 255's lifted loop,
+same hashes; host 144.5 -> 129.5 ns per loop iteration). Compile-time switch: -DSPU_SHUFB_HOIST=0 (C flags) = old
+(the lifted source still names spu_shufb1_h, which then is spu_shufb1). Upstream candidate (with 1082).
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -536,6 +536,40 @@
+ #else
+ static inline u128 spu_shufb1(u128 a, u128 c) { return spu_shufb(a, a, c); }
+ #endif
++/* KZ3 patch 1108 (SPU pass 79): shufb1 with a loop-invariant control, its decode hoisted. The lifter
++ * (spu_lifter.py, emit_source) finds functions with a loop, no calls and no ctx use besides gpr and LS, and for each
++ * shufb1 control register the function never writes, emits SPU_SHUFB1_DEC(n) once at entry and spu_shufb1_h(a, spu__sdN,
++ * c) at the uses (job 255's 0x5868 loop: 54 of 63 shufb1 on r11/r13/r21, none written in the function). The decode is
++ * a function of the control alone: idx = (c & 0x8F) ^ 3 (the 1082 byte index, bit 7 kept so pshufb zeroes a special
++ * selector's lane) and sp = the special byte per lane (0x00 for 0x80..0xBF and for every normal selector, 0xFF for
++ * 0xC0..0xDF, 0x80 for 0xE0..0xFF); the result is pshufb(a, idx) | sp: 2 ops per shufb instead of 7.
++ * Bit-identical to spu_shufb(a, a, c) (tools/spu/test_spu_shufh.sh). -DSPU_SHUFB_HOIST=0 = old (spu_shufb1 at
++ * every use, no decode). */
++#ifndef SPU_SHUFB_HOIST
++#  define SPU_SHUFB_HOIST 1
++#endif
++#if SPU_SHUFB_HOIST && defined(__SSE4_1__)
++typedef struct { __m128i idx, sp; } spu_shufb1_d;
++SPU_HOT spu_shufb1_d spu_shufb1_dec(u128 c) {
++    __m128i C; memcpy(&C, &c, 16);
++    const __m128i lut = _mm_setr_epi8(0,0,0,0, 0,0,0,0, 0,0,0,0, (char)0xFF,(char)0xFF,(char)0x80,(char)0x80);
++    spu_shufb1_d d;
++    d.idx = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8((char)0x8F)), _mm_set1_epi8(3));
++    d.sp  = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 4), _mm_set1_epi8(0x0F)));
++    return d;
++}
++SPU_HOT u128 spu_shufb1_h(u128 a, spu_shufb1_d d, u128 c) {
++    (void)c;
++    __m128i A; memcpy(&A, &a, 16);
++    __m128i r = _mm_or_si128(_mm_shuffle_epi8(A, d.idx), d.sp);
++    u128 out; memcpy(&out, &r, 16); return out;
++}
++#  define SPU_SHUFB1_DEC(n) const spu_shufb1_d spu__sd##n = spu_shufb1_dec(ctx->gpr[n]);
++#else
++typedef int spu_shufb1_d;
++#  define spu_shufb1_h(a, d, c) spu_shufb1((a), (c))
++#  define SPU_SHUFB1_DEC(n)
++#endif
+
+ /* ---- shift / rotate immediate (word lanes) ---- */
+ static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -147,6 +147,46 @@
+ #define spu_ls_write128(c, a, v) spu_ls_write128_l((c), spu__ls, spu__lsdbg, (a), (v))
+ """
+
++# KZ3 patch 1108: hoisting the shufb1 control decode (runtime/spu/spu_helpers.h spu_shufb1_dec / spu_shufb1_h).
++_SHUFB1_RE = re.compile(r"spu_shufb1\((ctx->gpr\[\d+\]), ctx->gpr\[(\d+)\]\)")
++_GPR_WRITE_RE = re.compile(r"ctx->gpr\[(\d+)\](?:\.\w+)?(?:\[[^\]]*\])?\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)")
++# The only uses of ctx a hoisting function may have: register reads/writes, the LS accessors, the return.
++_CTX_OK_RE = re.compile(r"ctx->gpr\[|spu_ls_read128\(ctx,|spu_ls_write128\(ctx,|SPU_RET\(ctx\)")
++
++
++def _shufb1_hoist(body_lines):
++    """Rewrite the shufb1 uses of loop-invariant controls (patch 1108); return (lines, hoisted register numbers).
++
++    A control register qualifies when the function has a loop (a goto back to an earlier label), touches ctx only
++    through gpr, the LS accessors and SPU_RET (so no call, channel, hop or halt can change a register behind its
++    back), and no statement of the function writes that register: its value at entry is then its value at every use,
++    and the decode can be done once at entry. Everything else is left as it was."""
++    if not any("spu_shufb1(" in b for b in body_lines):
++        return body_lines, []
++    seen, loop = set(), False
++    for b in body_lines:
++        if b.endswith(":"):
++            seen.add(b[:-1].strip())
++        m = re.search(r"goto (\w+);", b)
++        if m and m.group(1) in seen:
++            loop = True
++        if "&ctx->gpr" in b or len(_CTX_OK_RE.findall(b)) != b.count("ctx"):
++            return body_lines, []
++    if not loop:
++        return body_lines, []
++    written = {int(n) for b in body_lines for n in _GPR_WRITE_RE.findall(b)}
++    ctl = {int(m.group(2)) for b in body_lines for m in _SHUFB1_RE.finditer(b)} - written
++    if not ctl:
++        return body_lines, []
++
++    def sub(m):
++        n = int(m.group(2))
++        if n not in ctl:
++            return m.group(0)
++        return f"spu_shufb1_h({m.group(1)}, spu__sd{n}, ctx->gpr[{n}])"
++    return [_SHUFB1_RE.sub(sub, b) for b in body_lines], sorted(ctl)
++
++
+ # ---------------------------------------------------------------------------
+ # Operand helpers
+ # ---------------------------------------------------------------------------
+@@ -1101,7 +1141,11 @@
+             # KZ3 patch 1082: one LS base / debug-gate snapshot per function that touches LS (see SOURCE_PREAMBLE).
+             if any("spu_ls_read128(" in b or "spu_ls_write128(" in b for b in f.body_lines):
+                 lines.append("    SPU_LS_LOCALS")
+-            for b in f.body_lines:
++            # KZ3 patch 1108: loop-invariant shufb1 controls decoded once at entry (runtime/spu/spu_helpers.h).
++            body, decs = _shufb1_hoist(f.body_lines)
++            for n in decs:
++                lines.append(f"    SPU_SHUFB1_DEC({n})")
++            for b in body:
+                 lines.append(b if b.endswith(":") else f"    {b}")
+             lines.append("}")
+             lines.append("")

@@ -1,0 +1,625 @@
+KZ3 patch 2092: device-resident vertex cache (LD_VTX_DEV=1|0, LD_VTX_DEV_MB, LD_VTX_DEV_STAGE_MB); pass 87.
+
+Built on patch 2047's draw payload cache (which LD_VTX_DEV=1 turns on, main memory included): a cached draw's
+converted vertices and topology indices live in one DEFAULT-heap arena buffer instead of a CPU copy, so a hit costs
+no fetch, no ring copy and no PCIe read of the UPLOAD heap. The fill draw draws from the upload ring as before; its
+payload and indices are also written to a staging block of an own UPLOAD buffer and a GPU copy into the arena is
+queued; the copy list (patch 2053's, created for this switch too) runs it ahead of the submit's draw list. A hit
+binds the arena block as vertex and index buffer. Validity is 2047's rule, unchanged in meaning: no tracked write
+(cellGcm_note_guest_write_pages_ea, SPU puts, host file reads, the walker's own stores: the 64 KB page bitmap and
+stamps) since the fill, then a full compare of every source byte against the copy taken at the fill (recompiled PPU
+stores into main memory note nothing). A dropped entry's arena block and every staging block return to their
+allocator only when the fence of the lists that may still read them completes. Also for 2047: two ways per set
+instead of direct mapping (the less recently looked-up way is evicted), and with LD_VTX_DEV an entry invalidated
+twice by content changes is dynamic like one invalidated twice by tracked writes. Off with the dumps that read every
+draw's CPU payload, LD_GEOM_CAPTURE and LD_VTX_CACHE=verify. Log `[vtx-dev]` (cumulative, with `[vtx-cache]`).
+
+Host test: tools/smoke/test_vtx_dev.sh (arena with fence-deferred frees under a 200k-step random model, the
+tracked-write and full-compare hit rule; no D3D12).
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2734,6 +2734,7 @@
+     if (on < 0) { const char* e = getenv("LD_VB_DEVICE"); on = e && e[0] == '1'; }   /* default off: pass 55 measured no gain */
+     return on;
+ }
++static int ld_vd_on(void);   /* patch 2092 */
+ static ID3D12Resource* ld_vbd_make(u64 bytes)
+ {
+     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+@@ -2757,14 +2758,14 @@
+         if (ib_mb > INDEX_BUFFER_SIZE / (1024u * 1024u)) ib_mb = INDEX_BUFFER_SIZE / (1024u * 1024u);
+         g.vbd_size = vb_mb * 1024u * 1024u; g.ibd_size = ib_mb * 1024u * 1024u;
+     }
+-    f->vbd = ld_vbd_make(g.vbd_size); f->ibd = ld_vbd_make(g.ibd_size);
++    if (ld_vbd_on()) { f->vbd = ld_vbd_make(g.vbd_size); f->ibd = ld_vbd_make(g.ibd_size); }   /* 2092: or copy list only */
+     g.dev->lpVtbl->CreateCommandAllocator(g.dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&f->calloc);
+-    return f->vbd && f->ibd && f->calloc;
++    return (!ld_vbd_on() || (f->vbd && f->ibd)) && f->calloc;
+ }
+ static void ld_vbd_init(void)
+ {
+     g.vbd = NULL; g.ibd = NULL; g.clist = NULL;
+-    if (!ld_vbd_on()) return;
++    if (!ld_vbd_on() && !ld_vd_on()) return;   /* patch 2092: the device cache needs the copy list too */
+     int ok = ld_vbd_slot_init(&g.fr[0]);
+     if (ok && g.fif_n > 1) ok = ld_vbd_slot_init(&g.fr[1]);
+     if (ok) {
+@@ -2772,26 +2773,124 @@
+                                          &IID_ID3D12GraphicsCommandList, (void**)&g.clist);
+         if (g.clist) g.clist->lpVtbl->Close(g.clist); else ok = 0;
+     }
+-    if (!ok) { fprintf(stderr, "[live-draw] device vertex rings failed; upload-heap vertex reads\n"); return; }
++    if (!ok) { fprintf(stderr, "[live-draw] device vertex rings failed; upload-heap vertex reads\n"); g.clist = NULL; return; }
+     g.vbd = g.fr[g.fr_cur].vbd; g.ibd = g.fr[g.fr_cur].ibd; g.calloc = g.fr[g.fr_cur].calloc;
++    if (!ld_vbd_on()) return;   /* patch 2092: copy list only */
+     fprintf(stderr, "[live-draw] device vertex rings: vb %u MB, ib %u MB per frame slot\n", g.vbd_size >> 20, g.ibd_size >> 20);
+ }
++/* KZ3 patch 2092: device-resident vertex cache (LD_VTX_DEV=1|0, default LD_VTX_DEV_DEFAULT; LD_VTX_DEV_MB arena
++ * size, default 256). Patch 2047's payload cache (on with this switch, main memory included) keeps each cached
++ * draw's converted vertices and topology indices in one DEFAULT-heap buffer instead of a CPU copy: the fill draw
++ * reads the upload ring as before; its payload and indices are also written to a staging block (own UPLOAD buffer,
++ * LD_VTX_DEV_STAGE_MB, default 64; not the vertex ring, whose bytes a later draw or ring reset may overwrite before
++ * the submit) and a GPU copy into an arena block is queued (executed by the copy list ahead of the submit's draw
++ * list, as 2053's mirrors are; the staging block is free again once that submit's fence completes); a hit binds the block directly, so it costs no
++ * fetch, no ring copy and no PCIe read (pass 83: ~44 MB/frame of float4 vertices read from the UPLOAD heap, ~4.8 ms
++ * of K4 GPU draw time). Validity is 2047's rule (tracked page notes, then a full compare of the source bytes
++ * against the copy taken at the fill), so a hit draws the same bytes the fetch would. A dropped entry's block goes
++ * back to the arena only when the fence of the lists that may still read it completes (rsx_vtx_dev.h). Off with
++ * the dumps that read every draw's CPU payload (as 2047) and with LD_GEOM_CAPTURE. Log [vtx-dev]. */
++#include "rsx_vtx_dev.h"
++#define LD_VTX_DEV_DEFAULT 1   /* on since 2026-10-20: K4 A/B 6/6 pairs (RSX pass 88 + confirmation), fps_window +0.7 to +1.1 */
++#define LD_VD_COPIES 4096u
++static struct {
++    rsx_vd_arena a; ID3D12Resource* buf; u64 va; int tried, ok;
++    rsx_vd_arena sa; ID3D12Resource* stage; u8* stage_mapped;   /* staging blocks (UPLOAD heap) */
++    struct { u32 src_off, dst_off, len; } cp[LD_VD_COPIES]; u32 n_cp;
++} g_vd;
++static int ld_vd_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("LD_VTX_DEV");
++        on = e ? (e[0] == '1') : LD_VTX_DEV_DEFAULT;
++        if (getenv("RSX_DRAW_CSV") || getenv("LD_DRAW_INPUTS") || getenv("LD_DRAW_DUMP") || getenv("RSX_A010_GEOM") ||
++            getenv("LD_GEOM_CAPTURE"))
++            on = 0;
++        const char* m = getenv("LD_VTX_CACHE");
++        if (m && !strcmp(m, "verify")) on = 0;   /* verify compares CPU payloads: 2047's path */
++        fprintf(stderr, "[vtx-dev] %s (LD_VTX_DEV=%s) mb=%s\n", on ? "on" : "off", e ? e : "unset",
++                getenv("LD_VTX_DEV_MB") ? getenv("LD_VTX_DEV_MB") : "256");
++    }
++    return on && (!g_vd.tried || g_vd.ok);
++}
++/* Walker: the arena buffer, created at the first fill. 0 = unavailable (the cache then keeps CPU copies). */
++static int ld_vd_ready(void)
++{
++    if (g_vd.tried) return g_vd.ok;
++    g_vd.tried = 1;
++    if (!g.clist) { fprintf(stderr, "[vtx-dev] no copy list: off\n"); return 0; }
++    const char* e = getenv("LD_VTX_DEV_MB");
++    u32 mb = e ? (u32)atoi(e) : 256u;
++    if (mb < 16u) mb = 16u;
++    if (mb > 2047u) mb = 2047u;
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (u64)mb << 20; bd.Height = 1; bd.DepthOrArraySize = 1;
++    bd.MipLevels = 1; bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    const char* se = getenv("LD_VTX_DEV_STAGE_MB");
++    u32 smb = se ? (u32)atoi(se) : 64u;
++    if (smb < 4u) smb = 4u;
++    if (smb > 1024u) smb = 1024u;
++    D3D12_HEAP_PROPERTIES up = {0}; up.Type = D3D12_HEAP_TYPE_UPLOAD;
++    D3D12_RESOURCE_DESC sd = bd; sd.Width = (u64)smb << 20;
++    D3D12_RANGE nr = {0, 0};
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON,
++                                                      NULL, &IID_ID3D12Resource, (void**)&g_vd.buf)) ||
++        FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &up, D3D12_HEAP_FLAG_NONE, &sd,
++                                                      D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
++                                                      (void**)&g_vd.stage)) ||
++        FAILED(g_vd.stage->lpVtbl->Map(g_vd.stage, 0, &nr, (void**)&g_vd.stage_mapped)) ||
++        !rsx_vd_init(&g_vd.a, mb << 20) || !rsx_vd_init(&g_vd.sa, smb << 20)) {
++        fprintf(stderr, "[vtx-dev] arena of %u MB + staging %u MB failed: off\n", mb, smb);
++        if (g_vd.buf) { g_vd.buf->lpVtbl->Release(g_vd.buf); g_vd.buf = NULL; }
++        if (g_vd.stage) { g_vd.stage->lpVtbl->Release(g_vd.stage); g_vd.stage = NULL; }
++        return 0;
++    }
++    g_vd.va = g_vd.buf->lpVtbl->GetGPUVirtualAddress(g_vd.buf);
++    g_vd.ok = 1;
++    fprintf(stderr, "[vtx-dev] arena %u MB, staging %u MB\n", mb, smb);
++    return 1;
++}
++static u32 ld_vd_alloc(rsx_vd_arena* a, u32 len)
++{
++    u32 off = rsx_vd_alloc(a, len);
++    if (off == RSX_VD_NONE && a->n_pd) {   /* blocks freed earlier whose readers may have completed */
++        rsx_vd_reclaim(a, g.fence->lpVtbl->GetCompletedValue(g.fence));
++        off = rsx_vd_alloc(a, len);
++    }
++    return off;
++}
++/* The lists that may still read a dropped block signal at most the open list's value, g.fence_value + 1. */
++static void ld_vd_release(u32 off, u32 len)
++{
++    if (!rsx_vd_free_later(&g_vd.a, off, len, g.fence_value + 1u))
++        fprintf(stderr, "[vtx-dev] pending-free list out of memory (%u bytes leak)\n", len);
++}
+ /* Called by every submit before the draw list executes: copies the byte ranges the list's draws read. */
+ static void ld_vbd_submit(void)
+ {
+-    if (!g.vbd) return;
+-    const int vb = g.vb_hi > g.vb_lo, ib = g.ib_hi > g.ib_lo;
+-    if (!vb && !ib) return;
++    const int vd = g_vd.n_cp != 0;   /* patch 2092 */
++    if (!g.vbd && !vd) return;
++    const int vb = g.vbd && g.vb_hi > g.vb_lo, ib = g.vbd && g.ib_hi > g.ib_lo;
++    if (!vb && !ib && !vd) return;
+     g.clist->lpVtbl->Reset(g.clist, g.calloc, NULL);
+     ld_gt_copy_stamp(g.clist, 0);   /* patch 2052 timestamps */
+     g_gt.c_bytes += (double)(vb ? g.vb_hi - g.vb_lo : 0) + (double)(ib ? g.ib_hi - g.ib_lo : 0);
+-    D3D12_RESOURCE_BARRIER b[2]; memset(b, 0, sizeof b);
++    D3D12_RESOURCE_BARRIER b[3]; memset(b, 0, sizeof b);
+     u32 n = 0;
+     if (vb) { b[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[n].Transition.pResource = g.vbd; b[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[n].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST; n++; }
+     if (ib) { b[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[n].Transition.pResource = g.ibd; b[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[n].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST; n++; }
++    if (vd) { b[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[n].Transition.pResource = g_vd.buf; b[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[n].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST; n++; }   /* patch 2092 */
+     g.clist->lpVtbl->ResourceBarrier(g.clist, n, b);
+     if (vb) g.clist->lpVtbl->CopyBufferRegion(g.clist, g.vbd, g.vb_lo, g.vb, g.vb_lo, (u64)(g.vb_hi - g.vb_lo));
+     if (ib) g.clist->lpVtbl->CopyBufferRegion(g.clist, g.ibd, g.ib_lo, g.ib, g.ib_lo, (u64)(g.ib_hi - g.ib_lo));
++    for (u32 i = 0; i < g_vd.n_cp; i++) {   /* patch 2092: fills into the device cache */
++        g.clist->lpVtbl->CopyBufferRegion(g.clist, g_vd.buf, g_vd.cp[i].dst_off, g_vd.stage, g_vd.cp[i].src_off,
++                                          g_vd.cp[i].len);
++        g_gt.c_bytes += (double)g_vd.cp[i].len;
++    }
++    g_vd.n_cp = 0;
+     for (u32 i = 0; i < n; i++) { D3D12_RESOURCE_STATES t = b[i].Transition.StateBefore; b[i].Transition.StateBefore = b[i].Transition.StateAfter; b[i].Transition.StateAfter = t; }
+     g.clist->lpVtbl->ResourceBarrier(g.clist, n, b);
+     ld_gt_copy_stamp(g.clist, 1);
+@@ -3697,6 +3796,10 @@
+                 ld_td_test(g_ld_td_prev[e->location], e->offset, e->span)) { e->written = 1; g_ld_th.flip_flags++; }
+         }
+     }
++    if (g_vd.ok) {   /* patch 2092: blocks whose readers completed go back to the arenas */
++        const u64 done = g.fence->lpVtbl->GetCompletedValue(g.fence);
++        rsx_vd_reclaim(&g_vd.a, done); rsx_vd_reclaim(&g_vd.sa, done);
++    }
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) ld_vc_stat_print();   /* patch 2047 */
+     if ((g_ld_frames % 256u) == 255u) ld_apso_stat_print();   /* patch 2048 (prints only once builds ran) */
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) {
+@@ -10039,7 +10142,7 @@
+ #define LD_VC_SLOTS 16384u
+ #define LD_VC_KEY_MAX 1200u
+ #define LD_VC_SPANS 17u
+-typedef struct { u32 loc, off, len; u64 sh; } ld_vc_span;
++typedef rsx_vd_span ld_vc_span;   /* patch 2092: the sampled hash moved to ld_vc_entry.sh */
+ typedef struct {
+     u64 h; u32* key; u32 key_n;
+     u8 state;          /* 0 empty, 1 seen (no data), 2 filled */
+@@ -10054,13 +10157,18 @@
+     ld_vc_span cmp[LD_VC_SPANS];
+     u8* src;           /* pass 49: a copy of the source bytes of every cmp span, compared in full on a hit */
+     u32 src_bytes;
++    u64 sh[LD_VC_SPANS];   /* sampled hash per span (LD_VTX_CACHE_FULL=0) */
++    u32 last;          /* patch 2092: g_ld_frames at the last lookup (2-way victim choice) */
++    u32 dev_off, dev_len, dev_vb;   /* patch 2092: block in the device arena (dev_len 0 = none); ib at +dev_vb */
+ } ld_vc_entry;
+ static ld_vc_entry* g_vc;
+ static u32 g_vc_key[LD_VC_KEY_MAX];
+ static u64 g_vc_bytes;
+ static struct { u64 draws, hits, hit_verts, miss_verts, seen, filled, inval_tracked, inval_sample, inel_main,
+                 inel_main_verts, inel_inline, inel_other, inel_other_verts, nostore, full, dyn_skip,
+-                verify_ok, verify_bad, evict, cmp_bytes; } g_vc_st;
++                verify_ok, verify_bad, evict, cmp_bytes,
++                /* patch 2092 */ inval_content_dyn, dev_hits, dev_hit_bytes, dev_fills, dev_fill_bytes, dev_full,
++                dev_copy_full, dev_frees, miss_bytes, hit_draw_bytes, all_bytes, all_draws; } g_vc_st;
+ 
+ static void write_topology_indices(u32 prim, u32* indices);
+ static int ld_vc_full(void);   /* pass 49 */
+@@ -10071,6 +10179,7 @@
+     if (mode < 0) {
+         const char* e = getenv("LD_VTX_CACHE");
+         mode = e ? (!strcmp(e, "verify") ? 2 : atoi(e) != 0) : LD_VTX_CACHE_DEFAULT;
++        if (!e && ld_vd_on()) mode = 1;   /* patch 2092: the device cache is built on this cache */
+         if (getenv("RSX_DRAW_CSV") || getenv("LD_DRAW_INPUTS") || getenv("LD_DRAW_DUMP") || getenv("RSX_A010_GEOM"))
+             mode = 0;
+         fprintf(stderr, "[vtx-cache] mode=%d (LD_VTX_CACHE=%s) main=%d mb=%s full=%d\n", mode, e ? e : "unset",
+@@ -10165,17 +10274,16 @@
+ }
+ 
+ static int ld_vc_span_written(const ld_vc_span* sp, u32 since_frame)
+-{
+-    if (ld_td_test((const u32*)g_ld_td[sp->loc], sp->off, sp->len)) return 1;
+-    const u64 end = (u64)sp->off + sp->len - 1u;
+-    const u32 p1 = (u32)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
+-    for (u32 pg = sp->off >> 16; pg <= p1; pg++)
+-        if (g_ld_pg_stamp[sp->loc][pg] > since_frame) return 1;   /* stamp = frame + 1 of the write */
+-    return 0;
++{   /* patch 2092: the rule lives in rsx_vtx_dev.h (host-tested); stamp = frame + 1 of the write */
++    return rsx_vd_pages_written((const u32*)g_ld_td[sp->loc], g_ld_pg_stamp[sp->loc], sp->off, sp->len, since_frame);
+ }
++static int ld_vc_written_cb(void* ctx, const rsx_vd_span* sp, u32 since) { (void)ctx; return ld_vc_span_written(sp, since); }
++static const u8* ld_vc_ptr_cb(void* ctx, const rsx_vd_span* sp) { (void)ctx; return (const u8*)guest_ptr(sp->loc, sp->off, sp->len); }
++static void ld_vd_free_block(ld_vc_entry* e);   /* patch 2092 */
+ 
+ static void ld_vc_drop(ld_vc_entry* e)
+ {
++    if (e->dev_len) ld_vd_free_block(e);   /* patch 2092 */
+     if (e->data) { g_vc_bytes -= (u64)e->vb_bytes + e->ib_bytes; free(e->data); e->data = NULL; }
+     if (e->src) { g_vc_bytes -= e->src_bytes; free(e->src); e->src = NULL; e->src_bytes = 0; }
+     if (e->state == 2) e->state = 1;
+@@ -10191,10 +10299,18 @@
+     if (!n) return NULL;
+     if (!g_vc) { g_vc = (ld_vc_entry*)calloc(LD_VC_SLOTS, sizeof(ld_vc_entry)); if (!g_vc) return NULL; }
+     const u64 h = fnv1a(g_vc_key, n * 4u, 1469598103934665603ull);
+-    ld_vc_entry* e = &g_vc[(h ^ (h >> 32)) & (LD_VC_SLOTS - 1u)];
++    /* patch 2092: two ways per set (slots i and i^1): the key's own way, else an empty one, else the one looked up
++     * longer ago (pass 49: 124 direct-mapped evictions per frame threw filled entries away) */
++    ld_vc_entry* w0 = &g_vc[(h ^ (h >> 32)) & (LD_VC_SLOTS - 1u)];
++    ld_vc_entry* w1 = &g_vc[((h ^ (h >> 32)) & (LD_VC_SLOTS - 1u)) ^ 1u];
++#define LD_VC_SAME(x) ((x)->state && (x)->h == h && (x)->key_n == n && !memcmp((x)->key, g_vc_key, n * 4u))
++    ld_vc_entry* e = LD_VC_SAME(w0) ? w0 : LD_VC_SAME(w1) ? w1 : !w0->state ? w0 : !w1->state ? w1
++                   : ((u32)(g_ld_frames - w0->last) >= (u32)(g_ld_frames - w1->last) ? w0 : w1);
++#undef LD_VC_SAME
+     if (e->state && (e->h != h || e->key_n != n || memcmp(e->key, g_vc_key, n * 4u))) {
+         ld_vc_drop(e); free(e->key); memset(e, 0, sizeof(*e)); g_vc_st.evict++;
+     }
++    e->last = g_ld_frames;
+     if (!e->state) {
+         e->key = (u32*)malloc(n * 4u);
+         if (!e->key) return NULL;
+@@ -10206,17 +10322,19 @@
+         for (u32 i = 0; i < e->n_spans && !bad; i++)
+             if (ld_vc_span_written(&e->spans[i], e->frame)) bad = 1;
+         if (bad) { g_vc_st.inval_tracked++; if (e->dyn < 2) e->dyn++; ld_vc_drop(e); }
+-        else if (ld_vc_full()) {   /* pass 49: the whole source, byte for byte */
+-            const u8* c = e->src;
+-            for (u32 i = 0; i < e->n_cmp && !bad; i++) {
+-                const u8* p = guest_ptr(e->cmp[i].loc, e->cmp[i].off, e->cmp[i].len);
+-                if (!p || memcmp(p, c, e->cmp[i].len)) bad = 1;
+-                c += e->cmp[i].len; g_vc_st.cmp_bytes += e->cmp[i].len;
++        else if (ld_vc_full()) {   /* pass 49: the whole source, byte for byte (patch 2092: rsx_vd_validate) */
++            bad = rsx_vd_validate(e->spans, 0u, e->cmp, e->n_cmp, e->src, e->frame, ld_vc_written_cb, ld_vc_ptr_cb,
++                                  NULL, &g_vc_st.cmp_bytes) != RSX_VD_HIT;
++            if (bad) {
++                g_vc_st.inval_sample++;
++                /* patch 2092: a device entry whose source keeps changing with no tracked write (a PPU-written
++                 * ring) costs a fill and a GPU copy each time: dynamic after two, like tracked invalidations */
++                if (ld_vd_on() && e->dyn < 2) { e->dyn++; g_vc_st.inval_content_dyn++; }
++                ld_vc_drop(e);
+             }
+-            if (bad) { g_vc_st.inval_sample++; ld_vc_drop(e); }
+         } else {
+             for (u32 i = 0; i < e->n_spans && !bad; i++)
+-                if (ld_vc_sample(e->spans[i].loc, e->spans[i].off, e->spans[i].len) != e->spans[i].sh) bad = 1;
++                if (ld_vc_sample(e->spans[i].loc, e->spans[i].off, e->spans[i].len) != e->sh[i]) bad = 1;
+             if (bad) { g_vc_st.inval_sample++; ld_vc_drop(e); }
+         }
+         if (!bad) { g_vc_st.hits++; g_vc_st.hit_verts += e->n_verts; return e; }
+@@ -10231,7 +10349,7 @@
+ static int ld_vc_spans(ld_vc_entry* e)
+ {
+     static int main_ok = -1;   /* pass 49: read once */
+-    if (main_ok < 0) main_ok = getenv("LD_VTX_CACHE_MAIN") != NULL;
++    if (main_ok < 0) main_ok = getenv("LD_VTX_CACHE_MAIN") != NULL || ld_vd_on();   /* 2092: KZ3 draws from main */
+     u32 ns = 0;
+     if (dc.n_idx) {
+         rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
+@@ -10261,12 +10379,57 @@
+         if (e->spans[i].loc == 1u && !main_ok) return -1;
+     for (u32 i = 0; i < ns; i++) {
+         if (ld_td_test((const u32*)g_ld_td[e->spans[i].loc], e->spans[i].off, e->spans[i].len)) return 0;
+-        e->spans[i].sh = ld_vc_sample(e->spans[i].loc, e->spans[i].off, e->spans[i].len);
++        e->sh[i] = ld_vc_sample(e->spans[i].loc, e->spans[i].off, e->spans[i].len);
+     }
+     e->n_spans = (u8)ns;
+     return 1;
+ }
+ 
++static void ld_vd_free_block(ld_vc_entry* e)   /* patch 2092 */
++{
++    ld_vd_release(e->dev_off, e->dev_len); g_vc_st.dev_frees++;
++    e->dev_off = e->dev_len = e->dev_vb = 0;
++}
++/* Patch 2092: fill `e` in the device cache from this draw's ring bytes (the payload at g.vb_used, the indices
++ * written to ib_out = the ring at g.ib_used). Spans are classified (ld_vc_spans > 0). 0 = not filled. */
++static int ld_vd_fill(ld_vc_entry* e, u32 prim, const void* vb, u32 vb_bytes, u32 ib_bytes, u32 n_tri, int indexed,
++                      u32* ib_out)
++{
++    if (indexed) write_topology_indices(prim, ib_out);
++    if (!ld_vd_ready()) return 0;
++    if (g_vd.n_cp + 1u > LD_VD_COPIES) { g_vc_st.dev_copy_full++; return 0; }
++    ld_vc_merge(e);
++    u32 src_bytes = 0;
++    for (u32 i = 0; i < e->n_cmp; i++) src_bytes += e->cmp[i].len;
++    if (g_vc_bytes + src_bytes > ld_vc_budget()) { g_vc_st.full++; return 0; }
++    if (!indexed) ib_bytes = 0;
++    const u32 vb_r = rsx_vd_round(vb_bytes), len = vb_r + ib_bytes;
++    ld_vc_drop(e);
++    const u32 off = ld_vd_alloc(&g_vd.a, len);
++    if (off == RSX_VD_NONE) { g_vc_st.dev_full++; return 0; }
++    const u32 so = ld_vd_alloc(&g_vd.sa, len);
++    if (so == RSX_VD_NONE) { g_vc_st.dev_full++; ld_vd_release(off, len); return 0; }
++    u8* src = (u8*)malloc((size_t)src_bytes + 1u);
++    if (!src) { ld_vd_release(off, len); rsx_vd_free_now(&g_vd.sa, so, len); return 0; }
++    u8* c = src;
++    for (u32 i = 0; i < e->n_cmp; i++) {
++        const u8* p = guest_ptr(e->cmp[i].loc, e->cmp[i].off, e->cmp[i].len);
++        if (!p) { free(src); ld_vd_release(off, len); rsx_vd_free_now(&g_vd.sa, so, len); return 0; }
++        memcpy(c, p, e->cmp[i].len); c += e->cmp[i].len;
++    }
++    /* the staging block holds payload | pad | indices, one copy; free once the next submit's copy list ran */
++    memcpy(g_vd.stage_mapped + so, vb, vb_bytes);
++    if (ib_bytes) memcpy(g_vd.stage_mapped + so + vb_r, ib_out, ib_bytes);
++    g_vd.cp[g_vd.n_cp].src_off = so; g_vd.cp[g_vd.n_cp].dst_off = off; g_vd.cp[g_vd.n_cp].len = len; g_vd.n_cp++;
++    rsx_vd_free_later(&g_vd.sa, so, len, g.fence_value + 1u);
++    e->src = src; e->src_bytes = src_bytes; g_vc_bytes += src_bytes;
++    e->data = NULL; e->dev_off = off; e->dev_len = len; e->dev_vb = vb_r;
++    e->vb_bytes = vb_bytes; e->ib_bytes = ib_bytes; e->n_tri = n_tri; e->indexed = (u8)indexed;
++    e->n_verts = dc.n_verts; e->n_source_refs = dc.n_source_refs; e->frame = g_ld_frames; e->state = 2;
++    g_vc_st.filled++; g_vc_st.dev_fills++; g_vc_st.dev_fill_bytes += len;
++    return 1;
++}
++
+ /* Walker, after the fetch and topology of a draw whose key went to `e` (fill) or that hit `e` in verify mode
+  * (compare). vb = the fetched payload; the indices are written here (into `ib_out`, the ring). */
+ static void ld_vc_after_fetch(ld_vc_entry* e, int verify, u32 prim, const void* vb, u32 vb_bytes, u32 ib_bytes,
+@@ -10280,6 +10443,10 @@
+             if (indexed) write_topology_indices(prim, ib_out);
+             return;
+         }
++        if (ld_vd_on()) {   /* patch 2092: device block instead of a CPU copy */
++            ld_vd_fill(e, prim, vb, vb_bytes, ib_bytes, n_tri, indexed, ib_out);
++            return;
++        }
+     }
+     u8* buf = (u8*)malloc((size_t)vb_bytes + ib_bytes + 1u);
+     if (!buf) { if (indexed) write_topology_indices(prim, ib_out); return; }
+@@ -10350,6 +10517,18 @@
+             (unsigned long long)g_vc_st.full, (unsigned long long)g_vc_st.dyn_skip, (unsigned long long)g_vc_st.evict,
+             (unsigned long long)g_vc_st.verify_ok, (unsigned long long)g_vc_st.verify_bad,
+             (double)g_vc_bytes / 1048576.0, ld_vc_full(), (double)g_vc_st.cmp_bytes / 1048576.0);
++    /* patch 2092: cumulative; per frame = delta / delta frame. draws/all-bytes = every drawn payload+index; hit/miss = payload+index bytes of cacheable draws
++     * served from the cache vs fetched (miss = keyed draws not served: first sight, invalidated, dynamic) */
++    fprintf(stderr, "[vtx-dev] frame=%u on=%d draws=%llu all-bytes=%.1fMB hits=%llu hit-bytes=%.1fMB miss-bytes=%.1fMB fills=%llu fill-bytes=%.1fMB "
++                    "frees=%llu content-dyn=%llu arena-full=%llu copy-full=%llu arena-used=%.1fMB pend=%u stage-used=%.1fMB "
++                    "free-ext=%u\n",
++            g_ld_frames, ld_vd_on(), (unsigned long long)g_vc_st.all_draws, (double)g_vc_st.all_bytes / 1048576.0,
++            (unsigned long long)g_vc_st.dev_hits, (double)g_vc_st.hit_draw_bytes / 1048576.0,
++            (double)g_vc_st.miss_bytes / 1048576.0, (unsigned long long)g_vc_st.dev_fills,
++            (double)g_vc_st.dev_fill_bytes / 1048576.0, (unsigned long long)g_vc_st.dev_frees,
++            (unsigned long long)g_vc_st.inval_content_dyn, (unsigned long long)g_vc_st.dev_full,
++            (unsigned long long)g_vc_st.dev_copy_full, (double)g_vd.a.used / 1048576.0, g_vd.a.n_pd,
++            (double)g_vd.sa.used / 1048576.0, g_vd.a.n_fr);
+ }
+ 
+ static const float* dc_vertex_attr(
+@@ -12799,6 +12978,7 @@
+     const u32 vertex_stride = dc.vg ? 4u :   /* patch 2076: one u32 element index */
+         ld_vertex_compact_payload() ? used_layout.stride : VERT_STRIDE;
+     const u32 uploaded_vertices = indexed ? dc.n_verts : n_tri;
++    const int vd_hit = vc_hit && vc_hit->dev_len;   /* patch 2092: the payload and indices are in the device cache */
+     const void* vertex_data = vc_hit ? (const void*)vc_hit->data : ld_vertex_compact_payload()
+         ? (const void*)dc.compact_verts : (const void*)dc.verts;
+     const u64 draw_payload_bytes = (u64)uploaded_vertices * vertex_stride;
+@@ -12812,7 +12992,9 @@
+         g_ld_stats.group_drop_ring++;
+         return;
+     }
+-    if ((u64)g.vb_used + draw_vb_bytes > vb_capacity ||
++    if (vd_hit) {   /* patch 2092: nothing goes into the rings */
++        g_vc_st.dev_hits++; g_vc_st.dev_hit_bytes += draw_vb_bytes + draw_ib_bytes;
++    } else if ((u64)g.vb_used + draw_vb_bytes > vb_capacity ||
+         (u64)g.ib_used + draw_ib_bytes > INDEX_BUFFER_SIZE) {
+         /*
+          * The replay-proven renderer recycles this upload ring mid-frame.
+@@ -12830,7 +13012,10 @@
+         g.smp_ring_used = 0;
+     }
+     LDW_T0(vcopy_t0);
+-    if (draw_payload_bytes)
++    if (vc_fill && !vc_hit) g_vc_st.miss_bytes += draw_vb_bytes + draw_ib_bytes;   /* patch 2092 */
++    if (vc_hit) g_vc_st.hit_draw_bytes += draw_vb_bytes + draw_ib_bytes;
++    g_vc_st.all_bytes += draw_vb_bytes + draw_ib_bytes; g_vc_st.all_draws++;
++    if (draw_payload_bytes && !vd_hit)
+         memcpy(
+             g.vb_mapped + g.vb_used, vertex_data,
+             (size_t)draw_payload_bytes);
+@@ -12839,7 +13024,9 @@
+         vg_block_off = (u32)((((u64)g.vb_used + draw_payload_bytes + 255u) & ~(u64)255u) - g.vb_used);
+         rsx_vg_write_block(&dc.vg_d, g.vb_mapped + g.vb_used + vg_block_off);
+     }
+-    if (vc_hit) {   /* patch 2047 */
++    if (vd_hit) {
++        /* patch 2092: bound below */
++    } else if (vc_hit) {   /* patch 2047 */
+         if (indexed && draw_ib_bytes)
+             memcpy((u8*)g.ib_mapped + g.ib_used, vc_hit->data + vc_hit->vb_bytes, (size_t)draw_ib_bytes);
+     } else if (vc_fill && dc.fetch_ok)
+@@ -13611,8 +13798,9 @@
+     }
+ 
+     D3D12_VERTEX_BUFFER_VIEW vbv;
+-    ID3D12Resource* vb_src = vertex_stride ? ld_vbd_vb(g.vb_used, draw_vb_bytes) : g.vb;   /* patch 2053 */
+-    vbv.BufferLocation = vb_src->lpVtbl->GetGPUVirtualAddress(vb_src) + g.vb_used;
++    ID3D12Resource* vb_src = vd_hit ? NULL : vertex_stride ? ld_vbd_vb(g.vb_used, draw_vb_bytes) : g.vb;   /* 2053 */
++    vbv.BufferLocation = vd_hit ? g_vd.va + vc_hit->dev_off   /* patch 2092 */
++                                : vb_src->lpVtbl->GetGPUVirtualAddress(vb_src) + g.vb_used;
+     vbv.StrideInBytes = vertex_stride;
+     vbv.SizeInBytes = (u32)draw_payload_bytes;   /* patch 2076: the block after it is not vertex data */
+     if (vertex_stride)
+@@ -13666,9 +13854,12 @@
+         /* conditional render: the report says 0 samples, the RSX skips the draw */
+     } else if (indexed) {
+         D3D12_INDEX_BUFFER_VIEW ibv;
++        if (vd_hit) ibv.BufferLocation = g_vd.va + vc_hit->dev_off + vc_hit->dev_vb;   /* patch 2092 */
++        else {
+         ID3D12Resource* ib_src = ld_vbd_ib(g.ib_used, draw_ib_bytes);   /* patch 2053 */
+         ibv.BufferLocation =
+             ib_src->lpVtbl->GetGPUVirtualAddress(ib_src) + g.ib_used;
++        }
+         ibv.SizeInBytes = (u32)draw_ib_bytes;
+         ibv.Format = DXGI_FORMAT_R32_UINT;
+         g.list->lpVtbl->IASetIndexBuffer(g.list, &ibv);
+@@ -13778,8 +13969,10 @@
+         }
+     }
+     LDW_ADD(RSX_PERF_W_D_POST_T, post_t0);
++    if (!vd_hit) {   /* patch 2092: a device-cache hit used no ring bytes */
+     g.vb_used += (u32)draw_vb_bytes;
+     g.ib_used += (u32)draw_ib_bytes;
++    }
+     ld_profile_note_ring_highwater();
+ }
+ 
+--- /dev/null
++++ b/libs/video/rsx_vtx_dev.h
+@@ -0,0 +1,149 @@
++/* KZ3 patch 2092: device-resident vertex cache, the parts that need no D3D12 (host-tested by
++ * tools/smoke/test_vtx_dev.sh).
++ *
++ * 1. rsx_vd_arena: an allocator over one DEFAULT-heap buffer. A block freed while command lists that may read it
++ *    are still queued goes to a pending list tagged with the fence value those lists signal; it becomes free again
++ *    only when the completed fence value reaches the tag (rsx_vd_reclaim). Free extents are kept sorted and
++ *    coalesced; allocation is first fit in RSX_VD_ALIGN units.
++ * 2. rsx_vd_pages_written: the tracked-write test of patch 2047 (64 KB pages: a bit in the live bitmap = written
++ *    since the last flip; a stamp = 1 + the last frame a write was seen in) as a pure function.
++ * 3. rsx_vd_validate: the hit rule. A filled entry is a hit only when no tracked writer touched any source span
++ *    since the fill AND every merged source span still equals the copy taken at the fill (byte compare: recompiled
++ *    PPU stores into main memory note nothing, pass 48/49, so the compare is what makes a hit exact; the page notes
++ *    only reject known-written entries early and mark entries dynamic). */
++#ifndef RSX_VTX_DEV_H
++#define RSX_VTX_DEV_H
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define RSX_VD_ALIGN 256u
++#define RSX_VD_NONE 0xFFFFFFFFu
++
++typedef struct { uint32_t off, len; } rsx_vd_ext;
++typedef struct { uint32_t off, len; uint64_t fence; } rsx_vd_pend;
++typedef struct {
++    uint32_t size;
++    rsx_vd_ext* fr; uint32_t n_fr, cap_fr;    /* free extents, sorted by off, never adjacent */
++    rsx_vd_pend* pd; uint32_t n_pd, cap_pd;   /* freed blocks waiting for their fence (tags non-decreasing) */
++    uint64_t used;                            /* bytes allocated (pending blocks count as used) */
++} rsx_vd_arena;
++
++static inline uint32_t rsx_vd_round(uint32_t n) { return (n + RSX_VD_ALIGN - 1u) & ~(RSX_VD_ALIGN - 1u); }
++
++static inline int rsx_vd_init(rsx_vd_arena* a, uint32_t size)
++{
++    memset(a, 0, sizeof *a);
++    a->size = size & ~(RSX_VD_ALIGN - 1u);
++    a->cap_fr = 64u;
++    a->fr = (rsx_vd_ext*)malloc(a->cap_fr * sizeof a->fr[0]);
++    if (!a->fr) return 0;
++    a->fr[0].off = 0; a->fr[0].len = a->size; a->n_fr = a->size ? 1u : 0u;
++    return 1;
++}
++static inline void rsx_vd_destroy(rsx_vd_arena* a) { free(a->fr); free(a->pd); memset(a, 0, sizeof *a); }
++
++/* First fit; RSX_VD_NONE when no extent is large enough. */
++static inline uint32_t rsx_vd_alloc(rsx_vd_arena* a, uint32_t len)
++{
++    len = rsx_vd_round(len ? len : 1u);
++    for (uint32_t i = 0; i < a->n_fr; i++) {
++        if (a->fr[i].len < len) continue;
++        const uint32_t off = a->fr[i].off;
++        a->fr[i].off += len; a->fr[i].len -= len;
++        if (!a->fr[i].len) { memmove(a->fr + i, a->fr + i + 1, (a->n_fr - i - 1u) * sizeof a->fr[0]); a->n_fr--; }
++        a->used += len;
++        return off;
++    }
++    return RSX_VD_NONE;
++}
++
++/* Back into the free list at once (no reader can be queued). 0 = out of memory for the extent list. */
++static inline int rsx_vd_free_now(rsx_vd_arena* a, uint32_t off, uint32_t len)
++{
++    len = rsx_vd_round(len ? len : 1u);
++    uint32_t lo = 0, hi = a->n_fr;   /* first extent with off > this one */
++    while (lo < hi) { const uint32_t m = (lo + hi) / 2u; if (a->fr[m].off < off) lo = m + 1u; else hi = m; }
++    const int join_prev = lo > 0 && a->fr[lo - 1].off + a->fr[lo - 1].len == off;
++    const int join_next = lo < a->n_fr && off + len == a->fr[lo].off;
++    if (join_prev && join_next) {
++        a->fr[lo - 1].len += len + a->fr[lo].len;
++        memmove(a->fr + lo, a->fr + lo + 1, (a->n_fr - lo - 1u) * sizeof a->fr[0]); a->n_fr--;
++    } else if (join_prev) a->fr[lo - 1].len += len;
++    else if (join_next) { a->fr[lo].off = off; a->fr[lo].len += len; }
++    else {
++        if (a->n_fr == a->cap_fr) {
++            rsx_vd_ext* n = (rsx_vd_ext*)realloc(a->fr, 2u * a->cap_fr * sizeof a->fr[0]);
++            if (!n) return 0;
++            a->fr = n; a->cap_fr *= 2u;
++        }
++        memmove(a->fr + lo + 1, a->fr + lo, (a->n_fr - lo) * sizeof a->fr[0]);
++        a->fr[lo].off = off; a->fr[lo].len = len; a->n_fr++;
++    }
++    a->used -= len;
++    return 1;
++}
++
++/* Freed once the GPU has completed `fence` (the value the lists that may still read the block will signal). */
++static inline int rsx_vd_free_later(rsx_vd_arena* a, uint32_t off, uint32_t len, uint64_t fence)
++{
++    if (a->n_pd == a->cap_pd) {
++        const uint32_t c = a->cap_pd ? 2u * a->cap_pd : 256u;
++        rsx_vd_pend* n = (rsx_vd_pend*)realloc(a->pd, c * sizeof a->pd[0]);
++        if (!n) return 0;
++        a->pd = n; a->cap_pd = c;
++    }
++    a->pd[a->n_pd].off = off; a->pd[a->n_pd].len = len; a->pd[a->n_pd].fence = fence; a->n_pd++;
++    return 1;
++}
++
++/* Every pending block whose fence is <= completed goes back to the free list. Returns the bytes reclaimed. */
++static inline uint64_t rsx_vd_reclaim(rsx_vd_arena* a, uint64_t completed)
++{
++    uint32_t i = 0; uint64_t bytes = 0;
++    while (i < a->n_pd && a->pd[i].fence <= completed) {
++        if (!rsx_vd_free_now(a, a->pd[i].off, a->pd[i].len)) break;
++        bytes += rsx_vd_round(a->pd[i].len ? a->pd[i].len : 1u); i++;
++    }
++    if (i) { memmove(a->pd, a->pd + i, (a->n_pd - i) * sizeof a->pd[0]); a->n_pd -= i; }
++    return bytes;
++}
++
++/* Patch 2047's tracked-write rule. td_live: bit per 64 KB page written since the last flip; stamps: 1 + the
++ * last frame each page was written in (set at the flip). Written since `since_frame`? */
++static inline int rsx_vd_pages_written(const uint32_t* td_live, const uint32_t* stamps, uint32_t off, uint32_t len,
++                                       uint32_t since_frame)
++{
++    if (!len) return 1;
++    const uint64_t end = (uint64_t)off + len - 1u;
++    const uint32_t p0 = off >> 16, p1 = (uint32_t)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
++    for (uint32_t p = p0; ; p++) {
++        if (td_live[p >> 5] & (1u << (p & 31u))) return 1;
++        if (stamps[p] > since_frame) return 1;
++        if (p == p1) break;
++    }
++    return 0;
++}
++
++typedef struct { uint32_t loc, off, len; } rsx_vd_span;
++enum { RSX_VD_HIT = 0, RSX_VD_TRACKED = 1, RSX_VD_CONTENT = 2 };
++/* written(ctx, span, since): a tracked write touched the span since the frame; ptr(ctx, span): host bytes of the
++ * span or NULL. spans = the per-attribute/index source ranges, cmp = the same merged per location, copy = the
++ * bytes of every cmp span at the fill, back to back. *cmp_bytes += the bytes compared. */
++static inline int rsx_vd_validate(const rsx_vd_span* spans, uint32_t n_spans, const rsx_vd_span* cmp, uint32_t n_cmp,
++                                  const uint8_t* copy, uint32_t since_frame,
++                                  int (*written)(void*, const rsx_vd_span*, uint32_t),
++                                  const uint8_t* (*ptr)(void*, const rsx_vd_span*), void* ctx, uint64_t* cmp_bytes)
++{
++    for (uint32_t i = 0; i < n_spans; i++)
++        if (written(ctx, &spans[i], since_frame)) return RSX_VD_TRACKED;
++    for (uint32_t i = 0; i < n_cmp; i++) {
++        const uint8_t* p = ptr(ctx, &cmp[i]);
++        if (cmp_bytes) *cmp_bytes += cmp[i].len;
++        if (!p || memcmp(p, copy, cmp[i].len)) return RSX_VD_CONTENT;
++        copy += cmp[i].len;
++    }
++    return RSX_VD_HIT;
++}
++
++#endif /* RSX_VTX_DEV_H */

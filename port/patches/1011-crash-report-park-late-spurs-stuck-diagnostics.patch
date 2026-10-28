@@ -1,0 +1,223 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream added g_ppu_main_ctx next to it.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): crash filter installed first, then upstream's `ps3_stdio_init()` (buffered stdout+stderr, 50 ms flush; its crash filter chains to ours); our unbuffered stdout gone.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index bca5da4f..0c4e68d0 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -443,6 +443,9 @@ static struct SpursInst {
+     volatile long kernel_live; /* poll thread started */
+     int           nthreads;    /* kernel threads (KZ3_SPURS_THREADS, patch 1006) */
+ } s_inst[MAX_SPURS_INST];
++/* KZ3 patch 1011: the policy-module run in progress per instance (kernel thread 0). */
++static volatile u32 s_run_wid[MAX_SPURS_INST];
++static volatile u64 s_run_t0[MAX_SPURS_INST], s_run_rep[MAX_SPURS_INST];
+ static struct { struct SpursInst* si; int k; } s_kt_arg[MAX_SPURS_INST][8];
+ /* One kernel thread at a time per workload (patch 1006): the persistent PM
+  * contexts are per (workload, lane), and a lane must not run twice at once. */
+@@ -1717,6 +1720,28 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+         Sleep(1);
+         u32 ea = si->ea;
+         if (!ea || s_pm_off) continue;
++        /* KZ3 patch 1011 diagnostic (SPURS_STUCK_MS, default 3000; 0 = off): report a
++         * policy-module run on ANOTHER instance that has not returned for that long --
++         * its workload's contention byte stays set and nothing else on that instance runs. */
++        { static int s_sm = -1;
++          if (s_sm < 0) { const char* e = getenv("SPURS_STUCK_MS"); s_sm = e ? atoi(e) : 3000; }
++          if (s_sm > 0) {
++            u64 now = GetTickCount64();
++            for (int j = 0; j < MAX_SPURS_INST; j++) {
++              if (&s_inst[j] == si || !s_run_t0[j]) continue;
++              u64 d = now - s_run_t0[j];
++              if (d >= (u64)s_sm && now - s_run_rep[j] >= 5000) {
++                s_run_rep[j] = now;
++                extern void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num);
++                extern void spu_pm_ctx_describe(void* ctx, char* out, int n);
++                char b[512] = "";
++                spu_pm_ctx_describe(spu_pm_ctx_peek(s_run_wid[j], 0), b, sizeof b);
++                fprintf(stderr, "[spurs-stuck] \"%s\" wid=%u PM run not returned for %llu ms: %s\n",
++                        s_inst[j].prefix, s_run_wid[j], (unsigned long long)d, b);
++                fflush(stderr);
++              }
++            }
++          } }
+ 
+         if (watch) {
+             const unsigned char* live = (const unsigned char*)vm_base + ea;
+@@ -1861,6 +1886,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+             {
+                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
+                 uint32_t sz = s_workloads[wid].sizePm;
++                s_run_wid[si - s_inst] = wid; s_run_t0[si - s_inst] = GetTickCount64();   /* patch 1011 */
+                 if (maxcont <= 1) {
+                     spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                 } else {
+@@ -1884,6 +1910,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                     }
+                 }
+             }
++            s_run_t0[si - s_inst] = 0;   /* patch 1011 */
+             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+             /* "Found work" heuristic: a module that did something polls the
+              * kernel for MORE work before exiting (selectWorkload calls >0);
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index ec6f4d04..964c8eef 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1008,6 +1008,7 @@ static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
+ static u32 s_fifo_calloff = 0;
+ static u32 s_park_off = 0xFFFFFFFFu;  /* KZ3 patch 1007: park being waited on */
+ static u64 s_park_t0 = 0;
++static u32 s_park_put = 0, s_park_putchg = 0;  /* KZ3 patch 1011: put moves during a park wait */
+ 
+ /* KZ3 patch 1009 diagnostic, GCM_PARK_TRACE=1: the last 8 placeholder parks the walker
+  * went through (park words, put, both KZ3 contexts' `current`, a snapshot of the
+@@ -2438,15 +2439,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                       static int pw = -1;
+                       if (pw < 0) { const char* e = getenv("GCM_PARK_WAIT_MS"); pw = e ? atoi(e) : 30000; }
+                       u64 now = get_timestamp_ns();
+-                      if (s_park_off != s_fifo_getoff) { s_park_off = s_fifo_getoff; s_park_t0 = now; }
++                      if (s_park_off != s_fifo_getoff) { s_park_off = s_fifo_getoff; s_park_t0 = now;
++                                                         s_park_put = put; s_park_putchg = 0; }
++                      else if (put != s_park_put) { s_park_put = put; s_park_putchg++; }
+                       if (pw > 0 && now - s_park_t0 < (u64)pw * 1000000ull) { why = "park-wait"; s_park_pass = 1; break; }
+                       /* v0.18.0 (upstream f8255191): read the park again before giving up on it; an SPU job
+                        * filling a command-buffer hole may land between this pass's read and the resync. */
+                       if (vm_read32(gcm_io2ea(s_fifo_getoff)) != w) { why = "park-wait"; s_park_pass = 1; break; }
+                       s_park_off = 0xFFFFFFFFu;
+                       { static int pn = 0; if (pw > 0 && pn++ < 8)
+-                          fprintf(stderr, "[cellGcmSys] park 0x%08X not patched within %d ms -- resyncing\n",
+-                                  s_fifo_getoff, pw); }
++                          fprintf(stderr, "[cellGcmSys] park 0x%08X not patched within %d ms (put moved %u times) -- resyncing\n",
++                                  s_fifo_getoff, pw, s_park_putchg); }
+                       /* KZ3 patch 1008 diagnostic, GCM_PARK_DIAG=<hex label offset>: the park's
+                        * three words (park, refcount, patch jump), the label, and every
+                        * NV4097 SET_SEMAPHORE_OFFSET (0x1D6C) with that offset in IO memory. */
+@@ -2485,6 +2488,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                   break;
+               }
+               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
++              /* KZ3 patch 1011 diagnostic: a park the title patched after a long wait
++               * (how long, and whether put moved meanwhile). */
++              if (s_park_off == s_fifo_getoff) {
++                  u64 ms = (get_timestamp_ns() - s_park_t0) / 1000000ull;
++                  static u64 s_pmax; static int s_pn;
++                  if (ms >= 250 && (s_pn++ < 16 || ms > s_pmax))
++                      fprintf(stderr, "[park-late] park 0x%08X patched after %llu ms (put moved %u times) -> 0x%08X\n",
++                              s_fifo_getoff, (unsigned long long)ms, s_park_putchg, tgt);
++                  if (ms > s_pmax) s_pmax = ms;
++              }
+               s_park_off = 0xFFFFFFFFu;
+               kz3_pt_jump(s_fifo_getoff, tgt, put);   /* KZ3 patch 1009 diagnostic */
+               s_fifo_getoff = tgt;
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 8b2058ee..b7e43d0f 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -4007,9 +4007,62 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+ }
+ 
+ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
++#ifdef _WIN32
++/* KZ3 patch 1011: last-chance crash report. A host access violation the VM's own
++ * handlers do not claim used to end the process with exit code 0xC0000005 and no
++ * output (KZ3 after the intro movie). Print the code, the fault address, the RIP
++ * and up to 24 host frames as RVAs (nm/addr2line on the exe) plus the guest
++ * function each one belongs to, and the thread's guest context. Report only: it
++ * returns EXCEPTION_CONTINUE_SEARCH, so the process ends exactly as before.
++ * PS3_NO_CRASH_REPORT=1 leaves the filter out. */
++extern "C" uint32_t    g_last_hle_nid;
++extern "C" const char* g_last_hle_name;
++static LONG WINAPI ppu_crash_report(EXCEPTION_POINTERS* ep)
++{
++    static volatile LONG s_once = 0;
++    if (InterlockedExchange(&s_once, 1)) return EXCEPTION_CONTINUE_SEARCH;
++    EXCEPTION_RECORD* er = ep->ExceptionRecord;
++    char* mbase = (char*)GetModuleHandleA(NULL);
++    fprintf(stderr, "\n[CRASH] code=0x%08lX rip rva=0x%llX guest-fn=0x%08X tid=%lu last HLE 0x%08X (%s)\n",
++            (unsigned long)er->ExceptionCode, (unsigned long long)((char*)er->ExceptionAddress - mbase),
++            ppu_prof_resolve_host(er->ExceptionAddress), (unsigned long)GetCurrentThreadId(),
++            g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
++    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
++        fprintf(stderr, "[CRASH] %s of host 0x%llX (vm_base %p, guest 0x%llX)\n",
++                er->ExceptionInformation[0] == 1 ? "write" : er->ExceptionInformation[0] == 8 ? "execute" : "read",
++                (unsigned long long)er->ExceptionInformation[1], (void*)vm_base,
++                (unsigned long long)(er->ExceptionInformation[1] - (uintptr_t)vm_base));
++    if (g_active_ctx)
++        fprintf(stderr, "[CRASH] guest cia=0x%08X lr=0x%08X ctr=0x%08X r1=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r31=0x%08X\n",
++                (uint32_t)g_active_ctx->cia, (uint32_t)g_active_ctx->lr, (uint32_t)g_active_ctx->ctr,
++                (uint32_t)g_active_ctx->gpr[1], (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
++                (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[31]);
++    CONTEXT c = *ep->ContextRecord;
++    fprintf(stderr, "[CRASH] rax=%llX rbx=%llX rcx=%llX rdx=%llX rsi=%llX rdi=%llX r8=%llX r9=%llX\n",
++            (unsigned long long)c.Rax, (unsigned long long)c.Rbx, (unsigned long long)c.Rcx, (unsigned long long)c.Rdx,
++            (unsigned long long)c.Rsi, (unsigned long long)c.Rdi, (unsigned long long)c.R8, (unsigned long long)c.R9);
++    /* Walk the faulting thread's stack from its own context (RtlCaptureStackBackTrace
++     * here would start in the filter's dispatcher frames). */
++    for (int i = 0; i < 24 && c.Rip; i++) {
++        DWORD64 img = 0; PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &img, NULL);
++        fprintf(stderr, "[CRASH]   #%-2d rva=0x%llX guest-fn=0x%08X\n", i,
++                (unsigned long long)((char*)c.Rip - mbase), ppu_prof_resolve_host((void*)c.Rip));
++        if (!rf) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }
++        void* hd = NULL; DWORD64 ef = 0;
++        RtlVirtualUnwind(UNW_FLAG_NHANDLER, img, c.Rip, rf, &c, &hd, &ef, NULL);
++    }
++    fflush(stderr); fflush(stdout);
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++#endif
+ 
+ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
+ {
++#ifdef _WIN32
++    /* KZ3 patch 1011: the crash report filter goes in first; ps3_stdio_init() below chains to it
++     * (its crash flush calls the previous filter). */
++    if (!getenv("PS3_NO_CRASH_REPORT")) SetUnhandledExceptionFilter(ppu_crash_report);
++#endif
+     /* HLE logs mix printf (stdout) with probe fprintf (stderr); with a
+      * redirected block-buffered stdout and nothing flushing it, printf lines
+      * sat in the buffer for minutes and were LOST when the run was killed --
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index de8e84ca..2ff2d9c3 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -42,6 +42,27 @@ SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload cal
+ SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
+ volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
+ 
++/* KZ3 patch 1011: the persistent PM contexts at file scope, so a stuck run can be
++ * described from another thread (cellSpurs.c [spurs-stuck]). */
++static spu_context* g_pm_ctx_tab[16][6];
++void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num)
++{
++    return (wid < 16 && spu_num < 6) ? (void*)g_pm_ctx_tab[wid][spu_num] : NULL;
++}
++void spu_pm_ctx_describe(void* p, char* out, int n)
++{
++    spu_context* c = (spu_context*)p;
++    if (!c) { snprintf(out, n, "no context"); return; }
++    uint32_t w[8];
++    static const uint32_t at[8] = { 0x1520, 0x1560, 0x12A0, 0x12C0, 0x12F0, 0x1320, 0x1330, 0x1420 };
++    for (int i = 0; i < 8; i++) { uint32_t t; memcpy(&t, (const uint8_t*)c->ls + at[i], 4); w[i] = __builtin_bswap32(t); }
++    snprintf(out, n, "img=%d pc=0x%05X lr=0x%05X sp=0x%05X status=0x%X depth=%u tagstat=0x%X evstat=0x%X"
++             " LS1520=%08X 1560=%08X 12A0=%08X 12C0=%08X 12F0=%08X 1320=%08X 1330=%08X 1420=%08X",
++             c->image_id, c->pc & SPU_LS_MASK, c->gpr[0]._u32[0] & SPU_LS_MASK, c->gpr[1]._u32[0] & SPU_LS_MASK,
++             c->status, c->host_depth, c->mfc_tag_status, c->event_status,
++             w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++}
++
+ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+                           const uint8_t* pm_host, uint32_t pm_size,
+                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
+@@ -63,7 +84,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+      * once; re-entries keep LS and only refresh the entry registers and the
+      * (possibly game-updated) kernel-context fields. */
+     enum { SPURS_PM_MAX_WKL = 16 };
+-    static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];
++    spu_context* (*s_pm_ctx)[6] = g_pm_ctx_tab;   /* patch 1011: file scope, for spu_pm_ctx_peek */
+     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
+     spu_context* ctx = s_pm_ctx[wid][spu_num];
+     int first = 0;

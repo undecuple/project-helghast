@@ -1,0 +1,66 @@
+KZ3 patch 2041 (RSX pass 41): ZSTENCIL_CLEAR_VALUE decoded by the zeta format (Z16 vs Z24S8).
+rsx_dispatch.h: rsx_dsp_zclear_decode(value, depth_format, &depth, &stencil): Z24S8 (SURFACE_FORMAT depth field
+2) packs depth24 << 8 | stencil8; Z16 (field 1) keeps its 16-bit depth in bits 0-15 and has no stencil.
+rsx_live_draw.c: the depth/stencil clear used the Z24S8 layout for every zeta, so a Z16 clear to 1.0 (0x0000FFFF)
+cleared to depth 0xFF/0xFFFFFF = 0.0000152. KZ3's shadow maps (1408x1408, 512x512) and its 640x360 / 320x180
+buffers are Z16. A never-written value still clears to 1.0 / 0. Log: [zclear] for the first 16 distinct
+(format, value) pairs. Host test tools/smoke/test_zclear.sh. Same fix as ps3recomp PR #235 (upstream candidate).
+
+diff --git a/libs/video/rsx_dispatch.h b/libs/video/rsx_dispatch.h
+--- a/libs/video/rsx_dispatch.h
++++ b/libs/video/rsx_dispatch.h
+@@ -170,6 +170,19 @@ static inline u32 rsx_dsp_reg(const rsx_dispatch* rsx, u32 method)
+ u32  rsx_dsp_clear_color(const rsx_dispatch* rsx);
+ /* CLEAR_DEPTH_VALUE: depth [8:31], stencil [0:7] */
+ u32  rsx_dsp_clear_zstencil(const rsx_dispatch* rsx);
++/* KZ3 patch 2041: decode ZSTENCIL_CLEAR_VALUE by the zeta's SURFACE_FORMAT depth field. Z24S8 (2) packs
++ * depth24 << 8 | stencil8; Z16 (1) keeps its 16-bit depth in bits 0-15 and has no stencil (reading it as
++ * Z24S8 turned a Z16 clear to 1.0 (0x0000FFFF) into depth 0.0000152). */
++static inline void rsx_dsp_zclear_decode(u32 value, u32 depth_format, float* depth, u8* stencil)
++{
++    if (depth_format == 1) {
++        *depth = (float)(value & 0xFFFFu) / 65535.0f;
++        *stencil = 0;
++    } else {
++        *depth = (float)(value >> 8) / 16777215.0f;
++        *stencil = (u8)(value & 0xFFu);
++    }
++}
+ 
+ /* Surface (render target) state */
+ typedef struct rsx_dsp_surface {
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -10738,11 +10738,27 @@ static void sink_clear_impl(void* user, const rsx_dispatch* r, u32 mask)
+          * decode as the draw engine's clear. */
+         {
+             /* Patch 2006: "never written" is the seen[] count, not a zero value (0 = depth 0, stencil 0). */
+-            const u32 zs = g.rsx.seen[M_ZSTENCIL_CLEAR >> 2] ? rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR)
+-                                                            : 0xFFFFFF00u;
+-            const float cd = (float)(zs >> 8) / 16777215.0f;
++            /* Patch 2041: the value's layout follows the zeta format (Z16: depth in bits 0-15, no
++             * stencil); never written = depth 1.0, stencil 0 for either format. */
++            float cd = 1.0f; u8 cs = 0;
++            const int zs_seen = g.rsx.seen[M_ZSTENCIL_CLEAR >> 2] != 0;
++            const u32 zs = zs_seen ? rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR) : 0xFFFFFF00u;
++            if (zs_seen) rsx_dsp_zclear_decode(zs, sf.depth_format, &cd, &cs);
++            {   /* Patch 2041: log the first distinct (format, value) pairs once. */
++                static u32 seen_fmt_val[16]; static u32 n_seen;
++                const u32 key = (sf.depth_format << 28) ^ zs;
++                u32 k = 0;
++                while (k < n_seen && seen_fmt_val[k] != key) k++;
++                if (k == n_seen && n_seen < 16u) {
++                    seen_fmt_val[n_seen++] = key;
++                    fprintf(stderr, "[zclear] frame=%u zeta=%u:0x%08X %ux%u depth_fmt=%u value=0x%08X%s "
++                            "-> depth=%.6f stencil=%u mask=0x%02X\n", g_ld_frames, sf.zeta_location,
++                            sf.zeta_offset, sf.clip_w, sf.clip_h, sf.depth_format, zs,
++                            zs_seen ? "" : " (unset)", cd, cs, mask);
++                }
++            }
+             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
+-                clear_flags, cd, (UINT8)(zs & 0xFFu), n_crect, n_crect ? &crect : NULL);
++                clear_flags, cd, (UINT8)cs, n_crect, n_crect ? &crect : NULL);
+         }
+         if (zslot) {
+             g.zdepths[zslot - 1].cleared = 1;

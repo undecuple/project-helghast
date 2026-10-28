@@ -1,0 +1,436 @@
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 9eb33bab..32388fe7 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -68,6 +68,18 @@ static double pad_clock(unsigned long long t0_ms)
+   #include <xinput.h>
+ #endif
+ #include "pad_host.h"
++#ifndef _WIN32
++/* 4011: PKB_PROMPTS_* and the value names on every platform (pure header; the Windows keyboard code below includes it
++ * again for the bindings, which only Windows polls). */
++#if defined(__GNUC__)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wunused-function"
++#endif
++#include "pad_keybinds.h"
++#if defined(__GNUC__)
++#pragma GCC diagnostic pop
++#endif
++#endif
+ 
+ /* ---------------------------------------------------------------------------
+  * Internal state
+@@ -83,6 +95,13 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
+ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+ /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
+ static int s_data_fresh[PAD_MAX_HOST_PORTS];
++/* KZ3 patch 4011 (stage 2): the device button prompts are drawn for (pad_host.h PadLastDevice). s_port_dev = the
++ * host pad behind each port (PAD_DEV_*, 0 = none), s_port_motion = it has working motion sensors (4010's re-check:
++ * accelerometer or gyro on). Written by the pad poll, read by the renderer and the text hook (ints, no lock). */
++static int           s_port_dev[PAD_MAX_HOST_PORTS];
++static int           s_port_motion[PAD_MAX_HOST_PORTS];
++static PadLastDevice s_last_dev = { PAD_DEV_NONE, -1 };
++static int           s_keys_active = 0;   /* this poll had keyboard/mouse input (pad_poll_keyboard) */
+ 
+ #if PAD_BACKEND_SDL
+ typedef struct PadSdlGamepad PadSdlGamepad;   /* SDL_Gamepad */
+@@ -245,7 +264,6 @@ static unsigned long long s_kb_checked_ms = 0;
+ 
+ static PadKbUi     s_kb_ui;             /* patch 2038: the Keyboard page's capture state */
+ static SRWLOCK     s_kb_lock = SRWLOCK_INIT;   /* s_kb + s_kb_ui: pad poll vs the page's commands */
+-static int         s_kb_last_keys = 0;  /* 1 = the last input came from the keyboard (prompts) */
+ 
+ static void pad_kb_log(void* ctx, const char* msg)
+ {
+@@ -514,8 +532,19 @@ int pad_kb_ui_cmd(const char* cmd, char* out, size_t n)
+     return changed;
+ }
+ 
+-/* For keycap prompts: 1 when the last input came from the keyboard (or KZ3_KB_PROMPTS=1 forces it). */
+-int pad_kb_last_device_keyboard(void)
++/* The Options row "Button prompts" (keybinds.ini [prompts] buttons; patch 4011). */
++static int pad_kb_prompts_option(void)
++{
++    int v;
++    AcquireSRWLockShared(&s_kb_lock);
++    v = s_kb_ready ? s_kb.prompts : PKB_PROMPTS_AUTO;
++    ReleaseSRWLockShared(&s_kb_lock);
++    return v;
++}
++
++/* Auto: keycaps or not. 1 when the last input came from the keyboard; KZ3_KB_PROMPTS=1/0 forces keycaps / never
++ * keycaps, KZ3_KB_PROMPTS_FLIP=N (2039 tests) alternates every N s. */
++static int pad_kb_auto_keyboard(int dev_is_keyboard)
+ {
+     static int force = -1;
+     if (force < 0) { const char* e = getenv("KZ3_KB_PROMPTS"); force = e ? atoi(e) : -1; if (force < 0) force = 2; }
+@@ -524,7 +553,7 @@ int pad_kb_last_device_keyboard(void)
+         if (flip < 0) { const char* e = getenv("KZ3_KB_PROMPTS_FLIP"); flip = e ? atoi(e) : 0; t0 = GetTickCount64(); }
+         if (flip > 0) return (int)(((GetTickCount64() - t0) / (1000ull * (unsigned)flip)) & 1);
+     }
+-    return force == 2 ? s_kb_last_keys : force;
++    return force == 2 ? dev_is_keyboard : force;
+ }
+ 
+ /* First key bound to a pad button bit (CELL_PAD_CTRL_*), or 0; slot order. For keycap prompts. */
+@@ -611,7 +640,7 @@ static void pad_poll_keyboard(void)
+     }
+     s_kb_state = pad_kb_eval(&s_kb, pad_kb_down_win, NULL);
+     ReleaseSRWLockExclusive(&s_kb_lock);
+-    if (s_kb_state.buttons || s_kb_state.dirs) s_kb_last_keys = 1;
++    s_keys_active = (s_kb_state.buttons || s_kb_state.dirs) ? 1 : 0;   /* 4011: pad_prompt_track */
+ }
+ 
+ /* Port 0 = the XInput pad (if any) plus the keys. Without a pad, port 0 is the keys alone and is reported
+@@ -624,10 +653,7 @@ static void pad_merge_keyboard(void)
+     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+     int had_pad = hs->connected;
+     if (off) return;
+-    /* 2038: pad input (a button or a stick well off centre) makes the pad the last device again (prompts). */
+-    if (had_pad && (hs->buttons || hs->analog_lx < 64 || hs->analog_lx > 192 || hs->analog_ly < 64 || hs->analog_ly > 192
+-                    || hs->analog_rx < 64 || hs->analog_rx > 192 || hs->analog_ry < 64 || hs->analog_ry > 192))
+-        s_kb_last_keys = 0;
++    /* (2038's "pad input makes the pad the last device again" is pad_prompt_track now, patch 4011) */
+     if (!hs->connected) {
+         memset(hs, 0, sizeof *hs);
+         hs->connected = 1;
+@@ -667,6 +693,7 @@ static void pad_poll_xinput(void)
+     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+         if (s_pad_empty_until[i] && now < s_pad_empty_until[i]) {
+             s_host_state[i].connected = 0;
++            s_port_dev[i] = PAD_DEV_NONE;
+             continue;
+         }
+         XINPUT_STATE state;
+@@ -683,6 +710,8 @@ static void pad_poll_xinput(void)
+         s_pad_empty_until[i] = 0;
+ 
+         s_host_state[i].connected = 1;
++        s_port_dev[i] = PAD_DEV_XBOX;    /* 4011: an XInput pad is an Xbox pad (or shows itself as one) */
++        s_port_motion[i] = 0;
+         XINPUT_GAMEPAD* gp = &state.Gamepad;
+ 
+         /* Map XInput buttons to PS3 CELL_PAD_CTRL_* */
+@@ -840,6 +869,7 @@ static int pad_sdl_enable_sensor(void* gc, int type)
+ static void pad_sdl_open_log(int p, PadSdlGamepad* gc, uint32_t id, unsigned long long now)
+ {
+     pad_sensor_open(&s_sdl_sensors[p], now, pad_sdl_has_sensor, pad_sdl_enable_sensor, gc);
++    s_port_dev[p] = pad_dev_from_sdl_type(PSDL(SDL_GetGamepadType)(gc));   /* 4011: prompts */
+     const char* name = PSDL(SDL_GetGamepadName)(gc);
+     printf("[pad] port %d: %s (%s), face %s/%s/%s/%s, sensors %s\n", p,
+            pad_sdl_type_name(PSDL(SDL_GetGamepadType)(gc)), name ? name : "?",
+@@ -895,6 +925,8 @@ static void pad_sdl_sync(unsigned long long now)
+         if (!(changed & (1u << p))) continue;
+         if (s_sdl_controllers[p]) { PSDL(SDL_CloseGamepad)(s_sdl_controllers[p]); s_sdl_controllers[p] = NULL; }
+         s_host_state[p].connected = 0;
++        s_port_dev[p] = PAD_DEV_NONE;
++        s_port_motion[p] = 0;
+         s_rumble_lo[p] = s_rumble_hi[p] = 0;
+         memset(&s_sdl_sensors[p], 0, sizeof s_sdl_sensors[p]);
+         if (s_sdl_slot_id[p] < 0) { printf("[pad] port %d: disconnected\n", p); fflush(stdout); continue; }
+@@ -917,7 +949,7 @@ static void pad_poll_sdl(void)
+     pad_sdl_sync(now);
+     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+         PadSdlGamepad* gc = s_sdl_controllers[p];
+-        if (!gc) { s_host_state[p].connected = 0; continue; }
++        if (!gc) { s_host_state[p].connected = 0; s_port_dev[p] = PAD_DEV_NONE; s_port_motion[p] = 0; continue; }
+         PadSdlRaw r;
+         for (int b = 0; b < PAD_SDL_BUTTON_MAX; b++)
+             r.button[b] = PSDL(SDL_GetGamepadButton)(gc, b) ? 1 : 0;
+@@ -925,6 +957,7 @@ static void pad_poll_sdl(void)
+             r.axis[a] = PSDL(SDL_GetGamepadAxis)(gc, a);
+         pad_sdl_map(&r, &s_host_state[p]);
+         pad_sdl_sensor_recheck(p, gc, now);
++        s_port_motion[p] = s_sdl_sensors[p].on ? 1 : 0;   /* 4011 */
+         if (s_sdl_sensors[p].on) {
+             float acc[3], gyr[3];
+             int ha = (s_sdl_sensors[p].on & 1) && PSDL(SDL_GetGamepadSensorData)(gc, PAD_SDL_SENSOR_ACCEL, acc, 3);
+@@ -1113,6 +1146,79 @@ static unsigned long long pad_now_ms(void)
+ #endif
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 4011 (stage 2): the device the button prompts are drawn for
++ * -----------------------------------------------------------------------*/
++static void pad_prompt_track(void)
++{
++    static int said = 0;
++    int keys = s_keys_active;
++    s_keys_active = 0;
++    if (pad_last_device_update(&s_last_dev, keys, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS) && said < 40) {
++        said++;
++        printf("[pad] last input: %s%s (port %d)\n", pad_dev_name(s_last_dev.dev),
++               s_last_dev.port >= 0 && s_port_motion[s_last_dev.port] ? ", motion sensors" : "", s_last_dev.port);
++        fflush(stdout);
++    }
++}
++
++/* PAD_DEV_* of the device the prompts follow (the last input; before any, the first connected host pad). */
++int pad_prompt_device(void)
++{
++    return pad_last_device_current(&s_last_dev, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS, NULL);
++}
++
++/* 1 when that device has working motion sensors (a pad whose accelerometer or gyro 4010 turned on); 0 for the
++ * keyboard, XInput pads, pads without sensors and no device. For the motion tips (port/net/kz3_text_overrides.h). */
++int pad_prompt_motion(void)
++{
++    int port = -1;
++    int dev = pad_last_device_current(&s_last_dev, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS, &port);
++    if (dev == PAD_DEV_KEYBOARD || port < 0 || port >= PAD_MAX_HOST_PORTS) return 0;
++    return s_port_motion[port];
++}
++
++/* The glyph set (PAD_PROMPT_* = rsx_prompt_glyphs.h PG_*) the prompt atlases are drawn with: the Options row's choice,
++ * KZ3_PROMPTS=auto|ps3|ps4|xbox|keyboard (tests) before it; Auto = the device of pad_prompt_device. */
++int pad_prompt_set(void)
++{
++    static int env = -2;
++    if (env == -2) {
++        const char* e = getenv("KZ3_PROMPTS");
++        env = (e && *e) ? pad_kb_prompts_by_name(e, strlen(e)) : -1;
++        if (e && *e) { printf("[pad] KZ3_PROMPTS=%s: %s\n", e, env < 0 ? "unknown value, ignored" : "button prompts forced"); fflush(stdout); }
++    }
++#ifdef _WIN32
++    int opt = env >= 0 ? env : pad_kb_prompts_option();
++#else
++    int opt = env >= 0 ? env : PKB_PROMPTS_AUTO;
++#endif
++    switch (opt) {
++    case PKB_PROMPTS_PS3: return PAD_PROMPT_PS3;
++    case PKB_PROMPTS_PS4: return PAD_PROMPT_PS4;
++    case PKB_PROMPTS_XBOX: return PAD_PROMPT_XBOX;
++    case PKB_PROMPTS_KEYBOARD: return PAD_PROMPT_KBM;
++    default: break;
++    }
++    int dev = pad_prompt_device();
++#ifdef _WIN32
++    if (pad_kb_auto_keyboard(dev == PAD_DEV_KEYBOARD)) return PAD_PROMPT_KBM;
++#endif
++    if (dev == PAD_DEV_KEYBOARD) {   /* keycaps forced off: the pad that is plugged in */
++        PadLastDevice none = { PAD_DEV_NONE, -1 };
++        dev = pad_last_device_current(&none, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS, NULL);
++    }
++    return pad_prompt_set_for_device(dev);
++}
++
++#ifdef _WIN32
++/* For 2039's keycap prompts: 1 when the prompts are keycaps (pad_prompt_set; was "the last input was a key"). */
++int pad_kb_last_device_keyboard(void)
++{
++    return pad_prompt_set() == PAD_PROMPT_KBM;
++}
++#endif
++
+ static void pad_poll_backend(void)
+ {
+     static unsigned long long s_last_ms = 0;
+@@ -1134,6 +1240,9 @@ static void pad_poll_backend(void)
+ #ifdef _WIN32
+     /* KZ3 patch 2037: keys always polled (not only with no pad on port 0) and merged into port 0. */
+     pad_poll_keyboard();
++#endif
++    pad_prompt_track();   /* 4011: before the keys are merged into port 0 */
++#ifdef _WIN32
+     pad_merge_keyboard();
+ #endif
+     pad_track_assign();
+diff --git a/libs/input/pad_host.h b/libs/input/pad_host.h
+index 845b2acf..456308cb 100644
+--- a/libs/input/pad_host.h
++++ b/libs/input/pad_host.h
+@@ -419,4 +419,82 @@ static const char* const pad_sdl_env_hints[] PAD_HOST_UNUSED = {
+ };
+ #define PAD_SDL_HINT_OVERRIDE 2   /* SDL_HintPriority SDL_HINT_OVERRIDE */
+ 
++/* ---- KZ3 patch 4011 (stage 2): the device prompts are drawn for --------------------------------------------
++ * The "last device" is the keyboard/mouse or the pad type of the port whose input arrived last (SDL_GetGamepadType at
++ * open; the XInput backend = Xbox; a port with no host pad behind it, e.g. PAD_SCRIPT's, counts as a PS3 pad). Before
++ * any input it is the first connected host pad, else nothing (= the game's own PS3 prompts, as before 2039).
++ * PAD_PROMPT_* are the glyph sets of rsx_prompt_glyphs.h (patch 2090: PG_PS3, PG_PS4, PG_XBOX, PG_KBM). */
++enum { PAD_DEV_NONE = 0, PAD_DEV_KEYBOARD, PAD_DEV_PS3, PAD_DEV_PS4, PAD_DEV_PS5, PAD_DEV_XBOX, PAD_DEV_SWITCH,
++       PAD_DEV_OTHER, PAD_DEV_N };
++enum { PAD_PROMPT_PS3 = 0, PAD_PROMPT_PS4 = 1, PAD_PROMPT_XBOX = 2, PAD_PROMPT_KBM = 3 };
++
++/* SDL_GamepadType -> device. */
++static inline int pad_dev_from_sdl_type(int t)
++{
++    switch (t) {
++    case 2: case 3: return PAD_DEV_XBOX;            /* Xbox 360, Xbox One / Series */
++    case 4:         return PAD_DEV_PS3;
++    case 5:         return PAD_DEV_PS4;
++    case 6:         return PAD_DEV_PS5;
++    case 7: case 8: case 9: case 10: return PAD_DEV_SWITCH;   /* Switch Pro, Joy-Con L/R/pair */
++    default:        return PAD_DEV_OTHER;           /* unknown / standard gamepad */
++    }
++}
++
++static inline const char* pad_dev_name(int d)
++{
++    static const char* const n[PAD_DEV_N] = { "none", "keyboard", "PS3 pad", "PS4 pad", "PS5 pad", "Xbox pad",
++                                              "Switch pad", "other pad" };
++    return d >= 0 && d < PAD_DEV_N ? n[d] : "?";
++}
++
++/* Glyph set for a device. Switch and unknown pads keep the game's PS3 shapes (ASSUMPTION: the Xbox letters would sit
++ * on the wrong buttons of a Switch pad, whose south button reads B; no Switch set yet). */
++static inline int pad_prompt_set_for_device(int d)
++{
++    switch (d) {
++    case PAD_DEV_KEYBOARD: return PAD_PROMPT_KBM;
++    case PAD_DEV_PS4: case PAD_DEV_PS5: return PAD_PROMPT_PS4;
++    case PAD_DEV_XBOX: return PAD_PROMPT_XBOX;
++    default: return PAD_PROMPT_PS3;
++    }
++}
++
++/* A button, a trigger past the L2/R2 threshold or a stick well off centre: the player is using this pad (the same
++ * stick test 2038 used for "the pad is the last device again"). */
++static inline int pad_host_input_active(const PadHostState* hs)
++{
++    if (!hs->connected) return 0;
++    if (hs->buttons) return 1;
++    if (hs->trigger_l2 > PAD_HOST_TRIGGER_THRESHOLD || hs->trigger_r2 > PAD_HOST_TRIGGER_THRESHOLD) return 1;
++    return hs->analog_lx < 64 || hs->analog_lx > 192 || hs->analog_ly < 64 || hs->analog_ly > 192 ||
++           hs->analog_rx < 64 || hs->analog_rx > 192 || hs->analog_ry < 64 || hs->analog_ry > 192;
++}
++
++typedef struct { int dev; int port; } PadLastDevice;   /* port -1 = keyboard / none */
++
++/* One poll: the keys first, then every pad port with input (a pad wins over the keys in the same poll, as in 2038).
++ * port_dev[p] = the host pad behind port p (PAD_DEV_NONE: none, e.g. a scripted port). Returns 1 when it changed. */
++static inline int pad_last_device_update(PadLastDevice* l, int keys_active, const PadHostState* hs, const int* port_dev,
++                                         int nports)
++{
++    PadLastDevice o = *l;
++    if (keys_active) { l->dev = PAD_DEV_KEYBOARD; l->port = -1; }
++    for (int p = 0; p < nports; p++)
++        if (pad_host_input_active(&hs[p])) { l->dev = port_dev[p] ? port_dev[p] : PAD_DEV_PS3; l->port = p; }
++    return l->dev != o.dev || l->port != o.port;
++}
++
++/* The device prompts follow: the last one, else the first connected host pad, else none. *port gets its port. */
++static inline int pad_last_device_current(const PadLastDevice* l, const PadHostState* hs, const int* port_dev, int nports,
++                                          int* port)
++{
++    if (l->dev != PAD_DEV_NONE) { if (port) *port = l->port; return l->dev; }
++    for (int p = 0; p < nports; p++)
++        if (hs[p].connected && port_dev[p]) { if (port) *port = p; return port_dev[p]; }
++    if (port) *port = -1;
++    return PAD_DEV_NONE;
++}
++
++
+ #endif
+diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+index 16d8a882..efaa3908 100644
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -104,7 +104,25 @@ static const PadKbKey pad_kb_keys[] = {
+ #define PKB_N_KEYS ((int)(sizeof pad_kb_keys / sizeof pad_kb_keys[0]))
+ 
+ /* key[i][s] = virtual-key code of input i, slot s (0 = unbound). */
+-typedef struct { unsigned char key[PKB_N_INPUTS][PKB_SLOTS]; } PadKeybinds;
++/* KZ3 patch 4011: `prompts` = the Options row "Button prompts" (PKB_PROMPTS_*), section [prompts] of the file. */
++typedef struct { unsigned char key[PKB_N_INPUTS][PKB_SLOTS]; unsigned char prompts; } PadKeybinds;
++
++enum { PKB_PROMPTS_AUTO = 0, PKB_PROMPTS_PS3, PKB_PROMPTS_PS4, PKB_PROMPTS_XBOX, PKB_PROMPTS_KEYBOARD, PKB_N_PROMPTS };
++static const char* const pkb_prompt_names[PKB_N_PROMPTS] = { "auto", "ps3", "ps4", "xbox", "keyboard" };
++
++/* Value name -> PKB_PROMPTS_*, -1 if unknown ("ps5" = "ps4": one PS4/PS5 set). Case does not matter. */
++static int pad_kb_prompts_by_name(const char* s, size_t n)
++{
++    size_t i, k;
++    if (n == 3 && (s[0] | 0x20) == 'p' && (s[1] | 0x20) == 's' && s[2] == '5') return PKB_PROMPTS_PS4;
++    for (i = 0; i < PKB_N_PROMPTS; i++) {
++        const char* m = pkb_prompt_names[i];
++        if (strlen(m) != n) continue;
++        for (k = 0; k < n && (char)((s[k] >= 'A' && s[k] <= 'Z') ? s[k] + 32 : s[k]) == m[k]; k++) {}
++        if (k == n) return (int)i;
++    }
++    return -1;
++}
+ 
+ /* What the keys add to the pad this poll. */
+ typedef struct { unsigned short buttons; unsigned char dirs; } PadKbState;
+@@ -316,7 +334,7 @@ static int pad_kb_space(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* ctx)
+ {
+     const char* p = text;
+-    int line = 0, bad = 0, in_kb = 1;
++    int line = 0, bad = 0, in_kb = 1, in_pr = 0;
+     if (!text) return 0;
+     if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
+     while (*p) {
+@@ -332,10 +350,24 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
+         if (a < b) {
+             if (*a == '[') {
+                 const char* r = memchr(a, ']', (size_t)(b - a));
+-                if (!r) { pad_kb_logf(log, ctx, line, "broken section header", a, (size_t)(b - a)); bad++; in_kb = 0; }
++                if (!r) { pad_kb_logf(log, ctx, line, "broken section header", a, (size_t)(b - a)); bad++; in_kb = in_pr = 0; }
+                 else {
+                     in_kb = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "keyboard");
+-                    if (!in_kb) { pad_kb_logf(log, ctx, line, "section not read by this version", a, (size_t)(r - a + 1)); }
++                    in_pr = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "prompts");   /* 4011 */
++                    if (!in_kb && !in_pr) { pad_kb_logf(log, ctx, line, "section not read by this version", a, (size_t)(r - a + 1)); }
++                }
++            } else if (in_pr) {
++                /* 4011: "buttons = auto|ps3|ps4|xbox|keyboard"; anything else is logged and the value kept */
++                const char* q = memchr(a, '=', (size_t)(b - a));
++                const char *ne = q, *v = q ? q + 1 : NULL;
++                int pv;
++                if (!q) { pad_kb_logf(log, ctx, line, "no '=' in", a, (size_t)(b - a)); bad++; }
++                else {
++                    while (ne > a && pad_kb_space(ne[-1])) ne--;
++                    while (v < b && pad_kb_space(*v)) v++;
++                    if (!pad_kb_ieq(a, (size_t)(ne - a), "buttons")) { pad_kb_logf(log, ctx, line, "unknown prompts setting", a, (size_t)(ne - a)); bad++; }
++                    else if ((pv = pad_kb_prompts_by_name(v, (size_t)(b - v))) < 0) { pad_kb_logf(log, ctx, line, "unknown prompts value", v, (size_t)(b - v)); bad++; }
++                    else kb->prompts = (unsigned char)pv;
+                 }
+             } else if (in_kb) {
+                 eq = memchr(a, '=', (size_t)(b - a));
+@@ -440,6 +472,10 @@ static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
+         else snprintf(v, sizeof v, "%s, %s", pad_kb_key_name(kb->key[i][0]), pad_kb_key_name(kb->key[i][1]));
+         PKB_PUT("%-9s= %-22s# %s\n", pad_kb_inputs[i].name, v, pad_kb_inputs[i].what);
+     }
++    PKB_PUT("\n[prompts]\n"
++            "# Button pictures in the game (Options > Controls > Button prompts): auto = the device you used last,\n"
++            "# or always ps3, ps4 (PS4/PS5), xbox, keyboard.\n"
++            "buttons  = %s\n", pkb_prompt_names[kb->prompts < PKB_N_PROMPTS ? kb->prompts : 0]);
+ #undef PKB_PUT
+     return (int)o;
+ }
+@@ -678,6 +714,20 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+     if (!n) return 0;
+     out[0] = 0;
+     if (sscanf(cmd, "%15s %d %d", verb, &r, &s) < 1) return 0;
++    if (!strcmp(verb, "prompts")) {
++        /* 4011: "prompts" -> the Button prompts value's name; "prompts <name>" sets it (1 = changed, saved). */
++        const char* v = cmd + 7;
++        int pv;
++        while (*v == ' ') v++;
++        if (!*v) { snprintf(out, n, "%s", pkb_prompt_names[kb->prompts < PKB_N_PROMPTS ? kb->prompts : 0]); return 0; }
++        pv = pad_kb_prompts_by_name(v, strlen(v));
++        if (pv < 0) { snprintf(out, n, "bad"); return 0; }
++        snprintf(out, n, "%s", pkb_prompt_names[pv]);
++        if (kb->prompts == pv) return 0;
++        kb->prompts = (unsigned char)pv;
++        u->gen++;
++        return 1;
++    }
+     in = pad_kb_row_input(r);
+     if (!strcmp(verb, "rows")) { snprintf(out, n, "%d", PKB_N_ROWS); return 0; }
+     if (!strcmp(verb, "label")) { snprintf(out, n, "%s", in >= 0 ? pad_kb_rows[r].label : ""); return 0; }
+@@ -713,7 +763,8 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+         return 0;
+     }
+     if (!strcmp(verb, "reset")) {
+-        pad_kb_defaults(kb); u->phase = PKB_UI_IDLE; u->gen++; u->result = PKB_R_NONE;
++        unsigned char pr = kb->prompts;   /* 4011: the Keyboard page's reset keeps the Button prompts choice */
++        pad_kb_defaults(kb); kb->prompts = pr; u->phase = PKB_UI_IDLE; u->gen++; u->result = PKB_R_NONE;
+         snprintf(out, n, "ok");
+         return 1;
+     }

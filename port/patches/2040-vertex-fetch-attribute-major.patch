@@ -1,0 +1,54 @@
+KZ3 patch 2040 (RSX pass 40): attribute-major vertex fetch (RSX_VTX_BATCH).
+rsx_vertex_compact.c/.h: rsx_vertex_fetch_many(plan, refs, count, out, out_stride) converts a draw's unique
+vertices in blocks of 128, one layout slot at a time, with the element type and component count resolved once
+per block and slot (specialised loops per type x components); a vertex outside the attribute's contiguous
+mapping, a frequency-divided attribute, CMP32 and unmapped attributes take the per-vertex path, which is the
+slot body of rsx_vertex_fetch_one (now shared as rsx_vertex_fetch_attr_one). The per-component arithmetic is
+the same expression as rsx_vertex_decode_fast, so the payload bytes are identical; host test
+tools/smoke/test_vtx_batch.sh compares both paths byte for byte (every type, defaults, dividers, fallbacks,
+inline streams, counts around the block size) and times them.
+rsx_live_draw.c: the compact-payload fetch loop calls it when RSX_VTX_BATCH is on (default in
+LD_VTX_BATCH_DEFAULT = 1 since pass 41; RSX_VTX_BATCH=0 keeps the per-vertex loop). Log: [vtx-batch] once at the first draw.
+Upstream candidate (pure refactor of the fetch loop, no KZ3-specific behaviour).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): shrunk: upstream has the attribute-major rsx_vertex_fetch_many (no out_stride arg, writes at layout.stride); 2040 keeps only LD_VTX_BATCH's call in live_draw; tools/smoke/test_vtx_batch.c calls upstream's signature.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index c0bef983..b14689d9 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -483,6 +483,20 @@ static int ld_vertex_compact_payload(void)
+     return (g.vertex_features & LD_VERTEX_COMPACT_PAYLOAD) != 0;
+ }
+ 
++/* KZ3 patch 2040: RSX_VTX_BATCH=0|1, the attribute-major vertex fetch
++ * (rsx_vertex_fetch_many) for the compact payload. */
++#define LD_VTX_BATCH_DEFAULT 1
++static int ld_vtx_batch_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("RSX_VTX_BATCH");
++        on = e ? (atoi(e) != 0) : LD_VTX_BATCH_DEFAULT;
++        fprintf(stderr, "[vtx-batch] %s (RSX_VTX_BATCH=%s)\n", on ? "on" : "off", e ? e : "unset");
++    }
++    return on;
++}
++
+ static const char* ld_vertex_mode_name(void)
+ {
+     switch (g.vertex_mode) {
+@@ -7775,6 +7789,13 @@ static void fetch_batches_hoisted(
+             dc.fetch_ok = 0;
+             return;
+         }
++        if (ld_vtx_batch_on() && layout->stride) {   /* KZ3 patch 2040 */
++            if (!rsx_vertex_fetch_many(
++                    &dc.fetch_plan, dc.refs, dc.n_refs, dc.compact_verts)) {
++                dc.fetch_ok = 0;
++                return;
++            }
++        } else
+         for (u32 i = 0; i < dc.n_refs; i++) {
+             u8* destination = layout->stride
+                 ? dc.compact_verts + (u64)i * layout->stride : NULL;

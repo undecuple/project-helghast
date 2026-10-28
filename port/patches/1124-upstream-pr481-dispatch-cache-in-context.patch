@@ -1,0 +1,282 @@
+KZ3 patch 1124 (SPU pass 105): upstream ps3recomp PR #481 by tekulvw (MIT), the SPU dispatch cache in front of
+spu_lifted_lookup's full resolver, adapted: the cache lives in the spu_context (spu_context.dcache[512], 32-byte
+entries, last in the struct) instead of upstream's __thread t_dcache[512] keyed by a per-context id.
+
+Why in the context: patch 1017's rule, the MinGW toolchain emulates TLS (every thread-local read is a call into
+__emutls_get_address, SPU pass 100); a context runs on one host thread at a time, so its entries need no atomics,
+and spu_context_init zeroing the context replaces upstream's lifetime id. Keys as upstream: target, image, resident
+overlay, resident task, registry count (now published with a release store after the entry is linked), and
+dcache_residency, which spu_overlay_note_get bumps on every resident_code change. Misses are not cached.
+SPU_DISPATCH_CACHE: unset/0 off (KZ3 default, upstream's is on), 1 on, 2 or "shadow" on with the full resolver run on
+every hit, mismatches counted, the first 16 logged, the resolver's answer returned; shadow mode prints
+"[spu-dcache] hits= misses= shadow_mismatches=" at every power of two from 1024 hits or misses, every 2^22 after, and at exit. The PR's dispatch-cache test case
+runs with SPU_DISPATCH_CACHE=1 when the variable is unset. Tests: tools/spu/test_r105_dcache.sh (PR test 139/137
+checks in all modes; tools/spu/test_r105_dcache.c: filled on one host thread, hit on another; default off; shadow
+catches a stale entry). Note: KZ3's lifted code dispatches through spu_indirect_branch_mt's fast path (overlay,
+then image, patch 1096's memo) first; this cache serves only the full resolver and the interpreter rejoin.
+The array is not over-aligned: a first build with __attribute__((aligned(64))) hung K4 at start in 3 of 3 runs
+(SPURS job manager spinning, RSX park not patched), the build without it ran (SPU pass 105; ASSUMPTION: MinGW GCC
+does not realign the Win64 stack for over-aligned locals, and malloc'd contexts are 16-byte aligned).
+Upstream candidate: the context-resident variant (no TLS).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (cache in the context, default off) over upstream's TLS cache (on by default upstream). TODO fixup: upstream's `dcache_id, dcache_residency` field in spu_context.h duplicates 1124's `dcache_residency` (compile error until removed).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 1756a14b..3837c303 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1794,8 +1794,8 @@ void spu_register_function(uint32_t addr, spu_fn fn)
+     else
+         s_hash_next[s_hash_tail[h] - 1] = i + 1;
+     s_hash_tail[h] = i + 1;
+-    /* Published after the entry is linked: the dispatch cache keys its entries
+-     * by this count, so a lookup that sees the new count also finds the entry. */
++    /* KZ3 patch 1124 (upstream #481): published after the entry is linked: the dispatch cache keys its entries by
++     * this count, so a lookup that sees the new count also finds the entry. */
+     __atomic_store_n(&s_registry_count, i + 1, __ATOMIC_RELEASE);
+ }
+ 
+@@ -2059,99 +2059,93 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+     return (spu_lifted_fn)fn;
+ }
+ 
+-/* ---- Dispatch cache (on by default; SPU_DISPATCH_CACHE=0 turns it off) -----
+- * Indirect dispatch and interpreter rejoin resolve the same few targets
+- * millions of times a second, and each resolution re-derives ownership: the
+- * resident code slots (verifying a pending load), then the task, overlay and
+- * primary registries, each a hash-chain walk. The answer changes only when one
+- * of its inputs does, so remember it per host thread, keyed by everything the
+- * resolver reads:
++/* ---- Dispatch cache (KZ3 patch 1124, upstream #481 by tekulvw, adapted) --------------------------------------
++ * Indirect dispatch and interpreter rejoin resolve the same few targets very often, and each resolution re-derives
++ * ownership: the resident code slots (verifying a pending load), then the task, overlay and primary registries. The
++ * answer changes only when one of its inputs does, so the context remembers it, keyed by everything the resolver
++ * reads:
+  *  - the target and the context's image, resident overlay and resident task;
+- *  - the registry, by its append-only count (any registration drops every
+- *    entry);
+- *  - the context's resident code slots, by dcache_residency, which
+- *    spu_overlay_note_get (their only runtime writer) bumps on every change;
+- *  - the context's lifetime, by dcache_id: a context re-initialised at the
+- *    same address starts with id 0 and takes a fresh one.
+- * A verified slot is not re-compared, as without the cache (verify once per
+- * load); a store by SPU code into a verified span is not tracked, the same as
+- * there. Misses (NULL) are not cached, so a rejected or unlifted target is
+- * resolved every time, as before. SPU_DISPATCH_CACHE=shadow runs the full
+- * resolver on every hit, counts disagreements and returns its answer. */
+-typedef struct {
+-    spu_lifted_fn fn;
+-    uint32_t id, lsa, rgen, residency;
+-    int image, ovl, task;
+-} spu_dcache_ent;
+-#define SPU_DCACHE_ENTRIES 512u
+-static SPU_TLS spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
+-static uint32_t s_dcache_next_id;
++ *  - the registry, by its append-only count (any registration drops every entry);
++ *  - the context's resident code slots, by dcache_residency, which spu_overlay_note_get (their only runtime writer)
++ *    bumps on every change.
++ * Upstream's cache is a __thread array keyed by a per-context id; KZ3 keeps it in the context (patch 1017's rule:
++ * the MinGW toolchain emulates TLS, one call per thread-local read), which also makes the id unnecessary: the
++ * context's own init zeroes its cache. A context runs on one host thread at a time, so the entries need no atomics.
++ * A verified slot is not re-compared, as without the cache (verify once per load); a store by SPU code into a
++ * verified span is not tracked, the same as there. Misses (NULL) are not cached. SPU_DISPATCH_CACHE: 0 (default)
++ * off, 1 on, 2 (or "shadow") on with the full resolver run on every hit, disagreements counted and logged and its
++ * answer returned; the counts print as [spu-dcache] every 2^22 hits and every 2^22 misses (shadow mode only, the counters are shared). */
++static int s_dcache_mode = -1;
+ static unsigned long long s_dcache_hits, s_dcache_misses, s_dcache_shadow_bad;
++static void spu_dcache_shadow_final(void);
+ static int spu_dcache_mode(void)   /* 0 off, 1 on, 2 shadow */
+ {
+-    static int s_mode = -1;
+-    int m = __atomic_load_n(&s_mode, __ATOMIC_RELAXED);
+-    if (m < 0) {
++    int m = __atomic_load_n(&s_dcache_mode, __ATOMIC_RELAXED);
++    if (__builtin_expect(m < 0, 0)) {
+         const char* e = getenv("SPU_DISPATCH_CACHE");
+-        m = !e ? 1 : (!strcmp(e, "0") || !strcmp(e, "off")) ? 0 : !strcmp(e, "shadow") ? 2 : 1;
+-        __atomic_store_n(&s_mode, m, __ATOMIC_RELAXED);
++        m = (!e || !*e || !strcmp(e, "0") || !strcmp(e, "off")) ? 0
++          : (!strcmp(e, "2") || !strcmp(e, "shadow")) ? 2 : 1;
++        __atomic_store_n(&s_dcache_mode, m, __ATOMIC_RELAXED);
++        if (m == 2) atexit(spu_dcache_shadow_final);
++        if (m) fprintf(stderr, "[spu-dcache] dispatch cache %s (%u entries per context, KZ3 patch 1124)\n",
++                       m == 2 ? "on, shadow check" : "on", (unsigned)SPU_DCACHE_ENTRIES);
+     }
+     return m;
+ }
+-static void spu_dcache_residency_changed(spu_context* ctx) { ctx->dcache_residency++; }
+-static void spu_dcache_shadow_stats(void)
++static inline void spu_dcache_residency_changed(spu_context* ctx) { ctx->dcache_residency++; }
++/* n: the hits or misses count one lookup just reached (its own fetch_add, so no step is skipped by a race): prints at
++ * every power of two from 1024 and every 2^22 after that. */
++static void spu_dcache_shadow_stats(unsigned long long n)
+ {
+-    const unsigned long long n = __atomic_load_n(&s_dcache_hits, __ATOMIC_RELAXED) +
+-                                 __atomic_load_n(&s_dcache_misses, __ATOMIC_RELAXED);
+-    if (n && (n & ((1ull << 24) - 1)) == 0)
++    if (n == 0 || (n >= 1024 && (n & (n - 1)) == 0) || (n & ((1ull << 22) - 1)) == 0)   /* 0 = at exit */
+         fprintf(stderr, "[spu-dcache] hits=%llu misses=%llu shadow_mismatches=%llu\n",
+                 __atomic_load_n(&s_dcache_hits, __ATOMIC_RELAXED),
+                 __atomic_load_n(&s_dcache_misses, __ATOMIC_RELAXED),
+                 __atomic_load_n(&s_dcache_shadow_bad, __ATOMIC_RELAXED));
+ }
++static void spu_dcache_shadow_final(void) { spu_dcache_shadow_stats(0); }
++/* Host tests: reset the mode so a test can switch it between cases. */
++void spu_dcache_reset_mode_for_test(void) { __atomic_store_n(&s_dcache_mode, -1, __ATOMIC_RELAXED); }
++void spu_dcache_stats(unsigned long long* hits, unsigned long long* misses, unsigned long long* bad)
++{
++    if (hits) *hits = __atomic_load_n(&s_dcache_hits, __ATOMIC_RELAXED);
++    if (misses) *misses = __atomic_load_n(&s_dcache_misses, __ATOMIC_RELAXED);
++    if (bad) *bad = __atomic_load_n(&s_dcache_shadow_bad, __ATOMIC_RELAXED);
++}
+ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+ {
+     const int mode = spu_dcache_mode();
+     if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa);
+     spu_context* c = (spu_context*)ctx;
+-    uint32_t id = c->dcache_id;
+-    if (!id) {
+-        do id = __atomic_add_fetch(&s_dcache_next_id, 1, __ATOMIC_RELAXED); while (!id);
+-        c->dcache_id = id;
+-    }
+-    /* Read before the resolver walks the registry: an entry is never keyed by
+-     * a count newer than the registry it saw. */
++    /* Read before the resolver walks the registry: an entry is never keyed by a count newer than the registry it
++     * saw. */
+     const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
+-    spu_dcache_ent* e = &t_dcache[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
+-    if (e->fn && e->id == id && e->lsa == lsa && e->rgen == rgen &&
+-        e->residency == c->dcache_residency && e->image == c->image_id &&
+-        e->ovl == c->resident_ovl && e->task == c->resident_task) {
++    struct spu_dcache_ent* e = &c->dcache[((lsa >> 2) ^ (lsa >> 11)) & (SPU_DCACHE_ENTRIES - 1)];
++    if (e->fn && e->lsa == lsa && e->rgen == rgen && e->residency == c->dcache_residency &&
++        e->image == c->image_id && e->ovl == c->resident_ovl && e->task == c->resident_task) {
+         if (mode == 2) {
+-            __atomic_fetch_add(&s_dcache_hits, 1, __ATOMIC_RELAXED);
++            const unsigned long long nh = __atomic_add_fetch(&s_dcache_hits, 1, __ATOMIC_RELAXED);
+             const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa);
+-            if (full != e->fn) {
++            if (full != (spu_lifted_fn)e->fn) {
+                 if (__atomic_fetch_add(&s_dcache_shadow_bad, 1, __ATOMIC_RELAXED) < 16)
+                     fprintf(stderr, "[spu-dcache] shadow mismatch img=%d ovl=%d task=%d lsa=0x%05X "
+                             "cached=%p full=%p\n", c->image_id, c->resident_ovl, c->resident_task,
+-                            lsa, (void*)e->fn, (void*)full);
++                            lsa, e->fn, (void*)full);
+                 e->fn = NULL;
+                 return full;
+             }
+-            spu_dcache_shadow_stats();
++            spu_dcache_shadow_stats(nh);
+         }
+-        return e->fn;
++        return (spu_lifted_fn)e->fn;
+     }
+     if (mode == 2) {   /* shared counters only in shadow mode: they would bounce between SPU threads */
+-        __atomic_fetch_add(&s_dcache_misses, 1, __ATOMIC_RELAXED);
+-        spu_dcache_shadow_stats();
++        spu_dcache_shadow_stats(__atomic_add_fetch(&s_dcache_misses, 1, __ATOMIC_RELAXED));
+     }
+     const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
+     if (fn) {
+-        /* The resolver may have verified a pending slot; the entry records the
+-         * residency it resolved against, read after it. */
+-        e->fn = fn; e->id = id; e->lsa = lsa; e->rgen = rgen;
+-        e->residency = c->dcache_residency; e->image = c->image_id;
+-        e->ovl = c->resident_ovl; e->task = c->resident_task;
++        /* The resolver may have verified a pending slot; the entry records the residency read after it. */
++        e->fn = (void*)fn; e->lsa = lsa; e->rgen = rgen; e->residency = c->dcache_residency;
++        e->image = c->image_id; e->ovl = c->resident_ovl; e->task = c->resident_task;
+     }
+     return fn;
+ }
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 7e17fa26..35c27d59 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -221,6 +221,8 @@ typedef struct spu_channel {
+ /* ---------------------------------------------------------------------------
+  * SPU execution context
+  * -----------------------------------------------------------------------*/
++/* KZ3 patch 1124: entries of the context's dispatch cache (a power of two). */
++#define SPU_DCACHE_ENTRIES 512u
+ typedef struct spu_context {
+     /* 128 general-purpose 128-bit registers */
+     SPU_ALIGN16 u128 gpr[128];
+@@ -354,14 +356,6 @@ typedef struct spu_context {
+         int verify_state, source_index;
+     } resident_code[4];
+ 
+-    /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
+-     * context's current lifetime: 0 after spu_context_init (or a zeroed
+-     * allocation) until its first cached dispatch, so a context reset at the
+-     * same address never meets an earlier lifetime's entries. dcache_residency
+-     * is bumped on every change to resident_code, dropping the cached
+-     * resolutions of this context. */
+-    uint32_t dcache_id, dcache_residency;
+-
+     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
+      * for co-resident tasks. A taskset may hold several tasks that all lift at the
+      * SAME LS base (the shared task-code region at LS 0x3000+), so an LS address
+@@ -491,6 +485,19 @@ typedef struct spu_context {
+     /* KZ3 patch 1096: return pc of the innermost open call bracket (lifted brsl/bisl, spu_drain_call_full), or 0 at
+      * top level. A direct indirect hop to this address is left to the drain, which returns there. */
+     uint32_t hop_ret_pc;
++
++    /* KZ3 patch 1124 (upstream #481, adapted): the dispatch cache of spu_lifted_lookup (spu_channels.c). Upstream
++     * keeps it in a per-host-thread array keyed by a context id; here it lives in the context (patch 1017's rule:
++     * MinGW's emulated TLS makes every thread-local read a call), so no context id is needed: spu_context_init
++     * zeroes it and an entry with fn == NULL is empty. dcache_residency is bumped on every change to
++     * resident_code (spu_overlay_note_get), dropping this context's cached resolutions. Kept last so no hot field
++     * moves. */
++    uint32_t dcache_residency;
++    struct spu_dcache_ent {
++        void*    fn;
++        uint32_t lsa, rgen, residency;
++        int32_t  image, ovl, task;
++    } dcache[SPU_DCACHE_ENTRIES];   /* no over-alignment: contexts come from malloc and live on job stacks */
+ } spu_context;
+ 
+ /* event_status is written from more than one host thread: the SPU's own
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index ce11d991..414c9950 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -555,7 +555,7 @@ static void test_resident_interpreter_rejoin(void)
+     c->resident_ovl = 0;
+     check(spu_lifted_lookup(c, a) == rejoin_primary, "cleared resident identities expose primary");
+     check(spu_lifted_lookup(c, 0x19000) == NULL, "all registry misses stay unlifted");
+-    g_spu_trampoline_fn = 0;
++    c->tramp_fn = 0;   /* KZ3 patch 1017: g_spu_trampoline_fn is ctx->tramp_fn; this test names its context c */
+     free(c);
+ }
+ 
+@@ -570,6 +570,11 @@ static void dc_region(spu_context* c)  { c->gpr[9]._u32[0] = 4; }
+ static void test_dispatch_cache(void)
+ {
+     const uint32_t a = 0x1C000;
++    /* KZ3 patch 1124: the cache is off by default (SPU_DISPATCH_CACHE=1 turns it on); without the variable this
++     * case runs with it on, as upstream's default. */
++    extern void spu_dcache_reset_mode_for_test(void);
++    const int dc_env = getenv("SPU_DISPATCH_CACHE") != NULL;
++    if (!dc_env) { setenv("SPU_DISPATCH_CACHE", "1", 1); spu_dcache_reset_mode_for_test(); }
+     spu_context* c = calloc(1, sizeof *c);
+     spu_context* d = calloc(1, sizeof *d);
+     if (!c || !d) { check(0, "allocate dispatch cache contexts"); free(c); free(d); return; }
+@@ -612,14 +617,15 @@ static void test_dispatch_cache(void)
+     spu_overlay_note_get(c, 0x850000, c->ls + a + 0x800, 16);
+     check(spu_lifted_lookup(c, a) == dc_primary, "dcache: equal residency count in a new lifetime is a miss");
+ 
+-    if (!getenv("SPU_DISPATCH_CACHE")) {
++    if (!dc_env) {
+         /* Only spu_overlay_note_get may change resident code; a direct write
+          * that bypasses it keeps the cached answer, which shows the cache is
+          * on by default. */
+         spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+         check(spu_lifted_lookup(c, a) == dc_region, "dcache: region resident before the bypass");
+         memset(c->resident_code, 0, sizeof c->resident_code);
+-        check(spu_lifted_lookup(c, a) == dc_region, "dcache: on by default (a hit skips the resolver)");
++        check(spu_lifted_lookup(c, a) == dc_region, "dcache: on with SPU_DISPATCH_CACHE=1 (a hit skips the resolver)");
++        unsetenv("SPU_DISPATCH_CACHE"); spu_dcache_reset_mode_for_test();
+     }
+     free(c); free(d);
+ }

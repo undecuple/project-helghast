@@ -1,0 +1,214 @@
+KZ3 patch 2065 (RSX pass 63): an A8R8G8B8 render surface read as Y16_X16_FLOAT gets an R16G16_FLOAT copy of its words
+(LD_SURF_RG16=0 = old). rsx_live_draw.c: KZ3's lights read the G-buffer normals target 0x16C0000 (written as RGBA8
+bytes, patch 2064) as Y16_X16_FLOAT; the RSX reinterprets the 32-bit word, live-draw bound the RGBA8 UNORM view, so
+the normal was two byte values in [0,1]. ld_surface_rg16 runs a compute pass (the depth-snapshot root signature):
+word = A<<24|R<<16|G<<8|B, X = half(G<<8|B) (low half), Y = half(A<<8|R), into a per-surface R16G16_FLOAT texture
+refreshed when the surface's colour_gen changes; its SRV maps the RSX remap like the guest float-texture path
+(ld_float_tex_mapping). Exact for any filter. Log [surf-rg16]. The byte order follows the game's own write
+(the G-buffer packs h0.xy = normal.xy and stores the bytes as (y_lo, x_hi, x_lo, y_hi) into R,G,B,A). Note: the
+guest-memory Y16_X16_FLOAT decode of patch 2014 maps the FIRST half in memory to X, which this word order says is
+Y; KZ3 has no guest Y16_X16_FLOAT texture, so that path is left as it is (open item). Upstream candidate.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index a2cfc7f..3866fe3 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -191,7 +191,10 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ /* Patch 2063: per-zeta exact-size windows of the depth snapshot (LD_ZWIN_PER per zeta, see zdepth_window). */
+ #define LD_ZWIN_PER       3
+ #define SRV_ZWIN_BASE     (UAV_GEOM_CAP + 1)
+-#define SRV_CPU_HEAP_SLOTS (SRV_ZWIN_BASE + MAX_SURFACES * LD_ZWIN_PER)
++/* Patch 2065: per-surface R16G16_FLOAT reinterpretation of an RGBA8 surface read as Y16_X16_FLOAT (SRV + UAV). */
++#define SRV_SURF_RG16_BASE (SRV_ZWIN_BASE + MAX_SURFACES * LD_ZWIN_PER)
++#define UAV_SURF_RG16_BASE (SRV_SURF_RG16_BASE + MAX_SURFACES)
++#define SRV_CPU_HEAP_SLOTS (UAV_SURF_RG16_BASE + MAX_SURFACES)
+ #define SRV_TABLE_SIZE   16
+ #define SRV_RING_TABLES  4096
+ 
+@@ -250,6 +253,10 @@ typedef struct {
+     u8 gv_dirty;              /* explicit hook: the guest wrote after the last GPU write */
+     u8 gv_gpu_dirty;          /* the GPU wrote since the last write-back (main-memory surfaces) */
+     u32 colour_gen;           /* patch 2044: g_ld_cw_gen of the last draw/clear that wrote colour (mask != 0) */
++    ID3D12Resource* rg16;     /* patch 2065: the surface's bytes as Y16_X16_FLOAT (R16G16_FLOAT), see ld_surface_rg16 */
++    ID3D12Resource* rg16_src; /* patch 2065: the surface resource rg16 was made from */
++    u32 rg16_gen, rg16_remap; /* patch 2065: colour_gen it holds, remap its SRV maps */
++    int rg16_state;           /* patch 2065: 0 none, 1 UAV, 2 pixel-shader resource */
+ #if !defined(YZ_PERF_CLEAN)
+     u32 resource_serial;
+     u32 last_write_generation;
+@@ -426,6 +433,7 @@ typedef struct {
+     ID3D12RootSignature*       downsample_rootsig;
+     ID3D12PipelineState*       downsample_pso[4];
+     DXGI_FORMAT                downsample_fmt[4];
++    ID3D12PipelineState*       surf_rg16_pso;   /* patch 2065 */
+     psocache_t                 psos[MAX_PSOS];
+     u32                        n_psos;
+     shader_blob_cache_t        vs_blobs;
+@@ -6034,6 +6042,156 @@ static int zdepth_window(u32 i, u32 w, u32 h)
+     return (int)(SRV_ZWIN_BASE + i * LD_ZWIN_PER + k);
+ }
+ 
++/* Patch 2065 (KZ3 RSX pass 63): an A8R8G8B8 render surface read as Y16_X16_FLOAT. KZ3's G-buffer writes the view
++ * normal's two halves as the bytes of its third target (0x16C0000: UPB of r0.x, patch 2064) and every lighting
++ * pass reads that surface back as Y16_X16_FLOAT (remap 0x29E4). The RSX reinterprets the 32-bit word; live-draw
++ * bound the surface's RGBA8 UNORM view, so the lights read two byte values in [0,1] as the normal. The word is
++ * A<<24 | R<<16 | G<<8 | B (A8R8G8B8 in guest memory, big-endian) and Y16_X16 keeps Y in the high half, so
++ * X = half(G<<8 | B), Y = half(A<<8 | R). A compute pass (the depth-snapshot root signature) writes them to an
++ * R16G16_FLOAT copy, refreshed when the surface's colour_gen changes, whose SRV maps the remap as the float
++ * texture path does (ld_float_tex_mapping). Exact for any filter. LD_SURF_RG16=0 = old behaviour (RGBA8 view).
++ * ASSUMPTION: only draws and clears change a surface (colour_gen); a blit into it is not seen. */
++static int ld_surf_rg16_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_SURF_RG16"); on = (e && e[0] == '0') ? 0 : 1;
++                  fprintf(stderr, "[surf-rg16] %s (LD_SURF_RG16)\n", on ? "on" : "off"); }
++    return on;
++}
++static int ld_surf_rg16_pso(void)
++{
++    static int state = 0;   /* 0 untried, 1 ok, -1 failed */
++    if (state) return state > 0;
++    state = -1;
++    if (!g.depth_snapshot_rootsig) return 0;
++    static const char source[] =
++        "Texture2D<float4> surface_bytes : register(t0);\n"
++        "RWTexture2D<float2> halves : register(u0);\n"
++        "cbuffer size : register(b0) { uint width; uint height; };\n"
++        "[numthreads(8, 8, 1)]\n"
++        "void main(uint3 id : SV_DispatchThreadID) {\n"
++        "    if (id.x < width && id.y < height) {\n"
++        "        uint4 b = (uint4)round(saturate(surface_bytes.Load(int3(id.xy, 0))) * 255.0);\n"
++        "        halves[id.xy] = float2(f16tof32((b.y << 8) | b.z), f16tof32((b.w << 8) | b.x));\n"
++        "    }\n"
++        "}\n";
++    ID3DBlob* shader = NULL; ID3DBlob* errors = NULL;
++    HRESULT hr = D3DCompile(source, sizeof(source) - 1u, "surf_rg16_compute", NULL, NULL, "main", "cs_5_0",
++                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader, &errors);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[surf-rg16] shader compile failed hr=0x%08lX: %s\n", (unsigned long)hr,
++                errors ? (const char*)errors->lpVtbl->GetBufferPointer(errors) : "<no diagnostics>");
++        if (errors) errors->lpVtbl->Release(errors);
++        return 0;
++    }
++    if (errors) errors->lpVtbl->Release(errors);
++    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {0};
++    pipeline.pRootSignature = g.depth_snapshot_rootsig;
++    pipeline.CS.pShaderBytecode = shader->lpVtbl->GetBufferPointer(shader);
++    pipeline.CS.BytecodeLength = shader->lpVtbl->GetBufferSize(shader);
++    hr = g.dev->lpVtbl->CreateComputePipelineState(g.dev, &pipeline, &IID_ID3D12PipelineState,
++                                                   (void**)&g.surf_rg16_pso);
++    shader->lpVtbl->Release(shader);
++    if (FAILED(hr)) { fprintf(stderr, "[surf-rg16] pipeline failed hr=0x%08lX\n", (unsigned long)hr); return 0; }
++    state = 1;
++    return 1;
++}
++static int ld_surface_rg16(u32 si, u32 remap)
++{
++    surface_t* s = &g.surfaces[si];
++    if (!ld_surf_rg16_on() || !s->tex || s->fmt != DXGI_FORMAT_R8G8B8A8_UNORM || !ld_surf_rg16_pso()) return -1;
++    if (s->rg16_src != s->tex) {   /* new surface resource: new copy */
++        if (s->rg16) retire_texture(s->rg16);
++        s->rg16 = NULL; s->rg16_state = 0;
++        D3D12_HEAP_PROPERTIES hp = {0};
++        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++        D3D12_RESOURCE_DESC rd = {0};
++        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++        rd.Width = s->w; rd.Height = s->h;
++        rd.DepthOrArraySize = 1; rd.MipLevels = 1;
++        rd.Format = DXGI_FORMAT_R16G16_FLOAT;
++        rd.SampleDesc.Count = 1;
++        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&s->rg16))) {
++            static u32 n_fail;
++            if (n_fail++ < 8) fprintf(stderr, "[surf-rg16] create failed %u:0x%X %ux%u\n", s->location, s->offset, s->w, s->h);
++            s->rg16 = NULL;
++            return -1;
++        }
++        s->rg16_src = s->tex; s->rg16_state = 1; s->rg16_gen = s->colour_gen - 1u; s->rg16_remap = ~0u;
++        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
++        ud.Format = DXGI_FORMAT_R16G16_FLOAT;
++        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++        g.dev->lpVtbl->CreateUnorderedAccessView(g.dev, s->rg16, NULL, &ud, srv_cpu(UAV_SURF_RG16_BASE + si));
++        static u32 n_log;
++        if (n_log++ < 8) fprintf(stderr, "[surf-rg16] %u:0x%X %ux%u RGBA8 read as Y16_X16_FLOAT: R16G16 copy (slot %u)\n",
++                                 s->location, s->offset, s->w, s->h, si);
++    }
++    if ((remap & 0xFFFFu) != s->rg16_remap) {
++        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
++        sd.Format = DXGI_FORMAT_R16G16_FLOAT;
++        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++        sd.Shader4ComponentMapping = ld_float_tex_mapping(RSX_TEX_FMT_Y16X16_FLOAT, remap);
++        sd.Texture2D.MipLevels = 1;
++        ld_create_srv(g.dev, s->rg16, &sd, srv_cpu(SRV_SURF_RG16_BASE + si));
++        s->rg16_remap = remap & 0xFFFFu;
++    }
++    if (s->rg16_gen != s->colour_gen) {
++        if (g.srv_ring_used >= SRV_RING_TABLES) return -1;
++        const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
++        g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
++        cpu.ptr += (size_t)base * g.srv_step;
++        g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(SRV_SURFACE_BASE + si),
++                                             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++        cpu.ptr += g.srv_step;
++        g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(UAV_SURF_RG16_BASE + si),
++                                             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++        D3D12_GPU_DESCRIPTOR_HANDLE src_table, dst_table;
++        g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.srv_heap, &src_table);
++        src_table.ptr += (u64)base * g.srv_step;
++        dst_table = src_table; dst_table.ptr += g.srv_step;
++        D3D12_RESOURCE_BARRIER b[2] = {0};
++        u32 nb = 0;
++        b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[nb].Transition.pResource = s->tex;
++        b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++        nb++;
++        if (s->rg16_state != 1) {
++            b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++            b[nb].Transition.pResource = s->rg16;
++            b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++            b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++            b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++            nb++;
++        }
++        g.list->lpVtbl->ResourceBarrier(g.list, nb, b);
++        ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
++        g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
++        g.list->lpVtbl->SetPipelineState(g.list, g.surf_rg16_pso); LD_SM_INVALIDATE();
++        g.list->lpVtbl->SetComputeRootSignature(g.list, g.depth_snapshot_rootsig);
++        g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 0, src_table);
++        g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 1, dst_table);
++        const UINT size[2] = { s->w, s->h };
++        g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 2, size, 0);
++        g.list->lpVtbl->Dispatch(g.list, (s->w + 7u) / 8u, (s->h + 7u) / 8u, 1);
++        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[1].Transition.pResource = s->rg16;
++        b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++        s->rg16_state = 2;
++        s->rg16_gen = s->colour_gen;
++    }
++    return (int)(SRV_SURF_RG16_BASE + si);
++}
++
+ /* Patch 2024 (spike, diagnostic): LD_GEOM_CAPTURE=1 with LD_SURF_DUMP
+  * captures, in the frame after the dump fires, the guest clip-space position
+  * (o[0], before the host's posscale/offset) and the host clip position (Out.pos,
+@@ -12022,6 +12180,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             }
+             slots[u] = SRV_SURFACE_BASE + sampled;
+             g_ld_bind_surf++;
++            if ((t.format & TEX_FMT_BASE_MASK) == RSX_TEX_FMT_Y16X16_FLOAT) {   /* patch 2065 */
++                const int rg = ld_surface_rg16((u32)sampled, t.remap);
++                if (rg >= 0) { slots[u] = (u32)rg; continue; }
++            }
+             int seen = 0;
+             for (u32 k = 0; k < n_surf_used; k++) if (surf_used[k] == (u32)sampled) seen = 1;
+             if (!seen && n_surf_used < SRV_TABLE_SIZE) surf_used[n_surf_used++] = (u32)sampled;

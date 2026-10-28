@@ -1,0 +1,183 @@
+KZ3 patch 1131 (SPU pass 110; upstream candidate): fi, frest, frsqest and the per-lane-count word shifts shl, rot,
+rotm and rotma in SSE4.1 (AVX2 per-lane shifts when built with -mavx2). The helpers were per-lane loops that GCC does
+not vectorize (a table lookup, a branch, a variable shift count): each wrote its four result lanes to the stack and
+the next instruction read the 16-byte vector back, a failed store-to-load forward on x86 (~12-15 cycles per helper
+call, visible in the profile as the instruction after each loop). In K4 (frozen_shores, spu-r110-t1, KZ3_PROF) these
+loops and their reload stalls were ~35 % of the samples of the 3-bone skinning job's hottest function (job_01242c80
+func_5868, 6.2 % of all SPU samples); fi/frest are in the hot functions of jobs 241, 242 and others too.
+
+The new versions run the same operations on four lanes (fi: the same double scale, one cvtpd2ps rounding, float
+mul/sub without contraction; frest/frsqest: the exponent arithmetic in vector form, the four table entries gathered by
+index straight into a vector; shifts: x86 shifts give 0 / the sign for counts >= 32, the SPU result for 32..63). The
+loops stay as spu__*_ref (fi's out of line, for patch 1071's exponent-255 lanes and builds without SSE4.1).
+Same bits: tools/spu/test_r110_vec.sh (frest/frsqest on all 2^32 inputs, fi and the shifts on random and edge words,
+SSE4.1 and AVX2 builds, with a negative control).
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -363,7 +363,11 @@
+ 
+ /* FI decodes the base and step fields produced by the hardware estimate
+  * instructions; its second operand is not an ordinary reciprocal float. */
++#if defined(__SSE4_1__)
++SPU_XR_COLD u128 spu__fi_ref(u128 a, u128 b) {   /* KZ3 patch 1131: the loop below, out of line */
++#else
+ SPU_HOT u128 spu_fi(u128 a, u128 b) {
++#endif
+     u128 r;
+     for (int i = 0; i < 4; i++) {
+         uint32_t rb = b._u32[i];
+@@ -386,6 +390,35 @@
+     }
+     return r;
+ }
++#if defined(__SSE4_1__)
++/* KZ3 patch 1131 (SPU pass 110): fi in SSE4.1, the same operations as the loop above on four lanes at once. The loop
++ * wrote each lane to memory and the next instruction read the vector back (a failed store-to-load forward on x86,
++ * ~12-15 cycles per helper); fi/frest/frsqest/rotm were ~35 % of the 3-bone skinning job's hottest function
++ * (job_01242c80 func_5868, K4 profile spu-r110-t1). Same steps: base = rb & 0xFFFFFC00; step = the 10-bit step field
++ * times 2^(exp-140) in double (exact), one rounding to float (cvtpd2ps = the loop's cvtsd2ss), negated when base < 0
++ * (an ordered compare: NaN and -0 keep the sign as the loop); y = (ra & 0x7FFFF) * 2^-19 (exact); base - step * y in
++ * float (mulps/subps, no contraction, as the loop's mulss/subss). Exponent-255 lanes with the patch-1071 recompute on
++ * go through the loop. Same bits: tools/spu/test_r110_vec.sh. */
++SPU_HOT u128 spu_fi(u128 a, u128 b) {
++    __m128i A, B; memcpy(&A, &a, 16); memcpy(&B, &b, 16);
++    const __m128i e = _mm_and_si128(_mm_srli_epi32(B, 23), _mm_set1_epi32(0xFF));
++    if (__builtin_expect(!_mm_testz_si128(_mm_cmpeq_epi32(e, _mm_set1_epi32(0xFF)), _mm_set1_epi32(-1)), 0) &&
++        g_kz3_spu_xr)
++        return spu__fi_ref(a, b);
++    const __m128 base = _mm_castsi128_ps(_mm_and_si128(B, _mm_set1_epi32((int)0xFFFFFC00u)));
++    const __m128i sf = _mm_and_si128(B, _mm_set1_epi32(0x3FF));
++    const __m128i bias = _mm_set1_epi64x(1023 - 140);
++    const __m128d scl = _mm_castsi128_pd(_mm_slli_epi64(_mm_add_epi64(_mm_cvtepu32_epi64(e), bias), 52));
++    const __m128d sch = _mm_castsi128_pd(_mm_slli_epi64(_mm_add_epi64(_mm_cvtepu32_epi64(_mm_srli_si128(e, 8)), bias), 52));
++    const __m128 stl = _mm_cvtpd_ps(_mm_mul_pd(_mm_cvtepi32_pd(sf), scl));
++    const __m128 sth = _mm_cvtpd_ps(_mm_mul_pd(_mm_cvtepi32_pd(_mm_srli_si128(sf, 8)), sch));
++    __m128 step = _mm_movelh_ps(stl, sth);
++    step = _mm_xor_ps(step, _mm_and_ps(_mm_cmplt_ps(base, _mm_setzero_ps()), _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u))));
++    const __m128 y = _mm_mul_ps(_mm_cvtepi32_ps(_mm_and_si128(A, _mm_set1_epi32(0x7FFFF))), _mm_set1_ps(0x1p-19f));
++    const __m128 r4 = _mm_sub_ps(base, _mm_mul_ps(step, y));
++    u128 r; memcpy(&r, &r4, 16); return r;
++}
++#endif
+ static inline u128 spu_mpyu(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[i*2]*(uint32_t)b._u16[i*2]; return r; }
+ static inline u128 spu_mpyi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int16_t)imm; return r; }
+ 
+@@ -944,9 +977,33 @@
+ static inline u128 spu_dftsv(u128 a, int32_t imm){ (void)a; (void)imm; u128 r; memset(&r,0,sizeof r); return r; }
+ 
+ /* ---- Phase 2: register-variable shifts/rotates ---- */
+-static inline u128 spu_shl(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); } return r; }
++#if defined(__SSE4_1__)
++#if defined(__AVX2__)
++#include <immintrin.h>
++#endif
++/* KZ3 patch 1131 (SPU pass 110): shl/rot/rotm/rotma with a per-lane count, without the per-lane store and vector reload
++ * (see spu_fi). x86 shifts by a count >= the lane width give 0 (logical) or the sign (arithmetic), which is the SPU
++ * result for counts 32..63, so no compare is needed: AVX2 shifts each lane by its own count, SSE4.1 shifts the vector
++ * by each lane's count and blends. Same values as the loops (spu__*_ref, tools/spu/test_r110_vec.sh). */
++static inline __m128i spu__vsh32(__m128i a, __m128i s, int op) {   /* op 0 sll, 1 srl, 2 sra; s per lane 0..63 */
++#if defined(__AVX2__)
++    return op == 0 ? _mm_sllv_epi32(a, s) : op == 1 ? _mm_srlv_epi32(a, s) : _mm_srav_epi32(a, s);
++#else
++    const __m128i c0 = _mm_cvtsi32_si128(_mm_cvtsi128_si32(s)), c1 = _mm_cvtsi32_si128(_mm_extract_epi32(s, 1));
++    const __m128i c2 = _mm_cvtsi32_si128(_mm_extract_epi32(s, 2)), c3 = _mm_cvtsi32_si128(_mm_extract_epi32(s, 3));
++    __m128i r0, r1, r2, r3;
++    if (op == 0) { r0 = _mm_sll_epi32(a, c0); r1 = _mm_sll_epi32(a, c1); r2 = _mm_sll_epi32(a, c2); r3 = _mm_sll_epi32(a, c3); }
++    else if (op == 1) { r0 = _mm_srl_epi32(a, c0); r1 = _mm_srl_epi32(a, c1); r2 = _mm_srl_epi32(a, c2); r3 = _mm_srl_epi32(a, c3); }
++    else { r0 = _mm_sra_epi32(a, c0); r1 = _mm_sra_epi32(a, c1); r2 = _mm_sra_epi32(a, c2); r3 = _mm_sra_epi32(a, c3); }
++    return _mm_blend_epi16(_mm_blend_epi16(r0, r1, 0x0C), _mm_blend_epi16(r2, r3, 0xC0), 0xF0);
++#endif
++}
++#define SPU__VSH_FN(name, body) static inline u128 name(u128 a, u128 b) { __m128i A, B, R; memcpy(&A, &a, 16); \
++    memcpy(&B, &b, 16); body; u128 r; memcpy(&r, &R, 16); return r; }
++#endif
++static inline u128 spu__shl_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); } return r; }
+ static inline u128 spu_shlh(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); } return r; }
+-static inline u128 spu_rot(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&31; r._u32[i]= sh ? ((a._u32[i]<<sh)|(a._u32[i]>>(32-sh))) : a._u32[i]; } return r; }
++static inline u128 spu__rot_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&31; r._u32[i]= sh ? ((a._u32[i]<<sh)|(a._u32[i]>>(32-sh))) : a._u32[i]; } return r; }
+ static inline u128 spu_roth(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&15; r._u16[i]= sh ? (uint16_t)((a._u16[i]<<sh)|(a._u16[i]>>(16-sh))) : a._u16[i]; } return r; }
+ static inline u128 spu_shlqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) return a;
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+@@ -1033,7 +1090,7 @@
+     0x4180D7, 0x4180D7, 0x3E24CC, 0x3E24CC, 0x3AF4C3, 0x3AF4C3, 0x37E8BA, 0x37E8BA
+ };
+ 
+-static inline u128 spu_frsqest(u128 a) {
++static inline u128 spu__frsqest_ref(u128 a) {   /* KZ3 patch 1131: was spu_frsqest */
+     u128 r;
+     for (int i = 0; i < 4; i++) {
+         uint32_t bits = a._u32[i];
+@@ -1048,7 +1105,7 @@
+ }
+ /* frest: reciprocal estimate (refined by the following spu_fi Newton step).
+  * Full-precision 1/x is exact after fi and >= HW-estimate accuracy. */
+-static inline u128 spu_frest(u128 a) {
++static inline u128 spu__frest_ref(u128 a) {   /* KZ3 patch 1131: was spu_frest */
+     u128 r;
+     for (int i = 0; i < 4; i++) {
+         uint32_t bits = a._u32[i];
+@@ -1077,6 +1134,40 @@
+     return r;
+ }
+ 
++/* KZ3 patch 1131 (SPU pass 110): frest/frsqest without the per-lane store and vector reload (see spu_fi): exponent
++ * arithmetic on four lanes, the table entries fetched by index into a vector (no memory round trip of the result).
++ * Same values as the loops (spu__frest_ref / spu__frsqest_ref, tools/spu/test_r110_vec.sh: all 2^32 inputs). */
++#if defined(__SSE4_1__)
++SPU_HOT u128 spu_frsqest(u128 a) {
++    __m128i A; memcpy(&A, &a, 16);
++    const __m128i e = _mm_and_si128(_mm_srli_epi32(A, 23), _mm_set1_epi32(0xFF));
++    __m128i re = _mm_sub_epi32(_mm_set1_epi32(190), _mm_srli_epi32(_mm_add_epi32(e, _mm_set1_epi32(1)), 1));
++    re = _mm_blendv_epi8(re, _mm_set1_epi32(0xFF), _mm_cmpeq_epi32(e, _mm_setzero_si128()));
++    const __m128i fr = _mm_setr_epi32((int)spu_frsqest_fraction_lut[((uint32_t)_mm_cvtsi128_si32(A) >> 18) & 0x3F],
++                                      (int)spu_frsqest_fraction_lut[((uint32_t)_mm_extract_epi32(A, 1) >> 18) & 0x3F],
++                                      (int)spu_frsqest_fraction_lut[((uint32_t)_mm_extract_epi32(A, 2) >> 18) & 0x3F],
++                                      (int)spu_frsqest_fraction_lut[((uint32_t)_mm_extract_epi32(A, 3) >> 18) & 0x3F]);
++    const __m128i R = _mm_or_si128(_mm_slli_epi32(re, 23), _mm_and_si128(fr, _mm_set1_epi32(0x7FFFFF)));
++    u128 r; memcpy(&r, &R, 16); return r;
++}
++SPU_HOT u128 spu_frest(u128 a) {
++    __m128i A; memcpy(&A, &a, 16);
++    const __m128i sg = _mm_and_si128(A, _mm_set1_epi32((int)0x80000000u));
++    const __m128i e = _mm_and_si128(_mm_srli_epi32(A, 23), _mm_set1_epi32(0xFF));
++    const __m128i re = _mm_max_epi32(_mm_sub_epi32(_mm_set1_epi32(253), e), _mm_setzero_si128());   /* e >= 253 -> 0 */
++    const __m128i fr = _mm_setr_epi32((int)spu_frest_fraction_lut[((uint32_t)_mm_cvtsi128_si32(A) >> 18) & 0x1F],
++                                      (int)spu_frest_fraction_lut[((uint32_t)_mm_extract_epi32(A, 1) >> 18) & 0x1F],
++                                      (int)spu_frest_fraction_lut[((uint32_t)_mm_extract_epi32(A, 2) >> 18) & 0x1F],
++                                      (int)spu_frest_fraction_lut[((uint32_t)_mm_extract_epi32(A, 3) >> 18) & 0x1F]);
++    __m128i R = _mm_or_si128(sg, _mm_or_si128(_mm_slli_epi32(re, 23), _mm_and_si128(fr, _mm_set1_epi32(0x7FFFFF))));
++    R = _mm_blendv_epi8(R, _mm_or_si128(sg, _mm_set1_epi32(0x7FFFFFFF)), _mm_cmpeq_epi32(e, _mm_setzero_si128()));
++    u128 r; memcpy(&r, &R, 16); return r;
++}
++#else
++static inline u128 spu_frsqest(u128 a) { return spu__frsqest_ref(a); }
++static inline u128 spu_frest(u128 a) { return spu__frest_ref(a); }
++#endif
++
+ /* ---- Phase 3: sign extension ----
+  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word
+  * at the *lower* storage address). Same caveat as the mpy family. */
+@@ -1198,8 +1289,20 @@
+ static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0]+b._u32[0])); }
+ 
+ /* ---- Phase 3: rotate-and-mask family ---- */
+-static inline u128 spu_rotm(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); } return r; }
+-static inline u128 spu_rotma(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); } return r; }
++static inline u128 spu__rotm_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); } return r; }
++static inline u128 spu__rotma_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); } return r; }
++#if defined(__SSE4_1__)   /* KZ3 patch 1131 */
++SPU__VSH_FN(spu_shl, R = spu__vsh32(A, _mm_and_si128(B, _mm_set1_epi32(0x3F)), 0))
++SPU__VSH_FN(spu_rot, const __m128i s = _mm_and_si128(B, _mm_set1_epi32(31));
++            R = _mm_or_si128(spu__vsh32(A, s, 0), spu__vsh32(A, _mm_sub_epi32(_mm_set1_epi32(32), s), 1)))
++SPU__VSH_FN(spu_rotm, R = spu__vsh32(A, _mm_and_si128(_mm_sub_epi32(_mm_setzero_si128(), B), _mm_set1_epi32(0x3F)), 1))
++SPU__VSH_FN(spu_rotma, R = spu__vsh32(A, _mm_and_si128(_mm_sub_epi32(_mm_setzero_si128(), B), _mm_set1_epi32(0x3F)), 2))
++#else
++static inline u128 spu_shl(u128 a, u128 b) { return spu__shl_ref(a, b); }
++static inline u128 spu_rot(u128 a, u128 b) { return spu__rot_ref(a, b); }
++static inline u128 spu_rotm(u128 a, u128 b) { return spu__rotm_ref(a, b); }
++static inline u128 spu_rotma(u128 a, u128 b) { return spu__rotma_ref(a, b); }
++#endif
+ static inline u128 spu_rothm(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=(0-b._u16[i])&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); } return r; }
+ static inline u128 spu_rothma(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++){ uint32_t sh=(0-b._u16[i])&0x1F; r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); } return r; }
+ static inline u128 spu_rothmi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }

@@ -1,0 +1,34 @@
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1762,6 +1762,14 @@
+  * [spurs-stuck]: a policy-module run that has not returned for SPURS_STUCK_MS.
+  * [spurs-curcont]: a wklCurrentContention byte (+0x20+wid) that is nonzero while no run of that
+  * workload is in progress (the HLE sets it before a run and clears it after). */
++/* KZ3 patch 1042 (SPU pass 29): milliseconds from t0 to now, 0 when t0 is later than now. The watcher read now
++ * once per 50 ms pass, before the instance loop, while kernel threads keep stamping s_run_t0 with a fresh
++ * GetTickCount64(); a run that started after that read (the pc sampling of an earlier instance in the same pass sleeps
++ * ~300 ms) gave now - t0 < 0, which wrapped to ~2^64 ms and printed a false [spurs-stuck] line
++ * (18446744073709551423 ms in RSX pass 30). kz3-spurs-elapsed begin */
++static inline u64 kz3_spurs_elapsed_ms(u64 now, u64 t0) { return now > t0 ? now - t0 : 0; }
++/* kz3-spurs-elapsed end */
++
+ static DWORD WINAPI spurs_watch_thread(LPVOID p)
+ {
+     (void)p;
+@@ -1772,14 +1780,14 @@
+     static u64 cc_since[MAX_SPURS_INST][16], cc_rep[MAX_SPURS_INST][16];
+     for (;;) {
+         Sleep(50);
+-        u64 now = GetTickCount64();
+         for (int j = 0; j < MAX_SPURS_INST; j++) {
+             u32 ea = s_inst[j].ea;
+             if (!ea) continue;
+             u64 t0 = s_run_t0[j];
+             u32 rw = s_run_wid[j];
++            u64 now = GetTickCount64();   /* patch 1042: per instance, after t0 (was once per pass, before the loop) */
+             if (t0) {
+-                u64 d = now - t0;
++                u64 d = kz3_spurs_elapsed_ms(now, t0);
+                 if (d >= (u64)sm && now - s_run_rep[j] >= 5000) {
+                     s_run_rep[j] = now;
+                     extern void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num);

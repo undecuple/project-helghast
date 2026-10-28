@@ -1,0 +1,180 @@
+Rebased on ps3recomp v0.17.0 (SPU pass 95): partly absorbed: CreateTask's claim is #381's spu_taskset_mark_running, the elf flag mask is upstream's.
+SPU pass 96: spu_taskset_dispatch sets s_ts_held around spu_workload_dispatch_async: #381 made dispatch_async call
+spu_taskset_mark, which took ts_lock again on the same thread (non-recursive spinlock), so the first cellSpursCreateTask
+hung the main thread forever (v0.17.0 boot check: 0 flips).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 119d03f8..7c82223a 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1245,12 +1245,15 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                  * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
+                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
+                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
++                extern int spu_taskset_dispatch(uint32_t, uint32_t, const uint8_t*, uint32_t, uint32_t);
+                 if (sz)
+                     /* Async: SPURS tasks are persistent workers — running them
+-                     * inline would block this PPU thread forever (deadlock). */
+-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
+-                                                (uint32_t)(uintptr_t)context);
+-            }
++                     * inline would block this PPU thread forever (deadlock).
++                     * Under the scan's lock with this task's ids (KZ3 patch 1023). */
++                    spu_taskset_dispatch(taskset_ea, i, host_elf, (uint32_t)sz,
++                                         (uint32_t)(uintptr_t)context);
++                else { extern int spu_taskset_claim(uint32_t, uint32_t, int); spu_taskset_claim(taskset_ea, i, 0); }
++            } else { extern int spu_taskset_claim(uint32_t, uint32_t, int); spu_taskset_claim(taskset_ea, i, 0); }
+             return CELL_OK;
+         }
+     }
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index e21e1c5d..d1509499 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -554,7 +554,60 @@ void spu_taskset_line_scan(uint32_t line)
+         uint32_t ts = s_ts_run[i].ea;
+         if (ts && line >= ts && line < ts + 0x1900u) { hit = ts; break; }
+     }
+-    if (hit) spu_taskset_task_exited(hit, 128u, 0);
++    if (hit) {
++        /* TS_SCAN_LOG=1: what the SPU changed and what the scan sees (KZ3 patch 1023, diagnostic). */
++        static int s_lg = -1; if (s_lg < 0) s_lg = getenv("TS_SCAN_LOG") ? 1 : 0;
++        if (s_lg) {
++            static volatile LONG n; LONG k = InterlockedIncrement(&n);
++            if (k <= 200 || (k % 4096) == 0) {
++                extern uint8_t* vm_base; const uint8_t* t = vm_base + hit;
++                uint8_t* run = ts_running(hit);
++                fprintf(stderr, "[ts-scan] #%ld putllc ts=0x%08X +0x%04X run=%02X%02X ready=%02X%02X pend=%02X%02X en=%02X%02X sig=%02X%02X wait=%02X%02X\n",
++                        (long)k, hit, line - hit, run ? run[0] : 0, run ? run[1] : 0, t[0x10], t[0x11], t[0x20], t[0x21],
++                        t[0x30], t[0x31], t[0x40], t[0x41], t[0x50], t[0x51]);
++                for (int i = 0; i < 16; i++) {
++                    if (!(t[0x30 + i / 8] & (0x80u >> (i & 7)))) continue;
++                    const uint8_t* ti = t + 0x80 + 0x30 * i;
++                    fprintf(stderr, "[ts-scan]   task %d elf=%02X%02X%02X%02X ctx=%02X%02X%02X%02X\n", i, ti[0x14], ti[0x15], ti[0x16],
++                            ti[0x17], ti[0x1C], ti[0x1D], ti[0x1E], ti[0x1F]);
++                }
++            }
++        }
++        spu_taskset_task_exited(hit, 128u, 0);
++    }
++}
++
++/* Claim and dispatch a taskset task atomically with the taskset scan (KZ3 patch 1023).
++ * cellSpursCreateTask used to set the task's enabled+ready bits, then the single-slot globals, then
++ * dispatch, while the running mark was only set later in spu_async_run on the new thread. A scan in
++ * that window (another task's exit, or an SPU PUTLLC in the taskset, patch 1022) saw the task enabled,
++ * ready and not running and started it a second time, and the two writers of the globals could hand a
++ * job the other's task id. KZ3's Havok ray-cast tasks (image 43) ran twice that way (spu-10g: 14
++ * dispatches for 11 creates+starts). Now the creator claims the slot (running bit) under the scan's lock
++ * before it sets the bits, and dispatches under the same lock with its own ids. */
++int spu_taskset_claim(uint32_t taskset_ea, uint32_t t, int on)
++{
++    if (!taskset_ea || t >= 128) return 0;
++    ts_lock();
++    uint8_t* r = ts_running(taskset_ea);
++    uint8_t m = (uint8_t)(0x80u >> (t & 7));
++    int was = r ? ((r[t / 8] & m) != 0) : 0;
++    if (r) { if (on) r[t / 8] |= m; else r[t / 8] &= (uint8_t)~m; }
++    ts_unlock();
++    return !was;
++}
++int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image, uint32_t size, uint32_t ctx)
++{
++    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
++    ts_lock(); s_ts_held = 1;   /* dispatch_async marks the task running (#381): held, CreateTask marked it */
++    g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
++    int rc = spu_workload_dispatch_async(image, size, ctx);
++    if (!rc && taskset_ea && t < 128) {           /* not started: let a later scan try */
++        uint8_t* r = ts_running(taskset_ea);
++        if (r) r[t / 8] &= (uint8_t)~(0x80u >> (t & 7));
++    }
++    s_ts_held = 0; ts_unlock();
++    return rc;
+ }
+ 
+ static void spu_async_run(spu_async_job* j)
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index e8baa926..566d07dd 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -9,7 +9,7 @@
+ #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
+ #include <string.h>
+ #include <stdlib.h>               /* getenv */
+-#include "ps3emu/log_first.h"
++#include "ps3emu/log_first.h"
+ 
+ /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
+  * context EA the title's SPU task runtime is dispatched against. */
+@@ -291,6 +291,52 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
+ /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
+ static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
+ 
++/* KZ3 patch 1023: see SEMDUMP_LR in sys_event_queue_receive. */
++static volatile uint32_t s_sd_r[4];
++static uint32_t sd_rd32(uint32_t ea) { extern uint8_t* vm_base; const uint8_t* p = vm_base + ea; return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
++static void kz3_semdump_region(const char* tag, uint32_t ea, uint32_t len)
++{
++    extern uint8_t* vm_base;
++    if (!vm_base || ea < 0x10000u || ea >= 0xF0000000u) return;
++    for (uint32_t o = 0; o < len; o += 32) {
++        uint32_t w[8]; int nz = 0;
++        for (int k = 0; k < 8; k++) { w[k] = sd_rd32(ea + o + 4u * k); nz |= (w[k] != 0); }
++        if (!nz) continue;
++        fprintf(stderr, "[semdump] %s 0x%08X+%03X: %08X %08X %08X %08X %08X %08X %08X %08X\n", tag, ea, o,
++                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++    }
++}
++static void kz3_semdump_now(const char* why)
++{
++    uint32_t r28 = s_sd_r[0], r29 = s_sd_r[1], r30 = s_sd_r[2], r31 = s_sd_r[3];
++    fprintf(stderr, "[semdump] %s r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", why, r28, r29, r30, r31);
++    kz3_semdump_region("sem", r30, 0x10);
++    kz3_semdump_region("r29", r29, 0x380);
++    kz3_semdump_region("r28", r28, 0x100);
++    if (r29 >= 0x10000u && r29 < 0xF0000000u)
++        for (int i = 0; i < 4; i++) {
++            uint32_t p = sd_rd32(r29 + 0x90u + 4u * i);
++            char tag[16]; snprintf(tag, sizeof tag, "sem%d", i);
++            kz3_semdump_region(tag, p, 0x10);
++        }
++    fflush(stderr);
++}
++#ifdef _WIN32
++static DWORD WINAPI kz3_semdump_thread(LPVOID p) { (void)p; for (;;) { Sleep(30000); kz3_semdump_now("periodic"); } return 0; }
++#endif
++void kz3_semdump_note(uint32_t r28, uint32_t r29, uint32_t r30, uint32_t r31, uint32_t q, unsigned tid)
++{
++    static volatile LONG started = 0;
++    s_sd_r[0] = r28; s_sd_r[1] = r29; s_sd_r[2] = r30; s_sd_r[3] = r31;
++    char why[48]; snprintf(why, sizeof why, "receive q=%u tid=%u", q, tid);
++    kz3_semdump_now(why);
++#ifdef _WIN32
++    if (!InterlockedExchange(&started, 1)) CreateThread(NULL, 0, kz3_semdump_thread, NULL, 0, NULL);
++#else
++    (void)started;
++#endif
++}
++
+ int64_t sys_event_queue_receive(ppu_context* ctx)
+ {
+     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
+@@ -304,6 +350,18 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+                 queue_id, (unsigned long long)timeout_us,
+                 (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+ 
++    /* SEMDUMP_LR=<hex>: a receive whose guest lr is that address (a semaphore acquire's return site, e.g.
++     * KZ3's Havok 0x8E8A84) dumps r28..r31 and the guest memory they point at (0x380 bytes at r29, 0x100 at
++     * r28, 0x10 at r30, and the 16-byte objects whose pointers sit at r29+0x90..+0x9C), then again every
++     * 30 s from a host thread so the log ends with the state of the deadlock (KZ3 patch 1023, diagnostic). */
++    { static int64_t s_dlr = -2;
++      if (s_dlr == -2) { const char* e = getenv("SEMDUMP_LR"); s_dlr = e ? (int64_t)strtoul(e, 0, 16) : -1; }
++      if (s_dlr >= 0 && (uint32_t)ctx->lr == (uint32_t)s_dlr) {
++          extern void kz3_semdump_note(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, unsigned);
++          kz3_semdump_note((uint32_t)ctx->gpr[28], (uint32_t)ctx->gpr[29], (uint32_t)ctx->gpr[30],
++                           (uint32_t)ctx->gpr[31], queue_id, (unsigned)ctx->thread_id);
++      } }
++
+     /* PS3_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
+      * exact game function the main thread is stuck polling in the flip loop. */
+     if ((s_ps3_waitbt < 0 ? (s_ps3_waitbt = getenv("PS3_WAITBT") ? 1 : 0) : s_ps3_waitbt)) {

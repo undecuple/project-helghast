@@ -1,0 +1,47 @@
+gcm: count KZ3's game-frame marker (diagnostic only, no other behaviour).
+
+The back-end release of label 0x4A (NV4097 SET_SEMAPHORE_OFFSET 0x4A0, then 0x1D74) comes once per game frame,
+right before the G-buffer clears (the RE notes pass 26). rsx_commands.c counts it in g_rsx_game_frame_marks; the flip path
+(cellGcmSys.c gcm_flip_request)
+prints "[frame-mark] flips=N marks=M (+K markers in the last 256 flips)" every 256 flips.
+
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -36,6 +36,8 @@
+  * diagnostics can read it. RSX_SEMA_LOG=<N> logs the first N NV4097 semaphore
+  * methods (offset, value, guest address) and every 500th after that. */
+ u32 g_rsx_sem_off_4097 = 0;
++/* KZ3 patch 2026: count of game-frame markers (label 0x4A back-end releases). */
++volatile u32 g_rsx_game_frame_marks = 0;
+ static int rsx_sema_log_n(void) { static int n = -1;
+     if (n < 0) { const char* e = getenv("RSX_SEMA_LOG"); n = e ? atoi(e) : 0; } return n; }
+ 
+@@ -385,6 +387,10 @@
+       }
+       if (method == 0x1D74) {
+         extern void vm_write32(uint32_t a, uint32_t v);
++        /* KZ3 patch 2026: game-frame marker = the back-end release of label 0x4A
++         * (SET_SEMAPHORE_OFFSET 0x4A0, then 0x1D74), right before the G-buffer clears
++         * (the RE notes pass 26). Counted only; key on the offset, not the value. */
++        if (s_sem_off == 0x4A0u) g_rsx_game_frame_marks++;
+         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
+         return 0;
+       } }
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2888,6 +2888,13 @@
+                              "resolves=%llu reports=%llu segments=%llu\n", nf, (unsigned long long)st[0],
+                              (unsigned long long)st[1], (unsigned long long)st[2], (unsigned long long)st[3],
+                              (unsigned long long)st[4], (unsigned long long)st[5]);
++          /* KZ3 patch 2026: game-frame markers (label 0x4A back-end releases) per flip. */
++          extern volatile u32 g_rsx_game_frame_marks;
++          static u32 last_marks = 0;
++          const u32 marks = g_rsx_game_frame_marks;
++          fprintf(stderr, "[frame-mark] flips=%llu marks=%u (+%u markers in the last 256 flips)\n", nf, marks,
++                  marks - last_marks);
++          last_marks = marks;
+       } }
+     { extern void kz3_wacct_flip(void); kz3_wacct_flip(); }   /* KZ3 patch 1032: flips per accounting window */
+     /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips

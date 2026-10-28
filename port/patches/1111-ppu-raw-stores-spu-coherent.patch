@@ -1,0 +1,106 @@
+KZ3 patch 1111 (SPU pass 92): the lifted PPU's raw stores commit like vm_write* on a line an SPU has reserved.
+From JonathanDC64/ps3recomp PR #38 (MIT; the Demon's Souls port), adapted: the fork fixed the SPU side, here the
+store side is fixed.
+
+The lifter writes stvx/stvxl, stvebx/stvehx/stvewx, stvlx/stvrx (+l), dcbz and stwbrx/sthbrx/stdbrx straight into
+vm_base (VM_RAW_ST, vm_raw_st16, memset, a byte loop). Every other guest store goes through vm_write* (VM_WRITE_COH,
+ppu_loader.cpp): on a reserved line it takes the line's stripe (patch 1056), writes, and calls
+spu_coh_notify_write, which breaks the SPU reservation and raises SPU_EVENT_LR. The raw stores did none of it, so:
+- a raw store between a PUTLLC's compare and its copy (both under the stripe, spu_channels.c MFC_PUTLLC_CMD) is
+  written back over by the PUTLLC's 128 bytes: a lost PPU store, which Cell never does (the store either kills the
+  reservation first, so the PUTLLC fails, or lands after the commit);
+- an SPU waiting on the line for SPU_EVENT_LR learns of the store only from the RdEventStat snapshot poll
+  (spu_resv_lost_poll; one poll late, and an A-B-A store is missed).
+PR #38's own bug (a no-op PUTLLC decided from resv_valid alone, the fork's PR #17) is not in our tree: our PUTLLC
+compares the line with the snapshot under the stripe.
+
+Now VM_RAW_ST and vm_raw_st16 test spu_coh_is_reserved (one load of a bitmap bit, as vm_write* does) and on a
+reserved line call ppu_st_coh (ppu_loader.cpp: VM_WRITE_COH, plus ppu_resv_break_store when PPU_RESV_STORE is on).
+A stvx is one locked commit, not two halves. dcbz and stvlx/stvrx always call ppu_st_coh; their new branches sit at
+the top of _translate_op, ahead of the old ones, because patch 2082 rewrites the old branches' lines (the old
+branches are unreachable now; ppu_st_coh's VM_WRITE_COH carries 2082's page store note).
+KZ3_RAWST_COH=0 = the old plain copy (runtime switch; the lifted code is the same).
+Test: tools/spu/test_r92_rawst_coh.sh (fails without this patch).
+
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2021,6 +2021,25 @@
+ {
+     barrier_watch_hit(ea, val, width, ra);
+ }
++/* KZ3 patch 1111 (from JonathanDC64/ps3recomp PR #38, adapted): the commit of the lifted raw stores (stvx,
++ * stvebx/ehx/ewx, stvlx/stvrx, dcbz, st*brx; see VM_RAW_ST in ppu_lifter.py). Bytes already in guest order, one
++ * 128-byte line at most. vm_write*'s commit: under the line's stripe with the SPU reservation broken and
++ * SPU_EVENT_LR raised when an SPU holds the line, then the page store note. KZ3_RAWST_COH=0: the old plain copy
++ * (no stripe, no reservation broken; the note stays). */
++extern "C" void ppu_st_coh(uint32_t ea, const void* src, uint32_t n)
++{
++    static int s_on = -1;
++    if (__builtin_expect(s_on < 0, 0)) { const char* e = getenv("KZ3_RAWST_COH"); s_on = !(e && e[0] == '0'); }
++    if (!s_on) {
++        memcpy(vm_base + ea, src, n);
++#ifdef VM_STORE_NOTE   /* patch 2082, applied after this one */
++        VM_STORE_NOTE(ea, n);
++#endif
++        return;
++    }
++    VM_WRITE_COH(ea, src, n);
++    if (g_resv_store_active > 0) ppu_resv_break_store(ea);
++}
+ void vm_write8 (uint64_t a, uint8_t  v) { VM_WW((uint32_t)a, v, 1, __builtin_return_address(0));   /* patch 1080 */
+     if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
+ #ifdef _WIN32
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -151,13 +151,22 @@
+ #define VM_RAW_LD(T, ea) ({ const uint8_t* _p = vm_base + (uint32_t)(ea); T _v; \
+     if (!((uintptr_t)_p & (sizeof(T) - 1))) _v = __atomic_load_n((const T*)_p, __ATOMIC_RELAXED); \
+     else memcpy(&_v, _p, sizeof(T)); _v; })
++/* KZ3 patch 1111 (from JonathanDC64/ps3recomp PR #38, adapted): a raw store is a guest store like vm_write*'s,
++ * so on a 128-byte line an SPU has reserved it commits the same way -- under the line's stripe, with the SPU
++ * reservation broken and SPU_EVENT_LR raised (ppu_st_coh, runtime/ppu/ppu_loader.cpp). Without it a stvx, dcbz
++ * or stwbrx that lands between a PUTLLC's compare and its copy is written back over by the PUTLLC (a lost PPU
++ * store), and an SPU waiting on the line hears of it only from the RdEventStat poll. */
++int  spu_coh_is_reserved(uint32_t addr);
++void ppu_st_coh(uint32_t ea, const void* src, uint32_t n);
+ #define VM_RAW_ST(T, ea, val) do { uint8_t* _p = vm_base + (uint32_t)(ea); T _v = (val); \
+-    if (!((uintptr_t)_p & (sizeof(T) - 1))) __atomic_store_n((T*)_p, _v, __ATOMIC_RELAXED); \
++    if (__builtin_expect(spu_coh_is_reserved((uint32_t)(ea)), 0)) ppu_st_coh((uint32_t)(ea), &_v, sizeof(T)); \
++    else if (!((uintptr_t)_p & (sizeof(T) - 1))) __atomic_store_n((T*)_p, _v, __ATOMIC_RELAXED); \
+     else memcpy(_p, &_v, sizeof(T)); } while (0)
+ static inline void vm_raw_ld16(void* dst, uint64_t ea) {   /* quadword-aligned */
+     uint64_t lo = VM_RAW_LD(uint64_t, ea), hi = VM_RAW_LD(uint64_t, ea + 8);
+     memcpy(dst, &lo, 8); memcpy((uint8_t*)dst + 8, &hi, 8); }
+-static inline void vm_raw_st16(uint64_t ea, const void* src) {
++static inline void vm_raw_st16(uint64_t ea, const void* src) {   /* one line: one locked commit (patch 1111) */
++    if (__builtin_expect(spu_coh_is_reserved((uint32_t)ea), 0)) { ppu_st_coh((uint32_t)ea, src, 16); return; }
+     uint64_t lo, hi; memcpy(&lo, src, 8); memcpy(&hi, (const uint8_t*)src + 8, 8);
+     VM_RAW_ST(uint64_t, ea, lo); VM_RAW_ST(uint64_t, ea + 8, hi); }
+ extern int      vm_inline_ok;
+@@ -1412,6 +1421,26 @@
+             if v is not None:
+                 return v
+
++        # KZ3 patch 1111 (from JonathanDC64/ps3recomp PR #38, adapted): dcbz and the Cell unaligned vector
++        # stores write through ppu_st_coh (runtime/ppu/ppu_loader.cpp: vm_write*'s commit -- the SPU lock-line
++        # stripe and SPU_EVENT_LR on a reserved line, the page store note after it), so a PUTLLC cannot copy
++        # over them; see VM_RAW_ST in the header preamble for the other raw stores. They are taken here, ahead
++        # of their old branches below (kept for the later patches that edit them, now unreachable), because
++        # those patches rewrite the old branches' lines. stvlx/stvrx write one contiguous run of their quadword.
++        if mn == "dcbz":
++            ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1])
++            return (f"{{ static const uint8_t _z[128] = {{0}}; "
++                    f"ppu_st_coh((uint32_t)(({_xea(ra, rb)}) & ~0x7FULL), _z, 128); }}")
++        if mn in ("stvlx", "stvlxl", "stvrx", "stvrxl"):
++            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
++            ra, rb = _reg_idx(ops[1]), _reg_idx(ops[2])
++            s = f"(const uint8_t*)&ctx->vr[{vs}]"
++            if mn.startswith("stvl"):   # bytes 0..15-sh of vS to EA..the end of its quadword
++                st = f"ppu_st_coh((uint32_t)ea, {s}, 16u - sh);"
++            else:                       # bytes 16-sh..15 of vS to the start of EA's quadword
++                st = f"if (sh) ppu_st_coh((uint32_t)(ea & ~0xFULL), {s} + (16u - sh), sh);"
++            return f"{{ uint64_t ea = {_xea(ra, rb)}; uint32_t sh = (uint32_t)(ea & 0xF); {st} }}"
++
+         # ------- Arithmetic -------
+         if mn == "li":
+             rd = _reg_idx(ops[0])

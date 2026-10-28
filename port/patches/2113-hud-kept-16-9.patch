@@ -1,0 +1,303 @@
+KZ3 patch 2113 (RSX pass 106; ENHANCEMENT, display): HUD, menus, subtitles and movies kept 16:9 and centred at
+any window aspect (KZ3_HUD_169, display.ini hud_169, default on); 2D draws into the display buffer squeezed in the
+viewport epilogue and scissor, menu mouse through the inverse. Design: the RE notes Pass 159/162.
+
+diff --git a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+index 4d6f39e..9f0e686 100644
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -619,6 +619,25 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+ /* The page as before patch 2107's options (the Motion blur row only when the exe has the hook). */
+ static inline char* rsx_dm_patch_gum(const char* in, size_t n, size_t* out_n) { return rsx_dm_patch_gum_opts(in, n, out_n, 0); }
+ 
++/* KZ3 patch 2113 (RSX pass 106): hud_169 = on | off, the 2D layer (HUD, menus, subtitles, movies) kept 16:9 and centred
++ * when the window is not 16:9 (rsx_hud169.h; ENHANCEMENT, display, default on). KZ3_HUD_169=0|1 overrides it for one run. */
++static inline int rsx_dm_ini_hud169(const char* t)    /* 1 on, 0 off, -1 missing or unreadable */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "hud_169", v, sizeof v) ? rsx_dm_parse_vsync(v) : -1;
++}
++static inline int rsx_dm_ini_write_ext3(char* buf, size_t n, int mode, int scaling, int filter, int vsync, int motion_blur,
++                                        int fps, int fov, int hud169)
++{
++    int o = rsx_dm_ini_write_ext2(buf, n, mode, scaling, filter, vsync, motion_blur, fps, fov);
++    if (o < 0 || (size_t)o >= n) return o;
++    const int k = snprintf(buf + o, n - (size_t)o,
++                           "# hud_169 = on | off: HUD, menus, subtitles and movies kept 16:9 and centred when the window is wider or\n"
++                           "# narrower than 16:9 (the 3D view still fills the window). KZ3_HUD_169 overrides it for one run.\n"
++                           "hud_169 = %s\n", rsx_dm_vsync_name(hud169 != 0));
++    return k < 0 ? k : o + k;
++}
++
+ /* KZ3 patch 2096: view aspect (KZ3_ASPECT, ENHANCEMENT, default screen). Screen = the game's camera is set up for the
+  * window's (or the screen's) own aspect (port/kz3/main.cpp hooks GameViewGame::vf22 @0x007E5908: Hor+ above 16:9,
+  * Vert+ below) and every frame drawn with that camera is stretched to the whole client (the guest image stays
+diff --git a/libs/video/rsx_hud169.h b/libs/video/rsx_hud169.h
+new file mode 100644
+index 0000000..2adf743
+--- /dev/null
++++ b/libs/video/rsx_hud169.h
+@@ -0,0 +1,72 @@
++/* KZ3 patch 2113 (RSX pass 106; ENHANCEMENT, display): the 2D layer (HUD, menus, subtitles, movies) kept 16:9 and
++ * centred at any window aspect while the 3D view follows the window (patch 2096).
++ *
++ * The guest draws everything into its 1280x720 display buffer and the present stretches that buffer over the whole
++ * client (KZ3_ASPECT=screen, Image scaling Stretch). The 3D picture was rendered for the client's aspect, so it comes
++ * out right; the 2D drawn after it would be stretched with it. The draws classified 2D (rsx_live_draw.c, sink_end_impl)
++ * get their viewport epilogue squeezed about the buffer centre so that, after the stretch, they cover a centred 16:9
++ * box: above 16:9 x by kx = (16/9)/aspect, below 16:9 y by ky = aspect/(16/9). Their scissors are mapped the same way.
++ * The menu mouse (patch 2098) maps a buffer pixel back through the inverse for the GUM hit test only.
++ * Design and the draw capture it rests on: the RE notes "Pass 159" and "Pass 162".
++ *
++ * Pure helpers here (host test tools/smoke/test_hud169.c); state and classification in rsx_live_draw.c. */
++#ifndef RSX_HUD169_H
++#define RSX_HUD169_H
++
++#include <math.h>
++
++/* Factors for a client of w x h pixels: 1 when the squeeze is active (some factor differs from 1 by >= 1e-3). */
++static inline int rsx_h169_factors(unsigned w, unsigned h, float* kx, float* ky)
++{
++    *kx = 1.0f; *ky = 1.0f;
++    if (!w || !h) return 0;
++    const double a = (double)w / (double)h, r = a / (16.0 / 9.0);
++    if (r > 1.0) *kx = (float)(1.0 / r);
++    else         *ky = (float)r;
++    if (fabsf(*kx - 1.0f) < 1e-3f) *kx = 1.0f;
++    if (fabsf(*ky - 1.0f) < 1e-3f) *ky = 1.0f;
++    return *kx != 1.0f || *ky != 1.0f;
++}
++
++/* The host viewport epilogue xf[0..7] = {sx, sy, sz, 0, tx, ty, tz, 0} (NDC = clip * xf[0..2] + w * xf[4..6]): the
++ * buffer centre is NDC 0, so scaling both scale and offset squeezes about the centre. */
++static inline void rsx_h169_xf(float xf[8], float kx, float ky)
++{
++    xf[0] *= kx; xf[4] *= kx;
++    xf[1] *= ky; xf[5] *= ky;
++}
++
++/* One scissor edge pair [a0, a1) in guest pixels of an extent of n pixels, mapped about n/2 by k: the left/top edge
++ * floored, the right/bottom edge ceiled (never loses a covered pixel), the input first clamped to [0, n] so "no
++ * scissor" becomes the squeezed box. */
++static inline void rsx_h169_span(long a0, long a1, long n, float k, long* o0, long* o1)
++{
++    if (a0 < 0) a0 = 0;
++    if (a1 > n) a1 = n;
++    if (a1 < a0) a1 = a0;
++    const double c = (double)n * 0.5;
++    /* 1e-4 px of slack: a float k (0.9f is 0.89999998) must not push an exact edge to the next pixel */
++    *o0 = (long)floor(c + ((double)a0 - c) * (double)k + 1e-4);
++    *o1 = (long)ceil(c + ((double)a1 - c) * (double)k - 1e-4);
++    if (a1 == a0) *o1 = *o0;   /* an empty scissor stays empty */
++}
++
++/* The scissor rectangle {left, top, right, bottom} in guest pixels of a wv x hv viewport, mapped in place. */
++static inline void rsx_h169_scissor(long r[4], long wv, long hv, float kx, float ky)
++{
++    long a, b;
++    rsx_h169_span(r[0], r[2], wv, kx, &a, &b); r[0] = a; r[2] = b;
++    rsx_h169_span(r[1], r[3], hv, ky, &a, &b); r[1] = a; r[3] = b;
++}
++
++/* A buffer pixel (bx, by) of a wv x hv buffer -> the guest UI pixel the squeezed 2D layer shows there. 0 = in a bar
++ * (outside the 16:9 box): no hit. */
++static inline int rsx_h169_ui_point(float bx, float by, float wv, float hv, float kx, float ky, float* gx, float* gy)
++{
++    const float cx = wv * 0.5f, cy = hv * 0.5f;
++    *gx = cx + (bx - cx) / kx;
++    *gy = cy + (by - cy) / ky;
++    return *gx >= 0.0f && *gy >= 0.0f && *gx < wv && *gy < hv;
++}
++
++#endif /* RSX_HUD169_H */
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 5dea457..6c423a7 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -77,6 +77,8 @@ int  rsx_live_draw_set_fullscreen(int on) { (void)on; return -1; }   /* patch 20
+ int  rsx_live_draw_is_fullscreen(void) { return 0; }
+ void rsx_live_draw_set_scaling(int s, int f) { (void)s; (void)f; }
+ void rsx_live_draw_set_vsync(int on) { (void)on; }   /* patch 2103 */
++void rsx_live_draw_set_hud169(int on) { (void)on; }   /* patch 2113 */
++int  rsx_live_draw_hud169_factors(float* kx, float* ky) { *kx = *ky = 1.0f; return 0; }
+ u32  rsx_live_draw_get_frames(void) { return 0; }
+ void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
+ u32  rsx_live_draw_get_last_draws(void) { return 0; }
+@@ -13418,6 +13420,30 @@ void rsx_live_draw_submit_pending(void)
+ /* Patch 2029 (test hook): no-wait submits so far. */
+ u64 rsx_live_draw_debug_chunk_submits(void) { return g_ld_chunk_submits; }
+ 
++/* KZ3 patch 2113 (RSX pass 106): the 2D layer kept 16:9 and centred (rsx_hud169.h). Per frame (g_ld_frames): did a
++ * depth-tested draw run, was there a display-buffer draw yet. Per draw: does the pixel program sample a render target of
++ * (nearly) the target's size (the loading/pause blur composite of a screen copy: never squeezed, the copy holds the
++ * squeezed UI already). */
++#include "rsx_hud169.h"
++static int ld_h169_factors(float* kx, float* ky);   /* after ld_dm_scaling_now */
++static u32 g_h169_frame = 0xFFFFFFFFu;
++static int g_h169_depth_seen, g_h169_disp_seen, g_h169_rt_sampled;
++static int ld_h169_is_display(u32 target)
++{
++    const surface_t* s = &g.surfaces[target];
++    for (u32 i = 0; i < 8; i++) {
++        const display_buffer_t* d = &g.display_buffers[i];
++        if (d->valid && d->location == s->location && d->offset == s->offset) return 1;
++    }
++    return 0;
++}
++static int ld_h169_log_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("KZ3_HUD_169_LOG"); on = (e && *e && *e != '0') ? 1 : 0; }
++    return on;
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -13790,6 +13816,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     LDW_T0(texloop_t0);   /* patch 2045: the texture loop, TEX_T binds included */
+     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
+     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
++    g_h169_rt_sampled = 0;   /* patch 2113 */
+     u32 zdepth_used[SRV_TABLE_SIZE], n_zdepth_used = 0;
+     u32 texture_mask = 0;
+     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) slots[u] = SRV_WHITE;
+@@ -14059,6 +14086,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                             g.surfaces[sampled].offset,
+                             g.surfaces[sampled].w, g.surfaces[sampled].h);
+             }
++            /* patch 2113: a sampled render target of >= 90 % of the draw target's size in both axes */
++            if (((g_ld_fp_units_cur >> u) & 1u) && target < g.n_surfaces &&
++                g.surfaces[sampled].w * 10u >= g.surfaces[target].w * 9u &&
++                g.surfaces[sampled].h * 10u >= g.surfaces[target].h * 9u)
++                g_h169_rt_sampled = 1;
+             {   /* a smaller texture reads the surface's top-left samples, texel for sample */
+                 const int sw = surface_window((u32)sampled, &t, alias_dbg);
+                 if (sw >= 0) { slots[u] = (u32)sw; g_ld_bind_surf++; continue; }
+@@ -14291,6 +14323,35 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
+         xf[6] = vp.translate[2];
+     }
++    /* patch 2113: a 2D draw (display-buffer target, full guest viewport, 16:9 target, not the frame's 3D compose, no
++     * full-size render target sampled) is squeezed into the centred 16:9 box; the RE notes "Pass 162" s.4. */
++    float h_kx = 1.0f, h_ky = 1.0f;
++    int h169 = 0;
++    {
++        if (g_h169_frame != g_ld_frames) { g_h169_frame = g_ld_frames; g_h169_depth_seen = 0; g_h169_disp_seen = 0; }
++        if (target < g.n_surfaces && ld_h169_is_display(target)) {
++            const int first = !g_h169_disp_seen;
++            g_h169_disp_seen = 1;
++            if (ld_h169_factors(&h_kx, &h_ky)) {
++                const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
++                                 fabsf(vp.scale[1]) == Hv * 0.5f && vp.translate[1] == Hv * 0.5f;
++                const int is169 = (u32)Wv * 9u == (u32)Hv * 16u;
++                const int compose = first && g_h169_depth_seen;
++                h169 = full && is169 && !compose && !g_h169_rt_sampled;
++                if (ld_h169_log_on()) {
++                    static u32 n_log = 0;
++                    if (n_log < 400 || (compose && prim != 5u)) {
++                        n_log++;
++                        fprintf(stderr, "[hud169] f=%u surf=0x%X prim=%u verts=%u full=%d 16:9=%d compose=%d rt=%d -> %s "
++                                "k=%.4f/%.4f\n", g_ld_frames, g.surfaces[target].offset, prim, n_tri * 3u, full, is169,
++                                compose, g_h169_rt_sampled, h169 ? "squeeze" : "keep", h_kx, h_ky);
++                    }
++                }
++            }
++        }
++        if (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) g_h169_depth_seen = 1;
++        if (h169) rsx_h169_xf(xf, h_kx, h_ky);
++    }
+     u8* cbdst = g.cb_mapped + g.cb_used;
+     LDW_T0(vcb_t0);
+     memcpy(cbdst, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16);
+@@ -14343,6 +14404,13 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             if (sc.right  < sc.left)     sc.right  = sc.left;
+             if (sc.bottom < sc.top)      sc.bottom = sc.top;
+         }
++        if (h169) {   /* patch 2113: the scissor of a squeezed draw, mapped in guest pixels about the centre */
++            long rr[4] = { (long)(sc.left / ax), (long)(sc.top / ay), (long)((sc.right + ax - 1) / ax),
++                           (long)((sc.bottom + ay - 1) / ay) };
++            rsx_h169_scissor(rr, (long)Wv, (long)Hv, h_kx, h_ky);
++            sc.left = (LONG)rr[0] * ax; sc.top = (LONG)rr[1] * ay;
++            sc.right = (LONG)rr[2] * ax; sc.bottom = (LONG)rr[3] * ay;
++        }
+     }
+     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
+     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+@@ -15165,6 +15233,32 @@ static int ld_dm_scaling_now(void)
+ {
+     return (g_dm_present_n - g_dm_wide_n <= 3 && rsx_display_view_ratio() != 1.0) ? RSX_DM_STRETCH : g_dm_scaling;
+ }
++/* patch 2113: KZ3_HUD_169 (=0 off, else on; one run) over display.ini hud_169 (rsx_live_draw_set_hud169; default on).
++ * Active only while the present stretches the buffer to a client that is not 16:9: KZ3_ASPECT=screen and Stretch now
++ * (Fit already letterboxes the whole frame; KZ3_ASPECT=16:9 keeps the PS3 picture). */
++static volatile LONG g_h169_cfg = 1;
++void rsx_live_draw_set_hud169(int on) { InterlockedExchange(&g_h169_cfg, on ? 1 : 0); }
++static int ld_h169_on(void)
++{
++    static int env = -2;
++    if (env == -2) {
++        const char* e = getenv("KZ3_HUD_169");
++        env = (e && *e) ? (e[0] == '0' ? 0 : 1) : -1;
++        fprintf(stderr, "[hud169] 2D layer kept 16:9: %s (%s)\n", (env >= 0 ? env : (int)g_h169_cfg) ? "on" : "off",
++                env >= 0 ? "KZ3_HUD_169" : "display.ini hud_169");
++        fflush(stderr);
++    }
++    return env >= 0 ? env : (int)g_h169_cfg;
++}
++static int ld_h169_factors(float* kx, float* ky)
++{
++    *kx = 1.0f; *ky = 1.0f;
++    if (!ld_h169_on() || rsx_display_get_aspect() != RSX_DM_ASPECT_SCREEN || ld_dm_scaling_now() != RSX_DM_STRETCH)
++        return 0;
++    return rsx_h169_factors(g_dm_bb_w, g_dm_bb_h, kx, ky);
++}
++/* For the menu mouse (rsx_null_backend.c rsx_display_client_to_ui): the factors the 2D draws get now. */
++int rsx_live_draw_hud169_factors(float* kx, float* ky) { return ld_h169_factors(kx, ky); }
+ 
+ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32 bbi)
+ {
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index 9478880..2d5c470 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -62,6 +62,7 @@ static int s_present_suppressed = 0;
+  * never races the present. Exclusive fullscreen is the live-draw swap chain's (rsx_live_draw_set_fullscreen).
+  * -----------------------------------------------------------------------*/
+ #include "rsx_display_mode.h"
++#include "rsx_hud169.h"   /* patch 2113 */
+ extern int rsx_live_draw_set_fullscreen(int on);   /* 1 taken, 0 refused, -1 no swap chain yet (rsx_live_draw.c) */
+ extern int rsx_live_draw_is_fullscreen(void);
+ extern void rsx_live_draw_set_scaling(int scaling, int filter);   /* Fit/Stretch, Bilinear/Nearest */
+@@ -220,6 +221,22 @@ int rsx_display_client_to_guest(int cx, int cy, int* gx, int* gy)
+     return rsx_dm_to_guest(&r, (int)s_state.width, (int)s_state.height, cx, cy, gx, gy);
+ }
+ 
++/* KZ3 patch 2113: the menu mouse's map (patch 2098's g_mouse_guest, used only by the GUM hit test): a client pixel ->
++ * the guest UI pixel shown there while the 2D layer is squeezed into the centred 16:9 box (rsx_hud169.h); 0 on a bar.
++ * Look and aim read raw deltas and never come here. */
++int rsx_live_draw_hud169_factors(float* kx, float* ky);   /* rsx_live_draw.c */
++int rsx_display_client_to_ui(int cx, int cy, int* gx, int* gy)
++{
++    int ok = rsx_display_client_to_guest(cx, cy, gx, gy);
++    float kx, ky, ux, uy;
++    if (ok && rsx_live_draw_hud169_factors(&kx, &ky)) {
++        ok = rsx_h169_ui_point((float)*gx + 0.5f, (float)*gy + 0.5f, (float)s_state.width, (float)s_state.height, kx, ky,
++                               &ux, &uy);
++        *gx = (int)floorf(ux); *gy = (int)floorf(uy);
++    }
++    return ok;
++}
++
+ static int rsx_dm_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
+ {
+     (void)hwnd;
+@@ -545,7 +562,7 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+         NULL, NULL, GetModuleHandle(NULL), NULL);
+ 
+     { extern int (*g_pad_mouse_to_guest)(int, int, int*, int*);   /* KZ3 patch 2098: pointer -> guest pixels */
+-      g_pad_mouse_to_guest = rsx_display_client_to_guest; }
++      g_pad_mouse_to_guest = rsx_display_client_to_ui; }   /* 2113: through the 16:9 squeeze */
+     pad_mouse_attach(s_state.hwnd);   /* KZ3 patch 2069 */
+     if (!s_state.hwnd) {
+         printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());

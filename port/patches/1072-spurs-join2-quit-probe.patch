@@ -1,0 +1,239 @@
+KZ3 patch 1072 (SPU pass 57): KZ3_JOIN2_PROBE=1, logs only (off: one NULL function-pointer test per rdch/rchcnt).
+The T7 quit-to-menu stalls in cellSpursJoinTask2 called from the Havok pool destructor (the RE notes s.7).
+spu_workload.c keeps a registry of live taskset task threads (taskset, id, generation, image, start time, the SPU
+context seen by rdch/rchcnt, per-channel read/count calls) and a ring of the last task starts/exits (exit of a
+cut-off task marked), and spu_j2_dump prints them with the taskset's ready/pending/enabled bitsets, the Taskset2 size
+word, exit entries and task_info of ids 0..7; cellSpursJoinTask2 calls it at ~3, ~20 and ~40 s of spinning, plus the
+port's guest dump hook g_kz3_j2_guest_dump.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): both (stop request, then the join2 note).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index c084f3d6..8fd7b438 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1106,6 +1106,9 @@ s32 cellSpursTryJoinTask2(void* taskset, u32 id, s32* exitCode)
+     return CELL_OK;
+ }
+ 
++/* KZ3 patch 1072: set by the port (kz3_hkquit_probe.c) for the JoinTask2 spin dump. */
++void (*g_kz3_j2_guest_dump)(uint32_t ts, uint32_t id) = 0;
++
+ s32 cellSpursJoinTask2(void* taskset, u32 id, s32* exitCode)
+ {
+     u32 ts = (u32)(uintptr_t)taskset;
+@@ -1115,6 +1118,17 @@ s32 cellSpursJoinTask2(void* taskset, u32 id, s32* exitCode)
+     while (kz3_task2_enabled(ts, id)) {
+         Sleep(spins < 64 ? 0 : 1);
+         if (++spins == 20000) printf("[cellSpurs] JoinTask2 taskset=0x%08X id=%u still running after ~20 s\n", ts, id);
++        /* KZ3 patch 1072 (KZ3_JOIN2_PROBE=1): task-thread / taskset dump at ~3 s, ~20 s and ~40 s of spinning, plus the
++         * port's guest-side dump (Havok pool and job queue, port/spu/kz3_hkquit_probe.c). */
++        if (spins == 3000 || spins == 20000 || spins == 40000) {
++            extern int kz3_j2_on(void);
++            extern void spu_j2_dump(uint32_t ts, uint32_t id, unsigned spins);
++            if (kz3_j2_on()) {
++                fflush(stdout);
++                spu_j2_dump(ts, id, spins);
++                if (g_kz3_j2_guest_dump) g_kz3_j2_guest_dump(ts, id);
++            }
++        }
+     }
+     if (exitCode) vm_write32((u32)(uintptr_t)exitCode, kz3_task2_take_exit_code(ts, id));
+     else kz3_task2_take_exit_code(ts, id);
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 08aee851..64ab606c 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1364,9 +1364,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+  * Channel read (returns value in the preferred word slot)
+  * ===========================================================================*/
+ static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel);
++/* KZ3 patch 1072: spu_workload.c sets it while KZ3_JOIN2_PROBE=1 (task-thread channel counts for the JoinTask2 dump). */
++extern void (*g_kz3_j2_note)(spu_context* ctx, uint32_t ch);
+ u128 spu_rdch(spu_context* ctx, uint32_t channel)
+ {
+     spu_honour_stop_request(ctx);
++    if (g_kz3_j2_note) g_kz3_j2_note(ctx, channel & 31u);
+     u128 r = spu_rdch_impl(ctx, channel);
+     if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "rd", channel, r._u32[0]);
+     return r;
+@@ -1477,6 +1480,7 @@ static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel)
+ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+ {
+     spu_honour_stop_request(ctx);
++    if (g_kz3_j2_note) g_kz3_j2_note(ctx, 32u + (channel & 31u));   /* KZ3 patch 1072 */
+     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
+      * with the pc each SPU is sitting at.
+      *
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 6b9b21f6..7ead8e3b 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -605,6 +605,142 @@ int spu_taskset_join_wait(uint32_t taskset_ea)
+     return busy > 0 ? busy : 0;
+ }
+ 
++/* KZ3 patch 1072 (SPU pass 57, KZ3_JOIN2_PROBE=1, logs only): the T7 quit stalls in cellSpursJoinTask2 (Havok pool dtor,
++ * the RE notes s.7). A registry of the live task threads (taskset, id, generation, image, start time, SPU
++ * context seen by rdch/rchcnt, per-channel read counts) and a ring of the last task starts/exits, dumped by the
++ * JoinTask2 spin with the taskset's bitsets and exit entry. Separates a live task waiting (cause 1) from a stale
++ * enabled bit (cause 2). Off: one global int test per rdch/rchcnt. */
++int g_kz3_j2_on = -1;
++void (*g_kz3_j2_note)(spu_context* ctx, uint32_t ch) = 0;   /* called by spu_rdch / spu_rchcnt when set */
++void spu_j2_note(spu_context* ctx, uint32_t ch);
++int kz3_j2_on(void)
++{
++    if (g_kz3_j2_on < 0) {
++        const char* e = getenv("KZ3_JOIN2_PROBE");
++        g_kz3_j2_on = (e && *e == '1');
++        if (g_kz3_j2_on) g_kz3_j2_note = spu_j2_note;
++    }
++    return g_kz3_j2_on;
++}
++typedef struct {
++    volatile LONG used;
++    unsigned long tid;
++    uint32_t ts, id, gen, image;
++    unsigned long long t0;
++    spu_context* ctx;
++    unsigned long long rd[64], n;
++} j2_slot;
++#define J2_SLOTS 64
++static j2_slot s_j2[J2_SLOTS];
++static _Thread_local j2_slot* t_j2;
++typedef struct { unsigned long long ms; uint32_t ts, id, kind, gen; int32_t rc; unsigned long tid; } j2_ev;
++#define J2_EVS 96
++static j2_ev s_j2ev[J2_EVS];
++static volatile LONG s_j2ev_n;
++static unsigned long long j2_ms(void)
++{
++#ifdef _WIN32
++    return GetTickCount64();
++#else
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (unsigned long long)t.tv_sec * 1000ull + t.tv_nsec / 1000000;
++#endif
++}
++static unsigned long j2_tid(void)
++{
++#ifdef _WIN32
++    return (unsigned long)GetCurrentThreadId();
++#else
++    return (unsigned long)pthread_self();
++#endif
++}
++/* kind: 1 start, 2 exit, 3 exit of a cut-off (stale) task, 4 not started */
++static void j2_event(uint32_t ts, uint32_t id, uint32_t kind, int32_t rc)
++{
++    LONG k = InterlockedIncrement(&s_j2ev_n) - 1;
++    j2_ev* e = &s_j2ev[k % J2_EVS];
++    e->ms = j2_ms(); e->ts = ts; e->id = id; e->kind = kind; e->rc = rc; e->tid = j2_tid(); e->gen = t_task_gen;
++}
++static void j2_start(uint32_t ts, uint32_t id, int image)
++{
++    if (!kz3_j2_on() || !ts) return;
++    j2_event(ts, id, 1, 0);
++    for (int i = 0; i < J2_SLOTS; i++) {
++        if (InterlockedCompareExchange(&s_j2[i].used, 1, 0) == 0) {
++            j2_slot* s = &s_j2[i];
++            s->tid = j2_tid(); s->ts = ts; s->id = id; s->gen = t_task_gen; s->image = (uint32_t)image;
++            s->t0 = j2_ms(); s->ctx = NULL; s->n = 0; memset(s->rd, 0, sizeof s->rd);
++            t_j2 = s;
++            return;
++        }
++    }
++}
++static void j2_end(void)
++{
++    if (t_j2) { InterlockedExchange(&t_j2->used, 0); t_j2 = NULL; }
++}
++/* From spu_rdch / spu_rchcnt (spu_channels.c, through g_kz3_j2_note) while the probe is on. */
++void spu_j2_note(spu_context* ctx, uint32_t ch)
++{
++    j2_slot* s = t_j2;
++    if (!s) return;
++    s->ctx = ctx; s->n++;
++    if (ch < 64) s->rd[ch]++;
++}
++static void j2_hex(const char* tag, uint32_t ea, uint32_t n)
++{
++    extern uint8_t* vm_base;
++    char b[160]; int o = 0;
++    for (uint32_t i = 0; i < n && o < (int)sizeof b - 4; i++) o += snprintf(b + o, sizeof b - o, "%02X%s", vm_base[ea + i], (i & 3) == 3 ? " " : "");
++    fprintf(stderr, "[j2] %s @0x%08X: %s\n", tag, ea, b);
++}
++/* JoinTask2 spin dump (cellSpurs.c), taskset ts, waited-for task id. */
++void spu_j2_dump(uint32_t ts, uint32_t id, unsigned spins)
++{
++    extern uint8_t* vm_base;
++    if (!kz3_j2_on() || !vm_base || !ts) return;
++    unsigned long long now = j2_ms();
++    fprintf(stderr, "[j2] JoinTask2 ts=0x%08X id=%u spins=%u tid=%lu\n", ts, id, spins, j2_tid());
++    j2_hex("ready +0x10", ts + 0x10, 16); j2_hex("pending +0x20", ts + 0x20, 16); j2_hex("enabled +0x30", ts + 0x30, 16);
++    j2_hex("size +0x1890", ts + 0x1890, 4);
++    for (uint32_t t = 0; t < 8; t++) { char tag[32]; snprintf(tag, sizeof tag, "exit[%u]", t); j2_hex(tag, ts + 0x1980 + 16 * t, 16); }
++    for (uint32_t t = 0; t < 8; t++) { char tag[32]; snprintf(tag, sizeof tag, "task_info[%u]", t); j2_hex(tag, ts + 0x80 + 0x30 * t, 0x30); }
++    ts_lock();
++    int i = ts_find(ts);
++    if (i >= 0) {
++        int marks = 0; for (int b = 0; b < 16; b++) marks += __builtin_popcount(s_ts_run[i].running[b]);
++        fprintf(stderr, "[j2] ts_run: gen=%u parked=%d running-marks=%d byte0=0x%02X\n", (unsigned)s_ts_run[i].gen,
++                s_ts_run[i].parked, marks, s_ts_run[i].running[0]);
++    } else fprintf(stderr, "[j2] ts_run: taskset not tracked\n");
++    ts_unlock();
++    int live = 0;
++    for (int k = 0; k < J2_SLOTS; k++) {
++        j2_slot* s = &s_j2[k];
++        if (!s->used) continue;
++        live++;
++        spu_context* c = s->ctx;
++        char rd[400]; int o = 0;
++        for (int ch = 0; ch < 64 && o < (int)sizeof rd - 32; ch++)
++            if (s->rd[ch]) o += snprintf(rd + o, sizeof rd - o, " %s%d=%llu", ch >= 32 ? "cnt" : "rd", ch & 31, s->rd[ch]);
++        fprintf(stderr, "[j2] live task thread tid=%lu ts=0x%08X id=%u gen=%u image=%u age=%llu ms ch-ops=%llu%s\n",
++                s->tid, s->ts, s->id, s->gen, s->image, now - s->t0, s->n, rd);
++        if (c) {
++            fprintf(stderr, "[j2]   ctx pc=0x%05X lr=0x%05X sp=0x%05X r3=0x%08X status=0x%X stop=0x%X ev_mask=0x%X ev_stat=0x%X "
++                    "resv_valid=%d resv_ea=0x%08X\n", c->pc & 0x3FFFFu, c->gpr[0]._u32[0] & 0x3FFFFu, c->gpr[1]._u32[0] & 0x3FFFFu,
++                    c->gpr[3]._u32[0], c->status, c->stop_code, c->event_mask, c->event_status, c->resv_valid, c->resv_ea);
++            if (c->resv_valid && c->resv_ea) j2_hex("  resv line", c->resv_ea, 32);
++        }
++    }
++    fprintf(stderr, "[j2] %d live task thread(s); last task events (ms before now, kind 1 start 2 exit 3 stale-exit 4 not started):\n", live);
++    LONG n = s_j2ev_n; LONG from = n > J2_EVS ? n - J2_EVS : 0;
++    for (LONG k = from; k < n; k++) {
++        j2_ev* e = &s_j2ev[k % J2_EVS];
++        if (e->ts != ts && (n - k) > 24) continue;   /* other tasksets: only the last 24 */
++        fprintf(stderr, "[j2]   -%llu ms ts=0x%08X id=%u kind=%u rc=%d tid=%lu gen=%u\n", now - e->ms, e->ts, e->id, e->kind,
++                e->rc, e->tid, e->gen);
++    }
++    fflush(stderr);
++}
++
+ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
+ {
+     if (!taskset_ea || t >= 128 || s_ts_held) return;   /* held: caller set it */
+@@ -868,6 +1004,7 @@ static void spu_async_run(spu_async_job* j)
+ {
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     spu_taskset_bind_thread(j->taskset_ea);   /* KZ3 patch 1066 */
++    j2_start(j->taskset_ea, j->taskid, j->image_id);   /* KZ3 patch 1072 */
+     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
+      * back to a fresh per-dispatch LS when disabled / no taskset. */
+     spu_ts_ls_slot* ts_slot = NULL;
+@@ -1207,6 +1344,8 @@ static void spu_async_run(spu_async_job* j)
+             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                     "(job ran to completion, did not loop)\n", j->image_id, rc);
+             spu_serial_release();
++            if (j->taskset_ea && g_kz3_j2_on == 1)   /* KZ3 patch 1072 */
++                j2_event(j->taskset_ea, j->taskid, ts_stale(j->taskset_ea) ? 3 : 2, rc);
+             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid, rc);
+         }
+         /* Persistent LS is retained in its taskset slot for the next task; a
+@@ -1220,6 +1359,7 @@ static void spu_async_run(spu_async_job* j)
+         pthread_mutex_unlock(&ts_slot->lock);
+ #endif
+     }
++    j2_end();   /* KZ3 patch 1072 */
+     free(j);
+ }
+ 

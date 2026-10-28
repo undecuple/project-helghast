@@ -1,0 +1,105 @@
+KZ3 patch 1069 (SPU pass 52, the quit-to-menu hang): unlifted code inside a WWS job's local-store range runs in the
+full SPU interpreter, with the host call frames kept. KZ3's Amadeus mixer job (job_0127a180, wid 5 jm_amadeus) loads
+a DSP plugin (job_0129bd80, linked for LS 0x8000 but lifted at 0x4000) for the level's stream voice and calls into it
+through pointers (0x5E6C `bisl $0,$95` -> 0xB518, 0x6B1C -> 0x8030); the plugin calls back into the mixer's DMA helper
+0x4D70 at its absolute address. Before: the indirect-branch miss went to the SMC microstep (a stub interpreter for
+the job manager's generated save/restore code), and when the lifted helper returned (SPU_RET) into the plugin at
+0xBA70 the drain bracket found no lifted code there and took the restart dispatch, which longjmps to the lane driver
+and drops every host frame, including the policy module's job bracket: the lane's run ended inside the job
+([pm-end] pc 0x4D70 lr 0xBAA8, status RUNNING), the job stayed claimed (job-list row slot 0 = 0, never done),
+AmadeusScheduler's WaitForJobGroup 0x89D7C waited forever and the sound system's shutdown wait 0x300250 never
+returned. Now: (1) spu_indirect_branch, for a policy-mode lane whose pc is in [0x4000, 0x3FE80) with code there and
+no lifted function, runs spu_interp_run_until(pc, 0) (it stops at the first lifted address, the resident overlay
+first, patch 1028) and dispatches from there; (2) spu_drain_call, when a bracket's inner loop ends at such an
+unlifted pc, interprets until the bracket's return address or a lifted address and goes on, instead of the restart.
+KZ3_SPU_WWS_INTERP=0 restores both old paths. [pm-end] marks: N:pc interpreter entered, J:pc where it stopped.
+Upstream candidate (general: any title whose SPU jobs call runtime-loaded or differently-based code).
+
+--- a/runtime/spu/spu_drain.c	2026-10-13 15:12:01.028934386 -0500
++++ b/runtime/spu/spu_drain.c	2026-10-13 15:12:01.043930284 -0500
+@@ -518,6 +518,29 @@
+                 continue;
+             }
+         }
++        /* KZ3 patch 1069: a lifted function returned (SPU_RET with this bracket live) into unlifted code inside a
++         * WWS job's LS range (the plugin that called it, see spu_indirect_branch). Interpret from there until the
++         * bracket's return address or a lifted address, keeping the host frames, instead of the restart dispatch
++         * below (which abandons every frame up to the lane's driver, and with them the PM's job bracket). */
++        {
++            extern int kz3_wws_interp_on(void);
++            const uint32_t p = ctx->pc & SPU_LS_MASK & ~3u;
++            if (ctx->policy_mode && kz3_wws_interp_on() && p >= 0x4000 && p < 0x3FE80 &&
++                (ctx->ls[p] | ctx->ls[p + 1] | ctx->ls[p + 2] | ctx->ls[p + 3])) {
++                extern uint32_t spu_interp_run_until(spu_context*, uint32_t, uint32_t);
++                spu_recent_mark(ctx, 10, p);
++                spu_interp_run_until(ctx, p, return_pc & SPU_LS_MASK);
++                spu_recent_mark(ctx, 11, ctx->pc);
++                if (ctx->status == SPU_STATUS_RUNNING) {
++                    if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
++                        SPU_DRAIN_POP_IRQ();
++                        return;
++                    }
++                    g_spu_trampoline_fn = spu_indirect_branch;
++                    continue;
++                }
++            }
++        }
+         {
+             extern void spu_restart_dispatch(spu_context*);
+             SPU_DRAIN_POP_IRQ();
+--- a/runtime/spu/spu_channels.c	2026-10-13 15:12:01.029934408 -0500
++++ b/runtime/spu/spu_channels.c	2026-10-13 15:12:01.043453330 -0500
+@@ -2169,6 +2169,13 @@
+  * the first branch (trampoline re-dispatch). Returns 1 if it executed to a
+  * branch, 0 on an unknown opcode (caller falls through to BRANCH-TO-0). */
+ extern int g_kz3_pmend_ib;
++/* KZ3 patch 1069: KZ3_SPU_WWS_INTERP (default on; 0 = the old microstep / restart paths). */
++int kz3_wws_interp_on(void)
++{
++    static int s = -1;
++    if (s < 0) { const char* e = getenv("KZ3_SPU_WWS_INTERP"); s = (e && *e == '0') ? 0 : 1; }
++    return s;
++}
+ static int spu_smc_microstep_body(spu_context* ctx);
+ static int spu_smc_microstep(spu_context* ctx)   /* KZ3 patch 1068: marks around the body */
+ {
+@@ -2953,6 +2960,28 @@
+      * WWS jobmanager writes a save/restore stub above its static
+      * image and calls it). Interpret the live LS bytes; on success the next
+      * branch re-enters lifted code via the trampoline. */
++    /* KZ3 patch 1069: unlifted code inside a WWS job's LS range (a policy-module lane running a job). KZ3's Amadeus
++     * mixer job (job_0127a180 at 0x4000) loads a DSP plugin (job_0129bd80, linked for LS 0x8000, lifted at 0x4000)
++     * and calls into it through pointers; the plugin calls back into the mixer's helpers (0x4D70) at absolute
++     * addresses. The SMC microstep (a stub interpreter for the job manager's generated save/restore code) ran such
++     * code only by luck, and a lifted helper returning into it left the lane through a restart dispatch that dropped
++     * the PM's job bracket (the job stayed claimed forever: the quit-to-menu hang). Run it in the full interpreter
++     * instead; it stops at the first lifted address (the resident overlay first, patch 1028) and the dispatch goes
++     * on from there. KZ3_SPU_WWS_INTERP=0 restores the microstep path. */
++    if (ctx->policy_mode && kz3_wws_interp_on() && (ctx->pc & SPU_LS_MASK) >= 0x4000 && (ctx->pc & SPU_LS_MASK) < 0x3FE80) {
++        const uint32_t p = ctx->pc & SPU_LS_MASK & ~3u;
++        if (ctx->ls[p] | ctx->ls[p + 1] | ctx->ls[p + 2] | ctx->ls[p + 3]) {
++            extern uint32_t spu_interp_run_until(spu_context*, uint32_t, uint32_t);
++            spu_recent_mark(ctx, 10, p);
++            spu_interp_run_until(ctx, p, 0);
++            spu_recent_mark(ctx, 11, ctx->pc);
++            if (ctx->status == SPU_STATUS_RUNNING) {
++                g_spu_trampoline_fn = spu_indirect_branch;   /* dispatch the lifted code it stopped at */
++                return;
++            }
++            return;   /* the interpreter stopped the SPU (stop / halt): as the SPU_INTERP_UNLIFTED path */
++        }
++    }
+     if (spu_smc_microstep(ctx))
+         return;
+     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
+--- a/runtime/spu/spurs_policy.c	2026-10-13 15:12:01.030934431 -0500
++++ b/runtime/spu/spurs_policy.c	2026-10-13 15:12:01.044373672 -0500
+@@ -475,7 +475,7 @@
+             for (unsigned k = 0; k < n && p < (int)sizeof buf - 40; k++) {
+                 const uint32_t v = r[k], kind = v >> 28;
+                 if (k && k % 40 == 0) p += snprintf(buf + p, sizeof buf - p, "\n[pm-end]   +%u:", k);   /* log lines are cut near 1 KB */
+-                if (kind) p += snprintf(buf + p, sizeof buf - p, " %c:%05X/%u", "?IRXDEBLMF"[kind < 10 ? kind : 0], v & 0x3FFFF, (v >> 20) & 0xFF);
++                if (kind) p += snprintf(buf + p, sizeof buf - p, " %c:%05X/%u", "?IRXDEBLMFNJ"[kind < 12 ? kind : 0], v & 0x3FFFF, (v >> 20) & 0xFF);
+                 else p += snprintf(buf + p, sizeof buf - p, " %05X", v & 0x3FFFF);
+             }
+             { const uint8_t* L = ctx->ls;   /* registers a call through a pointer uses, and the LS around pc and lr */

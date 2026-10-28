@@ -1,0 +1,286 @@
+KZ3 patch 1110 (SPU pass 84): the last check for the lock-line-reservation-lost event before a reservation is
+replaced or dropped, and an opt-in lock-line stall snapshot (KZ3_LR_SNAP).
+
+Only writers that go through spu_coh_notify_write* raise SPU_EVENT_LR as they land. A store that bypasses them is
+seen only by the snapshot compare in rdch/rchcnt SPU_RdEventStat (spu_resv_lost_poll), and only while the
+reservation is still valid. GETLLAR (same line: snapshot overwritten; other line: spu_resv_drop) and PUTLLC
+(failure, or a drop for another line) ended the reservation without that compare, so the event hardware latches at
+the store was never raised and an SPU that then waits for it sleeps. RPCS3 PR #5435 (read as a reference only)
+orders its GETLLAR the same way: a last check for the event before the old reservation is replaced.
+
+Now spu_resv_last_check (spu_coherency.c), on the SPU's own thread: valid reservation, line != snapshot -> CAS
+resv_valid 1 -> 0 and raise SPU_EVENT_LR (a concurrent notifier wins or loses the same CAS: raised once). Called by
+spu_resv_drop, by GETLLAR on the same line before the snapshot is overwritten, and by a failing PUTLLC on its own
+line. KZ3_LR_LASTCHECK=0 = old behaviour.
+
+spu_context gains an LR history (raises, last source NOTIFY/POLL/LASTCHECK, last line, LR acks, last committed
+PUTLLC line, PUTLLC failures). KZ3_LR_SNAP=1 (off by default; KZ3_LR_SNAP_N snapshots per run, default 4) prints one
+line per registered SPU context with that history, the reservation (valid, line, changed-under-snapshot), the event
+mask/status and a class (never-written / unseen-write / not-advanced / missed-wake / no-lr-wait), plus the reserved
+line's 32 words, at the first 2 s heartbeat of a parked channel wait and at a 4M GETLLAR spin on one line.
+
+upstream test_spu_lockline_peer.c "a PUTLLC that fails its compare raises nothing": the peer is still untouched; the
+one raise is now the failing SPU's own (its reservation was lost to the unannounced store).
+Host test: tools/spu/test_lr_lastcheck.sh (passes; with KZ3_LR_LASTCHECK=0 its 4 missed-wake cases fail).
+
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -301,6 +301,14 @@
+     uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
+     uint64_t dbg_getllar;      /* SPU_PUTLLC_WHY: GETLLARs issued      */
+     uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
++    /* KZ3 patch 1110: lock-line event history for the KZ3_LR_SNAP stall
++     * snapshot (spu_coherency.c). Written with relaxed atomics, read racy. */
++    uint32_t lr_raise_n;       /* SPU_EVENT_LR raised on this SPU            */
++    uint32_t lr_last_src;      /* SPU_LR_SRC_* of the last raise             */
++    uint32_t lr_last_line;     /* line of the last raise                     */
++    uint32_t lr_ack_n;         /* WrEventAck writes with the LR bit          */
++    uint32_t lr_putllc_ok_ea;  /* line of the last committed PUTLLC          */
++    uint32_t lr_putllc_fail_n; /* failed PUTLLCs                             */
+ 
+     /* SPURS policy-module run mode (spurs_policy.c): nonzero while a lifted
+      * policy module runs under the HLE'd kernel handoff. spu_indirect_branch
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -92,6 +92,19 @@
+  * this at zero is a coherence miss; nonzero moves the question downstream. */
+ extern unsigned long g_spu_lr_raise;
+ 
++/* KZ3 patch 1110: who raised SPU_EVENT_LR (spu_context.lr_last_src). */
++#define SPU_LR_SRC_NOTIFY    1u   /* a notified write: PPU store, peer PUTLLC/PUTLLUC/PUT */
++#define SPU_LR_SRC_POLL      2u   /* the snapshot compare in rdch/rchcnt SPU_RdEventStat  */
++#define SPU_LR_SRC_LASTCHECK 3u   /* the last check before GETLLAR/PUTLLC drops a reservation */
++void spu_lr_note(spu_context* c, uint32_t src, uint32_t line);
++/* The last check for SPU_EVENT_LR on ctx's own thread before its valid
++ * reservation is replaced or dropped: raises the event if the line no longer
++ * matches the snapshot. Returns 1 if it raised. */
++int  spu_resv_last_check(spu_context* ctx);
++/* KZ3_LR_SNAP=1: print every registered SPU's lock-line event state (stderr). */
++int  spu_lr_snap_on(void);
++void spu_lr_snapshot(const char* why, const spu_context* who);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -181,9 +181,13 @@
+ void spu_resv_drop(spu_context* ctx)
+ {
+     if (__atomic_load_n(&ctx->resv_valid, __ATOMIC_ACQUIRE) == 0) return;
+     uint64_t m = spu_ll_mask(ctx->resv_ea, 1);
+     spu_ll_lock_mask(m);
+-    __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELEASE);
++    /* patch 1110: the last check runs under the old line's stripe like the drop
++     * itself: outside it, a notifier on that line that had already read resv_ea
++     * killed the reservation GETLLAR then published for the next line (ABA). */
++    if (!spu_resv_last_check(ctx))
++        __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELEASE);
+     spu_ll_unlock_mask(m);
+     LL_ST(s_st_drop, 1);
+ }
+@@ -195,8 +199,12 @@
+     if (spu_ll_stats_on()) spu_ll_stats_tick();
+     spu_coh_reserve(ctx, ea);      /* bitmap mark (+ registry add under all stripes): before any read */
+     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+-    if (__atomic_load_n(&ctx->resv_valid, __ATOMIC_ACQUIRE) && ((ctx->resv_ea ^ ea) & ~127u))
+-        spu_resv_drop(ctx);        /* leaving another line */
++    if (__atomic_load_n(&ctx->resv_valid, __ATOMIC_ACQUIRE)) {
++        if ((ctx->resv_ea ^ ea) & ~127u)
++            spu_resv_drop(ctx);    /* leaving another line (last check inside, patch 1110) */
++        else
++            spu_resv_last_check(ctx);   /* patch 1110: before the snapshot is overwritten */
++    }
+     if (!spu_ll_old()) {
+         for (int tries = 0; tries < 64; tries++) {
+             uint32_t s = spu_ll_read_begin(ea);
+@@ -276,6 +281,101 @@
+ 
+ unsigned long g_spu_lr_raise = 0;
+ 
++/* ===========================================================================
++ * KZ3 patch 1110: the last check for the lock-line event, and its history.
++ *
++ * Only writers that go through spu_coh_notify_write* raise SPU_EVENT_LR as
++ * they land. A store that bypasses them (an HLE memcpy into guest memory, a
++ * device write) is seen only by the snapshot compare in rdch/rchcnt
++ * SPU_RdEventStat (spu_resv_lost_poll), and only while the reservation is
++ * still valid. GETLLAR (same line: snapshot overwritten; other line:
++ * reservation dropped) and PUTLLC (failure, or a drop for another line) ended
++ * the reservation without making that compare, so the event hardware latched
++ * at the store was never raised, and an SPU that then waits for it sleeps.
++ * RPCS3 PR #5435 orders its GETLLAR the same way: a last check for the event
++ * before the old reservation is replaced. KZ3_LR_LASTCHECK=0 = old behaviour.
++ * ===========================================================================*/
++extern uint8_t* vm_base;
++void spu_lr_note(spu_context* c, uint32_t src, uint32_t line)
++{
++    __atomic_fetch_add(&c->lr_raise_n, 1, __ATOMIC_RELAXED);
++    __atomic_store_n(&c->lr_last_src, src, __ATOMIC_RELAXED);
++    __atomic_store_n(&c->lr_last_line, line, __ATOMIC_RELAXED);
++}
++static int spu_lr_lastcheck_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_LR_LASTCHECK"); v = (e && *e == '0') ? 0 : 1; }
++    return v;
++}
++/* On ctx's own thread (GETLLAR/PUTLLC), so no wake is needed. A notifier
++ * killing the same reservation concurrently loses or wins the same CAS:
++ * the event is raised once. */
++int spu_resv_last_check(spu_context* ctx)
++{
++    if (!spu_lr_lastcheck_on() || !vm_base) return 0;
++    if (__atomic_load_n(&ctx->resv_valid, __ATOMIC_ACQUIRE) != 1) return 0;
++    const uint32_t line = __atomic_load_n(&ctx->resv_ea, __ATOMIC_RELAXED) & ~127u;
++    if (line == 0 || memcmp(vm_base + line, ctx->resv_line, 128) == 0) return 0;
++    int one = 1;
++    if (!__atomic_compare_exchange_n(&ctx->resv_valid, &one, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
++        return 0;
++    spu_event_raise(ctx, SPU_EVENT_LR);
++    spu_lr_note(ctx, SPU_LR_SRC_LASTCHECK, line);
++    __atomic_fetch_add(&g_spu_lr_raise, 1, __ATOMIC_RELAXED);
++    return 1;
++}
++
++int spu_lr_snap_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_LR_SNAP"); v = (e && *e && *e != '0') ? 1 : 0; }
++    return v;
++}
++/* KZ3_LR_SNAP=1: at a stall (a 2 s RdEventStat/RdInMbox park, a GETLLAR spin
++ * of 4M on one line, or any watcher that calls it), one line per registered
++ * SPU context with what decides which way a lock-line wake went wrong:
++ *   never-written  reservation valid, line == snapshot (nobody wrote it)
++ *   missed-wake    reservation gone, LR not pending, LR in the mask (a wake
++ *                  that was never raised, or raised and acked without a re-read)
++ *   unseen-write   reservation valid, line != snapshot (the compare not run yet)
++ *   not-advanced   LR pending and enabled (raised; the SPU has not consumed it)
++ * KZ3_LR_SNAP_N = snapshots per run (default 4). */
++void spu_lr_snapshot(const char* why, const spu_context* who)
++{
++    static int s_left = -1;
++    if (s_left < 0) { const char* e = getenv("KZ3_LR_SNAP_N"); s_left = (e && atoi(e) > 0) ? atoi(e) : 4; }
++    if (__atomic_fetch_sub(&s_left, 1, __ATOMIC_RELAXED) <= 0) return;
++    fprintf(stderr, "[lr-snap] why=%s spu=%X pc=0x%05X lr_raise_total=%lu registry=%u\n", why ? why : "?",
++            who ? who->spu_id : 0xFFu, who ? (unsigned)(who->pc & 0x3FFFFu) : 0u,
++            __atomic_load_n(&g_spu_lr_raise, __ATOMIC_RELAXED), spu_coh_capacity());
++    SPU_COH_FOR_EACH(ch, i) {
++        const spu_context* c = __atomic_load_n(&ch->slot[i], __ATOMIC_ACQUIRE);
++        if (!c) continue;
++        const int v = __atomic_load_n(&c->resv_valid, __ATOMIC_ACQUIRE);
++        const uint32_t ea = c->resv_ea & ~127u, st = spu_event_load(c), mask = c->event_mask;
++        const int diff = (v && vm_base && ea) ? memcmp(vm_base + ea, c->resv_line, 128) != 0 : -1;
++        const char* cls = (st & mask & SPU_EVENT_LR) ? "not-advanced"
++                        : (v && diff == 1)          ? "unseen-write"
++                        : (v && diff == 0)          ? "never-written"
++                        : (mask & SPU_EVENT_LR)     ? "missed-wake" : "no-lr-wait";
++        fprintf(stderr, "[lr-snap]  spu=%X img=%d pc=0x%05X status=%u evmask=0x%X evstat=0x%X"
++                        " resv[v=%d ea=0x%08X diff=%d] atomic_stat=%u lr[n=%u src=%u line=0x%08X acks=%u]"
++                        " putllc[ok_ea=0x%08X fails=%u] getllar=%llu class=%s\n",
++                c->spu_id, c->image_id, (unsigned)(c->pc & 0x3FFFFu), (unsigned)c->status, mask, st,
++                v, ea, diff, c->atomic_stat, c->lr_raise_n, c->lr_last_src, c->lr_last_line, c->lr_ack_n,
++                c->lr_putllc_ok_ea, c->lr_putllc_fail_n, (unsigned long long)c->dbg_getllar, cls);
++        if (v && vm_base && ea) {
++            const uint8_t* m = vm_base + ea;
++            fprintf(stderr, "[lr-snap]   line 0x%08X:", ea);
++            for (int w = 0; w < 32; w++)
++                fprintf(stderr, " %02X%02X%02X%02X", m[4*w], m[4*w+1], m[4*w+2], m[4*w+3]);
++            fprintf(stderr, "\n");
++        }
++    }
++    fflush(stderr);
++}
++
+ static void spu_coh_reserve_add(spu_context* ctx);
+ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+ {
+@@ -419,6 +519,7 @@
+         if (!c || (const void*)c == self) continue;
+         if (spu_resv_kill(c, line)) {           /* patch 1056: CAS under the line's stripe */
+             spu_event_raise(c, SPU_EVENT_LR);   /* patch 1052 */
++            spu_lr_note(c, SPU_LR_SRC_NOTIFY, line);   /* patch 1110 */
+             __atomic_fetch_add(&g_spu_lr_raise, 1, __ATOMIC_RELAXED);
+             spu_ch_wake(c);
+         }
+@@ -433,6 +534,7 @@
+         if (!c) continue;
+         if (spu_resv_kill(c, line)) {           /* patch 1056: CAS, reservation lost, PUTLLC must fail */
+             spu_event_raise(c, SPU_EVENT_LR);   /* patch 1052 */
++            spu_lr_note(c, SPU_LR_SRC_NOTIFY, line);   /* patch 1110 */
+             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
+              * always fails for "no reservation" is useless without knowing who
+              * took it away -- a peer SPU, or the PPU committing to the line. */
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -691,6 +691,7 @@
+                               " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
+                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
++              if (spu_lr_snap_on()) spu_lr_snapshot("getllar-spin-4M", ctx);   /* patch 1110 */
+               /* The whole line and the waiter's state: which word is the stuck one (a semaphore at
+                * ea+(x & 0x7C) is usually in r3..r6), and whether it loops on the lost-reservation
+                * event (evmask 0x400) or on failed PUTLLCs (atomic_stat 1). */
+@@ -810,8 +811,14 @@
+                                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); } } }
+             spu_coh_notify_write(ea);
+             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
++            ctx->lr_putllc_ok_ea = ea;                 /* patch 1110 */
+         } else {
+             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
++            /* KZ3 patch 1110: a valid reservation on this line whose data moved
++             * under it was lost to a store that raised nothing: raise the event
++             * hardware latched at that store before the reservation is consumed. */
++            if (ctx->resv_valid && ctx->resv_ea == ea) spu_resv_last_check(ctx);
++            ctx->lr_putllc_fail_n++;
+             /* SPU_PUTLLC_WHY=1: which of the three conditions failed.
+              * A PUTLLC retry loop that never succeeds is a livelock, and
+              * "failed" alone cannot distinguish a lost reservation from a line
+@@ -1027,6 +1034,7 @@
+          * SPURS kernel this whole mechanism exists to wake. */
+         /* KZ3 patch 1056: the ack is atomic (1052), so it no longer takes the
+          * lock (with stripes that would be every stripe); KZ3_LL_OLD keeps it. */
++        if (v & SPU_EVENT_LR) __atomic_fetch_add(&ctx->lr_ack_n, 1, __ATOMIC_RELAXED);   /* patch 1110 */
+         if (spu_ll_old()) {
+             spu_lockline_lock();
+             spu_event_ack(ctx, v);
+@@ -1094,8 +1102,10 @@
+     if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
+         /* KZ3 patch 1056: CAS, so a peer's kill (which raised LR already) and this one count once. */
+         int one = 1;
+-        if (__atomic_compare_exchange_n(&ctx->resv_valid, &one, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
++        if (__atomic_compare_exchange_n(&ctx->resv_valid, &one, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+             spu_event_raise(ctx, 0x400u);   /* patch 1052: atomic */
++            spu_lr_note(ctx, SPU_LR_SRC_POLL, ctx->resv_ea & ~127u);   /* patch 1110 */
++        }
+     }
+ }
+ 
+@@ -1148,6 +1158,7 @@
+                         ctx->event_status, ctx->event_mask,
+                         ctx->resv_valid, ctx->resv_ea);
+                 fflush(stderr);
++                if (next_hb == 2000 && spu_lr_snap_on()) spu_lr_snapshot("ch-wait-2s", ctx);   /* patch 1110 */
+                 next_hb = ((waited / 2000) + 1) * 2000;
+             }
+         }
+diff --git a/runtime/spu/tests/test_spu_lockline_peer.c b/runtime/spu/tests/test_spu_lockline_peer.c
+--- a/runtime/spu/tests/test_spu_lockline_peer.c
++++ b/runtime/spu/tests/test_spu_lockline_peer.c
+@@ -220,7 +220,10 @@
+     CHECK_EQ_U32(g_b.atomic_stat, 1);
+     CHECK_EQ_U32(g_a.event_status, 0);
+     CHECK(g_a.resv_valid == 1);
+-    CHECK(g_spu_lr_raise == raised);
++    /* KZ3 patch 1110: the only raise is B's own: its reservation was lost to
++     * the unannounced store, and the failed PUTLLC makes the last check. */
++    CHECK(g_spu_lr_raise == raised + 1);
++    CHECK((g_b.event_status & SPU_EVENT_LR) != 0);
+     CHECK_EQ_U32(g_guest_mem[LINE_A + 8], 0x5A);   /* nothing was committed */
+ }
+ 

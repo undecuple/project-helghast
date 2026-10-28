@@ -1,0 +1,56 @@
+KZ3 patch 1134 (SPU pass 111; upstream candidate): fi's exponent-255 lanes (patch 1071's recompute, PR #287's integer
+fi in spu__fi_lane) in vector form (spu__fi_int4) blended into the 1131 result, instead of sending the whole vector
+to the scalar loop. Estimates of near-zero values reach fi with exponent 255 often: the out-of-line loop was 1.4 % of
+the K4 SPU samples. Same bits as spu__fi_lane for every exponent and as the 1131 loop (tools/spu/test_r111_vec.sh,
+64 M vectors each; tools/spu/test_r110_vec.sh unchanged and passing).
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -383,7 +383,7 @@
+ /* FI decodes the base and step fields produced by the hardware estimate
+  * instructions; its second operand is not an ordinary reciprocal float. */
+ #if defined(__SSE4_1__)
+-SPU_XR_COLD u128 spu__fi_ref(u128 a, u128 b) {   /* KZ3 patch 1131: the loop below, out of line */
++SPU_XR_COLD __attribute__((unused)) u128 spu__fi_ref(u128 a, u128 b) {   /* KZ3 patch 1131: the loop below; 1134: tests only */
+ #else
+ SPU_HOT u128 spu_fi(u128 a, u128 b) {
+ #endif
+@@ -418,12 +418,26 @@
+  * (an ordered compare: NaN and -0 keep the sign as the loop); y = (ra & 0x7FFFF) * 2^-19 (exact); base - step * y in
+  * float (mulps/subps, no contraction, as the loop's mulss/subss). Exponent-255 lanes with the patch-1071 recompute on
+  * go through the loop. Same bits: tools/spu/test_r110_vec.sh. */
++/* KZ3 patch 1134 (SPU pass 111): spu__fi_lane (PR #287's integer fi) on four lanes, for the exponent-255 lanes. The
++ * 1131 path sent any vector with such a lane to the loop: in K4 that was 1.4 % of the SPU samples (estimates of
++ * near-zero values reach fi often). m = ((2^13 | base) << 19) - step*y = 2^32 + L, L = (base << 19) - step*y; when
++ * L < 0 (step*y > base << 19, unsigned) m is normalized by one bit (exp - 1) and its bits 9..31 are those of 2L, else
++ * those of L (all mod 2^32). Same bits as spu__fi_lane for every exponent (tools/spu/test_r111_vec.sh). */
++static inline __m128i spu__fi_int4(__m128i A, __m128i B, __m128i e) {
++    const __m128i P = _mm_slli_epi32(_mm_srli_epi32(B, 10), 19);                     /* (base & 0x1FFF) << 19 */
++    const __m128i Q = _mm_mullo_epi32(_mm_and_si128(B, _mm_set1_epi32(0x3FF)), _mm_and_si128(A, _mm_set1_epi32(0x7FFFF)));
++    const __m128i neg = _mm_xor_si128(_mm_cmpeq_epi32(_mm_max_epu32(P, Q), P), _mm_set1_epi32(-1));   /* P < Q */
++    const __m128i L = _mm_sub_epi32(P, Q);
++    const __m128i mant = _mm_and_si128(_mm_srli_epi32(_mm_blendv_epi8(L, _mm_add_epi32(L, L), neg), 9), _mm_set1_epi32(0x7FFFFF));
++    const __m128i e2 = _mm_add_epi32(e, neg);                                           /* exp - (L < 0) */
++    const __m128i zero = _mm_or_si128(_mm_cmpeq_epi32(e, _mm_setzero_si128()), _mm_cmpeq_epi32(e2, _mm_setzero_si128()));
++    const __m128i r = _mm_or_si128(_mm_and_si128(B, _mm_set1_epi32((int)0x80000000u)), _mm_or_si128(_mm_slli_epi32(e2, 23), mant));
++    return _mm_andnot_si128(zero, r);
++}
+ SPU_HOT u128 spu_fi(u128 a, u128 b) {
+     __m128i A, B; memcpy(&A, &a, 16); memcpy(&B, &b, 16);
+     const __m128i e = _mm_and_si128(_mm_srli_epi32(B, 23), _mm_set1_epi32(0xFF));
+-    if (__builtin_expect(!_mm_testz_si128(_mm_cmpeq_epi32(e, _mm_set1_epi32(0xFF)), _mm_set1_epi32(-1)), 0) &&
+-        g_kz3_spu_xr)
+-        return spu__fi_ref(a, b);
++    const __m128i x255 = _mm_cmpeq_epi32(e, _mm_set1_epi32(0xFF));
+     const __m128 base = _mm_castsi128_ps(_mm_and_si128(B, _mm_set1_epi32((int)0xFFFFFC00u)));
+     const __m128i sf = _mm_and_si128(B, _mm_set1_epi32(0x3FF));
+     const __m128i bias = _mm_set1_epi64x(1023 - 140);
+@@ -435,6 +449,8 @@
+     step = _mm_xor_ps(step, _mm_and_ps(_mm_cmplt_ps(base, _mm_setzero_ps()), _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u))));
+     const __m128 y = _mm_mul_ps(_mm_cvtepi32_ps(_mm_and_si128(A, _mm_set1_epi32(0x7FFFF))), _mm_set1_ps(0x1p-19f));
+     const __m128 r4 = _mm_sub_ps(base, _mm_mul_ps(step, y));
++    if (__builtin_expect(!_mm_testz_si128(x255, x255), 0) && g_kz3_spu_xr)   /* patch 1134 (was spu__fi_ref) */
++        return spu__iv(_mm_blendv_epi8(_mm_castps_si128(r4), spu__fi_int4(A, B, e), x255));
+     u128 r; memcpy(&r, &r4, 16); return r;
+ }
+ #endif

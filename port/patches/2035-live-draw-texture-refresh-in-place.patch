@@ -1,0 +1,92 @@
+KZ3 patch 2035: texture content changes update the cached resource in place (RSX pass 35; RE pass 72 proposal 2).
+A refresh (a bound texture whose content hash changed) decoded into a new committed resource, rewrote the SRV and
+retired the old resource; in the level that is ~240 a frame, nearly all of them 8x8 fp16 textures rewritten every
+frame. The refresh now offers the entry's resource to create_texture_mipped, which copies the new texels into it
+when the description matches (PIXEL_SHADER_RESOURCE -> COPY_DEST -> PIXEL_SHADER_RESOURCE around the same upload
+ring copies). LD_TEX_INPLACE=0 restores the old path; [tex-hash] gains inplace=N per 256 frames.
+Upstream candidate (general: any title that rewrites small textures every frame).
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2419,6 +2419,23 @@
+ 
+ typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
+ 
++/* KZ3 patch 2035: content changes update the cached resource in place. A refresh (the bound texture's hash
++ * changed) used to decode into a new committed resource, rewrite the SRV and retire the old one; in the KZ3 level
++ * that is ~240 per frame, nearly all 8x8 fp16 textures rewritten every frame (RE pass 72, proposal 2). With
++ * g_ld_tex_reuse set by the refresh path, create_texture_mipped copies the new texels into that resource when its
++ * description matches (2D, size, mip count, format): PIXEL_SHADER_RESOURCE -> COPY_DEST, the same upload-ring
++ * copies, back to PIXEL_SHADER_RESOURCE. Draws recorded earlier read the old texels (the barrier orders them before
++ * the copy), later draws the new ones, the same as a new resource gave. LD_TEX_INPLACE=0 restores the old path.
++ * Cube, 3D and vertex textures keep the old path. Counted in [tex-hash] as inplace=N. */
++static ID3D12Resource* g_ld_tex_reuse;
++static unsigned long long g_ld_tex_inplace_n;
++static int ld_tex_inplace_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_TEX_INPLACE"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++
+ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
+ {
+     if (n == 0) return NULL;
+@@ -2428,7 +2445,23 @@
+     rd.Width = lv[0].w; rd.Height = lv[0].h; rd.DepthOrArraySize = 1;
+     rd.MipLevels = (u16)n; rd.Format = fmt; rd.SampleDesc.Count = 1;
+     ID3D12Resource* tex = NULL;
+-    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
++    if (g_ld_tex_reuse) {   /* patch 2035 */
++        D3D12_RESOURCE_DESC cur;
++        g_ld_tex_reuse->lpVtbl->GetDesc(g_ld_tex_reuse, &cur);
++        if (cur.Dimension == rd.Dimension && cur.Width == rd.Width && cur.Height == rd.Height &&
++            cur.DepthOrArraySize == 1 && cur.MipLevels == rd.MipLevels && cur.Format == rd.Format &&
++            cur.SampleDesc.Count == 1) {
++            tex = g_ld_tex_reuse;
++            D3D12_RESOURCE_BARRIER b0 = {0};
++            b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b0.Transition.pResource = tex;
++            b0.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++            b0.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++            b0.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++            g.list->lpVtbl->ResourceBarrier(g.list, 1, &b0);
++        }
++    }
++    if (!tex &&
++        FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                                                       &IID_ID3D12Resource, (void**)&tex)))
+         return NULL;
+@@ -2751,12 +2784,13 @@
+     }
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) {
+         fprintf(stderr, "[tex-hash] span=%d frame=%u hashes=%llu skipped=%llu bytes=%.1fMB changes=%llu tracked=%llu"
+-                        " untracked=%llu flip-flags=%llu\n",
++                        " untracked=%llu flip-flags=%llu inplace=%llu\n",
+                 ld_tex_hash_span(), g_ld_frames, (unsigned long long)g_ld_th.hashes,
+                 (unsigned long long)g_ld_th.skipped, (double)g_ld_th.hashed_bytes / 1048576.0,
+                 (unsigned long long)g_ld_th.changes, (unsigned long long)g_ld_th.tracked,
+-                (unsigned long long)g_ld_th.untracked, (unsigned long long)g_ld_th.flip_flags);
++                (unsigned long long)g_ld_th.untracked, (unsigned long long)g_ld_th.flip_flags, g_ld_tex_inplace_n);
+         memset(&g_ld_th, 0, sizeof g_ld_th);
++        g_ld_tex_inplace_n = 0;
+     }
+ }
+ 
+@@ -3891,9 +3925,15 @@
+               } }
+             entry->last_hash_frame = g_ld_frames;
+             if (readable && hash != entry->content_hash) {
++                /* patch 2035: offer the current resource for an in-place update */
++                g_ld_tex_reuse = ld_tex_inplace_on() ? entry->tex : NULL;
+                 ID3D12Resource* replacement =
+                     decode_guest_texture_profiled(t, remap);
+-                if (replacement) {
++                g_ld_tex_reuse = NULL;
++                if (replacement && replacement == entry->tex) {
++                    entry->content_hash = hash;   /* same resource, same SRV: nothing to rewrite or retire */
++                    g_ld_tex_inplace_n++;
++                } else if (replacement) {
+                     ID3D12Resource* old = entry->tex;
+                     entry->tex = replacement;
+                     entry->content_hash = hash;

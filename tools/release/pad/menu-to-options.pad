@@ -1,0 +1,13 @@
+# Main menu -> Options (4 DOWN; rows Campaign, Co-op, Multiplayer, Botzone, Options, Credits, Exit). mainsettings.gum.
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key X
+wait mainsettings.gum
+sleep 3
+mark options list (rows: Audio, Display, Set up 3D TV, Wireless Controller, Keyboard, Language)

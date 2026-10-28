@@ -1,0 +1,70 @@
+KZ3 patch 5006: cellFsStat and cellFsFstat report the host file's atime, mtime and ctime (they were always 0).
+Sony FIOS (statically linked in KZ3) keeps each cached file's mtime and ctime in its per-file cache record (56
+bytes, +8 mtime, +0x10 ctime; cache files /dev_hdd1/cache/BCUS98234/fios/cache.idx + cache.dat) and drops the
+blocks ("mod date changed" / "creation date changed" / "stat failed") when a fresh stat of the file differs at open or
+read (KZ3 1.14 read check 0xDF2B90..0xDF2C68, open check 0xDF7D9C..0xDF8160). A cache.idx written by the port had
+mtime 0 and ctime 0 for every file record (278 file-first descriptors checked in coord-bz4).
+The port serves one guest path from different host files: the disc entry first, the .pspatch output after the game
+flips SelectPatchSetSP/MP. With (0, 0) for both the cache kept serving blocks of the old file, so the patched
+defaultshared lump (3,095,022 -> 3,095,082 bytes) read back stale or short at its last block, the object pass
+failed (0x9488C returned 1, the RE notes s.46) and the batch stopped. Test: tools/net/test_fs_stat_times.sh.
+Upstream candidate (general: CellFsStat times are part of the API; any title validating a cache by date needs them).
+
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -673,14 +673,22 @@
+  * DLFileDeviceStream, stat@obj+0xD8) then have the trailing blksize clobber the
+  * field right after the stat (the fd at obj+0x10c), which later fails lseek.
+  * Layout: mode@0 uid@4 gid@8 atime@0x0C mtime@0x14 ctime@0x1C size@0x24 blksize@0x2C. */
+-static void write_stat(uint32_t sb, uint32_t mode, uint64_t size)
++/* KZ3 patch 5006: the three times are the host file's (seconds since the epoch, as on a PS3). They were always 0,
++ * so a title that validates a cache against them could never see a file change. Sony FIOS does: its HDD cache
++ * (cache.idx / cache.dat, 512 KB blocks) keeps each file's mtime and ctime and drops the blocks when "mod date
++ * changed" or "creation date changed" at open or read (KZ3 1.14 0xDF2BBC..0xDF2C68 read, 0xDF7D9C..0xDF8160 open).
++ * The port serves one guest path from different host files (the disc entry, then the .pspatch output after the
++ * game flips SelectPatchSetSP/MP), the cache saw identical (0, 0) for both and handed out blocks of the old file:
++ * the last block of defaultshared (3,095,022 bytes -> 3,095,082) came back short and the object pass failed. */
++static void write_stat(uint32_t sb, uint32_t mode, uint64_t size,
++                       int64_t atime = 0, int64_t mtime = 0, int64_t ctime = 0)
+ {
+     vm_write32(sb + 0x00, mode);
+     vm_write32(sb + 0x04, 0);            /* uid */
+     vm_write32(sb + 0x08, 0);            /* gid */
+-    vm_write64(sb + 0x0C, 0);            /* atime */
+-    vm_write64(sb + 0x14, 0);            /* mtime */
+-    vm_write64(sb + 0x1C, 0);            /* ctime */
++    vm_write64(sb + 0x0C, (uint64_t)atime);
++    vm_write64(sb + 0x14, (uint64_t)mtime);
++    vm_write64(sb + 0x1C, (uint64_t)ctime);
+     vm_write64(sb + 0x24, size);         /* size */
+     vm_write64(sb + 0x2C, 0x200);        /* blksize */
+ }
+@@ -709,7 +717,7 @@
+     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
+     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
+                                            : (CELL_FS_S_IFREG | 0x1B6);
+-    if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
++    if (sb) write_stat(sb, mode, (uint64_t)st.st_size, (int64_t)st.st_atime, (int64_t)st.st_mtime, (int64_t)st.st_ctime);
+     if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
+     ctx->gpr[3] = CELL_OK;
+ }
+@@ -738,7 +746,18 @@
+           if (c > 0 && sz > c) {
+               fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, c);
+               sz = c; } } }
+-    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
++    if (sb) {
++        /* times from the open handle's inode; a failing fstat leaves them 0 as before */
++        fs_stat64_t hst;
++        memset(&hst, 0, sizeof hst);
++#ifdef _WIN32
++        if (_fstat64(_fileno(f), &hst) != 0) memset(&hst, 0, sizeof hst);
++#else
++        if (fstat(fileno(f), &hst) != 0) memset(&hst, 0, sizeof hst);
++#endif
++        write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz,
++                   (int64_t)hst.st_atime, (int64_t)hst.st_mtime, (int64_t)hst.st_ctime);
++    }
+     if (getenv("PS3_FSLOG")) { static int _n=0; if(PS3_LOG_FIRST(_n, 12)) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
+     ctx->gpr[3] = CELL_OK;
+ }

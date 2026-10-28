@@ -1,0 +1,79 @@
+KZ3 patch 1063 (SPU pass 48): the PS3_SAMPLE sampler thread must not take the loader lock while it holds
+another thread suspended. samp_mod_hit (GetModuleHandleExA + GetModuleFileNameA) and samp_rva_hit's first
+GetModuleHandleA ran between SuspendThread and ResumeThread; under Wine those enter the loader critical section
+(LdrFindEntryForAddress), so a thread suspended inside LoadLibrary / a DLL entry / any Ldr* path was never resumed
+and the game froze: KZ3 spu-48q1 (level freeze at 124 s, sampler reports and the main thread stop together) and
+a quit-debug run (7 flips, early boot). The module attribution now runs after ResumeThread; only the
+context read, the lock-free sorted-map lookup and the stack read (NtReadVirtualMemory) stay inside the window.
+Upstream candidate (general toolkit bug; every sampled run can hit it).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ours, and the same fix applied to upstream's new one-thread sampler loop (`samp_rva_record`, which takes the loader lock once and reallocs, moved after ResumeThread in both loops). Upstream candidate (extended).
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 85a25bdf..fd8a6b92 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -710,18 +710,23 @@ static DWORD WINAPI samp_thread(LPVOID p)
+         if (main_h) {
+             if (SuspendThread(main_h) != (DWORD)-1) {
+                 CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+-                if (GetThreadContext(main_h, &c)) {
++                /* KZ3 patch 1063: only lock-free work while the thread is suspended (see below). */
++                const int got = GetThreadContext(main_h, &c);
++                uint32_t g = 0;
++                if (got) {
++                    g = samp_lookup((uintptr_t)c.Rip);
++                    if (!g && s_samp_main > 0) g = samp_stack_guest(main_h, &c);
++                }
++                ResumeThread(main_h);
++                if (got) {
+                     s_samp_total++;
+                     samp_rva_record((uintptr_t)c.Rip);
+-                    uint32_t g = samp_lookup((uintptr_t)c.Rip);
+-                    if (!g && s_samp_main > 0) g = samp_stack_guest(main_h, &c);
+                     if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(one_tid);
+                              samp_tid2(one_tid, 1, 0); }
+                     else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                            if (!nt) samp_rva_hit((uintptr_t)c.Rip);
+                            samp_tid2(one_tid, 0, nt); }
+                 }
+-                ResumeThread(main_h);
+             }
+             Sleep(period);
+             if (GetTickCount64() >= next_report) {
+@@ -749,19 +754,30 @@ static DWORD WINAPI samp_thread(LPVOID p)
+                                       FALSE, te.th32ThreadID);
+                 if (!h) continue;
+                 if (SuspendThread(h) != (DWORD)-1) {
++                    /* KZ3 patch 1063: while the thread is suspended do only lock-free work (its context,
++                     * the sorted-map lookup, the stack read). GetModuleHandleEx / GetModuleFileName
++                     * (samp_mod_hit) and GetModuleHandle (samp_rva_hit) take the loader lock; a thread
++                     * suspended while holding it (Wine's LdrFindEntryForAddress, LoadLibrary, DLL init) was
++                     * never resumed: the sampler blocked on the lock and the game froze with it (KZ3
++                     * spu-48q1: level freeze at 124 s, the sampler's reports stop at the same moment; the
++                     * a quit-debug run: 7 flips). The module attribution runs after ResumeThread. */
+                     CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+-                    if (GetThreadContext(h, &c)) {
+-                        s_samp_total++;
+-                        samp_rva_record((uintptr_t)c.Rip);
+-                        uint32_t g = samp_lookup((uintptr_t)c.Rip);
++                    int got = GetThreadContext(h, &c);
++                    uint32_t g = 0;
++                    if (got) {
++                        g = samp_lookup((uintptr_t)c.Rip);
+                         if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
++                    }
++                    ResumeThread(h);
++                    if (got) {
++                        s_samp_total++;
++                        samp_rva_record((uintptr_t)c.Rip);   /* after ResumeThread: first call takes the loader lock, realloc the heap lock */
+                         if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
+                                  samp_tid2(te.th32ThreadID, 1, 0); }
+                         else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                                if (!nt) samp_rva_hit((uintptr_t)c.Rip);
+                                samp_tid2(te.th32ThreadID, 0, nt); }
+                     }
+-                    ResumeThread(h);
+                 }
+                 CloseHandle(h);
+             } while (Thread32Next(snap, &te));

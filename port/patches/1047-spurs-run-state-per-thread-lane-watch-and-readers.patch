@@ -1,0 +1,233 @@
+KZ3 patch 1047 (SPU pass 34, RE pass 70/71): policy-module run state per (instance, kernel thread) with a join flag; the [spurs-stuck] watcher checks every kernel thread and samples every lane of the stuck workload (pc histogram with the jm wait-loop class, reservation, atomic, events, LS state words and the waited line) and prints the busy claims; kz3_spurs_dump_runs for the fiber stall report; readers kz3_spurs_ready_peek / kz3_spurs_ready_kick / kz3_spurs_workload_image.
+
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -442,8 +442,15 @@
+ } s_inst[MAX_SPURS_INST];
+ static DWORD WINAPI spurs_watch_thread(LPVOID p);   /* KZ3 patch 1013 */
+ /* KZ3 patch 1011: the policy-module run in progress per instance (kernel thread 0). */
+-static volatile u32 s_run_wid[MAX_SPURS_INST];
+-static volatile u64 s_run_t0[MAX_SPURS_INST], s_run_rep[MAX_SPURS_INST];
++/* KZ3 patch 1047 (SPU pass 34, RE pass 70): run state per (instance, kernel thread), not per instance: with
++ * several kernel threads one thread's 800 runs a second overwrote and zeroed the slot of a thread that never
++ * returned (gp-t2: spurs-kern0:HiPrio stuck in a wid-0 run from t = 411 s, never reported). s_run_join = the
++ * thread is in the lane join. kz3-spurs-runstate begin */
++#define KZ3_KT_MAX 8
++static volatile u32 s_run_wid[MAX_SPURS_INST][KZ3_KT_MAX];
++static volatile u64 s_run_t0[MAX_SPURS_INST][KZ3_KT_MAX], s_run_rep[MAX_SPURS_INST][KZ3_KT_MAX];
++static volatile int s_run_join[MAX_SPURS_INST][KZ3_KT_MAX];
++/* kz3-spurs-runstate end */
+ static struct { struct SpursInst* si; int k; } s_kt_arg[MAX_SPURS_INST][8];
+ /* One kernel thread at a time per workload (patch 1006): the persistent PM
+  * contexts are per (workload, lane), and a lane must not run twice at once. */
+@@ -1770,6 +1777,72 @@
+ static inline u64 kz3_spurs_elapsed_ms(u64 now, u64 t0) { return now > t0 ? now - t0 : 0; }
+ /* kz3-spurs-elapsed end */
+ 
++/* KZ3 patch 1047: one stuck-run report: the kernel thread's wid, elapsed, join state, every workload's busy
++ * claim (s_wkl_busy), then every lane context of that workload (spu_pm_ctx_peek(wid, 0..5)): the patch-1011
++ * description plus reservation / atomic / event state and a 100 x 1 ms PC sample. tag = the line prefix
++ * ("[spurs-stuck]" from the watcher, "[fiber]  " from the fiber stall report). kz3-spurs-report begin */
++extern uint32_t spu_pm_ctx_pc(void* ctx);
++extern void spu_pm_ctx_describe_resv(void* ctx, char* out, int n);
++/* The jm wait-loop classifier lives in the port (port/spu/kz3_fiber_stall.c); weak so the runtime links without it. */
++extern int kz3_jm_pc_class(uint32_t pc) __attribute__((weak));
++extern const char* kz3_jm_pc_class_name(int cls) __attribute__((weak));
++static void kz3_spurs_report_stuck_run(int j, int kt, u32 rw, u64 d, const char* tag)
++{
++    extern void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num);
++    extern void spu_pm_ctx_describe(void* ctx, char* out, int n);
++    char busy[80] = ""; int bo = 0;
++    for (u32 w = 0; w < CELL_SPURS_MAX_WORKLOAD; w++)
++        if (s_wkl_busy[w]) bo += snprintf(busy + bo, sizeof busy - bo, " %u", w);
++    fprintf(stderr, "%s \"%s\" kernel thread %d wid=%u PM run not returned for %llu ms%s; busy claims:%s\n", tag,
++            s_inst[j].prefix, kt, rw, (unsigned long long)d, s_run_join[j][kt] ? " (lane 0 returned, joining the lanes)" : "",
++            bo ? busy : " none");
++    for (u32 sn = 0; sn < 6; sn++) {
++        void* cx = spu_pm_ctx_peek(rw, sn);
++        if (!cx) continue;
++        char b[512] = "", r[640] = "";
++        spu_pm_ctx_describe(cx, b, sizeof b);
++        spu_pm_ctx_describe_resv(cx, r, sizeof r);
++        u32 pcs[8] = {0}, cnt[8] = {0};
++        for (int k = 0; k < 100; k++) {
++            u32 pc = spu_pm_ctx_pc(cx); int m;
++            for (m = 0; m < 8 && cnt[m] && pcs[m] != pc; m++) ;
++            if (m < 8) { pcs[m] = pc; cnt[m]++; }
++            Sleep(1);
++        }
++        char h[320] = ""; int ho = 0;
++        for (int m = 0; m < 8 && cnt[m]; m++) {
++            const char* cl = (kz3_jm_pc_class && kz3_jm_pc_class_name && !((spu_context*)cx)->resident_ovl) ? kz3_jm_pc_class_name(kz3_jm_pc_class(pcs[m])) : "";
++            ho += snprintf(h + ho, sizeof h - ho, " 0x%05X:%u%s%s%s", pcs[m], cnt[m], *cl ? " (" : "", cl, *cl ? ")" : "");
++        }
++        fprintf(stderr, "%s   lane %u: %s %s pcs:%s\n", tag, sn, b, r, h);
++    }
++    fflush(stderr);
++}
++/* For port/spu/kz3_ppu_overrides.cpp's fiber stall report: every kernel thread now in a run (any length), and
++ * the busy claims; returns the number of threads in a run. */
++int kz3_spurs_dump_runs(const char* tag)
++{
++    int n = 0;
++    u64 now = GetTickCount64();
++    for (int j = 0; j < MAX_SPURS_INST; j++) {
++        if (!s_inst[j].ea) continue;
++        for (int kt = 0; kt < KZ3_KT_MAX; kt++) {
++            u64 t0 = s_run_t0[j][kt];
++            if (!t0) continue;
++            n++;
++            kz3_spurs_report_stuck_run(j, kt, s_run_wid[j][kt], kz3_spurs_elapsed_ms(now, t0), tag);
++        }
++    }
++    if (!n) {
++        char busy[80] = ""; int bo = 0;
++        for (u32 w = 0; w < CELL_SPURS_MAX_WORKLOAD; w++)
++            if (s_wkl_busy[w]) bo += snprintf(busy + bo, sizeof busy - bo, " %u", w);
++        fprintf(stderr, "%s no kernel thread is in a policy-module run; busy claims:%s\n", tag, bo ? busy : " none");
++    }
++    return n;
++}
++/* kz3-spurs-report end */
++
+ static DWORD WINAPI spurs_watch_thread(LPVOID p)
+ {
+     (void)p;
+@@ -1783,49 +1856,29 @@
+         for (int j = 0; j < MAX_SPURS_INST; j++) {
+             u32 ea = s_inst[j].ea;
+             if (!ea) continue;
+-            u64 t0 = s_run_t0[j];
+-            u32 rw = s_run_wid[j];
+             u64 now = GetTickCount64();   /* patch 1042: per instance, after t0 (was once per pass, before the loop) */
+-            if (t0) {
++            /* KZ3 patch 1047: every kernel thread of the instance, every lane of the stuck workload. */
++            for (int kt = 0; kt < KZ3_KT_MAX; kt++) {
++                u64 t0 = s_run_t0[j][kt];
++                u32 rw = s_run_wid[j][kt];
++                if (!t0) continue;
+                 u64 d = kz3_spurs_elapsed_ms(now, t0);
+-                if (d >= (u64)sm && now - s_run_rep[j] >= 5000) {
+-                    s_run_rep[j] = now;
+-                    extern void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num);
+-                    extern void spu_pm_ctx_describe(void* ctx, char* out, int n);
+-                    char b[512] = "";
+-                    spu_pm_ctx_describe(spu_pm_ctx_peek(rw, 0), b, sizeof b);
+-                    /* where the run spends its time: 300 pc samples, 1 ms apart, top 4 */
+-                    extern uint32_t spu_pm_ctx_pc(void* ctx);
+-                    void* cx = spu_pm_ctx_peek(rw, 0);
+-                    /* arm a 600-event trace of this context (first two reports per instance) */
+-                    { extern void* volatile g_kz3_trace_ctx; extern volatile long g_kz3_trace_n;
+-                      static int s_tr[MAX_SPURS_INST];
+-                      if (cx && !g_kz3_trace_ctx && s_tr[j] < 2) { s_tr[j]++; g_kz3_trace_n = 600; g_kz3_trace_ctx = cx; } }
+-                    u32 pcs[8] = {0}, cnt[8] = {0};
+-                    for (int k = 0; k < 300 && cx; k++) {
+-                        u32 pc = spu_pm_ctx_pc(cx); int m;
+-                        for (m = 0; m < 8 && cnt[m] && pcs[m] != pc; m++) ;
+-                        if (m < 8) { pcs[m] = pc; cnt[m]++; }
+-                        Sleep(1);
+-                    }
+-                    char h[160] = ""; int ho = 0;
+-                    for (int m = 0; m < 8 && cnt[m]; m++)
+-                        ho += snprintf(h + ho, sizeof h - ho, " 0x%05X:%u", pcs[m], cnt[m]);
+-                    fprintf(stderr, "[spurs-stuck] t=%llu \"%s\" wid=%u PM run not returned for %llu ms: %s pcs:%s\n",
+-                            (unsigned long long)(now - s_t_start), s_inst[j].prefix, rw, (unsigned long long)d, b, h);
+-                    fflush(stderr);
++                if (d >= (u64)sm && now - s_run_rep[j][kt] >= 5000) {
++                    s_run_rep[j][kt] = now;
++                    kz3_spurs_report_stuck_run(j, kt, rw, d, "[spurs-stuck]");
+                 }
+             }
+             for (u32 w = 0; w < 16; w++) {
+                 u8 cc = *(vm_base + ea + SPURS_WKL_CURCONT + w);
+-                int running = t0 && rw == w;
++                int running = 0, run_wid = -1;   /* patch 1047: any kernel thread in a run of w / the last running wid */
++                for (int kt = 0; kt < KZ3_KT_MAX; kt++) if (s_run_t0[j][kt]) { run_wid = (int)s_run_wid[j][kt]; if (s_run_wid[j][kt] == w) running = 1; }
+                 if (!cc || running) { cc_since[j][w] = 0; continue; }
+                 if (!cc_since[j][w]) { cc_since[j][w] = now; continue; }
+                 if (now - cc_since[j][w] >= 1000 && now - cc_rep[j][w] >= 10000) {
+                     cc_rep[j][w] = now;
+                     fprintf(stderr, "[spurs-curcont] t=%llu \"%s\" wid=%u contention=%u for %llu ms with no run of it "
+                             "(running wid=%d) ready=%u state=%u\n", (unsigned long long)(now - s_t_start), s_inst[j].prefix, w, cc,
+-                            (unsigned long long)(now - cc_since[j][w]), t0 ? (int)rw : -1,
++                            (unsigned long long)(now - cc_since[j][w]), run_wid,
+                             *(vm_base + ea + SPURS_WKL_READY1 + w), *(vm_base + ea + SPURS_WKL_STATE1 + w));
+                     fflush(stderr);
+                 }
+@@ -2093,7 +2146,7 @@
+             {
+                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
+                 uint32_t sz = s_workloads[wid].sizePm;
+-                s_run_wid[si - s_inst] = wid; s_run_t0[si - s_inst] = GetTickCount64();   /* patch 1011 */
++                s_run_wid[si - s_inst][kt & 7] = wid; s_run_t0[si - s_inst][kt & 7] = GetTickCount64();   /* patch 1011, per thread since 1047 */
+                 /* KZ3 patch 1032: run time per wid, and the gap since this wid's last run ended */
+                 static uint64_t s_wa_wend[CELL_SPURS_MAX_WORKLOAD];
+                 const uint64_t wa0 = kz3_wacct_begin();
+@@ -2123,7 +2176,9 @@
+                             SetEvent(L->go);
+                         }
+                         spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
++                        s_run_join[si - s_inst][kt & 7] = 1;   /* patch 1047 */
+                         if (nth) WaitForMultipleObjects(nth, th, TRUE, INFINITE);
++                        s_run_join[si - s_inst][kt & 7] = 0;
+                         nth = 0;
+                     } else
+                     for (u32 sn = 1; sn < maxcont && nth < 7; sn++, nth++) {
+@@ -2135,7 +2190,9 @@
+                     }
+                     if (!lane_pool) spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                     if (nth) {
++                        s_run_join[si - s_inst][kt & 7] = 1;   /* patch 1047 */
+                         WaitForMultipleObjects(nth, th, TRUE, INFINITE);
++                        s_run_join[si - s_inst][kt & 7] = 0;
+                         for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);
+                     }
+                 }
+@@ -2143,7 +2200,7 @@
+                 kz3_wacct_end(KZ3_WA_PMRUN, wid, wa0);
+                 if (wa0) s_wa_wend[wid] = kz3_wacct_now();
+             }
+-            s_run_t0[si - s_inst] = 0;   /* patch 1011 */
++            s_run_t0[si - s_inst][kt & 7] = 0;   /* patch 1011 */
+             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+             /* "Found work" heuristic: a module that did something polls the
+              * kernel for MORE work before exiting (selectWorkload calls >0);
+@@ -2195,6 +2252,38 @@
+     return CELL_OK;
+ }
+ 
++/* KZ3 patch 1047 (SPU pass 34): host-side readers and a re-kick for the fiber stall report
++ * (port/spu/kz3_ppu_overrides.cpp). peek fills the host readyCount, the instance bytes (ready, state,
++ * current contention) and the owning instance EA; returns 1 when the workload is in use. kick is
++ * ReadyCountSwap without a guest pointer for the old value (returned). image returns the resolved
++ * policy-module image id (0 = none). kz3-spurs-ready begin */
++int kz3_spurs_ready_peek(u32 wid, u32* ready_host, u32* ready_inst, u32* state, u32* curcont, u32* spurs_ea)
++{
++    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use) return 0;
++    u32 ea = s_workloads[wid].spurs_ea;
++    if (ready_host) *ready_host = s_workloads[wid].readyCount;
++    if (ready_inst) *ready_inst = ea ? *(vm_base + ea + SPURS_WKL_READY1 + wid) : 0;
++    if (state)      *state      = ea ? *(vm_base + ea + SPURS_WKL_STATE1 + wid) : 0;
++    if (curcont)    *curcont    = ea ? *(vm_base + ea + SPURS_WKL_CURCONT + wid) : 0;
++    if (spurs_ea)   *spurs_ea   = ea;
++    return 1;
++}
++u32 kz3_spurs_ready_kick(u32 wid, u32 value)
++{
++    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use) return 0;
++    u32 old = s_workloads[wid].readyCount, ea = s_workloads[wid].spurs_ea;
++    s_workloads[wid].readyCount = value;
++    if (ea) *(vm_base + ea + SPURS_WKL_READY1 + wid) = (u8)value;
++    return old;
++}
++int kz3_spurs_workload_image(u32 wid)
++{
++    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use) return 0;
++    WklPm* r = spurs_resolve_pm(wid);
++    return r ? r->image_id : 0;
++}
++/* kz3-spurs-ready end */
++
+ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
+                                        CellSpursWorkloadId wid,
+                                        u32* old, u32 compare, u32 value)

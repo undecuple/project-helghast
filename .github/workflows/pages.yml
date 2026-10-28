@@ -1,0 +1,59 @@
+# GitHub Pages: publishes only site/ (the generated project page) and the screenshots it links, docs/screenshots/.
+# No Discussions feed. Dormant until the maintainer sets the repository variable PAGES_ENABLED to "true" (Settings,
+# Secrets and variables, Actions, Variables) and Settings, Pages, Source to "GitHub Actions": without the variable
+# both jobs are skipped on every push. Triggers: a push to main that touches site/ or docs/screenshots/, and
+# workflow_dispatch.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", "docs/screenshots/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions: {}   # each job asks for what it needs
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: vars.PAGES_ENABLED == 'true'
+    permissions:
+      contents: read
+      pages: read   # actions/configure-pages reads the Pages site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6.0.0
+      - name: Stage _site/
+        run: |
+          set -euo pipefail
+          mkdir -p _site/site
+          cp -a site/. _site/site/
+          mkdir -p _site/docs && cp -a docs/screenshots _site/docs/screenshots
+          touch _site/.nojekyll
+          printf '%s\n' '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=site/"><title>Redirect</title><a href="site/">site/</a>' > _site/index.html
+          test -s _site/site/index.html
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: vars.PAGES_ENABLED == 'true'
+    permissions:
+      pages: write      # deploy-pages
+      id-token: write   # deploy-pages verifies the artifact's origin
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1

@@ -1,0 +1,417 @@
+# Killzone 3 port host. Based on ps3recomp templates/project (MIT licence: third_party/ps3recomp/LICENSE).
+# Lifted code: work/recomp (tools/lift.sh, not committed). Toolkit: third_party/ps3recomp (pinned).
+cmake_minimum_required(VERSION 3.20)
+project(kz3
+    VERSION 0.1.0
+    LANGUAGES C CXX
+    DESCRIPTION "Recompiled PS3 game project (ps3recomp)"
+)
+
+# ---------------------------------------------------------------------------
+# Standards
+# ---------------------------------------------------------------------------
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Prefer Ninja if available
+if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT DEFINED ENV{CMAKE_GENERATOR})
+    message(STATUS "Tip: use -G Ninja for faster builds")
+endif()
+
+# ---------------------------------------------------------------------------
+# The two directories this project is built from
+# ---------------------------------------------------------------------------
+# PS3RECOMP_DIR is the toolkit checkout: include/, runtime/, libs/, tools/.
+# RECOMP_DIR is where the lifter's output for THIS game lives. They are
+# separate on purpose -- a port keeps its generated code in its own tree and
+# points at whatever toolkit checkout it is building against:
+#
+#   cmake -B build -G Ninja \
+#         -DPS3RECOMP_DIR=/path/to/ps3recomp \
+#         -DRECOMP_DIR=/path/to/my_game/recompiled
+#
+if(NOT DEFINED PS3RECOMP_DIR)
+    # KZ3: the patched copy (third_party/ps3recomp + port/patches), made by tools/ps3recomp-patched.sh.
+    get_filename_component(PS3RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../work/ps3recomp-patched" ABSOLUTE)
+endif()
+get_filename_component(PS3RECOMP_DIR "${PS3RECOMP_DIR}" ABSOLUTE)
+
+set(RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../work/recomp" CACHE PATH
+    "Directory holding the lifter's output: ppu_recomp.h and the lifted sources")
+get_filename_component(RECOMP_DIR "${RECOMP_DIR}" ABSOLUTE)
+
+message(STATUS "ps3recomp SDK:   ${PS3RECOMP_DIR}")
+message(STATUS "Lifted output:   ${RECOMP_DIR}")
+
+if(NOT EXISTS "${RECOMP_DIR}/ppu_recomp.h")
+    message(FATAL_ERROR
+        "No ppu_recomp.h in ${RECOMP_DIR}.\n"
+        "That header and the lifted sources beside it are what "
+        "tools/ppu_lifter.py writes. Run the lifter, drop its output there, "
+        "or point -DRECOMP_DIR= at wherever it already is.")
+endif()
+
+# The lifted translation units. A game's lift is hundreds of generated files,
+# so they are globbed rather than listed; re-run CMake after a fresh lift.
+file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS
+    "${RECOMP_DIR}/*.c"
+    "${RECOMP_DIR}/*.cpp"
+)
+if(NOT RECOMP_SOURCES)
+    message(FATAL_ERROR
+        "${RECOMP_DIR} has a ppu_recomp.h but no .c or .cpp beside it. The "
+        "lifted functions and the function table live in those; without them "
+        "there is nothing to run.")
+endif()
+list(LENGTH RECOMP_SOURCES RECOMP_SOURCE_COUNT)
+message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
+
+# ---------------------------------------------------------------------------
+# ps3recomp runtime library
+# ---------------------------------------------------------------------------
+# Built from source as a subdirectory rather than imported as a prebuilt
+# archive. A static library carries none of its own link requirements, so an
+# imported one arrives without SDL2, pthreads, the Metal frameworks or the
+# Winsock/XInput imports -- the link then fails on every platform for a
+# different reason. add_subdirectory hands all of that over with the target.
+add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
+                 EXCLUDE_FROM_ALL)
+
+# ---------------------------------------------------------------------------
+# The HLE NID table
+# ---------------------------------------------------------------------------
+# Maps each firmware import NID onto the handler in the runtime that answers
+# it. A port may keep a hand-curated one beside its lift; otherwise generate
+# the canonical every-module table, which is what the toolkit's own boot
+# harness uses.
+if(EXISTS "${RECOMP_DIR}/ppu_hle_nids.cpp")
+    set(HLE_NID_TABLE "${RECOMP_DIR}/ppu_hle_nids.cpp")
+    message(STATUS "HLE NID table:   ${HLE_NID_TABLE}")
+else()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(HLE_NID_TABLE "${CMAKE_CURRENT_BINARY_DIR}/ppu_hle_nids.cpp")
+    set(KZ3_PATCHSET_STAMP "")
+    if(EXISTS "${PS3RECOMP_DIR}/.kz3-patchset")
+        set(KZ3_PATCHSET_STAMP "${PS3RECOMP_DIR}/.kz3-patchset")
+    endif()
+    add_custom_command(
+        OUTPUT "${HLE_NID_TABLE}"
+        COMMAND "${Python3_EXECUTABLE}"
+                "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
+                --out "${HLE_NID_TABLE}" --all
+        DEPENDS "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
+                "${PS3RECOMP_DIR}/tools/nid_database.py"
+                # The patch-set stamp (tools/ps3recomp-patched.sh) changes with port/patches, so an HLE function a
+                # patch adds is in the table without a clean build (network pass 7: three cellHttp NIDs stayed unresolved).
+                ${KZ3_PATCHSET_STAMP}
+        COMMENT "Generating the HLE NID -> handler table")
+    message(STATUS "HLE NID table:   generated (every module)")
+endif()
+
+# ---------------------------------------------------------------------------
+# The game executable
+# ---------------------------------------------------------------------------
+# The PPU boot scaffold is compiled here rather than taken from the runtime
+# library: every one of these files #includes the lifter's per-game
+# ppu_recomp.h, so they can only be built against a particular lift.
+set(PS3RECOMP_SCAFFOLD
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_loader.cpp"
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_sysprx.cpp"
+)
+
+# ---------------------------------------------------------------------------
+# Lifted SPU images (optional)
+# ---------------------------------------------------------------------------
+# A title that runs SPU work gets its images lifted into <SPU_DIR>/<image>/ by
+# tools/spu_lifter.py, with a registration TU generated by
+# tools/build_spu_workloads.py. cellSpurs dispatches them by content
+# fingerprint, so the generated table is keyed to the images THIS build ships:
+# a table generated from another release registers signatures that can never
+# match, which is worse than shipping none. Both the table and the job-module
+# registry self-register from constructors and are therefore optional -- a tree
+# that has not lifted its SPU images yet configures and links without them.
+set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu" CACHE PATH
+    "Directory holding the lifted SPU images (<SPU_DIR>/<image>/spu_recomp.c)")
+option(PORT_ENABLE_SPU "Compile and register the title's lifted SPU images" ON)
+
+set(SPU_SOURCES "")
+if(PORT_ENABLE_SPU)
+    file(GLOB SPU_LIFTED CONFIGURE_DEPENDS "${SPU_DIR}/*/spu_recomp.c")
+    if(SPU_LIFTED)
+        list(LENGTH SPU_LIFTED SPU_IMAGE_COUNT)
+        message(STATUS "Lifted SPU:      ${SPU_IMAGE_COUNT} image(s)")
+        # The musttail indirect-branch fast path. Excluded from the runtime
+        # library on purpose (see the SDK root CMakeLists): it must be built
+        # here, by clang, or the tail call degrades to a plain call and a guest
+        # loop that branches indirectly walks the thread stack off its guard
+        # page a few thousand iterations in.
+        list(APPEND SPU_SOURCES ${SPU_LIFTED}
+             "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+        # Generated beside the lift; each is present only once its generator
+        # has been run, so each is included only if it is actually here.
+        foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c)
+            if(EXISTS "${SPU_DIR}/${gen}")
+                list(APPEND SPU_SOURCES "${SPU_DIR}/${gen}")
+            else()
+                message(STATUS "  (no ${gen} -- not registered)")
+            endif()
+        endforeach()
+    else()
+        message(STATUS "Lifted SPU:      none found in ${SPU_DIR}")
+    endif()
+endif()
+
+add_executable(${PROJECT_NAME}
+    main.cpp
+    stubs.cpp
+    psarc_vfs.cpp       # KZ3: data_ps3.psarc through the host VFS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vfs/kz3_overlay.c   # KZ3: 1.14 update layers over the disc archive
+    hle_kz3.cpp         # KZ3: HLE for imports the runtime leaves unresolved
+    kz3_log.c           # KZ3: the file log (levels, tags, crash files)
+    ${PS3RECOMP_SCAFFOLD}
+    ${HLE_NID_TABLE}
+    ${RECOMP_SOURCES}
+    ${SPU_SOURCES}
+)
+
+# KZ3 release (step 9s): the player's EBOOT.elf linked into kz3.exe. The release's first-run build
+# (tools/release/firstrun.py) passes -DKZ3_EMBED_EBOOT=<the EBOOT.elf it lifted>; kz3_eboot_blob.c carries its bytes
+# and the SHA-256 taken here, which main.cpp checks before loading them (kz3_embed.h). The exe is built on the
+# player's machine and never shared. Empty (developer builds): nothing embedded, the EBOOT comes from argv[1] /
+# kz3.ini / beside the exe as before.
+target_sources(${PROJECT_NAME} PRIVATE kz3_eboot_blob.c)
+set(KZ3_EMBED_EBOOT "" CACHE FILEPATH "decrypted EBOOT.elf to link into kz3.exe (release first-run build; empty = none)")
+set(_kz3_embed_dir "${CMAKE_BINARY_DIR}/kz3_embed_gen")
+if(KZ3_EMBED_EBOOT)
+    get_filename_component(_kz3_eboot "${KZ3_EMBED_EBOOT}" ABSOLUTE)
+    file(TO_CMAKE_PATH "${_kz3_eboot}" _kz3_eboot)
+    if(NOT EXISTS "${_kz3_eboot}" OR _kz3_eboot MATCHES "\"")
+        message(FATAL_ERROR "KZ3_EMBED_EBOOT: ${_kz3_eboot} not found (or has a quote in its path)")
+    endif()
+    file(SHA256 "${_kz3_eboot}" _kz3_eboot_sha)
+    file(CONFIGURE OUTPUT "${_kz3_embed_dir}/kz3_eboot_embed.h" CONTENT
+        "/* written by port/kz3/CMakeLists.txt (KZ3_EMBED_EBOOT) */\n#define KZ3_EMBED_EBOOT_FILE \"@_kz3_eboot@\"\n#define KZ3_EMBED_EBOOT_SHA256 \"@_kz3_eboot_sha@\"\n"
+        @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_kz3_eboot}")
+    set_source_files_properties(kz3_eboot_blob.c PROPERTIES
+        OBJECT_DEPENDS "${_kz3_eboot};${_kz3_embed_dir}/kz3_eboot_embed.h"
+        INCLUDE_DIRECTORIES "${_kz3_embed_dir}")
+    message(STATUS "Embedded EBOOT:  ${_kz3_eboot} (SHA-256 ${_kz3_eboot_sha})")
+else()
+    file(REMOVE "${_kz3_embed_dir}/kz3_eboot_embed.h")
+endif()
+
+# The lifted SPU sources use bare #include "spu_context.h". Scope that include
+# directory (and their flags) to those TUs alone: adding it to the whole target
+# changes the compile command of every lifted PPU TU, and those are large enough
+# that the needless rebuild is measured in tens of minutes.
+#   SPU_USE_DISPATCH_MT -- route SPU_IB_DISPATCH through the musttail path.
+#   -O2                 -- the SPU sources are small and decode-hot, so they get
+#                          full optimization whatever the build type sets
+#                          (releases build with -O2 -DNDEBUG). The last -O on
+#                          the line wins.
+if(SPU_SOURCES)
+    set_source_files_properties(${SPU_SOURCES} PROPERTIES
+        INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
+        COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT)
+    if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+    endif()
+endif()
+
+# app.rc carries the icon, the version block and the manifest, and needs a
+# resource compiler. Listing it as a source on a host that has none is not a
+# link error, it is a "no rule to make" for a file nothing can consume.
+# The icon is a copy of installer/art/kz3-launcher.ico (the port's own art from tools/release/installer_art.py; same
+# sha256 as art.json) kept next to app.rc, because the build server and the portable payload sync port/ only.
+if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/app.rc" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kz3-launcher.ico")
+    enable_language(RC)
+    set(KZ3_RC "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
+    set_source_files_properties("${KZ3_RC}" PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMPILE_DEFINITIONS "KZ3_VER_MAJOR=${PROJECT_VERSION_MAJOR};KZ3_VER_MINOR=${PROJECT_VERSION_MINOR};KZ3_VER_PATCH=${PROJECT_VERSION_PATCH}"
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kz3-launcher.ico;${CMAKE_CURRENT_SOURCE_DIR}/app.manifest")
+    target_sources(${PROJECT_NAME} PRIVATE "${KZ3_RC}")
+endif()
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+    "${RECOMP_DIR}"                            # the generated ppu_recomp.h
+    "${PS3RECOMP_DIR}/include"
+    "${PS3RECOMP_DIR}/runtime/ppu"
+    "${PS3RECOMP_DIR}/runtime/spu"
+    "${PS3RECOMP_DIR}/runtime/memory"
+    "${PS3RECOMP_DIR}/runtime/syscalls"
+    "${PS3RECOMP_DIR}/runtime/platform"        # win32_compat.h and friends
+    "${PS3RECOMP_DIR}/libs/video"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vfs"        # kz3_overlay.h
+)
+
+# The EBOOT version this exe is built for: psarc_vfs.cpp follows it for the default patch set (KZ3_PATCH_SET unset:
+# 1.14 -> sp, 1.00 -> none); KZ3_EBOOT_VER at run time overrides. Read from the lift itself (RE pass 149, series
+# step 6: the 1.14 lift moved to work/recomp, the 1.00 one to work/recomp-100, so the directory name alone no longer
+# tells): its .lift-stamp's elf= (tools/lift.sh: EBOOT-114.elf or EBOOT.elf), else the directory name (recomp-100 /
+# recomp-114 / recomp, tools/spu/kz3ver.py LIFT_DIRS), else kz3ver.py's DEFAULT. A relift re-runs this configure.
+set(KZ3_LIFT_VER "")
+if(EXISTS "${RECOMP_DIR}/.lift-stamp")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${RECOMP_DIR}/.lift-stamp")
+    file(STRINGS "${RECOMP_DIR}/.lift-stamp" _kz3_stamp LIMIT_COUNT 1)
+    if(_kz3_stamp MATCHES "elf=[^ ]*EBOOT-114")
+        set(KZ3_LIFT_VER 114)
+    elseif(_kz3_stamp MATCHES "elf=")
+        set(KZ3_LIFT_VER 100)
+    endif()
+endif()
+if(NOT KZ3_LIFT_VER)
+    get_filename_component(_kz3_rd "${RECOMP_DIR}" NAME)
+    if(_kz3_rd STREQUAL "recomp-100")
+        set(KZ3_LIFT_VER 100)
+    elseif(_kz3_rd STREQUAL "recomp-114" OR _kz3_rd STREQUAL "recomp")
+        set(KZ3_LIFT_VER 114)
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/spu/kz3ver.py")
+        file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/spu/kz3ver.py" _kz3_def REGEX "^DEFAULT = \"(100|114)\"")
+        string(REGEX REPLACE "^DEFAULT = \"([0-9]+)\".*" "\\1" KZ3_LIFT_VER "${_kz3_def}")
+    endif()
+endif()
+if(NOT KZ3_LIFT_VER MATCHES "^(100|114)$")
+    set(KZ3_LIFT_VER 114)   # kz3ver.py DEFAULT (not readable here, e.g. the remote build server's mirror has no tools/)
+endif()
+message(STATUS "KZ3: lift ${RECOMP_DIR} is EBOOT ${KZ3_LIFT_VER}")
+target_compile_definitions(${PROJECT_NAME} PRIVATE KZ3_EBOOT_VER_DEFAULT=${KZ3_LIFT_VER})
+
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    ps3recomp_runtime
+)
+
+# KZ3: lifted SPU images + their registration (port/spu). Sources come from tools/spu/lift_spu.sh in
+# work/spu (not committed); gen_spu_register.py --only narrows the set. Keep port/kz3/spu empty: the
+# template block above would compile spu_dispatch_mt.c a second time. -DKZ3_WITH_SPU=OFF builds without it.
+option(KZ3_WITH_SPU "link the lifted KZ3 SPU images (port/spu)" ON)
+# KZ3_PORT_SPU_SRC: where port/spu is read from. Default the tree's own; a separate test build of a requested port/spu
+# change points it at a patched copy (RSX pass 65: work/rsx/r65/port/spu), so the request is run before it is filed.
+set(KZ3_PORT_SPU_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../spu" CACHE PATH "port/spu sources (test builds of a requested diff only)")
+if(KZ3_WITH_SPU)
+    add_subdirectory("${KZ3_PORT_SPU_SRC}" "${CMAKE_BINARY_DIR}/kz3_spu")
+    target_link_libraries(${PROJECT_NAME} PRIVATE kz3_spu)
+endif()
+
+# KZ3: route the runtime's and the port's printf/fprintf/puts/fputs/fflush through kz3_log (the line router in
+# kz3_log.c: [tag] -> level, file log in <exe dir>/logs). Only the runtime library, the PPU scaffold and the port's
+# own .cpp files get it: the lifted PPU/SPU sources keep their compile command (changing it would rebuild all of
+# them, tens of minutes) and print nothing of their own. kz3_log.c itself must not get the redirect.
+option(KZ3_LOG_REDIRECT "route the runtime's stdio through kz3_log" ON)
+if(KZ3_LOG_REDIRECT)
+    set(KZ3_LOG_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/kz3_log.h")
+    target_compile_definitions(ps3recomp_runtime PRIVATE KZ3_LOG_REDIRECT_STDIO)
+    target_compile_options(ps3recomp_runtime PRIVATE -include "${KZ3_LOG_HEADER}")
+    set(KZ3_REDIRECTED main.cpp stubs.cpp psarc_vfs.cpp hle_kz3.cpp ${PS3RECOMP_SCAFFOLD})
+    set_property(SOURCE ${KZ3_REDIRECTED} APPEND PROPERTY COMPILE_DEFINITIONS KZ3_LOG_REDIRECT_STDIO)
+    set_property(SOURCE ${KZ3_REDIRECTED} APPEND PROPERTY COMPILE_OPTIONS -include "${KZ3_LOG_HEADER}")
+endif()
+
+# Discord Rich Presence (network pass 33): opt-in, always compiled; patch 4021 holds the cellFsOpen hook.
+set(KZ3_DISCORD_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../net/kz3_discord.c")
+target_sources(${PROJECT_NAME} PRIVATE ${KZ3_DISCORD_SRC})
+if(KZ3_LOG_REDIRECT)
+    set_property(SOURCE ${KZ3_DISCORD_SRC} APPEND PROPERTY COMPILE_DEFINITIONS KZ3_LOG_REDIRECT_STDIO)
+    set_property(SOURCE ${KZ3_DISCORD_SRC} APPEND PROPERTY COMPILE_OPTIONS -include "${KZ3_LOG_HEADER}")
+endif()
+
+# KZ3 online setup: online setup (port/net: online.ini, MUIS host map + egress allowlist, NP sign-in and
+# ticket). Inert unless KZ3_ONLINE is set; patches 4001-4003 hold the runtime side. -DKZ3_WITH_NET=OFF leaves it out.
+option(KZ3_WITH_NET "link the online setup (port/net)" ON)
+if(KZ3_WITH_NET)
+    set(KZ3_NET_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../net/kz3_net.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../net/np_kz3.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../net/np_ticket.c")
+    target_sources(${PROJECT_NAME} PRIVATE ${KZ3_NET_SOURCES})
+    set_property(SOURCE ${KZ3_NET_SOURCES} APPEND PROPERTY INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/libs/network")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE KZ3_WITH_NET)
+    if(KZ3_LOG_REDIRECT)
+        set_property(SOURCE ${KZ3_NET_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS KZ3_LOG_REDIRECT_STDIO)
+        set_property(SOURCE ${KZ3_NET_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -include "${KZ3_LOG_HEADER}")
+    endif()
+endif()
+
+# The runtime is C++, and on Apple also Objective-C. Letting CMake infer the
+# link language from the generated C would leave the C++ standard library out.
+set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
+
+# Windows system import libraries. dbghelp symbolizes crash-handler addresses
+# against the PDB, user32 and gdi32 are what the backend's window and its GDI
+# present are made of, and winmm is timeBeginPeriod. None of the four names
+# anything a POSIX linker can find; the D3D12 backend's own imports come in
+# through the #pragma comment(lib) in libs/video/rsx_d3d12_backend.c.
+if(WIN32)
+    # GUI subsystem: no console window beside the game (KZ3_CONSOLE=1 opens one, main.cpp). The entry stays main().
+    if(MSVC)
+        target_link_options(${PROJECT_NAME} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+    else()
+        target_link_options(${PROJECT_NAME} PRIVATE -mwindows)
+    endif()
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        dbghelp
+        user32
+        gdi32
+        winmm
+    )
+    # KZ3: MinGW ignores #pragma comment(lib), so name the backend's imports (and the
+    # rest of the runtime's) explicitly. Same list as tools/smoke/build-host.sh.
+    if(NOT MSVC)
+        target_link_libraries(${PROJECT_NAME} PRIVATE
+            d3d12 dxgi d3dcompiler dxguid ole32 ws2_32 bcrypt
+            shlwapi synchronization psapi
+        )
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Compiler-specific flags
+# ---------------------------------------------------------------------------
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        -Wall -Wextra -Wno-unused-parameter
+        -fno-strict-aliasing
+    )
+elseif(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        /W3 /wd4100 /wd4244 /wd4267
+        /Zc:__cplusplus         # report correct __cplusplus value
+        # ppu_recomp.h defines PPU_FENCE, the lowering of the guest's
+        # sync/lwsync/eieio/isync, and in C that is <stdatomic.h>. The lifter
+        # writes C++ by default, but --single-file writes ppu_recomp.c, and a
+        # port that took it would not compile without this. The runtime's own
+        # build already carries the same flag for the same reason.
+        /experimental:c11atomics
+    )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+    )
+endif()
+
+# The lifted translation units are machine-generated and can run to hundreds of
+# thousands of lines each, so they get their own flags:
+#
+#   - warnings off. They are about generated code and nobody will act on them,
+#     and at this volume they bury the diagnostics that matter.
+#   - no floating-point contraction. arm64 fuses a multiply and an add by
+#     default; a PPC fmadd is spelt as one where the lifter means one.
+#   - /bigobj on MSVC. A single lifted file routinely passes the 65,536-section
+#     limit of the default object format.
+if(MSVC)
+    set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "/w;/bigobj")
+else()
+    set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-w;-ffp-contract=off")
+endif()
+
+# ---------------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------------
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)

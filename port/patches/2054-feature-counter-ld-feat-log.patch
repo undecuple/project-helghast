@@ -1,0 +1,84 @@
+Opt-in feature counter LD_FEAT_LOG=1: which of PR #6 (one-channel crossbar), #305 (texture gamma) and #304 (SET_SHADER_PACKER output sRGB) KZ3 uses.
+
+Per sampled unit of each draw it counts one-channel formats (base 0x90-0x94, 0x9C) with a non-identity crossbar, non-zero TEXTURE_ADDRESS gamma fields (with the alpha bit and the source-signed filter bits apart), keyed by format, remap, zalias kind and colour target; and per draw the non-zero values of SET_SHADER_PACKER at 0x1FEC (the PR's address) and 0x1FBC (patch 2009's). `[feat]` table every 40,000 draws. No behaviour change.
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -7367,6 +7367,68 @@
+             unit, t->format, gam, t->wrap, draws);
+ }
+ 
++/* Patch 2054 (diagnostic, LD_FEAT_LOG=1): which of three RSX features KZ3 really uses, counted per sampled unit
++ * of each draw: one-channel texture formats (base 0x90-0x94, 0x9C) bound with a non-identity crossbar
++ * (NoahBPeterson PR #6), a non-zero TEXTURE_ADDRESS gamma field (PR #305, with the alpha bit and the
++ * source-signed filter bits apart), and non-zero SET_SHADER_PACKER at 0x1FEC (PR #304; patch 2009 logged
++ * 0x1FBC). Table keyed by (kind, format, remap, gamma/filter, zalias, colour target offset, target format). */
++typedef struct { u32 kind, fmt, remap, aux, zalias, target, tfmt; unsigned long long n; } ld_feat_row;
++static ld_feat_row g_ld_feat[512]; static u32 g_ld_feat_n; static unsigned long long g_ld_feat_draws;
++static unsigned long long g_ld_feat_pk_fec, g_ld_feat_pk_fbc;
++static int ld_feat_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("LD_FEAT_LOG") ? 1 : 0;
++    return on;
++}
++static void ld_feat_row_add(u32 kind, u32 fmt, u32 remap, u32 aux, u32 zalias, u32 target, u32 tfmt)
++{
++    for (u32 i = 0; i < g_ld_feat_n; i++) {
++        ld_feat_row* r = &g_ld_feat[i];
++        if (r->kind == kind && r->fmt == fmt && r->remap == remap && r->aux == aux && r->zalias == zalias &&
++            r->target == target && r->tfmt == tfmt) { r->n++; return; }
++    }
++    if (g_ld_feat_n < 512)
++        g_ld_feat[g_ld_feat_n++] = (ld_feat_row){kind, fmt, remap, aux, zalias, target, tfmt, 1};
++}
++static void ld_feat_dump(void)
++{
++    static const char* kn[] = {"onech-remap", "gamma", "gamma-alpha", "gamma-signed", "packer"};
++    fprintf(stderr, "[feat] draws=%llu packer1FEC=%llu packer1FBC=%llu (rows %u)\n", g_ld_feat_draws,
++            g_ld_feat_pk_fec, g_ld_feat_pk_fbc, g_ld_feat_n);
++    for (u32 i = 0; i < g_ld_feat_n; i++) {
++        const ld_feat_row* r = &g_ld_feat[i];
++        fprintf(stderr, "[feat] %s fmt=0x%02x remap=0x%04x aux=0x%x zalias=%u target=0x%08x tfmt=%u n=%llu\n",
++                kn[r->kind], r->fmt, r->remap, r->aux, r->zalias, r->target, r->tfmt, r->n);
++    }
++    fflush(stderr);
++}
++static void ld_feat_draw(u32 fp_ctrl)
++{
++    g_ld_feat_draws++;
++    { const u32 pk = rsx_dsp_reg(&g.rsx, 0x1FEC);
++      if (pk) { rsx_dsp_surface sf; rsx_dsp_get_surface(&g.rsx, &sf);
++                ld_feat_row_add(4, pk & 0xFFu, fp_ctrl & 0xFFFFu, (rsx_dsp_reg(&g.rsx, 0x0208) & 0x1Fu) << 8 | (sf.color_target & 0xFFu),
++                                0, sf.color_offset[0], sf.color_format); } }
++    if (rsx_dsp_reg(&g.rsx, 0x1FEC)) g_ld_feat_pk_fec++;
++    if (rsx_dsp_reg(&g.rsx, 0x1FBC)) g_ld_feat_pk_fbc++;
++    if ((g_ld_feat_draws % 40000ull) == 0) ld_feat_dump();
++}
++static void ld_feat_unit(const rsx_dsp_texture* t, int zalias)
++{
++    rsx_dsp_surface sf; rsx_dsp_get_surface(&g.rsx, &sf);
++    const u32 base = t->format & 0x9Fu, r16 = t->remap & 0xFFFFu;
++    const u32 rm = r16 ? r16 : 0xAAE4u;
++    if (((base >= 0x90u && base <= 0x94u) || base == 0x9Cu) && rm != 0xAAE4u)
++        ld_feat_row_add(0, base, rm, 0, (u32)zalias, sf.color_offset[0], sf.color_format);
++    const u32 gam = (t->wrap >> 20) & 0xFu;
++    if (gam) {
++        ld_feat_row_add(1, base, rm, gam, (u32)zalias, sf.color_offset[0], sf.color_format);
++        if (gam & 8u) ld_feat_row_add(2, base, rm, gam, (u32)zalias, sf.color_offset[0], sf.color_format);
++        if (t->filter >> 28) ld_feat_row_add(3, base, rm, t->filter >> 28, (u32)zalias, sf.color_offset[0], sf.color_format);
++    }
++}
++
+ /* KZ3 patch 2029: exact memo of get_pso's per-draw shader hashing. The PSO key
+  * starts with FNV-1a over the vertex program and the fragment program
+  * (structural hash in buffered mode), byte by byte, every draw, and the vertex
+@@ -7496,6 +7558,8 @@
+         rsx_dsp_get_texture(&g.rsx, unit, &texture);
+         if (texture.enabled || unit == 0) ld_gamma_log(unit, &texture);
+         const int zalias = texture.enabled ? tex_zalias_kind(&texture) : ZALIAS_NONE;
++        if (ld_feat_on()) { if (!(fp_units & ((1u << unit) - 1u))) ld_feat_draw(fp_ctrl);
++                            if (texture.enabled) ld_feat_unit(&texture, zalias); }
+         if (zalias == ZALIAS_SHADOW) {
+             shadow_mask |= 1u << unit;
+             shadow_zfunc[unit] = (u8)((texture.wrap >> 28) & 7u);

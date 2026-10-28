@@ -1,0 +1,380 @@
+KZ3 patch 1097 (SPU pass 72): cheaper SPU job code and direct hops for the audio mixer jobs.
+
+- fsmb/fsmbi: one 16-entry nibble table per SPU word (a constant immediate folds to a constant vector); the byte
+  loop was not unrolled by GCC -O2 (3.4 % of the audio synth job, SPU pass 71).
+- cbd/chd/cwd/cdd (and the x forms): the generate-controls as tables (16/8/4/2 entries) instead of a 16-byte loop
+  per call (spu_cwd_pos 4.5 % of the job).
+- cflts/cfltu/csflt/cuflt: four lanes in SSE4.1 double arithmetic instead of a scalar loop (same operations: widen,
+  scale by the power of two, clamp, truncate; cfltu converts floor(v) - 2^31 and flips the top bit). NaN lanes give
+  the loops' values (operand order of min/max); the loops stay for builds without SSE4.1; exp2 replaced by the
+  power of two from its exponent bits.
+- fma/fms/fnms: a lane whose double sum sits on a float rounding midpoint no longer goes to the per-lane libm
+  path when the double sum is exact (TwoSum error 0): then it is the fused value and its rounding to float is the
+  correctly rounded result. K2 (SPU pass 72, KZ3_SPU_FMASTATS=1): 158 M midpoint fallback lanes, the most common
+  reason (products of short mantissas).
+- fma/fms/fnms with -mfma (KZ3_SPU_ISA): one hardware fused multiply-add per vector; a lane whose result has
+  exponent 0 (non-zero), 1 or 255 sends the vector through the double path unchanged, so the bits are the same
+  (FTZ mode, the default); the -mfma build used the scalar per-lane path before (no FTZ).
+- direct hops (patch 1096): a computed hop to the innermost bracket's return pc returns to the host caller with
+  nothing pending (the drain only returned there, before any hook; the inline spu_drain_call then takes its fast
+  path); spu_ib_direct filters the taskset tests by bitmaps (policy image ids, hashed task entries) before the LS
+  read and the table scans, and probes the spu_lookup memo inline.
+Every helper change is bit-identical to the old code (tools/spu/test_spu_cg72.sh); hops: tools/spu/test_spu_hop.sh.
+Upstream candidate (helpers, the hop return).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 75bdf90a..274023ba 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1855,6 +1855,18 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
+     }
+     return NULL;
+ }
++/* KZ3 patch 1097: the memo probe inline (spu_ib_direct runs it on every computed direct hop; the out-of-line
++ * spu_lookup call was 2.4 % of the audio job in SPU pass 71). Same answer as spu_lookup: a memo hit is what
++ * spu_lookup returns for that key, and every other case calls it. */
++static inline __attribute__((always_inline)) spu_fn spu_lookup_memo(uint32_t addr, int image_id)
++{
++    if (image_id > 0 && image_id < (1 << 14) && addr <= 0x3FFFFu) {
++        const uint32_t key = addr | ((uint32_t)image_id << 18);
++        const uint64_t m = s_lk_memo[(key * 2654435761u) >> (32 - SPU_LK_MEMO_BITS)];
++        if ((uint32_t)m == key) return s_registry[(uint32_t)(m >> 32)].fn;
++    }
++    return spu_lookup(addr, image_id);
++}
+ 
+ /* Indirect dispatch resolves the same (address, image) pairs on every guest
+  * indirect branch. Each resolution walks the address's hash chain -- one entry
+@@ -2320,12 +2332,20 @@ static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*
+ #define SPU_TASK_ENTRY_MAX 16
+ static struct { uint32_t entry; int image_id; } s_task_entry[SPU_TASK_ENTRY_MAX];
+ static int s_task_entry_count = 0;
++/* KZ3 patch 1097: filters for spu_ib_direct (direct hops): a bit per registered task entry (hashed LS address) and
++ * per taskset policy image id, so a job overlay's computed hop skips the LS read and the table scans. A clear bit
++ * means no match; a set bit runs the scan as before. */
++static uint64_t s_task_entry_bits[16];
++#define SPU_TASK_POL_BITS 1024u
++static uint64_t s_task_pol_bits[SPU_TASK_POL_BITS / 64];
++static int s_task_pol_big;   /* a policy image id >= SPU_TASK_POL_BITS was registered: no filter */
+ void spu_taskset_register_task_entry(uint32_t entry, int image_id)
+ {
+     if (s_task_entry_count < SPU_TASK_ENTRY_MAX) {
+         s_task_entry[s_task_entry_count].entry = entry & SPU_LS_MASK;
+         s_task_entry[s_task_entry_count].image_id = image_id;
+         s_task_entry_count++;
++        s_task_entry_bits[(entry >> 2) & 15] |= 1ull << ((entry >> 6) & 63);   /* KZ3 patch 1097 */
+     }
+ }
+ static int spu_taskset_task_image(uint32_t entry)
+@@ -2345,6 +2365,10 @@ void spu_taskset_register_task_elf(uint32_t elf_ea, int image_id, int policy_ima
+         s_task_elf[s_task_elf_count].elf_ea = elf_ea & ~7u;
+         s_task_elf[s_task_elf_count].image_id = image_id;
+         s_task_elf[s_task_elf_count++].policy_image_id = policy_image_id;
++        if ((unsigned)policy_image_id < SPU_TASK_POL_BITS)   /* KZ3 patch 1097 */
++            s_task_pol_bits[(unsigned)policy_image_id / 64] |= 1ull << ((unsigned)policy_image_id % 64);
++        else
++            s_task_pol_big = 1;
+     }
+ }
+ static int spu_taskset_resident_image(const spu_context* ctx)
+@@ -3111,9 +3135,14 @@ spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
+         SPU_HS(6);
+         return NULL;
+     }
+-    if (t >= SPU_TASKSET_TASK_LO && (spu_taskset_resident_image(ctx) || spu_taskset_task_image(t))) {
+-        SPU_HS(7);
+-        return NULL;
++    if (t >= SPU_TASKSET_TASK_LO) {   /* KZ3 patch 1097: the filters first (exact: a clear bit = no table match) */
++        const unsigned ov = (unsigned)ctx->resident_ovl;
++        const int pol = s_task_pol_big || ov >= SPU_TASK_POL_BITS || (s_task_pol_bits[ov / 64] >> (ov % 64) & 1);
++        const int ent = (int)(s_task_entry_bits[(t >> 2) & 15] >> ((t >> 6) & 63) & 1);
++        if ((pol && spu_taskset_resident_image(ctx)) || (ent && spu_taskset_task_image(t))) {
++            SPU_HS(7);
++            return NULL;
++        }
+     }
+     for (unsigned slot = 0; slot < 4; ++slot)
+         if (ctx->resident_code[slot].image_id && t >= ctx->resident_code[slot].lsa &&
+@@ -3121,8 +3150,8 @@ spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
+             SPU_HS(8);
+             return NULL;
+         }
+-    spu_fn fn = ctx->resident_ovl ? spu_lookup(t, ctx->resident_ovl) : NULL;
+-    if (!fn) fn = spu_lookup(t, ctx->image_id);
++    spu_fn fn = ctx->resident_ovl ? spu_lookup_memo(t, ctx->resident_ovl) : NULL;   /* KZ3 patch 1097 */
++    if (!fn) fn = spu_lookup_memo(t, ctx->image_id);
+     SPU_HS(fn ? 0 : 9);
+     return fn;
+ }
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 9dbac9e6..3a0f3d3d 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -1098,6 +1098,13 @@ static inline __attribute__((always_inline)) void spu_drain_call(spu_context* ct
+  * or 0 (then the old trampoline path runs). The host stack does not grow (tail calls). KZ3_SPU_HOP=0 = old path;
+  * any dispatch diagnostic switch (SPU_TAILRET, SPU_JOBTRACE, SPU_POLLTRACE, ...) also turns it off. */
+ typedef void (*spu_hop_fn)(spu_context*);
++/* KZ3 patch 1097 (SPU pass 72): a computed hop to ctx->hop_ret_pc (the innermost open bracket's return pc) returns
++ * to the host caller with pc = the target and nothing pending. The old path set the resolver trampoline and returned;
++ * the bracket's drain then saw "resolver pending, pc == its return pc" and returned before any hook (the first test
++ * of spu_drain_call_body's loop); with nothing pending the inline spu_drain_call takes its own fast path (same depth
++ * limit test), and spu_drain_call_body's loop ends on the same pc test. Skipped while the frame-trace job bracket
++ * (g_kz3_wtrace, closed by spu_drain_call_full) is armed. 4.5-5.3 M such hops per 10 s in K2 (SPU pass 71). */
++extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
+ extern int g_spu_hop_on;                                  /* -1 = not decided yet, 0 = off, 1 = on (spu_drain.c) */
+ void spu_hop_init(void);                                  /* spu_drain.c: decides g_spu_hop_on (env) */
+ spu_hop_fn spu_ib_direct(spu_context* ctx, uint32_t t);   /* spu_channels.c */
+@@ -1131,6 +1138,8 @@ static inline __attribute__((always_inline)) void spu_hop_note(spu_context* ctx,
+ #define SPU_IB_HOP(ctx, T) do {                                                                  \
+         (ctx)->pc = (T);                                                                         \
+         if (SPU_HOP_DIRECT && g_spu_hop_on > 0) {                                                \
++            if (((uint32_t)(ctx)->pc & SPU_LS_MASK) == (ctx)->hop_ret_pc && (ctx)->hop_ret_pc &&  \
++                !g_kz3_wtrace) return;   /* KZ3 patch 1097: the drain would only return */      \
+             const spu_hop_fn _hf = spu_ib_direct((ctx), (uint32_t)(ctx)->pc & SPU_LS_MASK);      \
+             if (_hf) {                                                                           \
+                 (ctx)->pc &= SPU_LS_MASK;                                                        \
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 07895d81..3ea94cdf 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -602,18 +602,60 @@ SPU_HOT u128 spu_fs(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_sub_ps, a._f3
+ /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
+  * The canonical immediates 173 and 155 are identity conversions. */
+ /* patch 1079: forced inline (the lifted code passes i8 as a constant, so exp2 folds), the recompute out of line */
+-SPU_HOT u128 spu_cflts(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
++/* KZ3 patch 1097 (SPU pass 72): the four lanes in SSE4.1 double arithmetic instead of a scalar loop per lane (the
++ * mixer's cfltu was 2.6 % of the audio job, SPU pass 71). Same operations as the loop: the float lane widened to
++ * double (exact), times the power of two (exact; 2^-82..2^173 built from its exponent bits), clamped, truncated
++ * towards zero; cfltu has no unsigned double->u32 conversion in SSE, so it floors (= truncates for v >= 0) and
++ * converts floor(v) - 2^31 (exact: an integer below 2^32), then flips the top bit. csflt/cuflt: the integer widened
++ * to double (exact; cuflt via the signed value + 2^31), times the power of two, one rounding to float. Exponent-255
++ * lanes are recomputed by SPU_XR_RET as before. Same bits as the loops (tools/spu/test_spu_cg72.sh); the loops are
++ * kept for builds without SSE4.1. */
++static inline double spu__pow2d(int e) { uint64_t u = (uint64_t)(1023 + e) << 52; double d; memcpy(&d, &u, 8); return d; }
++#if defined(__SSE4_1__)
++static inline __m128d spu__cvt_lo(__m128 v) { return _mm_cvtps_pd(v); }
++static inline __m128d spu__cvt_hi(__m128 v) { return _mm_cvtps_pd(_mm_movehl_ps(v, v)); }
++SPU_HOT u128 spu_cflts(u128 a, int i8){ u128 r; __m128 A; memcpy(&A, &a, 16);
++    const __m128d f = _mm_set1_pd(spu__pow2d(173 - i8)), hi = _mm_set1_pd(2147483647.0), lo = _mm_set1_pd(-2147483648.0);
++    const __m128d l = _mm_max_pd(lo, _mm_min_pd(hi, _mm_mul_pd(spu__cvt_lo(A), f)));   /* NaN stays NaN, as the loop */
++    const __m128d h = _mm_max_pd(lo, _mm_min_pd(hi, _mm_mul_pd(spu__cvt_hi(A), f)));
++    const __m128i R = _mm_unpacklo_epi64(_mm_cvttpd_epi32(l), _mm_cvttpd_epi32(h)); memcpy(&r, &R, 16);
++    SPU_XR_RET(spu__xr_mask(a), r, a, a, SPU_XR_CFLTS, i8); }
++SPU_HOT u128 spu_cfltu(u128 a, int i8){ u128 r; __m128 A; memcpy(&A, &a, 16);
++    const __m128d f = _mm_set1_pd(spu__pow2d(173 - i8)), hi = _mm_set1_pd(4294967295.0), z = _mm_setzero_pd(),
++                  b31 = _mm_set1_pd(2147483648.0);
++    const __m128d l = _mm_sub_pd(_mm_floor_pd(_mm_min_pd(hi, _mm_max_pd(z, _mm_mul_pd(spu__cvt_lo(A), f)))), b31);
++    const __m128d h = _mm_sub_pd(_mm_floor_pd(_mm_min_pd(hi, _mm_max_pd(z, _mm_mul_pd(spu__cvt_hi(A), f)))), b31);
++    const __m128i R = _mm_xor_si128(_mm_unpacklo_epi64(_mm_cvttpd_epi32(l), _mm_cvttpd_epi32(h)),
++                                    _mm_set1_epi32((int)0x80000000u));
++    memcpy(&r, &R, 16);
++    SPU_XR_RET(spu__xr_mask(a), r, a, a, SPU_XR_CFLTU, i8); }
++SPU_HOT u128 spu_csflt(u128 a, int i8){ u128 r; __m128i A; memcpy(&A, &a, 16);
++    const __m128d f = _mm_set1_pd(spu__pow2d(i8 - 155));
++    const __m128 R = _mm_movelh_ps(_mm_cvtpd_ps(_mm_mul_pd(_mm_cvtepi32_pd(A), f)),
++                                   _mm_cvtpd_ps(_mm_mul_pd(_mm_cvtepi32_pd(_mm_unpackhi_epi64(A, A)), f)));
++    memcpy(&r, &R, 16);
++    SPU_XR_RET(spu__xr_mask(r), r, a, a, SPU_XR_CSFLT, i8); }
++SPU_HOT u128 spu_cuflt(u128 a, int i8){ u128 r; __m128i A; memcpy(&A, &a, 16);
++    const __m128d f = _mm_set1_pd(spu__pow2d(i8 - 155)), b31 = _mm_set1_pd(2147483648.0);
++    A = _mm_xor_si128(A, _mm_set1_epi32((int)0x80000000u));
++    const __m128d l = _mm_add_pd(_mm_cvtepi32_pd(A), b31), h = _mm_add_pd(_mm_cvtepi32_pd(_mm_unpackhi_epi64(A, A)), b31);
++    const __m128 R = _mm_movelh_ps(_mm_cvtpd_ps(_mm_mul_pd(l, f)), _mm_cvtpd_ps(_mm_mul_pd(h, f)));
++    memcpy(&r, &R, 16);
++    SPU_XR_RET(spu__xr_mask(r), r, a, a, SPU_XR_CUFLT, i8); }
++#else
++SPU_HOT u128 spu_cflts(u128 a, int i8){ u128 r; double f=spu__pow2d(173-i8);
+     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; }
+     SPU_XR_RET(spu__xr_mask(a), r, a, a, SPU_XR_CFLTS, i8); }
+-SPU_HOT u128 spu_cfltu(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
++SPU_HOT u128 spu_cfltu(u128 a, int i8){ u128 r; double f=spu__pow2d(173-i8);
+     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; }
+     SPU_XR_RET(spu__xr_mask(a), r, a, a, SPU_XR_CFLTU, i8); }
+-SPU_HOT u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
++SPU_HOT u128 spu_csflt(u128 a, int i8){ u128 r; double f=spu__pow2d(i8-155);
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f);
+     SPU_XR_RET(spu__xr_mask(r), r, a, a, SPU_XR_CSFLT, i8); }
+-SPU_HOT u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
++SPU_HOT u128 spu_cuflt(u128 a, int i8){ u128 r; double f=spu__pow2d(i8-155);
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f);
+     SPU_XR_RET(spu__xr_mask(r), r, a, a, SPU_XR_CUFLT, i8); }
++#endif
+ SPU_HOT u128 spu_fm(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_mul_ps, a._f32[i] * b._f32[i]); SPU_XR_RET_Q(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FM); }   /* patch 1079 */
+ /* KZ3 patch 1035: fused multiply-add without the libm call. Without -mfma, fmaf is MinGW's software
+  * routine (with frexp/ldexp inside; ~3 % of the level's SPURS samples in SPU pass 21). The product of two
+@@ -641,7 +683,10 @@ SPU_HOT float spu__fmaf(float a, float b, float c) {
+  * fmaf: the mixer's silent buffers made every sum an exact zero, which the scalar rule sent to fmaf.
+  * A lane outside the rule (float subnormal/overflow range, NaN/inf, a rounding midpoint) runs all four
+  * lanes through spu__fmaf as before. KZ3_SPU_FASTCG=0 keeps the old per-lane path. */
+-#if defined(__SSE4_1__) && !defined(__FMA__)
++#if defined(__SSE4_1__)   /* patch 1097: with -mfma too (hardware fast path in spu__fma4) */
++#if defined(__FMA__)
++#include <immintrin.h>
++#endif
+ /* KZ3 patch 1040 (SPU pass 28): SPU single-precision flush-to-zero for fma/fms/fnms results.
+  * g_kz3_spu_slowcg == 0 (KZ3_SPU_FASTCG >= 1040, the default; 2 = the 1038 fast paths without FTZ, 1 = the old
+  * paths; one variable, so each op still loads one flag): a result that would be a float subnormal is +-0 with the
+@@ -684,17 +729,39 @@ SPU_XR_COLD u128 spu__fma4_slow(__m128 av, __m128 bv, __m128 cv, int negb, int n
+     const __m128d al = _mm_and_pd(sl, absm), ah = _mm_and_pd(sh, absm);
+     const __m128d lo = _mm_set1_pd(0x1p-126);
+     const int ftz = cgm == 0;
++    /* KZ3 patch 1097 (SPU pass 72): a rounding midpoint is only a problem when the double sum was itself rounded.
++     * When p + c is exact in double (TwoSum error 0; the product p = a*b of two floats is always exact), s IS the
++     * fused value and its one rounding to float is the correctly rounded fma, the same value fmaf returns. Products
++     * of short mantissas (PCM samples times gains) land on midpoints often: the audio mixer sent them all to the
++     * per-lane reference path (spu__fma4_ref 2.4 % of the job, SPU pass 71). Normal-range lanes only, as before. */
++    {
++        __m128 A = av, B = bv, C = cv;
++        const __m128 sgn = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));
++        if (negb) B = _mm_xor_ps(B, sgn);
++        if (negc) C = _mm_xor_ps(C, sgn);
++        const __m128d pl = _mm_mul_pd(_mm_cvtps_pd(A), _mm_cvtps_pd(B)), cl = _mm_cvtps_pd(C);
++        const __m128d ph = _mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(A, A)), _mm_cvtps_pd(_mm_movehl_ps(B, B))),
++                      ch = _mm_cvtps_pd(_mm_movehl_ps(C, C));
++        const __m128d bl = _mm_sub_pd(sl, pl), bh = _mm_sub_pd(sh, ph);
++        const __m128d el = _mm_add_pd(_mm_sub_pd(pl, _mm_sub_pd(sl, bl)), _mm_sub_pd(cl, bl));
++        const __m128d eh = _mm_add_pd(_mm_sub_pd(ph, _mm_sub_pd(sh, bh)), _mm_sub_pd(ch, bh));
++        const __m128d hi = _mm_set1_pd(0x1p128), z = _mm_setzero_pd();
++        okl = _mm_or_pd(okl, _mm_and_pd(_mm_cmpeq_pd(el, z), _mm_and_pd(_mm_cmpge_pd(al, lo), _mm_cmplt_pd(al, hi))));
++        okh = _mm_or_pd(okh, _mm_and_pd(_mm_cmpeq_pd(eh, z), _mm_and_pd(_mm_cmpge_pd(ah, lo), _mm_cmplt_pd(ah, hi))));
++    }
+     if (ftz) {   /* off the common path: tiny sums are fine too, their result is flushed */
+         const __m128d edge = _mm_set1_pd(0x1p-126 - 0x1p-150);
+         okl = _mm_or_pd(okl, _mm_andnot_pd(_mm_cmpeq_pd(al, edge), _mm_cmplt_pd(al, lo)));
+         okh = _mm_or_pd(okh, _mm_andnot_pd(_mm_cmpeq_pd(ah, edge), _mm_cmplt_pd(ah, lo)));
+-        if ((_mm_movemask_pd(okl) & _mm_movemask_pd(okh)) == 3) {
+-            __m128 r4 = _mm_movelh_ps(_mm_cvtpd_ps(sl), _mm_cvtpd_ps(sh));
++    }
++    if ((_mm_movemask_pd(okl) & _mm_movemask_pd(okh)) == 3) {
++        __m128 r4 = _mm_movelh_ps(_mm_cvtpd_ps(sl), _mm_cvtpd_ps(sh));
++        if (ftz) {
+             const __m128 fsgn = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));   /* |r| < FLT_MIN -> +-0 */
+             const __m128 tiny = _mm_cmplt_ps(_mm_andnot_ps(fsgn, r4), _mm_set1_ps(0x1p-126f));
+             r4 = _mm_blendv_ps(r4, _mm_and_ps(r4, fsgn), tiny);
+-            u128 r; memcpy(&r, &r4, 16); return r;
+         }
++        u128 r; memcpy(&r, &r4, 16); return r;
+     }
+     if (__builtin_expect(g_kz3_fma_stats, 0)) {
+         double sv[4]; _mm_storeu_pd(sv, sl); _mm_storeu_pd(sv + 2, sh);
+@@ -709,6 +776,27 @@ SPU_XR_COLD u128 spu__fma4_slow(__m128 av, __m128 bv, __m128 cv, int negb, int n
+ }
+ SPU_HOT u128 spu__fma4(u128 a, u128 b, u128 c, int negb, int negc) {
+     const int cgm = g_kz3_spu_slowcg;
++#if defined(__FMA__)
++    /* KZ3 patch 1097 (SPU pass 72): with -mfma (KZ3_SPU_ISA) one fused multiply-add per vector. Its result r is the
++     * correctly rounded fused value, which is what the double path below returns for every lane it takes inline or
++     * through fmaf. The lanes that path treats specially are all caught by r's exponent: exponent 255 (an inf/NaN
++     * operand, i.e. a patch-1071 exponent-255 lane, or an overflow), exponent 0 with a non-zero mantissa (the FTZ
++     * flush) and exponent 1 (just above the flush edge, where the double sum's own rounding decides). Any such lane
++     * sends the vector through the double path unchanged, so the results are the same bits (FTZ mode, the
++     * default; the other modes take the double path). A zero r is its own FTZ result (sign included). */
++    if (__builtin_expect(cgm == 0, 1)) {
++        __m128 A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
++        const __m128 sgn = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));
++        if (negb) B = _mm_xor_ps(B, sgn);
++        if (negc) C = _mm_xor_ps(C, sgn);
++        const __m128 r4 = _mm_fmadd_ps(A, B, C);
++        const __m128i ab = _mm_and_si128(_mm_castps_si128(r4), _mm_set1_epi32(0x7FFFFFFF));
++        const __m128i odd = _mm_or_si128(
++            _mm_andnot_si128(_mm_cmpeq_epi32(ab, _mm_setzero_si128()), _mm_cmplt_epi32(ab, _mm_set1_epi32(0x01000000))),
++            _mm_cmpgt_epi32(ab, _mm_set1_epi32(0x7F7FFFFF)));
++        if (__builtin_expect(_mm_testz_si128(odd, odd), 1)) { u128 r; memcpy(&r, &r4, 16); return r; }
++    }
++#endif
+     __m128 A0, B0, C0; memcpy(&A0, &a, 16); memcpy(&B0, &b, 16); memcpy(&C0, &c, 16);
+     if (__builtin_expect(cgm != 1, 1)) {
+         __m128 A = A0, B = B0, C = C0;
+@@ -988,16 +1076,21 @@ static inline u128 spu_fsmh(u128 a) {
+  * andbi(fsmbi(0x101),-128) building a +0x80 EA offset in the low byte of words
+  * 1,3) places the value in the correct byte lane. Raw _u8[P] would put 0x80 in
+  * the high byte (bit 31) instead -> wrong DMA EA. */
+-static inline u128 spu_fsmb(u128 a) {
+-    u128 r; uint32_t v = a._u32[0] & 0xFFFF;
+-    for(int i=0;i<16;i++) r._u8[SPU_W(i)] = ((v>>(15-i))&1) ? 0xFFu : 0;
+-    return r;
+-}
+-static inline u128 spu_fsmbi(int32_t imm) {
+-    u128 r; uint32_t v = imm & 0xFFFF;
+-    for(int i=0;i<16;i++) r._u8[SPU_W(i)] = ((v>>(15-i))&1) ? 0xFFu : 0;
++/* KZ3 patch 1097 (SPU pass 72): the 16-bit mask expands one nibble per SPU word (host _u32[k] is SPU word k's
++ * value, SPU byte 4k its top byte), so each word is a 16-entry table entry; with the lifter's constant immediate the
++ * whole vector folds to a constant (the byte loop above was not unrolled by GCC -O2: 3.4 % of the audio job's
++ * samples in SPU pass 71). Same bytes as the loop (tools/spu/test_spu_cg72.sh checks all 65536 masks). */
++static const uint32_t spu__fsmb_nib[16] = {
++    0x00000000u, 0x000000FFu, 0x0000FF00u, 0x0000FFFFu, 0x00FF0000u, 0x00FF00FFu, 0x00FFFF00u, 0x00FFFFFFu,
++    0xFF000000u, 0xFF0000FFu, 0xFF00FF00u, 0xFF00FFFFu, 0xFFFF0000u, 0xFFFF00FFu, 0xFFFFFF00u, 0xFFFFFFFFu};
++static inline u128 spu__fsmb16(uint32_t v) {
++    u128 r;
++    r._u32[0] = spu__fsmb_nib[(v >> 12) & 0xF]; r._u32[1] = spu__fsmb_nib[(v >> 8) & 0xF];
++    r._u32[2] = spu__fsmb_nib[(v >> 4) & 0xF];  r._u32[3] = spu__fsmb_nib[v & 0xF];
+     return r;
+ }
++static inline u128 spu_fsmb(u128 a) { return spu__fsmb16(a._u32[0] & 0xFFFF); }
++static inline u128 spu_fsmbi(int32_t imm) { return spu__fsmb16((uint32_t)imm & 0xFFFF); }
+ 
+ /* ---- Phase 3: constant generators (insertion shuffle patterns) ---- */
+ /* Generate-controls (cbd/chd/cwd/cdd) — insertion selectors for the (now
+@@ -1008,30 +1101,36 @@ static inline u128 spu_fsmbi(int32_t imm) {
+  * a word, 0..7 for a doubleword. Every store is mapped through SPU_W to land at
+  * the right host index. Verified to compose correctly with the fixed shufb for
+  * both cbd-generated and immediate/LS-constant controls. */
+-static inline u128 spu_cbd_pos(int pos) {
+-    u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+-    r._u8[SPU_W(pos & 0xF)] = 0x03;                 /* a's preferred byte = SPU byte 3 */
+-    return r;
+-}
+-static inline u128 spu_chd_pos(int pos) {
+-    u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+-    int p = (pos & 0xF) & ~1;                       /* SPU halfword byte positions p, p+1 */
+-    r._u8[SPU_W(p)]   = 0x02;                        /* a SPU byte 2 (hi byte of preferred hw) */
+-    r._u8[SPU_W(p+1)] = 0x03;                        /* a SPU byte 3 (lo byte) */
+-    return r;
+-}
+-static inline u128 spu_cwd_pos(int pos) {
+-    u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+-    int p = (pos & 0xF) & ~3;
+-    for(int k=0;k<4;k++) r._u8[SPU_W(p+k)] = (uint8_t)k;   /* a SPU bytes 0..3 (preferred word) */
+-    return r;
+-}
+-static inline u128 spu_cdd_pos(int pos) {
+-    u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+-    int p = (pos & 0xF) & ~7;
+-    for(int k=0;k<8;k++) r._u8[SPU_W(p+k)] = (uint8_t)k;   /* a SPU bytes 0..7 (preferred dword) */
+-    return r;
+-}
++/* KZ3 patch 1097 (SPU pass 72): the controls as tables (16 cbd, 8 chd, 4 cwd, 2 cdd entries) instead of a 16-byte
++ * loop per call: spu_cwd_pos was 4.5 % of the audio job's samples (spu rounds 70-71). Word j of the base control is
++ * SPU bytes 4j..4j+3 = selectors 0x10+4j..0x13+4j; the insert replaces SPU byte p (cbd: 0x03), halfword p (chd:
++ * 0x0203), word p (cwd: 0x00010203) or doubleword p (cdd: 0x00010203 0x04050607). Same bytes as the old loops
++ * (tools/spu/test_spu_cg72.sh, every position). */
++#define SPU__CGW(j) ((uint32_t)(0x10u + 4u * (j)) << 24 | (uint32_t)(0x11u + 4u * (j)) << 16 | \
++                     (uint32_t)(0x12u + 4u * (j)) << 8 | (uint32_t)(0x13u + 4u * (j)))
++/* word j of a control with SPU byte p (in word j) replaced by v */
++#define SPU__CGB(j, p, v) (((p) >> 2) != (j) ? SPU__CGW(j) : \
++    ((SPU__CGW(j) & ~(0xFFu << (8 * (3 - ((p) & 3))))) | ((uint32_t)(v) << (8 * (3 - ((p) & 3))))))
++#define SPU__CBD(p) {{SPU__CGB(0, p, 3), SPU__CGB(1, p, 3), SPU__CGB(2, p, 3), SPU__CGB(3, p, 3)}}
++#define SPU__CGH(j, p) (((p) >> 2) != (j) ? SPU__CGW(j) : \
++    ((p) & 2 ? ((SPU__CGW(j) & 0xFFFF0000u) | 0x0203u) : ((SPU__CGW(j) & 0x0000FFFFu) | 0x02030000u)))
++#define SPU__CHD(p) {{SPU__CGH(0, p), SPU__CGH(1, p), SPU__CGH(2, p), SPU__CGH(3, p)}}
++#define SPU__CWD(w) {{(w) == 0 ? 0x00010203u : SPU__CGW(0), (w) == 1 ? 0x00010203u : SPU__CGW(1), \
++                      (w) == 2 ? 0x00010203u : SPU__CGW(2), (w) == 3 ? 0x00010203u : SPU__CGW(3)}}
++typedef struct { uint32_t w[4]; } spu__cgtab;
++static const spu__cgtab spu__cbd_tab[16] __attribute__((aligned(16))) = {
++    SPU__CBD(0), SPU__CBD(1), SPU__CBD(2), SPU__CBD(3), SPU__CBD(4), SPU__CBD(5), SPU__CBD(6), SPU__CBD(7),
++    SPU__CBD(8), SPU__CBD(9), SPU__CBD(10), SPU__CBD(11), SPU__CBD(12), SPU__CBD(13), SPU__CBD(14), SPU__CBD(15)};
++static const spu__cgtab spu__chd_tab[8] __attribute__((aligned(16))) = {
++    SPU__CHD(0), SPU__CHD(2), SPU__CHD(4), SPU__CHD(6), SPU__CHD(8), SPU__CHD(10), SPU__CHD(12), SPU__CHD(14)};
++static const spu__cgtab spu__cwd_tab[4] __attribute__((aligned(16))) = {SPU__CWD(0), SPU__CWD(1), SPU__CWD(2), SPU__CWD(3)};
++static const spu__cgtab spu__cdd_tab[2] __attribute__((aligned(16))) = {
++    {{0x00010203u, 0x04050607u, SPU__CGW(2), SPU__CGW(3)}}, {{SPU__CGW(0), SPU__CGW(1), 0x00010203u, 0x04050607u}}};
++static inline u128 spu__cgload(const spu__cgtab* t) { u128 r; memcpy(&r, t, 16); return r; }
++static inline u128 spu_cbd_pos(int pos) { return spu__cgload(&spu__cbd_tab[pos & 0xF]); }
++static inline u128 spu_chd_pos(int pos) { return spu__cgload(&spu__chd_tab[(pos & 0xF) >> 1]); }
++static inline u128 spu_cwd_pos(int pos) { return spu__cgload(&spu__cwd_tab[(pos & 0xF) >> 2]); }
++static inline u128 spu_cdd_pos(int pos) { return spu__cgload(&spu__cdd_tab[(pos & 0xF) >> 3]); }
+ static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_pos((int)a._u32[0]+i7); }
+ static inline u128 spu_chd(u128 a, int i7){ return spu_chd_pos((int)a._u32[0]+i7); }
+ static inline u128 spu_cwd(u128 a, int i7){ return spu_cwd_pos((int)a._u32[0]+i7); }

@@ -1,0 +1,358 @@
+KZ3 patch 2069 (RSX pass 65): native mouse look (the RE notes s.12.3, the RE notes "Pass 65").
+libs/input/pad_mouse.{h,c}: Raw Input counts (WM_INPUT, relative, unaccelerated) summed on the window thread and taken
+once per look update by kz3_mouse_look_pre (port/kz3/main.cpp, a pre-hook on ControllerBase::SetViewAngles at the
+soldier's on-foot call), which adds them to the game's own yaw delta / pitch with the weapon's look scale; the
+arithmetic, the KZ3_MOUSE_SCRIPT test input and the accumulator are header-only / platform-free (host test
+tools/smoke/test_mouse_look.sh). The two window procedures (null backend = live renderer, D3D12 backend) register Raw
+Input on the game window and hide/clip the cursor while it is active. KZ3_MOUSE_LOOK=1 turns it on (default off);
+KZ3_MOUSE_SENS, KZ3_MOUSE_ZOOM_SENS, KZ3_MOUSE_INVERT, KZ3_MOUSE_SCRIPT, KZ3_MOUSE_LOG. Sensitivity model (radians per
+count, 0.003 default) from KAMI (isJuhn/KAMI, MIT).
+
+diff --git a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+new file mode 100644
+index 0000000..1281982
+--- /dev/null
++++ b/libs/input/pad_mouse.c
+@@ -0,0 +1,157 @@
++/* KZ3 patch 2069: native mouse look, runtime side (pad_mouse.h has the design, switches and units). */
++#include "pad_mouse.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <pthread.h>
++#endif
++
++static int         s_on = -1;
++static int         s_log_each;
++static PadMouseCfg s_cfg = { PAD_MOUSE_SENS_DEFAULT, 1.0f, 0 };
++static PadMouseEv  s_ev[PAD_MOUSE_SCRIPT_MAX];
++static int         s_nev;
++static double      s_t0 = -1.0;
++static long        s_dx, s_dy;   /* counts since the last take (under s_lock) */
++#ifdef _WIN32
++static SRWLOCK     s_lock = SRWLOCK_INIT;
++#define PM_LOCK()   AcquireSRWLockExclusive(&s_lock)
++#define PM_UNLOCK() ReleaseSRWLockExclusive(&s_lock)
++#else
++static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
++#define PM_LOCK()   pthread_mutex_lock(&s_lock)
++#define PM_UNLOCK() pthread_mutex_unlock(&s_lock)
++#endif
++
++static float pm_envf(const char* name, float def)
++{
++    const char* e = getenv(name);
++    if (!e || !*e) return def;
++    char* end;
++    float v = strtof(e, &end);
++    return (end != e && isfinite(v)) ? v : def;
++}
++
++static void pm_init(void)
++{
++    if (s_on >= 0) return;
++    const char* e = getenv("KZ3_MOUSE_LOOK");
++    int on = e && atoi(e) > 0;
++    s_cfg.sens = pm_envf("KZ3_MOUSE_SENS", PAD_MOUSE_SENS_DEFAULT);
++    s_cfg.zoom_sens = pm_envf("KZ3_MOUSE_ZOOM_SENS", 1.0f);
++    e = getenv("KZ3_MOUSE_INVERT");
++    s_cfg.invert = e && atoi(e) > 0;
++    e = getenv("KZ3_MOUSE_LOG");
++    s_log_each = e && atoi(e) > 0;
++    e = getenv("KZ3_MOUSE_SCRIPT");
++    if (e && *e) {
++        int bad = 0;
++        s_nev = pad_mouse_script_parse(e, s_ev, PAD_MOUSE_SCRIPT_MAX, &bad);
++        if (bad) fprintf(stderr, "[mouse] WARNING: KZ3_MOUSE_SCRIPT: %d token(s) not read\n", bad);
++    }
++    if (on)
++        fprintf(stderr, "[mouse] look on: sens=%.5f rad/count zoom=%.3f invert=%d script=%d event(s)\n",
++                s_cfg.sens, s_cfg.zoom_sens, s_cfg.invert, s_nev);
++    s_on = on;
++}
++
++int pad_mouse_enabled(void) { pm_init(); return s_on; }
++const PadMouseCfg* pad_mouse_cfg(void) { pm_init(); return &s_cfg; }
++int pad_mouse_log_each(void) { pm_init(); return s_log_each; }
++
++void pad_mouse_add(int dx, int dy)
++{
++    PM_LOCK();
++    s_dx += dx;
++    s_dy += dy;
++    PM_UNLOCK();
++}
++
++int pad_mouse_take(double now, int* dx, int* dy)
++{
++    pm_init();
++    PM_LOCK();
++    *dx = (int)s_dx;
++    *dy = (int)s_dy;
++    s_dx = s_dy = 0;
++    PM_UNLOCK();
++    if (s_nev) {
++        if (s_t0 < 0.0) s_t0 = now;
++        pad_mouse_script_due(s_ev, s_nev, now - s_t0, dx, dy);
++    }
++    return *dx || *dy;
++}
++
++#ifdef _WIN32
++static HWND s_hwnd;
++static int  s_captured;
++
++static void pm_capture(HWND hwnd, int on)
++{
++    if (on) {
++        RECT rc;
++        POINT tl = {0, 0}, br;
++        GetClientRect(hwnd, &rc);
++        br.x = rc.right; br.y = rc.bottom;
++        ClientToScreen(hwnd, &tl);
++        ClientToScreen(hwnd, &br);
++        RECT clip = { tl.x, tl.y, br.x, br.y };
++        ClipCursor(&clip);
++        if (!s_captured) ShowCursor(FALSE);
++        s_captured = 1;
++    } else if (s_captured) {
++        ClipCursor(NULL);
++        ShowCursor(TRUE);
++        s_captured = 0;
++    }
++}
++
++void pad_mouse_attach(HWND hwnd)
++{
++    if (!pad_mouse_enabled() || !hwnd) return;
++    RAWINPUTDEVICE rid;
++    rid.usUsagePage = 0x01;   /* generic desktop */
++    rid.usUsage = 0x02;       /* mouse */
++    rid.dwFlags = 0;          /* only while the window has the focus */
++    rid.hwndTarget = hwnd;
++    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
++        fprintf(stderr, "[mouse] RegisterRawInputDevices failed (%lu): no mouse look\n", GetLastError());
++        return;
++    }
++    s_hwnd = hwnd;
++    if (GetForegroundWindow() == hwnd) pm_capture(hwnd, 1);
++    fprintf(stderr, "[mouse] raw input registered\n");
++}
++
++int pad_mouse_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
++{
++    (void)res;
++    if (!s_hwnd || hwnd != s_hwnd) return 0;
++    switch (msg) {
++    case WM_INPUT: {
++        RAWINPUT ri;
++        UINT size = sizeof(ri);
++        if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
++            ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
++            (ri.data.mouse.lLastX || ri.data.mouse.lLastY))
++            pad_mouse_add((int)ri.data.mouse.lLastX, (int)ri.data.mouse.lLastY);
++        return 0;   /* DefWindowProc cleans up */
++    }
++    case WM_ACTIVATE:
++        pm_capture(hwnd, LOWORD(wp) != WA_INACTIVE);
++        return 0;
++    case WM_SIZE:
++    case WM_MOVE:
++        if (s_captured) pm_capture(hwnd, 1);
++        return 0;
++    case WM_KILLFOCUS:
++        pm_capture(hwnd, 0);
++        return 0;
++    }
++    return 0;
++}
++#endif
+diff --git a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+new file mode 100644
+index 0000000..b1648ea
+--- /dev/null
++++ b/libs/input/pad_mouse.h
+@@ -0,0 +1,129 @@
++/* KZ3 patch 2069: native mouse look (the RE notes s.12; the hook design is s.12.3).
++ *
++ * The mouse does not move the camera from outside the frame. Raw Input counts (WM_INPUT, unaccelerated, relative)
++ * are summed here on the window thread; the game's own look update takes the sum once per call
++ * (kz3_mouse_look_pre in port/kz3/main.cpp, called at the entry of ControllerBase::SetViewAngles 0x5A3350 when the
++ * return address is the soldier's normal on-foot call 0x685FA4, 1.14 0x5B7760 / 0x69B120) and adds it to the
++ * yaw delta and the absolute pitch the game computed from the stick, so the game's own writer stores them and
++ * derives the aim point. The stick's dead zone, response curve, acceleration and smoothing never see the mouse.
++ *
++ * Units (s.12.2, 12.3): yaw argument = a per-call delta in radians, pitch = absolute radians clamped to the entity's
++ * limits E+0x1C4/+0x1C8. Mouse right (dx > 0) = negative yaw delta, mouse up (dy < 0) = positive pitch.
++ * scale = the weapon's own look scale (weapon->vf163(), 1.0 hip-fire, the designers' factor for scopes; the same
++ * factor the stick path multiplies by) times the user's zoom factor while the weapon reports zoom.
++ * Sensitivity model from KAMI (isJuhn/KAMI, MIT): radians per count, default 0.003 (about 0.17 degrees per count).
++ *
++ * Switches (read once; pad_mouse.c):
++ *   KZ3_MOUSE_LOOK=1        on (default off: opt-in until the owner has tried it).
++ *   KZ3_MOUSE_SENS=<f>      radians per count (0.003).
++ *   KZ3_MOUSE_ZOOM_SENS=<f> extra factor while zoomed (1.0; the weapon's own factor already applies).
++ *   KZ3_MOUSE_INVERT=1      inverted Y.
++ *   KZ3_MOUSE_SCRIPT=<s>    test input, "T:dx,dy[*N]" events separated by ',' ';' or spaces. T = seconds since
++ *                           the first on-foot look update; each event adds dx,dy counts to N consecutive look
++ *                           updates (default 1). Example "20:1047,0 30:0,-200*10".
++ *   KZ3_MOUSE_LOG=1         one "[mouse]" line per look update that moved (otherwise once per second).
++ *
++ * Header-only pure helpers (host test tools/smoke/test_mouse_look.c); the Win32 side is in pad_mouse.c. */
++#ifndef PAD_MOUSE_H
++#define PAD_MOUSE_H
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct {
++    float sens;       /* radians per count */
++    float zoom_sens;  /* extra factor while zoomed */
++    int   invert;     /* 1 = mouse up looks down */
++} PadMouseCfg;
++
++#define PAD_MOUSE_SENS_DEFAULT 0.003f
++
++/* New yaw delta and pitch for one look update. yaw/pitch hold the game's values on entry. ads = the weapon's look
++ * scale (1.0 without a weapon); pitch limits are applied when pmin <= pmax and both are finite (the game's pitch
++ * is already clamped, so only the sum needs it). Returns 1 when anything was added. */
++static inline int pad_mouse_look_apply(const PadMouseCfg* c, int dx, int dy, float ads, int zoomed,
++                                       float pmin, float pmax, float* yaw, float* pitch)
++{
++    if (!dx && !dy) return 0;
++    float k = c->sens * ((ads > 0.0f && isfinite(ads)) ? ads : 1.0f) * (zoomed ? c->zoom_sens : 1.0f);
++    *yaw += -(float)dx * k;
++    float p = *pitch + -(float)dy * k * (c->invert ? -1.0f : 1.0f);
++    if (isfinite(pmin) && isfinite(pmax) && pmin <= pmax) {
++        if (p < pmin) p = pmin;
++        if (p > pmax) p = pmax;
++    }
++    *pitch = p;
++    return 1;
++}
++
++/* KZ3_MOUSE_SCRIPT */
++typedef struct {
++    double t;
++    int dx, dy;
++    int left;   /* look updates still to feed */
++} PadMouseEv;
++
++#define PAD_MOUSE_SCRIPT_MAX 256
++
++/* Parses "T:dx,dy[*N]" events; returns the count, *bad = tokens it could not read. */
++static inline int pad_mouse_script_parse(const char* s, PadMouseEv* ev, int max, int* bad)
++{
++    int n = 0;
++    *bad = 0;
++    while (s && *s) {
++        while (*s == ' ' || *s == ',' || *s == ';' || *s == '\t' || *s == '\n' || *s == '\r') s++;
++        if (!*s) break;
++        char* e;
++        double t = strtod(s, &e);
++        int ok = e != s && *e == ':';
++        long dx = 0, dy = 0, cnt = 1;
++        if (ok) { s = e + 1; dx = strtol(s, &e, 10); ok = e != s && *e == ','; }
++        if (ok) { s = e + 1; dy = strtol(s, &e, 10); ok = e != s; }
++        if (ok && *e == '*') { s = e + 1; cnt = strtol(s, &e, 10); ok = e != s && cnt > 0; }
++        if (ok && *e && *e != ' ' && *e != ',' && *e != ';' && *e != '\t' && *e != '\n' && *e != '\r') ok = 0;
++        if (!ok) {
++            (*bad)++;
++            while (*s && *s != ' ' && *s != ';' && *s != '\t' && *s != '\n') s++;
++            continue;
++        }
++        if (n < max) { ev[n].t = t; ev[n].dx = (int)dx; ev[n].dy = (int)dy; ev[n].left = (int)cnt; n++; }
++        else (*bad)++;
++        s = e;
++    }
++    return n;
++}
++
++/* Adds the counts of every event due at `now` (one share per look update) to *dx and *dy. */
++static inline void pad_mouse_script_due(PadMouseEv* ev, int n, double now, int* dx, int* dy)
++{
++    for (int i = 0; i < n; i++)
++        if (ev[i].left > 0 && now >= ev[i].t) { *dx += ev[i].dx; *dy += ev[i].dy; ev[i].left--; }
++}
++
++/* Runtime side (pad_mouse.c). */
++int  pad_mouse_enabled(void);
++const PadMouseCfg* pad_mouse_cfg(void);
++int  pad_mouse_log_each(void);
++void pad_mouse_add(int dx, int dy);
++/* Takes (and clears) the counts since the last call, plus the script's due events; `now` = seconds on the caller's
++ * clock (the script's clock starts at the first call). Returns 1 when either count is non-zero. */
++int  pad_mouse_take(double now, int* dx, int* dy);
++
++#ifdef _WIN32
++#include <windows.h>
++/* Window glue for the backends' window procedures: registers Raw Input for the mouse on the game window (when
++ * KZ3_MOUSE_LOOK is on) and hides/clips the cursor while the window is active. pad_mouse_wndmsg returns 1 when the
++ * message is fully handled (*res set); WM_INPUT is never fully handled (DefWindowProc does the cleanup). */
++void pad_mouse_attach(HWND hwnd);
++int  pad_mouse_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 3bff425..1d30a98 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -698,10 +698,12 @@ static u32    s_lock_n  = 0;
+  * -----------------------------------------------------------------------*/
+ 
+ #include "rsx_window_size.h"   /* KZ3 patch 2062: window size apart from the guest output */
++#include "../input/pad_mouse.h"   /* KZ3 patch 2069: mouse look (Raw Input, cursor clip) */
+ 
+ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     LRESULT sized;
++    if (pad_mouse_wndmsg(hwnd, msg, wp, lp, &sized)) return sized;
+     if (rsx_win_size_msg(hwnd, msg, wp, lp, &sized)) return sized;
+     switch (msg) {
+     case WM_CLOSE:
+@@ -6914,6 +6916,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+                  title ? title : "ps3recomp");
+     }
+     s_d3d.hwnd = create_window(width, height, title);
++    pad_mouse_attach(s_d3d.hwnd);   /* KZ3 patch 2069 */
+     if (!s_d3d.hwnd) {
+         printf("[D3D12] ERROR: Window creation failed\n");
+         return -1;
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index e984679..264f138 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -53,10 +53,12 @@ static NullBackendState s_state;
+ static int s_present_suppressed = 0;
+ 
+ #include "rsx_window_size.h"   /* KZ3 patch 2062: window size apart from the guest output */
++#include "../input/pad_mouse.h"   /* KZ3 patch 2069: mouse look (Raw Input, cursor clip) */
+ 
+ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     LRESULT sized;
++    if (pad_mouse_wndmsg(hwnd, msg, wp, lp, &sized)) return sized;
+     if (rsx_win_size_msg(hwnd, msg, wp, lp, &sized)) return sized;
+     switch (msg) {
+     case WM_CLOSE:
+@@ -263,6 +265,7 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+         wr.right - wr.left, wr.bottom - wr.top,
+         NULL, NULL, GetModuleHandle(NULL), NULL);
+ 
++    pad_mouse_attach(s_state.hwnd);   /* KZ3 patch 2069 */
+     if (!s_state.hwnd) {
+         printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());
+         return -1;

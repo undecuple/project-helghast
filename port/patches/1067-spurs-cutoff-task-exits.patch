@@ -1,0 +1,132 @@
+KZ3 patch 1067 (SPU pass 50; opt-in KZ3_JOIN_CUTOFF_EXIT=1): after patch 1066 a task cut off by cellSpursJoinTaskset
+(parked in WAIT_SIGNAL when its taskset was joined) stays parked forever on its host thread: one leaked thread per
+cut-off (pass 49: 1 cut-off in 72 joins; pass 50: 0 in 56). With the switch the cut-off task leaves the wait (Join
+wakes the waiters; the 1 s timed wait catches a late one) without consuming or clearing the new generation's
+SIGNALLED bit, and spu_task_cutoff_exit ends its run like a quiet halt: spu_async_run then runs the task's exit, which
+1066 already makes leave the new task's bits alone, and the thread returns. Host-tested (tools/spu/test_spurs_join.sh);
+no game run has exercised the exit yet, hence opt-in. "[ts-join] cut-off task N ... leaves WAIT_SIGNAL" lines (first
+16, then every 64th). Upstream candidate together with 1066.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream's coherent signal watch + 1066's parked count; 1067's `!cut` on upstream's moved signalled update.
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 8526bbb4..a24b988b 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -184,6 +184,16 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+  * never sees atomics); the culling probe (port/spu/kz3_cull_probe.c) watches the frame's sync word with it. */
+ void (*g_kz3_putllc_hook)(uint32_t ea) = 0;
+ 
++/* KZ3 patch 1067: end a task cut off by cellSpursJoinTaskset from inside its WAIT_SIGNAL: back to
++ * spu_run_with_halt like a halt, without the halt's register dump; spu_async_run then runs the task's exit (which
++ * patch 1066 makes leave the new generation's bits alone) and the host thread returns. */
++void spu_task_cutoff_exit(spu_context* ctx)
++{
++    g_spu_trampoline_fn = 0;
++    if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
++    fprintf(stderr, "[ts-join] cut-off task outside the execution driver at 0x%05X: resumes\n", ctx->pc);
++}
++
+ void spu_halt(spu_context* ctx)
+ {
+     /* Register/context dump at halt-asserts: the WWS job's parameter guard
+@@ -2615,9 +2625,10 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+             }
+             yz_lockstep_block_begin(ctx);
+             spu_taskset_parked_add(ts, tid, wobj);
+-            spu_taskset_wait_signal(ts, tid);
++            const int cut = spu_taskset_wait_signal(ts, tid);   /* 1 = cut off by JoinTaskset (KZ3 patch 1067) */
+             spu_taskset_parked_del(ts, tid);
+             yz_lockstep_block_end(ctx);
++            if (cut == 1) spu_task_cutoff_exit(ctx);   /* ends the task's run; its exit leaves the new bits alone */
+             spu_ef_deliver_owed(ctx, wobj);
+         }
+         ctx->gpr[3]._u32[0] = 0;
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 72e461e7..6b9b21f6 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -535,6 +535,10 @@ static void ts_unlock(void) { InterlockedExchange(&s_ts_lock, 0); }
+  * taskset's waiting tasks are never resumed) and its exit, if any, leaves the new tasks' state alone.
+  * KZ3_JOIN_TASKSET_OLD=1 = the old behaviour; KZ3_JOIN_TASKSET_MS = the wait bound (default 1000). */
+ static _Thread_local uint32_t t_task_ts, t_task_gen;
++/* KZ3 patch 1067 (opt-in, KZ3_JOIN_CUTOFF_EXIT=1): a cut-off parked task leaves WAIT_SIGNAL and ends its host thread
++ * instead of staying parked forever (1066: one leaked parked thread per cut-off, about 1 join in 70 in pass 49-50
++ * runs). Off by default until a game run has exercised the exit path (none of 56 joins in pass 50 cut a task off). */
++static int ts_cutoff_exit(void) { static int v = -1; if (v < 0) { const char* e = getenv("KZ3_JOIN_CUTOFF_EXIT"); v = (e && *e == '1'); } return v; }
+ static int ts_join_old(void) { static int v = -1; if (v < 0) { const char* e = getenv("KZ3_JOIN_TASKSET_OLD"); v = (e && *e == '1'); } return v; }
+ static int ts_find(uint32_t taskset_ea)
+ {
+@@ -587,6 +591,7 @@ int spu_taskset_join_wait(uint32_t taskset_ea)
+                 memset(s_ts_run[i].running, 0, sizeof s_ts_run[i].running);
+             }
+             ts_unlock();
++            if (parked > 0) { extern void spu_taskset_wake_waiters(void); spu_taskset_wake_waiters(); }   /* 1067 */
+             break;
+         }
+         ts_unlock();
+@@ -1602,6 +1607,16 @@ void spu_taskset_line_committed(uint32_t line)
+ /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
+  * the 0xA70 taskset-syscall intercept). Consumes a pending signal or blocks
+  * until one is delivered. Returns 0 (the syscall's success rc). */
++/* KZ3 patch 1067: wake every WAIT_SIGNAL waiter to re-check its condition (a cut-off one then leaves). */
++void spu_taskset_wake_waiters(void)
++{
++#ifdef _WIN32
++    AcquireSRWLockExclusive(&s_sig_lock); WakeAllConditionVariable(&s_sig_cv); ReleaseSRWLockExclusive(&s_sig_lock);
++#else
++    pthread_mutex_lock(&s_sig_lock); pthread_cond_broadcast(&s_sig_cv); pthread_mutex_unlock(&s_sig_lock);
++#endif
++}
++
+ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+ {
+     if (!taskset_ea || taskId >= 128) return 0;
+@@ -1654,7 +1669,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+      * path (complete its loop / set completion flags) instead of hanging. 0/unset
+      * keeps the block-forever behaviour. Reversible, opt-in. */
+     unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
+-    int drained = 0;
++    int drained = 0, cut = 0;   /* cut: KZ3 patch 1067 */
+     /* Release the global SPU-serial lock while parked so another SPU task can
+      * run (and possibly signal us); re-acquired before returning to resume. */
+     spu_serial_release();
+@@ -1666,6 +1681,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+ #ifdef _WIN32
+     AcquireSRWLockExclusive(&s_sig_lock);
+     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId) || ts_stale(taskset_ea)) {   /* 1066 */
++        if (ts_cutoff_exit() && ts_stale(taskset_ea)) { cut = 1; break; }   /* 1067: never this task's signal */
+         if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+             static int _n = 0;
+             if (++secs && _n < 16) { _n++;
+@@ -1678,6 +1694,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+ #else
+     pthread_mutex_lock(&s_sig_lock);
+     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId) || ts_stale(taskset_ea)) {   /* 1066 */
++        if (ts_cutoff_exit() && ts_stale(taskset_ea)) { cut = 1; break; }   /* 1067: never this task's signal */
+         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
+         if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+             static int _n = 0;
+@@ -1693,7 +1710,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     spu_coh_watch_remove(&watch);
+     spu_lockline_unlock();
+     /* Signals coalesce in the bit, so consuming it outside s_sig_lock loses none. */
+-    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
++    if (!drained && !cut) spu_signalled_update(taskset_ea, taskId, 0);   /* 1067: not the new task's bit; PR #340 */
+     ts_parked_add(taskset_ea, -1);
+     if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
+         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
+@@ -1701,6 +1718,13 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     spu_serial_acquire();       /* resume: re-take the serial lock */
+     { extern unsigned long long ps3_ms_now(void);
+       s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
++    if (cut) {   /* KZ3 patch 1067: the caller ends the task (spu_task_cutoff_exit), the thread returns */
++        static volatile LONG n; LONG k = InterlockedIncrement(&n);
++        if (k <= 16 || (k % 64) == 0)
++            fprintf(stderr, "[ts-join] cut-off task %u of taskset 0x%08X leaves WAIT_SIGNAL after %us (#%ld)\n",
++                    taskId, taskset_ea, secs, (long)k);
++        return 1;
++    }
+     return 0;
+ }
+ 

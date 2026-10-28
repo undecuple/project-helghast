@@ -1,0 +1,127 @@
+{
+ "format": 1,
+ "generator_sha256": "7c26a799cf6fcece905b71bfdb31d4ddcd767694d891833d7c877b392862ab82",
+ "fonts_sha256": {
+  "Rajdhani-Bold.ttf": "691470dd3286a14e9677940d0bf75796179841ba5215cbda1a2c8910a3226afd",
+  "Rajdhani-Medium.ttf": "12ff7dcfe4c206e3875ac53b1762eab57de6a2fa7f5a86c26b97b88d6591eac2"
+ },
+ "fonts_source": "https://raw.githubusercontent.com/google/fonts/main/ofl/",
+ "pillow": "12.3.0",
+ "freetype": "2.14.3",
+ "files": {
+  "header-100.bmp": {
+   "size": [
+    55,
+    55
+   ],
+   "bytes": 9294,
+   "sha256": "adcdfd8158af9ce9f528700e560698ff494eaa069e43033e2567f5d5eaf9e51a"
+  },
+  "header-125.bmp": {
+   "size": [
+    64,
+    68
+   ],
+   "bytes": 13110,
+   "sha256": "24f90daa5bcaa351d516a66df893413249348c043dae7fdbbd8d433adae66484"
+  },
+  "header-150.bmp": {
+   "size": [
+    83,
+    80
+   ],
+   "bytes": 20214,
+   "sha256": "0474c3850c37b3d6898aa8bb48fc9aae67354de00b32c63e060dad52ffb9d245"
+  },
+  "header-200.bmp": {
+   "size": [
+    110,
+    106
+   ],
+   "bytes": 35246,
+   "sha256": "bddac06c984c15ff6b19a067281b1c5f3e0a668a816d7b291367f5615d2cd796"
+  },
+  "kz3-launcher.ico": {
+   "size": [
+    256,
+    256
+   ],
+   "bytes": 49844,
+   "sha256": "f4713121d8e61ef2d0e1987aff2268875a736a0b270ca12f616a0d20737534b0"
+  },
+  "kz3-setup.ico": {
+   "size": [
+    256,
+    256
+   ],
+   "bytes": 51453,
+   "sha256": "160be93b748f833e1859a94eedb5c9584f34bb83f6af6742a0cbf9e89465d98b"
+  },
+  "kz3-uninstall.ico": {
+   "size": [
+    256,
+    256
+   ],
+   "bytes": 49996,
+   "sha256": "b620b42502f8cbf5fcf9d4d69af93de6f306dc7df8a14d9701a4ead3697ccc8b"
+  },
+  "wizard-100.bmp": {
+   "size": [
+    164,
+    314
+   ],
+   "bytes": 154542,
+   "sha256": "eb639278853cbc4f4b4c2fe6570e90fcf68acb3c093b445ad1ea675c7ca04891"
+  },
+  "wizard-125.bmp": {
+   "size": [
+    192,
+    386
+   ],
+   "bytes": 222390,
+   "sha256": "3287281c9ea9018191b99c5270e9656a627c4c6952998fa12de2783a08366e53"
+  },
+  "wizard-150.bmp": {
+   "size": [
+    246,
+    459
+   ],
+   "bytes": 339714,
+   "sha256": "e544cffb53a7e7e27b7ae894a87338fd20f7914c39d3a139f1499164b263def9"
+  },
+  "wizard-200.bmp": {
+   "size": [
+    328,
+    604
+   ],
+   "bytes": 594390,
+   "sha256": "bee3b8027bb60a4ec94a5434d6312ebaa4e2c62d7713de0994d0f3ff7cf3fab8"
+  }
+ },
+ "public_files": {
+  "banner.png": {
+   "size": [
+    1280,
+    320
+   ],
+   "bytes": 78407,
+   "sha256": "0e5d4a8112f07583b52ecf4fe49bae328836b5a42e43b2c469680d2c87906045"
+  },
+  "banner@2x.png": {
+   "size": [
+    2560,
+    640
+   ],
+   "bytes": 150907,
+   "sha256": "76c43762cd7eddb97d48121a12ef0413e18ea0bb69d72346dc53441c56119937"
+  },
+  "social-preview.png": {
+   "size": [
+    1280,
+    640
+   ],
+   "bytes": 105171,
+   "sha256": "db553fd2f1464521c1e3c223862e9887bb0ff6fbfd582680304ef623eac3240e"
+  }
+ }
+}

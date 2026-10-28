@@ -1,0 +1,808 @@
+KZ3 patch 2033: cheaper texture change detection and the vertex-fetch profile (pass 34).
+
+- ld_fast_hash: the per-frame texture content hash (and the vertex-texture hash) runs four
+  independent lanes instead of one FNV chain; same bytes in, mutation detection only.
+- LD_TEX_HASH_SPAN=N (default 0 = off): a cached texture whose hash was unchanged N times in a
+  row is re-hashed every N frames unless a tracked writer touched its span. Tracked writers mark
+  a 64 KB page bitmap per location: the walker's own stores (NV0039 copies, NV3089 blits, NV308A
+  inline writes, surface write-backs) and SPU DMA puts (spu_dma.h -> cellGcm_note_guest_write_ea
+  through a hook pointer in spu_coherency.c that cellGcmInit installs via a weak function reference). Direct PPU stores are not tracked;
+  [tex-hash] counts hash changes that no tracked write preceded ("untracked").
+- [perf-vtx]: the vertex-fetch split (refs, remap, fetch, copy) and volumes inside the
+  RSX_PERF_PROF window; rsx_vertex_decode_fast hoists the type switch out of the component loop;
+  rsx_vertex_remap_build takes a dense id range as the unique list instead of the hash table.
+- Texture cache: MAX_TEXTURES 1024 -> 8192 (the level binds ~2,500 distinct textures a frame and the LRU
+  evicted ~243 per frame, each decoded again; RE pass 72) with a hash-indexed lookup in place of the
+  linear scan per bind.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream engine-wrote note added next to ours, both kept.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): decode_fast moved to upstream's rsx_vertex_fetch_attr_value (single-vertex path); upstream's attribute-major fetch_many left as is.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 70841f03..25e35b89 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -16,6 +16,8 @@
+ #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+ #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+ #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
++void cellGcm_spu_guest_write_hook_install(void);   /* patch 2033 */
++static void gcm_note_pages_ea(u32 ea, u32 size);           /* patch 2033 */
+ #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
+ #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
+ static unsigned long s_perf_rsx_tid, s_perf_gcm_tid;   /* RSX_PERF thread labels (patch 2007) */
+@@ -510,6 +512,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+ #ifdef _WIN32
+     if (rsx_perf_enabled()) s_perf_gcm_tid = GetCurrentThreadId();   /* RSX_PERF label */
+ #endif
++    if (rsx_live_draw_enabled()) cellGcm_spu_guest_write_hook_install();   /* patch 2033 */
+     printf("[cellGcmSys] Init(cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%08X)\n",
+            cmdSize, ioSize, ioAddress);
+ 
+@@ -1289,6 +1292,7 @@ static void nv3089_blit(void)
+                          srow + (u32)(su >> 20) * 4, 4);
+               }
+           } }
++        gcm_note_pages_ea(dst2, out_w * out_h * 4u);   /* patch 2033 */
+         { static int _n = 0; static int cap = -1;
+           if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
+           if (cap && _n < cap) { _n++;
+@@ -1394,6 +1398,7 @@ static void nv3089_blit(void)
+         const u32 y1 = (out_y + out_h < cy1) ? out_y + out_h : cy1;
+         nv3089_engine_wrote(dst_pitch, x0, y0, x1, y1);
+     }
++    if (out_h && out_w) gcm_note_pages_ea(dst + out_y * dst_pitch + out_x * bpp, (out_h - 1u) * dst_pitch + out_w * bpp);   /* patch 2033 */
+     { static int _n = 0; static int cap = -1;
+       if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
+       if (cap && _n < cap) { _n++;
+@@ -1603,6 +1608,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
+                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
+             vm_write32(base + py * dst_pitch + px * 4, data);
++            gcm_note_pages_ea(base + py * dst_pitch + px * 4, 4u);   /* patch 2033 */
+             return;
+         }
+         return;
+@@ -2335,6 +2341,12 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+                     d[RSX_PERF_W_M2MF_T] * tk, d[RSX_PERF_W_TEX_HASH_T] * tk,
+                     d[RSX_PERF_W_PSO_PRE_T] * tk, d[RSX_PERF_W_PSO_UNITS_T] * tk, d[RSX_PERF_W_PSO_KEY_T] * tk,
+                     d[RSX_PERF_W_PSO_FIND_T] * tk, d[RSX_PERF_W_PSO_MEMO_N]);
++            if (d[RSX_PERF_W_ON])   /* patch 2033: the vertex-fetch split, ms in the last period */
++                fprintf(stderr,
++                    "[perf-vtx] t=%.0fs refs %.1fms remap %.1f fetch %.1f copy %.1f | refs %lld verts %lld payload %.1fMB\n",
++                    tnow, d[RSX_PERF_W_VTX_REFS_T] * tk, d[RSX_PERF_W_VTX_REMAP_T] * tk,
++                    d[RSX_PERF_W_VTX_FETCH_T] * tk, d[RSX_PERF_W_VTX_COPY_T] * tk,
++                    d[RSX_PERF_W_VTX_REF_N], d[RSX_PERF_W_VTX_N], (double)d[RSX_PERF_W_VTX_BYTES] / 1048576.0);
+             s_perf_walk_on = s_perf_prof_a >= 0 && tnow >= s_perf_prof_a && tnow < s_perf_prof_b;
+         }
+         {   /* top 4 usleep sites of the cellGcmInit thread, real ms */
+@@ -4460,6 +4472,33 @@ u32 cellGcmResolveOffset(u32 offset)
+  * Safe from any thread; live-draw applies it before its next texture bind.
+  * Local memory -> location 0, IO-mapped main memory -> location 1; other
+  * addresses are not visible to the RSX and are ignored. */
++/* KZ3 patch 2033: the walker's own stores through effective addresses (NV3089 blits, NV308A inline writes):
++ * page-level note only (the per-frame hash already saw such writes at the next frame; this keeps the
++ * quiet-texture hashing from skipping them). */
++static void gcm_note_pages_ea(u32 ea, u32 size)
++{
++    if (!size || !rsx_live_draw_enabled()) return;
++    if (ea >= s_config.localAddress && ea - s_config.localAddress < s_config.localSize) {
++        rsx_live_draw_note_guest_write_pages(0u, ea - s_config.localAddress, size);
++        return;
++    }
++    const u16 io_page = s_io_address_table[ea >> 20];
++    if (io_page != 0xFFFF)
++        rsx_live_draw_note_guest_write_pages(1u, ((u32)io_page << 20) | (ea & 0xFFFFFu), size);
++}
++/* KZ3 patch 2033: SPU DMA puts (runtime/spu/spu_dma.h) report through a pointer owned by the SPU runtime
++ * (spu_coherency.c: spu_set_guest_write_hook). A weak function reference: programs without the SPU runtime
++ * (host tests) link with it null and skip the install. (A weak data definition did not link under MinGW's
++ * ld: the .refptr stub stayed undefined.) */
++extern void spu_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) __attribute__((weak));
++/* The SPU hook marks pages only. Feeding every DMA put into the patch-2017 gv ring made the walker scan all
++ * cache entries per put (r34a/b: texture binds 37-48 ms/frame against 21 in pass 30). The ring stays for
++ * explicit callers (cellGcm_note_guest_write_ea: host tests, PPU-side copies). */
++void cellGcm_note_guest_write_pages_ea(u32 ea, u32 size) { gcm_note_pages_ea(ea, size); }
++void cellGcm_spu_guest_write_hook_install(void)
++{
++    if (spu_set_guest_write_hook) spu_set_guest_write_hook(cellGcm_note_guest_write_pages_ea);
++}
+ void cellGcm_note_guest_write_ea(u32 ea, u32 size)
+ {
+     if (!size || !rsx_live_draw_enabled()) return;
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 4bc03bb8..31426fd0 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -52,6 +52,7 @@ void rsx_live_draw_debug_cond_render_stats(u64 o[6]) { for (int i = 0; i < 6; i+
+ u32  rsx_live_draw_report_value(u32 off, u32 dflt) { (void)off; return dflt; }
+ void rsx_live_draw_debug_report_readback_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] = 0; }
+ void rsx_live_draw_note_guest_write_async(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
++void rsx_live_draw_note_guest_write_pages(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }   /* patch 2033 */
+ void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ u32  rsx_live_draw_before_guest_sync(void) { return 0; }
+ void rsx_live_draw_debug_writeback_stats(double* t, u32* b, u32* s, u32* w)
+@@ -143,7 +144,10 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ 
+ #define LD_SWAP_BUFFERS  2
+ #define MAX_SURFACES     64
+-#define MAX_TEXTURES     1024
++#define MAX_TEXTURES     8192   /* patch 2033: was 1024; the level binds ~2,500 distinct textures a frame and the
++                                 * LRU evicted ~243 of them per frame (RE pass 72), each decoded again */
++#define TEX_INDEX_SIZE   (4u * MAX_TEXTURES)   /* patch 2033: hash index over g.textures, power of two */
++#define LD_TEX_HASH_SPAN_DEFAULT 0   /* patch 2033: LD_TEX_HASH_SPAN default (frames; 0 = hash every frame) */
+ #define MAX_RETIRED_TEXTURES 4096
+ #define MAX_VTEX         64
+ #define MAX_SAMPLERS     128
+@@ -289,6 +293,9 @@ typedef struct {
+     u32 last_hash_frame;
+     u64 last_use_serial;
+     u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
++    u32 quiet;  /* patch 2033: consecutive hashes that found the same bytes (saturating) */
++    u32 written;   /* patch 2033: a tracked writer touched the span since the last hash */
++    u32 skip_frame;   /* patch 2033: frame of the last counted skip */
+ } texcache_t;
+ typedef struct {
+     u32 location, offset, format, width, height, pitch;
+@@ -296,6 +303,7 @@ typedef struct {
+     u64 content_hash;
+     u32 last_hash_frame;
+     u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
++    u32 quiet, written, skip_frame;   /* patch 2033, as texcache_t */
+ } vtexcache_t;
+ typedef struct { u64 key; ID3D12PipelineState* pso; u8 preloaded; } psocache_t;   /* patch 2031: preloaded until first use */
+ typedef struct {
+@@ -2610,6 +2618,160 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
+     return t->cubemap ? span * 6 : span;
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 2033: cheaper texture change detection.
++ *
++ * 1. ld_fast_hash: the per-frame content hash ran one FNV multiply per 8 bytes
++ *    on a single dependency chain (~2.5 GB/s). Four independent lanes over
++ *    32-byte blocks keep the detector exact (every byte feeds the result) and
++ *    run at memory speed. The value is only compared with itself.
++ *
++ * 2. Quiet-texture hashing (LD_TEX_HASH_SPAN=N, 0 = off): a cached texture
++ *    whose hash came back unchanged N times in a row is re-hashed every N
++ *    frames instead of every frame, unless a tracked writer touched its guest
++ *    span. Tracked writers set bits in a 64 KB page bitmap per location
++ *    (ld_td_mark, any thread, atomic OR):
++ *      - the walker's own guest stores: NV0039 copies (note_guest_write),
++ *        NV3089 blits and NV308A inline writes (cellGcmSys.c), surface
++ *        write-backs (ld_writeback_surface / batch);
++ *      - SPU DMA puts (spu_dma.h -> cellGcm_note_guest_write_ea);
++ *      - the gv ring (rsx_live_draw_note_guest_write_async).
++ *    A bind consults the live bitmap (writes earlier this frame); the flip
++ *    moves the live bits aside and flags every entry under them (writes after
++ *    the bind), so a tracked write is hashed at the texture's next bind, as
++ *    before the patch. Direct PPU stores (recompiled code) have no hook: a
++ *    long-quiet texture rewritten in place by the PPU shows up to N-1 frames
++ *    late; [tex-hash] counts those as "untracked" changes (hash changed with
++ *    no tracked write), which is the evidence for the default.
++ * -------------------------------------------------------------------------*/
++static u64 ld_fast_hash(const u8* src, u32 n)
++{
++    const u64 P = 1099511628211ull;
++    u64 h0 = 1469598103934665603ull, h1 = 0x9E3779B97F4A7C15ull, h2 = 0xC2B2AE3D27D4EB4Full,
++        h3 = 0x165667B19E3779F9ull;
++    u32 i = 0;
++    for (; i + 32 <= n; i += 32) {
++        u64 w0, w1, w2, w3;
++        memcpy(&w0, src + i, 8); memcpy(&w1, src + i + 8, 8);
++        memcpy(&w2, src + i + 16, 8); memcpy(&w3, src + i + 24, 8);
++        h0 = (h0 ^ w0) * P; h1 = (h1 ^ w1) * P; h2 = (h2 ^ w2) * P; h3 = (h3 ^ w3) * P;
++    }
++    for (; i + 8 <= n; i += 8) { u64 w; memcpy(&w, src + i, 8); h0 = (h0 ^ w) * P; }
++    for (; i < n; i++) h0 = (h0 ^ src[i]) * P;
++    u64 h = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xC2B2AE3D27D4EB4Full) ^ (h3 * 0x165667B19E3779F9ull);
++    h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
++    return h;
++}
++
++#define LD_TD_WORDS 2048u   /* 64 KB pages over a 4 GB offset space, 32 pages per word, per location */
++static volatile LONG g_ld_td[2][LD_TD_WORDS];   /* pages written since the last flip (any thread) */
++static u32 g_ld_td_prev[2][LD_TD_WORDS];        /* pages written during the previous frame (walker) */
++static int g_ld_tex_hash_span = -1;
++static struct { u64 hashes, skipped, changes, tracked, untracked, hashed_bytes, flip_flags; } g_ld_th;
++
++static int ld_tex_hash_span(void)
++{
++    if (g_ld_tex_hash_span < 0) {
++        const char* e = getenv("LD_TEX_HASH_SPAN");
++        g_ld_tex_hash_span = e ? atoi(e) : LD_TEX_HASH_SPAN_DEFAULT;
++        if (g_ld_tex_hash_span < 0) g_ld_tex_hash_span = 0;
++    }
++    return g_ld_tex_hash_span;
++}
++
++/* Any thread. Marks the 64 KB pages of [offset, offset+size) in `location`. */
++static void ld_td_mark(u32 location, u32 offset, u32 size)
++{
++    if (location > 1u || !size) return;
++    const u64 end = (u64)offset + size - 1u;
++    const u32 p0 = offset >> 16, p1 = (u32)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
++    volatile LONG* td = g_ld_td[location];
++    for (u32 p = p0; ; p++) {
++        const LONG bit = (LONG)(1u << (p & 31u));
++        if (!(td[p >> 5] & bit)) InterlockedOr(&td[p >> 5], bit);
++        if (p == p1) break;
++    }
++}
++void rsx_live_draw_note_guest_write_pages(u32 location, u32 offset, u32 size) { ld_td_mark(location, offset, size); }
++
++/* Walker. Is any page of the span flagged in `td`? An unknown span (0) counts as written. */
++static int ld_td_test(const u32* td, u32 offset, u32 span)
++{
++    if (!span) return 1;
++    const u64 end = (u64)offset + span - 1u;
++    const u32 p0 = offset >> 16, p1 = (u32)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
++    for (u32 p = p0; ; p++) {
++        if (td[p >> 5] & (1u << (p & 31u))) return 1;
++        if (p == p1) break;
++    }
++    return 0;
++}
++
++/* Walker, at a hash decision: hash now, or keep the cached decode for this frame? */
++static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_frame, u32 quiet, u32* written,
++                           u32* skip_frame)
++{
++    const int n = ld_tex_hash_span();
++    if (location > 1u || !span) return 1;   /* never rate-limited; `written` stays as it is for the stat */
++    if (*written) return 1;
++    if (ld_td_test((const u32*)g_ld_td[location], offset, span)) { *written = 1; return 1; }
++    const int due = !n || quiet < (u32)n || g_ld_frames - last_hash_frame >= (u32)n;
++    { static int dbg = -1;   /* LD_TEX_HASH_DBG=1: every decision (host tests) */
++      if (dbg < 0) dbg = getenv("LD_TEX_HASH_DBG") ? 1 : 0;
++      if (dbg) fprintf(stderr, "[tex-hash-dbg] frame=%u src=%u:0x%08X span=%u quiet=%u last=%u due=%d\n",
++                       g_ld_frames, location, offset, span, quiet, last_hash_frame, due); }
++    if (due) return 1;
++    if (*skip_frame != g_ld_frames) { *skip_frame = g_ld_frames; g_ld_th.skipped++; }   /* once per entry per frame */
++    return 0;
++}
++
++/* Walker, at a hash result: keep the quiet counter and the statistics. */
++static void ld_tex_hash_note(int readable, int changed, u32* quiet, u32* written)
++{
++    g_ld_th.hashes++;
++    if (readable && changed) {
++        g_ld_th.changes++;
++        if (*written) g_ld_th.tracked++; else g_ld_th.untracked++;
++        *quiet = 0;
++    } else if (readable && *quiet < 0xFFFFu) {
++        (*quiet)++;
++    }
++    *written = 0;
++}
++
++/* Walker, at the flip: move the live bits aside and flag the entries under them. */
++static void ld_td_flip(void)
++{
++    int any = 0;
++    for (u32 l = 0; l < 2u; l++)
++        for (u32 i = 0; i < LD_TD_WORDS; i++) {
++            u32 w = 0;
++            if (g_ld_td[l][i]) { w = (u32)InterlockedExchange(&g_ld_td[l][i], 0); any = 1; }
++            g_ld_td_prev[l][i] = w;
++        }
++    if (any) {
++        for (u32 i = 0; i < g.n_textures; i++) {
++            texcache_t* e = &g.textures[i];
++            if (e->tex && !e->written && e->location < 2u &&
++                ld_td_test(g_ld_td_prev[e->location], e->offset, e->span)) { e->written = 1; g_ld_th.flip_flags++; }
++        }
++        for (u32 i = 0; i < g.n_vtex; i++) {
++            vtexcache_t* e = &g.vtex[i];
++            if (e->tex && !e->written && e->location < 2u &&
++                ld_td_test(g_ld_td_prev[e->location], e->offset, e->span)) { e->written = 1; g_ld_th.flip_flags++; }
++        }
++    }
++    if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) {
++        fprintf(stderr, "[tex-hash] span=%d frame=%u hashes=%llu skipped=%llu bytes=%.1fMB changes=%llu tracked=%llu"
++                        " untracked=%llu flip-flags=%llu\n",
++                ld_tex_hash_span(), g_ld_frames, (unsigned long long)g_ld_th.hashes,
++                (unsigned long long)g_ld_th.skipped, (double)g_ld_th.hashed_bytes / 1048576.0,
++                (unsigned long long)g_ld_th.changes, (unsigned long long)g_ld_th.tracked,
++                (unsigned long long)g_ld_th.untracked, (unsigned long long)g_ld_th.flip_flags);
++        memset(&g_ld_th, 0, sizeof g_ld_th);
++    }
++}
++
+ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+ {
+     const u32 span = texture_source_span(t);
+@@ -2644,20 +2806,10 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+           tsn++;
+       } }
+ 
+-    /* One hash per cached texture per presented frame.  Word-at-a-time FNV is
+-     * deliberately cheap; this is a mutation detector, not a content ID. */
+-    u64 hash = 1469598103934665603ull;
+-    u32 i = 0;
+-    for (; i + 8 <= span; i += 8) {
+-        u64 word;
+-        memcpy(&word, src + i, sizeof(word));
+-        hash ^= word;
+-        hash *= 1099511628211ull;
+-    }
+-    for (; i < span; i++) {
+-        hash ^= src[i];
+-        hash *= 1099511628211ull;
+-    }
++    /* One hash per cached texture per presented frame: a mutation detector, not
++     * a content ID (KZ3 patch 2033: four independent lanes, see ld_fast_hash). */
++    u64 hash = ld_fast_hash(src, span);
++    g_ld_th.hashed_bytes += span;
+     /* LD_TEX_RAW_DUMP=<hex offset>|all: write the texture's raw guest bytes (all mip levels, as the decoder
+      * reads them) to scratch/texraw_<loc>_<offset>_<n>_<w>x<h>_f<fmt>_r<remap>_m<mips>.bin when first seen and
+      * each time they change (max 64 files), so a texture can be inspected offline
+@@ -3502,7 +3654,9 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size);
+ 
+ void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size)
+ {
+-    if (!g.ready || !size || !ld_gv_enabled()) return;
++    if (!g.ready || !size) return;
++    ld_td_mark(location, offset, size);   /* patch 2033: SPU DMA puts, any thread */
++    if (!ld_gv_enabled()) return;
+     LONG slot;
+     for (;;) {                                           /* claim a slot unless the ring is full */
+         slot = g_gv_ring_head;
+@@ -3605,6 +3759,79 @@ static void ld_gv_flip(void)
+     }
+ }
+ 
++/* KZ3 patch 2033: hash index over the texture cache (the lookup was a linear
++ * scan of up to MAX_TEXTURES entries per bind, ~2,500 binds a frame). Open
++ * addressing, linear probing; slot value = entry index + 1, 0 = empty,
++ * TEX_INDEX_TOMB = removed. The table is rebuilt from the entries when the
++ * tombstones pile up. Keyed by the full descriptor tuple the scan compared. */
++#define TEX_INDEX_TOMB 0xFFFFFFFFu
++static u32 g_ld_tex_index[TEX_INDEX_SIZE];
++static u32 g_ld_tex_index_tombs;
++static u32 ld_tex_key_hash(u32 location, u32 offset, u32 format, u32 width, u32 height, u32 pitch, u32 remap,
++                           u32 cubemap, u32 dimension, u32 depth)
++{
++    u64 h = 0x9E3779B97F4A7C15ull ^ ((u64)offset << 32 | location);
++    h = (h ^ format) * 0xBF58476D1CE4E5B9ull;
++    h = (h ^ ((u64)width << 32 | height)) * 0x94D049BB133111EBull;
++    h = (h ^ ((u64)pitch << 32 | remap)) * 0xBF58476D1CE4E5B9ull;
++    h = (h ^ ((u64)cubemap << 40 | (u64)dimension << 32 | depth)) * 0x94D049BB133111EBull;
++    h ^= h >> 31;
++    return (u32)h;
++}
++static u32 ld_tex_entry_hash(const texcache_t* e)
++{
++    return ld_tex_key_hash(e->location, e->offset, e->format, e->width, e->height, e->pitch, e->remap, e->cubemap,
++                           e->dimension, e->depth);
++}
++static void ld_tex_index_insert(u32 index)
++{
++    u32 k = ld_tex_entry_hash(&g.textures[index]) & (TEX_INDEX_SIZE - 1u);
++    for (;;) {
++        const u32 v = g_ld_tex_index[k];
++        if (v == 0u || v == TEX_INDEX_TOMB) { if (v == TEX_INDEX_TOMB) g_ld_tex_index_tombs--; g_ld_tex_index[k] = index + 1u; return; }
++        k = (k + 1u) & (TEX_INDEX_SIZE - 1u);
++    }
++}
++static void ld_tex_index_rebuild(void)
++{
++    memset(g_ld_tex_index, 0, sizeof g_ld_tex_index);
++    g_ld_tex_index_tombs = 0;
++    for (u32 i = 0; i < g.n_textures; i++) ld_tex_index_insert(i);
++}
++static void ld_tex_index_remove(u32 index)
++{
++    u32 k = ld_tex_entry_hash(&g.textures[index]) & (TEX_INDEX_SIZE - 1u);
++    for (;;) {
++        const u32 v = g_ld_tex_index[k];
++        if (v == 0u) return;   /* not indexed (never inserted) */
++        if (v == index + 1u) {
++            g_ld_tex_index[k] = TEX_INDEX_TOMB;
++            if (++g_ld_tex_index_tombs > MAX_TEXTURES) ld_tex_index_rebuild();
++            return;
++        }
++        k = (k + 1u) & (TEX_INDEX_SIZE - 1u);
++    }
++}
++static u32 ld_tex_index_find(const rsx_dsp_texture* t, u32 remap)
++{
++    u32 k = ld_tex_key_hash(t->location, t->offset, t->format, t->width, t->height, t->pitch, remap, t->cubemap,
++                            t->dimension, t->depth) & (TEX_INDEX_SIZE - 1u);
++    for (;;) {
++        const u32 v = g_ld_tex_index[k];
++        if (v == 0u) return UINT32_MAX;
++        if (v != TEX_INDEX_TOMB) {
++            const texcache_t* entry = &g.textures[v - 1u];
++            if (entry->location == t->location && entry->offset == t->offset &&
++                entry->format == t->format && entry->width == t->width &&
++                entry->height == t->height && entry->pitch == t->pitch &&
++                entry->remap == remap && entry->cubemap == t->cubemap &&
++                entry->dimension == t->dimension && entry->depth == t->depth)
++                return v - 1u;
++        }
++        k = (k + 1u) & (TEX_INDEX_SIZE - 1u);
++    }
++}
++
+ /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
+  * descriptor-only cache, re-hash the source once per frame and refresh the
+  * D3D resource when the game rewrites the same guest address. */
+@@ -3619,20 +3846,17 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+         g_gv_watch[4].armed | g_gv_watch[5].armed | g_gv_watch[6].armed | g_gv_watch[7].armed)
+         ld_gv_watch_bind(t->location, t->offset, texture_source_span(t));
+ 
+-    for (u32 i = 0; i < g.n_textures; i++) {
++    for (u32 i = ld_tex_index_find(t, remap); i != UINT32_MAX; i = UINT32_MAX) {   /* patch 2033: indexed */
+         texcache_t* entry = &g.textures[i];
+-        if (entry->location != t->location || entry->offset != t->offset ||
+-            entry->format != t->format || entry->width != t->width ||
+-            entry->height != t->height || entry->pitch != t->pitch ||
+-            entry->remap != remap || entry->cubemap != t->cubemap ||
+-            entry->dimension != t->dimension || entry->depth != t->depth)
+-            continue;
+         if (refresh_enabled && entry->tex &&
+-            entry->last_hash_frame != g_ld_frames) {
++            entry->last_hash_frame != g_ld_frames &&
++            ld_tex_hash_due(entry->location, entry->offset, entry->span, entry->last_hash_frame,
++                            entry->quiet, &entry->written, &entry->skip_frame)) {   /* patch 2033 */
+             int readable = 0;
+             LDW_T0(th_t0);
+             const u64 hash = texture_content_hash(t, &readable);
+             LDW_ADD(RSX_PERF_W_TEX_HASH_T, th_t0);
++            ld_tex_hash_note(readable, hash != entry->content_hash, &entry->quiet, &entry->written);
+             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
+              * reads are microseconds apart, so they can only disagree if a
+              * guest thread is writing this texture right now -- i.e. we are
+@@ -3724,6 +3948,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+                 g.textures[index].last_use_serial)
+                 index = i;
+         evicted = g.textures[index].tex;
++        ld_tex_index_remove(index);   /* patch 2033: the slot gets a new key below */
+         g_ld_texture_cache_evictions++;
+         if (g_ld_texture_cache_full <= 16 ||
+             (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
+@@ -3758,10 +3983,15 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+         if (evicted)
+             retire_texture(evicted);
+         *entry = replacement;
++        ld_tex_index_insert(index);   /* patch 2033 */
+         write_texture_srv(index, entry);
+     } else {
+-        if (!cache_was_full)
++        if (!cache_was_full) {
+             g.textures[index] = replacement;
++            ld_tex_index_insert(index);   /* patch 2033: a failed decode stays cached as SRV_WHITE, as before */
++        } else {
++            ld_tex_index_insert(index);   /* patch 2033: the evicted key was removed above; re-index the old entry */
++        }
+         g_ld_texture_decode_fail++;
+         if (g_ld_texture_decode_fail <= 16 ||
+             (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
+@@ -3866,7 +4096,8 @@ static u64 vertex_texture_hash(const rsx_dsp_vertex_texture* vt,
+     const u8* src = span ? guest_ptr(vt->location, vt->offset, span) : NULL;
+     if (out_src) *out_src = src;
+     if (out_pitch) *out_pitch = pitch;
+-    return src ? fnv1a(src, span, 1469598103934665603ull) : 0;
++    if (src) g_ld_th.hashed_bytes += span;
++    return src ? ld_fast_hash(src, span) : 0;   /* patch 2033 */
+ }
+ 
+ static ID3D12Resource* decode_vertex_texture(
+@@ -3944,8 +4175,10 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
+             e->format != vt->format || e->width != vt->width ||
+             e->height != vt->height || e->pitch != vt->pitch)
+             continue;
+-        if (e->tex && e->last_hash_frame != g_ld_frames) {
++        if (e->tex && e->last_hash_frame != g_ld_frames &&
++            ld_tex_hash_due(e->location, e->offset, e->span, e->last_hash_frame, e->quiet, &e->written, &e->skip_frame)) {
+             const u64 hash = vertex_texture_hash(vt, NULL, NULL);
++            ld_tex_hash_note(hash != 0, hash && hash != e->content_hash, &e->quiet, &e->written);
+             e->last_hash_frame = g_ld_frames;
+             if (hash && hash != e->content_hash) {
+                 u64 replacement_hash = 0;
+@@ -7297,6 +7530,7 @@ static void fetch_batches(void)
+ static void fetch_batches_hoisted(
+     const rsx_vertex_layout_plan* layout, int packed_payload)
+ {
++    LDW_T0(refs_t0);   /* patch 2033: vertex-fetch split */
+     for (u32 batch = 0; batch < dc.n_arr && dc.fetch_ok; batch++)
+         for (u32 i = 0; i < dc.arr[batch].count && dc.fetch_ok; i++)
+             push_compact_ref(dc.arr[batch].first + i, 0);
+@@ -7360,6 +7594,8 @@ static void fetch_batches_hoisted(
+     if (!dc.fetch_ok)
+         return;
+     dc.n_source_refs = dc.n_refs;
++    LDW_ADD(RSX_PERF_W_VTX_REFS_T, refs_t0);
++    LDW_T0(remap_t0);
+     if (packed_payload && dc.n_refs > 1) {
+         u32 unique_refs = dc.n_refs;
+         if (rsx_vertex_remap_build(
+@@ -7368,6 +7604,8 @@ static void fetch_batches_hoisted(
+             dc.n_refs = unique_refs;
+         }
+     }
++    LDW_ADD(RSX_PERF_W_VTX_REMAP_T, remap_t0);
++    LDW_T0(fetch_t0);
+     dc.layout = *layout;
+     rsx_vertex_fetch_plan_init(
+         &dc.fetch_plan, &g.rsx, layout,
+@@ -7422,6 +7660,12 @@ static void fetch_batches_hoisted(
+         }
+     }
+     dc.n_verts = dc.n_refs;
++    if (fetch_t0) {
++        LDW_ADD(RSX_PERF_W_VTX_FETCH_T, fetch_t0);
++        rsx_perf_add(RSX_PERF_W_VTX_REF_N, dc.n_source_refs);
++        rsx_perf_add(RSX_PERF_W_VTX_N, dc.n_refs);
++        rsx_perf_add(RSX_PERF_W_VTX_BYTES, (long long)dc.n_refs * (packed_payload ? layout->stride : VERT_STRIDE));
++    }
+ }
+ 
+ static const float* dc_vertex_attr(
+@@ -8265,6 +8509,7 @@ static void ld_movie_capture_overlay(void)
+      * the guest surface is not sent to the swap chain. */
+     rsx_live_draw_before_guest_sync();   /* patch 2017 */
+     ld_gv_flip();
++    ld_td_flip();   /* patch 2033 */
+     g_ld_frames++;
+     ld_movie_reset_rings();
+ }
+@@ -9761,6 +10006,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         write_topology_indices(
+             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
+     LDW_ADD(RSX_PERF_W_VTX_T, vcopy_t0);
++    LDW_ADD(RSX_PERF_W_VTX_COPY_T, vcopy_t0);   /* patch 2033 */
+ 
+     LDW_T0(pso_t0);
+     ID3D12PipelineState* pso = get_pso(
+@@ -11490,13 +11736,15 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size)
+     const u32 stale = g_ld_frames - 1u;
+     for (u32 i = 0; i < g.n_textures; i++) {
+         texcache_t* e = &g.textures[i];
+-        if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1))
+-            e->last_hash_frame = stale;
++        if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1)) {
++            e->last_hash_frame = stale; e->written = 1;   /* patch 2033 */
++        }
+     }
+     for (u32 i = 0; i < g.n_vtex; i++) {
+         vtexcache_t* e = &g.vtex[i];
+-        if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1))
+-            e->last_hash_frame = stale;
++        if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1)) {
++            e->last_hash_frame = stale; e->written = 1;   /* patch 2033 */
++        }
+     }
+     for (u32 i = 0; i < g.n_surfaces; i++) {
+         surface_t* s = &g.surfaces[i];
+@@ -11518,6 +11766,7 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size)
+ u32 rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size)
+ {
+     if (!g.ready || !size) return 0;
++    ld_td_mark(location, offset, size);   /* patch 2033 */
+     if (ld_gv_enabled()) {
+         for (u32 i = 0; i < g.n_surfaces; i++) {
+             surface_t* s = &g.surfaces[i];
+@@ -11533,13 +11782,13 @@ u32 rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size)
+     for (u32 i = 0; i < g.n_textures; i++) {
+         texcache_t* e = &g.textures[i];
+         if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1)) {
+-            e->last_hash_frame = stale; marked++;
++            e->last_hash_frame = stale; e->written = 1; marked++;   /* patch 2033 */
+         }
+     }
+     for (u32 i = 0; i < g.n_vtex; i++) {
+         vtexcache_t* e = &g.vtex[i];
+         if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1)) {
+-            e->last_hash_frame = stale; marked++;
++            e->last_hash_frame = stale; e->written = 1; marked++;   /* patch 2033 */
+         }
+     }
+     return marked;
+@@ -12003,6 +12252,7 @@ static int ld_writeback_surface(u32 i, u32 for_off, u32 for_size)
+      * live-draw) go into the surface first, so the write-back keeps them. */
+     ld_gv_validate(i);
+     u8* gm = (u8*)guest_ptr(location, sf->offset, (u32)(s1 - s0));
++    ld_td_mark(location, sf->offset, (u32)(s1 - s0));   /* patch 2033: the walker writes guest bytes */
+     const size_t n = (size_t)sf->w * sf->h * texel;
+     u8* buf = gm ? (u8*)malloc(n) : NULL;
+     if (!buf) return 0;
+@@ -12106,6 +12356,7 @@ static int ld_rb_store(u32 i, u32 k, u32 for_off, u32 for_size)
+     const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
+     const u32 pitch = (sf->w * texel + 255u) & ~255u;
+     u8* gm = (u8*)guest_ptr(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel);
++    ld_td_mark(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel);   /* patch 2033 */
+     u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * sf->h};
+     if (!gm || FAILED(g_ld_rb[k]->lpVtbl->Map(g_ld_rb[k], 0, &rr, (void**)&px))) return 0;
+     for (u32 y = 0; y < sf->h; y++) {
+@@ -12960,6 +13211,7 @@ static void ld_present_body(u32 buffer_id)
+       packets_at_last_frame = g_ld_stats.packets_seen; }
+     rsx_live_draw_before_guest_sync();   /* patch 2017 */
+     ld_gv_flip();
++    ld_td_flip();   /* patch 2033 */
+     g_ld_frames++;
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_present(g_ld_frames);
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 09257c3d..af67c9fd 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -91,6 +91,9 @@ u32  rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size);
+  * memory at their next bind as a texture; cached textures are re-hashed.
+  * cellGcm_note_guest_write_ea() takes an effective address instead. */
+ void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size);
++/* KZ3 patch 2033: cheap page-level note of a guest write by the walker itself (NV3089 blits, NV308A inline
++ * writes): no entry scan, only the 64 KB page bitmap the quiet-texture hashing consults (LD_TEX_HASH_SPAN). */
++void rsx_live_draw_note_guest_write_pages(u32 location, u32 offset, u32 size);
+ /* Patch 2017 diagnostic (LD_GUEST_WRITE_DBG=1): remember the contents of an
+  * NV0039 copy destination; the next texture bind that reads it logs whether the
+  * guest rewrote it in between ([guest-write] lines). */
+@@ -232,7 +235,10 @@ enum {
+     RSX_PERF_W_WB_NV0039_T, RSX_PERF_W_WB_SYNC_N, RSX_PERF_W_WB_SYNC_T,
+     RSX_PERF_W_WB_STORE_T, RSX_PERF_W_M2MF_T, RSX_PERF_W_TEX_HASH_T,
+     RSX_PERF_W_PSO_PRE_T, RSX_PERF_W_PSO_UNITS_T, RSX_PERF_W_PSO_KEY_T, RSX_PERF_W_PSO_FIND_T,
+-    RSX_PERF_W_PSO_MEMO_N, RSX_PERF_W_ON,
++    RSX_PERF_W_PSO_MEMO_N,
++    /* KZ3 patch 2033: the vertex-fetch split (inside RSX_PERF_W_VTX_T) and volumes. */
++    RSX_PERF_W_VTX_REFS_T, RSX_PERF_W_VTX_REMAP_T, RSX_PERF_W_VTX_FETCH_T, RSX_PERF_W_VTX_COPY_T,
++    RSX_PERF_W_VTX_REF_N, RSX_PERF_W_VTX_N, RSX_PERF_W_VTX_BYTES, RSX_PERF_W_ON,
+     RSX_PERF_COUNT
+ };
+ int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index e31b6112..fe9bd25b 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -8,8 +8,13 @@
+ 
+ static float rsx_compact_be_f32(const u8* p)
+ {
+-    const u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) |
+-                  ((u32)p[2] << 8) | (u32)p[3];
++    u32 w;
++    memcpy(&w, p, sizeof(w));
++#if defined(__GNUC__)
++    w = __builtin_bswap32(w);   /* KZ3 patch 2033: one bswap instead of four shifts, same bits */
++#else
++    w = (w >> 24) | ((w >> 8) & 0xFF00u) | ((w << 8) & 0xFF0000u) | (w << 24);
++#endif
+     float f;
+     memcpy(&f, &w, sizeof(f));
+     return f;
+@@ -33,6 +38,54 @@ static float rsx_compact_be_f16(const u8* p)
+     return f;
+ }
+ 
++/* KZ3 patch 2033: the decoder with the type switch hoisted out of the component
++ * loop (the walker runs it once per attribute per vertex, ~10^5 times a frame).
++ * Same results as before, component by component: the per-component bodies and
++ * their arithmetic are unchanged. */
++static inline int rsx_vertex_decode_fast(
++    u32 type, u32 size, const u8* source, float out[4])
++{
++    const u32 n = size < 4u ? size : 4u;
++    out[0] = out[1] = out[2] = 0.0f;
++    out[3] = 1.0f;
++    if (!n)
++        return 1;
++    switch (type) {
++    case RSX_VTX_TYPE_FLOAT:
++        for (u32 c = 0; c < n; c++)
++            out[c] = rsx_compact_be_f32(source + c * 4);
++        return 1;
++    case RSX_VTX_TYPE_HALF:
++        for (u32 c = 0; c < n; c++)
++            out[c] = rsx_compact_be_f16(source + c * 2);
++        return 1;
++    case RSX_VTX_TYPE_UNORM8:
++        for (u32 c = 0; c < n; c++)
++            out[c] = source[c] / 255.0f;
++        return 1;
++    case RSX_VTX_TYPE_UINT8:
++        for (u32 c = 0; c < n; c++)
++            out[c] = (float)source[c];
++        return 1;
++    case RSX_VTX_TYPE_SNORM16:
++        for (u32 c = 0; c < n; c++) {
++            const s16 value = (s16)((source[c * 2] << 8) | source[c * 2 + 1]);
++            out[c] = value / 32767.0f;
++        }
++        return 1;
++    case RSX_VTX_TYPE_SINT16:
++        for (u32 c = 0; c < n; c++) {
++            const s16 value = (s16)((source[c * 2] << 8) | source[c * 2 + 1]);
++            out[c] = (float)value;
++        }
++        return 1;
++    case RSX_VTX_TYPE_CMP32:
++        return rsx_vertex_decode_element(type, 1u, source, out);
++    default:
++        return 0;
++    }
++}
++
+ int rsx_vertex_decode_element(
+     u32 type, u32 size, const u8* source, float out[4])
+ {
+@@ -299,7 +352,7 @@ static int rsx_vertex_fetch_attr_value(
+             fetch->elem_size);
+     }
+ 
+-    if (source && rsx_vertex_decode_element(
++    if (source && rsx_vertex_decode_fast(
+             fetch->desc.type, fetch->desc.size, source, value))
+         return 1;
+     if (attr == 0)
+@@ -427,6 +480,40 @@ int rsx_vertex_remap_build(
+ 
+     if (count > UINT_MAX / 2u)
+         return 0;
++    /* KZ3 patch 2033: dense-range fast path. Indexed meshes reference a
++     * compact id range many times over (Killzone 3: ~2 references per unique
++     * vertex, ~10^6 references a frame), and the hash table below cost
++     * ~5 ms a frame. When every reference shares one base_index and the id
++     * range is narrower than the reference count, the unique list is simply
++     * the range (ascending ids; a few unreferenced ids inside the range are
++     * fetched too, which stays within the per-attribute span that prepare()
++     * maps) and the occurrence map is id - min. The strict "<" keeps
++     * unique < count, so the caller still treats the draw as remapped
++     * (indexed); a draw whose ids are all distinct takes the hash path and
++     * keeps first-use order. Triangles are reconstructed from the occurrence
++     * map, so the drawn result is the same either way. */
++    {
++        u32 lo = refs[0].vertex_id, hi = lo;
++        const u32 base = refs[0].base_index;
++        int same_base = 1;
++        for (u32 occurrence = 1; occurrence < count; occurrence++) {
++            const u32 id = refs[occurrence].vertex_id;
++            if (refs[occurrence].base_index != base) { same_base = 0; break; }
++            if (id < lo) lo = id;
++            if (id > hi) hi = id;
++        }
++        if (same_base && hi - lo < count - 1u) {
++            const u32 range = hi - lo + 1u;
++            for (u32 occurrence = 0; occurrence < count; occurrence++)
++                remap->occurrence_to_unique[occurrence] = refs[occurrence].vertex_id - lo;
++            for (u32 i = 0; i < range; i++) {
++                refs[i].vertex_id = lo + i;
++                refs[i].base_index = base;
++            }
++            *unique_count = range;
++            return 1;
++        }
++    }
+     u32 slot_capacity = 16u;
+     const u32 required_slots = count * 2u;
+     while (slot_capacity < required_slots) {
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index d778cc55..c3f3fa40 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -682,3 +682,9 @@ void spu_coh_notify_write(uint32_t ea)
+ #ifdef __cplusplus
+ }
+ #endif
++
++/* KZ3 patch 2033: guest-write hook for SPU DMA puts (spu_dma.h). Owned here because every user of spu_dma.h
++ * already links this file (spu_coh_is_reserved); the live renderer installs cellGcm_note_guest_write_ea
++ * through spu_set_guest_write_hook (a weak reference on its side). */
++void (*g_spu_guest_write_hook)(uint32_t ea, uint32_t size) = 0;
++void spu_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) { g_spu_guest_write_hook = hook; }
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index d7f497da..5802633b 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -737,6 +737,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+             extern void spu_lockline_unlock(void);
+             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
+             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
++            /* KZ3 patch 2033: tell the live renderer which guest pages this put writes (quiet-texture
++             * hashing, libs/video); null until cellGcmInit installs it (spu_set_guest_write_hook). */
++            { extern void (*g_spu_guest_write_hook)(uint32_t ea, uint32_t size);   /* spu_coherency.c */
++              if (g_spu_guest_write_hook) g_spu_guest_write_hook((uint32_t)ea, size); }
+             uint32_t a0 = (uint32_t)ea & ~127u;
+             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+             int span_reserved = 0;

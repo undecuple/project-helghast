@@ -1,0 +1,28 @@
+KZ3 patch 1045 (SPU pass 34, upstream candidate): cellSpursReadyCountSwap and CompareAndSwap write the instance ready byte the kernel poll reads, as ReadyCountStore does; before, a Swap kick landed in the host side table only and the job manager ran on the idle cadence.
+
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2187,6 +2187,11 @@
+ 
+     vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
+     s_workloads[wid].readyCount = value;
++    /* KZ3 patch 1045 (SPU pass 34, RE pass 70 section 3a): the kernel poll reads the instance byte
++     * (SPURS_WKL_READY1 + wid), which ReadyCountStore writes; Swap and CompareAndSwap only kept the host copy, so
++     * a title kicking through these imports (KZ3's WWS job queues, func_0008978C) ran its job managers on the
++     * idle cadence only (zero POKE lines in a whole run). Upstream candidate. */
++    *(vm_base + (u32)(uintptr_t)spurs + SPURS_WKL_READY1 + wid) = (u8)value;
+     return CELL_OK;
+ }
+ 
+@@ -2199,8 +2204,10 @@
+     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
+ 
+     vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
+-    if (s_workloads[wid].readyCount == compare)
++    if (s_workloads[wid].readyCount == compare) {
+         s_workloads[wid].readyCount = value;
++        *(vm_base + (u32)(uintptr_t)spurs + SPURS_WKL_READY1 + wid) = (u8)value;   /* KZ3 patch 1045 */
++    }
+ 
+     return CELL_OK;
+ }

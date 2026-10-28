@@ -1,0 +1,605 @@
+KZ3 patch 1099 (SPU pass 73): lifted SPU functions use the System V calling convention on Win64 (SPU_ABI).
+
+The Microsoft x64 convention makes xmm6-xmm15, rsi and rdi callee-saved. A lifted SPU function that uses them
+saved and restored up to ten xmm registers and six general registers on every entry and exit, and since the direct
+hops of patch 1096 a hot SPU loop enters and leaves one or two lifted functions per iteration (the audio mixer job's
+spu_func_0000D100: 10 xmm stores, 10 xmm loads, 6 pushes and 6 pops per iteration; "entry/return" was 4.5 % of the
+audio SPU thread in SPU pass 72). Under sysv_abi every xmm register is caller-saved, so chains of lifted functions
+(hops, brsl calls between lifted functions) save nothing; a runtime function (Microsoft convention) that calls into
+lifted code saves them once per call.
+- spu_context.h: SPU_ABI = __attribute__((sysv_abi)) on Win64 GCC/clang builds (SPU_SYSV_ABI, default 1 there; build
+  every TU with -DSPU_SYSV_ABI=0 for the old convention), on: tramp_fn, spu_hop_fn, spu_take_interrupt,
+  spu_check_stack_reset, spu_indirect_branch, spu_ib_guess_register; spu_channels.c spu_fn, spu_run_with_halt;
+  spu_drain.c spu_drain_fn and the drain loop's locals; spu_interp.h spu_lifted_fn; spu_workload.h and
+  spu_lifted_job.h spu_lifted_entry_fn; the spu_run_with_halt externs; tsp_spu_func_00000A00 (weak stub and
+  externs); spu_dispatch_mt.c.
+- tools/spu_lifter.py: lifted functions, their declarations, the indirect-dispatch stubs, the function table and
+  the guess table are SPU_ABI. C diagnoses an assignment between pointer types of different conventions, so the
+  build itself checks that no lifted function is reached through a pointer of the other convention.
+- GCC emits no Win64 unwind data (.pdata/.xdata) for sysv_abi functions (SPU pass 73: 11 .pdata entries for
+  job_011e1180's 838 functions, against 1,470 with the Microsoft convention), and MinGW's setjmp() records its frame so that
+  longjmp unwinds through RtlUnwindEx, which cannot walk such a frame: the first build stalled the K2 audio policy
+  module (taskset join waiting forever). The SPU runtime's halt jump (spu_run_with_halt) and stack-reset jump
+  (spu_drain.c) run no unwind handlers and now use the frameless form, SPU_SETJMP = _setjmp(buf, NULL) on MinGW
+  x64 (longjmp restores the saved registers only). Stack traces of a crash inside lifted code stop at the first
+  lifted frame.
+Needs a relift. Linux builds are unchanged (SPU_ABI is empty off Win64). Upstream candidate.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): SPU_ABI on upstream's new signatures (`spu_take_interrupt`, `tramp`, the stack-reset cast); upstream's per-file `SPU_SETJMP` definitions (plain `setjmp` on Windows) would have overridden 1099's frameless `_setjmp(b, NULL)`: now guarded (`#ifndef` on Windows, `#undef` + `_setjmp` on POSIX). Upstream's `spu_jmp_no_unwind` is MSVC-only, a no-op here; part 3: also `spu_check_stack_reset`'s extern in spu_drain.c, `spu_drain_hop`/`spu_drain_hop_inline` and `spu_check_stack_reset_scan` (the MinGW build failed on them: sysv_abi vs plain pointers; Linux host tests cannot see it).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 1e995446..f06843d2 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -28,9 +28,13 @@
+  * sigprocmask system call per halt, stack reset or task resume. These frames
+  * never cross a signal handler, so the mask is the same at both ends. */
+ #if defined(_WIN32)
++/* KZ3 patch 1099: Windows keeps spu_context.h's SPU_SETJMP (frameless _setjmp(buf, NULL) on MinGW x64 sysv). */
++#ifndef SPU_SETJMP
+ #define SPU_SETJMP(env) setjmp(env)
++#endif
+ #define SPU_LONGJMP(env, v) longjmp(env, v)
+ #else
++#undef SPU_SETJMP
+ #define SPU_SETJMP(env) _setjmp(env)
+ #define SPU_LONGJMP(env, v) _longjmp(env, v)
+ #endif
+@@ -328,7 +332,7 @@ static void spu_honour_stop_request(spu_context* ctx)
+  * spurs_policy.c), so a run that never returns can be described from another thread. NULL unless
+  * port/spu/kz3_stall_diag.c installs it. Defined here, next to spu_run_with_halt, so every user of the runners links it. */
+ void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b) = 0;
+-int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
++int spu_run_with_halt(void (SPU_ABI *entry)(spu_context*), spu_context* ctx)
+ {
+     const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
+     int halted = 0;
+@@ -374,7 +378,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+      * executes at a time. No-op when unarmed. The thread-local halt env above
+      * makes a token pause/resume mid-run safe. */
+     yz_lockstep_register(ctx);
+-    switch (SPU_SETJMP(s_spu_halt_env)) {
++    switch (SPU_SETJMP(s_spu_halt_env)) {   /* KZ3 patch 1099: frameless on Win64 sysv */
+     case 1:
+         halted = 1;
+         g_spu_trampoline_fn = 0;
+@@ -1686,7 +1690,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+ /* ===========================================================================
+  * Indirect-branch dispatch + function registry
+  * ===========================================================================*/
+-typedef void (*spu_fn)(spu_context*);
++typedef void (SPU_ABI *spu_fn)(spu_context*);   /* SPU_ABI: patch 1099 */
+ 
+ typedef struct {
+     uint32_t addr;
+@@ -1897,7 +1901,7 @@ static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
+  * is the TU's own function; else 0 (the TU's guesses stay off). The registry is append-only, so that answer is
+  * final. Quiet: the chain walk is spu_lookup's without the cross-image report and the memo. */
+ volatile unsigned long long g_spu_ib_guess_n;
+-int spu_ib_guess_register(const uint32_t* addrs, void (*const* fns)(spu_context*), int n)
++int spu_ib_guess_register(const uint32_t* addrs, void (SPU_ABI *const* fns)(spu_context*), int n)
+ {
+     const int id = s_reg_image;
+     if (id <= 0) return 0;
+@@ -2319,13 +2323,13 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
+ }
+ 
+ #if defined(_MSC_VER)
+-static __declspec(noinline) void spu_check_stack_reset_scan(spu_context*, void (*)(spu_context*));
++static __declspec(noinline) void spu_check_stack_reset_scan(spu_context*, void (SPU_ABI *)(spu_context*));
+ #else
+-static __attribute__((noinline, cold)) void spu_check_stack_reset_scan(spu_context*, void (*)(spu_context*));
++static __attribute__((noinline, cold)) void spu_check_stack_reset_scan(spu_context*, void (SPU_ABI *)(spu_context*));
+ #endif
+ /* Also called before direct trampoline transfers: generated calls can enter
+  * a stack-switching routine without going through spu_indirect_branch. */
+-void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
++void spu_check_stack_reset(spu_context* ctx, void (SPU_ABI *fn)(spu_context*))
+ {
+     /* Runs on every drain transfer: test the registry before the
+      * thread-local halt state, which is a function call on Darwin, and keep
+@@ -2334,7 +2338,7 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
+     spu_check_stack_reset_scan(ctx, fn);
+ }
+ 
+-static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*))
++static void spu_check_stack_reset_scan(spu_context* ctx, void (SPU_ABI *fn)(spu_context*))
+ {
+     if (!s_spu_halt_armed) return;
+     const unsigned count = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
+@@ -3186,7 +3190,7 @@ spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
+     return fn;
+ }
+ 
+-void spu_indirect_branch(spu_context* ctx)
++SPU_ABI void spu_indirect_branch(spu_context* ctx)
+ {
+     if (__builtin_expect(g_spu_hop_on < 0, 0)) spu_hop_init();   /* KZ3 patch 1096 */
+     if (__builtin_expect(s_hop_stats != 0, 0)) {
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 3e009208..0aef6605 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -17,6 +17,38 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++/* KZ3 patch 1099 (SPU pass 73): lifted SPU functions use the System V calling convention on Win64. The Microsoft
++ * x64 convention makes xmm6-xmm15, rsi and rdi callee-saved, so every lifted function that uses them saved and
++ * restored up to ten xmm registers on each entry and exit, and direct hops (patch 1096) between lifted functions
++ * enter and leave one function per SPU transfer (spu_func_0000D100 of the audio mixer job: 10 xmm stores and loads
++ * and 6 pushes and pops per loop iteration). Under sysv_abi all xmm registers are caller-saved: chains of lifted
++ * functions save nothing, and a runtime (ms_abi) function that calls into lifted code saves them once. Every
++ * function-pointer type that holds lifted code (spu_fn, spu_hop_fn, spu_lifted_fn, spu_lifted_entry_fn, tramp_fn,
++ * ...) and every function stored in one carries SPU_ABI, so caller and callee always agree (C diagnoses a
++ * mismatched pointer assignment). -DSPU_SYSV_ABI=0 (for every TU) = the default convention. */
++#if !defined(SPU_SYSV_ABI)
++#  if defined(_WIN64) && defined(__GNUC__)
++#    define SPU_SYSV_ABI 1
++#  else
++#    define SPU_SYSV_ABI 0
++#  endif
++#endif
++#if SPU_SYSV_ABI && defined(_WIN64)
++#  define SPU_ABI __attribute__((sysv_abi))
++#else
++#  define SPU_ABI
++#endif
++/* GCC emits no Win64 unwind data (.pdata/.xdata) for sysv_abi functions, and MinGW's setjmp() records its frame
++ * so that longjmp unwinds the stack through RtlUnwindEx, which cannot walk a lifted frame without that data (spu
++ * pass 73: the K2 audio policy module stalled at its first halt longjmp). The SPU runtime's halt and stack-reset
++ * jumps run no unwind handlers, so they use the frameless form (_setjmp(buf, NULL): longjmp only restores the
++ * saved registers). */
++#if SPU_SYSV_ABI && defined(_WIN64) && defined(__MINGW64__)
++#  define SPU_SETJMP(b) _setjmp((b), NULL)
++#else
++#  define SPU_SETJMP(b) setjmp(b)
++#endif
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -335,7 +367,7 @@ typedef struct spu_context {
+      * per MFC channel access: 15-30 % of each SPU host thread's time in KZ3's
+      * movies. A context is pinned to one host thread, and a nested run on the same
+      * thread uses its own context, so per-context state means the same thing. */
+-    void   (*tramp_fn)(struct spu_context*);  /* pending cross-function transfer */
++    void   (SPU_ABI *tramp_fn)(struct spu_context*);  /* pending cross-function transfer (SPU_ABI: patch 1099) */
+     uint32_t pch_ring[8];                     /* last trampoline-hop PCs */
+     unsigned pch_n;
+     uint32_t recent_pc[256];                  /* last drain steps ([pm-end]); KZ3 patch 1068: 256 (was 32), with
+@@ -572,6 +604,38 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
+  * scalar path with the same per-lane _u32 semantics. */
+ #if defined(_MSC_VER)
+ #include <stdlib.h>
++
++/* KZ3 patch 1099 (SPU pass 73): lifted SPU functions use the System V calling convention on Win64. The Microsoft
++ * x64 convention makes xmm6-xmm15, rsi and rdi callee-saved, so every lifted function that uses them saved and
++ * restored up to ten xmm registers on each entry and exit, and direct hops (patch 1096) between lifted functions
++ * enter and leave one function per SPU transfer (spu_func_0000D100 of the audio mixer job: 10 xmm stores and loads
++ * and 6 pushes and pops per loop iteration). Under sysv_abi all xmm registers are caller-saved: chains of lifted
++ * functions save nothing, and a runtime (ms_abi) function that calls into lifted code saves them once. Every
++ * function-pointer type that holds lifted code (spu_fn, spu_hop_fn, spu_lifted_fn, spu_lifted_entry_fn, tramp_fn,
++ * ...) and every function stored in one carries SPU_ABI, so caller and callee always agree (C diagnoses a
++ * mismatched pointer assignment). -DSPU_SYSV_ABI=0 (for every TU) = the default convention. */
++#if !defined(SPU_SYSV_ABI)
++#  if defined(_WIN64) && defined(__GNUC__)
++#    define SPU_SYSV_ABI 1
++#  else
++#    define SPU_SYSV_ABI 0
++#  endif
++#endif
++#if SPU_SYSV_ABI && defined(_WIN64)
++#  define SPU_ABI __attribute__((sysv_abi))
++#else
++#  define SPU_ABI
++#endif
++/* GCC emits no Win64 unwind data (.pdata/.xdata) for sysv_abi functions, and MinGW's setjmp() records its frame
++ * so that longjmp unwinds the stack through RtlUnwindEx, which cannot walk a lifted frame without that data (spu
++ * pass 73: the K2 audio policy module stalled at its first halt longjmp). The SPU runtime's halt and stack-reset
++ * jumps run no unwind handlers, so they use the frameless form (_setjmp(buf, NULL): longjmp only restores the
++ * saved registers). */
++#if SPU_SYSV_ABI && defined(_WIN64) && defined(__MINGW64__)
++#  define SPU_SETJMP(b) _setjmp((b), NULL)
++#else
++#  define SPU_SETJMP(b) setjmp(b)
++#endif
+ #define SPU_BSWAP32(x) _byteswap_ulong(x)
+ #define SPU_LS_FAST 1
+ #elif defined(__GNUC__) || defined(__clang__)
+@@ -972,7 +1036,7 @@ static inline int spu_channel_has_data(const spu_channel* ch)
+ 
+ /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
+  * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
+-void spu_indirect_branch(spu_context* ctx);
++SPU_ABI void spu_indirect_branch(spu_context* ctx);
+ 
+ /* Pending cross-function transfer target; NULL when none. Thread-local: each
+  * spu_context is pinned to one host thread for its lifetime. */
+@@ -989,7 +1053,7 @@ void spu_indirect_branch(spu_context* ctx);
+ /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
+ void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
+ /* Complete ordered hop; the launch-only ABI above does not tick lockstep. */
+-void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
++void spu_drain_hop(spu_context* ctx, void (SPU_ABI *fn)(spu_context*));
+ extern unsigned g_spu_stack_reset_count; /* read-only outside registration */
+ static inline int spu_stack_reset_needed(const spu_context* ctx)
+ {
+@@ -1009,7 +1073,7 @@ void spu_task_launch_check_full(spu_context* ctx, void* fn); /* SPURS task-launc
+ #define spu_recent_mark(ctx, kind, pcv) \
+     ((ctx)->recent_pc[(ctx)->recent_n++ & 255] = ((uint32_t)(kind) << 28) | (((uint32_t)(ctx)->host_depth & 0xFFu) << 20) | \
+                                                  ((uint32_t)(pcv) & 0x3FFFFu))
+-void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*));
++void spu_check_stack_reset(spu_context* ctx, void (SPU_ABI *fn)(spu_context*));
+ void spu_launch_ls0_end(spu_context* ctx);
+ extern int g_spu_launch_diag;              /* 1: always the full hook (diagnostics or KZ3_SPU_FASTCG < 1039) */
+ extern uint32_t g_spu_depth_max;           /* spu_depth_guard's limit, 0 until its first call (or always,
+@@ -1026,7 +1090,7 @@ static inline __attribute__((always_inline)) void spu_task_launch_check(spu_cont
+     const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+     ctx->recent_pc[ctx->recent_n++ & 255] = pc;
+     if (__builtin_expect(g_spu_stack_reset_n != 0, 0) && ctx->host_depth && !ctx->policy_mode)
+-        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
++        spu_check_stack_reset(ctx, (void (SPU_ABI *)(spu_context*))fn);
+     /* same test as the full hook: a job branching to LS 0 (not on the first step) is complete */
+     if (__builtin_expect(ctx->steps++ && pc == 0, 0) && !ctx->policy_mode && ctx->image_id > 0)
+         spu_launch_ls0_end(ctx);
+@@ -1060,8 +1124,8 @@ int  spu_tailret_enabled(void);
+  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
+  * dispatcher to run instead of the interrupted transfer. Returns `tf`
+  * unchanged (interrupt not taken) if LS 0 holds no branch instruction. */
+-void (*spu_take_interrupt(spu_context* ctx,
+-                          void (*tf)(spu_context*)))(spu_context*);
++void (SPU_ABI *spu_take_interrupt(spu_context* ctx,
++                          void (SPU_ABI *tf)(spu_context*)))(spu_context*);
+ /* SPU_IRQWAIT_DIAG=1 (spu_drain.c): interrupts enabled with nothing pending to
+  * take. A guest that enables interrupts and spins until its handler runs (a
+  * job manager waiting on an event) reports what it is waiting on every 2^22
+@@ -1097,7 +1161,7 @@ static inline __attribute__((always_inline)) void spu_drain_call(spu_context* ct
+  * checks every condition under which spu_indirect_branch would do anything else and returns its lookup result,
+  * or 0 (then the old trampoline path runs). The host stack does not grow (tail calls). KZ3_SPU_HOP=0 = old path;
+  * any dispatch diagnostic switch (SPU_TAILRET, SPU_JOBTRACE, SPU_POLLTRACE, ...) also turns it off. */
+-typedef void (*spu_hop_fn)(spu_context*);
++typedef void (SPU_ABI *spu_hop_fn)(spu_context*);
+ /* KZ3 patch 1097 (SPU pass 72): a computed hop to ctx->hop_ret_pc (the innermost open bracket's return pc) returns
+  * to the host caller with pc = the target and nothing pending. The old path set the resolver trampoline and returned;
+  * the bracket's drain then saw "resolver pending, pc == its return pc" and returned before any hook (the first test
+@@ -1174,7 +1238,7 @@ extern uint64_t g_spu_task_pol_bits[16];
+ extern int g_spu_task_pol_big;
+ #define SPU_IBG_TASKSET_TASK_LO 0x3000u    /* = SPU_TASKSET_TASK_LO (spu_channels.c, static assert there) */
+ #define SPU_IBG_JOB_RETURN_LS   0x3FF00u   /* = SPU_JOB_RETURN_LS */
+-int spu_ib_guess_register(const uint32_t* addrs, void (*const* fns)(spu_context*), int n);
++int spu_ib_guess_register(const uint32_t* addrs, void (SPU_ABI *const* fns)(spu_context*), int n);
+ static inline __attribute__((always_inline)) int spu_ib_guess_ok(const spu_context* ctx, uint32_t g, int gid)
+ {
+     if (g == 0 || g == 0xA00u || g == SPURS_TASKSET_PM_SYSCALL_LS || g == SPU_IBG_JOB_RETURN_LS || g == 0x4A40u ||
+@@ -1291,7 +1355,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+                 g_spu_trampoline_fn = 0;                                   \
+                 break;                                                     \
+             }                                                              \
+-            void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
++            void (SPU_ABI *_tf)(spu_context*) = g_spu_trampoline_fn;    \
+             g_spu_trampoline_fn = 0;                            \
+             if (g_yz_lockstep_on) yz_lockstep_tick(ctx);       \
+             spu_task_launch_check((ctx), (void*)_tf);          \
+diff --git a/runtime/spu/spu_dispatch_mt.c b/runtime/spu/spu_dispatch_mt.c
+index 18e0b00b..8483b6bb 100644
+--- a/runtime/spu/spu_dispatch_mt.c
++++ b/runtime/spu/spu_dispatch_mt.c
+@@ -17,13 +17,13 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+-typedef void (*spu_dispatch_fn)(spu_context*);
++typedef void (SPU_ABI *spu_dispatch_fn)(spu_context*);
+ spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
+ void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
+ extern int g_spu_ovl_skip_any;                            /* KZ3 patch 1043 */
+ int spu_overlay_skip_entry(spu_context* ctx, int img);
+ 
+-void spu_indirect_branch_mt(spu_context* ctx)
++SPU_ABI void spu_indirect_branch_mt(spu_context* ctx)   /* SPU_ABI: KZ3 patch 1099 */
+ {
+     uint32_t pc = ctx->pc & SPU_LS_MASK;
+     /* PS3_SPU_PCWATCH: attribute silent SPU spins (a task that stops logging
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index d5a4bbfd..57b13186 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -12,9 +12,13 @@
+  * sigprocmask system call per halt, stack reset or task resume. These frames
+  * never cross a signal handler, so the mask is the same at both ends. */
+ #if defined(_WIN32)
++/* KZ3 patch 1099: Windows keeps spu_context.h's SPU_SETJMP (frameless _setjmp(buf, NULL) on MinGW x64 sysv). */
++#ifndef SPU_SETJMP
+ #define SPU_SETJMP(env) setjmp(env)
++#endif
+ #define SPU_LONGJMP(env, v) longjmp(env, v)
+ #else
++#undef SPU_SETJMP
+ #define SPU_SETJMP(env) _setjmp(env)
+ #define SPU_LONGJMP(env, v) _longjmp(env, v)
+ #endif
+@@ -245,9 +249,9 @@ static int spu_task_launch_diagnostics(void)
+ SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn)
+ {
+     ctx->recent_pc[ctx->recent_n++ & 255] = (uint32_t)ctx->pc & SPU_LS_MASK;   /* KZ3 1017 */
+-    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
++    extern void spu_check_stack_reset(spu_context*, void (SPU_ABI *)(spu_context*));
+     if (spu_stack_reset_needed(ctx))
+-        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
++        spu_check_stack_reset(ctx, (void (SPU_ABI *)(spu_context*))fn);
+     if (!spu_task_launch_diagnostics() && !g_pm_flow_ctx &&
+         (!ctx->steps || (ctx->pc & SPU_LS_MASK))) {
+         ctx->steps++;
+@@ -308,7 +312,7 @@ void spu_task_launch_check_full(spu_context* ctx, void* fn)
+ }
+ 
+ SPU_DRAIN_INLINE void spu_drain_hop_inline(spu_context* ctx,
+-    void (*fn)(spu_context*))
++    void (SPU_ABI *fn)(spu_context*))
+ {
+     /* Read the live gate each hop. -1 still takes the original initialization
+      * path; a callee can enable lockstep before the next checkpoint. */
+@@ -316,7 +320,7 @@ SPU_DRAIN_INLINE void spu_drain_hop_inline(spu_context* ctx,
+     spu_task_launch_check_inline(ctx, (void*)fn);
+ }
+ 
+-void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*))
++void spu_drain_hop(spu_context* ctx, void (SPU_ABI *fn)(spu_context*))
+ {
+     spu_drain_hop_inline(ctx, fn);
+ }
+@@ -573,8 +577,8 @@ void spu_irqwait_diag(spu_context* ctx)
+     fflush(stderr);
+ }
+ 
+-void (*spu_take_interrupt(spu_context* ctx,
+-                          void (*tf)(spu_context*)))(spu_context*)
++void (SPU_ABI *spu_take_interrupt(spu_context* ctx,
++                          void (SPU_ABI *tf)(spu_context*)))(spu_context*)
+ {
+     /* Stall-and-notify still settling: let the SPU run on (see above). */
+     if (g_sn_defer && g_sn_defer_ctx == (void*)ctx) {
+@@ -708,7 +712,7 @@ int spu_tailret_enabled(void)
+  * plain r0 drain with no entry, and the job ends on a garbage r0. So when the
+  * callee comes back on a lifted entry, run it in this drain until the pc
+  * reaches return_pc; only a pc with no lifted code behind it is unwound. */
+-typedef void (*spu_drain_fn)(spu_context*);
++typedef void (SPU_ABI *spu_drain_fn)(spu_context*);
+ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
+ 
+ 
+@@ -748,7 +752,7 @@ static void spu_drain_call_body(spu_context* ctx, uint32_t return_pc)
+      * to a thread-local is a call to the TLV resolver. The slot's address is
+      * fixed for the life of this host thread, and a drain never leaves its
+      * thread, so resolve it once per drain instead of once per access. */
+-    void (**const tramp)(spu_context*) = &g_spu_trampoline_fn;
++    void (SPU_ABI **const tramp)(spu_context*) = &g_spu_trampoline_fn;
+ 
+ #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; } while (0)
+     for (;;) {
+@@ -759,12 +763,12 @@ static void spu_drain_call_body(spu_context* ctx, uint32_t return_pc)
+                 SPU_DRAIN_POP_IRQ();
+                 return;
+             }
+-            void (*fn)(spu_context*) = *tramp;
++            void (SPU_ABI *fn)(spu_context*) = *tramp;
+             *tramp = 0;
+             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+             spu_drain_hop_inline(ctx, fn);
+             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+-                void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
++                void (SPU_ABI *vf)(spu_context*) = spu_take_interrupt(ctx, fn);
+                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
+                     /* Interrupt taken here: this loop is the frame the iret
+                      * comes back to, however deep the handler leaves from. */
+diff --git a/runtime/spu/spu_interp.h b/runtime/spu/spu_interp.h
+index 801245d8..7db69774 100644
+--- a/runtime/spu/spu_interp.h
++++ b/runtime/spu/spu_interp.h
+@@ -20,7 +20,7 @@ extern "C" {
+ #endif
+ 
+ /* A lifted SPU function: void f(spu_context*). Matches the lifter's signature. */
+-typedef void (*spu_lifted_fn)(spu_context*);
++typedef void (SPU_ABI *spu_lifted_fn)(spu_context*);
+ 
+ /* Resolve this LSA using runtime ownership: bounded resident code (including
+  * authoritative misses), then task, overlay, and primary image. This is the
+diff --git a/runtime/spu/spu_lifted_job.h b/runtime/spu/spu_lifted_job.h
+index 9a476b5b..8c848cf1 100644
+--- a/runtime/spu/spu_lifted_job.h
++++ b/runtime/spu/spu_lifted_job.h
+@@ -22,7 +22,7 @@
+ 
+ void spu_mfc_release(spu_context* ctx);   /* spu_channels.c */
+ 
+-typedef void (*spu_lifted_entry_fn)(spu_context*);
++typedef void (SPU_ABI *spu_lifted_entry_fn)(spu_context*);
+ /* Guest RAM base, for decoding a raw SPU thread's argument block. */
+ extern uint8_t* vm_base;
+ 
+@@ -304,7 +304,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+      * can be described from another thread (port/spu/kz3_stall_diag.c, KZ3_STALL_DIAG=1). */
+     { extern void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b);
+       if (g_kz3_run_ctx_hook) g_kz3_run_ctx_hook(&ctx, 1, 0, (uint32_t)image_id, args_ea); }
+-    { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
++    { extern int spu_run_with_halt(void (SPU_ABI *)(spu_context*), spu_context*);
+       _halted = spu_run_with_halt(entry, &ctx); }               /* run with halt pad   */
+     { extern void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b);
+       if (g_kz3_run_ctx_hook) g_kz3_run_ctx_hook(&ctx, 0, 0, 0, 0); }
+diff --git a/runtime/spu/spu_lifted_thread.c b/runtime/spu/spu_lifted_thread.c
+index e18d9bde..6f53283d 100644
+--- a/runtime/spu/spu_lifted_thread.c
++++ b/runtime/spu/spu_lifted_thread.c
+@@ -16,7 +16,8 @@ extern uint8_t* vm_base;
+ int  spu_have_function(uint32_t addr);
+ int  spu_image_of_function(uint32_t addr);
+ void spu_indirect_branch(struct spu_context* ctx);
+-int  spu_run_with_halt(void (*entry)(struct spu_context*), struct spu_context* ctx);
++int  spu_run_with_halt(void (SPU_ABI *entry)(struct spu_context*), struct spu_context* ctx);
++void spu_mfc_release(struct spu_context* ctx);
+ 
+ /* Guest memory is big-endian and this file reads descriptors out of it. lv2 has
+  * its own copy of this helper; duplicating four lines is cheaper than exporting
+diff --git a/runtime/spu/spu_raw.c b/runtime/spu/spu_raw.c
+index 75170110..e102f46c 100644
+--- a/runtime/spu/spu_raw.c
++++ b/runtime/spu/spu_raw.c
+@@ -45,7 +45,7 @@
+ 
+ extern uint8_t* vm_base;
+ extern int g_spu_force_ch_block;              /* spu_channels.c */
+-extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
++extern int spu_run_with_halt(void (SPU_ABI *)(spu_context*), spu_context*);
+ /* For attributing an MMIO store to the guest code that made it. */
+ #include "../ppu/ppu_context.h"
+ #include "ps3emu/thread_name.h"
+diff --git a/runtime/spu/spu_tsp_weak.c b/runtime/spu/spu_tsp_weak.c
+index 52d59ffe..24ca3b8d 100644
+--- a/runtime/spu/spu_tsp_weak.c
++++ b/runtime/spu/spu_tsp_weak.c
+@@ -9,10 +9,9 @@
+  * (Plain definition, not __attribute__((weak)): the runtime lib builds under
+  * MSVC, which has no GNU weak attribute.) */
+ #include <stdio.h>
++#include "spu_context.h"   /* SPU_ABI (KZ3 patch 1099) */
+ 
+-struct spu_context;
+-
+-void tsp_spu_func_00000A00(struct spu_context* ctx)
++SPU_ABI void tsp_spu_func_00000A00(struct spu_context* ctx)
+ {
+     (void)ctx;
+     fprintf(stderr, "[spu] tsp_spu_func_00000A00 stub called -- this port "
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index ca0e297b..a0636cd2 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -1068,7 +1068,7 @@ static void spu_async_run(spu_async_job* j)
+                  * task. Needs the SpursKernelContext at LS[0x1C0] (instance ptr)
+                  * + r80=0x100 context base, mirroring the kernel->policy handoff. */
+                 extern uint8_t* vm_base;
+-                extern void tsp_spu_func_00000A00(spu_context*);
++                extern SPU_ABI void tsp_spu_func_00000A00(spu_context*);
+                 if (vm_base) memcpy(ls + 0xA00, vm_base + 0x30023680, 0x2200);
+                 /* Build the REAL SpursTasksetContext at LS 0x2700 (taskset ptr @0x27B8,
+                  * TaskInfo @0x2780, syscallAddr @0x27C4) from the actual game taskset,
+diff --git a/runtime/spu/spu_workload.h b/runtime/spu/spu_workload.h
+index cb123d83..0a471a71 100644
+--- a/runtime/spu/spu_workload.h
++++ b/runtime/spu/spu_workload.h
+@@ -32,7 +32,7 @@
+ extern "C" {
+ #endif
+ 
+-typedef void (*spu_lifted_entry_fn)(spu_context*);
++typedef void (SPU_ABI *spu_lifted_entry_fn)(spu_context*);
+ 
+ /* FNV-1a 64-bit over a byte range. The canonical workload fingerprint; the
+  * offline extractor computes the same value so registrations and the images a
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index bb8f1226..547968a2 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -45,7 +45,7 @@
+ #include "ps3emu/log_first.h"
+ 
+ extern uint8_t* vm_base;
+-extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
++extern int spu_run_with_halt(void (SPU_ABI *)(spu_context*), spu_context*);
+ 
+ /* ---- guest reads (big-endian) ------------------------------------------ */
+ static uint32_t g32(uint32_t ea)
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 6f564ac7..d8eb6288 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -35,7 +35,7 @@
+ #include <string.h>
+ #include "ps3emu/log_first.h"
+ 
+-extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
++extern int spu_run_with_halt(void (SPU_ABI *)(spu_context*), spu_context*);
+ 
+ /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
+  * (single writer per run; reads are diagnostic). */
+@@ -651,7 +651,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+  * ------------------------------------------------------------------------- */
+ extern const unsigned char g_taskset_policy_bytes[];
+ extern const unsigned g_taskset_policy_size;
+-extern void tsp_spu_func_00000A00(spu_context*);
++extern SPU_ABI void tsp_spu_func_00000A00(spu_context*);
+ 
+ /* pm-flow hang watchdog: dump the traced run's partial transfer trail + live
+  * ctx state 5s after arm if the run hasn't returned (g_pm_flow_ctx still set).
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index 3658efc5..316abef3 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -99,8 +99,8 @@ extern "C" {
+  * musttail fast path spu_indirect_branch_mt (runtime/spu/spu_dispatch_mt.c) and
+  * define SPU_USE_DISPATCH_MT for the lifted TUs; dispatch sites below go
+  * through SPU_IB_DISPATCH so the choice is a compile-time switch. */
+-void spu_indirect_branch(spu_context* ctx);
+-void spu_indirect_branch_mt(spu_context* ctx);
++SPU_ABI void spu_indirect_branch(spu_context* ctx);   /* SPU_ABI: KZ3 patch 1099 (spu_context.h) */
++SPU_ABI void spu_indirect_branch_mt(spu_context* ctx);
+ #ifdef SPU_USE_DISPATCH_MT
+ #  define SPU_IB_DISPATCH spu_indirect_branch_mt
+ #else
+@@ -1088,14 +1088,14 @@ class SPULifter:
+     def emit_header(self) -> str:
+         lines = [HEADER_PREAMBLE, ""]
+         for f in self.functions:
+-            lines.append(f"void {f.name}(spu_context* ctx);")
++            lines.append(f"SPU_ABI void {f.name}(spu_context* ctx);")   # SPU_ABI: KZ3 patch 1099
+         defined = {f.start_addr for f in self.functions}
+         for t in sorted(self.call_targets | self.branch_targets):
+             if t not in defined:
+-                lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx); /* external */")
++                lines.append(f"SPU_ABI void {self.prefix}spu_func_{t:08X}(spu_context* ctx); /* external */")
+         lines.append("")
+         lines.append("/* Runtime glue (runtime/spu/spu_channels.c) */")
+-        lines.append("void spu_register_function(uint32_t addr, void (*fn)(spu_context*));")
++        lines.append("void spu_register_function(uint32_t addr, void (SPU_ABI *fn)(spu_context*));")
+         lines.append("/* Call once at init to register this image's functions for")
+         lines.append(" * indirect-branch dispatch (spu_indirect_branch). */")
+         lines.append(f"void {self.prefix}spu_recomp_register(void);")
+@@ -1108,7 +1108,7 @@ class SPULifter:
+         lines.append("static int s_spu_ib_gid;")
+         lines.append("")
+         for f in self.functions:
+-            lines.append(f"void {f.name}(spu_context* ctx) {{")
++            lines.append(f"SPU_ABI void {f.name}(spu_context* ctx) {{")
+             # KZ3 patch 1082: one LS base / debug-gate snapshot per function that touches LS (see SOURCE_PREAMBLE).
+             if any("spu_ls_read128(" in b or "spu_ls_write128(" in b for b in f.body_lines):
+                 lines.append("    SPU_LS_LOCALS")
+@@ -1130,14 +1130,14 @@ class SPULifter:
+             lines.append(" * function detector did not seed (typically conditional")
+             lines.append(" * branches that escape a function's range). */")
+             for t in externs:
+-                lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
++                lines.append(f"SPU_ABI void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
+                 lines.append(f"    ctx->pc = 0x{t:X}u; "
+                              f"g_spu_trampoline_fn = spu_indirect_branch; return;")
+                 lines.append("}")
+             lines.append("")
+ 
+         lines.append("/* Function table */")
+-        lines.append("typedef struct { uint32_t addr; void (*func)(spu_context*); const char* name; } spu_func_entry;")
++        lines.append("typedef struct { uint32_t addr; void (SPU_ABI *func)(spu_context*); const char* name; } spu_func_entry;")
+         lines.append("static const spu_func_entry spu_function_table[] = {")
+         for f in self.functions:
+             lines.append(f'    {{ 0x{f.start_addr:08X}u, {f.name}, "{f.name}" }},')
+@@ -1150,7 +1150,7 @@ class SPULifter:
+         tg = sorted(getattr(self, "ib_guess_targets", set()))
+         if tg:   # KZ3 patch 1098
+             lines.append("    static const uint32_t ga[] = { " + ", ".join(f"0x{t:X}u" for t in tg) + " };")
+-            lines.append("    static void (*const gf[])(spu_context*) = { "
++            lines.append("    static void (SPU_ABI *const gf[])(spu_context*) = { "
+                          + ", ".join(f"{self.prefix}spu_func_{t:08X}" for t in tg) + " };")
+             lines.append(f"    s_spu_ib_gid = s_spu_ib_gid ? -1 : spu_ib_guess_register(ga, gf, {len(tg)});")
+         lines.append("}")

@@ -1,0 +1,169 @@
+KZ3 4008: the three cellHttp imports Killzone 3 calls whose NIDs had no function: cellHttpInitCookie (0x9638F766,
+accepted, no cookie jar), cellHttpRequestSetHeader (0x54F2A4DE, adds or replaces a request header by name,
+case-insensitive; CR/LF in a value become spaces, a name with ':' or CR/LF is refused) and
+cellHttpRequestGetAllHeaders (0x42205FE0, the request headers in the caller's pool, laid out like
+cellHttpResponseGetAllHeaders, with the size query). SendRequest no longer sends a title's own Host or
+Content-Length a second time and drops a custom header that no longer fits instead of advancing past the buffer;
+AddRequestHeader logs the header name only (it printed guest addresses as host strings). Upstream candidate.
+Test: tools/net/test_net.sh (test_cellhttp_gate: set, replace, sanitise, list, and the request as the server got it).
+
+diff --git a/libs/network/cellHttp.c b/libs/network/cellHttp.c
+--- a/libs/network/cellHttp.c
++++ b/libs/network/cellHttp.c
+@@ -466,6 +466,18 @@
+     return CELL_OK;
+ }
+ 
++/* KZ3 4008: ASCII case-insensitive name compare (0 = equal), for request header names */
++static int http_name_eq(const char* a, const char* b)
++{
++    for (;; a++, b++) {
++        int ca = (unsigned char)*a, cb = (unsigned char)*b;
++        if (ca >= 'A' && ca <= 'Z') ca += 32;
++        if (cb >= 'A' && cb <= 'Z') cb += 32;
++        if (ca != cb) return 1;
++        if (!ca) return 0;
++    }
++}
++
+ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
+                         u32* sent)
+ {
+@@ -587,12 +599,23 @@
+                             (unsigned long long)t->request_content_length);
+     }
+ 
+-    /* Append custom headers */
++    /* Append custom headers. KZ3 4008: the runtime writes Host and Content-Length itself, so a title's own copy of
++     * either (cellHttpRequestSetHeader) is not sent twice; a header that no longer fits is dropped, never written
++     * past the buffer (snprintf's return is the untruncated length). */
+     for (u32 i = 0; i < t->custom_header_count; i++) {
+-        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+-                            "%s: %s\r\n",
+-                            t->custom_headers[i].name,
+-                            t->custom_headers[i].value);
++        if (!http_name_eq(t->custom_headers[i].name, "Host") ||
++            !http_name_eq(t->custom_headers[i].name, "Content-Length"))
++            continue;
++        int w = snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
++                         "%s: %s\r\n",
++                         t->custom_headers[i].name,
++                         t->custom_headers[i].value);
++        if (w < 0 || (u32)w >= sizeof(req_buf) - (u32)req_len - 3u) {
++            req_buf[req_len] = '\0';
++            printf("[cellHttp]   request header %u dropped (no room)\n", i);
++            continue;
++        }
++        req_len += w;
+     }
+ 
+     /* End of headers */
+@@ -1016,8 +1039,91 @@
+     h->value[sizeof(h->value) - 1] = '\0';
+     t->custom_header_count++;
+ 
+-    printf("[cellHttp] AddRequestHeader(trans=%u, '%s: %s')\n",
+-           transId, name, value);
++    /* KZ3 4008: the name only (it was the guest addresses read as host strings; values may be cookies) */
++    printf("[cellHttp] AddRequestHeader(trans=%u, '%s')\n", transId, h->name);
++    return CELL_OK;
++}
++
++/* KZ3 4008: three firmware imports Killzone 3 v1.00 calls whose NIDs had no function (the RE notes section 13.2).
++ * cellHttpInitCookie(pool, size) (@0x8210c, a 0x2800-byte pool): accepted, no cookie jar is kept (ASSUMPTION: no
++ * server the port talks to needs one; cookies from responses are not stored or sent back). */
++s32 cellHttpInitCookie(void* pool, u32 poolSize)
++{
++    (void)pool;
++    printf("[cellHttp] InitCookie(size=%u): accepted, cookies not kept\n", poolSize);
++    return CELL_OK;
++}
++
++/* cellHttpRequestSetHeader(transId, const CellHttpHeader* header) (@0x84494): header is a guest
++ * { u32 name; u32 value; } of two guest string pointers. Replaces a header of the same name (case-insensitive),
++ * else adds one. Names/values are cut to the slot sizes; the value is not logged (it may be a cookie or a key). */
++s32 cellHttpRequestSetHeader(CellHttpTransId transId, const void* header)
++{
++    if (!s_http_initialized)
++        return CELL_HTTP_ERROR_NOT_INITIALIZED;
++    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
++        return CELL_HTTP_ERROR_NOT_FOUND;
++    u32 hea = (u32)(uintptr_t)header;
++    if (!hea)
++        return CELL_HTTP_ERROR_INVALID_PARAMETER;
++    u32 nea = vm_read32(hea), vea = vm_read32(hea + 4u);
++    if (!nea || !vea)
++        return CELL_HTTP_ERROR_INVALID_PARAMETER;
++    HttpTransSlot* t = &s_transactions[transId];
++    char name[sizeof(t->custom_headers[0].name)];
++    strncpy(name, (const char*)vm_base + nea, sizeof(name) - 1);
++    name[sizeof(name) - 1] = '\0';
++    if (!name[0] || strpbrk(name, ":\r\n"))
++        return CELL_HTTP_ERROR_INVALID_PARAMETER;
++    u32 i = 0;
++    while (i < t->custom_header_count && http_name_eq(t->custom_headers[i].name, name)) i++;
++    if (i == t->custom_header_count) {
++        if (t->custom_header_count >= CELL_HTTP_MAX_CUSTOM_HEADERS)
++            return CELL_HTTP_ERROR_NO_BUFFER;
++        t->custom_header_count++;
++    }
++    HttpCustomHeader* h = &t->custom_headers[i];
++    memcpy(h->name, name, sizeof(h->name));
++    strncpy(h->value, (const char*)vm_base + vea, sizeof(h->value) - 1);
++    h->value[sizeof(h->value) - 1] = '\0';
++    for (char* c = h->value; *c; c++) if (*c == '\r' || *c == '\n') *c = ' ';   /* no header injection */
++    printf("[cellHttp] RequestSetHeader(trans=%u, '%s')\n", transId, h->name);
++    return CELL_OK;
++}
++
++/* cellHttpRequestGetAllHeaders(transId, CellHttpHeader** headers, size_t* items, void* pool, size_t poolSize,
++ * size_t* required) (@0x84524, a size query with no pool, then a pool of *required bytes): the request headers set
++ * so far (cellHttpRequestSetHeader / AddRequestHeader; ASSUMPTION: not Host, which the runtime adds when sending),
++ * laid out like cellHttpResponseGetAllHeaders: the {name, value} array, then the strings. */
++s32 cellHttpRequestGetAllHeaders(CellHttpTransId transId, void* headers, u32* items, void* pool, u32 poolSize,
++                                 u32* required)
++{
++    if (!s_http_initialized)
++        return CELL_HTTP_ERROR_NOT_INITIALIZED;
++    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
++        return CELL_HTTP_ERROR_NOT_FOUND;
++    HttpTransSlot* t = &s_transactions[transId];
++    u32 count = t->custom_header_count, need = count * 8u;
++    for (u32 i = 0; i < count; i++)
++        need += (u32)strlen(t->custom_headers[i].name) + 1u + (u32)strlen(t->custom_headers[i].value) + 1u;
++    u32 pool_ea = (u32)(uintptr_t)pool;
++    if (required) vm_write32((u32)(uintptr_t)required, need);
++    if (!pool_ea || poolSize < need) {
++        if (items) vm_write32((u32)(uintptr_t)items, 0);
++        return pool_ea ? CELL_HTTP_ERROR_NO_BUFFER : CELL_OK;
++    }
++    u32 at = pool_ea + count * 8u;
++    for (u32 i = 0; i < count; i++) {
++        u32 nl = (u32)strlen(t->custom_headers[i].name) + 1u, vl = (u32)strlen(t->custom_headers[i].value) + 1u;
++        memcpy(vm_base + at, t->custom_headers[i].name, nl);
++        vm_write32(pool_ea + i * 8u, at);
++        at += nl;
++        memcpy(vm_base + at, t->custom_headers[i].value, vl);
++        vm_write32(pool_ea + i * 8u + 4u, at);
++        at += vl;
++    }
++    if (headers) vm_write32((u32)(uintptr_t)headers, pool_ea);
++    if (items) vm_write32((u32)(uintptr_t)items, count);
+     return CELL_OK;
+ }
+ 
+diff --git a/libs/network/cellHttp.h b/libs/network/cellHttp.h
+--- a/libs/network/cellHttp.h
++++ b/libs/network/cellHttp.h
+@@ -117,6 +117,11 @@
+ s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
+                              const char* value);
+ s32 cellHttpAbortTransaction(CellHttpTransId transId);
++/* KZ3 4008: cookie init (accepted, no jar), request header set/replace and list (CellHttpHeader in guest memory) */
++s32 cellHttpInitCookie(void* pool, u32 poolSize);
++s32 cellHttpRequestSetHeader(CellHttpTransId transId, const void* header);
++s32 cellHttpRequestGetAllHeaders(CellHttpTransId transId, void* headers, u32* items, void* pool, u32 poolSize,
++                                 u32* required);
+ 
+ #ifdef __cplusplus
+ }

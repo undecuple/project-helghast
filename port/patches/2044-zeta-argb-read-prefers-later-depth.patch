@@ -1,0 +1,172 @@
+KZ3 patch 2044 (RSX pass 44): an A8R8G8B8 read of a Z24S8 zeta takes the zeta when its depth is newer than the
+last real colour write to the colour surface at the same address.
+rsx_live_draw.c: surfaces record colour_gen (draws whose colour mask is not all zero, per MRT nibble, and colour
+clears) and zetas zwrite_gen (depth test+write draws) on one counter, g_ld_cw_gen. At the texture bind, a
+ZALIAS_ARGB read (patch 2011 byte rebuild) whose zeta holds depth (had_write or a valid snapshot: had_write is
+cleared once a snapshot is taken) newer than every colour alias' colour_gen skips the colour alias, as patch 2022
+already did for X16/DEPTH16 reads. Cause in KZ3: from level 2 on, the depth pre-pass binds the scene zeta's address
+0x25C0000 as its colour target with all channels masked; the black colour alias won the bind, the half-res depth
+downsample (SHADER_CONTROL 0x300840E) rebuilt depth 0 everywhere, the DoF depth 0x1A1C000 went flat at 4.88e-5
+(near) and DepthToFuzzy blurred the whole frame. LD_NO_ZETA_ARGB_PREFER=1 = old behaviour. Logs: [zeta-argb]
+(decision changes, the first colour writes into zeta addresses, and with LD_ZPROBE the per-bind decision).
+Diagnostic: LD_DRAW_INPUTS=0:<idx>,... (patch 2043) = the first full frame after the gated LD_DRAW_DUMP frame.
+Host test tools/smoke/test_zeta_argb.c. Upstream candidate (general aliasing rule).
+
+--- a/libs/video/rsx_live_draw.c	2026-10-12 19:02:35.654161752 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-12 20:14:15.131981534 -0500
+@@ -241,6 +241,7 @@
+     u8 gv_pending;            /* the GPU wrote since the last baseline */
+     u8 gv_dirty;              /* explicit hook: the guest wrote after the last GPU write */
+     u8 gv_gpu_dirty;          /* the GPU wrote since the last write-back (main-memory surfaces) */
++    u32 colour_gen;           /* patch 2044: g_ld_cw_gen of the last draw/clear that wrote colour (mask != 0) */
+ #if !defined(YZ_PERF_CLEAN)
+     u32 resource_serial;
+     u32 last_write_generation;
+@@ -277,6 +278,7 @@
+     u64 depth_both_draws;
+     int reject_logged;
+     u32 depth_format;   /* patch 2012: SURFACE_FORMAT depth of the last draw into it (1 Z16, 2 Z24S8) */
++    u32 zwrite_gen;     /* patch 2044: g_ld_cw_gen of the last depth write (test+write draw or depth clear) */
+ } zdepth_t;
+ typedef struct {
+     u32 location, offset, format, width, height, pitch, remap;
+@@ -3502,6 +3504,13 @@
+  * the fragment program gets a shadow-compare or byte-rebuild post-pass. Both
+  * the PSO key and the bind use this test, so they agree. */
+ enum { ZALIAS_NONE = 0, ZALIAS_VALUE, ZALIAS_SHADOW, ZALIAS_ARGB };
++/* Patch 2044: one counter orders colour writes and depth writes, so a texture
++ * bind at an address that is both a colour surface and a host zeta can take the
++ * one written last (see the A8R8G8B8 rule at the bind). */
++static u32 g_ld_cw_gen = 0;
++static int zdepth_index_at(u32 location, u32 offset);
++/* Diagnostic: the first colour writes into a surface that shares its address with a zeta. */
++static void ld_cw_note(u32 slot, const char* how, u32 mask);
+ static int zdepth_index_at(u32 location, u32 offset)
+ {
+     for (u32 i = 0; i < g.n_zdepths; i++)
+@@ -3530,6 +3539,16 @@
+         return g.zdepths[zi].depth_format == 1 ? ZALIAS_NONE : ZALIAS_ARGB;
+     return ZALIAS_SHADOW;
+ }
++static void ld_cw_note(u32 slot, const char* how, u32 mask)
++{
++    static u32 n = 0;
++    if (n >= 24 || slot >= MAX_SURFACES) return;
++    if (zdepth_index_at(g.surfaces[slot].location, g.surfaces[slot].offset) < 0) return;
++    n++;
++    fprintf(stderr, "[zeta-argb] f=%u colour %s into %u:0x%08X %ux%u mask=0x%08X gen=%u\n", g_ld_frames, how,
++            g.surfaces[slot].location, g.surfaces[slot].offset, g.surfaces[slot].w, g.surfaces[slot].h, mask,
++            g.surfaces[slot].colour_gen);
++}
+ 
+ 
+ /* ---------------------------------------------------------------------------
+@@ -4494,6 +4513,7 @@
+     s->tex = replacement;
+     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
+     s->fmt = want_fmt;
++    s->colour_gen = 0;   /* patch 2044: a new resource holds no colour yet */
+ #if !defined(YZ_PERF_CLEAN)
+     s->resource_serial = ++g_ld_surface_resource_serial;
+ #endif
+@@ -8522,7 +8542,11 @@
+                      while (q && (*q == ':' || *q == ',') && want_n < 16) want_i[want_n++] = strtol(q + 1, &q, 10); } }
+         int want = 0;
+         for (int wi = 0; wi < want_n; wi++) if (want_i[wi] == (long)idx) want = 1;
+-        if (want_f >= 0 && (u32)want_f == frame && want) {
++        /* Patch 2044: frame 0 = the first full frame after the gated draw dump started (the frame number of a
++         * moment in a level differs from run to run; the frame-relative index is stable within a few draws). */
++        const int want_frame = want_f > 0 ? (u32)want_f == frame
++                             : want_f == 0 && dumped_frame != ~0u && frame == dumped_frame + 1u;
++        if (want_frame && want) {
+             const char* d = dir ? dir : "scratch";
+             char path[MAX_PATH * 2];
+             snprintf(path, sizeof(path), "%s\\inputs_f%06u_i%04u.txt", d, frame, idx);
+@@ -10184,7 +10208,36 @@
+         { static int off = -1;
+           if (off < 0) off = getenv("LD_NO_ZETA_PREFER") ? 1 : 0;
+           const int zk = off ? ZALIAS_NONE : tex_zalias_kind(&t);
+-          zeta_pref = zk == ZALIAS_VALUE || zk == ZALIAS_SHADOW; }
++          zeta_pref = zk == ZALIAS_VALUE || zk == ZALIAS_SHADOW;
++          /* Patch 2044: an A8R8G8B8 read of a Z24S8 zeta (the depth rebuild of
++           * patch 2011) also takes the zeta when its depth was written after
++           * the last real colour write to the colour surface at that address.
++           * KZ3's depth-only passes into 0x25C0000 (level 2 onward) bind that
++           * address as a colour target with all channels masked; the colour
++           * alias won, the half-res depth downsample read zeros, 0x1A1C000
++           * went flat at near depth and the DoF blurred the whole frame.
++           * LD_NO_ZETA_ARGB_PREFER=1 = old behaviour (colour alias first). */
++          static int aoff = -1;
++          if (aoff < 0) aoff = getenv("LD_NO_ZETA_ARGB_PREFER") ? 1 : 0;
++          if (zk == ZALIAS_ARGB && !aoff) {
++              const int zi = zdepth_index_at(t.location, t.offset);
++              if (zi >= 0 && (g.zdepths[zi].had_write || g.zdepths[zi].snapshot_valid)) {
++                  u32 cg = 0; int ci = -1;
++                  for (u32 i = 0; i < g.n_surfaces; i++)
++                      if (g.surfaces[i].location == t.location && g.surfaces[i].offset == t.offset &&
++                          i != target && g.surfaces[i].colour_gen >= cg) { cg = g.surfaces[i].colour_gen; ci = (int)i; }
++                  zeta_pref = g.zdepths[zi].zwrite_gen > cg;
++                  static u32 nlog = 0, ncall = 0; static int last = -1;
++                  const int key = (zeta_pref ? 1 : 0) | (ci << 1);
++                  if (ci >= 0 && nlog < 48 && (key != last || (ncall % 2000u) == 0)) {
++                      nlog++; last = key;
++                      fprintf(stderr, "[zeta-argb] f=%u %u:0x%08X %ux%u colour alias slot %d colour_gen=%u zeta #%d "
++                              "zwrite_gen=%u -> %s\n", g_ld_frames, t.location, t.offset, t.width, t.height, ci, cg, zi,
++                              g.zdepths[zi].zwrite_gen, zeta_pref ? "zeta" : "colour");
++                  }
++                  ncall++;
++              }
++          } }
+         if (!zeta_pref) { u32 best_gen = 0;
+           for (u32 i = 0; i < g.n_surfaces; i++) {
+               const surface_t* sf_i = &g.surfaces[i];
+@@ -10284,6 +10337,13 @@
+                 fprintf(stderr, "\n");
+             }
+         }
++        if (ld_zp_active() && tex_zalias_kind(&t) == ZALIAS_ARGB) {   /* patch 2044 diagnostic (LD_ZPROBE) */
++            static u32 nd = 0;
++            if (nd++ < 64)
++                fprintf(stderr, "[zeta-argb] f=%u bind ctrl=0x%08X target=%u:0x%X unit%u 0x%X -> sampled=%d zeta_pref=%d "
++                        "zslot=%u self=%d\n", g_ld_frames, rsx_dsp_reg(&g.rsx, 0x1D60), g.surfaces[target].location,
++                        g.surfaces[target].offset, u, t.offset, sampled, zeta_pref, current_zslot, self_zeta_read);
++        }
+         if (sampled < 0 && !zeta_pref && g.surfaces[target].location == t.location &&
+             g.surfaces[target].offset == t.offset) {
+             /* Reads its own render target: sample a copy of it. */
+@@ -10646,6 +10706,15 @@
+     ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
+     for (u32 r = 1; r < n_mrt; r++)
+         ld_surface_note_write(mrt[r], LD_SURFACE_WRITE_DRAW);
++    { /* Patch 2044: remember which targets this draw really wrote colour into.
++       * A colour target with every channel masked (KZ3's depth-only passes set
++       * the colour target to the zeta's own address) gets no colour. */
++      render_state_t cw;
++      decode_render_state(&cw);
++      if (cw.color_mask && target < MAX_SURFACES) { g.surfaces[target].colour_gen = ++g_ld_cw_gen; ld_cw_note(target, "draw", cw.color_mask); }
++      for (u32 r = 1; r < n_mrt; r++)
++          if (((cw.color_mask_mrt >> (4u * r)) & 0xFu) && mrt[r] < MAX_SURFACES)
++              g.surfaces[mrt[r]].colour_gen = ++g_ld_cw_gen; }
+     if (current_zslot) {
+         render_state_t depth_state;
+         decode_render_state(&depth_state);
+@@ -10658,8 +10727,10 @@
+         /* A write-enable bit alone does not prove that this draw produced a
+          * usable depth map.  With depth testing disabled RSX does not execute
+          * the depth pass represented by this tracked zeta. */
+-        if (depth_state.depth_test && depth_state.depth_write)
++        if (depth_state.depth_test && depth_state.depth_write) {
+             z->had_write = 1;
++            z->zwrite_gen = ++g_ld_cw_gen;   /* patch 2044 */
++        }
+     }
+     static int zp_on = -1;   /* patch 2022: LD_ZPROBE */
+     if (zp_on < 0) zp_on = getenv("LD_ZPROBE") != NULL;
+@@ -10827,6 +10898,7 @@
+           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
+         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, n_crect, n_crect ? &crect : NULL);
+         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
++        if (target < MAX_SURFACES) { g.surfaces[target].colour_gen = ++g_ld_cw_gen; ld_cw_note(target, "clear", mask); }   /* patch 2044 */
+     }
+     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
+         rsx_dsp_surface sf;

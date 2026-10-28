@@ -1,0 +1,15 @@
+# Combined move + fire test: T1 and T2 in one level run, interleaved so no button press overlaps
+# a stick segment. Times are run seconds with tools/level-run.sh (level load ~38 s, gameplay from ~120-135 s).
+# Evidence: [cellPad] script lines, [trace] move/yaw/pos once per second, the clip (KZ3_VIDEO=330:60), HUD if drawn.
+335:0,-1,0,0/8       # walk forward 8 s
+344:0x0800/1.0       # R1: one-second burst while standing (muzzle flash, ammo drops)
+347:0,0,1,0/3        # look right 3 s
+351:0x0800/1.0       # R1: burst after turning
+354:0x8000           # SQUARE: reload
+357:0,0,-1,0/3       # look left 3 s (back toward the gate)
+361:0x1000           # TRIANGLE: next weapon
+364:0,1,0,0/5        # walk back 5 s
+370:0x0200/0.5       # R2: throw
+374:0x0400/0.5       # L1: melee
+378:0x0004           # R3: zoom in
+382:0x0004           # R3: zoom out

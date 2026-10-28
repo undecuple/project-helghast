@@ -1,0 +1,19 @@
+name: Feedback or question
+description: A question, a comment or an idea that is not a bug
+labels: [feedback]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions, comments and ideas are welcome. For something that is broken use the bug report. Never attach game files.
+  - type: textarea
+    id: what
+    attributes:
+      label: Your feedback or question
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Port build (if it matters)
+      description: "Release number or commit, and game version (1.00 or 1.14)."

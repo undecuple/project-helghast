@@ -1,0 +1,25 @@
+# Fast menu script: from the first-boot profile (work/proton/coord-firstboot) to the
+# New Campaign level load of mission_0 at 38 s of run time instead of pad-r12's 122.7 s (fast-1/fast-2: preintro
+# 30 s -> intro 31 s -> title 32 s -> main menu 34 s -> difficulty 35 s -> level load 38.0 s, both runs; the 37-43 s
+# retries fire during the loading screen and do nothing). Measured on gp-t1 (v1.00,
+# 520 s, tools/boot_timeline.py): the settings pages auto-advance with a loaded profile (0.9-9.2 s), LOGOGG.BIK
+# (the logos, 602 frames) plays its full 20 s and ignores CROSS/START, the prenarrative and the opening cinematic
+# each end on the first CROSS (pad-r12: 29.4 -> 30.7 s and 31.1 -> 40.2 s), the title, main menu (Campaign is the
+# first item) and difficulty page take one CROSS each; pad-r12 then waited for its fixed times (50, 58, 120 s),
+# 80 s of nothing. Every page below gets two presses ~1.5 s apart (the second is a retry: an extra CROSS on any of
+# these pages only moves forward, and polling stops on the loading screen). Pad time T = seconds since the first
+# pad poll, about 1.1 s after the run's clock ([perf] t=); only integer T and plain masks, so a v1 (pre-3006) exe
+# parses it too once the comments are stripped (tools/level-run.sh does that). 12 events; a v1 exe keeps 32.
+# The in-level presses (CROSS every 20 s, as pad-r12) are appended by tools/level-run.sh.
+3:0x4000      # language page: auto-advances with a loaded profile; harmless
+6:0x4000      # epilepsy warning (5 s timer); harmless
+30:0x4000     # prenarrative (starts when the 20 s logo movie ends, run clock ~29.4 s): CROSS skips it
+31:0x4000     #   retry
+33:0x4000     # opening cinematic (intro.gum): CROSS skips it
+34:0x4000     #   retry
+36:0x4000     # title screen
+37:0x4000     #   retry
+39:0x4000     # main menu: Campaign (first item; no lobby with a profile that has no progress)
+40:0x4000     #   retry
+42:0x4000     # difficulty page: the highlighted default -> level load (the opening cinematic then plays in full
+43:0x4000     #   retry      while the level loads, ~72 s; the level-start checkpoint save marks the level start)

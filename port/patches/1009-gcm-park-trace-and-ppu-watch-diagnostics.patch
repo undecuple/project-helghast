@@ -1,0 +1,136 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index c5d133d2..4a8f5c35 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -936,6 +936,56 @@ static u32 s_fifo_calloff = 0;
+ static u32 s_park_off = 0xFFFFFFFFu;  /* KZ3 patch 1007: park being waited on */
+ static u64 s_park_t0 = 0;
+ 
++/* KZ3 patch 1009 diagnostic, GCM_PARK_TRACE=1: the last 8 placeholder parks the walker
++ * went through (park words, put, both KZ3 contexts' `current`, a snapshot of the
++ * sub-block), dumped with a diff against memory now when a park times out. */
++#define KZ3_PT_N 8
++#define KZ3_PT_SNAP 0x900
++typedef struct { u32 park, tgt, refs, put, t_ms, cur0, cur1, ret_from, ret_cur1, ret_t; u8 snap[KZ3_PT_SNAP]; } kz3_pt;
++static kz3_pt s_pt[KZ3_PT_N]; static unsigned s_pt_n = 0;
++static u32 gcm_ea2io(u32 ea);
++static int kz3_pt_on(void) { static int on = -1; if (on < 0) on = getenv("GCM_PARK_TRACE") ? 1 : 0; return on; }
++static u32 kz3_ctx_cur(int which) { u32 g = vm_read32(0x0133163Cu); if (!g) return 0;
++    u32 c = vm_read32(g + (which ? 0xF0u : 0x10u) + 8u); return c ? gcm_ea2io(c) : 0; }
++static u32 kz3_pt_ms(void) { return (u32)(get_timestamp_ns() / 1000000ull); }
++static void kz3_pt_jump(u32 from, u32 tgt, u32 put) {
++    if (!kz3_pt_on()) return;
++    u32 fea = gcm_io2ea(from); if (!fea) return;
++    if (vm_read32(fea + 8) == vm_read32(fea) && vm_read32(fea + 4) < 16u) {   /* P[0] == P[2]: patched placeholder */
++        kz3_pt* e = &s_pt[s_pt_n++ % KZ3_PT_N]; memset(e, 0, sizeof *e);
++        e->park = from; e->tgt = tgt; e->refs = vm_read32(fea + 4); e->put = put;
++        e->t_ms = kz3_pt_ms(); e->cur0 = kz3_ctx_cur(0); e->cur1 = kz3_ctx_cur(1);
++        for (u32 i = 0; i < KZ3_PT_SNAP; i += 4) { u32 ea = gcm_io2ea(tgt + i); u32 v = ea ? vm_read32(ea) : 0; memcpy(e->snap + i, &v, 4); }
++        return;
++    }
++    if (s_pt_n) { kz3_pt* e = &s_pt[(s_pt_n - 1) % KZ3_PT_N];
++        if (tgt == e->park + 0xC && !e->ret_from) { e->ret_from = from; e->ret_cur1 = kz3_ctx_cur(1); e->ret_t = kz3_pt_ms(); } }
++}
++static void kz3_pt_ctx(const char* tag) {
++    u32 g = vm_read32(0x0133163Cu); if (!g) return;
++    for (int w = 0; w < 2; w++) { u32 c = g + (w ? 0xF0u : 0x10u);
++        u32 b = vm_read32(c), en = vm_read32(c + 4), cu = vm_read32(c + 8), pp = vm_read32(c + 0x70), r = vm_read32(c + 0x74);
++        fprintf(stderr, "[park-ctx] %s t=%u ctx%d@%08X begin=%08X(io %08X) end=%08X cur=%08X(io %08X) P=%08X(io %08X) ret=%08X\n",
++                tag, kz3_pt_ms(), w, c, b, gcm_ea2io(b), en, cu, gcm_ea2io(cu), pp, gcm_ea2io(pp), r); }
++    fprintf(stderr, "[park-ctx] %s G+5B0=%08X G+5B8=%08X label480=%08X label490=%08X label4A0=%08X get=%08X\n", tag,
++            vm_read32(g + 0x5B0), vm_read32(g + 0x5B8), vm_read32(0x20000480u), vm_read32(0x20000490u), vm_read32(0x200004A0u), s_fifo_getoff);
++}
++static void kz3_pt_dump(void) {
++    if (!kz3_pt_on()) return;
++    unsigned first = s_pt_n > KZ3_PT_N ? s_pt_n - KZ3_PT_N : 0;
++    for (unsigned k = first; k < s_pt_n; k++) { kz3_pt* e = &s_pt[k % KZ3_PT_N];
++        u32 nch = 0, lo = 0xFFFFFFFFu, hi = 0, term_then = 0xFFFFFFFFu, term_now = 0xFFFFFFFFu, back = 0x20000000u | (e->park + 0xC);
++        for (u32 i = 0; i < KZ3_PT_SNAP; i += 4) { u32 ea = gcm_io2ea(e->tgt + i); u32 v = ea ? vm_read32(ea) : 0, o; memcpy(&o, e->snap + i, 4);
++            if (v != o) { nch++; if (i < lo) lo = i; hi = i; }
++            if (o == back && term_then == 0xFFFFFFFFu) term_then = i;
++            if (v == back && term_now == 0xFFFFFFFFu) term_now = i; }
++        fprintf(stderr, "[park-trace] #%u t=%u park=%08X refs=%u -> %08X put=%08X cur0=%08X cur1=%08X | ret from %08X t=%u cur1=%08X | term then +%X now +%X | %u words changed since [+%X..+%X] now t=%u\n",
++                k, e->t_ms, e->park, e->refs, e->tgt, e->put, e->cur0, e->cur1, e->ret_from, e->ret_t, e->ret_cur1,
++                term_then, term_now, nch, lo, hi, kz3_pt_ms()); }
++    kz3_pt_ctx("timeout");
++    fflush(stderr);
++}
++
+ /* ---------------------------------------------------------------------------
+  * 2D transfer engines (FIFO subchannels != 0).
+  *
+@@ -1769,6 +1819,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * then runs off the end of the previous frame's bytes until it meets a
+      * word that is not a command, and parks there forever. */
+     atomic_thread_fence(memory_order_acquire);
++    /* KZ3 patch 1009 diagnostic: both KZ3 contexts every 2 s. */
++    if (kz3_pt_on()) { static u32 last_tick = 0; u32 now = kz3_pt_ms();
++        if (now - last_tick >= 2000u) { last_tick = now; kz3_pt_ctx("tick"); } }
+     /* KZ3 patch 1007: GCM_STALL_LOG=<N>: every Nth drain, where the walker is
+      * (get, call return) against the title's put -- tells "release still queued
+      * behind the walker" from "release never submitted". */
+@@ -2024,12 +2077,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                             fprintf(stderr, "[park-diag] park io=0x%08X words %08X %08X %08X put=0x%08X label[0x%X]=0x%08X\n",
+                                     s_fifo_getoff, vm_read32(pe), vm_read32(pe + 4), vm_read32(pe + 8), put,
+                                     poff, vm_read32(0x20000000u + poff));
++                            kz3_pt_dump();   /* KZ3 patch 1009 diagnostic */
+                             u32 base = s_config.ioAddress, sz = s_config.ioSize; int hits = 0;
+                             for (u32 o = 0; o + 16 <= sz && hits < 48; o += 4)
+                                 if (vm_read32(base + o) == 0x00041D6Cu && vm_read32(base + o + 4) == poff) {
+                                     hits++;
+                                     fprintf(stderr, "[park-diag] 1D6C=0x%X at io 0x%08X then %08X %08X\n",
+                                             poff, o, vm_read32(base + o + 8), vm_read32(base + o + 12));
++                                    /* KZ3 patch 1009 diagnostic: the stream before the hit, raw. */
++                                    if (kz3_pt_on()) for (u32 d = (o >= 0x300u ? o - 0x300u : 0); d < o + 0x40u; d += 0x20u) {
++                                        fprintf(stderr, "[park-mem] %08X:", d);
++                                        for (u32 j = 0; j < 8; j++) fprintf(stderr, " %08X", vm_read32(base + d + j * 4));
++                                        fprintf(stderr, "\n"); }
+                                     /* Which JUMP/CALL in IO memory leads into the 0x400 bytes before it. */
+                                     for (u32 q = 0; q + 4 <= sz; q += 4) {
+                                         u32 w = vm_read32(base + q), t = w & 0x1FFFFFFCu;
+@@ -2046,6 +2105,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+               }
+               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
+               s_park_off = 0xFFFFFFFFu;
++              kz3_pt_jump(s_fifo_getoff, tgt, put);   /* KZ3 patch 1009 diagnostic */
+               s_fifo_getoff = tgt;
+               /* get is the RSX's fetch pointer: a title polling it sees the
+                * GPU leave a segment as soon as the JUMP out of it is taken.
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 3a54f0e6..254e6e5a 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1827,7 +1827,9 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
+       if (s_wv && v == s_wv && a >= s_wvlo && a < s_wvhi &&
+           (!s_wvg || GetFileAttributesA(s_wvg) != INVALID_FILE_ATTRIBUTES)) {
+           static int _n = 0;
+-          if (PS3_LOG_FIRST(_n, 24)) {
++          /* KZ3 patch 1009 diagnostic: PPU_WWATCH_MAX=<n> lifts the 24-hit cap. */
++          static int _max = -1; if (_max < 0) { const char* e = getenv("PPU_WWATCH_MAX"); _max = e ? atoi(e) : 24; }
++          if (PS3_LOG_FIRST(_n, _max)) {
+               fprintf(stderr, "[wv] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
+                       a, v, width, ppu_prof_resolve_host(ra));
+               extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+@@ -1886,8 +1888,20 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
+           static long _cap = -1;
+           if (_cap < 0) { const char* e = getenv("PPU_WWATCH_MAX");
+                           _cap = e ? atol(e) : 64; }
+-          long _i = ++_n;
+-          if (_cap == 0 || _i <= _cap) {
++          /* KZ3 patch 1009 diagnostic: PPU_WWATCH_DEC=1 logs only stores whose value is
++           * lower than the previous value stored at that address (a pointer rewind),
++           * with the guest stack for the first 8 of them. */
++          int _skip = 0;
++          { static int _dec = -1; if (_dec < 0) { const char* e = getenv("PPU_WWATCH_DEC"); _dec = e ? 1 : 0; }
++            if (_dec) { static uint32_t _lastv[64]; uint32_t _k = ((a - (s_ww & ~15u)) >> 2) & 63u;
++                        uint32_t _pv = _lastv[_k]; _lastv[_k] = v;
++                        if (!(_pv && v < _pv)) _skip = 1;
++                        else { static int _dh = 0; extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++                               extern void ppu_dump_guest_stack(ppu_context*, const char*);
++                               fprintf(stderr, "[ww-dec] 0x%08X: 0x%08X -> 0x%08X\n", a, _pv, v);
++                               if (_dh++ < 8 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "ww-dec"); } } }
++          long _i = _skip ? 0 : ++_n;
++          if (!_skip && (_cap == 0 || _i <= _cap)) {
+               /* guest lr and tid as well as the host-sampled function. The
+                * sampler resolves a HOST return address, and identical code
+                * folding makes that ambiguous -- GH3's runaway memset reported

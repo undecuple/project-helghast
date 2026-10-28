@@ -1,0 +1,108 @@
+KZ3 patch 2059 (RSX pass 59): an A8R8G8B8 read of a Z24S8 zeta address gets the depth byte rebuild in its shader
+only when the bind really takes the zeta.
+Cause of the pause-screen blur's black blocky holes and of the orange wash / red blocks over the main menu after
+Pause > Quit: KZ3's 320x180 blur ping-pong (0x2980000, 0x2DA0000; downsample of 0x1300000, two 4-tap blur passes,
+SET_SHADER_PACKER 1, gamma on R,G,B) shares its addresses with the level's shadow-map zetas. Patch 2044 decides at
+the bind which one an A8R8G8B8 read takes (the zeta only when its depth is newer than the last real colour write),
+but get_pso tagged every such unit ZALIAS_ARGB from tex_zalias_kind alone, so the pixel shader ran
+rsx_fp_apply_depth_argb (patch 2011) on the colour texel: .x taken as depth and split into A,R,G bytes, and no gamma
+decode. Measured (LD_DRAW_INPUTS dumps, draws 72-75 of a menu frame): fresh boot the blur keeps (1,0,1)/255 through
+both passes; after a quit the same draws give 13/255 then 64/255 (rebuilt bytes, then sRGB-encoded twice), the
+composite adds that as an orange layer; in the level the same passes punch holes where the rebuilt bytes saturate.
+rsx_live_draw.c: ld_argb_zeta_pref (2044's rule, shared by the bind and the PSO) and ld_shader_zalias_kind (ZALIAS_ARGB
+only when the zeta is preferred or no colour surface, the draw's own target included, sits at the address); used for
+get_pso's per-unit kind (argb_mask, gamma) and for patch 2021's unnormalised-size rule. LD_NO_ARGB_BIND_MATCH=1 = old
+tagging. Log: [zeta-argb] ... pso unit reads colour (first 16). Host test tools/smoke/test_zeta_argb.c case D now
+checks all four channels of a 0.3 colour (COL0 = 1 survived the rebuild by accident). Upstream candidate (general
+aliasing rule, follows 2011/2044).
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -4185,6 +4185,54 @@
+         return g.zdepths[zi].depth_format == 1 ? ZALIAS_NONE : ZALIAS_ARGB;
+     return ZALIAS_SHADOW;
+ }
++/* Patch 2059 (RSX pass 59): one rule for an A8R8G8B8 read of a Z24S8 zeta address, used by the texture bind
++ * AND the PSO. Patch 2044's rule (the zeta wins when its depth was written after the last real colour write to a
++ * colour surface at the same address, the draw's own target excluded) lived only in the bind, while get_pso
++ * tagged every such unit ZALIAS_ARGB, so the shader rebuilt depth bytes (rsx_fp_apply_depth_argb: .x taken as
++ * depth, split into A,R,G) from the COLOUR texel whenever the bind had picked the colour surface, and skipped that
++ * unit's gamma decode. In KZ3 the 320x180 blur ping-pong 0x2980000 / 0x2DA0000 shares its addresses with the
++ * level's shadow-map zetas: once a level has run, every blur pass (pause screen, and the main menu after a quit)
++ * rebuilt bytes from colour, near-black became (1,1,1)/255, the sRGB output (2055) lifted it to 13/255, the next
++ * pass to 64/255: the orange wash, the blocks and the black holes. A fresh-boot menu has no zeta there.
++ * cg_out / ci_out (optional): the newest colour alias' colour_gen and slot (-1 none), for the bind's log. */
++static int ld_argb_zeta_pref(const rsx_dsp_texture* t, u32 target, u32* cg_out, int* ci_out)
++{
++    u32 cg = 0; int ci = -1;
++    if (cg_out) *cg_out = 0;
++    if (ci_out) *ci_out = -1;
++    static int aoff = -1;
++    if (aoff < 0) aoff = getenv("LD_NO_ZETA_ARGB_PREFER") ? 1 : 0;   /* patch 2044: colour alias first */
++    const int zi = zdepth_index_at(t->location, t->offset);
++    if (aoff || zi < 0) return 0;
++    for (u32 i = 0; i < g.n_surfaces; i++)
++        if (g.surfaces[i].location == t->location && g.surfaces[i].offset == t->offset &&
++            i != target && g.surfaces[i].colour_gen >= cg) { cg = g.surfaces[i].colour_gen; ci = (int)i; }
++    if (cg_out) *cg_out = cg;
++    if (ci_out) *ci_out = ci;
++    return g.zdepths[zi].zwrite_gen > cg;
++}
++/* The kind the shader must be built for: ZALIAS_ARGB only when the bind takes the zeta, i.e. the zeta is
++ * preferred, or no colour surface (the draw's own target included: the bind then samples a feedback copy of it)
++ * sits at the address. LD_NO_ARGB_BIND_MATCH=1 = the old PSO tagging (A/B). */
++static u32 current_surface(void);
++static int ld_shader_zalias_kind(const rsx_dsp_texture* t)
++{
++    const int k = tex_zalias_kind(t);
++    if (k != ZALIAS_ARGB) return k;
++    const u32 target = current_surface();   /* the draw's colour target, as the bind sees it */
++    static int old = -1;
++    if (old < 0) old = getenv("LD_NO_ARGB_BIND_MATCH") ? 1 : 0;
++    if (old || ld_argb_zeta_pref(t, target, NULL, NULL)) return k;
++    for (u32 i = 0; i < g.n_surfaces; i++)
++        if (g.surfaces[i].location == t->location && g.surfaces[i].offset == t->offset) {
++            static u32 n = 0;
++            if (n < 16) { n++;
++                fprintf(stderr, "[zeta-argb] f=%u pso unit reads colour %u:0x%08X %ux%u (slot %u), no depth rebuild\n",
++                        g_ld_frames, t->location, t->offset, t->width, t->height, i); }
++            return ZALIAS_NONE;
++        }
++    return k;
++}
+ static void ld_cw_note(u32 slot, const char* how, u32 mask)
+ {
+     static u32 n = 0;
+@@ -7586,7 +7634,7 @@
+         rsx_dsp_texture texture;
+         rsx_dsp_get_texture(&g.rsx, unit, &texture);
+         if (texture.enabled || unit == 0) ld_gamma_log(unit, &texture);
+-        const int zalias = texture.enabled ? tex_zalias_kind(&texture) : ZALIAS_NONE;
++        const int zalias = texture.enabled ? ld_shader_zalias_kind(&texture) : ZALIAS_NONE;   /* patch 2059 */
+         if (ld_feat_on()) { if (!(fp_units & ((1u << unit) - 1u))) ld_feat_draw(fp_ctrl);
+                             if (texture.enabled) ld_feat_unit(&texture, zalias); }
+         if (zalias == ZALIAS_SHADOW) {
+@@ -7738,7 +7786,7 @@
+          * 640x360 half-resolution depth share 0x2980000). Texel coordinates
+          * then address that resource, so divide by its size, not by the
+          * texture's: 640x360 texels sit in its top-left corner, as in VRAM. */
+-        if (tex_zalias_kind(&ut) != ZALIAS_NONE) {
++        if (ld_shader_zalias_kind(&ut) != ZALIAS_NONE) {   /* patch 2059: only when the zeta is bound */
+             const int zi = zdepth_index_at(ut.location, ut.offset);
+             if (zi >= 0 && g.zdepths[zi].snapshot &&
+                 g.zdepths[zi].snapshot_w >= ut.width &&
+@@ -11589,12 +11637,9 @@
+           if (aoff < 0) aoff = getenv("LD_NO_ZETA_ARGB_PREFER") ? 1 : 0;
+           if (zk == ZALIAS_ARGB && !aoff) {
+               const int zi = zdepth_index_at(t.location, t.offset);
+-              if (zi >= 0 && (g.zdepths[zi].had_write || g.zdepths[zi].snapshot_valid)) {
++              if (zi >= 0) {
+                   u32 cg = 0; int ci = -1;
+-                  for (u32 i = 0; i < g.n_surfaces; i++)
+-                      if (g.surfaces[i].location == t.location && g.surfaces[i].offset == t.offset &&
+-                          i != target && g.surfaces[i].colour_gen >= cg) { cg = g.surfaces[i].colour_gen; ci = (int)i; }
+-                  zeta_pref = g.zdepths[zi].zwrite_gen > cg;
++                  zeta_pref = ld_argb_zeta_pref(&t, target, &cg, &ci);   /* patch 2059: the rule get_pso uses too */
+                   static u32 nlog = 0, ncall = 0; static int last = -1;
+                   const int key = (zeta_pref ? 1 : 0) | (ci << 1);
+                   if (ci >= 0 && nlog < 48 && (key != last || (ncall % 2000u) == 0)) {

@@ -1,0 +1,83 @@
+KZ3 patch 2120 (RSX pass 113): write-back batches are sized for the whole surface table (MAX_SURFACES), never dropping a
+surface. Patch 2018 capped its callers at a literal 64 and 2119 clamped to 64; the table is bounded at MAX_SURFACES = 64
+(slot allocation evicts there), so nothing was lost in practice, but the bound was implicit. Adds a [wb-cap] log of each
+new maximum batch size.
+
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -16698,6 +16698,18 @@
+     return 1;
+ }
+ 
++/* Patch 2120 (diagnostic): log each new maximum of surfaces in one write-back batch (callers: 0 = NV0039 copy
++ * range, 1 = guest sync point). The batch bound is MAX_SURFACES; a line with n > 64 cannot happen. */
++static void ld_wb_cap_note(u32 n, int caller)
++{
++    static u32 mx[2]; static u32 nlog;
++    if (n > mx[caller]) {
++        mx[caller] = n;
++        if (nlog++ < 16) fprintf(stderr, "[wb-cap] f=%u %s batch of %u surface(s) (new max; table bound %d, n_surfaces %u)\n",
++                                 g_ld_frames, caller ? "sync" : "copy", n, MAX_SURFACES, g.n_surfaces);
++    }
++}
++
+ /* Write back surfaces idx[0..n): all copies, one submit + wait, all stores.
+  * Falls back to the per-surface path when LD_WRITEBACK_BATCH=0. */
+ static u32 ld_writeback_batch(const u32* idx_in, u32 n, u32 for_off, u32 for_size)
+@@ -16711,8 +16723,11 @@
+      * drawn after the frame's NV0039 scene copy) sits inside the 1280x720 scene target at the same address,
+      * and the next frame's copy wrote last frame's radar over the scene's top-left 256x256 corner, which the
+      * compose then showed as a black box holding a second minimap. LD_WB_ORDER=0 keeps the table order. */
+-    u32 idx[64];
+-    if (n > 64u) n = 64u;   /* both callers collect at most 64 (patch 2018's batch arrays) */
++    /* Patch 2120: the surface table holds at most MAX_SURFACES live surfaces (slot allocation evicts at that
++     * bound), so a batch is at most that many indices; the copy is sized for the whole table and nothing is
++     * dropped (2119 had clamped to a literal 64, 2018's callers capped their arrays at a literal 64). */
++    u32 idx[MAX_SURFACES];
++    if (n > MAX_SURFACES) { fprintf(stderr, "[wb-cap] BUG: %u indices exceed the surface table (%d)\n", n, MAX_SURFACES); n = MAX_SURFACES; }
+     memcpy(idx, idx_in, (size_t)n * sizeof idx[0]);
+     { static int en = -1;
+       if (en < 0) { const char* e = getenv("LD_WB_ORDER"); en = e ? atoi(e) : 1; }
+@@ -17178,8 +17193,8 @@
+     if (en < 0) { const char* e = getenv("LD_NV0039_WRITEBACK"); en = e ? atoi(e) : 1; }
+     if (!en || !g.ready || !size) return 0;
+     const u64 r0 = offset, r1 = r0 + size;
+-    u32 done = 0, idx[64], n = 0;
+-    for (u32 i = 0; i < g.n_surfaces; i++) {
++    u32 done = 0, idx[MAX_SURFACES], n = 0;   /* patch 2120: sized for the whole table, never drops */
++    for (u32 i = 0; i < g.n_surfaces && i < MAX_SURFACES; i++) {
+         const surface_t* sf = &g.surfaces[i];
+         if (!sf->tex || sf->location != location) continue;
+         const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+@@ -17187,13 +17202,14 @@
+         if (gp < sf->w * texel) continue;
+         const u64 s0 = sf->offset, s1 = s0 + (u64)gp * (sf->h - 1u) + (u64)sf->w * texel;
+         if (!(s0 < r1 && r0 < s1)) continue;
+-        if (n < 64) idx[n++] = i;   /* patch 2018: batched */
++        idx[n++] = i;   /* patch 2018: batched */
+         /* Patch 2023: a copy of a whole frame-sized colour surface is the
+          * scene leaving for the SPU post chain (KZ3: local 0x1300000 -> main
+          * 0x1310400, where SPU MLAA ran); the host AA pass runs on it first. */
+         if (r0 <= s0 && r1 >= s1) ld_host_aa(i);
+     }
+     LDW_T0(wb_t0);
++    ld_wb_cap_note(n, 0);
+     done = ld_writeback_batch(idx, n, offset, size);
+     if (wb_t0 && n) { LDW_ADD(RSX_PERF_W_WB_NV0039_T, wb_t0); rsx_perf_add(RSX_PERF_W_WB_NV0039_N, 1); }
+     return done;
+@@ -17213,11 +17229,12 @@
+     static int en = -1;
+     if (en < 0) { const char* e = getenv("LD_MAIN_SURFACE_WRITEBACK"); en = e ? atoi(e) : 1; }
+     if (!en || !g.ready) return 0;
+-    u32 idx[64], n = 0;
+-    for (u32 i = 0; i < g.n_surfaces && n < 64; i++)
++    u32 idx[MAX_SURFACES], n = 0;   /* patch 2120: sized for the whole table, never drops */
++    for (u32 i = 0; i < g.n_surfaces && i < MAX_SURFACES; i++)
+         if (g.surfaces[i].tex && g.surfaces[i].location == 1u && g.surfaces[i].gv_gpu_dirty)
+             idx[n++] = i;
+     if (!n) return 0;
++    ld_wb_cap_note(n, 1);
+     LDW_T0(wb_t0);
+     const u32 done = ld_writeback_batch(idx, n, 0, 0);   /* patch 2018: one GPU wait */
+     if (wb_t0) { LDW_ADD(RSX_PERF_W_WB_SYNC_T, wb_t0); rsx_perf_add(RSX_PERF_W_WB_SYNC_N, 1); }

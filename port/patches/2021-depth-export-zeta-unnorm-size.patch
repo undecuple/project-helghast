@@ -1,0 +1,64 @@
+live-draw: fragment depth export, and texel coordinates of zeta-snapshot binds use the snapshot's size.
+
+Symptom (Killzone 3, pass 22): in the first level the whole picture was evenly blurred by the depth of field. The
+320x180 F_X32 DepthToFuzzy target (0x1A1C000) was one flat value, the 640x360 target 0x1892400 black.
+
+Cause 1: the half-resolution depth downsample (one draw per frame, SHADER_CONTROL 0x300840E) reads the Z24S8 scene
+zeta as A8R8G8B8, rebuilds the 24-bit depth from its bytes and writes it as the fragment depth (r1.z) into the
+640x360 Z16 zeta 0x2980000. The decompiler ignored SHADER_CONTROL's depth-export bits (0xE), so the zeta kept the
+full-screen quad's constant depth. Now the program outputs SV_Depth = saturate(r1.z) (fp32 r1.z whatever the colour
+export width, as RPCS3 and NV_fragment_program), and the depth-export bits join the PSO key.
+
+Cause 2: the zeta 0x2980000 also holds the 1408x1408 shadow map, so its host depth resource and snapshot are
+1408x1408. The DoF and soft-particle passes read the 640x360 depth as X16 with texel (unnormalised) coordinates; the
+unnormalise post-pass divided by 640x360, which stretched the top-left 640x360 corner over the whole 1408x1408
+snapshot. Units that bind a zeta snapshot now divide by the snapshot size (LD_NO_ZALIAS_UNNORM_FIX=1 = old).
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR279 depth export taken, our zeta-alias snapshot sizing replaces the PR280 one (later patches build on it).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -5584,28 +5584,20 @@ static ID3D12PipelineState* get_pso(
+         unnorm_mask |= 1u << uu;
+         unnorm_dim[uu][0] = ut.width;
+         unnorm_dim[uu][1] = ut.height;
+-        /* A depth texture bound to a zeta's snapshot reads that host
+-         * resource, which is as large as the largest pass that used the zeta
+-         * (bounded by the zeta), not as large as the texture. Texel
+-         * coordinates address the resource, so divide by its size: a texture
+-         * smaller than the zeta then reads its top-left corner, as it does in
+-         * VRAM, instead of a stretched copy of the whole depth buffer. */
+-        if ((ut.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) ==
+-                TEX_FMT_DEPTH24_D8) {
+-            for (u32 zi = 0; zi < g.n_zdepths; zi++) {
+-                const zdepth_t* z = &g.zdepths[zi];
+-                if (z->location != ut.location || z->offset != ut.offset)
+-                    continue;
+-                /* Only when the bind will take the snapshot (it has, or
+-                 * will copy, a depth-writing pass); a zeta that was only
+-                 * cleared is read from guest memory at texture size. */
+-                if (z->snapshot && (z->had_write || z->snapshot_valid) &&
+-                    z->snapshot_w >= ut.width &&
+-                    z->snapshot_h >= ut.height) {
+-                    unnorm_dim[uu][0] = z->snapshot_w;
+-                    unnorm_dim[uu][1] = z->snapshot_h;
+-                }
+-                break;
++        /* Patch 2021: a unit that binds a zeta snapshot (patch 2011) reads
++         * the host depth resource, which is as large as the biggest pass that
++         * used that zeta offset (KZ3: the 1408x1408 shadow map and the
++         * 640x360 half-resolution depth share 0x2980000). Texel coordinates
++         * then address that resource, so divide by its size, not by the
++         * texture's: 640x360 texels sit in its top-left corner, as in VRAM. */
++        if (tex_zalias_kind(&ut) != ZALIAS_NONE) {
++            const int zi = zdepth_index_at(ut.location, ut.offset);
++            if (zi >= 0 && g.zdepths[zi].snapshot &&
++                g.zdepths[zi].snapshot_w >= ut.width &&
++                g.zdepths[zi].snapshot_h >= ut.height &&
++                !getenv("LD_NO_ZALIAS_UNNORM_FIX")) {
++                unnorm_dim[uu][0] = g.zdepths[zi].snapshot_w;
++                unnorm_dim[uu][1] = g.zdepths[zi].snapshot_h;
+             }
+         }
+     }

@@ -1,0 +1,562 @@
+Rebased on ps3recomp v0.18.0 (SPU pass 108): remap on upstream #570's held-button decrement.
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 32388fe7..a45dc12d 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1219,6 +1219,98 @@ int pad_kb_last_device_keyboard(void)
+ }
+ #endif
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 4013 (stage 3): pad presets and custom mapping (ENHANCEMENT, opt-in; pad_remap.h)
++ * -----------------------------------------------------------------------*/
++static PadRemap s_remap[2];        /* per pad family (PRM_FAM_*) */
++static int      s_remap_set = 0;
++static uint32_t s_remap_sig[2];    /* 0 = identity (the game's own scheme) */
++
++/* The modern preset's table depends on the pad: PlayStation pads (and a port with no host pad, i.e. a scripted one)
++ * get the PS table, every other pad the Xbox one. KZ3_PAD_FAMILY=ps|xbox forces it (tests). */
++static int pad_remap_family(int dev)
++{
++    static int env = -2;
++    if (env == -2) {
++        const char* e = getenv("KZ3_PAD_FAMILY");
++        env = (e && !strcmp(e, "xbox")) ? PRM_FAM_XBOX : (e && !strcmp(e, "ps")) ? PRM_FAM_PS : -1;
++    }
++    if (env >= 0) return env;
++    switch (dev) {
++    case PAD_DEV_XBOX: case PAD_DEV_SWITCH: case PAD_DEV_OTHER: return PRM_FAM_XBOX;
++    default: return PRM_FAM_PS;
++    }
++}
++
++/* The table the Options row (keybinds.ini [pad]) selects; KZ3_PAD_PRESET=default|modern|custom (tests) before it. */
++static void pad_remap_refresh(void)
++{
++    static int env = -2;
++    PadRemap cust, m[2];
++    int preset = PRM_DEFAULT_PRESET, f;
++    uint32_t sig[2];
++    if (env == -2) {
++        const char* e = getenv("KZ3_PAD_PRESET");
++        env = (e && *e) ? prm_preset_by_name(e, strlen(e)) : -1;
++        if (e && *e) { printf("[pad] KZ3_PAD_PRESET=%s: %s\n", e, env < 0 ? "unknown value, ignored" : "pad layout forced"); fflush(stdout); }
++    }
++    prm_identity(&cust);
++#ifdef _WIN32
++    AcquireSRWLockShared(&s_kb_lock);
++    if (s_kb_ready) { preset = s_kb.padmap; memcpy(cust.src, s_kb.padc, sizeof cust.src); }
++    ReleaseSRWLockShared(&s_kb_lock);
++#endif
++    if (env >= 0) preset = env;
++    for (f = 0; f < 2; f++) { prm_fill(preset, f, &cust, &m[f]); sig[f] = prm_sig(&m[f]); }
++    if (!s_remap_set || sig[0] != s_remap_sig[0] || sig[1] != s_remap_sig[1]) {
++        int g;
++        printf("[pad] layout: %s%s\n", preset >= 0 && preset < PRM_N_PRESETS ? prm_preset_names[preset] : "?",
++               sig[0] || sig[1] ? "" : " (the game's own)");
++        for (f = 0; f < 2; f++)
++            for (g = 0; sig[f] && g < PRM_N; g++)
++                if (m[f].src[g] != g) printf("[pad]   %s pads: game %s <- pad %s\n", f ? "Xbox" : "PS", prm_names[g],
++                                             m[f].src[g] < PRM_N ? prm_names[m[f].src[g]] : "none");
++        fflush(stdout);
++    }
++    s_remap[0] = m[0]; s_remap[1] = m[1];
++    s_remap_sig[0] = sig[0]; s_remap_sig[1] = sig[1];
++    s_remap_set = 1;
++}
++
++/* The remap on every connected host pad (a fresh report each poll, so it is applied once). */
++static void pad_remap_apply_all(void)
++{
++    pad_remap_refresh();
++    if (!s_remap_sig[0] && !s_remap_sig[1]) return;
++    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) pad_host_remap(&s_remap[pad_remap_family(s_port_dev[p])], &s_host_state[p]);
++}
++
++/* The family the prompts describe: the pad last used; with no pad (keys, nothing) the glyph set's. */
++static int pad_remap_prompt_family(void)
++{
++    int dev = pad_prompt_device();
++    if (dev == PAD_DEV_KEYBOARD || dev == PAD_DEV_NONE) return pad_prompt_set() == PAD_PROMPT_XBOX ? PRM_FAM_XBOX : PRM_FAM_PS;
++    return pad_remap_family(dev);
++}
++
++/* For the prompt atlases (rsx_live_draw.c, patch 4013): 0 = identity, else a hash of the table. */
++unsigned pad_remap_sig(void)
++{
++    return s_remap_sig[pad_remap_prompt_family()];
++}
++
++/* The host button (PS3 name) that presses game button `game_input` ("r1", "cross" ...), "" when none, NULL for a name
++ * that is not a button or while the layout is the game's own. The prompt for a game button shows this one. */
++const char* pad_remap_host_for(const char* game_input)
++{
++    int g;
++    const int f = pad_remap_prompt_family();
++    if (!s_remap_sig[f] || !game_input) return NULL;
++    g = prm_button_by_name(game_input, strlen(game_input));
++    if (g < 0) return NULL;
++    return s_remap[f].src[g] < PRM_N ? prm_names[s_remap[f].src[g]] : "";
++}
++
+ static void pad_poll_backend(void)
+ {
+     static unsigned long long s_last_ms = 0;
+@@ -1241,6 +1333,7 @@ static void pad_poll_backend(void)
+     /* KZ3 patch 2037: keys always polled (not only with no pad on port 0) and merged into port 0. */
+     pad_poll_keyboard();
+ #endif
++    pad_remap_apply_all();   /* 4013: the pad layout, on the pads only (not on the keys, merged below) */
+     pad_prompt_track();   /* 4011: before the keys are merged into port 0 */
+ #ifdef _WIN32
+     pad_merge_keyboard();
+@@ -1654,6 +1747,7 @@ skip_inject: ;
+           double now = pad_clock(t0);   /* PR #344: PAD_CLOCK=flips counts guest flips (3006's v2 grammar unchanged) */
+           unsigned m = 0; unsigned char ax[6]; int ax_set = 0;
+           pad_script_poll(&s_script, now, &m, ax, &ax_set);
++          if (s_remap_sig[0] || s_remap_sig[1]) m = prm_apply_mask(&s_remap[pad_remap_family(s_port_dev[0])], m);   /* 4013: a scripted pad is a pad (digital part only) */
+           data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(m & 0xFF);
+           data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((m >> 8) & 0xFF);
+           if (ax_set) {
+@@ -1701,9 +1795,10 @@ skip_inject: ;
+               }
+           }
+           if (held_n > 0) {
+-              if (data->len > 0) held_n--;
+-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
+-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
++              if (data->len > 0) held_n--;   /* upstream #570: holds survive empty drain reads */
++              const unsigned hm = (s_remap_sig[0] || s_remap_sig[1]) ? prm_apply_mask(&s_remap[pad_remap_family(s_port_dev[0])], held_mask) : held_mask;   /* 4013 */
++              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(hm & 0xFF);
++              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((hm >> 8) & 0xFF); }
+       } }
+ 
+     /* Analog sticks */
+diff --git a/libs/input/pad_host.h b/libs/input/pad_host.h
+index 456308cb..2efdc048 100644
+--- a/libs/input/pad_host.h
++++ b/libs/input/pad_host.h
+@@ -496,5 +496,26 @@ static inline int pad_last_device_current(const PadLastDevice* l, const PadHostS
+     return PAD_DEV_NONE;
+ }
+ 
++/* ---- KZ3 patch 4013 (stage 3): the pad remap on a host report ------------------------------------------------ */
++#include "pad_remap.h"
++static inline void pad_host_remap(const PadRemap* m, PadHostState* hs)
++{
++    unsigned char p[PRM_N], q[PRM_N];
++    unsigned o;
++    int i;
++    if (!hs->connected || prm_is_identity(m)) return;
++    p[PRM_UP] = hs->press_up;       p[PRM_RIGHT] = hs->press_right;  p[PRM_DOWN] = hs->press_down;
++    p[PRM_LEFT] = hs->press_left;   p[PRM_L2] = hs->trigger_l2;      p[PRM_R2] = hs->trigger_r2;
++    p[PRM_L1] = hs->press_l1;       p[PRM_R1] = hs->press_r1;        p[PRM_TRIANGLE] = hs->press_triangle;
++    p[PRM_CIRCLE] = hs->press_circle; p[PRM_CROSS] = hs->press_cross; p[PRM_SQUARE] = hs->press_square;
++    p[PRM_SELECT] = p[PRM_L3] = p[PRM_R3] = p[PRM_START] = 0;
++    for (i = 0; i < PRM_N; i++) if (((hs->buttons >> i) & 1u) && !p[i]) p[i] = 255;   /* digital: full pressure */
++    prm_apply(m, hs->buttons, p, &o, q);
++    hs->buttons = (u16)o;
++    hs->press_up = q[PRM_UP];       hs->press_right = q[PRM_RIGHT];  hs->press_down = q[PRM_DOWN];
++    hs->press_left = q[PRM_LEFT];   hs->trigger_l2 = q[PRM_L2];      hs->trigger_r2 = q[PRM_R2];
++    hs->press_l1 = q[PRM_L1];       hs->press_r1 = q[PRM_R1];        hs->press_triangle = q[PRM_TRIANGLE];
++    hs->press_circle = q[PRM_CIRCLE]; hs->press_cross = q[PRM_CROSS]; hs->press_square = q[PRM_SQUARE];
++}
+ 
+ #endif
+diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+index efaa3908..0a65c4c9 100644
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -26,6 +26,7 @@
+ #ifndef PAD_KEYBINDS_H
+ #define PAD_KEYBINDS_H
+ 
++#include "pad_remap.h"   /* 4013 */
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -105,7 +106,10 @@ static const PadKbKey pad_kb_keys[] = {
+ 
+ /* key[i][s] = virtual-key code of input i, slot s (0 = unbound). */
+ /* KZ3 patch 4011: `prompts` = the Options row "Button prompts" (PKB_PROMPTS_*), section [prompts] of the file. */
+-typedef struct { unsigned char key[PKB_N_INPUTS][PKB_SLOTS]; unsigned char prompts; } PadKeybinds;
++/* KZ3 patch 4013 (stage 3): `padmap` = the pad layout preset (PRM_*, section [pad] preset), `padc` = the custom
++ * table (src of each game button, [pad] "r1 = r2"; identity unless the file says otherwise). */
++typedef struct { unsigned char key[PKB_N_INPUTS][PKB_SLOTS]; unsigned char prompts; unsigned char padmap;
++                 unsigned char padc[PRM_N]; } PadKeybinds;
+ 
+ enum { PKB_PROMPTS_AUTO = 0, PKB_PROMPTS_PS3, PKB_PROMPTS_PS4, PKB_PROMPTS_XBOX, PKB_PROMPTS_KEYBOARD, PKB_N_PROMPTS };
+ static const char* const pkb_prompt_names[PKB_N_PROMPTS] = { "auto", "ps3", "ps4", "xbox", "keyboard" };
+@@ -124,6 +128,14 @@ static int pad_kb_prompts_by_name(const char* s, size_t n)
+     return -1;
+ }
+ 
++/* 4013: the remap table the file selects (preset, or the custom lines). */
++static void pad_kb_remap(const PadKeybinds* kb, int family, PadRemap* m)
++{
++    PadRemap c;
++    memcpy(c.src, kb->padc, sizeof c.src);
++    prm_fill(kb->padmap, family, &c, m);
++}
++
+ /* What the keys add to the pad this poll. */
+ typedef struct { unsigned short buttons; unsigned char dirs; } PadKbState;
+ 
+@@ -312,6 +324,8 @@ static void pad_kb_defaults(PadKeybinds* kb)
+     };
+     unsigned i;
+     memset(kb, 0, sizeof *kb);
++    for (i = 0; i < PRM_N; i++) kb->padc[i] = (unsigned char)i;   /* 4013 */
++    kb->padmap = PRM_DEFAULT_PRESET;
+     for (i = 0; i < sizeof d / sizeof d[0]; i++) {
+         int k = pad_kb_input_by_name(d[i].in, strlen(d[i].in));
+         if (k >= 0) { kb->key[k][0] = d[i].a; kb->key[k][1] = d[i].b; }
+@@ -334,7 +348,7 @@ static int pad_kb_space(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* ctx)
+ {
+     const char* p = text;
+-    int line = 0, bad = 0, in_kb = 1, in_pr = 0;
++    int line = 0, bad = 0, in_kb = 1, in_pr = 0, in_pd = 0;
+     if (!text) return 0;
+     if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
+     while (*p) {
+@@ -350,11 +364,32 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
+         if (a < b) {
+             if (*a == '[') {
+                 const char* r = memchr(a, ']', (size_t)(b - a));
+-                if (!r) { pad_kb_logf(log, ctx, line, "broken section header", a, (size_t)(b - a)); bad++; in_kb = in_pr = 0; }
++                if (!r) { pad_kb_logf(log, ctx, line, "broken section header", a, (size_t)(b - a)); bad++; in_kb = in_pr = in_pd = 0; }
+                 else {
+                     in_kb = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "keyboard");
+                     in_pr = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "prompts");   /* 4011 */
+-                    if (!in_kb && !in_pr) { pad_kb_logf(log, ctx, line, "section not read by this version", a, (size_t)(r - a + 1)); }
++                    in_pd = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "pad");        /* 4013 */
++                    if (!in_kb && !in_pr && !in_pd) { pad_kb_logf(log, ctx, line, "section not read by this version", a, (size_t)(r - a + 1)); }
++                }
++            } else if (in_pd) {
++                /* 4013: "preset = default|modern|custom" and "<game button> = <host button>|none" (custom table) */
++                const char* q = memchr(a, '=', (size_t)(b - a));
++                const char *ne = q, *v = q ? q + 1 : NULL;
++                int gi, vi;
++                if (!q) { pad_kb_logf(log, ctx, line, "no '=' in", a, (size_t)(b - a)); bad++; }
++                else {
++                    while (ne > a && pad_kb_space(ne[-1])) ne--;
++                    while (v < b && pad_kb_space(*v)) v++;
++                    if (pad_kb_ieq(a, (size_t)(ne - a), "preset")) {
++                        if ((vi = prm_preset_by_name(v, (size_t)(b - v))) < 0) { pad_kb_logf(log, ctx, line, "unknown pad preset", v, (size_t)(b - v)); bad++; }
++                        else kb->padmap = (unsigned char)vi;
++                    } else if ((gi = prm_button_by_name(a, (size_t)(ne - a))) < 0) {
++                        pad_kb_logf(log, ctx, line, "unknown pad setting", a, (size_t)(ne - a)); bad++;
++                    } else if (pad_kb_ieq(v, (size_t)(b - v), "none")) {
++                        kb->padc[gi] = PRM_NONE;
++                    } else if ((vi = prm_button_by_name(v, (size_t)(b - v))) < 0) {
++                        pad_kb_logf(log, ctx, line, "unknown pad button", v, (size_t)(b - v)); bad++;
++                    } else kb->padc[gi] = (unsigned char)vi;
+                 }
+             } else if (in_pr) {
+                 /* 4011: "buttons = auto|ps3|ps4|xbox|keyboard"; anything else is logged and the value kept */
+@@ -476,6 +511,17 @@ static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
+             "# Button pictures in the game (Options > Controls > Button prompts): auto = the device you used last,\n"
+             "# or always ps3, ps4 (PS4/PS5), xbox, keyboard.\n"
+             "buttons  = %s\n", pkb_prompt_names[kb->prompts < PKB_N_PROMPTS ? kb->prompts : 0]);
++    /* 4013 */
++    PKB_PUT("\n[pad]\n"
++            "# Pad buttons (Options > Controls > Controller layout): default = the game's own scheme, modern = a\n"
++            "# modern-shooter layout (PlayStation pads: fire R1, aim L1, grenade L2; Xbox pads: fire RT, aim LT,\n"
++            "# grenade LB; crouch on B/Circle, melee on R3), custom = the lines below. Left of '=' is the\n"
++            "# game's button, right of it the pad button that presses it (names are the PS3 ones: l2 = LT on an Xbox\n"
++            "# pad), or none. A button not listed stays on itself.\n"
++            "preset   = %s\n", prm_preset_names[kb->padmap < PRM_N_PRESETS ? kb->padmap : PRM_DEFAULT_PRESET]);
++    for (i = 0; i < PRM_N; i++)
++        if (kb->padc[i] != i)
++            PKB_PUT("%-9s= %s\n", prm_names[i], kb->padc[i] < PRM_N ? prm_names[kb->padc[i]] : "none");
+ #undef PKB_PUT
+     return (int)o;
+ }
+@@ -714,6 +760,20 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+     if (!n) return 0;
+     out[0] = 0;
+     if (sscanf(cmd, "%15s %d %d", verb, &r, &s) < 1) return 0;
++    if (!strcmp(verb, "padmap")) {
++        /* 4013: "padmap" -> the Controller layout value's name; "padmap <name>" sets it (1 = changed, saved). */
++        const char* v = cmd + 6;
++        int pv;
++        while (*v == ' ') v++;
++        if (!*v) { snprintf(out, n, "%s", prm_preset_names[kb->padmap < PRM_N_PRESETS ? kb->padmap : 0]); return 0; }
++        pv = prm_preset_by_name(v, strlen(v));
++        if (pv < 0) { snprintf(out, n, "bad"); return 0; }
++        snprintf(out, n, "%s", prm_preset_names[pv]);
++        if (kb->padmap == pv) return 0;
++        kb->padmap = (unsigned char)pv;
++        u->gen++;
++        return 1;
++    }
+     if (!strcmp(verb, "prompts")) {
+         /* 4011: "prompts" -> the Button prompts value's name; "prompts <name>" sets it (1 = changed, saved). */
+         const char* v = cmd + 7;
+@@ -763,8 +823,8 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+         return 0;
+     }
+     if (!strcmp(verb, "reset")) {
+-        unsigned char pr = kb->prompts;   /* 4011: the Keyboard page's reset keeps the Button prompts choice */
+-        pad_kb_defaults(kb); kb->prompts = pr; u->phase = PKB_UI_IDLE; u->gen++; u->result = PKB_R_NONE;
++        PadKeybinds keep = *kb;   /* 4011/4013: the Keyboard page's reset keeps the Button prompts and the pad layout */
++        pad_kb_defaults(kb); kb->prompts = keep.prompts; kb->padmap = keep.padmap; memcpy(kb->padc, keep.padc, sizeof kb->padc); u->phase = PKB_UI_IDLE; u->gen++; u->result = PKB_R_NONE;
+         snprintf(out, n, "ok");
+         return 1;
+     }
+diff --git a/libs/input/pad_remap.h b/libs/input/pad_remap.h
+new file mode 100644
+index 00000000..f6bd0bec
+--- /dev/null
++++ b/libs/input/pad_remap.h
+@@ -0,0 +1,151 @@
++/*
++ * KZ3 patch 4013 (stage 3, ENHANCEMENT, opt-in): pad button remap, pure (no host types, host-testable).
++ *
++ * The remap sits in the port's pad layer, between the host pad and what cellPadGetData hands the game, so the game's
++ * own control scheme options (Standard, Alternate, swap sticks, swap L1/L2 ...) keep working on top of it. It is a
++ * table over the 16 digital buttons, written in PS3 terms: src[g] = the host button that drives game button g
++ * (PRM_NONE = nothing drives it). The host backends already put every pad in PS3 terms (SDL and XInput: A/Cross,
++ * LT/L2, RB/R1 ...), so one table serves PS3, PS4/PS5 and Xbox pads; only the prompt pictures differ per pad.
++ * A value is 0..255 (pressure; a digital button is 0 or 255), so a trigger can drive a shoulder button and back.
++ *
++ * Presets (PRM_DEFAULT_PRESET below is the one a file without a [pad] section gets):
++ *   default = identity, the game's own scheme, unchanged.
++ *   modern  = a modern-shooter layout (spec 2026-10-20) laid on the game's Standard scheme. Where the
++ *             spec puts a button depends on the pad family, so there are two tables, picked per port by the pad type:
++ *             PS family (PS3, PS4, PS5 pads, and a scripted port): fire R1, aim L1, grenade L2;
++ *             Xbox family (Xbox, Switch, other pads): fire RT, aim LT, grenade LB.
++ *             game R1 (fire)        <- PS R1          | Xbox R2 (RT)
++ *             game R3 (zoom/aim)    <- PS L1          | Xbox L2 (LT)
++ *             game R2 (grenade)     <- PS L2          | Xbox L1 (LB)
++ *             game L2 (crouch/cover)<- Circle (B)
++ *             game Circle (use)     <- Square (X)     (Square also stays reload/pick-up: one button, both actions)
++ *             game L1 (melee)       <- R3 (right stick click; the nearest free input)
++ *             Sprint L3, jump Cross (A), weapon switch Triangle (Y), d-pad, Start, Select, sticks stay.
++ *   custom  = keybinds.ini [pad] entries "game button = host button | none", unlisted buttons identity.
++ */
++#ifndef PAD_REMAP_H
++#define PAD_REMAP_H
++
++#include <stdint.h>
++#include <string.h>
++
++#define PRM_N 16
++#define PRM_NONE 0xFFu
++
++/* Button index = bit number of CELL_PAD_CTRL_* (cellPad.h). */
++enum { PRM_SELECT = 0, PRM_L3, PRM_R3, PRM_START, PRM_UP, PRM_RIGHT, PRM_DOWN, PRM_LEFT, PRM_L2, PRM_R2, PRM_L1, PRM_R1,
++       PRM_TRIANGLE, PRM_CIRCLE, PRM_CROSS, PRM_SQUARE };
++static const char* const prm_names[PRM_N] = { "select", "l3", "r3", "start", "up", "right", "down", "left",
++                                              "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square" };
++
++typedef struct { unsigned char src[PRM_N]; } PadRemap;
++
++enum { PRM_DEFAULT = 0, PRM_MODERN, PRM_CUSTOM, PRM_N_PRESETS };
++/* THE default preset (still to be decided): what a keybinds.ini without a [pad] section, and no file at
++ * all, gives. PRM_DEFAULT = the game's own scheme. Every other place reads this constant. */
++#define PRM_DEFAULT_PRESET PRM_DEFAULT
++enum { PRM_FAM_PS = 0, PRM_FAM_XBOX = 1 };   /* which modern table a pad gets */
++static const char* const prm_preset_names[PRM_N_PRESETS] = { "default", "modern", "custom" };
++
++static int prm_ieq(const char* s, size_t n, const char* m)
++{
++    size_t k;
++    if (strlen(m) != n) return 0;
++    for (k = 0; k < n; k++) {
++        char c = s[k];
++        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
++        if (c != m[k]) return 0;
++    }
++    return 1;
++}
++
++/* Name -> button index (-1 unknown); "cross"/"x" etc. are not aliased: the PS3 names only. */
++static int prm_button_by_name(const char* s, size_t n)
++{
++    int i;
++    for (i = 0; i < PRM_N; i++) if (prm_ieq(s, n, prm_names[i])) return i;
++    return -1;
++}
++
++static int prm_preset_by_name(const char* s, size_t n)
++{
++    int i;
++    for (i = 0; i < PRM_N_PRESETS; i++) if (prm_ieq(s, n, prm_preset_names[i])) return i;
++    return -1;
++}
++
++static void prm_identity(PadRemap* m)
++{
++    int i;
++    for (i = 0; i < PRM_N; i++) m->src[i] = (unsigned char)i;
++}
++
++static int prm_is_identity(const PadRemap* m)
++{
++    int i;
++    for (i = 0; i < PRM_N; i++) if (m->src[i] != i) return 0;
++    return 1;
++}
++
++/* The table for a preset; `custom` is used for PRM_CUSTOM (NULL = identity). An out-of-range src (hostile file)
++ * reads as none. */
++static void prm_fill(int preset, int family, const PadRemap* custom, PadRemap* m)
++{
++    int i;
++    prm_identity(m);
++    if (preset == PRM_MODERN) {
++        if (family == PRM_FAM_XBOX) {
++            m->src[PRM_R1] = PRM_R2;   /* RT fires */
++            m->src[PRM_R3] = PRM_L2;   /* LT aims */
++            m->src[PRM_R2] = PRM_L1;   /* LB grenade */
++        } else {
++            m->src[PRM_R3] = PRM_L1;   /* L1 aims (R1 fires as before) */
++            m->src[PRM_R2] = PRM_L2;   /* L2 grenade */
++        }
++        m->src[PRM_L2] = PRM_CIRCLE;   /* B / Circle crouches */
++        m->src[PRM_CIRCLE] = PRM_SQUARE;   /* X / Square: use (and, unchanged, reload / pick up) */
++        m->src[PRM_L1] = PRM_R3;       /* melee on the stick click */
++    } else if (preset == PRM_CUSTOM && custom) {
++        *m = *custom;
++        for (i = 0; i < PRM_N; i++) if (m->src[i] >= PRM_N) m->src[i] = PRM_NONE;
++    }
++}
++
++/* 0 for the identity (nothing to redraw), else an FNV-1a hash of the table that is never 0 (prompt cache key). */
++static uint32_t prm_sig(const PadRemap* m)
++{
++    uint32_t h = 2166136261u;
++    int i;
++    if (prm_is_identity(m)) return 0;
++    for (i = 0; i < PRM_N; i++) { h ^= m->src[i]; h *= 16777619u; }
++    return h ? h : 1u;
++}
++
++/* The remap on one report. mask = CELL_PAD_CTRL_* bits, press[b] = 0..255 per button (the caller fills a digital
++ * button's 255 when its bit is set). Game button g takes the bit and the value of host button src[g]. */
++static void prm_apply(const PadRemap* m, unsigned mask, const unsigned char press[PRM_N], unsigned* omask,
++                      unsigned char opress[PRM_N])
++{
++    unsigned o = mask & ~0xFFFFu;
++    int g;
++    for (g = 0; g < PRM_N; g++) {
++        const unsigned s = m->src[g];
++        if (s >= PRM_N) { opress[g] = 0; continue; }
++        opress[g] = press[s];
++        if (mask & (1u << s)) o |= 1u << g;
++    }
++    *omask = o;
++}
++
++/* Just the bits (scripted input). */
++static unsigned prm_apply_mask(const PadRemap* m, unsigned mask)
++{
++    unsigned char p[PRM_N], q[PRM_N];
++    unsigned o;
++    int i;
++    for (i = 0; i < PRM_N; i++) p[i] = (mask >> i) & 1u ? 255 : 0;
++    prm_apply(m, mask, p, &o, q);
++    return o;
++}
++
++#endif
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 321bd8c4..5dea457c 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -145,6 +145,14 @@ static int ld_prompt_set(void)
+     return s >= PG_PS3 && s < PG_N_SETS ? s : PG_PS3;
+ }
+ static unsigned ld_prompt_opts(int set) { return set == PG_KBM ? PG_OPT_KBM_2039 : 0u; }
++/* patch 4013 (stage 3): the pad layout (cellPad.c: Options row "Controller layout", keybinds.ini [pad]). The
++ * prompt for a game button shows the pad button that presses it, so with a remap the atlas cells are permuted:
++ * the cell of game button g gets the picture of host button pad_remap_host_for(g) of the same glyph set. Keycaps
++ * (PG_KBM) are not touched: the keys are bound to game buttons, after the remap. */
++unsigned pad_remap_sig(void);
++int pad_prompt_device(void);   /* cellPad.c (4011); PAD_DEV_PS5 = 4 */
++const char* pad_remap_host_for(const char* game_input);
++static unsigned ld_remap_sig(int set) { return set == PG_KBM ? 0u : pad_remap_sig(); }
+ /* The atlas cache signature: 0 = no source / off, 1 = the game's own atlas (PS3), 2039's binding hash for keycaps,
+  * else a value per set and options (never 0/1; ASSUMPTION: a binding hash equal to one of these is negligible). */
+ static uint32_t ld_prompt_sig(void)
+@@ -152,8 +160,63 @@ static uint32_t ld_prompt_sig(void)
+     if (!kc_enabled()) return 0;
+     const int set = ld_prompt_set();
+     if (set == PG_KBM) return rsx_keycaps_sig();
+-    if (set == PG_PS3) return 1;
+-    return 0x50470000u | (ld_prompt_opts(set) << 4) | (uint32_t)set;
++    const uint32_t rm = ld_remap_sig(set);
++    if (set == PG_PS3 && !rm) return 1;
++    /* patch 2094's PS5 variant is a second state inside set PG_PS4 (the main.cpp pad_variant callback: a DualSense,
++     * or KZ3_PROMPTS_PS5=1): it is part of the signature so a DualSense after a DualShock 4 re-uploads the atlas */
++    static int ps5_force = -1;
++    if (ps5_force < 0) { const char* e = getenv("KZ3_PROMPTS_PS5"); ps5_force = (e && e[0] == '1') ? 1 : 0; }
++    const uint32_t ps5 = (set == PG_PS4 && (ps5_force || pad_prompt_device() == 4)) ? 0x100u : 0u;
++    return (0x50470000u | ps5 | (ld_prompt_opts(set) << 4) | (uint32_t)set) ^ (rm * 2654435761u);
++}
++/* The atlas `cur` (BC3, w x h, the glyph set already drawn; `own` = malloc'd copy or the game's source) with the
++ * cells of remapped game buttons replaced by the picture of the pad button that presses them. Returns a new malloc'd
++ * copy (`cur` untouched), or NULL when nothing changes. *n = cells moved. */
++static uint8_t* ld_prompt_remap_cells(const uint8_t* cur, uint32_t w, uint32_t h, uint32_t bytes, int kind, int* n)
++{
++    *n = 0;
++    if (!pad_remap_sig() || bytes < w * h || (w & 3) || (h & 3)) return NULL;
++    const kc_cell* cells = kind == KC_HUD ? kc_hud_cells : kc_menu_cells;
++    const unsigned nc = kind == KC_HUD ? sizeof kc_hud_cells / sizeof kc_hud_cells[0] : sizeof kc_menu_cells / sizeof kc_menu_cells[0];
++    uint8_t* out = (uint8_t*)malloc(bytes);
++    if (!out) return NULL;
++    memcpy(out, cur, bytes);
++    const uint32_t bw = w / 4;
++    for (unsigned c = 0; c < nc; c++) {
++        const kc_cell* t = &cells[c];
++        const char* hn = pad_remap_host_for(t->input);
++        if (!hn || !*hn || !strcmp(hn, t->input)) continue;   /* not a button, none, or unchanged */
++        const kc_cell* sc = NULL;
++        for (unsigned i = 0; i < nc; i++) if (!strcmp(cells[i].input, hn)) { sc = &cells[i]; break; }
++        if (!sc) continue;
++        const int tw = t->r - t->l + 1, th = t->b - t->t + 1, sw = sc->r - sc->l + 1, sh = sc->b - sc->t + 1;
++        if (tw <= 0 || th <= 0 || sw <= 0 || sh <= 0 || t->r >= (int)w || t->b >= (int)h || sc->r >= (int)w || sc->b >= (int)h) continue;
++        uint8_t* cap = (uint8_t*)malloc((size_t)tw * th * 4);
++        if (!cap) continue;
++        for (int y = 0; y < th; y++)   /* the source cell from `cur` (nearest texel when the sizes differ) */
++            for (int x = 0; x < tw; x++) {
++                const int sx = sc->l + (x * sw) / tw, sy = sc->t + (y * sh) / th;
++                uint8_t px[16][4];
++                kc_bc3_decode(cur + ((size_t)(sy / 4) * bw + (size_t)(sx / 4)) * 16, px);
++                memcpy(cap + ((size_t)y * tw + x) * 4, px[(sy & 3) * 4 + (sx & 3)], 4);
++            }
++        for (uint32_t by = t->t / 4; by <= (uint32_t)t->b / 4 && by < h / 4; by++)
++            for (uint32_t bx = t->l / 4; bx <= (uint32_t)t->r / 4 && bx < bw; bx++) {
++                uint8_t* blk = out + ((size_t)by * bw + bx) * 16;
++                uint8_t px[16][4];
++                kc_bc3_decode(blk, px);
++                for (int i = 0; i < 16; i++) {
++                    const int x = (int)bx * 4 + (i & 3), y = (int)by * 4 + (i >> 2);
++                    if (x < t->l || x > t->r || y < t->t || y > t->b) continue;
++                    memcpy(px[i], cap + ((size_t)(y - t->t) * tw + (x - t->l)) * 4, 4);
++                }
++                kc_bc3_encode(px, blk);
++            }
++        free(cap);
++        (*n)++;
++    }
++    if (!*n) { free(out); return NULL; }
++    return out;
+ }
+ #include "rsx_pso_async.h"
+ /* patch 2048: asynchronous PSO build bookkeeping */
+@@ -4364,6 +4427,11 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+                 fprintf(stderr, "[keycap] %s atlas %ux%u src=%u:0x%08X upload %s (%d cells, sig %08X)\n",
+                         g_ld_kc_kind == KC_HUD ? "hud" : "menu", w, h, t->location, t->offset,
+                         kc_copy ? set_name[set] : "pad glyphs", cells, g_ld_kc_sig);
++                if (set != PG_KBM) {   /* patch 4013: the pad layout moves the pictures to the buttons that press */
++                    int moved = 0;
++                    u8* rm = ld_prompt_remap_cells(kc_copy ? kc_copy : src, w, h, total, g_ld_kc_kind, &moved);
++                    if (rm) { free(kc_copy); kc_copy = rm; fprintf(stderr, "[keycap] pad layout: %d prompt cell(s) moved\n", moved); }
++                }
+                 if (kc_copy) src = kc_copy;
+             }
+         }

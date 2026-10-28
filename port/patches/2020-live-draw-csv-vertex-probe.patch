@@ -1,0 +1,37 @@
+live-draw: LD_CSV_VALUES=1 adds attribute 0 and a c0..c3 transform to RSX_DRAW_CSV rows.
+
+Diagnostic for draws that execute but write nothing (pass 21, Killzone 3 G-buffer): per row, attribute 0's
+type/size/stride/location:offset, VP constants c0..c3 and, for the first three vertices, attribute 0 as decoded
+and o = v.x*c0 + v.y*c1 + v.z*c2 + v.w*c3 (KZ3's G-buffer vertex programs compute the clip position this way).
+Off unless the variable is set; RSX_DRAW_CSV must be set too.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 5235d89..ee8ab00 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -7342,6 +7342,25 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+             fprintf(file, "bb=%.0f,%.0f-%.0f,%.0f ", x0, y0, x1, y1);
+         }
+     }
++    /* LD_CSV_VALUES=1 (pass 21 probe): attr 0 format, the first three vertices' attr 0 and
++     * c0..c3 as a row-vector transform (o = v.x*c0 + v.y*c1 + v.z*c2 + v.w*c3, the KZ3
++     * G-buffer VP pattern) so missing geometry can be told apart from culled/clipped geometry. */
++    { static int cv = -1; if (cv < 0) cv = getenv("LD_CSV_VALUES") ? 1 : 0;
++      if (cv) {
++        rsx_dsp_vertex_attr a0; rsx_dsp_get_vertex_attr(&g.rsx, 0, &a0);
++        fprintf(file, "a0=%u/%u/%u/%u:%X ", a0.type, a0.size, a0.stride, a0.location, a0.offset);
++        const u32 nv = dc.n_source_refs ? dc.n_source_refs : dc.n_verts;
++        float c[4][4];
++        for (u32 i = 0; i < 4; i++) memcpy(c[i], g.rsx.constants[i], 16);
++        for (u32 i = 0; i < 4; i++) fprintf(file, "c%u=%g/%g/%g/%g ", i, c[i][0], c[i][1], c[i][2], c[i][3]);
++        for (u32 k = 0; k < nv && k < 3; k++) {
++            const u32 vtx = dc.refs_remapped ? rsx_vertex_remap_index(&dc.ref_remap, k) : k;
++            float fb[4]; const float* v = dc_vertex_attr_canonical(vtx, 0, fb);
++            float o[4];
++            for (u32 j = 0; j < 4; j++) o[j] = v[0]*c[0][j] + v[1]*c[1][j] + v[2]*c[2][j] + v[3]*c[3][j];
++            fprintf(file, "v%u=%g/%g/%g/%g clip=%g/%g/%g/%g ", k, v[0], v[1], v[2], v[3], o[0], o[1], o[2], o[3]);
++        }
++      } }
+     fprintf(file, "A=%u:%X/%u fmt=%u rt=%u ", sf.color_location[0], sf.color_offset[0], sf.color_pitch[0], sf.color_format, sf.raster_type);
+     fprintf(file, "ct=0x%X B=%u:%X C=%u:%X D=%u:%X ", sf.color_target,
+             sf.color_location[1], sf.color_offset[1], sf.color_location[2], sf.color_offset[2],

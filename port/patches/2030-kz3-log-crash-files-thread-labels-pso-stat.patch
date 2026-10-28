@@ -1,0 +1,365 @@
+KZ3 logging hooks in the runtime, plus per-minute PSO / shader-compile statistics.
+
+Only active when the TU is built with -DKZ3_LOG_REDIRECT_STDIO (port/kz3/CMakeLists.txt does that for the runtime
+library and the PPU scaffold, together with -include port/kz3/kz3_log.h); without it every hunk compiles to the old
+code, so host tests and other builds are unchanged.
+- ppu_crash_report: after the [CRASH] lines, kz3_log_write_crash (logs/crash-*.txt with the last 200 log lines) and
+  a MiniDumpNormal minidump beside it (dbghelp loaded at run time), then kz3_crash_notify (port/kz3/main.cpp).
+- the stuck-caller exit(3) becomes kz3_log_fatal("ppu", ...) first (crash file, exit code 70).
+- unresolved NIDs: once per distinct NID with lr (KZ3_LOG_ONCE_KEY), was the first 40 hits.
+- sys_process_exit closes the log before the host exit(); guest TTY (sys_tty_write, console_write) goes to [tty].
+- thread labels ppu:<id>, spu:<id>, spurs:<k> in the log file.
+- live-draw (always, LD_PSO_STAT=0 off): [pso-stat] one line per minute of run time with PSO cache misses
+  (count, total, max, >4/16/50 ms), vertex/pixel D3DCompile count/total/max, shader disk-cache hits and
+  CreateGraphicsPipelineState count/total/max on the walker thread.
+Not here: the HardExit (0x8CF08) override, which belongs to the 1.14 build (switch-114).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): both (upstream ps3_thread_name, then the kz3_log label).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index b62cca5a..a5aae27f 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2473,6 +2473,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ #endif
+     struct SpursInst* si = ((struct { struct SpursInst* si; int k; }*)p)->si;
+     const int kt = ((struct { struct SpursInst* si; int k; }*)p)->k;   /* kernel thread index */
++#ifdef KZ3_LOG_REDIRECT_STDIO
++    { char lb[16]; snprintf(lb, sizeof lb, "spurs:%d", kt); kz3_log_set_thread_label(lb); }   /* KZ3 patch 2030 */
++#endif
+     const int multi = si->nthreads > 1;
+     static volatile long s_pm_off = -1;
+     if (s_pm_off < 0) s_pm_off = getenv("PS3_NO_SPURS_PM") ? 1 : 0;
+diff --git a/libs/system/sysPrxForUser.c b/libs/system/sysPrxForUser.c
+index b2cba7b6..e109cc27 100644
+--- a/libs/system/sysPrxForUser.c
++++ b/libs/system/sysPrxForUser.c
+@@ -196,6 +196,9 @@ void sys_process_exit(s32 exitcode)
+ #endif
+         }
+     }
++#ifdef KZ3_LOG_REDIRECT_STDIO
++    kz3_log_shutdown();   /* KZ3 patch 2030: close the log before the host exit */
++#endif
+     exit(exitcode);
+ }
+ 
+@@ -1128,7 +1131,11 @@ s32 sys_get_random_number(void* buf, u64 size)
+ 
+ s32 console_putc(s32 ch)
+ {
++#ifdef KZ3_LOG_REDIRECT_STDIO
++    { char c[2] = { (char)ch, 0 }; fputs(c, stderr); }   /* patch 2030: joined per thread by the log router */
++#else
+     fputc(ch, stderr);
++#endif
+     return CELL_OK;
+ }
+ 
+@@ -1140,7 +1147,11 @@ s32 console_getc(void)
+ s32 console_write(const void* buf, u32 len)
+ {
+     if (buf && len > 0)
++#ifdef KZ3_LOG_REDIRECT_STDIO
++        kz3_log(KZ3_LOG_INFO, "tty", "%.*s", (int)len, (const char*)buf);   /* patch 2030 */
++#else
+         fwrite(buf, 1, len, stderr);
++#endif
+     return CELL_OK;
+ }
+ 
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 80e1a928..d5ac8436 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -5732,6 +5732,84 @@ static u32 vp_txl_unit_mask(const u8* ucode, u32 instrs)
+     return mask;
+ }
+ 
++/* KZ3 patch 2030: PSO / shader-compile statistics on the walker thread, one [pso-stat] line per minute of run time
++ * with any PSO built (minute = ms since process start / 60000). For the shader preload decision (RSX pass 31):
++ * miss = the whole PSO cache-miss path (decompile + compile or disk load + CreateGraphicsPipelineState).
++ * LD_PSO_STAT=0 turns it off. */
++typedef struct { unsigned n, max_us; unsigned long long us; } ld_pstat_acc;
++static struct {
++    int on; long long qpf, qpc0, ms0; long long bucket;
++    ld_pstat_acc miss, vsc, psc, create;
++    unsigned disk_v, disk_p, over4, over16, over50;
++    unsigned long long tot_miss, tot_compile; unsigned long long tot_miss_us;
++} g_ld_pstat = { -1 };
++static long long ld_pstat_now_ms(void)
++{
++    LARGE_INTEGER q; QueryPerformanceCounter(&q);
++    return g_ld_pstat.ms0 + (q.QuadPart - g_ld_pstat.qpc0) * 1000 / g_ld_pstat.qpf;
++}
++static int ld_pstat_on(void)
++{
++    if (g_ld_pstat.on < 0) {
++        const char* e = getenv("LD_PSO_STAT");
++        g_ld_pstat.on = !(e && *e == '0');
++        LARGE_INTEGER f, q; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q);
++        g_ld_pstat.qpf = f.QuadPart; g_ld_pstat.qpc0 = q.QuadPart;
++        FILETIME c, x, k, u, now; GetSystemTimeAsFileTime(&now);
++        g_ld_pstat.ms0 = 0;
++        if (GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u)) {
++            ULARGE_INTEGER a, b; a.LowPart = c.dwLowDateTime; a.HighPart = c.dwHighDateTime;
++            b.LowPart = now.dwLowDateTime; b.HighPart = now.dwHighDateTime;
++            if (b.QuadPart > a.QuadPart) g_ld_pstat.ms0 = (long long)((b.QuadPart - a.QuadPart) / 10000u);
++        }
++        g_ld_pstat.bucket = -1;
++    }
++    return g_ld_pstat.on;
++}
++static void ld_pstat_acc_add(ld_pstat_acc* a, unsigned us) { a->n++; a->us += us; if (us > a->max_us) a->max_us = us; }
++static unsigned ld_pstat_us(LONGLONG t0) { LARGE_INTEGER q; QueryPerformanceCounter(&q);
++    return (unsigned)((q.QuadPart - t0) * 1000000 / (g_ld_pstat.qpf ? g_ld_pstat.qpf : 1)); }
++static LONGLONG ld_pstat_qpc(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart; }
++/* Called on every PSO miss: closes the previous minute's line when the minute changed. */
++static void ld_pstat_flush_if_new_minute(void)
++{
++    const long long b = ld_pstat_now_ms() / 60000;
++    if (b == g_ld_pstat.bucket) return;
++    if (g_ld_pstat.bucket >= 0 && g_ld_pstat.miss.n)
++        fprintf(stderr, "[pso-stat] min %lld: pso-miss n=%u tot=%.1f ms max=%.1f ms (>4ms %u >16ms %u >50ms %u)"
++                " | vs-compile n=%u tot=%.1f max=%.1f | ps-compile n=%u tot=%.1f max=%.1f | disk-hit vs=%u ps=%u"
++                " | create n=%u tot=%.1f max=%.1f | run total miss=%llu compiles=%llu %.1f ms\n",
++                g_ld_pstat.bucket, g_ld_pstat.miss.n, g_ld_pstat.miss.us / 1e3, g_ld_pstat.miss.max_us / 1e3,
++                g_ld_pstat.over4, g_ld_pstat.over16, g_ld_pstat.over50,
++                g_ld_pstat.vsc.n, g_ld_pstat.vsc.us / 1e3, g_ld_pstat.vsc.max_us / 1e3,
++                g_ld_pstat.psc.n, g_ld_pstat.psc.us / 1e3, g_ld_pstat.psc.max_us / 1e3,
++                g_ld_pstat.disk_v, g_ld_pstat.disk_p,
++                g_ld_pstat.create.n, g_ld_pstat.create.us / 1e3, g_ld_pstat.create.max_us / 1e3,
++                g_ld_pstat.tot_miss, g_ld_pstat.tot_compile, g_ld_pstat.tot_miss_us / 1e3);
++    memset(&g_ld_pstat.miss, 0, sizeof g_ld_pstat.miss); memset(&g_ld_pstat.vsc, 0, sizeof g_ld_pstat.vsc);
++    memset(&g_ld_pstat.psc, 0, sizeof g_ld_pstat.psc); memset(&g_ld_pstat.create, 0, sizeof g_ld_pstat.create);
++    g_ld_pstat.disk_v = g_ld_pstat.disk_p = g_ld_pstat.over4 = g_ld_pstat.over16 = g_ld_pstat.over50 = 0;
++    g_ld_pstat.bucket = b;
++}
++static HRESULT ld_pstat_compile(LPCVOID src, SIZE_T n, LPCSTR name, const D3D_SHADER_MACRO* defs, ID3DInclude* inc,
++                                LPCSTR entry, LPCSTR target, UINT f1, UINT f2, ID3DBlob** code, ID3DBlob** err)
++{
++    const LONGLONG t0 = ld_pstat_qpc();
++    HRESULT hr = D3DCompile(src, n, name, defs, inc, entry, target, f1, f2, code, err);
++    if (g_ld_pstat.on > 0) {
++        ld_pstat_acc_add(target[0] == 'v' ? &g_ld_pstat.vsc : &g_ld_pstat.psc, ld_pstat_us(t0));
++        g_ld_pstat.tot_compile++;
++    }
++    return hr;
++}
++static ID3DBlob* shader_disk_cache_load(u32 stage, const char* source, u32 source_length, u64 hash);
++static ID3DBlob* ld_pstat_disk_load(u32 stage, const char* source, u32 source_length, u64 hash)
++{
++    ID3DBlob* b = shader_disk_cache_load(stage, source, source_length, hash);
++    if (b && g_ld_pstat.on > 0) { if (stage == 'V') g_ld_pstat.disk_v++; else g_ld_pstat.disk_p++; }
++    return b;
++}
++
+ static ID3D12PipelineState* build_pso(
+     const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
+     const rsx_vertex_layout_plan* masked_layout, int packed_offsets)
+@@ -5775,7 +5853,7 @@ static ID3D12PipelineState* build_pso(
+ #if defined(YZ_PERF_PROFILE)
+         g_ld_profile.total.vs_blob_misses++;
+ #endif
+-        vs = shader_disk_cache_load('V', vs_hlsl, vs_length, vs_hash);
++        vs = ld_pstat_disk_load('V', vs_hlsl, vs_length, vs_hash);
+         if (vs) {
+             shader_blob_cache_insert_accounted(
+                 &g.vs_blobs, vs_hlsl, vs_length, vs_hash, vs,
+@@ -5785,7 +5863,7 @@ static ID3D12PipelineState* build_pso(
+             g_ld_profile.total.vs_compile_calls++;
+             const LONGLONG compile_begin = ld_profile_qpc();
+ #endif
+-            vs_hr = D3DCompile(
++            vs_hr = ld_pstat_compile(
+                 vs_hlsl, vs_length, "xvs", NULL, NULL, "main",
+                 "vs_5_0", 0, 0, &vs, &err);
+ #if defined(YZ_PERF_PROFILE)
+@@ -5837,7 +5915,7 @@ static ID3D12PipelineState* build_pso(
+ #if defined(YZ_PERF_PROFILE)
+         g_ld_profile.total.ps_blob_misses++;
+ #endif
+-        ps = shader_disk_cache_load('P', ps_hlsl, ps_length, ps_hash);
++        ps = ld_pstat_disk_load('P', ps_hlsl, ps_length, ps_hash);
+         if (ps) {
+             shader_blob_cache_insert_accounted(
+                 &g.ps_blobs, ps_hlsl, ps_length, ps_hash, ps,
+@@ -5847,7 +5925,7 @@ static ID3D12PipelineState* build_pso(
+             g_ld_profile.total.ps_compile_calls++;
+             const LONGLONG compile_begin = ld_profile_qpc();
+ #endif
+-            ps_hr = D3DCompile(
++            ps_hr = ld_pstat_compile(
+                 ps_hlsl, ps_length, "xps", NULL, NULL, "main",
+                 "ps_5_0", 0, 0, &ps, &err);
+ #if defined(YZ_PERF_PROFILE)
+@@ -5911,7 +5989,9 @@ static ID3D12PipelineState* build_pso(
+     g_ld_profile.total.create_pso_calls++;
+     const LONGLONG create_begin = ld_profile_qpc();
+ #endif
++    const LONGLONG pst_c0 = ld_pstat_qpc();
+     HRESULT hr = ld_create_pso(&pd, rs, &pso);
++    if (g_ld_pstat.on > 0) ld_pstat_acc_add(&g_ld_pstat.create, ld_pstat_us(pst_c0));
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.create_pso_qpc +=
+         (u64)(ld_profile_qpc() - create_begin);
+@@ -6343,6 +6423,7 @@ static ID3D12PipelineState* get_pso(
+         LD_PSO_BAIL("PSO cache full (MAX_PSOS)");
+         return NULL;
+     }
++    const LONGLONG pst_m0 = ld_pstat_on() ? (ld_pstat_flush_if_new_minute(), ld_pstat_qpc()) : 0;   /* patch 2030 */
+ 
+     static char vs_hlsl[256 * 1024];
+     static char ps_hlsl[256 * 1024];
+@@ -6477,6 +6558,12 @@ static ID3D12PipelineState* get_pso(
+         if (bp_t0) { LDW_ADD(RSX_PERF_W_PSO_NEW_T, bp_t0); rsx_perf_add(RSX_PERF_W_PSO_NEW_N, 1); }
+     }
+ 
++    if (pst_m0) {
++        const unsigned us = ld_pstat_us(pst_m0);
++        ld_pstat_acc_add(&g_ld_pstat.miss, us);
++        g_ld_pstat.tot_miss++; g_ld_pstat.tot_miss_us += us;
++        g_ld_pstat.over4 += us > 4000; g_ld_pstat.over16 += us > 16000; g_ld_pstat.over50 += us > 50000;
++    }
+     g.psos[g.n_psos].key = key;
+     g.psos[g.n_psos].pso = pso;
+     g.n_psos++;
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 0b2d9622..e836b66c 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -772,8 +772,13 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
+             return;
+         }
++#ifdef KZ3_LOG_REDIRECT_STDIO
++        /* KZ3 patch 2030: each distinct NID once, with its caller (was: the first 40 hits). */
++        KZ3_LOG_ONCE_KEY(KZ3_LOG_WARN, "hle", nid, "unresolved NID 0x%08X lr=0x%08X", nid, (uint32_t)ctx->lr);
++#else
+         static int logged = 0;
+         if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
++#endif
+         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
+          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
+          * protocol so it can be implemented. */
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 61806d06..28732b2d 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3182,7 +3182,13 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
+                     (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[31]);
+             ppu_log_host_chain("stuck-caller");
+             ppu_dump_guest_stack(ctx, "stuck-caller");
+-            fflush(stderr); exit(3);
++            fflush(stderr);
++#ifdef KZ3_LOG_REDIRECT_STDIO
++            /* KZ3 patch 2030: a fatal error with a crash file instead of a silent exit code 3. */
++            kz3_log_fatal("ppu", "guest call stuck on an unresolved target (lr=0x%08X), see the [ppu] lines above",
++                          (uint32_t)ctx->lr);
++#endif
++            exit(3);
+         }
+         return;   /* don't spam the log on a tight retry loop */
+     }
+@@ -4238,6 +4244,9 @@ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
+  * PS3_NO_CRASH_REPORT=1 leaves the filter out. */
+ extern "C" uint32_t    g_last_hle_nid;
+ extern "C" const char* g_last_hle_name;
++#ifdef KZ3_LOG_REDIRECT_STDIO
++extern "C" void kz3_crash_notify(const char* crash_file);   /* port/kz3/main.cpp: tells the player (patch 2030) */
++#endif
+ static LONG WINAPI ppu_crash_report(EXCEPTION_POINTERS* ep)
+ {
+     static volatile LONG s_once = 0;
+@@ -4273,6 +4282,38 @@ static LONG WINAPI ppu_crash_report(EXCEPTION_POINTERS* ep)
+         RtlVirtualUnwind(UNW_FLAG_NHANDLER, img, c.Rip, rf, &c, &hd, &ef, NULL);
+     }
+     fflush(stderr); fflush(stdout);
++#ifdef KZ3_LOG_REDIRECT_STDIO
++    /* KZ3 patch 2030 (logger): the [CRASH] lines above went to the log file as errors; add the crash file
++     * (time, thread, reason, the last 200 log lines) and a minidump beside it, then let the port tell the player. */
++    {
++        char reason[128], details[256];
++        snprintf(reason, sizeof reason, "unhandled exception 0x%08lX", (unsigned long)er->ExceptionCode);
++        snprintf(details, sizeof details, "rip rva=0x%llX guest-fn=0x%08X cia=0x%08X lr=0x%08X tid=%lu",
++                 (unsigned long long)((char*)er->ExceptionAddress - mbase), ppu_prof_resolve_host(er->ExceptionAddress),
++                 g_active_ctx ? (uint32_t)g_active_ctx->cia : 0u, g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u,
++                 (unsigned long)GetCurrentThreadId());
++        const char* crash = kz3_log_write_crash(reason, details);
++        if (crash && *crash) {
++            char dmp[600];
++            snprintf(dmp, sizeof dmp, "%s", crash);
++            char* dot = strrchr(dmp, '.');
++            if (dot && (size_t)(dot - dmp) + 5 < sizeof dmp) strcpy(dot, ".dmp");
++            HANDLE f = CreateFileA(dmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++            if (f != INVALID_HANDLE_VALUE) {
++                typedef BOOL (WINAPI *mdw_fn)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
++                struct { DWORD tid; EXCEPTION_POINTERS* ep; BOOL client; } mei = { GetCurrentThreadId(), ep, FALSE };
++                HMODULE dh = LoadLibraryA("dbghelp.dll");
++                mdw_fn mdw = dh ? (mdw_fn)(void*)GetProcAddress(dh, "MiniDumpWriteDump") : NULL;
++                /* MiniDumpNormal (0): thread stacks and module list only; the 4 GB guest reservation stays out. */
++                BOOL ok = mdw ? mdw(GetCurrentProcess(), GetCurrentProcessId(), f, 0, &mei, NULL, NULL) : FALSE;
++                CloseHandle(f);
++                if (!ok) DeleteFileA(dmp);
++                fprintf(stderr, "[CRASH] crash file %s, minidump %s\n", crash, ok ? dmp : "(not written)");
++            }
++        }
++        kz3_crash_notify(crash ? crash : "");
++    }
++#endif
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
+ #endif
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index a390cc28..1b8669e7 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -85,8 +85,13 @@ static int64_t sys_tty_write(ppu_context* ctx)
+ 
+     if (buf_ea && len > 0 && vm_base) {
+         /* Write guest string data to host stderr */
++#ifdef KZ3_LOG_REDIRECT_STDIO
++        /* KZ3 patch 2030: the title's own TTY text goes to the log under [tty] (one line per newline). */
++        kz3_log(KZ3_LOG_INFO, "tty", "%.*s", (int)len, (const char*)(vm_base + buf_ea));
++#else
+         fwrite(vm_base + buf_ea, 1, len, stderr);
+         fflush(stderr);
++#endif
+         /* TTY_BT=<substring>: dump the guest LR back-chain whenever the title
+          * prints a line containing it. The two hooks below do exactly this for
+          * one hardcoded string each, which only ever helped the title they were
+@@ -730,6 +735,9 @@ static void* spu_exec_thread_proc(void* arg)
+     spu_thread_t* t = (spu_thread_t*)arg;
+     { const spu_group_t* g = spu_find_group(t->group_id);
+       ps3_thread_name("spu %s:%u", g && g->name[0] ? g->name : "group", t->index); }
++#ifdef KZ3_LOG_REDIRECT_STDIO
++    { char lb[16]; snprintf(lb, sizeof lb, "spu:%u", (unsigned)t->tid); kz3_log_set_thread_label(lb); }   /* patch 2030 */
++#endif
+     spu_lifted_thread_result r;
+     spu_lifted_thread_run(t->sctx, &r);
+     t->exit_status = r.exit_status;
+@@ -771,6 +779,9 @@ static void* spu_fallback_thread_proc(void* arg)
+     spu_thread_t* t = (spu_thread_t*)arg;
+     { const spu_group_t* g = spu_find_group(t->group_id);
+       ps3_thread_name("spu-hle %s:%u", g && g->name[0] ? g->name : "group", t->index); }
++#ifdef KZ3_LOG_REDIRECT_STDIO
++    { char lb[16]; snprintf(lb, sizeof lb, "spu:%u", (unsigned)t->tid); kz3_log_set_thread_label(lb); }   /* patch 2030 */
++#endif
+     int32_t rc = 0;
+     if (t->fb_handler) {
+         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
+diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
+index acbc2d5d..10203794 100644
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -197,6 +197,10 @@ static void* ppu_host_thread_proc(void* param)
+     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+     ps3_tprof_thread('P', (uint32_t)info->ctx.thread_id);
+ 
++#ifdef KZ3_LOG_REDIRECT_STDIO
++    { char lb[16]; snprintf(lb, sizeof lb, "ppu:%llu", (unsigned long long)info->ctx.thread_id);
++      kz3_log_set_thread_label(lb); }   /* KZ3 patch 2030: thread label in the log file */
++#endif
+     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
+             (unsigned long long)info->ctx.thread_id,
+             (unsigned long long)info->entry_addr, (unsigned long)GetCurrentThreadId());

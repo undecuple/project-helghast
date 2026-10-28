@@ -1,0 +1,28 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR253 page-sized blocks, ours keeps thread blocks after the main 0x8000 (KZ3-tested) where upstream starts them at main+total.
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3753,15 +3753,16 @@ static uint32_t ppu_tls_new_block(void)
+     uint32_t total = (g_tls_memsz + 0xFFFu) & ~0xFFFu;
+     uint32_t lim   = 0x11000000u;               /* same bound the main block uses */
+     if (ppu_vm_size && ppu_vm_size < lim) lim = ppu_vm_size;
+-    /* Threads are created concurrently, so hand out offsets atomically. */
++    /* Threads are created concurrently, so hand out offsets atomically. The
++     * first 0x8000 belong to the main block (its image and its r13 page). */
+     static uint32_t s_bump = 0;
+     uint32_t off  = __atomic_fetch_add(&s_bump, total, __ATOMIC_RELAXED);
+-    uint32_t base = PPU_TLS_IMG + total + off;  /* main block occupies the first */
++    uint32_t base = PPU_TLS_IMG + 0x8000u + off;
+     if (base + total > lim) {                   /* out of room: share, as before */
+         static int s_warned = 0;
+         if (!__atomic_exchange_n(&s_warned, 1, __ATOMIC_RELAXED))
+-            fprintf(stderr, "[ppu] TLS window full after %u thread blocks: later "
+-                    "threads share the main thread's TLS\n", (unsigned)(off / total));
++            fprintf(stderr, "[ppu] TLS window full after %u thread blocks: later threads "
++                    "share the main block's TLS\n", (unsigned)(off / total));
+         return 0;
+     }
+     if (g_tls_filesz) memcpy(vm_base + base, vm_base + g_tls_vaddr, g_tls_filesz);

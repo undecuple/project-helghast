@@ -1,0 +1,59 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): kept, PR287 is reverted by 1000-spu (it had every op), ilh line from PR234 taken.
+
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -144,6 +144,8 @@ static int spu_step(spu_context* ctx) {
+     case SPU_cg:   DST = spu_cg(A,B); break;
+     case SPU_cgx:  DST = spu_cgx(A,B,DST); break;
+     case SPU_mpyi: DST = spu_mpyi(A,I); break;
++    case SPU_mpyui:DST = spu_mpyui(A,I); break;
++    case SPU_bgx:  DST = spu_bgx(A,B,DST); break;
+     /* logical */
+     case SPU_and: DST = spu_and(A,B); break;
+     case SPU_or:  DST = spu_or(A,B); break;
+@@ -189,6 +191,8 @@ static int spu_step(spu_context* ctx) {
+     case SPU_rotmai:DST = spu_rotmai(A,I); break;
+     case SPU_roth: DST = spu_roth(A,B); break;
+     case SPU_rothi:DST = spu_rothi(A,I); break;
++    case SPU_rothmi: DST = spu_rothmi(A,I); break;
++    case SPU_rotmahi:DST = spu_rotmahi(A,I); break;
+     case SPU_shlqbi: DST = spu_shlqbi(A,B); break;
+     case SPU_shlqbii:DST = spu_shlqbii(A,I); break;
+     case SPU_shlqby: DST = spu_shlqby(A,B); break;
+@@ -245,6 +249,14 @@ static int spu_step(spu_context* ctx) {
+     case SPU_fcmeq:  DST = spu_fcmeq(A,B); break;
+     case SPU_fesd:   DST = spu_fesd(A); break;
+     case SPU_frds:   DST = spu_frds(A); break;
++    case SPU_dfa:  DST = spu_dfa(A,B); break;
++    case SPU_dfs:  DST = spu_dfs(A,B); break;
++    case SPU_dfm:  DST = spu_dfm(A,B); break;
++    case SPU_dfceq: DST = spu_dfceq(A,B); break;
++    case SPU_dfcmeq:DST = spu_dfcmeq(A,B); break;
++    case SPU_dfcgt: DST = spu_dfcgt(A,B); break;
++    case SPU_dfcmgt:DST = spu_dfcmgt(A,B); break;
++    case SPU_mpyhhau:DST = spu_mpyhhau(A,B,DST); break;
+     case SPU_fma:  DSTC = spu_fma(A,B,T); break;    /* RRR: dest=rc */
+     case SPU_fms:  DSTC = spu_fms(A,B,T); break;
+     case SPU_fnms: DSTC = spu_fnms(A,B,T); break;
+@@ -263,7 +275,7 @@ static int spu_step(spu_context* ctx) {
+     case SPU_mpys:  DST = spu_mpys(A,B); break;
+     case SPU_mpyhh: DST = spu_mpyhh(A,B); break;
+     case SPU_mpyhhu:DST = spu_mpyhhu(A,B); break;
+-    case SPU_mpyhha:DSTC = spu_mpyhha(A,B,T); break;  /* RRR */
++    case SPU_mpyhha:DST = spu_mpyhha(A,B,DST); break;  /* RR form (op11 0x346): rt is the accumulator */
+     /* rotate / shift extras */
+     case SPU_rothm:    DST = spu_rothm(A,B); break;
+     case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
+@@ -278,7 +290,8 @@ static int spu_step(spu_context* ctx) {
+     /* hints / no-ops */
+     case SPU_nop: case SPU_lnop: case SPU_sync: case SPU_dsync:
+     case SPU_hbr: case SPU_hbra: case SPU_hbrr: case SPU_mtspr:
+-    case SPU_mfspr: case SPU_fscrrd: case SPU_fscrwr: break;
++    case SPU_mfspr: case SPU_fscrwr: break;
++    case SPU_fscrrd: DST = spu_fscrrd(A); break;   /* as the lifter: FPSCR reads 0 */
+     /* control flow */
+     case SPU_br: case SPU_bra: next = d.tgt; break;
+     case SPU_brsl: case SPU_brasl: DST = spu_link(pc + 4); next = d.tgt;

@@ -1,0 +1,51 @@
+KZ3 patch 1120 (SPU pass 103): the part of upstream ps3recomp PR #434 our set lacks (MIT; author: tekulvw, https://github.com/sp00nznet/ps3recomp/pull/434). POSIX hosts use _setjmp/_longjmp for the SPU halt, stack-reset, resume
+and IRQ jumps (no sigprocmask per jump): SPU_SETJMP (patch 1099's macro, spu_context.h) gains the POSIX branch and
+SPU_LONGJMP is new; Windows keeps patch 1099's frameless _setjmp(buf, NULL) and plain longjmp (the PR's own
+definition in spu_channels.c would have redefined SPU_SETJMP as plain setjmp on Windows and undone 1099). The rest of
+the PR is already in our set in KZ3's form: t_recent (one TLS object in the PR) is the per-context step ring of
+patches 1068/1086, spu_task_launch_check's fast path is patch 1039's inline form, spu_depth_guard's shared ring was
+removed by 1086, and spu_check_stack_reset is reached only when the registry is non-empty (1039 inline test, 1017
+order). Windows objects of spu_channels.c and spu_drain.c are instruction-identical with and without this patch.
+Notes the RE notes Pass 103.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 5cd19e48..331d5d15 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -198,7 +198,7 @@ int (*g_kz3_spurs_kpoll)(uint32_t, uint32_t, uint32_t, uint32_t*) = 0;
+ void spu_task_cutoff_exit(spu_context* ctx)
+ {
+     g_spu_trampoline_fn = 0;
+-    if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
++    if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
+     fprintf(stderr, "[ts-join] cut-off task outside the execution driver at 0x%05X: resumes\n", ctx->pc);
+ }
+ 
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 633e9c5f..7e17fa26 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -43,10 +43,20 @@
+  * pass 73: the K2 audio policy module stalled at its first halt longjmp). The SPU runtime's halt and stack-reset
+  * jumps run no unwind handlers, so they use the frameless form (_setjmp(buf, NULL): longjmp only restores the
+  * saved registers). */
++/* Upstream PR #434 (KZ3 patch 1120): setjmp/longjmp also save and restore the signal mask on POSIX: one
++ * sigprocmask system call per halt, stack reset or task resume. These frames never cross a signal handler, so the
++ * mask is the same at both ends: POSIX hosts use _setjmp/_longjmp. Windows keeps the forms above (patch 1099). */
+ #if SPU_SYSV_ABI && defined(_WIN64) && defined(__MINGW64__)
+ #  define SPU_SETJMP(b) _setjmp((b), NULL)
+-#else
++#elif defined(_WIN32)
+ #  define SPU_SETJMP(b) setjmp(b)
++#else
++#  define SPU_SETJMP(b) _setjmp(b)
++#endif
++#if defined(_WIN32)
++#  define SPU_LONGJMP(b, v) longjmp((b), (v))
++#else
++#  define SPU_LONGJMP(b, v) _longjmp((b), (v))
+ #endif
+ 
+ #ifdef __cplusplus

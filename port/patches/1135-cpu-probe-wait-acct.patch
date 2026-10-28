@@ -1,0 +1,157 @@
+KZ3 patch 1135 (SPU pass 112; diagnostic, off by default): KZ3_CPU_PROBE=1 (needs KZ3_WAIT_ACCT) samples the logical processor of every
+thread that runs SPU code (every 256th spu_ib_direct hop, MFC tag-status read and MFC command). Each [wacct] thread line then
+carries cpums= (the thread's CPU ms in the window), tid= and cpus=N:count,...; [cpu-topo] lines at start list each core's
+logical processors, SMT flag and efficiency class (under Proton: 1 = P-core, 0 = E-core).
+
+--- a/runtime/diag/kz3_wait_acct.c
++++ b/runtime/diag/kz3_wait_acct.c
+@@ -17,6 +17,7 @@
+ #endif
+ 
+ int g_kz3_wacct = -1;
++int g_kz3_cpuprobe = 0;   /* patch 1135: KZ3_CPU_PROBE=1 (needs KZ3_WAIT_ACCT) */
+ /* KZ3 patch 1102: read by every computed-hop guess (spu_context.h SPU_READ_MOSTLY; this TU does not include it) */
+ #if defined(_WIN32) && defined(__GNUC__) && !defined(SPU_NO_READ_MOSTLY)
+ __attribute__((section(".data$kz3rm")))
+@@ -31,6 +32,8 @@
+     int depth;
+     volatile uint64_t top_ns[KZ3_WA_NKIND], top_n[KZ3_WA_NKIND];
+     int job_img; uint64_t job_t0;
++    unsigned cpu_tick; volatile uint32_t cpu_cnt[64], p_cpu_cnt[64];   /* patch 1135: KZ3_CPU_PROBE */
++    void* hq; uint64_t p_cpu_ns;
+     void* hthr;   /* patch 1033: duplicated thread handle when the profiler samples this thread */
+     wa_slot tab[WA_SLOTS];
+     /* printer-owned snapshot */
+@@ -236,6 +239,45 @@
+ }
+ 
+ /* ---- printer ---------------------------------------------------------------------- */
++/* ---- patch 1135: KZ3_CPU_PROBE (diagnostic, opt-in) ------------------------------------------------
++ * Every 256th indirect hop (spu_ib_direct) of an SPU thread samples the logical processor it runs on; each [wacct] window
++ * prints the per-processor counts and the thread's CPU ms next to the wait totals, and `[cpu-topo]` at start lists
++ * each logical processor's core, SMT sibling and efficiency class. */
++void kz3_wacct_cpu_probe(void)
++{
++#ifdef _WIN32
++    wa_thr* t = me();
++    if (!t || (++t->cpu_tick & 255u)) return;
++    const unsigned c = GetCurrentProcessorNumber();
++    if (c < 64) t->cpu_cnt[c]++;
++#endif
++}
++
++#ifdef _WIN32
++static void cpu_topo(void)
++{
++    DWORD len = 0;
++    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
++    if (!len) { fprintf(stderr, "[cpu-topo] GetLogicalProcessorInformationEx gave no length\n"); return; }
++    char* buf = (char*)malloc(len);
++    if (!buf || !GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)buf, &len)) {
++        fprintf(stderr, "[cpu-topo] GetLogicalProcessorInformationEx failed\n"); free(buf); return; }
++    int core = 0;
++    for (DWORD off = 0; off < len; ) {
++        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* i = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
++        char cpus[96]; int n = 0; cpus[0] = 0;
++        for (int g = 0; g < i->Processor.GroupCount; g++)
++            for (int b = 0; b < 64; b++)
++                if (((unsigned long long)i->Processor.GroupMask[g].Mask >> b) & 1 && n < (int)sizeof cpus - 8)
++                    n += snprintf(cpus + n, sizeof cpus - n, "%s%d", n ? "," : "", g * 64 + b);
++        fprintf(stderr, "[cpu-topo] core%d cpus=%s smt=%d effclass=%d\n", core++, cpus,
++                (i->Processor.Flags & LTP_PC_SMT) ? 1 : 0, (int)i->Processor.EfficiencyClass);
++        off += i->Size;
++    }
++    free(buf);
++}
++#endif
++
+ static void print_window(double t_s, long flips)
+ {
+     fprintf(stderr, "[wacct] ---- t=%.1fs window=%dms flips=%ld\n", t_s, g_kz3_wacct, flips);
+@@ -277,6 +319,9 @@
+             best[pos] = s; bns[pos] = dn; bn[pos] = dc;
+             if (nb < TOPN) nb++;
+         }
++        if (g_kz3_cpuprobe && !any && !tot) {   /* patch 1135: a thread with samples but no waits (the Bink decoder) is listed too */
++            for (int c = 0; c < 64; c++) if (t->cpu_cnt[c] != t->p_cpu_cnt[c]) { any = 1; break; }
++        }
+         if (!any && !tot) continue;
+         char nm[64], line[2000]; int o = 0;
+         thr_name(t, nm, sizeof nm);
+@@ -289,6 +334,26 @@
+         for (int g = 0; g < ng; g++)
+             o += snprintf(line + o, sizeof line - o, " gap:wid%u=%.1fms*%llu", gs[g],
+                           gn[g] ? (double)gns[g] / 1e6 / (double)gn[g] : 0.0, (unsigned long long)gn[g]);
++        if (g_kz3_cpuprobe) {
++#ifdef _WIN32
++            if (!t->hq && t->ostid) t->hq = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)t->ostid);
++            if (t->hq) {
++                FILETIME c_, e_, k_, u_;
++                if (GetThreadTimes((HANDLE)t->hq, &c_, &e_, &k_, &u_)) {
++                    const uint64_t cpu = (((uint64_t)k_.dwHighDateTime << 32) | k_.dwLowDateTime) +
++                                         (((uint64_t)u_.dwHighDateTime << 32) | u_.dwLowDateTime);
++                    o += snprintf(line + o, sizeof line - o, " cpums=%llu", (unsigned long long)((cpu - t->p_cpu_ns) / 10000ull));
++                    t->p_cpu_ns = cpu;
++                }
++            }
++#endif
++            o += snprintf(line + o, sizeof line - o, " tid=%lu cpus=", t->ostid);
++            for (int c = 0; c < 64; c++) {
++                const uint32_t v = t->cpu_cnt[c], d = v - t->p_cpu_cnt[c];
++                t->p_cpu_cnt[c] = v;
++                if (d) o += snprintf(line + o, sizeof line - o, "%d:%u,", c, d);
++            }
++        }
+         o += snprintf(line + o, sizeof line - o, " |");
+         for (int b = 0; b < nb && o < (int)sizeof line - 80; b++) {
+             uint64_t key = t->tab[best[b]].key;
+@@ -573,6 +638,10 @@
+     if (ms) { s_tls = TlsAlloc(); if (s_tls == TLS_OUT_OF_INDEXES) ms = 0; }
+ #endif
+     s_t0 = kz3_wacct_now();
++    { const char* cp = getenv("KZ3_CPU_PROBE"); g_kz3_cpuprobe = (ms && cp && atoi(cp) > 0) ? 1 : 0; }
++#ifdef _WIN32
++    if (g_kz3_cpuprobe) { cpu_topo(); }
++#endif
+     if (ms) {
+         fprintf(stderr, "[wacct] on: %d ms windows (KZ3 patch 1032)\n", ms);
+         g_kz3_wacct = ms;
+--- a/runtime/diag/kz3_wait_acct.h
++++ b/runtime/diag/kz3_wait_acct.h
+@@ -50,6 +50,8 @@
+ void     kz3_wacct_job(int image);          /* SPU host thread: job module now resident (0 = none) */
+ void     kz3_wacct_name(const char* name);  /* name this host thread */
+ void     kz3_wacct_flip(void);
++extern int g_kz3_cpuprobe;                  /* patch 1135: KZ3_CPU_PROBE */
++void     kz3_wacct_cpu_probe(void);         /* patch 1135: SPU thread, per MFC tag-status read */
+ 
+ static inline int kz3_wacct_on(void) { return g_kz3_wacct < 0 ? kz3_wacct_init() : g_kz3_wacct; }
+ /* Returns 0 when off; kz3_wacct_end ignores t0 == 0. */
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -1759,6 +1759,7 @@
+         spu->mfc_tag = value & 0x1F;
+         break;
+     case MFC_Cmd:
++        { extern int g_kz3_cpuprobe; extern void kz3_wacct_cpu_probe(void); if (g_kz3_cpuprobe) kz3_wacct_cpu_probe(); }   /* patch 1135 */
+         mfc_submit(mfc, spu, value);
+         break;
+     case MFC_WrTagMask:
+@@ -1794,6 +1795,7 @@
+ {
+     switch (channel) {
+     case MFC_RdTagStat:
++        { extern int g_kz3_cpuprobe; extern void kz3_wacct_cpu_probe(void); if (g_kz3_cpuprobe) kz3_wacct_cpu_probe(); }   /* patch 1135 */
+         /* KZ3 patch 1052: count "a list is parked at a stall-and-notify element,
+          * its stall is not yet read (list_stall_stat), but SN is not pending":
+          * nothing will ever resume that list (the lost-wakeup signature). With
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -3181,6 +3181,7 @@
+ spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
+ {
+     extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
++    { extern int g_kz3_cpuprobe; extern void kz3_wacct_cpu_probe(void); if (g_kz3_cpuprobe) kz3_wacct_cpu_probe(); }   /* patch 1135 */
+     if (!spu_hop_ok(ctx)) {
+         SPU_HS(ctx->int_enable && (spu_event_load(ctx) & ctx->event_mask) ? 1 : 2);
+         return NULL;

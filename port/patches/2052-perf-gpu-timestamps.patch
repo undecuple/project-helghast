@@ -1,0 +1,331 @@
+KZ3 patch 2052 (RSX pass 55): RSX_PERF_GPU=2 adds per-draw GPU timestamps grouped by pass and PSO.
+
+D3D12 TIMESTAMP queries: a stamp after every draw (and after clears and surface copies) plus one at each
+list's start and end, resolved to a readback ring before Close; the 1 ms fence poller of patch 2051 turns
+them into intervals when the list completes and credits each to the PSO and the render-target set that ended
+it. Every 10 s: `[perf-gt]` (GPU ms/frame by kind), `[perf-gt-pass]` (top 8 passes) and `[perf-gt-pso]` (top
+12 PSOs) with draws/frame, us/draw, Mpx/frame and the RT formats and sizes. Default off.
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2258,6 +2258,210 @@
+  * submit), completion] (resolution ~1 ms), and prints `[perf-gpu]` once per second:
+  * lists, busy ms, longest single list. Busy ms close to a second means the GPU, not the
+  * walker's CPU, is the limit; a low value with long walker waits means latency. */
++/* Patch 2052: RSX_PERF_GPU=2 adds GPU timestamps (D3D12 TIMESTAMP queries). Every list gets a stamp at its
++ * start (right after Reset), one after every draw (and after clears / surface copies) and one at its end;
++ * ResolveQueryData copies them to a readback ring before Close. When the list's fence completes the 1 ms
++ * poller turns neighbouring stamps into intervals and credits each to the draw (its PSO and its pass =
++ * render-target set) that ended it, so an interval holds the draw plus whatever state/barrier/copy work the
++ * walker recorded just before it. Every 10 s `[perf-gt]`, `[perf-gt-pass]` and `[perf-gt-pso]` print the
++ * top entries in GPU ms per frame. Default off; no cost when off beyond one int test per draw. */
++#define LD_GT_RING 32768u
++#define LD_GT_LIST_MAX 4094u
++#define LD_GT_PASSES 256u
++#define LD_GT_PSOS 4096u
++#define LD_GT_PSO_HASH 16384u
++enum { LD_GT_START, LD_GT_DRAW, LD_GT_CLEAR, LD_GT_COPY, LD_GT_TAIL, LD_GT_VBCOPY, LD_GT_KINDS };   /* VBCOPY: patch 2053 copy lists */
++typedef struct { u32 loc[5], off[5], w[5], h[5], fmt[5]; u32 n_mrt; } ld_gt_passkey;   /* [4] = zeta */
++typedef struct { u64 key, vp_hash; u32 fp_loc, fp_off, fp_size, vp_instrs, input_mask, txl_mask, vtex_mask, ntex; } ld_gt_psoinfo;
++typedef struct { u16 kind, pass; u32 pso, verts, px; } ld_gt_meta;
++typedef struct { double ms; u64 n; double px, verts; } ld_gt_acc;
++static struct {
++    int on;
++    ID3D12QueryHeap* heap; ID3D12Resource* rb; const u64* rbmap; u64 freq;
++    u32 head, first, n, open, pend_first, pend_n, pend_c;
++    double c_bytes; u64 c_copies;
++    ld_gt_meta meta[LD_GT_RING];
++    struct { u64 v; u32 first, n, c; } fr[1024];
++    ld_gt_passkey pk[LD_GT_PASSES]; u32 n_pk; u32 last_pass;
++    ld_gt_psoinfo pi[LD_GT_PSOS]; u32 n_pi; u32 hash[LD_GT_PSO_HASH];
++    u64 dropped;
++    ld_gt_acc pass[LD_GT_PASSES], pso[LD_GT_PSOS], kind[LD_GT_KINDS];   /* poller-owned window sums */
++} g_gt;
++static void ld_gt_stamp(u32 kind, u32 pass, u32 pso, u32 verts, u32 px)
++{
++    if (g_gt.n >= LD_GT_LIST_MAX) { g_gt.dropped++; return; }
++    const u32 s = g_gt.first + g_gt.n++;
++    g.list->lpVtbl->EndQuery(g.list, g_gt.heap, D3D12_QUERY_TYPE_TIMESTAMP, s);
++    g_gt.meta[s].kind = (u16)kind; g_gt.meta[s].pass = (u16)pass; g_gt.meta[s].pso = pso;
++    g_gt.meta[s].verts = verts; g_gt.meta[s].px = px;
++}
++static void ld_gt_begin(void)
++{
++    if (g_gt.on <= 0 || g_gt.open) return;
++    if (g_gt.head + LD_GT_LIST_MAX + 2 > LD_GT_RING) g_gt.head = 0;
++    g_gt.first = g_gt.head; g_gt.n = 0; g_gt.open = 1;
++    ld_gt_stamp(LD_GT_START, 0, 0, 0, 0);
++}
++static void ld_gt_other(u32 kind)
++{
++    if (g_gt.on <= 0) return;
++    ld_gt_begin();
++    ld_gt_stamp(kind, 0xFFFF, 0, 0, 0);
++}
++static void ld_gt_close(void)
++{
++    g_gt.pend_n = 0; g_gt.pend_c = 0xFFFFFFFFu;
++    if (g_gt.on <= 0 || !g_gt.open) return;
++    ld_gt_stamp(LD_GT_TAIL, 0xFFFF, 0, 0, 0);
++    g.list->lpVtbl->ResolveQueryData(g.list, g_gt.heap, D3D12_QUERY_TYPE_TIMESTAMP, g_gt.first, g_gt.n, g_gt.rb, (u64)g_gt.first * 8u);
++    g_gt.pend_first = g_gt.first; g_gt.pend_n = g_gt.n;
++    g_gt.head = g_gt.first + g_gt.n; g_gt.open = 0;
++}
++static u32 ld_gt_pso_index(void)
++{
++    const u64 k = g_ld_current_pso.key;
++    u32 h = (u32)(k ^ (k >> 32) ^ (k >> 17)) & (LD_GT_PSO_HASH - 1);
++    for (;;) {
++        const u32 e = g_gt.hash[h];
++        if (!e) break;
++        if (g_gt.pi[e - 1].key == k) return e - 1;
++        h = (h + 1) & (LD_GT_PSO_HASH - 1);
++    }
++    if (g_gt.n_pi >= LD_GT_PSOS) return LD_GT_PSOS - 1;
++    ld_gt_psoinfo* p = &g_gt.pi[g_gt.n_pi];
++    p->key = k; p->vp_hash = g_ld_current_pso.vp_hash; p->fp_loc = g_ld_current_pso.fp_location;
++    p->fp_off = g_ld_current_pso.fp_offset; p->fp_size = g_ld_current_pso.fp_size;
++    p->vp_instrs = g_ld_current_pso.vp_instrs; p->input_mask = g_ld_current_pso.input_mask;
++    p->txl_mask = g_ld_current_pso.txl_mask; p->vtex_mask = g_ld_current_pso.vtex_mask;
++    p->ntex = 0;
++    g_gt.hash[h] = ++g_gt.n_pi;
++    return g_gt.n_pi - 1;
++}
++static u32 ld_gt_pass_index(u32 target, u32 n_mrt, const u32* mrt, u32 zslot)
++{
++    ld_gt_passkey k; memset(&k, 0, sizeof k);
++    k.n_mrt = n_mrt;
++    for (u32 r = 0; r < n_mrt && r < 4; r++) {
++        const u32 t = mrt[r];
++        if (t >= MAX_SURFACES) continue;
++        k.loc[r] = g.surfaces[t].location; k.off[r] = g.surfaces[t].offset;
++        k.w[r] = g.surfaces[t].w; k.h[r] = g.surfaces[t].h; k.fmt[r] = (u32)g.surfaces[t].fmt;
++    }
++    (void)target;
++    if (zslot) {
++        const zdepth_t* z = &g.zdepths[zslot - 1];
++        k.loc[4] = z->location; k.off[4] = z->offset; k.w[4] = z->w; k.h[4] = z->h; k.fmt[4] = z->depth_format;
++    } else k.off[4] = 0xFFFFFFFFu;   /* the main zeta */
++    if (g_gt.last_pass < g_gt.n_pk && !memcmp(&g_gt.pk[g_gt.last_pass], &k, sizeof k)) return g_gt.last_pass;
++    for (u32 i = 0; i < g_gt.n_pk; i++)
++        if (!memcmp(&g_gt.pk[i], &k, sizeof k)) return g_gt.last_pass = i;
++    if (g_gt.n_pk >= LD_GT_PASSES) return LD_GT_PASSES - 1;
++    g_gt.pk[g_gt.n_pk] = k;
++    return g_gt.last_pass = g_gt.n_pk++;
++}
++static void ld_gt_draw(u32 target, u32 n_mrt, const u32* mrt, u32 zslot, u32 verts, u32 px, u32 ntex)
++{
++    if (g_gt.on <= 0) return;
++    ld_gt_begin();
++    const u32 pso = ld_gt_pso_index();
++    g_gt.pi[pso].ntex = ntex;
++    ld_gt_stamp(LD_GT_DRAW, ld_gt_pass_index(target, n_mrt, mrt, zslot), pso, verts, px);
++}
++/* Patch 2053's copy list: two stamps around its copies, same fence as the draw list that follows. */
++static void ld_gt_copy_stamp(ID3D12GraphicsCommandList* l, int second)
++{
++    if (g_gt.on <= 0) return;
++    if (!second) {
++        if (g_gt.head + 2 > LD_GT_RING) g_gt.head = 0;
++        g_gt.pend_c = g_gt.head; g_gt.head += 2;
++    }
++    if (g_gt.pend_c == 0xFFFFFFFFu) return;
++    l->lpVtbl->EndQuery(l, g_gt.heap, D3D12_QUERY_TYPE_TIMESTAMP, g_gt.pend_c + (u32)second);
++    if (second) l->lpVtbl->ResolveQueryData(l, g_gt.heap, D3D12_QUERY_TYPE_TIMESTAMP, g_gt.pend_c, 2, g_gt.rb, (u64)g_gt.pend_c * 8u);
++}
++/* Poller side: credit the intervals of one completed list. */
++static void ld_gt_consume(u32 first, u32 n, u32 c)
++{
++    if (c != 0xFFFFFFFFu) {
++        const u64 a = g_gt.rbmap[c], b = g_gt.rbmap[c + 1];
++        g_gt.kind[LD_GT_VBCOPY].ms += b >= a ? (double)(b - a) * 1000.0 / (double)g_gt.freq : 0.0;
++        g_gt.kind[LD_GT_VBCOPY].n++;
++    }
++    for (u32 i = 1; i < n; i++) {
++        const u64 a = g_gt.rbmap[first + i - 1], b = g_gt.rbmap[first + i];
++        const double ms = b >= a ? (double)(b - a) * 1000.0 / (double)g_gt.freq : 0.0;
++        const ld_gt_meta* m = &g_gt.meta[first + i];
++        ld_gt_acc* k = &g_gt.kind[m->kind < LD_GT_KINDS ? m->kind : 0];
++        k->ms += ms; k->n++;
++        if (m->kind == LD_GT_DRAW) {
++            ld_gt_acc* p = &g_gt.pass[m->pass < LD_GT_PASSES ? m->pass : 0];
++            ld_gt_acc* o = &g_gt.pso[m->pso < LD_GT_PSOS ? m->pso : 0];
++            p->ms += ms; p->n++; p->px += m->px; p->verts += m->verts;
++            o->ms += ms; o->n++; o->px += m->px; o->verts += m->verts;
++        }
++    }
++}
++static void ld_gt_report(unsigned secs, u32 frames)
++{
++    static const char* kn[LD_GT_KINDS] = {"start", "draw", "clear", "copy", "tail", "vbcopy-list"};
++    const double fr = frames ? (double)frames : 1.0;
++    char line[420]; int o = snprintf(line, sizeof line, "[perf-gt] t=%us frames %u dropped %llu", secs, frames, (unsigned long long)g_gt.dropped);
++    double tot = 0;
++    for (int k = 0; k < LD_GT_KINDS; k++) tot += g_gt.kind[k].ms;
++    o += snprintf(line + o, sizeof line - o, " gpu %.1f ms/frame (copy MB/frame %.1f):", tot / fr, g_gt.c_bytes / fr / 1048576.0);
++    for (int k = 1; k < LD_GT_KINDS; k++)
++        o += snprintf(line + o, sizeof line - o, " %s %.1f (%.0f/frame)", kn[k], g_gt.kind[k].ms / fr, (double)g_gt.kind[k].n / fr);
++    fprintf(stderr, "%s\n", line);
++    for (int rank = 0; rank < 8; rank++) {
++        int bi = -1; double bm = 0;
++        for (u32 i = 0; i < g_gt.n_pk && i < LD_GT_PASSES; i++) if (g_gt.pass[i].ms > bm) { bm = g_gt.pass[i].ms; bi = (int)i; }
++        if (bi < 0) break;
++        const ld_gt_passkey* k = &g_gt.pk[bi]; const ld_gt_acc* a = &g_gt.pass[bi];
++        char rt[160]; int q = snprintf(rt, sizeof rt, "rt0 %u:0x%X %ux%u fmt%u", k->loc[0], k->off[0], k->w[0], k->h[0], k->fmt[0]);
++        if (k->n_mrt > 1) q += snprintf(rt + q, sizeof rt - q, " +%u mrt (rt1 0x%X fmt%u)", k->n_mrt - 1, k->off[1], k->fmt[1]);
++        if (k->off[4] == 0xFFFFFFFFu) snprintf(rt + q, sizeof rt - q, " z main");
++        else snprintf(rt + q, sizeof rt - q, " z 0x%X %ux%u zf%u", k->off[4], k->w[4], k->h[4], k->fmt[4]);
++        fprintf(stderr, "[perf-gt-pass] t=%us #%d %.2f ms/frame draws %.0f/frame %.2f us/draw Mpx/frame %.2f kverts/frame %.1f | %s\n",
++                secs, bi, a->ms / fr, (double)a->n / fr, a->ms * 1000.0 / (double)a->n, a->px / fr / 1e6, a->verts / fr / 1e3, rt);
++        g_gt.pass[bi].ms = -g_gt.pass[bi].ms;   /* mark as printed */
++    }
++    for (u32 i = 0; i < g_gt.n_pk && i < LD_GT_PASSES; i++) if (g_gt.pass[i].ms < 0) g_gt.pass[i].ms = -g_gt.pass[i].ms;
++    for (int rank = 0; rank < 12; rank++) {
++        int bi = -1; double bm = 0;
++        for (u32 i = 0; i < g_gt.n_pi && i < LD_GT_PSOS; i++) if (g_gt.pso[i].ms > bm) { bm = g_gt.pso[i].ms; bi = (int)i; }
++        if (bi < 0) break;
++        const ld_gt_psoinfo* p = &g_gt.pi[bi]; const ld_gt_acc* a = &g_gt.pso[bi];
++        fprintf(stderr, "[perf-gt-pso] t=%us #%d key %08x %.2f ms/frame draws %.1f/frame %.1f us/draw Mpx/frame %.2f kverts/frame %.1f | fp %u:0x%X size %u vp %08x instrs %u ntex %u txl %X vtex %X in %X\n",
++                secs, bi, (unsigned)p->key, a->ms / fr, (double)a->n / fr, a->ms * 1000.0 / (double)a->n, a->px / fr / 1e6, a->verts / fr / 1e3,
++                p->fp_loc, p->fp_off, p->fp_size, (unsigned)p->vp_hash, p->vp_instrs, p->ntex, p->txl_mask, p->vtex_mask, p->input_mask);
++        g_gt.pso[bi].ms = -g_gt.pso[bi].ms;
++    }
++    for (u32 i = 0; i < g_gt.n_pi && i < LD_GT_PSOS; i++) if (g_gt.pso[i].ms < 0) g_gt.pso[i].ms = -g_gt.pso[i].ms;
++    g_gt.c_bytes = 0;
++    memset(g_gt.pass, 0, sizeof g_gt.pass); memset(g_gt.pso, 0, sizeof g_gt.pso); memset(g_gt.kind, 0, sizeof g_gt.kind);
++}
++static void ld_gt_init(void)
++{
++    g_gt.on = 0;
++    D3D12_QUERY_HEAP_DESC qd = {0}; qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qd.Count = LD_GT_RING;
++    if (FAILED(g.dev->lpVtbl->CreateQueryHeap(g.dev, &qd, &IID_ID3D12QueryHeap, (void**)&g_gt.heap))) {
++        fprintf(stderr, "[perf-gt] CreateQueryHeap failed\n"); return;
++    }
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC rd = {0};
++    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = (u64)LD_GT_RING * 8u; rd.Height = 1;
++    rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
++                                                      NULL, &IID_ID3D12Resource, (void**)&g_gt.rb))) {
++        fprintf(stderr, "[perf-gt] readback buffer failed\n"); return;
++    }
++    void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)LD_GT_RING * 8u};
++    if (FAILED(g_gt.rb->lpVtbl->Map(g_gt.rb, 0, &rr, &mp))) { fprintf(stderr, "[perf-gt] Map failed\n"); return; }
++    g_gt.rbmap = (const u64*)mp;
++    g.queue->lpVtbl->GetTimestampFrequency(g.queue, &g_gt.freq);
++    fprintf(stderr, "[perf-gt] GPU timestamps on: ring %u, freq %llu Hz\n", LD_GT_RING, (unsigned long long)g_gt.freq);
++    g_gt.on = 1;
++}
+ #define LD_GM_N 1024u
+ static struct { u64 v; long long t; } g_gm[LD_GM_N];
+ static int g_gm_on = -1;
+@@ -2282,6 +2486,7 @@
+             const double d = now > st ? (double)(now - st) * tk : 0.0;
+             busy += d; if (d > longest) longest = d;
+             lists++; prev = now;
++            if (g_gt.on > 0 && g_gt.fr[v & 1023].v == v) ld_gt_consume(g_gt.fr[v & 1023].first, g_gt.fr[v & 1023].n, g_gt.fr[v & 1023].c);
+         }
+         if (done > seen) seen = done;
+         if ((double)(now - win0) * tk >= 1000.0) {
+@@ -2298,6 +2503,7 @@
+                 fprintf(stderr, "%s\n", vl);
+             }
+             win0 = now; busy = longest = 0.0; lists = missed = 0;
++            if (g_gt.on > 0 && secs % 10u == 0) { static u32 fr0; ld_gt_report(secs, g_ld_frames - fr0); fr0 = g_ld_frames; }
+         }
+     }
+     return 0;
+@@ -2308,9 +2514,11 @@
+         const char* e = getenv("RSX_PERF_GPU");
+         g_gm_on = e && *e && *e != '0';
+         if (g_gm_on) rsx_vtx_prof_clock = rsx_perf_now;
++        if (g_gm_on && *e == '2') ld_gt_init();   /* patch 2052 */
+         if (g_gm_on) CreateThread(NULL, 0, ld_gm_thread, NULL, 0, NULL);
+     }
+     if (!g_gm_on) return;
++    if (g_gt.on > 0) { g_gt.fr[v & 1023].v = v; g_gt.fr[v & 1023].first = g_gt.pend_first; g_gt.fr[v & 1023].n = g_gt.pend_n; g_gt.fr[v & 1023].c = g_gt.pend_c; g_gt.pend_n = 0; g_gt.pend_c = 0xFFFFFFFFu; }   /* patch 2052 */
+     g_gm[v & (LD_GM_N - 1)].t = rsx_perf_now();
+     g_gm[v & (LD_GM_N - 1)].v = v;
+ }
+@@ -2329,6 +2537,7 @@
+     (void)reason;
+ #endif
+     ld_oq_close();   /* patch 2025: a query must end in the list it began in */
++    ld_gt_close();   /* patch 2052 */
+     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+     if (FAILED(close_hr)) {
+         fprintf(stderr,
+@@ -2370,7 +2579,7 @@
+         ld_fr_release_retired(nxt);
+         ld_fr_load(nxt);
+         g.alloc->lpVtbl->Reset(g.alloc);
+-        g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE();   /* patch 2045 */
++        g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE(); ld_gt_begin();   /* patches 2045, 2052 */
+         g.upload_used = 0;
+         g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
+         g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */ g.smp_ring_used = 0;
+@@ -2416,7 +2625,7 @@
+     ld_fr_release_retired(0);
+     ld_fr_release_retired(1);
+     g.alloc->lpVtbl->Reset(g.alloc);
+-    g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE();   /* patch 2045 */
++    g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE(); ld_gt_begin();   /* patches 2045, 2052 */
+     g.upload_used = 0;
+     ld_rb_drain();   /* patch 2027 */
+ #if defined(YZ_PERF_PROFILE)
+@@ -5054,6 +5263,7 @@
+     }
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+     ld_surface_note_write(slot, LD_SURFACE_WRITE_COPY);
++    ld_gt_other(LD_GT_COPY);   /* patch 2052 */
+     if (s_csv_file && s_csv_gate_open) {
+         fprintf(s_csv_file, "#resolve,%u,%u:0x%X,%u:0x%X,%u,%u,%ux%u\n", g_ld_frames,
+                 src_loc, src_abs, dst_loc, dst_abs, sx, sy, w, h);
+@@ -5120,6 +5330,7 @@
+     }
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+     ld_surface_note_write((u32)di, LD_SURFACE_WRITE_COPY);
++    ld_gt_other(LD_GT_COPY);   /* patch 2052 */
+     return 1;
+ }
+ 
+@@ -10677,6 +10888,7 @@
+ {
+     if (!g.ready || !g_ld_unsubmitted || g_oq.open) return;
+     LDW_T0(t0);
++    ld_gt_close();   /* patch 2052 */
+     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+     if (FAILED(close_hr)) {
+         fprintf(stderr, "[d3d-fail] command-list Close (chunk) hr=0x%08lX frame=%u\n",
+@@ -10698,7 +10910,7 @@
+         return;
+     }
+     ld_rb_stamp(v);   /* patch 2027: queued report copies complete with this fence */
+-    g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE();   /* patch 2045 */
++    g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE(); ld_gt_begin();   /* patches 2045, 2052 */
+     g_ld_unsubmitted = 0;
+     g_ld_chunk_submits++;
+     if (t0) { LDW_ADD(RSX_PERF_W_SUBMIT_T, t0); rsx_perf_add(RSX_PERF_W_CHUNK_N, 1); }
+@@ -11673,6 +11885,7 @@
+         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
+     }
+     ld_oq_after_draw(oq_pred);
++    if (g_gt.on > 0) ld_gt_draw(target, n_mrt, mrt, current_zslot, n_tri, sf.clip_w * sf.clip_h, (u32)__builtin_popcount(texture_mask));   /* patch 2052 */
+     LDW_ADD(RSX_PERF_W_D_REC_T, rec_t0);
+     LDW_T0(post_t0);   /* patch 2045 */
+     ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
+@@ -11875,6 +12088,7 @@
+           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
+         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, n_crect, n_crect ? &crect : NULL);
+         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
++        ld_gt_other(LD_GT_CLEAR);   /* patch 2052 */
+         if (target < MAX_SURFACES) { g.surfaces[target].colour_gen = ++g_ld_cw_gen; ld_cw_note(target, "clear", mask); }   /* patch 2044 */
+     }
+     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
+@@ -11915,6 +12129,7 @@
+             }
+             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
+                 clear_flags, cd, (UINT8)cs, n_crect, n_crect ? &crect : NULL);
++            ld_gt_other(LD_GT_CLEAR);   /* patch 2052 */
+         }
+         if (zslot) {
+             g.zdepths[zslot - 1].cleared = 1;

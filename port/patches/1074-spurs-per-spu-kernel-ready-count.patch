@@ -1,0 +1,562 @@
+KZ3 patch 1074 (SPU pass 58; DEFAULT ON since SPU pass 60 with 1062 + 1077, KZ3_SPURS_KERNEL=0 = the old poll
+kernel): the SPURS kernel
+as one host thread per SPU of the instance, running a workload only while it is wanted, from ps3recomp PR #213
+(libs/spurs/spurs_kernel.c, kselect) by NoahBPeterson (MIT). The selection rule and weight are his; the port keeps
+this runtime's policy-module runner (spu_run_policy_module, persistent PM contexts per (wid, spuNum)) and its
+lock-line stripes, and leaves out the system service, pending contention and the PPU helper threads.
+- Thread kt of an instance is SPU kt (spuNum = kt, nSpus threads). Between modules it selects under the instance
+  line's stripe lock (runtime/spu/spurs_kern_sched.h kz3_ksel): runnable (enabled, state 2, a module of this
+  instance), priority byte for this SPU != 0, contention < maxContention, and wanted (signal, flag, or
+  readyCount != 0 and readyCount + idleSpuCount > contention); weight = wanted, priority, last workload, below
+  minContention, fewer SPUs, same uniqueId, lowest wid. The pick's contention is raised and its signal taken; the
+  module runs on this thread as SPU kt until it returns to the kernel; contention is lowered.
+- Nothing wanted: the SPU sleeps on the instance's condition variable, woken by the ReadyCount imports, a PUTLLC
+  commit on the instance's lines 0-1, another SPU leaving a workload, RequestIdleSpu and cellSpursWakeUp, and
+  re-reads the instance at most 1 ms later for the guest's own inlined stores.
+- selectWorkload from a running module (LS 0x9D0) is answered by the same rule with the SPU's own unit left out
+  ({wid, status} in r3 words 0/1).
+- The ReadyCount imports update the instance byte under the stripe lock and return the instance's old value (the
+  WWS PM swaps its readyCount to 0 when its list runs dry and CASes it back, so the host copy was stale), and
+  cellSpursRequestIdleSpu(spurs, wid, count) sets idleSpuCount (it was a stub that dropped both arguments). Both
+  only with the per-SPU kernel (default; not with KZ3_SPURS_KERNEL=0).
+- KZ3_SPURS_IDLE_ADMIT=1 (experiment): idleSpuCount alone admits a workload on an idle SPU. KZ3_KERN_TRACE=n:
+  [spurs-ktrace] lines for the first n runs/polls per wid. [spurs-inst] every 10 s: the instance's ready and
+  contention bytes.
+Why it was opt-in until pass 60 (SPU pass 58, K4 recipe, the RE notes Pass 58; the cause, found in pass 60, was
+the PM argument layout fixed by patch 1077: every PM entry PUT FFFF over the list, the RE notes Pass 60): with 5/1 (KZ3_SPURS_ATTR_SDK=1) the boot stalls at
+~9-12 s (runs spu-58-gate/-gate2/-gate3/-diag/-diag2): the PPU kicks jm_generic (wid 8, readyCount 8), five SPUs
+take it, one runs the only claimable job while the other four find the next job blocked and drain the ready count
+to 0 (PM 0x3040), the running PM's next poll is answered "switch" (ready 0), and no job completion re-kicks wid 8:
+the list strands and the main thread waits at 0x307148 forever. The old kernel's cadence runs hide this. With
+idle admission the SPUs churn on wid 7 instead (14 flips). Host test tools/spu/test_spurs_kern.sh.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 8fd7b438..e1bd1712 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -15,6 +15,7 @@
+ #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+ #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
+ #include "kz3_spurs_attr.h" /* KZ3 patch 1062: the internal AttributeInitialize signature */
++#include "../../runtime/spu/spurs_kern_sched.h" /* KZ3 patch 1074: per-SPU kernel selection (from PR #213) */
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+ #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
+ #include "../../runtime/ppu/ppu_context.h"  /* g_active_ctx: 9th argument on the guest stack */
+@@ -109,8 +110,10 @@ static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
+  * on its SPU task once or twice per 5.3 ms audio block, fell behind, and
+  * GH3's songs played ~60% silence (heard as static). */
+ static volatile long s_ef_ppu_waiters;
++static void kz3_kern_line_committed(uint32_t line);   /* KZ3 patch 1074 */
+ static void ef_line_committed(uint32_t line)
+ {
++    kz3_kern_line_committed(line);   /* KZ3 patch 1074: idle SPUs re-read the instance */
+     if (!s_ef_ppu_waiters) return;
+     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
+         EventFlagSync* s = &s_ef_sync[i];
+@@ -469,6 +472,31 @@ static volatile long s_kz3_ready_calls[3][CELL_SPURS_MAX_WORKLOAD], s_kz3_ready_
+ static volatile int s_run_join[MAX_SPURS_INST][KZ3_KT_MAX];
+ /* kz3-spurs-runstate end */
+ static struct { struct SpursInst* si; int k; } s_kt_arg[MAX_SPURS_INST][8];
++/* KZ3 patch 1074: the SPURS kernel as one host thread per SPU of the instance (spuNum = thread index) that runs a
++ * workload only while it is wanted (readyCount > contention, a signal, the flag), with the selection rule of
++ * runtime/spu/spurs_kern_sched.h (ported from ps3recomp PR #213, NoahBPeterson). DEFAULT ON since SPU pass 60
++ * (the round-58 boot strand was the PM argument layout, patch 1077); KZ3_SPURS_KERNEL=0 restores the
++ * old poll kernel (every enabled workload on an idle cadence, maxContention lanes per run, one
++ * ready unit consumed per pass), which with the game's real 5/1 SPUs (1062) spins (spu rounds 47-48). */
++static int kz3_kern_old(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_SPURS_KERNEL"); v = (e && *e == '0') ? 1 : 0; }
++    return v;
++}
++static kz3_kwake s_kz3_kw[MAX_SPURS_INST];
++static volatile long s_kz3_kw_init[MAX_SPURS_INST];
++static void kz3_kern_wake_ea(u32 ea)
++{
++    for (int j = 0; j < MAX_SPURS_INST; j++) if (s_inst[j].ea == ea && s_kz3_kw_init[j]) kz3_kwake_signal(&s_kz3_kw[j]);
++}
++static void kz3_kern_line_committed(uint32_t line)
++{
++    for (int j = 0; j < MAX_SPURS_INST; j++) {
++        const u32 ea = s_inst[j].ea;
++        if (ea && s_kz3_kw_init[j] && line - ea < 0x100u) kz3_kwake_signal(&s_kz3_kw[j]);   /* lines 0-1 */
++    }
++}
+ /* One kernel thread at a time per workload (patch 1006): the persistent PM
+  * contexts are per (workload, lane), and a lane must not run twice at once. */
+ static volatile long s_wkl_busy[CELL_SPURS_MAX_WORKLOAD];
+@@ -560,6 +588,15 @@ static void kz3_lanes_report(unsigned long long t_s)
+     }
+     fprintf(stderr, "[spurs-lanes] t=%llus%s (dispatches by ready count before the pass / by lanes run)%s\n", t_s,
+             o ? line : " none", kz3_lanes_ready_on() ? " [KZ3_SPURS_LANES_READY]" : "");
++    /* KZ3 patch 1074: per instance, the scheduling bytes now: readyCount, contention, signal, enabled (hex). */
++    if (!kz3_kern_old())
++        for (int j = 0; j < MAX_SPURS_INST; j++) {
++            const u32 ea = s_inst[j].ea; if (!ea) continue;
++            const u8* S = vm_base + ea; char r[40], c[40];
++            for (int i = 0; i < 16; i++) { snprintf(r + 2 * i, 3, "%02X", S[SPURS_WKL_READY1 + i]); snprintf(c + 2 * i, 3, "%02X", S[SPURS_WKL_CURCONT + i]); }
++            fprintf(stderr, "[spurs-inst] t=%llus \"%s\" ready=%s cont=%s sig=%02X%02X enabled=%08X\n", t_s, s_inst[j].prefix, r, c,
++                    S[SPURS_WKL_SIGNAL1], S[SPURS_WKL_SIGNAL1 + 1], vm_read32(ea + SPURS_WKL_ENABLED));
++        }
+ }
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+ /* KZ3 patch 1057 (SPU pass 39): called by the kernel thread when a workload's policy-module run starts (end 0,
+@@ -597,6 +634,14 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+     memset(vm_base + spurs_ea, 0, SPURS_INST_SIZE);
+     *(vm_base + spurs_ea + SPURS_NSPUS) = (u8)si->nspus;
+     vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
++    /* KZ3 patch 1074: the workload flag's receiver byte (+0x77) = 0xFF, none (the memset left wid 0). */
++    if (!kz3_kern_old()) {
++        *(vm_base + spurs_ea + KZ3_K_FLAG_RCV) = 0xFF;
++        const int j = (int)(si - s_inst);
++        if (!s_kz3_kw_init[j]) { kz3_kwake_init(&s_kz3_kw[j]); s_kz3_kw_init[j] = 1; }
++        extern void (*g_spu_line_commit_hook)(uint32_t);
++        g_spu_line_commit_hook = ef_line_committed;   /* forwards instance-line commits to kz3_kern_line_committed */
++    }
+ 
+     if (!si->kernel_live) {
+         si->kernel_live = 1;
+@@ -613,6 +658,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+          * single poll thread. SPU pass 21: level 0.83 vs 0.34 flips/s with busy no-sleep (the RE notes). */
+         int n = 8;
+         { const char* e = getenv("KZ3_SPURS_THREADS"); if (e) n = atoi(e); }
++        /* KZ3 patch 1074: the per-SPU kernel has one thread per SPU (spuNum = thread index); KZ3_SPURS_THREADS
++         * still lowers it. */
+         if (n < 1) n = 1;
+         if (n > (int)si->nspus) n = (int)si->nspus;
+         if (n > 8) n = 8;
+@@ -2141,6 +2188,133 @@ static DWORD WINAPI kz3_lane_thread(LPVOID p)
+     return 0;
+ }
+ 
++/* KZ3 patch 1074: one SPU of the instance (spuNum = kt). Between modules it selects a workload under the instance
++ * line's stripe lock (kz3_ksel: contention raised, signal taken), runs that workload's policy module on this thread
++ * as SPU kt until the module returns to the kernel, then leaves it (contention lowered) and selects again. Nothing
++ * wanted: it sleeps until the runtime sees the instance change (kz3_kwake) or at most 1 ms (the guest's own
++ * inlined stores to the instance). The module's own selectWorkload polls are answered by kz3_kern_poll below. */
++/* KZ3_KERN_TRACE=n (diagnostic, default 0): the first n module runs and n selectWorkload answers per wid, as
++ * [spurs-ktrace] lines: SPU, ready count at the pick / after the run, contention, the PM's AllocateJob result
++ * (LS 0x1440), its saved ready count (LS 0x1510), the polls of the run and its length. */
++static int kz3_ktrace_n(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_KERN_TRACE"); v = e ? atoi(e) : 0; if (v < 0) v = 0; }
++    return v;
++}
++static volatile long s_kz3_ktr_run[CELL_SPURS_MAX_WORKLOAD], s_kz3_ktr_poll[CELL_SPURS_MAX_WORKLOAD];
++/* KZ3_SPURS_IDLE_ADMIT=1 (experiment, off by default = PR #213's rule): idleSpuCount alone admits a workload on an
++ * idle SPU (spurs_kern_sched.h). SPU pass 58 run spu-58-gate3: worse, the SPUs churned on wid 7 (44.8 M picks in
++ * 190 s, the "last workload" weight keeps re-picking it), 14 flips. */
++static int kz3_idle_admits(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_SPURS_IDLE_ADMIT"); v = (e && *e == '1') ? 1 : 0; }
++    return v;
++}
++static u16 kz3_kern_mine(u32 ea)
++{
++    u16 m = 0;
++    for (u32 w = 0; w < 16; w++)
++        if (s_workloads[w].in_use && s_workloads[w].spurs_ea == ea && s_wkl_pm[w].resolved >= 0) m |= (u16)(0x8000u >> w);
++    return m;
++}
++static void kz3_spu_loop(struct SpursInst* si, int kt, int pm_off)
++{
++    const int j = (int)(si - s_inst);
++    u32 cur = KZ3_KSEL_NONE;
++    int idle_rest = 0;
++    static uint64_t s_wa_wend[CELL_SPURS_MAX_WORKLOAD];
++    for (;;) {
++        const u32 ea = si->ea;
++        if (!ea || pm_off) { Sleep(1); continue; }
++        const uint32_t gen = kz3_kwake_gen(&s_kz3_kw[j]);
++        const u16 mine = kz3_kern_mine(ea);
++        /* An idle-admitted run that found nothing (no poll) leaves this SPU idle until the instance changes or 1 ms:
++         * the next pass may admit idle requests again only after that. */
++        const int idle_ok = kz3_idle_admits() && !idle_rest;
++        idle_rest = 0;
++        uint8_t* S = vm_base + ea;
++        const uint64_t llm = spu_ll_mask(ea, 128);
++        uint32_t st = 0;
++        spu_ll_lock_mask(llm);
++        const u32 sel = kz3_ksel(S, mine, (uint32_t)kt, cur, 0, idle_ok, &st);
++        const u8 rc = sel < 16 ? S[SPURS_WKL_READY1 + sel] : 0;
++        const u8 cont = sel < 16 ? S[SPURS_WKL_CURCONT + sel] : 0;
++        if (sel < 16) spu_coh_notify_write(ea);
++        spu_ll_unlock_mask(llm);
++        if (sel >= 16) {
++            const uint64_t wa0 = kz3_wacct_begin();
++            kz3_kwake_wait(&s_kz3_kw[j], gen, 1);
++            kz3_wacct_end(KZ3_WA_KSLEEP, 0, wa0);
++            continue;
++        }
++        s_kz3_lanes_rc[sel][rc > 7 ? 7 : rc]++;          /* patch 1064's histogram: ready count at the pick */
++        s_kz3_lanes_n[sel][cont > 7 ? 7 : cont]++;       /* ... and the workload's contention with this SPU */
++        WklPm* r = spurs_resolve_pm(sel);
++        if (r) {
++            const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[sel].pm;
++            const uint64_t arg = vm_read64(ea + SPURS_WKL_INFO1 + sel * SPURS_WKL_INFO_SZ + 8);
++            if (g_kz3_pm_run_hook) g_kz3_pm_run_hook(ea, sel, 0);   /* KZ3 patch 1057 */
++            s_run_wid[j][kt & 7] = sel; s_run_t0[j][kt & 7] = GetTickCount64();   /* patch 1011/1047 */
++            const uint64_t wa0 = kz3_wacct_begin();
++            if (wa0 && s_wa_wend[sel]) kz3_wacct_note(KZ3_WA_KGAP, sel, wa0 - s_wa_wend[sel]);
++            const uint64_t kt0 = GetTickCount64();
++            spu_run_policy_module(r->fn, r->image_id, pm, s_workloads[sel].sizePm, arg, sel, ea, (uint32_t)kt);
++            { extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
++              if (st == 0 && rc == 0 && g_spurs_pm_polls == 0) idle_rest = 1; }
++            if (kz3_ktrace_n() && __atomic_add_fetch(&s_kz3_ktr_run[sel], 1, __ATOMIC_RELAXED) <= kz3_ktrace_n()) {
++                extern void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num);
++                extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
++                const spu_context* pc = (const spu_context*)spu_pm_ctx_peek(sel, (uint32_t)kt);
++                const uint8_t* L = pc ? pc->ls : NULL;
++                fprintf(stderr, "[spurs-ktrace] run wid=%u spu=%d t=%llu ms ready %u->%u cont=%u st=%u polls=%u len=%llu ms"
++                        " LS1440=%02X%02X%02X%02X LS1510=%02X%02X%02X%02X pc=0x%05X\n", sel, kt,
++                        (unsigned long long)kt0, rc, S[SPURS_WKL_READY1 + sel], S[SPURS_WKL_CURCONT + sel], st, g_spurs_pm_polls,
++                        (unsigned long long)(GetTickCount64() - kt0),
++                        L ? L[0x1440] : 0, L ? L[0x1441] : 0, L ? L[0x1442] : 0, L ? L[0x1443] : 0,
++                        L ? L[0x1510] : 0, L ? L[0x1511] : 0, L ? L[0x1512] : 0, L ? L[0x1513] : 0, pc ? (unsigned)(pc->pc & SPU_LS_MASK) : 0);
++            }
++            kz3_wacct_job(0);
++            kz3_wacct_end(KZ3_WA_PMRUN, sel, wa0);
++            if (wa0) s_wa_wend[sel] = kz3_wacct_now();
++            s_run_t0[j][kt & 7] = 0;
++        }
++        spu_ll_lock_mask(llm);
++        kz3_kleave(S, sel);
++        spu_coh_notify_write(ea);
++        spu_ll_unlock_mask(llm);
++        if (r && g_kz3_pm_run_hook) g_kz3_pm_run_hook(ea, sel, 1);
++        kz3_kwake_signal(&s_kz3_kw[j]);   /* contention fell: an idle SPU may now qualify for it */
++        cur = sel;
++    }
++}
++/* KZ3 patch 1074: cellSpursModulePoll / selectWorkload from a running module (the LS 0x9D0 intercept,
++ * spu_channels.c): the kernel's selection for this SPU with its own unit left out; returns the wid (cur = keep
++ * running) and *status, or -1 when the old kernel is on (the intercept then answers as before). */
++static int kz3_kern_poll(uint32_t ea, uint32_t spu_num, uint32_t cur, uint32_t* status)
++{
++    if (kz3_kern_old()) return -1;
++    struct SpursInst* si = spurs_inst_find(ea);
++    if (!si || !ea) return -1;
++    uint8_t* S = vm_base + ea;
++    const uint64_t llm = spu_ll_mask(ea, 128);
++    spu_ll_lock_mask(llm);
++    const u8 sig0 = S[SPURS_WKL_SIGNAL1], sig1 = S[SPURS_WKL_SIGNAL1 + 1];
++    const u32 sel = kz3_ksel(S, kz3_kern_mine(ea), spu_num, cur, 1, kz3_idle_admits(), status);
++    if (S[SPURS_WKL_SIGNAL1] != sig0 || S[SPURS_WKL_SIGNAL1 + 1] != sig1) spu_coh_notify_write(ea);
++    const u8 krc = cur < 16 ? S[SPURS_WKL_READY1 + cur] : 0, kcont = cur < 16 ? S[SPURS_WKL_CURCONT + cur] : 0;
++    spu_ll_unlock_mask(llm);
++    if (kz3_ktrace_n() && cur < 16 && __atomic_add_fetch(&s_kz3_ktr_poll[cur], 1, __ATOMIC_RELAXED) <= kz3_ktrace_n())
++        fprintf(stderr, "[spurs-ktrace] poll wid=%u spu=%u ready=%u cont=%u -> %u st=%u\n", cur, spu_num, krc, kcont, sel, *status);
++    return (int)sel;
++}
++__attribute__((constructor)) static void kz3_kern_poll_init(void)
++{
++    extern int (*g_kz3_spurs_kpoll)(uint32_t, uint32_t, uint32_t, uint32_t*);
++    g_kz3_spurs_kpoll = kz3_kern_poll;
++}
++
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ {
+ #ifdef _WIN32
+@@ -2156,6 +2330,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+             si->prefix, kt + 1, si->nthreads, si->ea, s_pm_off ? "DISABLED (PS3_NO_SPURS_PM)" : "enabled");
+     fflush(stderr);
+     if (kz3_wacct_on()) { char nm[40]; snprintf(nm, sizeof nm, "spurs-kern%d:%s", kt, si->prefix); kz3_wacct_name(nm); }
++    if (!kz3_kern_old()) { kz3_spu_loop(si, kt, (int)s_pm_off); return 0; }   /* KZ3 patch 1074 */
+ 
+     /* Instance change detector (SPURS_KERN_WATCH=1).
+      *
+@@ -2458,12 +2633,35 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+     }
+ }
+ 
++/* KZ3 patch 1074: the ReadyCount imports as atomic updates of the instance byte, the value the kernel and the
++ * policy modules use. The WWS job-manager PM swaps its own readyCount to 0 when its list runs dry and CASes it back
++ * (SPU-side cellSpursReadyCountSwap/CompareAndSwap at PM LS 0x3868/0x37C0, GETLLAR/PUTLLC on the instance line), so
++ * the host copy (s_workloads[].readyCount) the old imports returned and compared against goes stale; and a plain byte
++ * store between the PM's GETLLAR and PUTLLC compare was lost. Here: the byte is read and written under the line's
++ * stripe lock, peer reservations are broken, the host copy follows, and idle SPUs are woken. mode 0 store, 1 swap,
++ * 2 compare-and-swap; returns the old byte. */
++static u32 kz3_ready_update(u32 ea, u32 wid, int mode, u32 compare, u32 value)
++{
++    const uint64_t m = spu_ll_mask(ea, 128);
++    spu_ll_lock_mask(m);
++    volatile u8* b = vm_base + ea + SPURS_WKL_READY1 + wid;
++    const u8 old = *b;
++    const int wr = mode != 2 || old == (u8)compare;
++    if (wr) *b = (u8)value;
++    s_kz3_ready_calls[mode][wid]++; if (wr && old != (u8)value) s_kz3_ready_chg[mode][wid]++;   /* patch 1049 */
++    if (wr) { s_workloads[wid].readyCount = value; spu_coh_notify_write(ea); }
++    spu_ll_unlock_mask(m);
++    if (wr) kz3_kern_wake_ea(ea);
++    return old;
++}
++
+ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
+                              u32 value)
+ {
+     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
++    if (!kz3_kern_old()) { (void)kz3_ready_update((u32)(uintptr_t)spurs, wid, 0, 0, value); return CELL_OK; }   /* KZ3 patch 1074 */
+ 
+     s_workloads[wid].readyCount = value;
+     /* The real store: the instance byte the kernel (poll thread) watches. */
+@@ -2484,6 +2682,8 @@ s32 cellSpursReadyCountSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
+     if (!spurs || !old) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
++    if (!kz3_kern_old()) {   /* KZ3 patch 1074 */
++        vm_write32((u32)(uintptr_t)old, kz3_ready_update((u32)(uintptr_t)spurs, wid, 1, 0, value)); return CELL_OK; }
+ 
+     vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
+     s_workloads[wid].readyCount = value;
+@@ -2534,6 +2734,8 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
+     if (!spurs || !old) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
++    if (!kz3_kern_old()) {   /* KZ3 patch 1074 */
++        vm_write32((u32)(uintptr_t)old, kz3_ready_update((u32)(uintptr_t)spurs, wid, 2, compare, value)); return CELL_OK; }
+ 
+     vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
+     if (s_workloads[wid].readyCount == compare) {
+@@ -2569,6 +2771,8 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
+      * are common -- the guest calls it whenever it adds work) does not spawn
+      * another copy. */
+     const uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
++    /* KZ3 patch 1074: the per-SPU kernel runs every workload itself; WakeUp wakes its idle SPUs. */
++    if (!kz3_kern_old()) { kz3_kern_wake_ea(spurs_ea); return CELL_OK; }
+     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
+         SpursWorkload* w = &s_workloads[i];
+         if (!w->in_use || w->started || w->spurs_ea != spurs_ea) continue;
+@@ -3749,10 +3953,23 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
+  * Misc SPURS surface the title links (logged CELL_OK stubs).
+  * =====================================================================*/
+ 
+-s32 cellSpursRequestIdleSpu(u64 spurs_ea)
++/* KZ3 patch 1074: (spurs, wid, spuCount) as in PR #213 (NoahBPeterson): the workload's idleSpuCount byte (+0x10+wid),
++ * which the per-SPU kernel's selection reads; was a stub that dropped both arguments. KZ3 asks 7 for every job
++ * manager (0xA78964 / 0xA78A4C, after AddWorkload). */
++s32 cellSpursRequestIdleSpu(u64 spurs_ea, u32 wid, u32 count)
+ {
+     static int _n = 0;
+-    if (PS3_LOG_FIRST(_n, 4)) printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X)\n", (u32)spurs_ea);
++    if (PS3_LOG_FIRST(_n, 16)) printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X wid=%u count=%u)\n", (u32)spurs_ea, wid, count);
++    if (kz3_kern_old()) return CELL_OK;
++    const u32 ea = (u32)spurs_ea;
++    if (!ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
++    if (wid >= 16 || !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) return CELL_SPURS_CORE_ERROR_INVAL;
++    const uint64_t m = spu_ll_mask(ea, 128);
++    spu_ll_lock_mask(m);
++    *(vm_base + ea + SPURS_WKL_IDLE2 + wid) = (u8)count;
++    spu_coh_notify_write(ea);
++    spu_ll_unlock_mask(m);
++    kz3_kern_wake_ea(ea);
+     return CELL_OK;
+ }
+ 
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 64ab606c..82f99dfd 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -184,6 +184,9 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+ /* KZ3 patch 1051 (SPU pass 35): called after every committed PUTLLC with the line EA (the DMA put hook above
+  * never sees atomics); the culling probe (port/spu/kz3_cull_probe.c) watches the frame's sync word with it. */
+ void (*g_kz3_putllc_hook)(uint32_t ea) = 0;
++/* KZ3 patch 1074: the per-SPU kernel's answer to selectWorkload (libs/spurs/cellSpurs.c kz3_kern_poll): (spurs ea,
++ * spuNum, wklCurrentId, &status) -> wid, or -1 = not this kernel. */
++int (*g_kz3_spurs_kpoll)(uint32_t, uint32_t, uint32_t, uint32_t*) = 0;
+ 
+ /* KZ3 patch 1067: end a task cut off by cellSpursJoinTaskset from inside its WAIT_SIGNAL: back to
+  * spu_run_with_halt like a halt, without the halt's register dump; spu_async_run then runs the task's exit (which
+@@ -2957,6 +2960,22 @@ void spu_indirect_branch(spu_context* ctx)
+                   ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                   return;
+               } }
++            /* KZ3 patch 1074: the per-SPU kernel answers {wid, poll status} in r3's words 0 and 1 (the WWS PM's
++             * wrapper 0x3678 compares word 0 with wklCurrentId and stores word 1, the status, at LS 0x1520). */
++            if (g_kz3_spurs_kpoll) {
++                const uint8_t* kls = ctx->ls; uint32_t kst = 0;
++                const int ksel = g_kz3_spurs_kpoll(
++                    (uint32_t)kls[0x1C4] << 24 | (uint32_t)kls[0x1C5] << 16 | (uint32_t)kls[0x1C6] << 8 | kls[0x1C7],
++                    (uint32_t)kls[0x1C8] << 24 | (uint32_t)kls[0x1C9] << 16 | (uint32_t)kls[0x1CA] << 8 | kls[0x1CB],
++                    (uint32_t)kls[0x1DC] << 24 | (uint32_t)kls[0x1DD] << 16 | (uint32_t)kls[0x1DE] << 8 | kls[0x1DF], &kst);
++                if (ksel >= 0) {
++                    ++g_spurs_pm_polls;
++                    ctx->gpr[3] = spu_make_preferred_u32((uint32_t)ksel);
++                    ctx->gpr[3]._u32[1] = kst;
++                    ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++                    return;
++                }
++            }
+             /* KZ3 patch 1058 (RE pass 86): the WWS job-manager PM compares this answer with wklCurrentId (LS 0x1DC)
+              * and stops after the job in flight when they differ; the old constant 0 below differed for every
+              * wid != 0, so each job manager ran one job per kernel run. Answer the current id unless the port's
+diff --git a/runtime/spu/spurs_kern_sched.h b/runtime/spu/spurs_kern_sched.h
+new file mode 100644
+index 00000000..b9686c14
+--- /dev/null
++++ b/runtime/spu/spurs_kern_sched.h
+@@ -0,0 +1,159 @@
++/* KZ3 patch 1074: the SPURS kernel's workload selection and the idle SPUs' wake, for the per-SPU kernel threads of
++ * libs/spurs/cellSpurs.c (kz3_spu_loop) and the selectWorkload answer to a running policy module (kz3_kern_poll).
++ *
++ * The selection rule and its weight are ported from ps3recomp PR #213 (libs/spurs/spurs_kernel.c, kselect) by
++ * NoahBPeterson (MIT), which models the SPURS1 kernel checked against firmware libsre under RPCS3. Adapted to this
++ * runtime: the instance is read and updated by the caller under the instance line's lock-line stripe (the PM's own
++ * GETLLAR/PUTLLC on the same line then fail and retry, as on hardware), the system service is not modelled (no
++ * workload qualifies = idle), and pending contention (the poll's switch bookkeeping) is not kept.
++ *
++ * A workload qualifies on SPU n when it is runnable (enabled, state 2, a module of this instance), its priority byte
++ * for SPU n (wklInfo +0x18+n) is not 0, its current contention is below maxContention, and it is wanted: signalled,
++ * the workload flag's receiver with the flag at 0, or readyCount != 0 and readyCount + idleSpuCount > contention.
++ * idle_admits (KZ3 pass 58, ASSUMPTION, see below): idleSpuCount > contention alone also qualifies, below every
++ * wanted workload (no "wanted" weight bit). Nothing else ever runs: a workload nobody signalled ready keeps no SPU (the port's old kernel ran every enabled
++ * workload on an idle cadence with maxContention lanes, which with the game's real 5/1 SPUs spun 25 host threads).
++ * Weight, most significant first: wanted (signal, flag, readyCount > contention), the SPU's priority (0x10 - p), is
++ * the workload this SPU ran last, below its minimum contention, fewer SPUs on it, same module uniqueId; ties go to
++ * the lowest wid. Pure C on a byte image of the instance, so tools/spu/test_spurs_kern.sh checks it on the host. */
++/* idle_admits: PR #213's rule (and the RPCS3 kernel it was checked against) needs readyCount != 0, idleSpuCount
++ * only adds SPUs to a workload that has a ready count. KZ3 calls cellSpursRequestIdleSpu(wid, 7) for every job
++ * manager while its kicks already ask for 8 SPUs (above maxContention 5), which would make the request a no-op; and
++ * with readyCount-only admission its first jm_generic list strands at boot (SPU pass 58: the PMs drain the ready
++ * count to 0 while one job runs, the running PM is then told to switch, nothing kicks again). ASSUMPTION tested
++ * (KZ3_SPURS_IDLE_ADMIT=1): an idle SPU (no wanted workload) runs a workload that requested idle SPUs, up to that
++ * count. Run spu-58-gate3 with it: worse (14 flips), so it stays an opt-in experiment. */
++#ifndef SPURS_KERN_SCHED_H
++#define SPURS_KERN_SCHED_H
++#include <stdint.h>
++
++#define KZ3_KSEL_NONE      0x20u   /* no workload: the SPU idles (SPURS_SYS_SERVICE_WID in the firmware) */
++#define KZ3_POLL_READY     1u      /* poll status: readyCount > contention */
++#define KZ3_POLL_SIGNAL    2u
++#define KZ3_POLL_FLAG      4u
++
++enum {
++    KZ3_K_READY1 = 0x00, KZ3_K_IDLE2 = 0x10, KZ3_K_CURCONT = 0x20, KZ3_K_MINCONT = 0x40, KZ3_K_MAXCONT = 0x50,
++    KZ3_K_FLAG = 0x60 /* be u32 flag at +0x0C */, KZ3_K_SIGNAL1 = 0x70 /* be u16, bit 15-wid */,
++    KZ3_K_FLAG_RCV = 0x77, KZ3_K_STATE1 = 0x80, KZ3_K_ENABLED = 0xB0, KZ3_K_INFO1 = 0xB00, KZ3_K_INFO_SZ = 0x20,
++};
++
++static inline uint32_t kz3_k_be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++
++/* Workloads runnable on this instance: `mine` (host table: a module added to this instance) & enabled & state 2. */
++static inline uint16_t kz3_k_runnable(const uint8_t* S, uint16_t mine)
++{
++    const uint16_t en = (uint16_t)(kz3_k_be32(S + KZ3_K_ENABLED) >> 16);
++    uint16_t r = 0;
++    for (uint32_t i = 0; i < 16; i++)
++        if ((mine & en & (0x8000u >> i)) && S[KZ3_K_STATE1 + i] == 2) r |= (uint16_t)(0x8000u >> i);
++    return r;
++}
++
++/* Select a workload for SPU spu_num. S = the instance (big-endian bytes). cur = the workload this SPU ran last
++ * (kernel select) or runs now (poll), KZ3_KSEL_NONE if none. poll = 0: the kernel between modules: the pick's
++ * contention is raised and its signal taken. poll = 1: a running module asks (cellSpursModulePoll): this SPU's own
++ * unit is left out of cur's contention, nothing is written except the signal when the answer is cur. The caller
++ * holds the instance line's stripe lock. Returns the wid or KZ3_KSEL_NONE; *status = KZ3_POLL_* of the pick. */
++static inline uint32_t kz3_ksel(uint8_t* S, uint16_t mine, uint32_t spu_num, uint32_t cur, int poll, int idle_admits,
++                                uint32_t* status)
++{
++    const uint16_t runnable = kz3_k_runnable(S, mine);
++    const uint16_t sig = (uint16_t)(S[KZ3_K_SIGNAL1] << 8 | S[KZ3_K_SIGNAL1 + 1]);
++    const uint32_t flag = kz3_k_be32(S + KZ3_K_FLAG + 0x0C);
++    const uint8_t rcv = S[KZ3_K_FLAG_RCV];
++    const uint8_t cur_uid = cur < 16 ? S[KZ3_K_INFO1 + cur * KZ3_K_INFO_SZ + 0x14] : 0xFF;
++    uint32_t sel = KZ3_KSEL_NONE, st = 0, best = 0;
++    for (uint32_t i = 0; i < 16; i++) {
++        if (!(runnable & (0x8000u >> i))) continue;
++        const uint8_t* info = S + KZ3_K_INFO1 + i * KZ3_K_INFO_SZ;
++        const uint8_t p = spu_num < 8 ? info[0x18 + spu_num] : 0;
++        if (!p) continue;
++        uint32_t cont = S[KZ3_K_CURCONT + i];
++        if (poll && i == cur && cont) cont--;                     /* this SPU's own unit */
++        if (S[KZ3_K_MAXCONT + i] <= cont) continue;
++        const uint32_t ready = S[KZ3_K_READY1 + i] > 8 ? 8u : S[KZ3_K_READY1 + i];
++        const uint32_t idle = S[KZ3_K_IDLE2 + i] > 8 ? 8u : S[KZ3_K_IDLE2 + i];
++        const int wsig = (sig & (0x8000u >> i)) != 0;
++        const int wflag = flag == 0 && rcv == i;
++        if (!(wflag || wsig || (ready && ready + idle > cont) || (idle_admits && idle > cont))) continue;
++        uint32_t w = (wflag || wsig || ready > cont) ? 0x8000u : 0;
++        w |= (uint32_t)((0x10u - (p > 0x0F ? 0x0F : p)) & 0x7F) << 8;
++        w |= i == cur ? 0x80u : 0;
++        w |= (cont > 0 && S[KZ3_K_MINCONT + i] > cont) ? 0x40u : 0;
++        w |= (uint32_t)((8u - (cont > 8 ? 8u : cont)) & 0x0F) << 2;
++        w |= info[0x14] == cur_uid ? 0x02u : 0;
++        w |= 1;
++        if (w > best) {
++            best = w; sel = i;
++            st = (ready > cont ? KZ3_POLL_READY : 0) | (wsig ? KZ3_POLL_SIGNAL : 0) | (wflag ? KZ3_POLL_FLAG : 0);
++        }
++    }
++    if (sel < 16 && (!poll || sel == cur)) {
++        S[KZ3_K_SIGNAL1 + (sel >> 3)] &= (uint8_t)~(0x80u >> (sel & 7));   /* this SPU takes the signal */
++        if (sel == rcv && flag == 0) { S[KZ3_K_FLAG + 0x0C] = S[KZ3_K_FLAG + 0x0D] = S[KZ3_K_FLAG + 0x0E] = S[KZ3_K_FLAG + 0x0F] = 0xFF; }
++    }
++    if (sel < 16 && !poll) S[KZ3_K_CURCONT + sel]++;
++    if (status) *status = st;
++    return sel;
++}
++
++/* The SPU leaves workload wid (its module returned to the kernel). Caller holds the stripe lock. */
++static inline void kz3_kleave(uint8_t* S, uint32_t wid)
++{
++    if (wid < 16 && S[KZ3_K_CURCONT + wid]) S[KZ3_K_CURCONT + wid]--;
++}
++
++/* Idle SPUs of one instance. A real idle SPU waits for its reservation on the instance line to be lost; here an
++ * idle kernel thread sleeps on a condition variable woken by everything the runtime sees change the instance (the
++ * ReadyCount imports, a PUTLLC on an instance line, another SPU leaving a workload, cellSpursWakeUp), and re-reads
++ * the instance at most `ms` later for the guest's own plain stores (PPU code updates readyCount and the signal bits
++ * with inlined lwarx/stwcx., which do not pass through the runtime). gen is read before the instance is evaluated,
++ * so a wake between the evaluation and the wait is never lost. */
++#ifdef _WIN32
++#include <windows.h>
++typedef struct { SRWLOCK lk; CONDITION_VARIABLE cv; volatile LONG gen; } kz3_kwake;
++static inline void kz3_kwake_init(kz3_kwake* w) { InitializeSRWLock(&w->lk); InitializeConditionVariable(&w->cv); w->gen = 0; }
++static inline uint32_t kz3_kwake_gen(kz3_kwake* w) { return (uint32_t)__atomic_load_n(&w->gen, __ATOMIC_ACQUIRE); }
++static inline void kz3_kwake_signal(kz3_kwake* w)
++{
++    AcquireSRWLockExclusive(&w->lk); __atomic_add_fetch(&w->gen, 1, __ATOMIC_ACQ_REL); ReleaseSRWLockExclusive(&w->lk);
++    WakeAllConditionVariable(&w->cv);
++}
++/* Returns 1 when woken (gen moved), 0 on the timeout. */
++static inline int kz3_kwake_wait(kz3_kwake* w, uint32_t seen, unsigned ms)
++{
++    int woke = 1;
++    AcquireSRWLockExclusive(&w->lk);
++    if ((uint32_t)w->gen == seen) { SleepConditionVariableSRW(&w->cv, &w->lk, ms, 0); woke = (uint32_t)w->gen != seen; }
++    ReleaseSRWLockExclusive(&w->lk);
++    return woke;
++}
++#else
++#include <pthread.h>
++#include <time.h>
++typedef struct { pthread_mutex_t lk; pthread_cond_t cv; volatile uint32_t gen; } kz3_kwake;
++static inline void kz3_kwake_init(kz3_kwake* w) { pthread_mutex_init(&w->lk, 0); pthread_cond_init(&w->cv, 0); w->gen = 0; }
++static inline uint32_t kz3_kwake_gen(kz3_kwake* w) { return __atomic_load_n(&w->gen, __ATOMIC_ACQUIRE); }
++static inline void kz3_kwake_signal(kz3_kwake* w)
++{
++    pthread_mutex_lock(&w->lk); __atomic_add_fetch(&w->gen, 1, __ATOMIC_ACQ_REL); pthread_cond_broadcast(&w->cv);
++    pthread_mutex_unlock(&w->lk);
++}
++static inline int kz3_kwake_wait(kz3_kwake* w, uint32_t seen, unsigned ms)
++{
++    int woke = 1;
++    pthread_mutex_lock(&w->lk);
++    if (w->gen == seen) {
++        struct timespec t; clock_gettime(CLOCK_REALTIME, &t);
++        t.tv_sec += ms / 1000; t.tv_nsec += (long)(ms % 1000) * 1000000L;
++        if (t.tv_nsec >= 1000000000L) { t.tv_sec++; t.tv_nsec -= 1000000000L; }
++        while (w->gen == seen && pthread_cond_timedwait(&w->cv, &w->lk, &t) == 0) {}
++        woke = w->gen != seen;
++    }
++    pthread_mutex_unlock(&w->lk);
++    return woke;
++}
++#endif
++
++#endif

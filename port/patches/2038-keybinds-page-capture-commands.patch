@@ -1,0 +1,441 @@
+KZ3 patch 2038 (hooks A/B, RSX pass 37): the in-game Keyboard page.
+pad_keybinds.h: page rows/labels, the text command interpreter (pad_kb_ui_command) and the capture of the next
+key (pad_kb_ui_step: waits until the opening key is up, Escape cancels, Delete clears, 10 s timeout); cellPad.c:
+pad_kb_ui_cmd (locked entry for port/kz3/main.cpp), the capture in the pad poll (keys kept from the game while it
+runs and until released), writing keybinds.ini after a change, KZ3_KB_TEST_KEY for Xvfb tests, and the last-device
+flag / first key per pad button for keycap prompts (pad_kb_last_device_keyboard, pad_kb_key_for_button).
+Pass 38 (UI review): rows carry the game's EButton name (the page shows the game's own action string for the
+player's preset, read at run time), plain key names plus a separate "dup" query, "state"/"cf"/"cap"/"hint" for a
+footer the page composes, "sel R S" + Delete clears the selected cell outside a capture, an idle line that names the
+bound keys.
+Host test: tools/smoke/test_pad_keybinds.sh section 5.
+
+--- a/libs/input/cellPad.c	2026-10-12 08:59:27.402446232 -0500
++++ b/libs/input/cellPad.c	2026-10-12 09:02:48.101968062 -0500
+@@ -150,6 +150,10 @@
+ static FILETIME    s_kb_stamp;
+ static unsigned long long s_kb_checked_ms = 0;
+ 
++static PadKbUi     s_kb_ui;             /* patch 2038: the Keyboard page's capture state */
++static SRWLOCK     s_kb_lock = SRWLOCK_INIT;   /* s_kb + s_kb_ui: pad poll vs the page's commands */
++static int         s_kb_last_keys = 0;  /* 1 = the last input came from the keyboard (prompts) */
++
+ static void pad_kb_log(void* ctx, const char* msg)
+ {
+     (void)ctx;
+@@ -157,6 +161,7 @@
+ }
+ 
+ static int pad_kb_down_win(void* ctx, int vk) { (void)ctx; return (GetAsyncKeyState(vk) & 0x8000) != 0; }
++static int pad_kb_down_none(void* ctx, int vk) { (void)ctx; (void)vk; return 0; }
+ 
+ static char* pad_kb_read_w(const wchar_t* path)       /* malloc'd, NUL-terminated; NULL if unreadable */
+ {
+@@ -251,6 +256,71 @@
+     fflush(stdout);
+ }
+ 
++/* Write the current bindings (the page changed them). The new time stamp is taken so the 2 s check does not
++ * read our own write back. */
++static void pad_kb_save(void)
++{
++    char buf[8192];
++    int len = pad_kb_format(&s_kb, buf, sizeof buf);
++    FILE* f = _wfopen(s_kb_path, L"wb");
++    int ok = f && len > 0 && len < (int)sizeof buf && fwrite(buf, 1, (size_t)len, f) == (size_t)len;
++    if (f) ok = (fclose(f) == 0) && ok;
++    if (!pad_kb_stamp(&s_kb_stamp)) memset(&s_kb_stamp, 0, sizeof s_kb_stamp);
++    printf("[keybinds] %ls: %s by the Keyboard page\n", s_kb_path, ok ? "written" : "NOT written");
++    fflush(stdout);
++}
++
++static void pad_kb_ensure_loaded(void)
++{
++    if (!s_kb_ready) { pad_kb_find_path(); pad_kb_load(1); s_kb_ready = 1; s_kb_checked_ms = GetTickCount64(); }
++}
++
++/* The Keyboard page's command entry (port/kz3/main.cpp calls it from the Lua bridge). See pad_kb_ui_command. */
++int pad_kb_ui_cmd(const char* cmd, char* out, size_t n)
++{
++    int changed;
++    AcquireSRWLockExclusive(&s_kb_lock);
++    pad_kb_ensure_loaded();
++    changed = pad_kb_ui_command(&s_kb_ui, &s_kb, cmd, out, n, GetTickCount64());
++    if (changed) pad_kb_save();
++    ReleaseSRWLockExclusive(&s_kb_lock);
++    return changed;
++}
++
++/* For keycap prompts: 1 when the last input came from the keyboard (or KZ3_KB_PROMPTS=1 forces it). */
++int pad_kb_last_device_keyboard(void)
++{
++    static int force = -1;
++    if (force < 0) { const char* e = getenv("KZ3_KB_PROMPTS"); force = e ? atoi(e) : -1; if (force < 0) force = 2; }
++    return force == 2 ? s_kb_last_keys : force;
++}
++
++/* First key bound to a pad button bit (CELL_PAD_CTRL_*), or 0; slot order. For keycap prompts. */
++int pad_kb_key_for_button(unsigned bit)
++{
++    int i, vk = 0;
++    AcquireSRWLockShared(&s_kb_lock);
++    for (i = 0; i < PKB_N_INPUTS && !vk; i++)
++        if (pad_kb_inputs[i].btn == bit) vk = s_kb.key[i][0] ? s_kb.key[i][0] : s_kb.key[i][1];
++    ReleaseSRWLockShared(&s_kb_lock);
++    return vk;
++}
++
++const char* pad_kb_key_label(int vk) { return pad_kb_key_name(vk); }
++
++/* KZ3_KB_TEST_KEY=<key name>: a capture that waits for a key gets this one after 0.7 s (Xvfb runs have no keyboard
++ * focus; the page's capture is otherwise untestable there). */
++static int pad_kb_test_key(void)
++{
++    static int vk = -2;
++    if (vk == -2) {
++        const char* e = getenv("KZ3_KB_TEST_KEY");
++        vk = e && *e ? pad_kb_key_by_name(e, strlen(e)) : -1;
++        if (e && *e) printf("[keybinds] KZ3_KB_TEST_KEY=%s -> %s\n", e, vk > 0 ? "used for the page's captures" : "unknown key");
++    }
++    return vk;
++}
++
+ static void pad_poll_keyboard(void)
+ {
+     static int off = -1;
+@@ -258,19 +328,39 @@
+     s_kb_state.buttons = 0; s_kb_state.dirs = 0;
+     if (off) return;
+ 
+-    if (!s_kb_ready) { pad_kb_find_path(); pad_kb_load(1); s_kb_ready = 1; s_kb_checked_ms = GetTickCount64(); }
++    AcquireSRWLockExclusive(&s_kb_lock);
++    if (!s_kb_ready) pad_kb_ensure_loaded();
+     else {
+         unsigned long long now = GetTickCount64();
+         if (now - s_kb_checked_ms >= 2000) {
+             FILETIME t;
+             s_kb_checked_ms = now;
+-            if (pad_kb_stamp(&t) && CompareFileTime(&t, &s_kb_stamp) != 0) pad_kb_load(0);
++            if (pad_kb_stamp(&t) && CompareFileTime(&t, &s_kb_stamp) != 0) { pad_kb_load(0); s_kb_ui.gen++; }
++        }
++    }
++    {
++        /* The page's capture (2038): it sees the keys before the game does, and keeps them from the game while it
++         * runs and until every key is up afterwards. */
++        int focused = pad_host_window_focused();
++        unsigned long long now = GetTickCount64();
++        int tk = pad_kb_test_key();
++        if (tk > 0 && s_kb_ui.phase == PKB_UI_WAIT && now - s_kb_ui.t_wait >= 700) {
++            if (pad_kb_ui_key(&s_kb_ui, &s_kb, tk)) pad_kb_save();
++            printf("[keybinds] test key %s -> row %d slot %d\n", pad_kb_key_name(tk), s_kb_ui.row, s_kb_ui.slot);
++            fflush(stdout);
++        } else if (pad_kb_ui_step(&s_kb_ui, &s_kb, focused ? pad_kb_down_win : pad_kb_down_none, NULL, now)) {
++            pad_kb_save();
++        }
++        if (pad_kb_ui_busy(&s_kb_ui) || !focused) {
++            /* Nothing while another program has the focus; releasing on focus loss keeps a key held while
++             * alt-tabbing from staying down forever. */
++            ReleaseSRWLockExclusive(&s_kb_lock);
++            return;
+         }
+     }
+-    /* Nothing while another program has the focus; releasing on focus loss keeps a key held while alt-tabbing
+-     * from staying down forever. */
+-    if (!pad_host_window_focused()) return;
+     s_kb_state = pad_kb_eval(&s_kb, pad_kb_down_win, NULL);
++    ReleaseSRWLockExclusive(&s_kb_lock);
++    if (s_kb_state.buttons || s_kb_state.dirs) s_kb_last_keys = 1;
+ }
+ 
+ /* Port 0 = the XInput pad (if any) plus the keys. Without a pad, port 0 is the keys alone and is reported
+@@ -283,6 +373,10 @@
+     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+     int had_pad = hs->connected;
+     if (off) return;
++    /* 2038: pad input (a button or a stick well off centre) makes the pad the last device again (prompts). */
++    if (had_pad && (hs->buttons || hs->analog_lx < 64 || hs->analog_lx > 192 || hs->analog_ly < 64 || hs->analog_ly > 192
++                    || hs->analog_rx < 64 || hs->analog_rx > 192 || hs->analog_ry < 64 || hs->analog_ry > 192))
++        s_kb_last_keys = 0;
+     if (!hs->connected) {
+         memset(hs, 0, sizeof *hs);
+         hs->connected = 1;
+--- a/libs/input/pad_keybinds.h	2026-10-12 08:59:27.404117662 -0500
++++ b/libs/input/pad_keybinds.h	2026-10-12 09:02:48.102968084 -0500
+@@ -353,4 +353,277 @@
+     return 0;
+ }
+ 
++/* ---- KZ3 patch 2038 (hooks A/B): the in-game Keyboard page ----
++ * The page (a GUM served by the port, port/kz3/main.cpp) asks the host through text commands
++ * (pad_kb_ui_command); the capture of the next key runs in the pad poll (pad_kb_ui_step). Both are platform-free so
++ * the host test drives them with a fake key state. Rows are the page's order. The page shows the game's own action
++ * name for a pad button row (the GUM reads settings:controllerconfigs/activeconfig/<button> at run time, so it is the
++ * player's language and active preset; pass 38); `label` is the port's own fallback (file comments, host tests) and
++ * the page text for the eight stick directions and Start, which have no string of their own in the game. */
++typedef struct { const char* input; const char* label; const char* button; } PadKbRow;
++static const PadKbRow pad_kb_rows[] = {
++    { "ls_up", "Move forward", 0 },       { "ls_down", "Move back", 0 },
++    { "ls_left", "Strafe left", 0 },      { "ls_right", "Strafe right", 0 },
++    { "rs_up", "Look up", 0 },            { "rs_down", "Look down", 0 },
++    { "rs_left", "Turn left", 0 },        { "rs_right", "Turn right", 0 },
++    { "r1", "Fire", "Shoulder_Right_1" }, { "r3", "Zoom", "Right_Analog" },
++    { "square", "Reload", "Square" },     { "triangle", "Next weapon", "Triangle" },
++    { "cross", "Jump", "Cross" },         { "circle", "Use", "Circle" },
++    { "l2", "Crouch", "Shoulder_Left_2" }, { "l3", "Sprint", "Left_Analog" },
++    { "l1", "Melee", "Shoulder_Left_1" }, { "r2", "Grenade", "Shoulder_Right_2" },
++    { "up", "Up", "Up" },                 { "down", "Down", "Down" },
++    { "left", "Left", "Left" },           { "right", "Right", "Right" },
++    { "start", "Pause", 0 },              { "select", "Objectives", "Select" },
++};
++#define PKB_N_ROWS ((int)(sizeof pad_kb_rows / sizeof pad_kb_rows[0]))
++
++#define PKB_VK_CANCEL 0x1B      /* Escape: cancels a capture (so the page cannot bind it; the file can) */
++#define PKB_VK_CLEAR  0x2E      /* Delete: clears the slot being captured */
++#define PKB_CAPTURE_MS 10000ull /* a capture with no key for this long ends by itself */
++
++enum { PKB_UI_IDLE, PKB_UI_RELEASE, PKB_UI_WAIT };                    /* PadKbUi.phase */
++enum { PKB_R_NONE, PKB_R_BOUND, PKB_R_CANCEL, PKB_R_CLEARED, PKB_R_TIMEOUT };  /* PadKbUi.result */
++
++typedef struct {
++    int phase;                  /* PKB_UI_*: RELEASE = waiting until every key is up (the key that opened it) */
++    int row, slot;              /* what is being captured */
++    unsigned long long t0;      /* capture start, ms */
++    unsigned long long t_wait;  /* when the RELEASE phase ended, ms */
++    int result, vk;             /* how the last capture ended, and its key */
++    unsigned gen, seen_gen;     /* gen counts binding changes; "poll" reports one once */
++    int suppress;               /* after a capture: keys stay away from the game until all are up */
++    int sel, sel_slot;          /* the page's selected cell + 1 ("sel R S", pass 38; 0 = page closed, so a zeroed
++                                 * PadKbUi has none): Delete clears it */
++} PadKbUi;
++
++static int pad_kb_row_input(int row)
++{
++    if (row < 0 || row >= PKB_N_ROWS) return -1;
++    return pad_kb_input_by_name(pad_kb_rows[row].input, strlen(pad_kb_rows[row].input));
++}
++
++static int pad_kb_key_uses(const PadKeybinds* kb, int vk)       /* how many inputs have this key (either slot) */
++{
++    int i, n = 0;
++    if (!vk) return 0;
++    for (i = 0; i < PKB_N_INPUTS; i++) if (kb->key[i][0] == vk || kb->key[i][1] == vk) n++;
++    return n;
++}
++
++/* Bind vk to (input, slot). The same key in the input's other slot is cleared there (one key, one slot). */
++static void pad_kb_assign(PadKeybinds* kb, int input, int slot, int vk)
++{
++    if (input < 0 || input >= PKB_N_INPUTS || slot < 0 || slot >= PKB_SLOTS) return;
++    if (vk && kb->key[input][!slot] == vk) kb->key[input][!slot] = 0;
++    kb->key[input][slot] = (unsigned char)vk;
++}
++
++/* End the capture with key vk (PKB_VK_CANCEL / PKB_VK_CLEAR are the special keys). 1 = bindings changed. */
++static int pad_kb_ui_key(PadKbUi* u, PadKeybinds* kb, int vk)
++{
++    int in = pad_kb_row_input(u->row);
++    u->phase = PKB_UI_IDLE; u->suppress = 1; u->vk = vk;
++    if (vk == PKB_VK_CANCEL || in < 0) { u->result = PKB_R_CANCEL; return 0; }
++    if (vk == PKB_VK_CLEAR) { pad_kb_assign(kb, in, u->slot, 0); u->result = PKB_R_CLEARED; }
++    else { pad_kb_assign(kb, in, u->slot, vk); u->result = PKB_R_BOUND; }
++    u->gen++;
++    return 1;
++}
++
++/* Once per pad poll. down() is the real key state (zero when the window has no focus). 1 = bindings changed (save).
++ * While a capture runs, and after it until every key is up, the caller must not pass keys to the game. */
++static int pad_kb_ui_step(PadKbUi* u, PadKeybinds* kb, PadKbDown down, void* ctx, unsigned long long now)
++{
++    int i, first = 0;
++    for (i = 0; i < PKB_N_KEYS; i++)
++        if (down(ctx, pad_kb_keys[i].vk)) { first = pad_kb_keys[i].vk; break; }
++    if (u->phase == PKB_UI_IDLE) {
++        if (u->suppress && !first) u->suppress = 0;
++        /* Pass 38: Delete on the page (no capture running) clears the selected cell. sel is set only while the
++         * page is open (the page sends "sel R S" from its timer; "sel -1 -1" and "cancel" end it). suppress = one clear per press. */
++        if (!u->suppress && u->sel > 0 && down(ctx, PKB_VK_CLEAR)) {
++            int in = pad_kb_row_input(u->sel - 1);
++            u->suppress = 1;
++            if (in >= 0 && kb->key[in][u->sel_slot]) {
++                pad_kb_assign(kb, in, u->sel_slot, 0); u->result = PKB_R_CLEARED; u->gen++;
++                return 1;
++            }
++        }
++        return 0;
++    }
++    if (now - u->t0 > PKB_CAPTURE_MS) { u->phase = PKB_UI_IDLE; u->suppress = 1; u->result = PKB_R_TIMEOUT; return 0; }
++    if (u->phase == PKB_UI_RELEASE) { if (!first) { u->phase = PKB_UI_WAIT; u->t_wait = now; } return 0; }
++    return first ? pad_kb_ui_key(u, kb, first) : 0;
++}
++
++static int pad_kb_ui_busy(const PadKbUi* u) { return u->phase != PKB_UI_IDLE || u->suppress; }
++
++/* The page's (and keycap prompts') display name: at most 9 characters so it fits one key column in the game's menu
++ * font (the file keeps the full names). Unbound = "---". */
++static const char* pad_kb_key_short(int vk)
++{
++    static const struct { unsigned char vk; const char* s; } t[] = {
++        { 0x01, "Mouse 1" }, { 0x02, "Mouse 2" }, { 0x04, "Mouse 3" }, { 0x05, "Mouse 4" }, { 0x06, "Mouse 5" },
++        { 0x08, "Backspace" }, { 0x0D, "Enter" }, { 0x14, "Caps Lock" }, { 0x1B, "Esc" }, { 0x21, "Page Up" },
++        { 0x22, "Page Down" }, { 0x2D, "Insert" }, { 0x2E, "Delete" },
++        { 0x60, "Num 0" }, { 0x61, "Num 1" }, { 0x62, "Num 2" }, { 0x63, "Num 3" }, { 0x64, "Num 4" },
++        { 0x65, "Num 5" }, { 0x66, "Num 6" }, { 0x67, "Num 7" }, { 0x68, "Num 8" }, { 0x69, "Num 9" },
++        { 0x6A, "Num *" }, { 0x6B, "Num +" }, { 0x6D, "Num -" }, { 0x6E, "Num ." }, { 0x6F, "Num /" },
++        { 0xA0, "L Shift" }, { 0xA1, "R Shift" }, { 0xA2, "L Ctrl" }, { 0xA3, "R Ctrl" }, { 0xA4, "L Alt" },
++        { 0xA5, "R Alt" }, { 0xBA, ";" }, { 0xBB, "=" }, { 0xBC, "," }, { 0xBD, "Minus" }, { 0xBE, "." },
++        { 0xBF, "/" }, { 0xC0, "`" }, { 0xDB, "[" }, { 0xDC, "\\" }, { 0xDD, "]" }, { 0xDE, "'" },
++    };
++    unsigned i;
++    if (!vk) return "---";
++    for (i = 0; i < sizeof t / sizeof t[0]; i++) if (t[i].vk == vk) return t[i].s;
++    return pad_kb_key_name(vk);
++}
++
++static const char* pad_kb_ui_keytext(int vk) { return pad_kb_key_short(vk); }
++
++/* The first key bound to two inputs, in page order: its key and the two rows. 0 = no conflict. */
++static int pad_kb_first_conflict(const PadKeybinds* kb, int* ra, int* rb)
++{
++    int i, j, b;
++    for (i = 0; i < PKB_N_ROWS; i++) {
++        int a = pad_kb_row_input(i);
++        for (j = 0; j < PKB_SLOTS; j++) {
++            int vk = a >= 0 ? kb->key[a][j] : 0;
++            if (pad_kb_key_uses(kb, vk) < 2) continue;
++            for (b = i + 1; b < PKB_N_ROWS; b++) {
++                int c = pad_kb_row_input(b);
++                if (c >= 0 && (kb->key[c][0] == vk || kb->key[c][1] == vk)) { *ra = i; *rb = b; return vk; }
++            }
++        }
++    }
++    return 0;
++}
++
++/* The key the page names for a pad input: `prefer` when it is bound there, else the first bound key (0 = none). */
++static int pad_kb_ui_key_of(const PadKeybinds* kb, const char* input, int prefer)
++{
++    int in = pad_kb_input_by_name(input, strlen(input));
++    if (in < 0) return 0;
++    if (prefer && (kb->key[in][0] == prefer || kb->key[in][1] == prefer)) return prefer;
++    return kb->key[in][0] ? kb->key[in][0] : kb->key[in][1];
++}
++
++/* The idle status line (pass 38, ui-style.md "Prompts": every input that works): built from the bindings, so it
++ * names the keys the player really has. "Enter change, Delete clear, Left / Right column, R reset, Esc back." */
++static void pad_kb_ui_hint(const PadKeybinds* kb, char* out, size_t n)
++{
++    int ch = pad_kb_ui_key_of(kb, "cross", 0x0D), l = pad_kb_ui_key_of(kb, "left", 0), r = pad_kb_ui_key_of(kb, "right", 0);
++    int rs = pad_kb_ui_key_of(kb, "square", 0), bk = pad_kb_ui_key_of(kb, "start", PKB_VK_CANCEL);
++    char cs[48];
++    size_t m;
++    if (bk != PKB_VK_CANCEL) bk = pad_kb_ui_key_of(kb, "circle", 0);    /* the page's Back is Circle, and Start */
++    snprintf(out, n, "%s%s", ch ? pad_kb_key_short(ch) : "", ch ? " change, " : "");
++    m = strlen(out);
++    snprintf(out + m, n - m, "Delete clear, ");
++    m = strlen(out);
++    if (l && r) { snprintf(cs, sizeof cs, "%s", pad_kb_key_short(l)); snprintf(out + m, n - m, "%s / %s column, ", cs, pad_kb_key_short(r)); }
++    m = strlen(out);
++    if (rs) snprintf(out + m, n - m, "%s reset, ", pad_kb_key_short(rs));
++    m = strlen(out);
++    if (bk) snprintf(out + m, n - m, "%s back, ", pad_kb_key_short(bk));
++    m = strlen(out);
++    if (m >= 2 && out[m - 2] == ',') { out[m - 2] = '.'; out[m - 1] = 0; }
++}
++
++/* One page command; the reply goes to out (always NUL-terminated). Returns 1 when the bindings changed (save them).
++ *   rows                 -> number of rows          label R    -> the row's port label (fallback)
++ *   src R                -> the row's EButton name for settings:controllerconfigs/activeconfig/<name> ("" = none)
++ *   key R S              -> key name of row R slot S ("---" unbound, "..." while captured)
++ *   dup R S              -> "1" when that key is also bound to another input, else ""
++ *   capture R S          -> starts capturing the next key for row R slot S ("ok", or "bad")
++ *   cancel               -> ends a capture and the selection
++ *   sel R S              -> the page's selected cell (Delete clears it); "sel -1 -1" = none
++ *   poll                 -> "busy" | "changed" (once per change) | ""
++ *   reset                -> the default bindings    clear R S  -> unbinds
++ *   state                -> "capture" | "timeout" | "conflict" | "idle" (what the footer shows)
++ *   cf key|a|b           -> the first conflict: its key name, the first and the second row number
++ *   cap                  -> the row being captured  hint       -> the idle line (keys from the bindings)
++ *   caphint              -> the capture line's tail
++ *   status               -> one complete footer line with the port labels (host tests, logs) */
++static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char* out, size_t n, unsigned long long now)
++{
++    char verb[16] = { 0 };
++    int r = -1, s = -1, in, k, ca = 0, cb = 0;
++    if (!n) return 0;
++    out[0] = 0;
++    if (sscanf(cmd, "%15s %d %d", verb, &r, &s) < 1) return 0;
++    in = pad_kb_row_input(r);
++    if (!strcmp(verb, "rows")) { snprintf(out, n, "%d", PKB_N_ROWS); return 0; }
++    if (!strcmp(verb, "label")) { snprintf(out, n, "%s", in >= 0 ? pad_kb_rows[r].label : ""); return 0; }
++    if (!strcmp(verb, "src")) { snprintf(out, n, "%s", in >= 0 && pad_kb_rows[r].button ? pad_kb_rows[r].button : ""); return 0; }
++    if (!strcmp(verb, "key") || !strcmp(verb, "dup")) {
++        if (in < 0 || s < 0 || s >= PKB_SLOTS) { snprintf(out, n, verb[0] == 'k' ? "?" : ""); return 0; }
++        k = kb->key[in][s];
++        if (verb[0] == 'd') { snprintf(out, n, "%s", pad_kb_key_uses(kb, k) > 1 ? "1" : ""); return 0; }
++        if (u->phase != PKB_UI_IDLE && u->row == r && u->slot == s) { snprintf(out, n, "..."); return 0; }
++        snprintf(out, n, "%s", pad_kb_ui_keytext(k));
++        return 0;
++    }
++    if (!strcmp(verb, "capture")) {
++        if (in < 0 || s < 0 || s >= PKB_SLOTS) { snprintf(out, n, "bad"); return 0; }
++        u->phase = PKB_UI_RELEASE; u->row = r; u->slot = s; u->t0 = now; u->result = PKB_R_NONE; u->vk = 0;
++        u->gen++;                                           /* the row shows "..." */
++        snprintf(out, n, "ok");
++        return 0;
++    }
++    if (!strcmp(verb, "cancel")) {
++        u->sel = 0;
++        if (u->phase != PKB_UI_IDLE) { u->phase = PKB_UI_IDLE; u->suppress = 1; u->result = PKB_R_CANCEL; u->gen++; }
++        return 0;
++    }
++    if (!strcmp(verb, "sel")) {
++        u->sel = in >= 0 && s >= 0 && s < PKB_SLOTS ? r + 1 : 0;
++        u->sel_slot = u->sel ? s : 0;
++        return 0;
++    }
++    if (!strcmp(verb, "poll")) {
++        if (u->gen != u->seen_gen) { u->seen_gen = u->gen; snprintf(out, n, "changed"); }
++        else if (u->phase != PKB_UI_IDLE) snprintf(out, n, "busy");
++        return 0;
++    }
++    if (!strcmp(verb, "reset")) {
++        pad_kb_defaults(kb); u->phase = PKB_UI_IDLE; u->gen++; u->result = PKB_R_NONE;
++        snprintf(out, n, "ok");
++        return 1;
++    }
++    if (!strcmp(verb, "clear")) {
++        if (in < 0 || s < 0 || s >= PKB_SLOTS) { snprintf(out, n, "bad"); return 0; }
++        pad_kb_assign(kb, in, s, 0); u->gen++;
++        snprintf(out, n, "ok");
++        return 1;
++    }
++    k = pad_kb_first_conflict(kb, &ca, &cb);
++    if (!strcmp(verb, "state")) {
++        snprintf(out, n, "%s", u->phase != PKB_UI_IDLE ? "capture" : u->result == PKB_R_TIMEOUT ? "timeout" : k ? "conflict" : "idle");
++        return 0;
++    }
++    if (!strcmp(verb, "cf")) {
++        const char* w = strchr(cmd, ' ');
++        w = w ? w + 1 : "";
++        if (!k) return 0;
++        if (!strcmp(w, "key")) snprintf(out, n, "%s", pad_kb_key_short(k));
++        else if (!strcmp(w, "a")) snprintf(out, n, "%d", ca);
++        else if (!strcmp(w, "b")) snprintf(out, n, "%d", cb);
++        return 0;
++    }
++    if (!strcmp(verb, "cap")) { snprintf(out, n, "%d", u->phase != PKB_UI_IDLE ? u->row : -1); return 0; }
++    if (!strcmp(verb, "hint")) { pad_kb_ui_hint(kb, out, n); return 0; }
++    if (!strcmp(verb, "caphint")) { snprintf(out, n, "Esc cancels, Delete clears."); return 0; }
++    if (!strcmp(verb, "status")) {
++        if (u->phase != PKB_UI_IDLE)
++            snprintf(out, n, "Press a key for %s. Esc cancels, Delete clears.", pad_kb_rows[u->row].label);
++        else if (u->result == PKB_R_TIMEOUT) snprintf(out, n, "No key pressed: unchanged.");
++        else if (k) snprintf(out, n, "%s is bound to both %s and %s.", pad_kb_key_short(k), pad_kb_rows[ca].label, pad_kb_rows[cb].label);
++        else pad_kb_ui_hint(kb, out, n);
++        return 0;
++    }
++    snprintf(out, n, "unknown");
++    return 0;
++}
++
+ #endif /* PAD_KEYBINDS_H */

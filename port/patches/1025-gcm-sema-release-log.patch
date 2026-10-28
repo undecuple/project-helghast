@@ -1,0 +1,55 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index bedb70f7..7f082cd2 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2079,6 +2079,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                       { static int pn = 0; if (pw > 0 && pn++ < 8)
+                           fprintf(stderr, "[cellGcmSys] park 0x%08X not patched within %d ms (put moved %u times) -- resyncing\n",
+                                   s_fifo_getoff, pw, s_park_putchg); }
++                      /* KZ3 patch 1025 diagnostic, GCM_PARK_SCAN=1: at a park timeout, the words around the
++                       * park and every JUMP/CALL in the IO window whose target lies in the 0x4000 bytes up to
++                       * the park (who leads the walker there), with the words before each source. */
++                      { static int ps = -1; if (ps < 0) { const char* e = getenv("GCM_PARK_SCAN"); ps = e ? atoi(e) : 0; }
++                        if (ps > 0) { ps--;
++                            u32 pe = gcm_io2ea(s_fifo_getoff);
++                            for (u32 d = 0; pe && d < 0x80u; d += 0x20u) {
++                                u32 a = pe - 0x40u + d;
++                                fprintf(stderr, "[park-scan] ea %08X:", a);
++                                for (u32 j = 0; j < 8; j++) fprintf(stderr, " %08X", vm_read32(a + j * 4));
++                                fprintf(stderr, "\n"); }
++                            u32 base = s_config.ioAddress, sz = s_config.ioSize; int hits = 0;
++                            for (u32 q = 0; q + 4 <= sz && hits < 24; q += 4) {
++                                u32 w = vm_read32(base + q), t = w & 0x1FFFFFFCu;
++                                if (((w & 0xE0000003u) == 0x20000000u || (w & 0xE0000003u) == 2u) &&
++                                    t + 0x4000u > s_fifo_getoff && t <= s_fifo_getoff && t != q) {
++                                    hits++;
++                                    fprintf(stderr, "[park-scan] %s at io 0x%08X -> 0x%08X; before:", (w & 3u) == 2u ? "CALL" : "JUMP", q, t);
++                                    for (u32 j = 8; j >= 1; j--) fprintf(stderr, " %08X", q >= j * 4 ? vm_read32(base + q - j * 4) : 0);
++                                    fprintf(stderr, "\n"); }
++                            }
++                            fprintf(stderr, "[park-scan] %d source(s) in io [0, 0x%X)\n", hits, sz);
++                        } }
+                       /* KZ3 patch 1008 diagnostic, GCM_PARK_DIAG=<hex label offset>: the park's
+                        * three words (park, refcount, patch jump), the label, and every
+                        * NV4097 SET_SEMAPHORE_OFFSET (0x1D6C) with that offset in IO memory. */
+@@ -2200,6 +2223,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
+                         s_ft_sema_t0 = 0;
+                     }
++                    /* GCM_SEMA_LOG=N: the first N NV406E releases/acquires of each label, then every 1024th
++                     * (label index = offset / 16; GCM_VAL_WATCH cannot see these, it sits after the continue). */
++                    if (m == 0x68u || m == 0x6Cu) {
++                        static int slog = -2;
++                        static u32 scnt[0x1000];
++                        if (slog == -2) { const char* e = getenv("GCM_SEMA_LOG"); slog = e ? atoi(e) : -1; }
++                        if (slog >= 0) {
++                            u32 li = (s_sema_offset & 0xFFFFu) >> 4, c = ++scnt[li];
++                            if (c <= (u32)slog || (c & 1023u) == 0)
++                                fprintf(stderr, "[SEMA] %s label 0x%X v=0x%08X (was 0x%08X) get=0x%X #%u\n",
++                                        m == 0x6Cu ? "release" : "acquire", li, v, vm_read32(la),
++                                        s_fifo_getoff, c);
++                        }
++                    }
+                     if (m == 0x64u)      s_sema_offset = v;
+                     else if (m == 0x6Cu) {
+                         /* The RSX has fetched past a RELEASE before its

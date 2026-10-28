@@ -1,0 +1,250 @@
+gcm/live-draw: write-backs of several surfaces share one readback submit and one GPU wait.
+
+Symptom (Killzone 3, pass 20): patch 2017 writes every main-memory render target back at the first guest sync
+point after it was drawn; KZ3 has four of them per frame (640x360, 320x180, 640x360, 320x180 F_X32) at one
+semaphore release, plus the NV0039 scene copy. Each write-back created a committed readback buffer, recorded the
+copy, submitted the command list and waited for the whole queue: four allocations and four full GPU waits per
+release.
+
+Fix: ld_writeback_batch records the copy of every surface into persistent readback buffers (16 slots, grown on
+demand, rounded to 1 MB), submits once (ld_flush LD_FLUSH_READBACK), waits once, then converts all of them into
+guest memory (RGBA8 -> A,R,G,B; FP16 and R32F byte-swapped). Both callers use it: the sync-point write-back
+(rsx_live_draw_before_guest_sync) and the NV0039 range write-back (rsx_live_draw_writeback_range).
+LD_WRITEBACK_BATCH=0 keeps the per-surface path for an A/B. rsx_live_draw_debug_writeback_stats reports totals
+(time, calls, surfaces, GPU waits); [main-surface-writeback] prints them.
+
+Verification: tools/smoke/test_wb_batch.c (KZ3-shaped frame, 120 frames under Proton, RTX 4060): release with
+four main-memory surfaces 8.8-9.2 ms -> 0.63 ms, NV0039 copy segment 3.8-4.1 ms -> 2.2-2.4 ms; 9600/9600 checks
+in both modes; LD_MAIN_SURFACE_WRITEBACK=0 fails (negative control).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 92c488c..5235d89 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -46,6 +46,8 @@ u32  rsx_live_draw_writeback_range(u32 l, u32 o, u32 n) { (void)l; (void)o; (voi
+ void rsx_live_draw_note_guest_write_async(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ u32  rsx_live_draw_before_guest_sync(void) { return 0; }
++void rsx_live_draw_debug_writeback_stats(double* t, u32* b, u32* s, u32* w)
++{ if (t) *t = 0; if (b) *b = 0; if (s) *s = 0; if (w) *w = 0; }
+ int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u32 h)
+ { (void)sl; (void)sa; (void)sp; (void)dl; (void)da; (void)dp; (void)w; (void)h; return 0; }
+ int  rsx_live_draw_resolve_blit(u32 sl, u32 sa, u32 sp, u32 ds, u32 dt, u32 dl, u32 da,
+@@ -10105,13 +10107,160 @@ static int ld_writeback_surface(u32 i, u32 for_off, u32 for_size)
+     return ok;
+ }
+ 
++/* Patch 2018: batched write-backs. ld_writeback_surface above costs one
++ * readback buffer allocation and one full GPU wait per surface; Killzone 3
++ * writes four main-memory surfaces back at one release per frame (pass 19).
++ * The batch records every surface's copy into a persistent readback buffer,
++ * submits once, waits once, then converts all of them into guest memory.
++ * LD_WRITEBACK_BATCH=0 selects the per-surface path (A/B). */
++#define LD_RB_SLOTS 16
++static ID3D12Resource* g_ld_rb[LD_RB_SLOTS];
++static u64 g_ld_rb_bytes[LD_RB_SLOTS];
++static struct { u64 qpc; u32 syncs, surfaces, waits; } g_ld_wb;
++
++static int ld_wb_batch_enabled(void)
++{
++    static int en = -1;
++    if (en < 0) { const char* e = getenv("LD_WRITEBACK_BATCH"); en = e ? atoi(e) : 1; }
++    return en;
++}
++
++/* Record surface i's copy into readback slot k (no wait). Slots are only in
++ * use between ld_rb_record and the batch's single wait, so a slot can be
++ * resized here without racing the GPU. */
++static int ld_rb_record(u32 i, u32 k)
++{
++    const surface_t* sf = &g.surfaces[i];
++    const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++    const u32 pitch = (sf->w * texel + 255u) & ~255u;
++    const u64 need = (u64)pitch * sf->h;
++    if (g_ld_rb_bytes[k] < need) {
++        if (g_ld_rb[k]) { g_ld_rb[k]->lpVtbl->Release(g_ld_rb[k]); g_ld_rb[k] = NULL; g_ld_rb_bytes[k] = 0; }
++        const u64 bytes = (need + 0xFFFFFull) & ~0xFFFFFull;
++        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++        D3D12_RESOURCE_DESC bd = {0};
++        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)bytes;
++        bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
++        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&g_ld_rb[k])))
++            { g_ld_rb[k] = NULL; return 0; }
++        g_ld_rb_bytes[k] = bytes;
++    }
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition.pResource = sf->tex;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
++    src.pResource = sf->tex; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    dst.pResource = g_ld_rb[k]; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    dst.PlacedFootprint.Footprint.Format = sf->fmt;
++    dst.PlacedFootprint.Footprint.Width = sf->w;
++    dst.PlacedFootprint.Footprint.Height = sf->h;
++    dst.PlacedFootprint.Footprint.Depth = 1;
++    dst.PlacedFootprint.Footprint.RowPitch = pitch;
++    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    return 1;
++}
++
++/* After the wait: slot k (surface i) -> guest memory in the RSX layout. */
++static int ld_rb_store(u32 i, u32 k, u32 for_off, u32 for_size)
++{
++    const surface_t* sf = &g.surfaces[i];
++    const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++    const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
++    const u32 pitch = (sf->w * texel + 255u) & ~255u;
++    u8* gm = (u8*)guest_ptr(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel);
++    u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * sf->h};
++    if (!gm || FAILED(g_ld_rb[k]->lpVtbl->Map(g_ld_rb[k], 0, &rr, (void**)&px))) return 0;
++    for (u32 y = 0; y < sf->h; y++) {
++        const u8* sp = px + (size_t)y * pitch;
++        u8* dp = gm + (size_t)y * gp;
++        if (sf->fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {               /* host R,G,B,A -> guest A,R,G,B */
++            for (u32 x = 0; x < sf->w; x++, sp += 4, dp += 4) {
++                dp[0] = sp[3]; dp[1] = sp[0]; dp[2] = sp[1]; dp[3] = sp[2];
++            }
++        } else if (texel == 8) {                                    /* LE halves -> BE, X first */
++            for (u32 x = 0; x < sf->w * 4u; x++, sp += 2, dp += 2) { dp[0] = sp[1]; dp[1] = sp[0]; }
++        } else {                                                    /* R32_FLOAT LE -> BE */
++            for (u32 x = 0; x < sf->w; x++, sp += 4, dp += 4) {
++                u32 v; memcpy(&v, sp, 4); v = __builtin_bswap32(v); memcpy(dp, &v, 4);
++            }
++        }
++    }
++    D3D12_RANGE wr = {0, 0};
++    g_ld_rb[k]->lpVtbl->Unmap(g_ld_rb[k], 0, &wr);
++    g.surfaces[i].gv_gpu_dirty = 0;
++    if (ld_gv_enabled()) ld_gv_baseline(&g.surfaces[i]);   /* guest bytes == host now */
++    static int logged;
++    if (logged++ < 8)
++        fprintf(stderr, "[surface-writeback] surface %u:0x%08X %ux%u fmt=%d pitch=%u for 0x%08X+0x%X (batched)\n",
++                sf->location, sf->offset, sf->w, sf->h, (int)sf->fmt, gp, for_off, for_size);
++    return 1;
++}
++
++/* Write back surfaces idx[0..n): all copies, one submit + wait, all stores.
++ * Falls back to the per-surface path when LD_WRITEBACK_BATCH=0. */
++static u32 ld_writeback_batch(const u32* idx, u32 n, u32 for_off, u32 for_size)
++{
++    LARGE_INTEGER t0, t1;
++    QueryPerformanceCounter(&t0);
++    u32 done = 0;
++    if (!ld_wb_batch_enabled()) {
++        for (u32 j = 0; j < n; j++) { done += (u32)ld_writeback_surface(idx[j], for_off ? for_off : g.surfaces[idx[j]].offset, for_size); g_ld_wb.waits++; }
++    } else {
++        for (u32 j0 = 0; j0 < n && g.ready; j0 += LD_RB_SLOTS) {
++            u32 rec[LD_RB_SLOTS], nrec = 0;
++            for (u32 j = j0; j < n && j < j0 + LD_RB_SLOTS; j++) {
++                const u32 i = idx[j];
++                const surface_t* sf = &g.surfaces[i];
++                const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++                const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
++                if (!sf->tex || gp < sf->w * texel) continue;
++                if (!guest_ptr(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel)) continue;
++                /* Patch 2017: guest bytes newer than the GPU's go into the surface first. */
++                ld_gv_validate(i);
++                if (ld_rb_record(i, nrec)) rec[nrec++] = i;
++            }
++            if (!nrec) continue;
++            ld_flush(LD_FLUSH_READBACK);
++            g_ld_wb.waits++;
++            if (!g.ready) break;
++            for (u32 k = 0; k < nrec; k++)
++                done += (u32)ld_rb_store(rec[k], k, for_off ? for_off : g.surfaces[rec[k]].offset, for_size);
++        }
++    }
++    QueryPerformanceCounter(&t1);
++    g_ld_wb.qpc += (u64)(t1.QuadPart - t0.QuadPart);
++    g_ld_wb.syncs++;
++    g_ld_wb.surfaces += done;
++    return done;
++}
++
++/* Patch 2018 (test/diagnostic hook): write-back totals since start. */
++void rsx_live_draw_debug_writeback_stats(double* us_total, u32* batches, u32* surfaces, u32* gpu_waits)
++{
++    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
++    if (us_total) *us_total = (double)g_ld_wb.qpc * 1e6 / (double)f.QuadPart;
++    if (batches) *batches = g_ld_wb.syncs;
++    if (surfaces) *surfaces = g_ld_wb.surfaces;
++    if (gpu_waits) *gpu_waits = g_ld_wb.waits;
++}
++
+ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+ {
+     static int en = -1;
+     if (en < 0) { const char* e = getenv("LD_NV0039_WRITEBACK"); en = e ? atoi(e) : 1; }
+     if (!en || !g.ready || !size) return 0;
+     const u64 r0 = offset, r1 = r0 + size;
+-    u32 done = 0;
++    u32 done = 0, idx[64], n = 0;
+     for (u32 i = 0; i < g.n_surfaces; i++) {
+         const surface_t* sf = &g.surfaces[i];
+         if (!sf->tex || sf->location != location) continue;
+@@ -10120,8 +10269,9 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+         if (gp < sf->w * texel) continue;
+         const u64 s0 = sf->offset, s1 = s0 + (u64)gp * (sf->h - 1u) + (u64)sf->w * texel;
+         if (!(s0 < r1 && r0 < s1)) continue;
+-        done += (u32)ld_writeback_surface(i, offset, size);
++        if (n < 64) idx[n++] = i;   /* patch 2018: batched */
+     }
++    done = ld_writeback_batch(idx, n, offset, size);
+     return done;
+ }
+ 
+@@ -10139,16 +10289,22 @@ u32 rsx_live_draw_before_guest_sync(void)
+     static int en = -1;
+     if (en < 0) { const char* e = getenv("LD_MAIN_SURFACE_WRITEBACK"); en = e ? atoi(e) : 1; }
+     if (!en || !g.ready) return 0;
+-    u32 done = 0;
+-    for (u32 i = 0; i < g.n_surfaces; i++)
++    u32 idx[64], n = 0;
++    for (u32 i = 0; i < g.n_surfaces && n < 64; i++)
+         if (g.surfaces[i].tex && g.surfaces[i].location == 1u && g.surfaces[i].gv_gpu_dirty)
+-            done += (u32)ld_writeback_surface(i, g.surfaces[i].offset, 0);
++            idx[n++] = i;
++    if (!n) return 0;
++    const u32 done = ld_writeback_batch(idx, n, 0, 0);   /* patch 2018: one GPU wait */
+     if (done) {
+         static u64 total; total += done;
+-        static u32 n;
+-        if (n++ < 8 || (n & 1023u) == 0)
+-            fprintf(stderr, "[main-surface-writeback] %u surface(s) at a guest sync point (frame %u, total %llu)\n",
+-                    done, g_ld_frames, (unsigned long long)total);
++        static u32 nlog;
++        if (nlog++ < 8 || (nlog & 1023u) == 0) {
++            double us = 0; u32 b = 0, sfc = 0, w = 0;
++            rsx_live_draw_debug_writeback_stats(&us, &b, &sfc, &w);
++            fprintf(stderr, "[main-surface-writeback] %u surface(s) at a guest sync point (frame %u, total %llu; "
++                    "all write-backs: %u batches, %u GPU waits, %.0f us avg)\n",
++                    done, g_ld_frames, (unsigned long long)total, b, w, b ? us / b : 0.0);
++        }
+     }
+     return done;
+ }
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 41b0e64..c057aed 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -106,6 +106,10 @@ u32  rsx_live_draw_before_guest_sync(void);
+  * bytes; FP16/FP32 big-endian). Blocks on a GPU readback. Returns the number
+  * of surfaces written back. */
+ u32  rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size);
++/* Patch 2018: write-backs are batched (all copies, one GPU wait, all stores;
++ * LD_WRITEBACK_BATCH=0 = one wait per surface). Totals since start: wall time
++ * in microseconds, batches (calls), surfaces written, GPU waits. */
++void rsx_live_draw_debug_writeback_stats(double* us_total, u32* batches, u32* surfaces, u32* gpu_waits);
+ /* 1:1 NV3089 blit whose source is a live GPU surface: copy it on the GPU.
+  * Addresses are location-relative byte offsets of the rect's top-left.
+  * Returns 1 when handled (the guest-memory copy still runs regardless). */

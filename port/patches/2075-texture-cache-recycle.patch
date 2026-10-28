@@ -1,0 +1,192 @@
+KZ3 patch 2075 (RSX pass 70): texture cache recycling, the RE notes "Pass 70".
+KZ3's SPU jobs write per-object 8x8 W16Z16Y16X16_FLOAT parameter blocks into a ring in main memory
+(1:0x0005C180-0x00C8F700 on K4, ~25,000 block slots), so each frame binds a few hundred blocks at offsets the texture
+cache does not hold: on K4 they are 118,698 of the 125,184 new cache entries in 49 s (coord-fullclk-k4,
+[perf-newtex-shape]). Past 8,192 entries every such miss scanned all entries for the smallest use serial, created a
+512-byte committed resource and retired the victim's. Now (LD_TEX_RECYCLE, default on; =0 the old path) the victim
+comes from an exact LRU list (libs/video/rsx_tex_lru.h, same order as the serials, O(1)) and the victim's resource is
+offered to the decode as patch 2035's in-place target (reused when the description matches). [tex-hash] gains
+evict=N recycle=N entries=N. Host test tools/smoke/test_tex_lru.sh.
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -129,6 +129,7 @@
+ /* patch 2048: asynchronous PSO build bookkeeping */
+ #include "rsx_pso_template.h"   /* patch 2071 */
+ #include "rsx_pace.h"           /* patch 2072 */
++#include "rsx_tex_lru.h"        /* patch 2075 */
+ #include <sys/stat.h>
+
+ #pragma comment(lib, "d3d12.lib")
+@@ -2967,6 +2968,7 @@
+ static unsigned long long g_ld_tex_inplace_n;
+ static unsigned long long g_ld_b8_direct_n;   /* patch 2036 */
+ static unsigned long long g_ld_argb_direct_n;   /* patch 2046 */
++static unsigned long long g_ld_tex_evict_n, g_ld_tex_recycle_n;   /* patch 2075: per [tex-hash] window */
+ static u32 g_ld_tex_raw;   /* patch 2046: what the last decode_guest_texture made (1 = raw A,R,G,B bytes) */
+ static int ld_tex_inplace_on(void)
+ {
+@@ -3360,14 +3362,15 @@
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) {
+         fprintf(stderr, "[tex-hash] span=%d big=%u frame=%u hashes=%llu skipped=%llu bytes=%.1fMB changes=%llu tracked=%llu"
+                         " untracked=%llu flip-flags=%llu wr-unchanged=%llu dyn-forced=%llu inplace=%llu b8-direct=%llu"
+-                        " argb-direct=%llu\n",
++                        " argb-direct=%llu evict=%llu recycle=%llu entries=%u\n",
+                 ld_tex_hash_span(), ld_tex_hash_big(), g_ld_frames, (unsigned long long)g_ld_th.hashes,
+                 (unsigned long long)g_ld_th.skipped, (double)g_ld_th.hashed_bytes / 1048576.0,
+                 (unsigned long long)g_ld_th.changes, (unsigned long long)g_ld_th.tracked,
+                 (unsigned long long)g_ld_th.untracked, (unsigned long long)g_ld_th.flip_flags,
+                 (unsigned long long)g_ld_th.wr_unchanged, (unsigned long long)g_ld_th.dyn_forced, g_ld_tex_inplace_n,
+-                g_ld_b8_direct_n, g_ld_argb_direct_n);
++                g_ld_b8_direct_n, g_ld_argb_direct_n, g_ld_tex_evict_n, g_ld_tex_recycle_n, g.n_textures);
+         memset(&g_ld_th, 0, sizeof g_ld_th);
++        g_ld_tex_evict_n = g_ld_tex_recycle_n = 0;   /* patch 2075 */
+         g_ld_tex_inplace_n = 0;
+         g_ld_b8_direct_n = 0;
+         g_ld_argb_direct_n = 0;
+@@ -4713,6 +4716,24 @@
+     }
+ }
+
++/* KZ3 patch 2075: texture cache recycling (RSX pass 70, the RE notes "Pass 70"). KZ3's SPU jobs write per-object
++ * 8x8 W16Z16Y16X16_FLOAT blocks into a ring in main memory (1:0x0005C180-0x00C8F700 on K4, ~25,000 block slots),
++ * so every frame binds a few hundred blocks at offsets the cache does not hold: on K4 95 % of the new cache entries
++ * (118,698 of 125,184 in 49 s). Once the 8,192 entries are full every such miss paid a linear scan of all entries for
++ * the LRU victim, a CreateCommittedResource for 512 bytes and the retirement of the victim's resource.
++ * With LD_TEX_RECYCLE on (default; =0 the old path): the victim comes from an exact LRU list (rsx_tex_lru.h, the
++ * same order as the use serials), and the victim's resource is offered to the decode as 2035's in-place target
++ * (create_texture_mipped reuses it when the description matches: barrier, upload copy, barrier). Draws recorded
++ * before the copy read the old texels, as with a 2035 refresh. Counted in [tex-hash] as evict=N recycle=N. */
++static rsx_tex_lru g_ld_tex_lru = { RSX_TEX_LRU_NIL, RSX_TEX_LRU_NIL };
++static rsx_tex_lru_link g_ld_tex_lru_link[MAX_TEXTURES];
++static int ld_tex_recycle_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_TEX_RECYCLE"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++
+ /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
+  * descriptor-only cache, re-hash the source once per frame and refresh the
+  * D3D resource when the game rewrites the same guest address. */
+@@ -4835,14 +4856,28 @@
+             }
+         }
+         entry->last_use_serial = ++g_ld_texture_use_serial;
++        if (ld_tex_recycle_on()) rsx_tex_lru_touch(&g_ld_tex_lru, g_ld_tex_lru_link, i);   /* patch 2075 */
+         return entry->tex ? SRV_TEXTURE_BASE + i : SRV_WHITE;
+     }
+
+     u32 index;
+     ID3D12Resource* evicted = NULL;
+     const int cache_was_full = g.n_textures >= MAX_TEXTURES;
++    const int recycle = ld_tex_recycle_on();   /* patch 2075 */
+     if (!cache_was_full) {
+         index = g.n_textures++;
++        if (recycle) rsx_tex_lru_push_front(&g_ld_tex_lru, g_ld_tex_lru_link, index);
++    } else if (recycle) {   /* patch 2075: the LRU victim without the scan; same counters and log as below */
++        g_ld_texture_cache_full++;
++        index = rsx_tex_lru_victim(&g_ld_tex_lru);
++        evicted = g.textures[index].tex;
++        ld_tex_index_remove(index);
++        g_ld_texture_cache_evictions++;
++        g_ld_tex_evict_n++;
++        if (g_ld_texture_cache_full <= 16 ||
++            (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
++            fprintf(stderr, "[texture-cache] FULL cap=%u lru-evictions=%llu (list)\n", MAX_TEXTURES,
++                    (unsigned long long)g_ld_texture_cache_evictions);
+     } else {
+         /*
+          * A full boot plus a010 binds far more than 128 distinct guest
+@@ -4862,6 +4897,7 @@
+         evicted = g.textures[index].tex;
+         ld_tex_index_remove(index);   /* patch 2033: the slot gets a new key below */
+         g_ld_texture_cache_evictions++;
++        g_ld_tex_evict_n++;   /* patch 2075 */
+         if (g_ld_texture_cache_full <= 16 ||
+             (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
+             fprintf(stderr,
+@@ -4891,15 +4927,20 @@
+     }
+     g_ld_kc_kind = 0;
+     LDW_T0(nw_t0);
++    g_ld_tex_reuse = recycle ? evicted : NULL;   /* patch 2075: upload into the victim's resource when it matches */
+     replacement.tex = decode_guest_texture_profiled(t, remap);
++    g_ld_tex_reuse = NULL;
+     ld_redecode_note(2, t, replacement.span, nw_t0 ? rsx_perf_now() - nw_t0 : 0);   /* patch 2045 diagnostic: new entries */
+     replacement.kc_kind = g_ld_kc_kind;   /* patch 2039 */
+     replacement.kc_sig = g_ld_kc_sig;
+     replacement.raw_argb = g_ld_tex_raw;   /* patch 2046 */
+     if (replacement.tex) {
+         texcache_t* entry = &g.textures[index];
+-        if (evicted)
++        if (evicted && replacement.tex == evicted)
++            g_ld_tex_recycle_n++;   /* patch 2075: same resource, new texels; nothing to retire */
++        else if (evicted)
+             retire_texture(evicted);
++        if (recycle && cache_was_full) rsx_tex_lru_touch(&g_ld_tex_lru, g_ld_tex_lru_link, index);   /* patch 2075 */
+         *entry = replacement;
+         ld_tex_index_insert(index);   /* patch 2033 */
+         write_texture_srv(index, entry);
+@@ -16635,6 +16676,7 @@
+ #endif
+     if (g.dev) g.dev->lpVtbl->Release(g.dev);
+     memset(&g, 0, sizeof(g));
++    rsx_tex_lru_init(&g_ld_tex_lru);   /* patch 2075: the cache is empty again */
+     if (dc.verts) { free(dc.verts); dc.verts = NULL; dc.cap_verts = 0; }
+     if (dc.refs) { free(dc.refs); dc.refs = NULL; dc.cap_refs = 0; }
+     if (dc.compact_verts) {
+--- /dev/null
++++ b/libs/video/rsx_tex_lru.h
+@@ -0,0 +1,51 @@
++/* KZ3 patch 2075: exact LRU order over the live-draw texture cache in O(1).
++ *
++ * The cache picked its eviction victim by scanning every entry for the smallest last_use_serial: 8,192 entries
++ * (~850 KB of texcache_t) per miss once the cache is full. KZ3's SPU jobs write per-object 8x8 fp16 parameter
++ * blocks into a ring in main memory, so every frame binds a few hundred of them at offsets the cache has not seen
++ * (K4: 2,400 new entries a second); each one paid the full scan. This list keeps the same order the serials give
++ * (touch = move to the front, victim = the back), so the victim is the one the scan would have found.
++ *
++ * Intrusive doubly linked list over entry indices; the caller owns the link array (one per entry).
++ * Pure C, no allocation, no locking (the walker thread owns the cache). Host test: tools/smoke/test_tex_lru.sh. */
++#ifndef RSX_TEX_LRU_H
++#define RSX_TEX_LRU_H
++
++#include <stdint.h>
++
++#define RSX_TEX_LRU_NIL 0xFFFFFFFFu
++
++typedef struct { uint32_t prev, next; } rsx_tex_lru_link;   /* prev = more recent, next = less recent */
++typedef struct { uint32_t head, tail; } rsx_tex_lru;        /* head = most recent, tail = least recent */
++
++static inline void rsx_tex_lru_init(rsx_tex_lru* l) { l->head = l->tail = RSX_TEX_LRU_NIL; }
++
++static inline void rsx_tex_lru_unlink(rsx_tex_lru* l, rsx_tex_lru_link* k, uint32_t i)
++{
++    const uint32_t p = k[i].prev, n = k[i].next;
++    if (p != RSX_TEX_LRU_NIL) k[p].next = n; else l->head = n;
++    if (n != RSX_TEX_LRU_NIL) k[n].prev = p; else l->tail = p;
++    k[i].prev = k[i].next = RSX_TEX_LRU_NIL;
++}
++
++/* i must not be in the list */
++static inline void rsx_tex_lru_push_front(rsx_tex_lru* l, rsx_tex_lru_link* k, uint32_t i)
++{
++    k[i].prev = RSX_TEX_LRU_NIL;
++    k[i].next = l->head;
++    if (l->head != RSX_TEX_LRU_NIL) k[l->head].prev = i; else l->tail = i;
++    l->head = i;
++}
++
++/* i is in the list: make it the most recent */
++static inline void rsx_tex_lru_touch(rsx_tex_lru* l, rsx_tex_lru_link* k, uint32_t i)
++{
++    if (l->head == i) return;
++    rsx_tex_lru_unlink(l, k, i);
++    rsx_tex_lru_push_front(l, k, i);
++}
++
++/* least recently used entry, RSX_TEX_LRU_NIL when empty */
++static inline uint32_t rsx_tex_lru_victim(const rsx_tex_lru* l) { return l->tail; }
++
++#endif

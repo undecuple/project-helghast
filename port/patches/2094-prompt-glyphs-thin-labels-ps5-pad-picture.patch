@@ -1,0 +1,380 @@
+diff --git a/libs/video/rsx_keycaps.h b/libs/video/rsx_keycaps.h
+index 5cc4acb3..e3c943e1 100644
+--- a/libs/video/rsx_keycaps.h
++++ b/libs/video/rsx_keycaps.h
+@@ -34,6 +34,11 @@ typedef struct rsx_keycap_source {
+     /* Rasterise `text` (bold UI face) into an 8-bit coverage mask w x h (zeroed by the caller), as large as fits
+      * w x h with the cap height at most max_px; any placement (the caller re-centres on the ink). 0 = nothing. */
+     int (*text_mask)(const char* text, int max_px, unsigned char* mask, int w, int h);
++    /* Patch 2094: the same with the thin label face (Rajdhani Medium, letter-spaced) the PS3 icon labels use;
++     * NULL = the bold face. And the pad variant: 1 = a DualSense (its glyph set shows CREATE where the DualShock 4
++     * shows the touchpad); NULL / 0 = DualShock 4. Both appended: older initialisers leave them NULL. */
++    int (*text_mask_thin)(const char* text, int max_px, unsigned char* mask, int w, int h);
++    int (*pad_variant)(void);
+ } rsx_keycap_source;
+ 
+ static rsx_keycap_source g_kc_src;
+@@ -51,7 +56,7 @@ static int kc_enabled(void)
+     return on && g_kc_have_src;
+ }
+ 
+-enum { KC_NONE = 0, KC_HUD = 1, KC_MENU = 2 };
++enum { KC_NONE = 0, KC_HUD = 1, KC_MENU = 2, KC_CTL = 3 };   /* KC_CTL (patch 2094): the controls page's pad picture */
+ 
+ #define KC_HUD_W 1024u
+ #define KC_HUD_H 512u
+@@ -59,6 +64,9 @@ enum { KC_NONE = 0, KC_HUD = 1, KC_MENU = 2 };
+ #define KC_MENU_W 512u
+ #define KC_MENU_H 128u
+ #define KC_MENU_FNV 0x6211cf01ca168d67ull
++#define KC_CTL_W 512u
++#define KC_CTL_H 256u
++#define KC_CTL_FNV 0x7c99d20bb0f3afebull
+ 
+ /* One cell: the keybinds.ini input whose key it shows, and the rectangle (inclusive). "ls"/"rs" = a stick's four
+  * directions. */
+@@ -101,10 +109,11 @@ static int rsx_keycaps_kind(const uint8_t* src, uint32_t w, uint32_t h, uint32_t
+ {
+     static int dbg = -1;
+     if (dbg < 0) { const char* e = getenv("LD_KEYCAP_DBG"); dbg = (e && e[0] == '1') ? 1 : 0; }
+-    if (!src || !((w == KC_HUD_W && h == KC_HUD_H) || (w == KC_MENU_W && h == KC_MENU_H))) return KC_NONE;
++    if (!src || !((w == KC_HUD_W && h == KC_HUD_H) || (w == KC_MENU_W && h == KC_MENU_H) || (w == KC_CTL_W && h == KC_CTL_H))) return KC_NONE;
+     if (bytes < w * h) return KC_NONE;
+     const uint64_t f = kc_fnv(src, (size_t)w * h);
+-    const int kind = (w == KC_HUD_W && f == KC_HUD_FNV) ? KC_HUD : (w == KC_MENU_W && f == KC_MENU_FNV) ? KC_MENU : KC_NONE;
++    const int kind = (w == KC_HUD_W && f == KC_HUD_FNV) ? KC_HUD : (w == KC_MENU_W && h == KC_MENU_H && f == KC_MENU_FNV) ? KC_MENU
++                   : (w == KC_CTL_W && h == KC_CTL_H && f == KC_CTL_FNV) ? KC_CTL : KC_NONE;
+     if (dbg) fprintf(stderr, "[keycap] dxt5 %ux%u fnv=%016llx kind=%d\n", w, h, (unsigned long long)f, kind);
+     return kind;
+ }
+@@ -423,7 +432,7 @@ static int kc_stick_label(const char* stick, char* out, size_t n)
+ static uint8_t* rsx_keycaps_patch(const uint8_t* src, uint32_t w, uint32_t h, uint32_t bytes, int kind, int* n_cells)
+ {
+     *n_cells = 0;
+-    if (kind == KC_NONE || rsx_keycaps_sig() < 2) return NULL;
++    if ((kind != KC_HUD && kind != KC_MENU) || rsx_keycaps_sig() < 2) return NULL;
+     const kc_cell* cells = kind == KC_HUD ? kc_hud_cells : kc_menu_cells;
+     const unsigned nc = kind == KC_HUD ? sizeof kc_hud_cells / sizeof kc_hud_cells[0] : sizeof kc_menu_cells / sizeof kc_menu_cells[0];
+     /* RSX pass 57: the caps are drawn into a full-size overlay first (in = which texels belong to a drawn cell), then
+diff --git a/libs/video/rsx_prompt_glyphs.h b/libs/video/rsx_prompt_glyphs.h
+index e97d951d..120ee4ed 100644
+--- a/libs/video/rsx_prompt_glyphs.h
++++ b/libs/video/rsx_prompt_glyphs.h
+@@ -28,6 +28,7 @@
+ 
+ enum { PG_PS3 = 0, PG_PS4 = 1, PG_XBOX = 2, PG_KBM = 3, PG_N_SETS = 4 };
+ #define PG_OPT_PS4_SHARE 1u   /* PS4/PS5 SELECT cell shows SHARE instead of the touchpad */
++#define PG_OPT_PS5 4u         /* PG_PS4: a DualSense: SELECT = CREATE (a pill with a label) where the DualShock 4 shows the touchpad (patch 2094) */
+ #define PG_OPT_KBM_2039 2u    /* PG_KBM: 2039's keycaps as shipped (rsx_keycaps_patch) instead of the matched bodies */
+ 
+ /* ---- where the game draws inside each cell ---------------------------------------------------------------------
+@@ -184,10 +185,10 @@ static void pg_mask_at(uint8_t* cell, int cw, int ch, const unsigned char* mk, i
+ static int pg_text(uint8_t* cell, int cw, int ch, const char* t, int cap_px, int mw, int mh, float cx, float cy,
+                    const float c[3], int outline)
+ {
+-    if (!g_kc_have_src || !g_kc_src.text_mask || mw < 2 || mh < 2) return 0;
++    if (!g_kc_have_src || !(g_kc_src.text_mask || g_kc_src.text_mask_thin) || mw < 2 || mh < 2) return 0;
+     unsigned char* mk = (unsigned char*)calloc((size_t)mw * mh, 1);
+     if (!mk) return 0;
+-    const int ok = g_kc_src.text_mask(t, cap_px, mk, mw, mh);
++    const int ok = (g_kc_src.text_mask_thin ? g_kc_src.text_mask_thin : g_kc_src.text_mask)(t, cap_px, mk, mw, mh);
+     if (ok) pg_mask_at(cell, cw, ch, mk, mw, mh, cx, cy, c, outline);
+     free(mk);
+     return ok;
+@@ -234,19 +235,21 @@ typedef enum { PG_ICON_PILL, PG_ICON_TOUCHPAD, PG_ICON_VIEW, PG_ICON_MENU } pg_i
+ 
+ static void pg_icon_label(uint8_t* cell, int cw, int ch, const float bx[4], pg_icon icon, const char* label, int menu)
+ {
++    /* Patch 2094 (layout choice 4): the icon band is taller (0.60 / 0.56 of the box, was 0.55 / 0.50) and the pills and the
++     * View / Menu pictures fill it, so they read at HUD size; the label band is what is left. */
+     const float bh = bx[3] - bx[1], bw = bx[2] - bx[0], cx = (bx[0] + bx[2]) * 0.5f;
+-    const float ih = bh * (menu ? 0.50f : 0.55f), iy = bx[1] + ih * 0.5f;
++    const float ih = bh * (menu ? 0.58f : 0.60f), iy = bx[1] + ih * 0.5f;
+     switch (icon) {
+-    case PG_ICON_PILL:      /* OPTIONS / SHARE: a small upright capsule */
+-        pg_button_body(cell, cw, ch, cx, iy, ih * 0.26f, ih * 0.46f, ih * 0.26f);
++    case PG_ICON_PILL:      /* OPTIONS / SHARE / CREATE: an upright capsule */
++        pg_button_body(cell, cw, ch, cx, iy, ih * 0.34f, ih * 0.5f - 0.3f, ih * 0.34f);
+         break;
+     case PG_ICON_TOUCHPAD:  /* the touchpad: a wide flat rounded box (the game's SELECT pill, wider) */
+-        pg_button_body(cell, cw, ch, cx, iy, bw * 0.36f, ih * 0.44f, ih * 0.24f);
++        pg_button_body(cell, cw, ch, cx, iy, bw * 0.40f, ih * 0.46f, ih * 0.26f);
+         break;
+     case PG_ICON_VIEW: {    /* View: a round button with two overlapping box outlines */
+-        const float r = ih * 0.5f - 0.3f, s = r * 0.40f, st = r > 7.f ? 1.2f : 1.0f;
++        const float r = ih * 0.5f - 0.2f, s = r * 0.50f, st = r > 7.f ? 1.3f : 1.1f;
+         pg_round_body(cell, cw, ch, cx, iy, r);
+-        const float k1[5] = { cx - s * 0.40f, iy - s * 0.40f, s, s * 0.78f, st }, k2[5] = { cx + s * 0.40f, iy + s * 0.40f, s, s * 0.78f, st };
++        const float k1[5] = { cx - s * 0.42f, iy - s * 0.42f, s, s * 0.78f, st }, k2[5] = { cx + s * 0.42f, iy + s * 0.42f, s, s * 0.78f, st };
+         pg_fill(cell, cw, ch, pg_in_box_outline, k1, pg_face_white);
+         const float kb[4] = { k2[0], k2[1], s - st, s * 0.78f - st };     /* the front box hides the back one */
+         const float dark[3] = { 34.f, 34.f, 34.f };
+@@ -254,7 +257,7 @@ static void pg_icon_label(uint8_t* cell, int cw, int ch, const float bx[4], pg_i
+         pg_fill(cell, cw, ch, pg_in_box_outline, k2, pg_face_white);
+         break; }
+     case PG_ICON_MENU: {    /* Menu: a round button with three lines */
+-        const float r = ih * 0.5f - 0.3f, hw = r * 0.48f, st = r > 7.f ? 0.8f : 0.6f, gap = r * 0.32f;
++        const float r = ih * 0.5f - 0.2f, hw = r * 0.56f, st = r > 7.f ? 1.0f : 0.8f, gap = r * 0.38f;
+         pg_round_body(cell, cw, ch, cx, iy, r);
+         for (int i = -1; i <= 1; i++) {
+             const float k[4] = { cx, iy + i * gap, hw, st };
+@@ -262,10 +265,10 @@ static void pg_icon_label(uint8_t* cell, int cw, int ch, const float bx[4], pg_i
+         }
+         break; }
+     }
+-    /* the label: grey with a dark outline on the HUD, lighter grey without on the menu (as the game's labels) */
++    /* the label in the thin face: grey with a dark outline on the HUD, lighter grey without on the menu (as the game's labels) */
+     const float g = menu ? 200.f : 156.f, lc[3] = { g, g, g };
+-    const float ly0 = bx[1] + ih + (menu ? bh * 0.08f : 0.f), lh = bx[3] - ly0;
+-    pg_text(cell, cw, ch, label, (int)(lh * (menu ? 0.80f : 0.72f)), (int)bw, (int)lh + 2, cx, ly0 + lh * 0.5f, lc, menu ? 0 : 1);
++    const float ly0 = bx[1] + ih + (menu ? bh * 0.04f : 0.f), lh = bx[3] - ly0;
++    pg_text(cell, cw, ch, label, (int)(lh * (menu ? 0.84f : 0.80f) + 0.5f), (int)bw, (int)lh + 2, cx, ly0 + lh * 0.5f, lc, menu ? 0 : 1);
+ }
+ 
+ /* The stick-press cell (PS3 L3/R3): a stem with a down arrow above a round knob and a short stem below, the label
+@@ -330,6 +333,7 @@ static int rsx_pg_draw_cell(int set, unsigned opts, const char* in, int menu, ui
+         if (!pg_is(in, "select") && !pg_is(in, "start")) return 0;
+         memset(cell, 0, (size_t)cw * ch * 4);
+         if (pg_is(in, "start")) pg_icon_label(cell, cw, ch, bx, PG_ICON_PILL, "OPTIONS", menu);
++        else if (opts & PG_OPT_PS5) pg_icon_label(cell, cw, ch, bx, PG_ICON_PILL, "CREATE", menu);
+         else if (opts & PG_OPT_PS4_SHARE) pg_icon_label(cell, cw, ch, bx, PG_ICON_PILL, "SHARE", menu);
+         else pg_icon_label(cell, cw, ch, bx, PG_ICON_TOUCHPAD, "TOUCHPAD", menu);
+         return 1;
+@@ -374,6 +378,212 @@ static int rsx_pg_draw_cell(int set, unsigned opts, const char* in, int menu, ui
+     return 0;
+ }
+ 
++/* ---- the controls page's pad picture (patch 2094, layout choice 6) ---------------------------------------------------
++ * The game's controls page shows one 512x256 picture of a DualShock 3 with a leader line from each legend label to
++ * its button (the labels are drawn by the game; their places are the line ends below). KC_CTL = that texture. For
++ * the PS4/PS5 and Xbox sets the port draws its own picture: a simplified body outline, the shoulder bars and the
++ * buttons of that pad, strokes in the game's style (grey body, white buttons and lines), and the leader lines from
++ * the same outer ends, re-aimed at the buttons of the drawn pad. Nothing is copied from the original picture or from
++ * any maker's artwork: shapes are the port's own parametric drawing (leader coordinates measured on the game
++ * texture are numbers only). PS3 keeps the game's own picture. */
++typedef float (*pc_dist_fn)(float x, float y, const float* k);
++
++static float pc_d_seg(float x, float y, float ax, float ay, float bx, float by)
++{
++    const float dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
++    float t = l2 > 0.f ? ((x - ax) * dx + (y - ay) * dy) / l2 : 0.f;
++    t = t < 0.f ? 0.f : t > 1.f ? 1.f : t;
++    const float ex = x - (ax + t * dx), ey = y - (ay + t * dy);
++    return sqrtf(ex * ex + ey * ey);
++}
++/* k = { n, x0, y0, x1, y1, ... } */
++static float pc_d_poly(float x, float y, const float* k)
++{
++    float d = 1e9f;
++    for (int i = 0; i + 1 < (int)k[0]; i++) {
++        const float v = pc_d_seg(x, y, k[1 + 2 * i], k[2 + 2 * i], k[3 + 2 * i], k[4 + 2 * i]);
++        if (v < d) d = v;
++    }
++    return d;
++}
++/* k = { cx, cy, R } */
++static float pc_d_circle(float x, float y, const float* k)
++{
++    const float dx = x - k[0], dy = y - k[1];
++    return sqrtf(dx * dx + dy * dy) - k[2];
++}
++/* k = { cx, cy, hx, hy, r } */
++static float pc_d_rbox(float x, float y, const float* k) { return kc_rbox(x, y, k[0], k[1], k[2], k[3], k[4]); }
++/* k = { cx, cy, arm, half-width, r }: a plus (the d-pad) */
++static float pc_d_plus(float x, float y, const float* k)
++{
++    const float a = kc_rbox(x, y, k[0], k[1], k[2], k[3], k[4]), b = kc_rbox(x, y, k[0], k[1], k[3], k[2], k[4]);
++    return a < b ? a : b;
++}
++/* k = { centre rbox (cx cy hx hy r), left grip (cx cy hx hy r), right grip (cx cy hx hy r) }: the body */
++static float pc_d_body(float x, float y, const float* k)
++{
++    float d = kc_rbox(x, y, k[0], k[1], k[2], k[3], k[4]);
++    for (int g = 1; g < 3; g++) {
++        const float v = kc_rbox(x, y, k[5 * g], k[5 * g + 1], k[5 * g + 2], k[5 * g + 3], k[5 * g + 4]);
++        if (v < d) d = v;
++    }
++    return d;
++}
++
++/* Stroke (hw > 0: the line |d| < hw) or fill (hw < 0: d < 0) of a distance function, grey `lum`, over the bounding
++ * box x0..x1, y0..y1 (the whole image when x1 <= x0). */
++static void pc_draw(uint8_t* img, int w, int h, pc_dist_fn fn, const float* k, float hw, float lum,
++                    int x0, int y0, int x1, int y1)
++{
++    if (x1 <= x0) { x0 = 0; y0 = 0; x1 = w; y1 = h; }
++    if (x0 < 0) x0 = 0;
++    if (y0 < 0) y0 = 0;
++    if (x1 > w) x1 = w;
++    if (y1 > h) y1 = h;
++    for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) {
++        const float d = fn(x + 0.5f, y + 0.5f, k);
++        const float cov = hw > 0.f ? kc_clamp01(hw + 0.5f - fabsf(d)) : kc_clamp01(0.5f - d);
++        if (cov > 0.f) kc_over(img + ((size_t)y * w + x) * 4, lum, lum, lum, cov);
++    }
++}
++static void pc_line(uint8_t* img, int w, int h, const float* pts, int n, float lum)
++{
++    float k[32];
++    k[0] = (float)n;
++    float mnx = 1e9f, mny = 1e9f, mxx = -1e9f, mxy = -1e9f;
++    for (int i = 0; i < 2 * n; i++) k[1 + i] = pts[i];
++    for (int i = 0; i < n; i++) {
++        if (pts[2 * i] < mnx) mnx = pts[2 * i];
++        if (pts[2 * i] > mxx) mxx = pts[2 * i];
++        if (pts[2 * i + 1] < mny) mny = pts[2 * i + 1];
++        if (pts[2 * i + 1] > mxy) mxy = pts[2 * i + 1];
++    }
++    pc_draw(img, w, h, pc_d_poly, k, 0.62f, lum, (int)mnx - 2, (int)mny - 2, (int)mxx + 3, (int)mxy + 3);
++}
++static void pc_ring(uint8_t* img, int w, int h, float cx, float cy, float r, float hw, float lum)
++{
++    const float k[3] = { cx, cy, r };
++    pc_draw(img, w, h, pc_d_circle, k, hw, lum, (int)(cx - r) - 3, (int)(cy - r) - 3, (int)(cx + r) + 4, (int)(cy + r) + 4);
++}
++static void pc_rbox(uint8_t* img, int w, int h, float cx, float cy, float hx, float hy, float r, float hw, float lum)
++{
++    const float k[5] = { cx, cy, hx, hy, r };
++    pc_draw(img, w, h, pc_d_rbox, k, hw, lum, (int)(cx - hx) - 3, (int)(cy - hy) - 3, (int)(cx + hx) + 4, (int)(cy + hy) + 4);
++}
++
++/* The leader lines: outer end, optional bend, button end. One row per legend entry, in the game's picture the lines
++ * of: L2, L1, R2, R1 (the shoulder bars), d-pad up, d-pad centre, d-pad left, d-pad down, left stick, SELECT, right
++ * stick, triangle, square, circle, cross. Outer ends are the same for every set (the labels are the game's). */
++typedef struct { int n; float p[8]; } pc_lead;
++enum { PCL_L2, PCL_L1, PCL_R2, PCL_R1, PCL_DUP, PCL_DMID, PCL_DLEFT, PCL_DDOWN, PCL_LS, PCL_SEL, PCL_RS, PCL_TRI, PCL_SQR,
++       PCL_CIR, PCL_CRS, PCL_N };
++
++/* Button places of a pad: shared by the leader targets and the shapes. */
++typedef struct {
++    float body[15];                     /* pc_d_body */
++    float l2[4], l1[4], r2[4], r1[4];   /* shoulder bars: cx cy hx hy */
++    float dpad[2], ls[2], rs[2], tri[2], sqr[2], cir[2], crs[2];
++} pc_layout;
++
++static void pc_layout_of(int xbox, pc_layout* L)
++{
++    static const float ps[15] = { 256.f, 112.f, 150.f, 66.f, 52.f, 124.f, 172.f, 44.f, 68.f, 42.f, 388.f, 172.f, 44.f, 68.f, 42.f };
++    static const float xb[15] = { 256.f, 108.f, 144.f, 64.f, 56.f, 118.f, 172.f, 42.f, 66.f, 40.f, 394.f, 172.f, 42.f, 66.f, 40.f };
++    memcpy(L->body, xbox ? xb : ps, sizeof ps);
++    const float l2[4] = { 159.f, 16.f, 24.f, 10.f }, l1[4] = { 155.f, 36.5f, 23.f, 9.5f };
++    const float r2[4] = { 343.f, 16.f, 24.f, 10.f }, r1[4] = { 347.f, 36.5f, 23.f, 9.5f };
++    memcpy(L->l2, l2, sizeof l2); memcpy(L->l1, l1, sizeof l1); memcpy(L->r2, r2, sizeof r2); memcpy(L->r1, r1, sizeof r1);
++    /* the same button places for every pad: the leader lines (and the game's labels) fix them */
++    const float dp[2] = { 153.f, 117.f }, ls[2] = { 207.f, 172.f }, rs[2] = { 296.f, 172.f }, tri[2] = { 349.f, 89.f },
++                sq[2] = { 322.f, 117.f }, ci[2] = { 378.f, 117.f }, cr[2] = { 349.f, 146.f };
++    memcpy(L->dpad, dp, sizeof dp); memcpy(L->ls, ls, sizeof ls); memcpy(L->rs, rs, sizeof rs); memcpy(L->tri, tri, sizeof tri);
++    memcpy(L->sqr, sq, sizeof sq); memcpy(L->cir, ci, sizeof ci); memcpy(L->crs, cr, sizeof cr);
++}
++
++static void pc_leads(const pc_layout* L, float sel_x, float sel_y, pc_lead out[PCL_N])
++{
++    const pc_lead t[PCL_N] = {
++        [PCL_L2]    = { 2, { 105.f, 2.f, L->l2[0] - L->l2[2] + 1.f, 12.f } },
++        [PCL_L1]    = { 2, { 105.f, 24.f, L->l1[0] - L->l1[2] + 1.f, 33.f } },
++        [PCL_R2]    = { 2, { 399.f, 2.f, L->r2[0] + L->r2[2] - 1.f, 12.f } },
++        [PCL_R1]    = { 2, { 399.f, 24.f, L->r1[0] + L->r1[2] - 1.f, 33.f } },
++        [PCL_DUP]   = { 2, { 49.f, 90.f, L->dpad[0] - 9.f, 90.f } },
++        [PCL_DMID]  = { 3, { 78.f, 117.f, 88.f, 110.f, L->dpad[0], 110.f } },
++        [PCL_DLEFT] = { 3, { 23.f, 153.f, 82.f, 153.f, L->dpad[0] - 25.f, L->dpad[1] + 10.f } },
++        [PCL_DDOWN] = { 3, { 48.f, 187.f, 80.f, 187.f, L->dpad[0] - 1.f, L->dpad[1] + 30.f } },
++        [PCL_LS]    = { 2, { 140.f, 251.f, L->ls[0] - 17.f, L->ls[1] + 17.f } },
++        [PCL_SEL]   = { 4, { 213.f, 215.f, 250.f, 159.f, 250.f, sel_y, sel_x, sel_y } },
++        [PCL_RS]    = { 2, { 364.f, 251.f, L->rs[0] + 17.f, L->rs[1] + 17.f } },
++        [PCL_TRI]   = { 2, { 466.f, 86.f, L->tri[0] + 14.f, 86.f } },
++        [PCL_SQR]   = { 3, { L->sqr[0] + 8.f, 114.f, 423.f, 114.f, 435.f, 121.f } },
++        [PCL_CIR]   = { 3, { 491.f, 155.f, 427.f, 155.f, L->cir[0] + 2.f, L->cir[1] + 14.f } },
++        [PCL_CRS]   = { 3, { 463.f, 188.f, 412.f, 188.f, L->crs[0] + 6.f, L->crs[1] + 12.f } },
++    };
++    memcpy(out, t, sizeof t);
++}
++
++/* The picture of a pad into an RGBA image w x h (cleared here), PG_PS4 (DualShock 4 / DualSense) or PG_XBOX. */
++static void rsx_pg_draw_pad(int set, unsigned opts, uint8_t* img, int w, int h)
++{
++    (void)opts;
++    const int xbox = set == PG_XBOX;
++    pc_layout L;
++    pc_layout_of(xbox, &L);
++    memset(img, 0, (size_t)w * h * 4);
++    const float G = 112.f, W = 255.f;     /* body grey, button white */
++    pc_draw(img, w, h, pc_d_body, L.body, 1.0f, G, 0, 0, 0, 0);
++    /* shoulder bars */
++    const float* bar[4] = { L.l2, L.l1, L.r2, L.r1 };
++    const char* nm_ps[4] = { "L2", "L1", "R2", "R1" }, * nm_xb[4] = { "LT", "LB", "RT", "RB" };
++    for (int i = 0; i < 4; i++) {
++        pc_rbox(img, w, h, bar[i][0], bar[i][1], bar[i][2], bar[i][3], xbox && (i & 1) == 0 ? 8.f : 5.f, 1.0f, W);
++        const float c[3] = { 200.f, 200.f, 200.f };
++        pg_text(img, w, h, xbox ? nm_xb[i] : nm_ps[i], (int)(bar[i][3] * 0.9f), (int)(bar[i][2] * 1.2f), (int)(bar[i][3] * 1.5f), bar[i][0], bar[i][1], c, 0);
++    }
++    /* d-pad, sticks, face buttons */
++    const float dk[5] = { L.dpad[0], L.dpad[1], 30.f, 10.f, 4.f };
++    pc_draw(img, w, h, pc_d_plus, dk, 1.0f, W, 118, 80, 190, 152);
++    pc_ring(img, w, h, L.ls[0], L.ls[1], 24.f, 1.0f, W);
++    pc_ring(img, w, h, L.ls[0], L.ls[1], 32.f, 0.8f, G);
++    pc_ring(img, w, h, L.rs[0], L.rs[1], 24.f, 1.0f, W);
++    pc_ring(img, w, h, L.rs[0], L.rs[1], 32.f, 0.8f, G);
++    const float* fb[4] = { L.tri, L.sqr, L.cir, L.crs };
++    for (int i = 0; i < 4; i++) pc_ring(img, w, h, fb[i][0], fb[i][1], 14.f, 1.0f, W);
++    float sel_x = 232.f, sel_y = 114.f;
++    if (xbox) {
++        /* face letters in the Xbox colours, View / Menu round buttons, the Guide button */
++        const struct { const float* at; const char* t; const float* c; } f[4] = {
++            { L.tri, "Y", pg_xb_y }, { L.sqr, "X", pg_xb_x }, { L.cir, "B", pg_xb_b }, { L.crs, "A", pg_xb_a } };
++        for (int i = 0; i < 4; i++) pg_text(img, w, h, f[i].t, 14, 20, 20, f[i].at[0], f[i].at[1], f[i].c, 0);
++        pc_ring(img, w, h, 232.f, 120.f, 8.f, 1.0f, W);
++        pc_ring(img, w, h, 280.f, 120.f, 8.f, 1.0f, W);
++        pc_ring(img, w, h, 256.f, 82.f, 12.f, 1.0f, W);
++    } else {
++        /* touchpad, Share/Create and Options pills, the PS button */
++        pc_rbox(img, w, h, 256.f, 92.f, 44.f, 24.f, 9.f, 1.0f, W);
++        pc_rbox(img, w, h, 198.f, 98.f, 4.f, 9.f, 4.f, 1.0f, W);
++        pc_rbox(img, w, h, 314.f, 98.f, 4.f, 9.f, 4.f, 1.0f, W);
++        pc_ring(img, w, h, 256.f, 142.f, 10.f, 1.0f, G);
++        /* the four symbols (drawn, not copied: a triangle, a square, a circle and a cross) */
++        {
++            const float S = 235.f, tx = L.tri[0], ty = L.tri[1];
++            const float tri[1 + 8] = { 4.f, tx, ty - 7.f, tx + 6.5f, ty + 4.5f, tx - 6.5f, ty + 4.5f, tx, ty - 7.f };
++            pc_draw(img, w, h, pc_d_poly, tri, 0.9f, S, (int)tx - 10, (int)ty - 10, (int)tx + 11, (int)ty + 9);
++            pc_rbox(img, w, h, L.sqr[0], L.sqr[1], 5.5f, 5.5f, 0.5f, 0.9f, S);
++            pc_ring(img, w, h, L.cir[0], L.cir[1], 6.f, 0.9f, S);
++            const float c1[1 + 4] = { 2.f, L.crs[0] - 5.5f, L.crs[1] - 5.5f, L.crs[0] + 5.5f, L.crs[1] + 5.5f };
++            const float c2[1 + 4] = { 2.f, L.crs[0] + 5.5f, L.crs[1] - 5.5f, L.crs[0] - 5.5f, L.crs[1] + 5.5f };
++            pc_draw(img, w, h, pc_d_poly, c1, 0.9f, S, (int)L.crs[0] - 9, (int)L.crs[1] - 9, (int)L.crs[0] + 10, (int)L.crs[1] + 10);
++            pc_draw(img, w, h, pc_d_poly, c2, 0.9f, S, (int)L.crs[0] - 9, (int)L.crs[1] - 9, (int)L.crs[0] + 10, (int)L.crs[1] + 10);
++        }
++        sel_y = 112.f;
++    }
++    pc_lead lead[PCL_N];
++    pc_leads(&L, sel_x, sel_y, lead);
++    for (int i = 0; i < PCL_N; i++) pc_line(img, w, h, lead[i].p, lead[i].n, W);
++}
++
+ /* Write an RGBA cell into the BC3 atlas `out` (w wide): the blocks under the cell are decoded, the cell's texels
+  * replaced and the blocks re-encoded (2039's encoder), so texels outside the cell keep their colours up to BC3
+  * precision and blocks outside the cell are untouched. */
+@@ -403,6 +613,24 @@ static uint8_t* rsx_pg_patch(const uint8_t* src, uint32_t w, uint32_t h, uint32_
+ {
+     *n_cells = 0;
+     if (kind == KC_NONE || set <= PG_PS3 || set >= PG_N_SETS) return NULL;
++    if (set == PG_PS4 && g_kc_have_src && g_kc_src.pad_variant && g_kc_src.pad_variant() == 1) opts |= PG_OPT_PS5;
++    if (kind == KC_CTL) {   /* the controls page's pad picture: PS4/PS5 and Xbox draw their own, keyboard keeps the game's */
++        if (set != PG_PS4 && set != PG_XBOX) return NULL;
++        if (bytes < w * h || w < 4 || h < 4) return NULL;
++        uint8_t* o = (uint8_t*)malloc(bytes);
++        uint8_t* rgba = (uint8_t*)malloc((size_t)w * h * 4);
++        if (!o || !rgba) { free(o); free(rgba); return NULL; }
++        memcpy(o, src, bytes);
++        rsx_pg_draw_pad(set, opts, rgba, (int)w, (int)h);
++        for (uint32_t by = 0; by < h / 4; by++) for (uint32_t bx = 0; bx < w / 4; bx++) {
++            uint8_t px[16][4];
++            for (int i = 0; i < 16; i++) memcpy(px[i], rgba + (((size_t)by * 4 + (i >> 2)) * w + bx * 4 + (i & 3)) * 4, 4);
++            kc_bc3_encode(px, o + ((size_t)by * (w / 4) + bx) * 16);
++        }
++        free(rgba);
++        *n_cells = 1;
++        return o;
++    }
+     if (set == PG_KBM && (opts & PG_OPT_KBM_2039)) return rsx_keycaps_patch(src, w, h, bytes, kind, n_cells);
+     if (bytes < w * h) return NULL;
+     const kc_cell* cells = kind == KC_HUD ? kc_hud_cells : kc_menu_cells;

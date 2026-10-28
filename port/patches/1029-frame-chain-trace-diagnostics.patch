@@ -1,0 +1,193 @@
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index a2a2deda..fa36290a 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -25,6 +25,10 @@ static u32 s_gcm_context_ea = 0;
+ #include <stdio.h>
+ #include <time.h>
+ static void gcm_walker_user_command(u32 cmd);
++/* KZ3 patch 1029 diagnostic, KZ3_FTRACE=1: one line per frame-chain event (walker user command, pump delivery
++ * and handler return, park start/patch, NV406E release of label KZ3_FTRACE_LABEL (default 0x4B)), host ms. */
++extern unsigned long long ps3_ms_now(void);
++static int kz3_ft_on(void) { static int on = -1; if (on < 0) { const char* e = getenv("KZ3_FTRACE"); on = (e && *e && *e != '0') ? 1 : 0; } return on; }
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdint.h>
+@@ -878,8 +882,10 @@ void ppu_gcm_pump(void)
+     }
+     if (user) {
+         u32 cmd = (u32)user;
++        if (kz3_ft_on()) fprintf(stderr, "[ft] %llu deliver cmd=0x%08X opd=0x%08X\n", ps3_ms_now(), cmd, s_user_handler_opd);
+         if (s_user_handler_opd && g_ps3_guest_caller)
+             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
++        if (kz3_ft_on()) fprintf(stderr, "[ft] %llu handled cmd=0x%08X\n", ps3_ms_now(), cmd);
+     }
+     GCM_PUMP_LEAVE();
+ }
+@@ -2444,13 +2450,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                       if (pw < 0) { const char* e = getenv("GCM_PARK_WAIT_MS"); pw = e ? atoi(e) : 30000; }
+                       u64 now = get_timestamp_ns();
+                       if (s_park_off != s_fifo_getoff) { s_park_off = s_fifo_getoff; s_park_t0 = now;
+-                                                         s_park_put = put; s_park_putchg = 0; }
++                                                         s_park_put = put; s_park_putchg = 0;
++                          if (kz3_ft_on()) fprintf(stderr, "[ft] %llu park io=0x%08X ea=0x%08X put=0x%08X\n", ps3_ms_now(),
++                                                   s_fifo_getoff, gcm_io2ea(s_fifo_getoff), put); }
+                       else if (put != s_park_put) { s_park_put = put; s_park_putchg++; }
+                       if (pw > 0 && now - s_park_t0 < (u64)pw * 1000000ull) { why = "park-wait"; s_park_pass = 1; break; }
+                       /* v0.18.0 (upstream f8255191): read the park again before giving up on it; an SPU job
+                        * filling a command-buffer hole may land between this pass's read and the resync. */
+                       if (vm_read32(gcm_io2ea(s_fifo_getoff)) != w) { why = "park-wait"; s_park_pass = 1; break; }
+                       s_park_off = 0xFFFFFFFFu;
++                      if (kz3_ft_on()) fprintf(stderr, "[ft] %llu park-timeout io=0x%08X put=0x%08X\n", ps3_ms_now(), s_fifo_getoff, put);
+                       { static int pn = 0; if (pw > 0 && pn++ < 8)
+                           fprintf(stderr, "[cellGcmSys] park 0x%08X not patched within %d ms (put moved %u times) -- resyncing\n",
+                                   s_fifo_getoff, pw, s_park_putchg); }
+@@ -2524,6 +2533,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                       fprintf(stderr, "[park-late] park 0x%08X patched after %llu ms (put moved %u times) -> 0x%08X\n",
+                               s_fifo_getoff, (unsigned long long)ms, s_park_putchg, tgt);
+                   if (ms > s_pmax) s_pmax = ms;
++                  if (kz3_ft_on()) fprintf(stderr, "[ft] %llu unpark io=0x%08X after %llu ms -> 0x%08X\n", ps3_ms_now(),
++                                           s_fifo_getoff, (unsigned long long)ms, tgt);
+               }
+               s_park_off = 0xFFFFFFFFu;
+               kz3_pt_jump(s_fifo_getoff, tgt, put);   /* KZ3 patch 1009 diagnostic */
+@@ -2605,6 +2616,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         static int slog = -2;
+                         static u32 scnt[0x1000];
+                         if (slog == -2) { const char* e = getenv("GCM_SEMA_LOG"); slog = e ? atoi(e) : -1; }
++                        if (kz3_ft_on() && m == 0x6Cu) { static int fl = -1;
++                            if (fl < 0) { const char* e = getenv("KZ3_FTRACE_LABEL"); fl = e ? (int)strtoul(e, 0, 16) : 0x4B; }
++                            if ((int)((s_sema_offset & 0xFFFFu) >> 4) == fl)
++                                fprintf(stderr, "[ft] %llu release label 0x%X v=0x%X get=0x%08X\n", ps3_ms_now(), fl, v, s_fifo_getoff); }
+                         if (slog >= 0) {
+                             u32 li = (s_sema_offset & 0xFFFFu) >> 4, c = ++scnt[li];
+                             if (c <= (u32)slog || (c & 1023u) == 0)
+@@ -4464,6 +4479,9 @@ static void gcm_walker_user_command(u32 cmd)
+         { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
+ #endif
+     }
++    if (kz3_ft_on()) { u64 o = GCM_USER_PENDING_PEEK();
++        fprintf(stderr, "[ft] %llu ucmd cmd=0x%08X get=0x%08X pending=%s0x%08X\n", ps3_ms_now(), cmd, s_fifo_getoff,
++                o ? "STILL " : "", (u32)o); }
+     { u64 old = GCM_USER_PENDING_PEEK(); static int n = 0;
+       if (old && n++ < 8) fprintf(stderr, "[usercmd] pending 0x%08X not taken in 50 ms; replaced by 0x%08X\n",
+                                   (u32)old, cmd); }
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index dedffcc1..7961c8a0 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -226,7 +226,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+             uint32_t lo = g_spu_dma_watch_lo[i], hi = g_spu_dma_watch_hi[i];
+             if (!hi || (uint32_t)ea >= hi || (uint32_t)ea + size <= lo) continue;
+             long c = __atomic_add_fetch(&g_spu_dma_watch_hits[i], 1, __ATOMIC_RELAXED);
+-            if (c > 24 && (c & 255) != 0) continue;
++            /* KZ3 patch 1029: SPU_DMAW_ALL=1 reports every hit (with host ms) instead of 24 + every 256th. */
++            static int s_all = -1; if (s_all < 0) s_all = getenv("SPU_DMAW_ALL") ? 1 : 0;
++            if (!s_all && c > 24 && (c & 255) != 0) continue;
++            if (s_all) { extern unsigned long long ps3_ms_now(void); fprintf(stderr, "[ft] %llu ", ps3_ms_now()); }
+             uint32_t first = (uint32_t)ea > lo ? (uint32_t)ea : lo, v = 0;
+             if (mfc_is_put(cmd)) {
+                 if (lo >= (uint32_t)ea) { const uint8_t* q = spu->ls + ((lsa + (lo - (uint32_t)ea)) & SPU_LS_MASK);
+@@ -238,6 +241,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                     (uint32_t)spu->pc & SPU_LS_MASK, first - lo, v);
+         }
+     }
++    /* KZ3 patch 1029 diagnostic, SPU_DMA_PC=<hex>[,<hex>]: every transfer issued at one of these SPU pcs (e.g.
++     * 0x4260, KZ3 job 36's 4-byte PUT that patches a frame park), with host ms and the first LS/guest word. */
++    { static uint32_t s_pc[4]; static int s_npc = -1;
++      if (s_npc < 0) { const char* e = getenv("SPU_DMA_PC"); s_npc = 0;
++          while (e && *e && s_npc < 4) { char* d; uint32_t v = (uint32_t)strtoul(e, &d, 16); if (d == e) break;
++              s_pc[s_npc++] = v; e = (*d == ',') ? d + 1 : d; } }
++      for (int i = 0; i < s_npc; i++) if (((uint32_t)spu->pc & SPU_LS_MASK) == s_pc[i]) {
++          extern unsigned long long ps3_ms_now(void);
++          const uint8_t* q = spu->ls + (lsa & SPU_LS_MASK);
++          fprintf(stderr, "[ft] %llu spu%u img=%d pc=0x%05X %s ea=0x%08X size=0x%X lsa=0x%05X lsword=0x%08X\n",
++                  ps3_ms_now(), spu->spu_id & 7u, spu->image_id, s_pc[i], mfc_is_put(cmd) ? "PUT" : "GET", (uint32_t)ea, size, lsa,
++                  (uint32_t)q[0] << 24 | q[1] << 16 | q[2] << 8 | q[3]);
++          break; } }
+     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
+      * this guest address. A DMA landing in the loaded ELF image is always a
+      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index 15884a50..c9502c2d 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -312,6 +312,11 @@ static void kz3_semdump_now(const char* why)
+     uint32_t r28 = s_sd_r[0], r29 = s_sd_r[1], r30 = s_sd_r[2], r31 = s_sd_r[3];
+     fprintf(stderr, "[semdump] %s r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", why, r28, r29, r30, r31);
+     kz3_semdump_region("sem", r30, 0x10);
++    /* KZ3 patch 1029: a Havok semaphore (0x8E88E4) keeps its (waiters << 16 | count) word at [r30+4]. */
++    if (r30 >= 0x10000u && r30 < 0xF0000000u) { uint32_t wp = sd_rd32(r30 + 4u);
++        if (wp >= 0x10000u && wp < 0xF0000000u)
++            fprintf(stderr, "[semdump] semword [0x%08X]=0x%08X (waiters %u, count %u) port=0x%X queue=0x%X\n", wp, sd_rd32(wp),
++                    sd_rd32(wp) >> 16, sd_rd32(wp) & 0xFFFFu, sd_rd32(r30 + 8u), sd_rd32(r30 + 12u)); }
+     kz3_semdump_region("r29", r29, 0x380);
+     kz3_semdump_region("r28", r28, 0x100);
+     if (r29 >= 0x10000u && r29 < 0xF0000000u)
+@@ -338,6 +343,10 @@ void kz3_semdump_note(uint32_t r28, uint32_t r29, uint32_t r30, uint32_t r31, ui
+ #endif
+ }
+ 
++/* KZ3 patch 1029 diagnostic, KZ3_EVQ_TRACE=<queue id>: every push into that queue (rc, count/capacity, data) and
++ * every receive that returns from it (tid, data), with host ms; first 4000 lines. */
++static int kz3_evq_trace_q(void) { static int q = -2; if (q == -2) { const char* e = getenv("KZ3_EVQ_TRACE"); q = e ? atoi(e) : -1; } return q; }
++static volatile long kz3_evq_lines;
+ int64_t sys_event_queue_receive(ppu_context* ctx)
+ {
+     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
+@@ -352,6 +361,18 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+                 queue_id, (unsigned long long)timeout_us,
+                 (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+ 
++    /* KZ3 patch 1029 diagnostic, WAITBT_LR=<hex>[,<hex>]: guest stack + back chain of the first WAITBT_LR_N (default 4)
++     * receives whose guest lr is one of these, only when sp >= WAITBT_LR_SPMIN (hex, default 0): who called a wait. */
++    { static uint32_t s_lr[4], s_spmin; static int s_nlr = -1, s_left;
++      if (s_nlr < 0) { const char* e = getenv("WAITBT_LR"); s_nlr = 0;
++          while (e && *e && s_nlr < 4) { char* d; s_lr[s_nlr++] = (uint32_t)strtoul(e, &d, 16); if (d == e) break; e = (*d == ',') ? d + 1 : d; }
++          { const char* n = getenv("WAITBT_LR_N"); s_left = n ? atoi(n) : 4; }
++          { const char* m = getenv("WAITBT_LR_SPMIN"); s_spmin = m ? (uint32_t)strtoul(m, 0, 16) : 0; } }
++      for (int i = 0; i < s_nlr; i++)
++          if ((uint32_t)ctx->lr == s_lr[i] && (uint32_t)ctx->gpr[1] >= s_spmin && s_left > 0) {
++              s_left--; extern void ppu_dump_guest_stack(ppu_context*, const char*);
++              char tag[64]; snprintf(tag, sizeof tag, "waitlr tid=%llu q=%u", (unsigned long long)ctx->thread_id, queue_id);
++              ppu_dump_guest_stack(ctx, tag); break; } }
+     /* SEMDUMP_LR=<hex>: a receive whose guest lr is that address (a semaphore acquire's return site, e.g.
+      * KZ3's Havok 0x8E8A84) dumps r28..r31 and the guest memory they point at (0x380 bytes at r29, 0x100 at
+      * r28, 0x10 at r30, and the 16-byte objects whose pointers sit at r29+0x90..+0x9C), then again every
+@@ -675,6 +696,11 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+         out[2] = bswap64(evt.data2);
+         out[3] = bswap64(evt.data3);
+     }
++    { if (kz3_evq_trace_q() == (int)queue_id && __sync_add_and_fetch(&kz3_evq_lines, 1) <= 4000) {
++        extern unsigned long long ps3_ms_now(void);
++        fprintf(stderr, "[evq] %llu recv q=%u tid=%llu lr=0x%08X src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX left=%u\n", ps3_ms_now(),
++                queue_id, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr, (unsigned long long)evt.source,
++                (unsigned long long)evt.data1, (unsigned long long)evt.data2, (unsigned long long)evt.data3, q->count); } }
+     /* Diagnostic: prove the blocked receiver was WOKEN and is returning an event
+      * (vs. staying blocked forever). Distinguishes a wake bug from game logic. */
+     /* Was hardcoded to queue 1, which makes every other queue look silent: the
+@@ -826,6 +852,10 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
+ #endif
+ 
+     if (q->count >= q->capacity) {
++        if (kz3_evq_trace_q() == (int)(q - g_sys_event_queues) + 1 && __sync_add_and_fetch(&kz3_evq_lines, 1) <= 4000) {
++            extern unsigned long long ps3_ms_now(void);
++            fprintf(stderr, "[evq] %llu push q=%d FULL (%u) src=0x%llX d1=0x%llX\n", ps3_ms_now(), kz3_evq_trace_q(),
++                    (unsigned)q->capacity, (unsigned long long)evt->source, (unsigned long long)evt->data1); }
+ #ifdef _WIN32
+         LeaveCriticalSection(&q->lock);
+ #else
+@@ -837,6 +867,11 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
+     q->buffer[q->tail] = *evt;
+     q->tail = (q->tail + 1) % q->capacity;
+     q->count++;
++    if (kz3_evq_trace_q() == (int)(q - g_sys_event_queues) + 1 && __sync_add_and_fetch(&kz3_evq_lines, 1) <= 4000) {
++        extern unsigned long long ps3_ms_now(void);
++        fprintf(stderr, "[evq] %llu push q=%d src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX count=%u/%u\n", ps3_ms_now(),
++                kz3_evq_trace_q(), (unsigned long long)evt->source, (unsigned long long)evt->data1,
++                (unsigned long long)evt->data2, (unsigned long long)evt->data3, (unsigned)q->count, (unsigned)q->capacity); }
+ 
+ #ifdef _WIN32
+     WakeConditionVariable(&q->not_empty);

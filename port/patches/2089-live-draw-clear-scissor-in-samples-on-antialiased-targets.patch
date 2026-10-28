@@ -1,0 +1,53 @@
+gcm/live-draw: CLEAR_SURFACE scissor scaled to the sample grid of an antialiased target (LD_CLEAR_AA_SCISSOR=0 old).
+
+Symptom (Killzone 2, Corinth River): once the level fades in, the right half of the 1280x720 picture is white or a
+smear, with an edge at x = 640.
+
+Cause: patch 2006 limits a clear to the surface clip and the guest scissor. An antialiased surface is held at its
+sample resolution (rsx_dispatch.h: clip_x/w and clip_y/h are already multiplied by aa_sx/aa_sy), but the scissor
+register stays in pixels, and the clear took it as samples. Killzone 2 clears its 2560x720 sample depth (0x25B0000,
+DIAGONAL_CENTERED_2, 1280x720 pixels) with scissor 1280x720 every frame: only the left 1280 samples were cleared, so
+the right half kept old depth, the G-buffer pass failed the depth test there (only the first-person weapon, nearer
+than the stale depth, was drawn), and the lighting and the resolve showed last frames' white. The draw path already
+scales the scissor by aa_sx/aa_sy; the clear now does the same.
+From our Killzone 2 port (its patch 2089). KZ3: both RPCS3 level captures (2026-10-08) issue no CLEAR_SURFACE while
+an antialiased format is set; the 320x180 SQUARE_ROTATED_4 pass is cleared (mask 0x01) through a 640x360 1x1 view of
+the same memory (format 0x128, colour 0x16C0000, zeta 0x2980000, scissor 640x360), so KZ3's clears do not change.
+Log: `[clear-aa]` once with the switch state, then the first 8 clears of an antialiased surface (offset, mask, clip,
+scissor, rectangle).
+
+Upstream candidate (general: any title that clears an antialiased surface with a scissor set).
+Verification: Killzone 2 under Proton (their runtime pass 20); KZ3 see the RE notes "Pass 84".
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -13853,12 +13853,27 @@
+           if (g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] || g.rsx.seen[M_SCISSOR_VERTICAL >> 2]) {
+               const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+               const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+-              const LONG sx = (LONG)(sh & 0xFFFFu), sw = (LONG)(sh >> 16);
+-              const LONG sy = (LONG)(sv & 0xFFFFu), svh = (LONG)(sv >> 16);
++              /* Patch 2089 (from our Killzone 2 port): the scissor is in pixels, the clip of an antialiased surface
++               * in samples (as the draw path's scissor; LD_CLEAR_AA_SCISSOR=0 = old: pixels taken as samples). */
++              static int aa_on = -1;
++              if (aa_on < 0) { const char* e = getenv("LD_CLEAR_AA_SCISSOR"); aa_on = e ? atoi(e) != 0 : 1;
++                               fprintf(stderr, "[clear-aa] clear scissor scaled to the sample grid: %s\n",
++                                       aa_on ? "on" : "off (LD_CLEAR_AA_SCISSOR=0)"); }
++              const LONG ax = aa_on ? (LONG)csf.aa_sx : 1, ay = aa_on ? (LONG)csf.aa_sy : 1;
++              const LONG sx = (LONG)(sh & 0xFFFFu) * ax, sw = (LONG)(sh >> 16) * ax;
++              const LONG sy = (LONG)(sv & 0xFFFFu) * ay, svh = (LONG)(sv >> 16) * ay;
+               if (sx > l) l = sx;
+               if (sy > t) t = sy;
+               if (sx + sw < r) r = sx + sw;
+               if (sy + svh < b) b = sy + svh;
++              if (csf.aa_sx * csf.aa_sy > 1u) {   /* which clears of an antialiased surface this touches (first 8) */
++                  static u32 aa_logs;
++                  if (aa_logs++ < 8)
++                      fprintf(stderr, "[clear-aa] frame=%u 0x%X mask=0x%02X clip %ux%u samples (grid %ux%u) scissor "
++                              "%u,%u %ux%u px -> rect %ld,%ld-%ld,%ld\n", g_ld_frames, g.surfaces[target].offset, mask,
++                              csf.clip_w, csf.clip_h, csf.aa_sx, csf.aa_sy, sh & 0xFFFFu, sv & 0xFFFFu, sh >> 16, sv >> 16,
++                              (long)l, (long)t, (long)r, (long)b);
++              }
+           }
+           if (r <= l || b <= t) return;   /* empty rectangle: the clear writes nothing */
+           crect.left = l; crect.top = t; crect.right = r; crect.bottom = b;

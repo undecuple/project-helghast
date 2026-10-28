@@ -1,0 +1,138 @@
+diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -291,6 +291,35 @@
+  * frame waits on it), so the vblank rate sets the cap: 16 ms (62.5 Hz, the port's tick before 2107) = 30, 8 = 60, 4 = 120. */
+ static inline unsigned rsx_dm_fps_vblank_ms(int fps) { return fps == RSX_DM_FPS_120 ? 4u : fps == RSX_DM_FPS_60 ? 8u : 16u; }
+ 
++/* KZ3 patch 2109 (RSX pass 103): field of view (ENHANCEMENT, opt-in; port/kz3/main.cpp applies it in the camera
++ * writer). 0 = default (the game's own); else the horizontal FOV in degrees at 16:9 for the first-person view, 70-110 in
++ * steps of 5 (the row's values; a hand-edited file may hold any whole number in that range). */
++#define RSX_DM_FOV_MIN 70
++#define RSX_DM_FOV_MAX 110
++static inline int rsx_dm_parse_fov(const char* s)   /* 0 default, 70..110, -1 unreadable */
++{
++    size_t n;
++    if (!rsx_dm_trim(&s, &n)) return -1;
++    if (rsx_dm_ieq(s, n, "default") || rsx_dm_ieq(s, n, "off")) return 0;
++    int v = 0;
++    for (size_t i = 0; i < n; i++) {
++        if (s[i] < '0' || s[i] > '9' || i > 3) return -1;
++        v = v * 10 + (s[i] - '0');
++    }
++    return v >= RSX_DM_FOV_MIN && v <= RSX_DM_FOV_MAX ? v : -1;
++}
++static inline const char* rsx_dm_fov_name(int v, char* buf, size_t n)
++{
++    if (v < RSX_DM_FOV_MIN || v > RSX_DM_FOV_MAX) return "default";
++    snprintf(buf, n, "%d", v);
++    return buf;
++}
++static inline int rsx_dm_ini_fov(const char* t)   /* 0 default, 70..110, -1 missing or unreadable */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "fov", v, sizeof v) ? rsx_dm_parse_fov(v) : -1;
++}
++
+ static inline int rsx_dm_ini_write_ext(char* buf, size_t n, int mode, int scaling, int filter, int vsync, int motion_blur, int fps)
+ {
+     return snprintf(buf, n,
+@@ -303,6 +332,19 @@
+                     rsx_dm_vsync_name(motion_blur != 0), rsx_dm_fps_name(fps));
+ }
+ 
++/* patch 2109: the file with the fov key too */
++static inline int rsx_dm_ini_write_ext2(char* buf, size_t n, int mode, int scaling, int filter, int vsync, int motion_blur,
++                                        int fps, int fov)
++{
++    char f[16];
++    int o = rsx_dm_ini_write_ext(buf, n, mode, scaling, filter, vsync, motion_blur, fps);
++    if (o < 0 || (size_t)o >= n) return o;
++    const int k = snprintf(buf + o, n - (size_t)o,
++                           "# fov = default | 70..110: first-person horizontal field of view in degrees at 16:9 (campaign only; off in multiplayer).\n"
++                           "fov = %s\n", rsx_dm_fov_name(fov, f, sizeof f));
++    return k < 0 ? k : o + k;
++}
++
+ static inline int rsx_dm_ini_write(char* buf, size_t n, int mode, int scaling, int filter, int vsync)
+ {
+     return snprintf(buf, n,
+@@ -329,6 +371,7 @@
+  * missing (the Brightness listitem, the settingscript CDATA end), the script already has an OnPageOn, or the row is
+  * already there: the page is then served unchanged. */
+ #define RSX_DM_GUM_MBLUR 1   /* rsx_dm_patch_gum_opts: add the Motion blur row (patch 2107) */
++#define RSX_DM_GUM_FOV   2   /* rsx_dm_patch_gum_opts: add the Field of view row (patch 2109) */
+ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_n, unsigned opts)
+ {
+     static const char rsx_dm_gum_row[] =
+@@ -366,6 +409,28 @@
+         "\t\t\t\t<selectitem value=\"on\">On</selectitem>\n"
+         "\t\t\t\t<selectitem value=\"off\">Off</selectitem>\n"
+         "\t\t\t</select>\n\n\t\t\t";
++    static const char rsx_dm_gum_row_fov[] =   /* patch 2109: only when the camera hook is installed */
++        "<select id=\"slc_kz3_fov\" label=\"Field of view\" onchange=\"script(settingscript,KZ3ChangeFov)\"\n"
++        "\t\t\t\tdefault-value=\"default\">\n"
++        "\t\t\t\t<selectitem value=\"default\">Default</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"70\">70</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"75\">75</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"80\">80</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"85\">85</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"90\">90</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"95\">95</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"100\">100</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"105\">105</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"110\">110</selectitem>\n"
++        "\t\t\t</select>\n\n\t\t\t";
++    static const char rsx_dm_gum_lua_fov[] =   /* patch 2109: with the Field of view row only */
++        "\t\tfunction KZ3FovOn()\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_fov\"):SetValue(KZ3DisplayCmd(\"fov\"))\n"
++        "\t\tend\n\n"
++        "\t\tfunction KZ3ChangeFov(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"fov \"..e:GetSender():GetValue()) end\n"
++        "\t\tend\n";
+     static const char rsx_dm_gum_lua_mb[] =   /* patch 2107: with the Motion blur row only */
+         "\t\tfunction KZ3MBlurOn()\n"
+         "\t\t\tgRoot:GetTag(\"slc_kz3_mblur\"):SetValue(KZ3DisplayCmd(\"motionblur\"))\n"
+@@ -396,6 +461,7 @@
+         "\t\t\tgRoot:GetTag(\"slc_kz3_vsync\"):SetValue(KZ3DisplayCmd(\"vsync\"))\n"
+         "\t\t\tgRoot:GetTag(\"slc_kz3_fps\"):SetValue(KZ3DisplayCmd(\"fps\"))\n"
+         "\t\t\tif (KZ3MBlurOn) then KZ3MBlurOn() end\n"
++        "\t\t\tif (KZ3FovOn) then KZ3FovOn() end\n"
+         "\t\t\tgKz3Dm = 1\n"
+         "\t\tend\n\n"
+         "\t\tgKz3FpsWant = \"30\"\n"
+@@ -448,16 +514,31 @@
+     at_scr = (size_t)(scr - in);
+     at_lua = (size_t)(cd - in);
+     size_t nlm = nm ? sizeof rsx_dm_gum_lua_mb - 1 : 0;
+-    out = (char*)malloc(n + nr + nm + nd + nl + nlm + 1);
++    const size_t nf = (opts & RSX_DM_GUM_FOV) ? sizeof rsx_dm_gum_row_fov - 1 : 0, nlf = nf ? sizeof rsx_dm_gum_lua_fov - 1 : 0;
++    out = (char*)malloc(n + nr + nm + nf + nd + nl + nlm + nlf + 16 + 1);
+     if (!out) return NULL;
+-    memcpy(out + o, in, at_row); o += at_row;
++    /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend (run r103-dpage3):
++     * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead. */
++    static const char rsx_dm_list_tag[] = "<list id=\"lst_options\" class=\"PEDS\"";
++    static const char rsx_dm_list_h[] = " height=\"400\"";
++    const char* lt = nf ? rsx_dm_find(in, n, 0, rsx_dm_list_tag) : NULL;
++    if (lt && lt < row) {
++        const size_t at_lt = (size_t)(lt - in) + sizeof rsx_dm_list_tag - 1;
++        memcpy(out + o, in, at_lt); o += at_lt;
++        memcpy(out + o, rsx_dm_list_h, sizeof rsx_dm_list_h - 1); o += sizeof rsx_dm_list_h - 1;
++        memcpy(out + o, in + at_lt, at_row - at_lt); o += at_row - at_lt;
++    } else {
++        memcpy(out + o, in, at_row); o += at_row;
++    }
+     memcpy(out + o, rsx_dm_gum_row, nr); o += nr;
+     memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;
++    memcpy(out + o, rsx_dm_gum_row_fov, nf); o += nf;                  /* patch 2109 */
+     memcpy(out + o, in + at_row, at_scr - at_row); o += at_scr - at_row;
+     memcpy(out + o, rsx_dm_gum_dlg, nd); o += nd;                      /* patch 2107: before <script id="settingscript"> */
+     memcpy(out + o, in + at_scr, at_lua - at_scr); o += at_lua - at_scr;
+     memcpy(out + o, rsx_dm_gum_lua, nl); o += nl;
+     memcpy(out + o, rsx_dm_gum_lua_mb, nlm); o += nlm;
++    memcpy(out + o, rsx_dm_gum_lua_fov, nlf); o += nlf;
+     memcpy(out + o, in + at_lua, n - at_lua); o += n - at_lua;
+     out[o] = 0;
+     *out_n = o;

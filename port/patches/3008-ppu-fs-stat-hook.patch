@@ -1,0 +1,28 @@
+KZ3 patch 3008: cellFsStat hook (KZ3 only). A port hook may answer cellFsStat for a guest path before the host
+is asked; port/kz3/psarc_vfs.cpp answers ENOENT for the archive it serves so FIOS keeps using loose paths
+with any compiler or CRT (release pass 10).
+
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -586,11 +586,21 @@
+     vm_write64(sb + 0x2C, 0x200);        /* blksize */
+ }
+ 
++/* KZ3 patch 3008: a port hook may answer cellFsStat for a guest path before the
++ * host is asked (0 = no opinion, else the CELL_FS error to return). KZ3's
++ * psarc_vfs uses it to keep FIOS off the archive it serves. */
++extern "C" int (*g_ps3_fs_stat_hook)(const char* guest_path);
++int (*g_ps3_fs_stat_hook)(const char* guest_path) = NULL;
++
+ static void cellFsStat(ppu_context* ctx)
+ {
+     char gpath[1024], hpath[1100];
+     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+     uint32_t sb = (uint32_t)ctx->gpr[4];
++    if (g_ps3_fs_stat_hook) {
++        const int hr = g_ps3_fs_stat_hook(gpath);
++        if (hr) { ctx->gpr[3] = (uint64_t)(int64_t)hr; return; }
++    }
+     host_path(hpath, sizeof hpath, gpath);
+     fs_stat64_t st;
+     if (FS_STAT64(hpath, &st) != 0) {

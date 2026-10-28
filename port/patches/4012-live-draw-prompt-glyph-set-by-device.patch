@@ -1,0 +1,68 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 54d527ac..352965a5 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -129,6 +129,26 @@ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context *
+ #include <d3dcompiler.h>
+ #include "rsx_vertex_formats.h"
+ #include "rsx_keycaps.h"   /* patch 2039: keycap prompts */
++#include "rsx_prompt_glyphs.h"   /* patch 4012 (stage 2): PS4/PS5, Xbox glyph sets of patch 2090 */
++/* patch 4012: the glyph set the prompt atlases are drawn with (cellPad.c patch 4011: the Options row "Button prompts",
++ * Auto = the device of the last input; PAD_PROMPT_* = PG_*). Keyboard/mouse keeps 2039's keycaps as shipped. */
++int pad_prompt_set(void);
++static int ld_prompt_set(void)
++{
++    const int s = pad_prompt_set();
++    return s >= PG_PS3 && s < PG_N_SETS ? s : PG_PS3;
++}
++static unsigned ld_prompt_opts(int set) { return set == PG_KBM ? PG_OPT_KBM_2039 : 0u; }
++/* The atlas cache signature: 0 = no source / off, 1 = the game's own atlas (PS3), 2039's binding hash for keycaps,
++ * else a value per set and options (never 0/1; ASSUMPTION: a binding hash equal to one of these is negligible). */
++static uint32_t ld_prompt_sig(void)
++{
++    if (!kc_enabled()) return 0;
++    const int set = ld_prompt_set();
++    if (set == PG_KBM) return rsx_keycaps_sig();
++    if (set == PG_PS3) return 1;
++    return 0x50470000u | (ld_prompt_opts(set) << 4) | (uint32_t)set;
++}
+ #include "rsx_pso_async.h"
+ /* patch 2048: asynchronous PSO build bookkeeping */
+ #include "rsx_pso_template.h"   /* patch 2071 */
+@@ -3105,9 +3125,9 @@ static ID3D12Resource* g_ld_tex_reuse;
+ static int g_ld_kc_kind;
+ static u32 g_ld_kc_sig;
+ static u32 g_ld_kc_sig_frame = 0xFFFFFFFFu, g_ld_kc_sig_now;
+-static u32 ld_keycaps_sig_frame(u32 frame)   /* once per frame: device + bindings */
++static u32 ld_keycaps_sig_frame(u32 frame)   /* once per frame: glyph set (4012) + bindings */
+ {
+-    if (g_ld_kc_sig_frame != frame) { g_ld_kc_sig_frame = frame; g_ld_kc_sig_now = rsx_keycaps_sig(); }
++    if (g_ld_kc_sig_frame != frame) { g_ld_kc_sig_frame = frame; g_ld_kc_sig_now = ld_prompt_sig(); }
+     return g_ld_kc_sig_now;
+ }
+ static unsigned long long g_ld_tex_inplace_n;
+@@ -4212,17 +4232,20 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+             }
+             return create_texture_cube(dxgi, cube_levels, n_mips);
+         }
+-        /* patch 2039: a prompt atlas gets keycaps in its pad-button cells while the keyboard is in use */
++        /* patch 2039: a prompt atlas gets keycaps in its pad-button cells while the keyboard is in use; patch 4012:
++         * the glyph set of the device in use (2090's rsx_pg_patch; PS3 = the atlas unchanged) */
+         u8* kc_copy = NULL;
+         if (base_fmt == TEX_FMT_DXT45 && kc_enabled()) {
+             g_ld_kc_kind = rsx_keycaps_kind(src, w, h, total);
+             if (g_ld_kc_kind) {
++                static const char* const set_name[PG_N_SETS] = { "pad glyphs", "PS4/PS5 glyphs", "Xbox glyphs", "keycaps" };
+                 int cells = 0;
+-                g_ld_kc_sig = rsx_keycaps_sig();
+-                kc_copy = rsx_keycaps_patch(src, w, h, total, g_ld_kc_kind, &cells);
++                const int set = ld_prompt_set();
++                g_ld_kc_sig = ld_prompt_sig();
++                kc_copy = rsx_pg_patch(src, w, h, total, g_ld_kc_kind, set, ld_prompt_opts(set), &cells);
+                 fprintf(stderr, "[keycap] %s atlas %ux%u src=%u:0x%08X upload %s (%d cells, sig %08X)\n",
+                         g_ld_kc_kind == KC_HUD ? "hud" : "menu", w, h, t->location, t->offset,
+-                        kc_copy ? "keycaps" : "pad glyphs", cells, g_ld_kc_sig);
++                        kc_copy ? set_name[set] : "pad glyphs", cells, g_ld_kc_sig);
+                 if (kc_copy) src = kc_copy;
+             }
+         }

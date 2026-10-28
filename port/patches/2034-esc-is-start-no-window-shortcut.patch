@@ -1,0 +1,63 @@
+KZ3 patch 2034: Esc is the pad's START, not a window-destroy shortcut (RSX pass 35: Esc should open
+the menu). Both window procedures (null backend, which hosts the live-draw swapchain, and the D3D12 backend)
+destroyed the window on Esc and set window_closed; kz3.exe then kept running without a window. Esc now goes
+through cellPad.c's keyboard map as CELL_PAD_CTRL_START (Enter stays START), so in game it opens the pause menu
+and in menus it does what the game's START does. Closing the window stays WM_CLOSE (X button, Alt+F4, a scripted
+WM_CLOSE); port/kz3/main.cpp turns window_closed into a clean shutdown (live-draw shutdown, log flush, exit 0).
+Upstream candidate: a title cannot use Esc while the backend eats it, and an accidental Esc ends the session.
+
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -157,6 +157,9 @@
+         return;
+     }
+ 
++    /* The one keyboard -> pad table (KZ3 patch 2034 adds Esc = START, so Esc opens the pause menu in game and
++     * acts as the game's own back/resume in menus; Enter stays START too). A key-binding file replaces
++     * this table later. */
+     static const struct { int vk; u16 btn; } map[] = {
+         { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
+         { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
+@@ -165,6 +168,7 @@
+         { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
+         { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
+         { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
++        { VK_ESCAPE, CELL_PAD_CTRL_START },
+     };
+ 
+     u16 btns = 0;
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -707,12 +707,8 @@
+     case WM_DESTROY:
+         PostQuitMessage(0);
+         return 0;
+-    case WM_KEYDOWN:
+-        if (wp == VK_ESCAPE) {
+-            s_d3d.window_closed = 1;
+-            DestroyWindow(hwnd);
+-        }
+-        return 0;
++    /* KZ3 patch 2034: no Esc shortcut (Esc is the pad's START in cellPad.c's keyboard map); closing goes
++     * through WM_CLOSE only. */
+     }
+     return DefWindowProcA(hwnd, msg, wp, lp);
+ }
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -92,12 +92,9 @@
+         return 0;
+     }
+ 
+-    case WM_KEYDOWN:
+-        if (wp == VK_ESCAPE) {
+-            s_state.window_closed = 1;
+-            DestroyWindow(hwnd);
+-        }
+-        return 0;
++    /* KZ3 patch 2034: no Esc shortcut here. Esc is a pad button (cellPad.c's keyboard map: START), so it opens
++     * the game's pause menu instead of destroying the window; closing goes through WM_CLOSE (X, Alt+F4, a
++     * scripted WM_CLOSE) and the title's own shutdown on window_closed. */
+     }
+ 
+     return DefWindowProcA(hwnd, msg, wp, lp);

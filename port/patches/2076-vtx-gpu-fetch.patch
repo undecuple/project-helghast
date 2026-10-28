@@ -1,0 +1,656 @@
+KZ3 patch 2076 (RSX pass 72): GPU-side vertex fetch, LD_VTX_GPU=1 (default off), the RE notes "Pass 72".
+The K4 walker spends ~20 of ~68 ms per frame on vertices (fetch, refs, copy, remap; rounds 69 and 71), most of it
+decoding every attribute of every unique vertex into float4 slots on the CPU and uploading 16 bytes per slot.
+With the switch on, a covered draw uploads the raw guest bytes its attributes span (merged per buffer) plus a
+512-byte attribute table into the vertex ring, and one u32 per unique vertex (its element index); the vertex shader
+decodes (root SRVs t20 = the draw's block, t21 = a decode table). The decode is written once in the C/HLSL common
+subset (libs/video/rsx_vtx_gpu.h, RSX_VG_SHARED): FLOAT and HALF from the bits, UINT8/SINT16 exact conversions,
+UNORM8/SNORM16/CMP32 through a table that rsx_vertex_decode_element itself fills, so the values equal the CPU path's
+bit for bit (host test tools/smoke/test_vtx_gpu.sh runs the same text as C against rsx_vertex_fetch_many).
+Draws with a frequency-divided or unmapped attribute, no inputs, or a block over LD_VTX_GPU_MB (8) keep the CPU
+fetch; [vtx-gpu] prints both counts and the reasons per frame (mean of 60). Index buffers, refs and remap unchanged.
+The GPU variant is PSO packed mode 2 (own key, one R32_UINT input); the template prewarm builds it from packed
+records when the switch is on; it is never recorded. 16 failed GPU-fetch pipelines with none built turn it off.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): both (upstream branch bits before the vgpu choice; header: user-clip decl + vgpu decl).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 3398d7e9..9dcb3e34 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -100,6 +100,8 @@ static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_sur
+ static volatile long g_ld_ps1_vram_ready = 0;
+ #include "rsx_restart_cuts.h"
+ #include "rsx_vertex_compact.h"
++#include "rsx_vtx_gpu.h"   /* KZ3 patch 2076 */
++static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context */
+ #include "rsx_vp_decompiler.h"
+ 
+ #include <ctype.h>
+@@ -7373,6 +7375,7 @@ static void ld_pl_open(void)
+ /* Walker thread, after a successful build: append the record when the key is new. */
+ static void ld_pl_record(u64 key, const render_state_t* rs, const rsx_vertex_layout_plan* layout, int packed, int depth)
+ {
++    if (packed == 2) return;   /* patch 2076: the GPU-fetch variant is derived from the packed record at prewarm */
+     if (!g_ld_pl.opened || !g_ld_pl.path[0] || !ld_pl_keyset_add(key)) return;
+     ld_pl_rec r; memset(&r, 0, sizeof r);
+     r.key = key; r.vs_hash = g_ld_pl_last_vs_hash; r.ps_hash = g_ld_pl_last_ps_hash;
+@@ -7422,6 +7425,12 @@ static void ld_pso_desc_fill(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT
+                              ID3DBlob* vs, ID3DBlob* ps, const render_state_t* rs,
+                              u32 input_count, const u8* attrs, int masked, int packed_offsets, int has_depth)
+ {
++    if (masked && packed_offsets == 2) {   /* patch 2076: GPU fetch, the element index only */
++        const D3D12_INPUT_ELEMENT_DESC e = { "VGIDX", 0, DXGI_FORMAT_R32_UINT, 0, 0,
++                                             D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
++        il[0] = e;
++        input_count = 1;
++    } else
+     for (u32 slot = 0; slot < input_count; slot++) {
+         const u32 attr = masked ? attrs[slot] : slot;
+         D3D12_INPUT_ELEMENT_DESC e = {
+@@ -7685,6 +7694,7 @@ typedef struct {
+     u32 vp_branch_bits;                        /* v0.18.0: BRB/CLB outcomes baked into the VP (0x1FF8) */
+     u64 gamma_mask; u32 argb_mask; const u16* argb_remap; u32 srgb_out;
+     u32 fp_const_count; u32 fp_alpha_ref;
++    int vgpu;                                  /* patch 2076: GPU-fetch vertex shader (packed payload 2) */
+ } ld_xl_in;
+ static CRITICAL_SECTION g_ld_xl_cs;
+ static volatile LONG g_ld_xl_state;
+@@ -7708,7 +7718,11 @@ static void ld_xlate(const ld_xl_in* in, char* vs_hlsl, size_t vs_sz, char* ps_h
+     ld_xl_lock();
+     rsx_vp_set_branch_base(in->vp_start);
+     rsx_vp_set_branch_bits(in->vp_branch_bits);
+-    const int vi = masked_layout
++    const int vi = masked_layout && in->vgpu   /* patch 2076 */
++        ? rsx_vp_decompile_vgpu_ex(
++            vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
++            vs_hlsl, vs_sz)
++        : masked_layout
+         ? rsx_vp_decompile_compact_ex(
+             vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
+             vs_hlsl, vs_sz)
+@@ -8006,11 +8020,17 @@ static void ld_pt_build(u32 ri, char* vs_hlsl, char* ps_hlsl, rsx_fp_constant_bl
+     xi.unnorm_mask = r->unnorm_mask; xi.unnorm_dim = unn; xi.gamma_mask = r->gamma_mask;
+     xi.argb_mask = r->argb_mask; xi.argb_remap = remap; xi.srgb_out = r->srgb_out;
+     xi.fp_const_count = (u32)fc; xi.fp_alpha_ref = 0;
++    u64 key = r->key;
++    int packed = (r->flags & RSX_PT_FLAG_PACKED) != 0;
+     {   /* the record's key must be what the walker derives from these programs and this state */
+         const u64 fh = rsx_fp_structural_hash(fp->bytes, fp->size, r->vp_hash);
+-        if (!fh || ld_pso_key_tail(fh, &xi, (r->flags & RSX_PT_FLAG_PACKED) != 0, NULL) != r->key) {
++        if (!fh || ld_pso_key_tail(fh, &xi, packed, NULL) != r->key) {
+             InterlockedIncrement(&g_pt.failed_key); return;
+         }
++        if (masked && packed && ld_vtx_gpu_on()) {   /* patch 2076: build the GPU-fetch variant the walker will use */
++            packed = 2; xi.vgpu = 1;
++            key = ld_pso_key_tail(fh, &xi, packed, NULL);
++        }
+     }
+     const LONGLONG t0 = ld_pt_qpc();
+     int vi = 0, fi = 0;
+@@ -8022,11 +8042,11 @@ static void ld_pt_build(u32 ri, char* vs_hlsl, char* ps_hlsl, rsx_fp_constant_bl
+     D3D12_INPUT_ELEMENT_DESC il[16];
+     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+     ld_pso_desc_fill(&pd, il, vs, ps, &rs, masked ? r->layout_count : RSX_DSP_NUM_VERTEX_ATTR, r->attrs,
+-                     masked, (r->flags & RSX_PT_FLAG_PACKED) != 0, (r->flags & RSX_PT_FLAG_DEPTH) != 0);
++                     masked, packed, (r->flags & RSX_PT_FLAG_DEPTH) != 0);
+     ID3D12PipelineState* pso = NULL;
+     int lib_hit = 0;
+     const LONGLONG tc = ld_pt_qpc();
+-    const HRESULT hr = ld_pl_create(&pd, &rs, r->key, &pso, &lib_hit);
++    const HRESULT hr = ld_pl_create(&pd, &rs, key, &pso, &lib_hit);
+     const unsigned long long cus = (unsigned long long)((ld_pt_qpc() - tc) * 1000000 / g_pt.qpf);
+     vs->lpVtbl->Release(vs); ps->lpVtbl->Release(ps);
+     EnterCriticalSection(&g_pt.cs);
+@@ -8035,7 +8055,7 @@ static void ld_pt_build(u32 ri, char* vs_hlsl, char* ps_hlsl, rsx_fp_constant_bl
+     if (FAILED(hr) || !pso) { InterlockedIncrement(&g_pt.failed_pso); return; }
+     if (lib_hit) InterlockedIncrement(&g_pt.lib_hits);
+     InterlockedIncrement(&g_pt.built);
+-    ld_pl_stage(r->key, pso, 2);
++    ld_pl_stage(key, pso, 2);
+     InterlockedIncrement(&g_pt.staged);
+ }
+ 
+@@ -8595,7 +8615,7 @@ static int ld_apso_submit(const char* vs_hlsl, const char* ps_hlsl, const render
+     if (!j->vs) { int own = 0; j->vs_e = rsx_apso_blob_acquire(&g_apso.tab, 'V', j->vs_src, j->vs_len, j->vs_hash, &own); j->vs_own = (u8)own; }
+     if (!j->ps) { int own = 0; j->ps_e = rsx_apso_blob_acquire(&g_apso.tab, 'P', j->ps_src, j->ps_len, j->ps_hash, &own); j->ps_own = (u8)own; }
+     j->key = key; j->rs = *rs;
+-    j->masked = masked_layout != NULL; j->packed = (u8)(packed != 0); j->depth = g.depth != NULL;
++    j->masked = masked_layout != NULL; j->packed = (u8)packed; j->depth = g.depth != NULL;   /* 2076: 0/1/2 */
+     if (masked_layout) j->layout = *masked_layout;
+     { LARGE_INTEGER q; QueryPerformanceCounter(&q); j->t_submit = q.QuadPart; }
+     EnterCriticalSection(&g_apso.cs);
+@@ -9125,13 +9145,15 @@ static ID3D12PipelineState* get_pso(
+     xi.vp_branch_bits = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16) ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;   /* v0.18.0 */
+     xi.gamma_mask = gamma_mask; xi.argb_mask = argb_mask; xi.argb_remap = argb_remap; xi.srgb_out = srgb_out;
+     xi.fp_const_count = g.fp_constants.count; xi.fp_alpha_ref = g.fp_alpha_ref;
++    xi.vgpu = masked_layout && packed_payload == 2;   /* patch 2076 */
+     u64 kl_pre_rs = 0;
+     key = ld_pso_key_tail(key, &xi, packed_payload, &kl_pre_rs);   /* patch 2071: shared with the prewarm */
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_note_fp_variants(
+         fp_uc, fp_size, fp_ctrl_key, cube_mask, &rs);
+ #endif
+-    if (g_pt.out_on) ld_pt_note(key, &xi, masked_layout && packed_payload, g.depth != NULL);
++    if (g_pt.out_on && packed_payload != 2)   /* patch 2076: the template holds the packed record */
++        ld_pt_note(key, &xi, masked_layout && packed_payload, g.depth != NULL);
+     LDW_ADD(RSX_PERF_W_PSO_KEY_T, gp_t2);
+     LDW_T0(gp_t3);
+     g_ld_current_pso.valid = 1;
+@@ -9393,12 +9415,56 @@ typedef struct {
+      * the n_verts position at each one and the STRIP/FAN expansion must
+      * not bridge across a cut. */
+     u32*    cuts; u32 n_cuts, cap_cuts;
++    int vg;              /* patch 2076: this draw's vertices are fetched on the GPU (payload = u32 element) */
++    rsx_vg_draw vg_d;    /* patch 2076: its table and raw spans */
+ } draw_ctx;
+ 
+ static draw_ctx dc;
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 2076: GPU-side vertex fetch (LD_VTX_GPU=1, default off; rsx_vtx_gpu.h). A covered draw uploads the raw
++ * guest bytes its attributes span plus a 512-byte table and one u32 per unique vertex; the vertex shader decodes
++ * (t20 = the draw's block, t21 = the decode table). Other draws keep the CPU fetch; [vtx-gpu] gives both counts
++ * and the reasons per frame (mean over the last 60 frames). LD_VTX_GPU_MB caps one draw's block (default 8 MB).
++ * -----------------------------------------------------------------------*/
++static struct {
++    int on;                    /* -1 unread */
++    u32 max_block;
++    UINT root;                 /* root parameter of t20; t21 = root + 1 */
++    ID3D12Resource* lut;       /* upload heap, RSX_VG_LUT_WORDS floats */
++    unsigned long long draws, cpu, why[RSX_VG_REASONS], verts, block_bytes, frames;
++} g_vg = { -1, 0, 0, NULL, 0, 0, {0}, 0, 0, 0 };
++static int ld_vtx_gpu_on(void)
++{
++    if (g_vg.on < 0) {
++        const char* e = getenv("LD_VTX_GPU");
++        const char* mb = getenv("LD_VTX_GPU_MB");
++        g_vg.on = (e && e[0] == '1') ? 1 : 0;
++        g_vg.max_block = (mb && atoi(mb) > 0 ? (u32)atoi(mb) : 8u) << 20;
++        if (getenv("RSX_DRAW_CSV") || getenv("LD_DRAW_INPUTS") || getenv("LD_DRAW_DUMP") || getenv("RSX_A010_GEOM") ||
++            getenv("LD_GEOM_CAPTURE"))
++            g_vg.on = 0;   /* tools that read the CPU payload */
++        fprintf(stderr, "[vtx-gpu] %s (LD_VTX_GPU=%s) max-block=%uMB\n", g_vg.on ? "on" : "off", e ? e : "unset",
++                g_vg.max_block >> 20);
++    }
++    return g_vg.on;
++}
++static void ld_vg_frame(void)   /* at each flip */
++{
++    if (g_vg.on <= 0) return;
++    if (++g_vg.frames < 60) return;
++    const double n = (double)g_vg.frames;
++    fprintf(stderr, "[vtx-gpu] frame=%u per-frame: gpu=%.1f cpu=%.1f (no-inputs=%.1f divided=%.1f unmapped=%.1f"
++                    " type=%.1f big=%.1f) verts=%.0f block=%.1fKB\n", g_ld_frames, g_vg.draws / n, g_vg.cpu / n,
++            g_vg.why[RSX_VG_NO_INPUTS] / n, g_vg.why[RSX_VG_DIVIDED] / n, g_vg.why[RSX_VG_UNMAPPED] / n,
++            g_vg.why[RSX_VG_TYPE] / n, g_vg.why[RSX_VG_BIG] / n, g_vg.verts / n, g_vg.block_bytes / n / 1024.0);
++    g_vg.draws = g_vg.cpu = g_vg.verts = g_vg.block_bytes = g_vg.frames = 0;
++    memset(g_vg.why, 0, sizeof g_vg.why);
++}
++
+ static void dc_reset(void)
+ {
++    dc.vg = 0;   /* patch 2076 */
+     dc.n_arr = dc.n_idx = dc.n_verts = dc.n_refs = 0;
+     dc.n_source_refs = 0;
+     dc.refs_remapped = 0;
+@@ -9720,6 +9786,24 @@ static void fetch_batches_hoisted(
+         if (dc.fetch_plan.attr[attr].desc.frequency >= 2)
+             g_ld_divider_fetches += dc.n_refs;
+     }
++    if (packed_payload && ld_vtx_gpu_on()) {   /* patch 2076 */
++        const int why = rsx_vg_plan(&dc.fetch_plan, g_vg.max_block, &dc.vg_d);
++        if (why == RSX_VG_OK && reserve_compact_vertices((u64)dc.n_refs * 4u)) {
++            u32* out = (u32*)dc.compact_verts;
++            for (u32 i = 0; i < dc.n_refs; i++) out[i] = rsx_vg_element(&dc.refs[i]);
++            dc.vg = 1;
++            g_vg.draws++; g_vg.verts += dc.n_refs; g_vg.block_bytes += dc.vg_d.block_bytes;
++            dc.n_verts = dc.n_refs;
++            if (fetch_t0) {
++                LDW_ADD(RSX_PERF_W_VTX_FETCH_T, fetch_t0);
++                rsx_perf_add(RSX_PERF_W_VTX_REF_N, dc.n_source_refs);
++                rsx_perf_add(RSX_PERF_W_VTX_N, dc.n_refs);
++                rsx_perf_add(RSX_PERF_W_VTX_BYTES, (long long)dc.n_refs * 4 + dc.vg_d.block_bytes);
++            }
++            return;
++        }
++        g_vg.cpu++; g_vg.why[why == RSX_VG_OK ? RSX_VG_BIG : why]++;
++    }
+     if (packed_payload) {
+         const u64 required = (u64)dc.n_refs * layout->stride;
+         if (!reserve_compact_vertices(required)) {
+@@ -10955,6 +11039,7 @@ static void ld_movie_capture_overlay(void)
+     rsx_live_draw_before_guest_sync();   /* patch 2017 */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
++    ld_vg_frame();  /* patch 2076 */
+     g_ld_frames++;
+     ld_movie_reset_rings();
+ }
+@@ -12516,7 +12601,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     LDW_ADD(RSX_PERF_W_D_PRE_T, pre_t0);
+     LDW_T0(vtx_t0);
+     ld_vc_entry* vc_hit = NULL; ld_vc_entry* vc_fill = NULL; int vc_verify = 0;   /* patch 2047 */
+-    if (ld_vertex_compact_payload() && ld_vc_mode()) {
++    if (ld_vertex_compact_payload() && ld_vc_mode() && !ld_vtx_gpu_on()) {   /* 2076: no payload to cache */
+         vc_hit = ld_vc_lookup(prim, &used_layout, &vc_fill);
+         if (vc_hit && ld_vc_mode() == 2) { vc_fill = vc_hit; vc_hit = NULL; vc_verify = 1; }
+     }
+@@ -12561,12 +12646,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ 
+     if (!vc_hit) live_a010_geom_trace(prim, n_tri);   /* patch 2047: a hit has no CPU-side payload */
+ 
+-    const u32 vertex_stride =
++    const u32 vertex_stride = dc.vg ? 4u :   /* patch 2076: one u32 element index */
+         ld_vertex_compact_payload() ? used_layout.stride : VERT_STRIDE;
+     const u32 uploaded_vertices = indexed ? dc.n_verts : n_tri;
+     const void* vertex_data = vc_hit ? (const void*)vc_hit->data : ld_vertex_compact_payload()
+         ? (const void*)dc.compact_verts : (const void*)dc.verts;
+-    const u64 draw_vb_bytes = (u64)uploaded_vertices * vertex_stride;
++    const u64 draw_payload_bytes = (u64)uploaded_vertices * vertex_stride;
++    /* patch 2076: the draw's block follows the payload at the next 256-byte offset of the ring (the ring offset
++     * stays 4-aligned: payload 4 n, padding <= 252, block a multiple of 16; 256 + block bounds it) */
++    const u64 draw_vb_bytes = draw_payload_bytes + (dc.vg ? 256u + (u64)dc.vg_d.block_bytes : 0u);
+     const u64 draw_ib_bytes = indexed ? (u64)n_tri * sizeof(u32) : 0;
+     const u64 vb_capacity = VERT_BUFFER_SIZE;
+     if (draw_vb_bytes > vb_capacity || draw_ib_bytes > INDEX_BUFFER_SIZE) {
+@@ -12592,10 +12680,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g.smp_ring_used = 0;
+     }
+     LDW_T0(vcopy_t0);
+-    if (draw_vb_bytes)
++    if (draw_payload_bytes)
+         memcpy(
+             g.vb_mapped + g.vb_used, vertex_data,
+-            (size_t)draw_vb_bytes);
++            (size_t)draw_payload_bytes);
++    u32 vg_block_off = 0;   /* patch 2076: from g.vb_used */
++    if (dc.vg) {
++        vg_block_off = (u32)((((u64)g.vb_used + draw_payload_bytes + 255u) & ~(u64)255u) - g.vb_used);
++        rsx_vg_write_block(&dc.vg_d, g.vb_mapped + g.vb_used + vg_block_off);
++    }
+     if (vc_hit) {   /* patch 2047 */
+         if (indexed && draw_ib_bytes)
+             memcpy((u8*)g.ib_mapped + g.ib_used, vc_hit->data + vc_hit->vb_bytes, (size_t)draw_ib_bytes);
+@@ -12611,8 +12704,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     LDW_T0(pso_t0);
+     ID3D12PipelineState* pso = get_pso(
+         ld_vertex_mask_signature() ? &used_layout : NULL,
+-        ld_vertex_compact_payload());
++        ld_vertex_compact_payload() ? (dc.vg ? 2 : 1) : 0);   /* patch 2076: 2 = GPU fetch variant */
+     LDW_ADD(RSX_PERF_W_PSO_T, pso_t0);
++    if (dc.vg) {   /* patch 2076: the shader compiler must take the GPU-fetch vertex shaders, or the mode goes off */
++        static u32 vg_ok, vg_fail;
++        if (pso) vg_ok++;
++        else if (++vg_fail == 16u && !vg_ok) {
++            fprintf(stderr, "[vtx-gpu] 16 GPU-fetch pipelines failed, none built: off (CPU fetch from here)\n");
++            g_vg.on = 0;
++        }
++    }
+     if (!pso) {
+ #if defined(YZ_PERF_PROFILE)
+         ld_profile_note_rejected_pso();
+@@ -13367,9 +13468,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     ID3D12Resource* vb_src = vertex_stride ? ld_vbd_vb(g.vb_used, draw_vb_bytes) : g.vb;   /* patch 2053 */
+     vbv.BufferLocation = vb_src->lpVtbl->GetGPUVirtualAddress(vb_src) + g.vb_used;
+     vbv.StrideInBytes = vertex_stride;
+-    vbv.SizeInBytes = (u32)draw_vb_bytes;
++    vbv.SizeInBytes = (u32)draw_payload_bytes;   /* patch 2076: the block after it is not vertex data */
+     if (vertex_stride)
+         g.list->lpVtbl->IASetVertexBuffers(g.list, 0, 1, &vbv);
++    if (dc.vg) {   /* patch 2076: t20 = this draw's table + raw spans, t21 = the decode table */
++        g.list->lpVtbl->SetGraphicsRootShaderResourceView(g.list, g_vg.root, vbv.BufferLocation + vg_block_off);
++        g.list->lpVtbl->SetGraphicsRootShaderResourceView(g.list, g_vg.root + 1,
++                                                          g_vg.lut->lpVtbl->GetGPUVirtualAddress(g_vg.lut));
++    }
+     g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     LDW_T0(recent_t0);   /* patch 2045 */
+     {
+@@ -13767,6 +13873,22 @@ static int make_root_signature(void)
+     D3D12_ROOT_SIGNATURE_DESC rsd = {0};
+     rsd.NumParameters = 5; rsd.pParameters = xp;
+     if (ld_gc_enabled()) { rsd.NumParameters = 7; rsd.pParameters = xp7; }
++    /* Patch 2076 (LD_VTX_GPU=1): two root SRVs for the vertex stage after the others, t20 = the draw's block,
++     * t21 = the decode table. Only with the switch on, so the off root signature (and its pipeline library
++     * entries) stays byte for byte the old one. */
++    D3D12_ROOT_PARAMETER xp9[9];
++    if (ld_vtx_gpu_on()) {
++        memcpy(xp9, rsd.pParameters, rsd.NumParameters * sizeof xp9[0]);
++        for (u32 k = 0; k < 2; k++) {
++            D3D12_ROOT_PARAMETER* p = &xp9[rsd.NumParameters + k];
++            memset(p, 0, sizeof *p);
++            p->ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
++            p->Descriptor.ShaderRegister = 20 + k;
++            p->ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
++        }
++        g_vg.root = rsd.NumParameters;
++        rsd.NumParameters += 2; rsd.pParameters = xp9;
++    }
+     /* Patch 2011: comparison samplers for shadow-compare units at s16 + F,
+      * F = RSX texture zfunc. RPCS3 reverses the function (VKDraw.cpp
+      * get_compare_func(..., true)): GEQUAL -> LESS_EQUAL. Linear (PCF),
+@@ -14084,6 +14206,19 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+         D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g.vb);
+     g.vb->lpVtbl->Map(g.vb, 0, &rr, (void**)&g.vb_mapped);
++    if (ld_vtx_gpu_on()) {   /* patch 2076: the decode table, filled once by the CPU decoder (upload heap, read-only) */
++        float* lut = NULL;
++        bd.Width = RSX_VG_LUT_WORDS * 4u;
++        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++                D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g_vg.lut)) ||
++            FAILED(g_vg.lut->lpVtbl->Map(g_vg.lut, 0, &rr, (void**)&lut))) {
++            fprintf(stderr, "[vtx-gpu] decode table failed; off\n");
++            g_vg.on = 0;
++        } else {
++            rsx_vg_lut_build(lut);
++            g_vg.lut->lpVtbl->Unmap(g_vg.lut, 0, NULL);
++        }
++    }
+ 
+     bd.Width = INDEX_BUFFER_SIZE;
+     g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+@@ -16050,6 +16185,7 @@ static void ld_present_body(u32 buffer_id)
+     rsx_live_draw_before_guest_sync();   /* patch 2017 */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
++    ld_vg_frame();  /* patch 2076 */
+     g_ld_frames++;
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_present(g_ld_frames);
+diff --git a/libs/video/rsx_vp_decompiler.c b/libs/video/rsx_vp_decompiler.c
+index ba6c18eb..5881f518 100644
+--- a/libs/video/rsx_vp_decompiler.c
++++ b/libs/video/rsx_vp_decompiler.c
+@@ -29,6 +29,7 @@
+  *       o15 = TEX8. Unwritten outputs default to (0,0,0,1).
+  */
+ #include "rsx_vp_decompiler.h"
++#include "rsx_vtx_gpu.h"   /* KZ3 patch 2076 */
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -310,6 +311,24 @@ int rsx_vp_decompile_compact_ex(
+         ucode, max_bytes, vtex_mask, 1, input_mask, out, out_size);
+ }
+ 
++/* KZ3 patch 2076: GPU-side vertex fetch. Same input analysis as the compact variant; the shader's only vertex
++ * input is the element index (uint VGIDX), and each read register is decoded from the raw guest bytes by
++ * vg_attr (rsx_vtx_gpu.h). */
++int rsx_vp_decompile_vgpu_ex(
++    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
++    char* out, u32 out_size)
++{
++    rsx_vp_input_analysis analysis;
++    if (rsx_vp_analyze_inputs(ucode, max_bytes, &analysis) < 0 ||
++        !analysis.exact ||
++        (analysis.input_mask & ~(input_mask & 0xFFFFu)) != 0)
++        input_mask = 0xFFFFu;
++    else
++        input_mask = analysis.input_mask;
++    return rsx_vp_decompile_impl(
++        ucode, max_bytes, vtex_mask, 2, input_mask, out, out_size);
++}
++
+ static int rsx_vp_decompile_impl(
+     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+     u32 input_mask, char* out, u32 out_size)
+@@ -597,6 +616,9 @@ static int rsx_vp_decompile_impl(
+             "    float4 a8:ATTR8;  float4 a9:ATTR9;  float4 a10:ATTR10; float4 a11:ATTR11;\n"
+             "    float4 a12:ATTR12; float4 a13:ATTR13; float4 a14:ATTR14; float4 a15:ATTR15;\n"
+             "};\n");
++    } else if (compact_inputs == 2) {   /* patch 2076 */
++        emit(&o, "struct VSInput {\n    uint vg_e:VGIDX;\n};\n");
++        emit(&o, RSX_VG_HLSL);
+     } else {
+         emit(&o, "struct VSInput {\n");
+         if (!(input_mask & 0xFFFFu))
+@@ -663,6 +685,10 @@ static int rsx_vp_decompile_impl(
+         for (u32 attr = 0; attr < 16; attr++) {
+             if (!(input_mask & (1u << attr))) continue;
+             char assignment[64];
++            if (compact_inputs == 2)   /* patch 2076 */
++                snprintf(assignment, sizeof(assignment),
++                         "    v[%u]=vg_attr(%uu, input.vg_e);\n", attr, attr);
++            else
+             snprintf(assignment, sizeof(assignment),
+                      "    v[%u]=input.a%u;\n", attr, attr);
+             emit(&o, assignment);
+diff --git a/libs/video/rsx_vp_decompiler.h b/libs/video/rsx_vp_decompiler.h
+index 130b1ca4..fd014466 100644
+--- a/libs/video/rsx_vp_decompiler.h
++++ b/libs/video/rsx_vp_decompiler.h
+@@ -87,6 +87,13 @@ int rsx_vp_decompile_compact_ex(
+  * gets 0.5 and never clips. Returns 0 (nothing to do when ops is 0), or -1
+  * when the text is not in the decompiler's form or does not fit in cap. */
+ int rsx_vp_apply_user_clip(char* hlsl, size_t cap, u32 ops);
++/* KZ3 patch 2076: GPU-side vertex fetch variant (LD_VTX_GPU). The only vertex input is
++ * uint VGIDX (the element index); each register in input_mask is decoded in the shader
++ * from the raw guest bytes (rsx_vtx_gpu.h: t20 block, t21 decode table). */
++#define RSX_VP_PATCH_2076 1
++int rsx_vp_decompile_vgpu_ex(
++    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
++    char* out, u32 out_size);
+ 
+ /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
+ const char* rsx_vp_vec_name(u32 op);
+diff --git a/libs/video/rsx_vtx_gpu.h b/libs/video/rsx_vtx_gpu.h
+new file mode 100644
+index 00000000..a5c7f330
+--- /dev/null
++++ b/libs/video/rsx_vtx_gpu.h
+@@ -0,0 +1,215 @@
++/*
++ * KZ3 patch 2076: GPU-side vertex fetch for the live renderer (LD_VTX_GPU, default off).
++ *
++ * The CPU path decodes every attribute of every unique vertex into float4 slots (rsx_vertex_fetch_many) and
++ * uploads 16 bytes per slot. In this mode a draw uploads the raw guest bytes its attributes span instead, plus a
++ * 512-byte attribute table, and the vertex shader decodes them: the per-vertex payload is one u32, the element
++ * index (vertex_id + base_index) & 0xFFFFF of the unique reference.
++ *
++ * Block layout (one per draw, in the vertex upload ring, bound as the root SRV t20, ByteAddressBuffer vg_raw):
++ *   [0, 512)  16 rows of rsx_vg_attr: uint4 {base, stride, fmt, lim}, float4 default
++ *   [512, ..) the merged raw spans, each placed so its host address and block offset agree mod 4
++ * Attribute i of element e reads at base + e * stride (u32 arithmetic, wraps like the C code), clamped to lim (the
++ * last element's address), so a reference outside the draw's span stays inside the block (root SRVs have no
++ * bounds check). fmt = type | n << 4, n = min(size, 4); fmt 0 = the row's default (disabled attribute, or a
++ * register the layout does not feed: (0,0,0,1), as the compact CPU path).
++ *
++ * Exactness: FLOAT and HALF are built from the bits (same integer steps as rsx_compact_be_f16), UINT8 and SINT16
++ * are exact integer conversions, and the three formats with a division (UNORM8 x/255, SNORM16 x/32767, CMP32
++ * x/1023 and z/511) read a table filled at start-up by rsx_vertex_decode_element itself (t21, vg_lut), so the
++ * shader's values are the CPU path's bit for bit by construction. The decode is written once, in the common
++ * subset of C and HLSL, inside RSX_VG_SHARED: the host test compiles it as C (RSX_VG_C_REFERENCE) and the
++ * renderer pastes the same text, stringified, into the vertex shader.
++ */
++#ifndef PS3RECOMP_RSX_VTX_GPU_H
++#define PS3RECOMP_RSX_VTX_GPU_H
++
++#include "rsx_vertex_compact.h"   /* not rsx_vertex_formats.h: its DXGI_FORMAT_* macros break dxgiformat.h */
++#include <stdint.h>
++#include <string.h>
++
++#define RSX_VG_TABLE_BYTES 512u
++#define RSX_VG_LUT_UNORM8  0u        /* 256 entries, by byte */
++#define RSX_VG_LUT_SNORM16 256u      /* 65,536 entries, by the raw big-endian u16 */
++#define RSX_VG_LUT_CMPXY   65792u    /* 2,048 entries, by the 11-bit field */
++#define RSX_VG_LUT_CMPZ    67840u    /* 1,024 entries, by the 10-bit field */
++#define RSX_VG_LUT_WORDS   68864u
++
++/* The decode, in the C/HLSL common subset. VG_FN, VG_RAW(a) (the little-endian dword at byte a, a % 4 == 0),
++ * VG_LUT(i) (float i of the table), uint, asint and asfloat come from the including side. The LUT offsets are the
++ * RSX_VG_LUT_* numbers (checked by the host test). Types: 1 SNORM16, 2 FLOAT, 3 HALF, 4 UNORM8, 5 SINT16,
++ * 6 CMP32, 7 UINT8 (rsx_dispatch.h). */
++#define RSX_VG_SHARED(X) X( \
++VG_FN uint vg_b(uint a) { return (VG_RAW(a & 0xFFFFFFFCu) >> ((a & 3u) * 8u)) & 255u; } \
++VG_FN uint vg_be16(uint a) { return (vg_b(a) << 8u) | vg_b(a + 1u); } \
++VG_FN uint vg_be32(uint a) { \
++    uint w = VG_RAW(a & 0xFFFFFFFCu); \
++    if ((a & 3u) != 0u) w = vg_b(a) | (vg_b(a + 1u) << 8u) | (vg_b(a + 2u) << 16u) | (vg_b(a + 3u) << 24u); \
++    return (w >> 24u) | ((w >> 8u) & 0xFF00u) | ((w << 8u) & 0xFF0000u) | (w << 24u); \
++} \
++VG_FN float vg_fetch(uint base, uint stride, uint fmt, uint lim, float dflt, uint e, uint c) { \
++    uint t = fmt & 15u; \
++    uint n = (fmt >> 4u) & 15u; \
++    uint a = base + e * stride; \
++    if (t == 0u) return dflt; \
++    if (a > lim) a = lim; \
++    if (t == 6u) { \
++        uint w = vg_be32(a); \
++        if (c == 0u) return VG_LUT(65792u + (w & 0x7FFu)); \
++        if (c == 1u) return VG_LUT(65792u + ((w >> 11u) & 0x7FFu)); \
++        if (c == 2u) return VG_LUT(67840u + (w >> 22u)); \
++        return 1.0f; \
++    } \
++    if (c >= n) return c == 3u ? 1.0f : 0.0f; \
++    if (t == 2u) return asfloat(vg_be32(a + c * 4u)); \
++    if (t == 3u) { \
++        uint h = vg_be16(a + c * 2u); \
++        uint x = h & 0x7C00u; \
++        uint mag = ((h & 0x7FFFu) << 13u) + (x == 0x7C00u ? (224u << 23u) : (112u << 23u)); \
++        return asfloat(((h & 0x8000u) << 16u) | (x != 0u ? mag : 0u)); \
++    } \
++    if (t == 4u) return VG_LUT(vg_b(a + c)); \
++    if (t == 7u) return (float)vg_b(a + c); \
++    if (t == 1u) return VG_LUT(256u + vg_be16(a + c * 2u)); \
++    if (t == 5u) return (float)(asint(vg_be16(a + c * 2u) << 16u) >> 16); \
++    return 0.0f; \
++} )
++#define RSX_VG_CODE(...) __VA_ARGS__
++#define RSX_VG_TEXT(...) #__VA_ARGS__
++
++/* What the vertex shader declares (HLSL): the two buffers, the macros the shared code uses, the code, and the
++ * per-attribute float4 reader. */
++#define RSX_VG_HLSL \
++    "ByteAddressBuffer vg_raw : register(t20);\n" \
++    "ByteAddressBuffer vg_lut : register(t21);\n" \
++    "#define VG_FN\n" \
++    "#define VG_RAW(a) vg_raw.Load(a)\n" \
++    "#define VG_LUT(i) asfloat(vg_lut.Load((i) * 4u))\n" \
++    RSX_VG_SHARED(RSX_VG_TEXT) "\n" \
++    "float4 vg_attr(uint i, uint e) {\n" \
++    "    uint r = i * 32u;\n" \
++    "    uint b = vg_raw.Load(r); uint s = vg_raw.Load(r + 4u); uint f = vg_raw.Load(r + 8u); uint l = vg_raw.Load(r + 12u);\n" \
++    "    return float4(vg_fetch(b, s, f, l, asfloat(vg_raw.Load(r + 16u)), e, 0u),\n" \
++    "                  vg_fetch(b, s, f, l, asfloat(vg_raw.Load(r + 20u)), e, 1u),\n" \
++    "                  vg_fetch(b, s, f, l, asfloat(vg_raw.Load(r + 24u)), e, 2u),\n" \
++    "                  vg_fetch(b, s, f, l, asfloat(vg_raw.Load(r + 28u)), e, 3u));\n" \
++    "}\n"
++
++/* One table row (the shader reads it with eight Load: plain Load only, for Wine's vkd3d-shader HLSL compiler). */
++typedef struct rsx_vg_attr { u32 base, stride, fmt, lim; float dflt[4]; } rsx_vg_attr;
++typedef struct rsx_vg_span { const u8* src; u32 bytes; u32 dst; } rsx_vg_span;
++typedef struct rsx_vg_draw {
++    rsx_vg_attr table[RSX_DSP_NUM_VERTEX_ATTR];
++    rsx_vg_span span[RSX_DSP_NUM_VERTEX_ATTR];
++    u32 n_span;
++    u32 block_bytes;   /* table + spans, a multiple of 16 */
++} rsx_vg_draw;
++
++/* Why a draw stays on the CPU path ([vtx-gpu] log columns). */
++enum { RSX_VG_OK = 0, RSX_VG_NO_INPUTS, RSX_VG_DIVIDED, RSX_VG_UNMAPPED, RSX_VG_TYPE, RSX_VG_BIG, RSX_VG_REASONS };
++
++/* The per-vertex payload: the element index every non-divided attribute reads (rsx_vertex_element_index with
++ * frequency <= 1; the host test compares the two). */
++static inline u32 rsx_vg_element(const rsx_vertex_ref* r) { return (r->vertex_id + r->base_index) & 0x000FFFFFu; }
++
++/* Plan one draw from a prepared fetch plan (rsx_vertex_fetch_plan_prepare over the draw's unique refs): every
++ * enabled attribute of the layout needs its whole element range mapped (stable_base), frequency <= 1 and a known
++ * type; otherwise the draw keeps the CPU path and the reason is returned. */
++static inline int rsx_vg_plan(const rsx_vertex_fetch_plan* p, u32 max_block, rsx_vg_draw* d)
++{
++    if (!p->layout.count) return RSX_VG_NO_INPUTS;
++    memset(d->table, 0, sizeof d->table);
++    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) d->table[a].dflt[3] = 1.0f;
++    struct { const u8* src; u64 bytes; } cand[RSX_DSP_NUM_VERTEX_ATTR];
++    u32 nc = 0;
++    for (u32 s = 0; s < p->layout.count; s++) {
++        const u32 a = p->layout.attrs[s];
++        const rsx_vertex_fetch_attr* f = &p->attr[a];
++        if (!f->desc.type || !f->desc.size) { memcpy(d->table[a].dflt, f->default_value, 16); continue; }
++        if (f->desc.frequency > 1) return RSX_VG_DIVIDED;
++        if (f->desc.type < 1 || f->desc.type > 7 || !f->elem_size) return RSX_VG_TYPE;
++        if (!f->stable_base) return RSX_VG_UNMAPPED;
++        const u64 bytes = (u64)(f->stable_last - f->stable_first) * f->stride + f->elem_size;
++        if (bytes > max_block) return RSX_VG_BIG;
++        cand[nc].src = f->stable_base; cand[nc].bytes = bytes; nc++;
++    }
++    for (u32 i = 1; i < nc; i++)   /* by host address, then merge overlapping or touching ranges */
++        for (u32 j = i; j > 0 && cand[j].src < cand[j - 1].src; j--) {
++            const u8* ts = cand[j].src; const u64 tb = cand[j].bytes;
++            cand[j] = cand[j - 1]; cand[j - 1].src = ts; cand[j - 1].bytes = tb;
++        }
++    u64 cursor = RSX_VG_TABLE_BYTES;
++    d->n_span = 0;
++    for (u32 i = 0; i < nc; i++) {
++        rsx_vg_span* last = d->n_span ? &d->span[d->n_span - 1] : NULL;
++        if (last && cand[i].src <= last->src + last->bytes) {
++            const u64 end = (u64)(cand[i].src - last->src) + cand[i].bytes;
++            if (end > last->bytes) { cursor += end - last->bytes; last->bytes = (u32)end; }
++            continue;
++        }
++        cursor = ((cursor + 15u) & ~(u64)15u) + ((uintptr_t)cand[i].src & 3u);
++        rsx_vg_span* sp = &d->span[d->n_span++];
++        sp->src = cand[i].src; sp->bytes = (u32)cand[i].bytes; sp->dst = (u32)cursor;
++        cursor += cand[i].bytes;
++    }
++    cursor = (cursor + 15u) & ~(u64)15u;
++    if (cursor > max_block) return RSX_VG_BIG;
++    d->block_bytes = (u32)cursor;
++    for (u32 s = 0; s < p->layout.count; s++) {
++        const u32 a = p->layout.attrs[s];
++        const rsx_vertex_fetch_attr* f = &p->attr[a];
++        if (!f->desc.type || !f->desc.size) continue;
++        const rsx_vg_span* sp = d->span;
++        while (!(f->stable_base >= sp->src && f->stable_base < sp->src + sp->bytes)) sp++;
++        const u32 first_at = sp->dst + (u32)(f->stable_base - sp->src);
++        rsx_vg_attr* t = &d->table[a];
++        t->stride = f->stride;
++        t->base = first_at - f->stable_first * f->stride;
++        t->lim = first_at + (f->stable_last - f->stable_first) * f->stride;
++        t->fmt = f->desc.type | ((f->desc.size < 4u ? f->desc.size : 4u) << 4);
++    }
++    return RSX_VG_OK;
++}
++
++/* Write the block: table, then the spans (dst must hold d->block_bytes). */
++static inline void rsx_vg_write_block(const rsx_vg_draw* d, u8* dst)
++{
++    memcpy(dst, d->table, sizeof d->table);
++    for (u32 i = 0; i < d->n_span; i++) memcpy(dst + d->span[i].dst, d->span[i].src, d->span[i].bytes);
++}
++
++/* The decode table, filled by the CPU decoder itself (exact by construction). */
++static inline void rsx_vg_lut_build(float* lut)
++{
++    float o[4];
++    u8 b[4] = {0, 0, 0, 0};
++    for (u32 i = 0; i < 256u; i++) {
++        b[0] = (u8)i; rsx_vertex_decode_element(RSX_VTX_TYPE_UNORM8, 1, b, o); lut[RSX_VG_LUT_UNORM8 + i] = o[0];
++    }
++    for (u32 i = 0; i < 65536u; i++) {
++        b[0] = (u8)(i >> 8); b[1] = (u8)i; rsx_vertex_decode_element(RSX_VTX_TYPE_SNORM16, 1, b, o);
++        lut[RSX_VG_LUT_SNORM16 + i] = o[0];
++    }
++    for (u32 i = 0; i < 2048u; i++) {   /* x field = i */
++        b[0] = 0; b[1] = 0; b[2] = (u8)(i >> 8); b[3] = (u8)i;
++        rsx_vertex_decode_element(RSX_VTX_TYPE_CMP32, 1, b, o); lut[RSX_VG_LUT_CMPXY + i] = o[0];
++    }
++    for (u32 i = 0; i < 1024u; i++) {   /* z field = i: bits 22-31 */
++        const u32 w = i << 22;
++        b[0] = (u8)(w >> 24); b[1] = (u8)(w >> 16); b[2] = 0; b[3] = 0;
++        rsx_vertex_decode_element(RSX_VTX_TYPE_CMP32, 1, b, o); lut[RSX_VG_LUT_CMPZ + i] = o[2];
++    }
++}
++
++#ifdef RSX_VG_C_REFERENCE
++/* The shared decode as C, for host tests: the includer defines VG_RAW(a) and VG_LUT(i) first. */
++typedef unsigned int rsx_vg_uint;
++#define uint rsx_vg_uint
++#define VG_FN static inline
++static inline float asfloat(uint w) { float f; memcpy(&f, &w, sizeof f); return f; }
++static inline int asint(uint w) { int i; memcpy(&i, &w, sizeof i); return i; }
++RSX_VG_SHARED(RSX_VG_CODE)
++#undef uint
++#endif
++
++#endif /* PS3RECOMP_RSX_VTX_GPU_H */

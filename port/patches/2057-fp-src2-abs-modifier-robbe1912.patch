@@ -1,0 +1,81 @@
+Third-source abs modifier of the fragment decompiler (opt-in LD_SRC2_ABS=1), plus a counter of the programs that set it (LD_FEAT_LOG=1, `[feat] src2-abs opcode=`). From robbe1912/ps3recomp 0d03c8b5 (decode third-source absolute modifier).
+
+decode_src(w3, 0, &s2) ignored DWORD3 bit 18 (SRC2.abs in RPCS3's FP decoder, the same position as SRC1.abs in DWORD2). With the switch on the third source of MAD/LRP-type ops decodes to abs(...). The switch changes shader text, so it is part of the PSO key (tag 0x5A2A, only when on).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 1b31c6dd..d60eaa47 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -44,6 +44,7 @@
+ #define FP_SRC_NEGATE       (1u << 17)
+ #define FP_SRC0_ABS         (1u << 29) /* in DWORD1 */
+ #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
++#define FP_SRC2_ABS         (1u << 18) /* in DWORD3 (patch 2057) */
+ #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
+ 
+ /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
+@@ -341,6 +342,14 @@ typedef struct {
+     char swz[5];    /* e.g. "xyzw" */
+ } Src;
+ 
++int rsx_fp_src2_abs_seen[64];   /* patch 2057: per-opcode count of instructions with DWORD3 bit 18 set */
++static int fp_src2_abs_mode(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_SRC2_ABS"); on = (e && e[0] == '1') ? 1 : 0; }
++    return on;
++}
++static void fp_src2_abs_note(u32 opcode) { rsx_fp_src2_abs_seen[opcode & 63u]++; }
+ static void decode_src(u32 w, int abs_bit, Src* s)
+ {
+     static const char comp[4] = {'x','y','z','w'};
+@@ -809,7 +818,11 @@ static int rsx_fp_decompile_internal(
+         Src s0, s1, s2;
+         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
+         decode_src(w2, w2 & FP_SRC1_ABS, &s1);
+-        decode_src(w3, 0,                &s2);
++        /* Patch 2057 (from robbe1912/ps3recomp 0d03c8b5): the third source's abs bit (DWORD3 bit 18, RPCS3's SRC2.abs).
++         * Opt-in LD_SRC2_ABS=1. LD_FEAT_LOG=1 counts the programs that set it (per opcode) without applying it. */
++        const int src2_abs = fp_src2_abs_mode();
++        if ((w3 & FP_SRC2_ABS) && !(w2 & FP_BRANCH)) fp_src2_abs_note(opcode);
++        decode_src(w3, src2_abs ? (int)(w3 & FP_SRC2_ABS) : 0, &s2);
+ 
+         /* Inline constant: any CONST source pulls the next 16 bytes as a
+          * float4 literal and advances past it. */
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index 5f6d1634..f37ef9b4 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -96,6 +96,7 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
+  * per unit (unit u at bits 3u..3u+2: R, G, B). Returns the number of sample
+  * sites wrapped, or -1 if the buffer is too small. */
+ int rsx_fp_apply_gamma(char* hlsl, u32 hlsl_size, u64 gamma_mask);
++extern int rsx_fp_src2_abs_seen[64];   /* patch 2057 diagnostic */
+ 
+ /* Patch 2011: zeta-aliased texture units (see rsx_fp_decompiler.c).
+  * Shadow compare: units in shadow_mask sample with SampleCmpLevelZero against
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 0a2a456d..ed1cd120 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -7827,6 +7827,8 @@ static void ld_feat_dump(void)
+         fprintf(stderr, "[feat] %s fmt=0x%02x remap=0x%04x aux=0x%x zalias=%u target=0x%08x tfmt=%u n=%llu\n",
+                 kn[r->kind], r->fmt, r->remap, r->aux, r->zalias, r->target, r->tfmt, r->n);
+     }
++    for (u32 i = 0; i < 64; i++)
++        if (rsx_fp_src2_abs_seen[i]) fprintf(stderr, "[feat] src2-abs opcode=0x%02x instructions=%d\n", i, rsx_fp_src2_abs_seen[i]);
+     fflush(stderr);
+ }
+ static void ld_feat_draw(u32 fp_ctrl)
+@@ -8109,6 +8111,9 @@ static ID3D12PipelineState* get_pso(
+         key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
+     if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
+     if (srgb_out) key = fnv1a(&srgb_out, sizeof(srgb_out), key);   /* patch 2055 */
++    { static int s2a = -1;   /* patch 2057: the SRC2 abs switch changes shader text, so it changes the key */
++      if (s2a < 0) { const char* e = getenv("LD_SRC2_ABS"); s2a = (e && e[0] == '1') ? 1 : 0; }
++      if (s2a) { const u32 tag = 0x5A2Au; key = fnv1a(&tag, sizeof(tag), key); } }
+     if (shadow_mask) {
+         key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
+         key = fnv1a(shadow_zfunc, sizeof(shadow_zfunc), key);

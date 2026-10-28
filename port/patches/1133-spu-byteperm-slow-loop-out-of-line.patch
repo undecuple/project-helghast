@@ -1,0 +1,38 @@
+KZ3 patch 1133 (SPU pass 111; upstream candidate): the KZ3_SPU_FASTCG=0 byte loop of the quadword byte shifts and
+rotates (shlqbyi, rotqbyi, shlqby, rotqby, shlqbybi, rotqbybi, rotqmby, rotqmbybi, rotqmbyi) moves out of line into
+spu__byteperm_ref, called from spu__byteperm; SPU_FASTPERM becomes a plain return. With the loop inline in each
+helper the operand was address-taken, so GCC (MinGW) copied the SPU register through two 64-bit GPR stores into a
+stack slot and the pshufb read it back as 16 bytes, a failed store-to-load forward: spu_rotqbyi's reloads were 13 % of
+job_011f7d00 func_5700's K4 samples. Same bytes (result SPU byte i = SPU byte i + d, wrapping or zero-filled), the
+switch still selects the loop: tools/spu/test_r111_vec.sh checks every count 0..127 with the switch on and off.
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -701,7 +701,18 @@
+  * runtime at start) keeps the old loops for A/B runs. */
+ #if defined(__SSE4_1__)
+ extern int g_kz3_spu_slowcg;
++/* KZ3 patch 1133 (SPU pass 111): the KZ3_SPU_FASTCG=0 byte loop out of line, here instead of in each helper. With the
++ * loop inline after SPU_FASTPERM the helpers' operand was address-taken, so GCC copied the register through two
++ * 64-bit GPR stores into a stack slot and pshufb read it back as 16 bytes (a failed store-to-load forward; spu_rotqbyi
++ * in job_011f7d00 func_5700 took 13 % of that function's K4 samples on those reloads). Same bytes as each helper's
++ * loop: result SPU byte i = a SPU byte i + d (mod 16 with wrap, else 0 out of 0..15). */
++SPU_XR_COLD u128 spu__byteperm_ref(u128 a, int d, int wrap) {
++    u128 r;
++    for (int i = 0; i < 16; i++) { int s = i + d; if (wrap) s &= 15; r._u8[SPU_W(i)] = (s < 0 || s > 15) ? 0 : a._u8[SPU_W(s)]; }
++    return r;
++}
+ SPU_HOT u128 spu__byteperm(u128 a, int d, int wrap) {
++    if (__builtin_expect(g_kz3_spu_slowcg == 1, 0)) return spu__byteperm_ref(a, d, wrap);
+     const __m128i iv = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);   /* SPU byte of host byte h */
+     __m128i t = _mm_add_epi8(iv, _mm_set1_epi8((char)d));
+     __m128i idx;
+@@ -715,7 +726,7 @@
+     A = _mm_shuffle_epi8(A, idx);
+     u128 r; memcpy(&r, &A, 16); return r;
+ }
+-#  define SPU_FASTPERM(expr) if (__builtin_expect(g_kz3_spu_slowcg != 1, 1)) return (expr)   /* 1040: 2 = fast, no FTZ */
++#  define SPU_FASTPERM(expr) return (expr)   /* 1040: 2 = fast, no FTZ; patch 1133: KZ3_SPU_FASTCG=0 in spu__byteperm */
+ #else
+ #  define SPU_FASTPERM(expr) ((void)0)
+ #endif

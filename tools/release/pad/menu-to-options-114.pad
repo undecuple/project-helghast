@@ -1,0 +1,16 @@
+# 1.14 main menu has an extra row (Campaign, Co-op, Multiplayer, Botzone, Downloadable Content, Options, Credits, Exit): Options is 5 DOWN.
+# (CROSS on Downloadable Content shows 'Connecting...' and stays: no PSN.) Same as menu-to-options.pad otherwise.
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key X
+wait mainsettings.gum
+sleep 3
+mark options list (1.14 rows: Audio, Display, Set up 3D TV, Wireless Controller, Keyboard, Language)

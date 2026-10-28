@@ -1,0 +1,11 @@
+# level index 4 (id 204), node offset 0; expected level load at ~72 s: use level-run.sh --load 72
+46:0x0040      # lobby: DOWN from the disabled Continue to Select Chapter
+49:0x4000      # Select Chapter -> campaignlevelselect.gum
+52:0x0040      # level list: DOWN 1/4
+55:0x0040      # level list: DOWN 2/4
+58:0x0040      # level list: DOWN 3/4
+61:0x0040      # level list: DOWN 4/4
+64:0x4000      # pick level index 4 (id 204) -> campaignmissionselect.gum
+67:0x4000      # first node -> campaigndifficulty.gum
+70:0x4000      # difficulty: the highlighted default -> level load (loading cinematic ~73-86 s)
+71:0x4000      # retry

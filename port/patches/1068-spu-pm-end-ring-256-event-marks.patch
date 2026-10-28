@@ -1,0 +1,197 @@
+KZ3 patch 1068 (SPU pass 52, diagnostic, no behaviour change): the [pm-end] post-mortem (a SPURS policy-module lane run
+that ended anywhere but exitToKernel, which strands the job it had claimed) now keeps 256 drain steps (was 32) and
+marks the control-flow events that bypass the trampoline ring: interrupt taken (I:srr0), iret register restore
+(R:pc), restart dispatch longjmp (X:pc), drain resume at a lifted entry (D:pc), the driver's restart entry (E:pc), each
+with the host depth; the line also gives the wid, image, resident overlay, interrupt enable, event status/mask, srr0,
+the saved-register state (irq_saved, resume pc) and steps, written as one buffer. Found need: KZ3's quit hang, the
+Amadeus mixer job (job_0127a180, wid 5) ends its lane at pc 0x4D70 inside the job with status RUNNING, depth 0, and
+the 32-step ring could not say how.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): marks kept; ring 256 everywhere.
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index a24b988b..9f41853e 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -160,6 +160,7 @@ void spu_jmp_no_unwind(void* env)
+ void spu_restart_dispatch(spu_context* ctx)
+ {
+     g_spu_trampoline_fn = 0;
++    spu_recent_mark(ctx, 3, ctx->pc);   /* KZ3 patch 1068 */
+     if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
+     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
+     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+@@ -373,6 +374,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+          * Re-enter its target with the same guest state on the driver stack. */
+         ctx->host_depth = 0;
+         g_spu_trampoline_fn = 0;
++        spu_recent_mark(ctx, 5, ctx->pc);   /* KZ3 patch 1068 */
+         spu_indirect_branch(ctx);
+         SPU_DRAIN(ctx);
+         break;
+@@ -2650,7 +2652,16 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+  * the small instruction set such stubs use, and exit back into lifted code at
+  * the first branch (trampoline re-dispatch). Returns 1 if it executed to a
+  * branch, 0 on an unknown opcode (caller falls through to BRANCH-TO-0). */
+-static int spu_smc_microstep(spu_context* ctx)
++extern int g_kz3_pmend_ib;
++static int spu_smc_microstep_body(spu_context* ctx);
++static int spu_smc_microstep(spu_context* ctx)   /* KZ3 patch 1068: marks around the body */
++{
++    if (g_kz3_pmend_ib > 0) spu_recent_mark(ctx, 8, ctx->pc);
++    const int r = spu_smc_microstep_body(ctx);
++    if (!r && g_kz3_pmend_ib > 0) spu_recent_mark(ctx, 9, ctx->pc);
++    return r;
++}
++static int spu_smc_microstep_body(spu_context* ctx)
+ {
+     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+     /* Straight runs of quadword loads and stores (lqa/stqa/lqd/stqd) go through
+@@ -2871,8 +2882,15 @@ static int spu_smc_microstep(spu_context* ctx)
+     return 0;
+ }
+ 
++/* KZ3 patch 1068: KZ3_PMEND_IB=1 also marks every indirect-branch entry in the [pm-end] ring (B:pc, then L:link
++ * register) and the SMC microstep (M:pc entry, F:pc when it gives up). Off by default (one global test). */
++int g_kz3_pmend_ib = -1;
+ void spu_indirect_branch(spu_context* ctx)
+ {
++    if (__builtin_expect(g_kz3_pmend_ib != 0, 0)) {
++        if (g_kz3_pmend_ib < 0) { const char* e = getenv("KZ3_PMEND_IB"); g_kz3_pmend_ib = (e && *e == '1') ? 1 : 0; }
++        if (g_kz3_pmend_ib) { spu_recent_mark(ctx, 6, ctx->pc); spu_recent_mark(ctx, 7, ctx->gpr[0]._u32[0]); }
++    }
+     if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "ib", 0, ctx->gpr[0]._u32[0]);
+     if (__builtin_expect(g_spu_ovl_skip_any, 0) && ctx->resident_ovl > 0)
+         spu_overlay_skip_entry(ctx, ctx->resident_ovl);   /* KZ3 patch 1043 */
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index a38ae59b..81ae1a25 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -338,7 +338,8 @@ typedef struct spu_context {
+     void   (*tramp_fn)(struct spu_context*);  /* pending cross-function transfer */
+     uint32_t pch_ring[8];                     /* last trampoline-hop PCs */
+     unsigned pch_n;
+-    uint32_t recent_pc[32];                   /* last drain steps ([pm-end]) */
++    uint32_t recent_pc[256];                  /* last drain steps ([pm-end]); KZ3 patch 1068: 256 (was 32), with
++                                                 event marks (kind << 28 | depth << 20 | pc, spu_recent_mark) */
+     unsigned recent_n;
+     void*    mfc_cache;                       /* this context's MFC engine */
+ 
+@@ -951,6 +952,12 @@ static inline int spu_stack_reset_needed(const spu_context* ctx)
+  * pm flow capture targets this context, or KZ3_SPU_FASTCG is below 1039 (then g_spu_launch_diag = 1 and
+  * g_spu_depth_max stays 0, so both inline tests fail without a flag of their own: no extra load per hook). */
+ void spu_task_launch_check_full(spu_context* ctx, void* fn); /* SPURS task-launch */
++/* KZ3 patch 1068: an event mark in the [pm-end] ring: kind 1 interrupt taken (pc = srr0), 2 iret register restore
++ * (pc = resume pc), 3 restart dispatch (longjmp to the driver), 4 drain resume at a lifted entry, 5 driver restart
++ * entry (case 2); bits 20-27 = host depth. */
++#define spu_recent_mark(ctx, kind, pcv) \
++    ((ctx)->recent_pc[(ctx)->recent_n++ & 255] = ((uint32_t)(kind) << 28) | (((uint32_t)(ctx)->host_depth & 0xFFu) << 20) | \
++                                                 ((uint32_t)(pcv) & 0x3FFFFu))
+ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*));
+ void spu_launch_ls0_end(spu_context* ctx);
+ extern int g_spu_launch_diag;              /* 1: always the full hook (diagnostics or KZ3_SPU_FASTCG < 1039) */
+@@ -966,7 +973,7 @@ static inline __attribute__((always_inline)) void spu_task_launch_check(spu_cont
+         return;
+     }
+     const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+-    ctx->recent_pc[ctx->recent_n++ & 31] = pc;
++    ctx->recent_pc[ctx->recent_n++ & 255] = pc;
+     if (__builtin_expect(g_spu_stack_reset_n != 0, 0) && ctx->host_depth && !ctx->policy_mode)
+         spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+     /* same test as the full hook: a job branching to LS 0 (not on the first step) is complete */
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 24c20448..8a86b9a8 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -109,9 +109,9 @@ extern void spu_halt(spu_context*);
+  * ended where it should not have (spurs_policy.c, [pm-end]). KZ3 patch 1017: per
+  * context (was a thread-local ring, emulated TLS on MinGW). */
+ unsigned spu_recent_pcs(const spu_context* ctx, uint32_t* out, unsigned max)
+-{
+-    unsigned n = ctx->recent_n < 32 ? ctx->recent_n : 32, k = n < max ? n : max;
+-    for (unsigned i = 0; i < k; i++) out[i] = ctx->recent_pc[(ctx->recent_n - k + i) & 31];
++{   /* KZ3 patch 1017: per context (was a thread-local ring, emulated TLS on MinGW) */
++    unsigned n = ctx->recent_n < 256 ? ctx->recent_n : 256, k = n < max ? n : max;   /* KZ3 patch 1068: 256 */
++    for (unsigned i = 0; i < k; i++) out[i] = ctx->recent_pc[(ctx->recent_n - k + i) & 255];
+     return k;
+ }
+ 
+@@ -139,7 +139,7 @@ static int spu_task_launch_diagnostics(void)
+  * guest calls can change PM-flow, PC and steps before the next hop. */
+ SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn)
+ {
+-    ctx->recent_pc[ctx->recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;   /* KZ3 1017 */
++    ctx->recent_pc[ctx->recent_n++ & 255] = (uint32_t)ctx->pc & SPU_LS_MASK;   /* KZ3 1017 */
+     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+     if (spu_stack_reset_needed(ctx))
+         spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+@@ -397,6 +397,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
+                 ctx->int_enable) {
+                 memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
+                 ctx->irq_saved = 0;
++                spu_recent_mark(ctx, 2, ctx->pc);   /* KZ3 patch 1068 */
+                 /* The iret completed below the frame that took the interrupt:
+                  * abandon the handler's host frames and resume there. */
+                 spu_irq_frame* f = (spu_irq_frame*)ctx->irq_frame;
+@@ -493,6 +494,7 @@ void (*spu_take_interrupt(spu_context* ctx,
+         return tf;
+     }
+     ctx->srr0 = ctx->pc;             /* resume point for iret */
++    spu_recent_mark(ctx, 1, ctx->srr0);   /* KZ3 patch 1068 */
+     ctx->int_enable = 0;
+     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
+     { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+@@ -669,6 +671,7 @@ void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
+                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
+                             (int)ctx->resident_ovl); }
+                 *tramp = spu_indirect_branch;
++                spu_recent_mark(ctx, 4, pc);   /* KZ3 patch 1068 */
+                 continue;
+             }
+         }
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 5140552c..c0704817 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -466,13 +466,35 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+      * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
+     if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
+         extern unsigned spu_recent_pcs(const spu_context*, uint32_t*, unsigned);
+-        uint32_t r[32]; unsigned n = spu_recent_pcs(ctx, r, 32);
++        uint32_t r[256]; unsigned n = spu_recent_pcs(ctx, r, 256);
+         static volatile long s_pe; if (__atomic_add_fetch(&s_pe, 1, __ATOMIC_RELAXED) <= 64) {
+-            fprintf(stderr, "[pm-end] lane %u ctx=%p halted=%d status=0x%X pc=0x%05X lr=0x%05X r3=0x%08X depth=%u recent:",
+-                    spu_num, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,
+-                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->host_depth);
+-            for (unsigned k = 0; k < n; k++) fprintf(stderr, " %05X", r[k]);
+-            fprintf(stderr, "\n"); fflush(stderr); } }
++            /* KZ3 patch 1068: one buffer (other threads print too), 256 steps, event marks (I = interrupt taken at srr0,
++             * R = iret register restore, X = restart dispatch, D = drain resume, E = driver restart entry; /depth),
++             * and the interrupt state. */
++            static char buf[8192]; static volatile long s_bl;
++            while (__atomic_exchange_n(&s_bl, 1, __ATOMIC_ACQUIRE)) { }
++            int p = snprintf(buf, sizeof buf, "[pm-end] lane %u wid %u ctx=%p halted=%d status=0x%X pc=0x%05X lr=0x%05X r3=0x%08X depth=%u "
++                    "img=%d ovl=%d int=%u evst=0x%X evmask=0x%X srr0=0x%05X irq_saved=%d resume=0x%05X steps=%u recent:",
++                    spu_num, wid, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,
++                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->host_depth, ctx->image_id,
++                    ctx->resident_ovl, ctx->int_enable, ctx->event_status, ctx->event_mask, ctx->srr0 & SPU_LS_MASK,
++                    ctx->irq_saved, ctx->irq_resume_pc & SPU_LS_MASK, (unsigned)ctx->steps);
++            for (unsigned k = 0; k < n && p < (int)sizeof buf - 40; k++) {
++                const uint32_t v = r[k], kind = v >> 28;
++                if (k && k % 40 == 0) p += snprintf(buf + p, sizeof buf - p, "\n[pm-end]   +%u:", k);   /* log lines are cut near 1 KB */
++                if (kind) p += snprintf(buf + p, sizeof buf - p, " %c:%05X/%u", "?IRXDEBLMF"[kind < 10 ? kind : 0], v & 0x3FFFF, (v >> 20) & 0xFF);
++                else p += snprintf(buf + p, sizeof buf - p, " %05X", v & 0x3FFFF);
++            }
++            { const uint8_t* L = ctx->ls;   /* registers a call through a pointer uses, and the LS around pc and lr */
++              p += snprintf(buf + p, sizeof buf - p, "\n[pm-end]   r2=%08X r80=%08X r95=%08X r126=%08X LS1320=%02X%02X%02X%02X LS[pc&~0xF]:",
++                            ctx->gpr[2]._u32[0], ctx->gpr[80]._u32[0], ctx->gpr[95]._u32[0], ctx->gpr[126]._u32[0],
++                            L[0x1320], L[0x1321], L[0x1322], L[0x1323]);
++              const uint32_t a0 = ((uint32_t)ctx->pc & SPU_LS_MASK & ~0xFu), a1 = ((ctx->gpr[0]._u32[0] & SPU_LS_MASK & ~0xFu) - 0x40) & SPU_LS_MASK;
++              for (uint32_t o = 0; o < 32 && a0 + o + 3 < 0x40000; o += 4) p += snprintf(buf + p, sizeof buf - p, " %02X%02X%02X%02X", L[a0+o], L[a0+o+1], L[a0+o+2], L[a0+o+3]);
++              p += snprintf(buf + p, sizeof buf - p, "\n[pm-end]   LS[lr-0x40 = 0x%05X..]:", a1);
++              for (uint32_t o = 0; o < 0x60 && a1 + o + 3 < 0x40000; o += 4) p += snprintf(buf + p, sizeof buf - p, " %02X%02X%02X%02X", L[a1+o], L[a1+o+1], L[a1+o+2], L[a1+o+3]); }
++            fprintf(stderr, "%s\n", buf); fflush(stderr);
++            __atomic_store_n(&s_bl, 0, __ATOMIC_RELEASE); } }
+ 
+     if (s_claimlog) {
+         unsigned claims = g_spu_putllc_sync_hit - claim_before;

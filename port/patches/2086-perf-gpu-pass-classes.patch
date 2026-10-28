@@ -1,0 +1,214 @@
+KZ3 patch 2086: RSX_PERF_GPUPASS=1, GPU time per pass class and per PSO once per second (`[perf-gpupass]`); pass 83.
+
+Diagnostic only, default off (one cached getenv in the patch-2051 init). It turns on patch 2052's GPU timestamps
+(a stamp after every draw, resolved into the readback ring, credited when the list's fence completes) without
+RSX_PERF_GPU=2, and the 1 ms GPU poller prints one line per second: GPU ms per frame and draws per frame for the
+classes shadow / zpre / gbuf / post (rule in libs/video/rsx_gpupass.h; ASSUMPTION: a heuristic from RSX pass 55's
+K4 pass table, not a guest pass id), clear/copy/tail intervals, the 2051 wall busy ms of that second, the top 3
+render-target sets and the top 4 PSOs. The 10 s `[perf-gt*]` tables of 2052 still print.
+
+Host test: tools/smoke/test_gpupass.sh (class rule and top-N pick, no D3D12).
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -134,6 +134,7 @@
+ #include "rsx_pso_template.h"   /* patch 2071 */
+ #include "rsx_pace.h"           /* patch 2072 */
+ #include "rsx_tex_lru.h"        /* patch 2075 */
++#include "rsx_gpupass.h"        /* patch 2086 */
+ #include <sys/stat.h>
+ 
+ #pragma comment(lib, "d3d12.lib")
+@@ -2402,7 +2403,7 @@
+ enum { LD_GT_START, LD_GT_DRAW, LD_GT_CLEAR, LD_GT_COPY, LD_GT_TAIL, LD_GT_VBCOPY, LD_GT_KINDS };   /* VBCOPY: patch 2053 copy lists */
+ typedef struct { u32 loc[5], off[5], w[5], h[5], fmt[5]; u32 n_mrt; } ld_gt_passkey;   /* [4] = zeta */
+ typedef struct { u64 key, vp_hash; u32 fp_loc, fp_off, fp_size, vp_instrs, input_mask, txl_mask, vtex_mask, ntex; } ld_gt_psoinfo;
+-typedef struct { u16 kind, pass; u32 pso, verts, px; } ld_gt_meta;
++typedef struct { u16 kind, pass; u32 pso, verts, px; u8 cls; } ld_gt_meta;   /* cls: patch 2086 (0xFF = none) */
+ typedef struct { double ms; u64 n; double px, verts; } ld_gt_acc;
+ static struct {
+     int on;
+@@ -2415,6 +2416,9 @@
+     ld_gt_psoinfo pi[LD_GT_PSOS]; u32 n_pi; u32 hash[LD_GT_PSO_HASH];
+     u64 dropped;
+     ld_gt_acc pass[LD_GT_PASSES], pso[LD_GT_PSOS], kind[LD_GT_KINDS];   /* poller-owned window sums */
++    /* Patch 2086 (RSX_PERF_GPUPASS=1): one-second sums for `[perf-gpupass]`, also poller-owned. */
++    int gp; u32 next_cls;
++    ld_gt_acc s_pass[LD_GT_PASSES], s_pso[LD_GT_PSOS], s_kind[LD_GT_KINDS], s_cls[RSX_GP_CLASSES];
+ } g_gt;
+ static void ld_gt_stamp(u32 kind, u32 pass, u32 pso, u32 verts, u32 px)
+ {
+@@ -2423,6 +2427,7 @@
+     g.list->lpVtbl->EndQuery(g.list, g_gt.heap, D3D12_QUERY_TYPE_TIMESTAMP, s);
+     g_gt.meta[s].kind = (u16)kind; g_gt.meta[s].pass = (u16)pass; g_gt.meta[s].pso = pso;
+     g_gt.meta[s].verts = verts; g_gt.meta[s].px = px;
++    g_gt.meta[s].cls = (u8)g_gt.next_cls; g_gt.next_cls = 0xFFu;   /* patch 2086 */
+ }
+ static void ld_gt_begin(void)
+ {
+@@ -2494,7 +2499,15 @@
+     ld_gt_begin();
+     const u32 pso = ld_gt_pso_index();
+     g_gt.pi[pso].ntex = ntex;
+-    ld_gt_stamp(LD_GT_DRAW, ld_gt_pass_index(target, n_mrt, mrt, zslot), pso, verts, px);
++    const u32 pass = ld_gt_pass_index(target, n_mrt, mrt, zslot);
++    if (g_gt.gp) {   /* patch 2086: the draw's pass class from its targets and colour masks */
++        const ld_gt_passkey* k = &g_gt.pk[pass < LD_GT_PASSES ? pass : 0];
++        u32 cm_mrt = g.rsx.seen[M_COLOR_MASK_MRT >> 2] ? rsx_dsp_reg(&g.rsx, M_COLOR_MASK_MRT) : 0xFFF0u;
++        cm_mrt &= (n_mrt >= 4) ? 0xFFF0u : (n_mrt == 3) ? 0x0FF0u : (n_mrt == 2) ? 0x00F0u : 0u;
++        g_gt.next_cls = rsx_gp_class(n_mrt, k->w[0], k->h[0], 1, zslot ? k->fmt[4] : 0u,
++                                     rsx_dsp_reg(&g.rsx, M_COLOR_MASK), cm_mrt);
++    }
++    ld_gt_stamp(LD_GT_DRAW, pass, pso, verts, px);
+ }
+ /* Patch 2053's copy list: two stamps around its copies, same fence as the draw list that follows. */
+ static void ld_gt_copy_stamp(ID3D12GraphicsCommandList* l, int second)
+@@ -2513,8 +2526,9 @@
+ {
+     if (c != 0xFFFFFFFFu) {
+         const u64 a = g_gt.rbmap[c], b = g_gt.rbmap[c + 1];
+-        g_gt.kind[LD_GT_VBCOPY].ms += b >= a ? (double)(b - a) * 1000.0 / (double)g_gt.freq : 0.0;
+-        g_gt.kind[LD_GT_VBCOPY].n++;
++        const double cms = b >= a ? (double)(b - a) * 1000.0 / (double)g_gt.freq : 0.0;
++        g_gt.kind[LD_GT_VBCOPY].ms += cms; g_gt.kind[LD_GT_VBCOPY].n++;
++        if (g_gt.gp) { g_gt.s_kind[LD_GT_VBCOPY].ms += cms; g_gt.s_kind[LD_GT_VBCOPY].n++; }   /* patch 2086 */
+     }
+     for (u32 i = 1; i < n; i++) {
+         const u64 a = g_gt.rbmap[first + i - 1], b = g_gt.rbmap[first + i];
+@@ -2528,6 +2542,14 @@
+             p->ms += ms; p->n++; p->px += m->px; p->verts += m->verts;
+             o->ms += ms; o->n++; o->px += m->px; o->verts += m->verts;
+         }
++        if (g_gt.gp) {   /* patch 2086 */
++            ld_gt_acc* sk = &g_gt.s_kind[m->kind < LD_GT_KINDS ? m->kind : 0]; sk->ms += ms; sk->n++;
++            if (m->kind == LD_GT_DRAW) {
++                ld_gt_acc* sp = &g_gt.s_pass[m->pass < LD_GT_PASSES ? m->pass : 0]; sp->ms += ms; sp->n++; sp->verts += m->verts;
++                ld_gt_acc* so = &g_gt.s_pso[m->pso < LD_GT_PSOS ? m->pso : 0]; so->ms += ms; so->n++; so->verts += m->verts;
++                if (m->cls < RSX_GP_CLASSES) { g_gt.s_cls[m->cls].ms += ms; g_gt.s_cls[m->cls].n++; }
++            }
++        }
+     }
+ }
+ static void ld_gt_report(unsigned secs, u32 frames)
+@@ -2569,6 +2591,44 @@
+     g_gt.c_bytes = 0;
+     memset(g_gt.pass, 0, sizeof g_gt.pass); memset(g_gt.pso, 0, sizeof g_gt.pso); memset(g_gt.kind, 0, sizeof g_gt.kind);
+ }
++/* Patch 2086: one line per second, `[perf-gpupass] t= frames gpu ms/frame | classes | top passes | top PSOs`.
++ * Values are GPU ms per frame of that second (interval after each draw, as patch 2052 credits them). */
++static void ld_gp_report(unsigned secs, u32 frames, double wall_busy_ms)
++{
++    static const char* kn[LD_GT_KINDS] = {"start", "draw", "clear", "copy", "tail", "vbcopy"};
++    const double fr = frames ? (double)frames : 1.0;
++    char line[1400]; int o = 0;
++    double tot = 0.0;
++    for (int k = 0; k < LD_GT_KINDS; k++) tot += g_gt.s_kind[k].ms;
++    o += snprintf(line + o, sizeof line - o, "[perf-gpupass] t=%us frames %u gpu %.2f ms/frame busy %.1f ms/s |",
++                  secs, frames, tot / fr, wall_busy_ms);
++    for (int c = 0; c < RSX_GP_CLASSES; c++)
++        o += snprintf(line + o, sizeof line - o, " %s %.2f/%.0f", rsx_gp_class_name[c], g_gt.s_cls[c].ms / fr, (double)g_gt.s_cls[c].n / fr);
++    for (int k = 2; k < LD_GT_KINDS; k++)
++        if (g_gt.s_kind[k].n) o += snprintf(line + o, sizeof line - o, " %s %.2f/%.0f", kn[k], g_gt.s_kind[k].ms / fr, (double)g_gt.s_kind[k].n / fr);
++    static double v[LD_GT_PSOS]; unsigned top[4], nt;
++    const u32 npk = g_gt.n_pk < LD_GT_PASSES ? g_gt.n_pk : LD_GT_PASSES;
++    for (u32 i = 0; i < npk; i++) v[i] = g_gt.s_pass[i].ms;
++    nt = rsx_gp_topn(v, npk, 3, top);
++    o += snprintf(line + o, sizeof line - o, " | pass");
++    for (unsigned r = 0; r < nt && o < (int)sizeof line - 160; r++) {
++        const ld_gt_passkey* k = &g_gt.pk[top[r]]; const ld_gt_acc* a = &g_gt.s_pass[top[r]];
++        o += snprintf(line + o, sizeof line - o, " #%u %.2f/%.0f rt0 0x%X %ux%u f%u mrt%u z %s0x%X zf%u;", top[r], a->ms / fr, (double)a->n / fr,
++                      k->off[0], k->w[0], k->h[0], k->fmt[0], k->n_mrt, k->off[4] == 0xFFFFFFFFu ? "main " : "", k->off[4], k->fmt[4]);
++    }
++    const u32 npi = g_gt.n_pi < LD_GT_PSOS ? g_gt.n_pi : LD_GT_PSOS;
++    for (u32 i = 0; i < npi; i++) v[i] = g_gt.s_pso[i].ms;
++    nt = rsx_gp_topn(v, npi, 4, top);
++    o += snprintf(line + o, sizeof line - o, " | pso");
++    for (unsigned r = 0; r < nt && o < (int)sizeof line - 160; r++) {
++        const ld_gt_psoinfo* p = &g_gt.pi[top[r]]; const ld_gt_acc* a = &g_gt.s_pso[top[r]];
++        o += snprintf(line + o, sizeof line - o, " %08x %.2f/%.0f kv %.0f fp %u:0x%X/%u vp %u ntex %u;", (unsigned)p->key, a->ms / fr, (double)a->n / fr,
++                      a->verts / fr / 1e3, p->fp_loc, p->fp_off, p->fp_size, p->vp_instrs, p->ntex);
++    }
++    fprintf(stderr, "%s\n", line);
++    memset(g_gt.s_pass, 0, sizeof g_gt.s_pass); memset(g_gt.s_pso, 0, sizeof g_gt.s_pso);
++    memset(g_gt.s_kind, 0, sizeof g_gt.s_kind); memset(g_gt.s_cls, 0, sizeof g_gt.s_cls);
++}
+ static void ld_gt_init(void)
+ {
+     g_gt.on = 0;
+@@ -2621,6 +2681,7 @@
+         if ((double)(now - win0) * tk >= 1000.0) {
+             fprintf(stderr, "[perf-gpu] t=%us lists %u busy %.1f ms of %.0f longest %.1f missed %u\n",
+                     ++secs, lists, busy, (double)(now - win0) * tk, longest, missed);
++            if (g_gt.on > 0 && g_gt.gp) { static u32 gfr0; ld_gp_report(secs, g_ld_frames - gfr0, busy); gfr0 = g_ld_frames; }   /* patch 2086 */
+             {   static const char* nm[10] = {"slow", "snorm16", "float", "half", "unorm8", "sint16", "cmp32", "uint8", "default", "unk"};
+                 static unsigned long long last[10][3];
+                 char vl[400]; int o = snprintf(vl, sizeof vl, "[perf-vtxtype] t=%us", secs);
+@@ -2643,7 +2704,12 @@
+         const char* e = getenv("RSX_PERF_GPU");
+         g_gm_on = e && *e && *e != '0';
+         if (g_gm_on) rsx_vtx_prof_clock = rsx_perf_now;
+-        if (g_gm_on && *e == '2') ld_gt_init();   /* patch 2052 */
++        const char* gpe = getenv("RSX_PERF_GPUPASS");   /* patch 2086: implies the 2052 timestamps */
++        const int gp = gpe && *gpe && *gpe != '0';
++        if (gp) g_gm_on = 1;
++        if (g_gm_on) rsx_vtx_prof_clock = rsx_perf_now;
++        if (g_gm_on && ((e && *e == '2') || gp)) ld_gt_init();   /* patch 2052 */
++        if (gp && g_gt.on > 0) { g_gt.gp = 1; fprintf(stderr, "[perf-gpupass] on: per-second GPU ms by pass class\n"); }
+         if (g_gm_on) CreateThread(NULL, 0, ld_gm_thread, NULL, 0, NULL);
+     }
+     if (!g_gm_on) return;
+--- /dev/null
++++ b/libs/video/rsx_gpupass.h
+@@ -0,0 +1,52 @@
++/* Patch 2086 (KZ3 RSX pass 83): per-pass-class GPU time, one summary line per second.
++ *
++ * RSX_PERF_GPUPASS=1 turns on patch 2052's GPU timestamps (one stamp after every draw, resolved into a readback
++ * ring) and adds `[perf-gpupass]` once per second: GPU ms per frame by pass class, the top render-target sets and
++ * the top PSOs of that second. This header holds the pure parts (the class rule, the top-N pick) so a host test can
++ * check them without D3D12 (tools/smoke/test_gpupass.sh).
++ *
++ * Classes (ASSUMPTION: a heuristic from the K4 pass table of RSX pass 55, not a guest-side pass id):
++ *   shadow  depth target is Z16, or colour writes are off and render target 0 is square (the 1024x1024 cascades)
++ *   zpre    colour writes off with a depth target (depth pre-pass draws, e.g. the position-only PSO in the scene)
++ *   gbuf    colour on, 2 or more render targets (the 1280x720 G-buffer MRT pass)
++ *   post    colour on, one render target (lighting, half-res, blur, HUD, post)
++ * Colour off = COLOR_MASK has no nonzero byte (the live renderer's rule: any nonzero byte = channel on) and no MRT
++ * slot 1-3 has a COLOR_MASK_MRT nibble set (callers pass the MRT mask already cut to the bound count). */
++#ifndef RSX_GPUPASS_H
++#define RSX_GPUPASS_H
++
++enum { RSX_GP_SHADOW, RSX_GP_ZPRE, RSX_GP_GBUF, RSX_GP_POST, RSX_GP_CLASSES };
++
++static const char* const rsx_gp_class_name[RSX_GP_CLASSES] = {"shadow", "zpre", "gbuf", "post"};
++
++/* zfmt: 1 = Z16, 2 = Z24S8 (CELL_GCM_SURFACE_Z16/Z24S8), 0 = unknown (the main zeta). */
++static inline unsigned rsx_gp_class(unsigned n_mrt, unsigned rt0_w, unsigned rt0_h, int has_zeta, unsigned zfmt,
++                                    unsigned color_mask, unsigned color_mask_mrt)
++{
++    const int colour_off = color_mask == 0u && (n_mrt < 2u || (color_mask_mrt & 0xFFF0u) == 0u);
++    if (has_zeta && (zfmt == 1u || (colour_off && rt0_w == rt0_h && rt0_w >= 256u))) return RSX_GP_SHADOW;
++    if (colour_off && has_zeta) return RSX_GP_ZPRE;
++    if (n_mrt >= 2u) return RSX_GP_GBUF;
++    return RSX_GP_POST;
++}
++
++/* Indices of the k largest positive values of v[0..n) in descending order (ties: lower index first); returns how
++ * many were found (<= k). O(n*k), k is small. */
++static inline unsigned rsx_gp_topn(const double* v, unsigned n, unsigned k, unsigned* out)
++{
++    unsigned got = 0;
++    for (unsigned r = 0; r < k; r++) {
++        int bi = -1; double bm = 0.0;
++        for (unsigned i = 0; i < n; i++) {
++            if (!(v[i] > bm)) continue;
++            int taken = 0;
++            for (unsigned j = 0; j < got; j++) if (out[j] == i) { taken = 1; break; }
++            if (!taken) { bm = v[i]; bi = (int)i; }
++        }
++        if (bi < 0) break;
++        out[got++] = (unsigned)bi;
++    }
++    return got;
++}
++
++#endif

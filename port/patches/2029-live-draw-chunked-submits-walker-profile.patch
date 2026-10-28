@@ -1,0 +1,671 @@
+live-draw: submit recorded work without waiting (chunks and walker idle points); walker profile split.
+
+Symptom: in the Killzone 3 level (RSX pass 29) the FIFO walker / live-draw thread is the critical path:
+162 ms of 237 ms per frame, 49 ms of it waiting for GPU fences in ~3.9 non-present flushes per frame. The
+walker recorded a whole frame into one command list and handed it to the GPU only at a sync point (NV0039
+scene copy write-back, main-surface write-back at a semaphore release, ring wrap, present), then waited for
+all of it: the GPU idled while the walker recorded and the walker idled while the GPU ran.
+
+Fix: no-wait submits (Close, ExecuteCommandLists, Signal, Reset on the same allocator) every
+LD_SUBMIT_CHUNK draws (default 128, 0 = off) before a draw records anything, and when the walker goes
+idle (caught up with put or parked on an unpatched JUMP; rsx_live_draw_submit_pending from the FIFO walk).
+Sync points still wait before any guest memory or semaphore is written, so no guest-visible ordering
+changes; rings, retired textures and readback slots are still recycled only after a fence wait. Not while
+an occlusion query is open (patch 2025 counts a split query as two segments).
+
+Per-draw PSO cost (the largest walker item in the r30a profile, 34 ms per frame): get_pso hashed the vertex
+program twice per draw (the key and vp_hash are the same FNV-1a) and the fragment program once, byte by byte,
+and called getenv() per draw for LD_GAMMA_LOG (every gamma texture unit) and LD_NO_ZALIAS_UNNORM_FIX. Now
+the VP FNV is computed once, the VP/FP hashes and the FP size scan are memoized against a copy of the last
+bytes (memcmp; exact, keys keep their values; LD_PSO_MEMO=0 turns it off), and both getenv calls are cached.
+
+Diagnostics (off by default): RSX_PERF=1 with RSX_PERF_PROF=A,B prints "[perf-walk]" each second inside
+that window (seconds since the first walk): draw time split into vertex fetch/copy, PSO lookup (new PSOs
+and their build time), constants, texture binds (new decodes), clears, submit time, no-wait chunks, GPU
+waits of readback flushes vs others, NV0039 and sync-point write-backs (count/time), the stores, and the
+NV0039 guest copy, the texture content hash, and get_pso's parts (program sizes, texture-unit scan,
+key, lookup; memo hits). RSX_PERF_SAMPLE=2 samples the walker thread itself inside the window, with the samples
+outside the exe split by module ("[perf-samp-mod]"). LD_WB_UNSAFE_NOWAIT=1 is the host test's negative
+control (write-backs read the readback buffers without waiting); never set it in a real run.
+
+Test: tools/smoke/test_wb_batch.c (KZ3-shaped frame plus 150 extra draws, alternating patterns).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 30574067..70841f03 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1476,6 +1476,7 @@ static void nv0039_copy(u32 notify)
+         wb = rsx_live_draw_writeback_range(sl ? 0u : 1u, (u32)(lo_in - (s64)src) + s_nv0039.off_in,
+                                            (u32)(hi_in - lo_in));
+     s_nv0039_wb += wb;
++    const long long m2mf_t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;   /* patch 2029 */
+     for (u32 y = 0; y < n; y++) {
+         u8* d = vm_base + (u32)((s64)dst + (s64)y * pout);
+         const u8* sp = vm_base + (u32)((s64)src + (s64)y * pin);
+@@ -1483,6 +1484,7 @@ static void nv0039_copy(u32 notify)
+         else  /* ASSUMPTION: FORMAT is the byte increment on each side (NV m2mf). */
+             for (u32 x = 0; x < len; x++) d[(size_t)x * out_inc] = sp[(size_t)x * in_inc];
+     }
++    if (m2mf_t0) rsx_perf_add(RSX_PERF_W_M2MF_T, rsx_perf_now() - m2mf_t0);
+     u32 marked = 0;
+     if (rsx_live_draw_enabled())
+         marked = rsx_live_draw_note_guest_write(dl ? 0u : 1u, (u32)(lo_out - (s64)dst) + s_nv0039.off_out,
+@@ -2138,6 +2140,12 @@ void rsx_perf_note_gcm_wait(unsigned lr, long long ticks)
+         }
+     }
+ }
++/* Patch 2029: the walker split ([perf-walk]) and RSX_PERF_SAMPLE=2 (sample the
++ * walker thread) count only inside RSX_PERF_PROF=A,B (seconds since the first
++ * walk), so a level run keeps clean windows before and after it. */
++static volatile int s_perf_walk_on;
++static double s_perf_prof_a = -1, s_perf_prof_b = -1;
++int rsx_perf_walk_on(void) { return s_perf_walk_on; }
+ void rsx_perf_add(int idx, long long v)
+ {
+     if (rsx_perf_enabled() && idx >= 0 && idx < RSX_PERF_COUNT)
+@@ -2193,6 +2201,23 @@ static char      s_ps_lab[PS_HOT][48];
+ static uintptr_t s_ps_key[PS_HOT][PS_SLOTS];
+ static unsigned  s_ps_cnt[PS_HOT][PS_SLOTS];
+ static unsigned  s_ps_total[PS_HOT], s_ps_other[PS_HOT], s_ps_out[PS_HOT];
++/* Patch 2029: outside-exe samples by module (PE modules by name, "unix" for the
++ * host side: winevulkan/driver .so code has no PE module). */
++enum { PS_MODS = 12 };
++static HMODULE   s_ps_mod[PS_HOT][PS_MODS];
++static unsigned  s_ps_mod_n[PS_HOT][PS_MODS], s_ps_mod_unix[PS_HOT];
++static void rsx_perf_sample_mod(int i, uintptr_t rip)
++{
++    HMODULE mod = NULL;
++    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)rip, &mod) || !mod)
++        { s_ps_mod_unix[i]++; return; }
++    for (int m = 0; m < PS_MODS; m++) {
++        if (s_ps_mod[i][m] == mod) { s_ps_mod_n[i][m]++; return; }
++        if (!s_ps_mod[i][m]) { s_ps_mod[i][m] = mod; s_ps_mod_n[i][m] = 1; return; }
++    }
++    s_ps_mod_unix[i]++;
++}
+ static void rsx_perf_sample_once(void)
+ {
+     const uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+@@ -2204,7 +2229,8 @@ static void rsx_perf_sample_once(void)
+         ResumeThread(s_ps_h[i]);
+         if (!ok) continue;
+         s_ps_total[i]++;
+-        if ((uintptr_t)c.Rip < base || (s_ps_end && (uintptr_t)c.Rip >= s_ps_end)) { s_ps_out[i]++; continue; }
++        if ((uintptr_t)c.Rip < base || (s_ps_end && (uintptr_t)c.Rip >= s_ps_end)) {
++            s_ps_out[i]++; rsx_perf_sample_mod(i, (uintptr_t)c.Rip); continue; }
+         const uintptr_t k = ((uintptr_t)c.Rip - base) >> 8;
+         unsigned h = (unsigned)(k * 2654435761u) & (PS_SLOTS - 1);
+         for (int n = 0; n < PS_SLOTS; n++, h = (h + 1) & (PS_SLOTS - 1)) {
+@@ -2231,6 +2257,18 @@ static void rsx_perf_sample_report(void)
+             s_ps_cnt[i][b] = 0;
+         }
+         fprintf(stderr, "%s\n", line);
++        if (s_ps_out[i]) {   /* patch 2029: outside-exe by module */
++            int mo = snprintf(line, sizeof line, "[perf-samp-mod] %s unix=%u", s_ps_lab[i], s_ps_mod_unix[i]);
++            for (int m = 0; m < PS_MODS && s_ps_mod[i][m] && mo < (int)sizeof line - 80; m++) {
++                char path[MAX_PATH] = "?"; GetModuleFileNameA(s_ps_mod[i][m], path, sizeof path);
++                const char* bn = path;
++                for (const char* q = path; *q; q++) if (*q == '\\' || *q == '/') bn = q + 1;
++                mo += snprintf(line + mo, sizeof line - mo, " %.24s=%u", bn, s_ps_mod_n[i][m]);
++            }
++            fprintf(stderr, "%s\n", line);
++        }
++        memset(s_ps_mod[i], 0, sizeof s_ps_mod[i]); memset(s_ps_mod_n[i], 0, sizeof s_ps_mod_n[i]);
++        s_ps_mod_unix[i] = 0;
+         memset(s_ps_cnt[i], 0, sizeof s_ps_cnt[i]); memset(s_ps_key[i], 0, sizeof s_ps_key[i]);
+         s_ps_total[i] = s_ps_other[i] = s_ps_out[i] = 0;
+     }
+@@ -2240,6 +2278,9 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+ {
+     const char* pse = getenv("RSX_PERF_SAMPLE");
+     const int sampling = pse && *pse && *pse != '0';
++    const int sample_rsx = sampling && atoi(pse) == 2;   /* patch 2029: the walker thread only, in the window */
++    { const char* pp = getenv("RSX_PERF_PROF");
++      if (pp && sscanf(pp, "%lf,%lf", &s_perf_prof_a, &s_perf_prof_b) != 2) s_perf_prof_a = s_perf_prof_b = -1; }
+     unsigned secs = 0;
+     (void)unused;
+     enum { MAXT = 512, TOP = 10 };
+@@ -2277,6 +2318,25 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+             d[RSX_PERF_PRESENT_T] * tk, d[RSX_PERF_SWAP_T] * tk, d[RSX_PERF_REFPOLL],
+             d[RSX_PERF_USLEEP_GCM_N], d[RSX_PERF_USLEEP_GCM_T] * tk, d[RSX_PERF_USLEEP_OTHER_T] * tk);
+         prev_methods = m; prev_draws = dr; prev_ff = rsx_perf_fifo_flips();
++        {   /* patch 2029: the walker split, ms in the last period (only while the window was on) */
++            const double tnow = (double)(now.QuadPart - t0.QuadPart) * tk / 1000.0;
++            if (d[RSX_PERF_W_ON])
++                fprintf(stderr,
++                    "[perf-walk] t=%.0fs draw %.1fms (vtx %.1f, pso %.1f new %lld/%.1fms, const %.1f, tex %.1f new %lld/%.1fms)"
++                    " clear %.1f | submit %.1fms chunks %lld | gpuwait rb %.1fms other %.1fms"
++                    " | wb nv0039 %lld/%.1fms sync %lld/%.1fms store %.1fms | m2mf %.1fms | tex-hash %.1fms | pso: pre %.1f units %.1f key %.1f find %.1f memo-hits %lld\n",
++                    tnow, d[RSX_PERF_W_DRAW_T] * tk, d[RSX_PERF_W_VTX_T] * tk, d[RSX_PERF_W_PSO_T] * tk,
++                    d[RSX_PERF_W_PSO_NEW_N], d[RSX_PERF_W_PSO_NEW_T] * tk, d[RSX_PERF_W_CONST_T] * tk,
++                    d[RSX_PERF_W_TEX_T] * tk, d[RSX_PERF_W_TEX_NEW_N], d[RSX_PERF_W_TEX_NEW_T] * tk,
++                    d[RSX_PERF_W_CLEAR_T] * tk, d[RSX_PERF_W_SUBMIT_T] * tk, d[RSX_PERF_W_CHUNK_N],
++                    d[RSX_PERF_W_WAIT_RB_T] * tk, d[RSX_PERF_W_WAIT_OTHER_T] * tk,
++                    d[RSX_PERF_W_WB_NV0039_N], d[RSX_PERF_W_WB_NV0039_T] * tk,
++                    d[RSX_PERF_W_WB_SYNC_N], d[RSX_PERF_W_WB_SYNC_T] * tk, d[RSX_PERF_W_WB_STORE_T] * tk,
++                    d[RSX_PERF_W_M2MF_T] * tk, d[RSX_PERF_W_TEX_HASH_T] * tk,
++                    d[RSX_PERF_W_PSO_PRE_T] * tk, d[RSX_PERF_W_PSO_UNITS_T] * tk, d[RSX_PERF_W_PSO_KEY_T] * tk,
++                    d[RSX_PERF_W_PSO_FIND_T] * tk, d[RSX_PERF_W_PSO_MEMO_N]);
++            s_perf_walk_on = s_perf_prof_a >= 0 && tnow >= s_perf_prof_a && tnow < s_perf_prof_b;
++        }
+         {   /* top 4 usleep sites of the cellGcmInit thread, real ms */
+             char sl[256]; int so = snprintf(sl, sizeof sl, "[perf-wait] gcm usleep by lr:");
+             for (int k = 0; k < 4; k++) {
+@@ -2331,7 +2391,8 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+         if (sampling) {   /* next second's sample set: threads >= 300 ms, not rsx/self */
+             int hot[TOP], nh = 0;
+             for (int i = 0; i < ntop && nh < PS_HOT; i++)
+-                if (top_ms[i] >= 300 && top_tid[i] != s_perf_rsx_tid && top_tid[i] != GetCurrentThreadId())
++                if (sample_rsx ? (s_perf_walk_on && top_tid[i] == s_perf_rsx_tid)   /* patch 2029 */
++                    : (top_ms[i] >= 300 && top_tid[i] != s_perf_rsx_tid && top_tid[i] != GetCurrentThreadId()))
+                     hot[nh++] = i;
+             for (int j = 0; j < PS_HOT; j++) {   /* drop slots that went cold (keep their counts) */
+                 int keep = 0;
+@@ -2514,6 +2575,7 @@ void cellGcm_rsx_process_fifo(void)
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+     rsx_perf_add(RSX_PERF_WALK_T, rsx_perf_now() - t0);
+     rsx_perf_add(RSX_PERF_WALK_N, 1);
++    if (s_perf_walk_on) rsx_perf_add(RSX_PERF_W_ON, 1);
+ }
+ 
+ /* The methods rsx_process_method acts on beyond its own rsx_state: the notify
+@@ -3428,6 +3490,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
+       } else { stuck = 0; last = s_fifo_getoff; } }
+ 
++    /* KZ3 patch 2029: the walker is about to idle (caught up with put, or parked
++     * on a JUMP-to-self the SPU has not patched yet): hand the GPU what it has
++     * recorded so far instead of letting it sit until the next sync point. */
++    if (strcmp(why, "flip") != 0 && rsx_live_draw_enabled()) rsx_live_draw_submit_pending();
++
+     /* Publish progress: get chases put; ref advances at most ONE queued fence
+      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
+      * value stays observable to equality-waiters. The wrap recycle path polls
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 3beacdfc..80e1a928 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -65,6 +65,7 @@ int  rsx_live_draw_resolve_blit(u32 sl, u32 sa, u32 sp, u32 ds, u32 dt, u32 dl,
+ void rsx_live_draw_note_resolve(u32 sl, u32 sa, u32 dl, u32 da)
+ { (void)sl; (void)sa; (void)dl; (void)da; }
+ void rsx_live_draw_flush(void) {}
++void rsx_live_draw_submit_pending(void) {}
+ void rsx_live_draw_present(u32 b) { (void)b; }
+ void rsx_live_draw_set_movie_mode(int on) { (void)on; }
+ void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
+@@ -2158,8 +2159,16 @@ static void ld_wait_idle(void)
+ static void ld_oq_close(void);   /* patch 2025 */
+ static void ld_rb_stamp(u64 v);   /* patch 2027 */
+ static void ld_rb_drain(void);
++/* Patch 2029: walker split timers (RSX_PERF=1 + RSX_PERF_PROF=A,B window). */
++#define LDW_T0(name) const long long name = rsx_perf_walk_on() ? rsx_perf_now() : 0
++#define LDW_ADD(idx, t0) do { if (t0) rsx_perf_add((idx), rsx_perf_now() - (t0)); } while (0)
++/* Patch 2029: draws recorded since the last submit (chunked submits). */
++static u32 g_ld_unsubmitted;
++static u64 g_ld_chunk_submits;
+ static void ld_flush_body(ld_flush_reason reason)
+ {
++    g_ld_unsubmitted = 0;
++    LDW_T0(submit_t0);
+ #if defined(YZ_PERF_PROFILE)
+     const LONGLONG flush_begin = ld_profile_qpc();
+     g_ld_profile.total.flush_reason[reason]++;
+@@ -2191,6 +2200,7 @@ static void ld_flush_body(ld_flush_reason reason)
+         return;
+     }
+     ld_rb_stamp(v);   /* patch 2027 */
++    LDW_ADD(RSX_PERF_W_SUBMIT_T, submit_t0);
+     if (g.fif_n > 1 && reason == LD_FLUSH_PRESENT) {
+         /* Frame N is queued; recycle frame N-1's slot once its fence passes,
+          * so the walker records frame N+1 while the GPU and the swap chain
+@@ -2232,7 +2242,10 @@ static void ld_flush_body(ld_flush_reason reason)
+         }
+         { const long long w0 = rsx_perf_now();
+           WaitForSingleObject(g.fence_event, INFINITE);
+-          rsx_perf_add(RSX_PERF_GPUWAIT_T, rsx_perf_now() - w0); }
++          rsx_perf_add(RSX_PERF_GPUWAIT_T, rsx_perf_now() - w0);
++          if (rsx_perf_walk_on())   /* patch 2029: which flushes wait */
++              rsx_perf_add(reason == LD_FLUSH_READBACK ? RSX_PERF_W_WAIT_RB_T : RSX_PERF_W_WAIT_OTHER_T,
++                           rsx_perf_now() - w0); }
+ #if defined(YZ_PERF_PROFILE)
+         const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
+         g_ld_profile.total.fence_wait_qpc += wait_ticks;
+@@ -3113,7 +3126,9 @@ static ID3D12Resource* decode_guest_texture_profiled(
+     const LONGLONG begin = ld_profile_qpc();
+     g_ld_profile.total.texture_decode_calls++;
+ #endif
++    LDW_T0(dec_t0);
+     ID3D12Resource* result = decode_guest_texture(texture, remap);
++    if (dec_t0) { LDW_ADD(RSX_PERF_W_TEX_NEW_T, dec_t0); rsx_perf_add(RSX_PERF_W_TEX_NEW_N, 1); }
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.texture_decode_qpc +=
+         (u64)(ld_profile_qpc() - begin);
+@@ -3615,7 +3630,9 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+         if (refresh_enabled && entry->tex &&
+             entry->last_hash_frame != g_ld_frames) {
+             int readable = 0;
++            LDW_T0(th_t0);
+             const u64 hash = texture_content_hash(t, &readable);
++            LDW_ADD(RSX_PERF_W_TEX_HASH_T, th_t0);
+             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
+              * reads are microseconds apart, so they can only disagree if a
+              * guest thread is writing this texture right now -- i.e. we are
+@@ -5984,9 +6001,34 @@ static void ld_gamma_log(u32 unit, const rsx_dsp_texture* t)
+             unit, t->format, gam, t->wrap, draws);
+ }
+ 
++/* KZ3 patch 2029: exact memo of get_pso's per-draw shader hashing. The PSO key
++ * starts with FNV-1a over the vertex program and the fragment program
++ * (structural hash in buffered mode), byte by byte, every draw, and the vertex
++ * program was hashed twice (the key and g_ld_current_pso.vp_hash are the same
++ * FNV over the same bytes). Consecutive draws mostly reuse both programs, so
++ * keep a copy of the last bytes hashed and reuse the result when a memcmp says
++ * they are identical; the FP size scan is reused the same way (same address,
++ * same bytes up to the cached END -> same size). Keys and vp_hash keep their
++ * exact values. LD_PSO_MEMO=0 turns it off. */
++static int ld_no_zalias_unnorm_fix(void)   /* patch 2029: getenv once */
++{
++    static int on = -1;
++    if (on < 0) on = getenv("LD_NO_ZALIAS_UNNORM_FIX") ? 1 : 0;
++    return on;
++}
++static int ld_pso_memo(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_PSO_MEMO"); on = e ? atoi(e) != 0 : 1; }
++    return on;
++}
++static struct { u32 n; u64 h; u8 bytes[RSX_DSP_VP_INSTR * 16]; } g_ld_vpm;
++static struct { u32 loc, off, size, hvalid, hmode; u64 hseed, h; u8 bytes[0x10000]; } g_ld_fpm;
++
+ static ID3D12PipelineState* get_pso(
+     const rsx_vertex_layout_plan* masked_layout, int packed_payload)
+ {
++    LDW_T0(gp_t0);
+     memset(&g_ld_current_pso, 0, sizeof(g_ld_current_pso));
+     const u32 start = rsx_dsp_vp_start(&g.rsx);
+     if (start >= RSX_DSP_VP_INSTR) { LD_PSO_BAIL("no vertex program uploaded (vp start out of range)"); return NULL; }
+@@ -5998,7 +6040,12 @@ static ID3D12PipelineState* get_pso(
+     const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
+     const u8* fp_uc = guest_ptr(fp_loc, fp_off, 16);
+     if (!fp_uc) { LD_PSO_BAIL("fragment program address does not resolve to guest memory"); return NULL; }
+-    const u32 fp_size = rsx_fp_program_size(fp_uc, 0x10000);
++    u32 fp_size = 0; int fp_same = 0;   /* patch 2029 memo */
++    if (ld_pso_memo() && g_ld_fpm.size && g_ld_fpm.loc == fp_loc && g_ld_fpm.off == fp_off) {
++        const u8* q = guest_ptr(fp_loc, fp_off, g_ld_fpm.size);
++        if (q && !memcmp(q, g_ld_fpm.bytes, g_ld_fpm.size)) { fp_size = g_ld_fpm.size; fp_same = 1; }
++    }
++    if (!fp_same) fp_size = rsx_fp_program_size(fp_uc, 0x10000);
+     if (!fp_size) {
+         /* No END-bit instruction in 64 KB: the bytes at (location, offset) are
+          * not a fragment program. Almost always the LOCATION is wrong, not the
+@@ -6041,6 +6088,12 @@ static ID3D12PipelineState* get_pso(
+     /* re-resolve with the true size to validate the whole program is mapped */
+     fp_uc = guest_ptr(fp_loc, fp_off, fp_size);
+     if (!fp_uc) { LD_PSO_BAIL("fragment program is not fully mapped in guest memory"); return NULL; }
++    if (ld_pso_memo() && !fp_same && fp_size <= sizeof g_ld_fpm.bytes) {
++        g_ld_fpm.loc = fp_loc; g_ld_fpm.off = fp_off; g_ld_fpm.size = fp_size; g_ld_fpm.hvalid = 0;
++        memcpy(g_ld_fpm.bytes, fp_uc, fp_size);
++    }
++    LDW_ADD(RSX_PERF_W_PSO_PRE_T, gp_t0);
++    LDW_T0(gp_t1);
+ 
+     /* Fragment output register mode (fp16 h0 vs fp32 r0) is driven by the
+      * SHADER_CONTROL word bit 0x40 (same fix as the replay harness — the
+@@ -6084,7 +6137,9 @@ static ID3D12PipelineState* get_pso(
+                 if (g.surfaces[si].location == texture.location &&
+                     g.surfaces[si].offset == texture.offset) { is_surf = 1; break; }
+             { static u32 n_log = 0;
+-              if (getenv("LD_GAMMA_LOG") && n_log < 24 && is_surf) {
++              static int gamma_log = -1;   /* patch 2029: getenv once, not per draw and unit */
++              if (gamma_log < 0) gamma_log = getenv("LD_GAMMA_LOG") ? 1 : 0;
++              if (gamma_log && n_log < 24 && is_surf) {
+                   n_log++;
+                   fprintf(stderr, "[gamma] unit %u samples a render surface (0x%08x fmt 0x%02x %ux%u)\n",
+                           unit, texture.offset, texture.format, texture.width, texture.height);
+@@ -6126,6 +6181,8 @@ static ID3D12PipelineState* get_pso(
+         }
+     }
+ 
++    LDW_ADD(RSX_PERF_W_PSO_UNITS_T, gp_t1);
++    LDW_T0(gp_t2);
+     render_state_t rs;
+     decode_render_state(&rs);
+     if (rsx_fp_collect_constants(
+@@ -6136,12 +6193,33 @@ static ID3D12PipelineState* get_pso(
+     g.fp_alpha_ref = rsx_fp_alpha_ref(
+         rs.alpha_ref_raw, rs.alpha_ref_format);
+ 
+-    u64 key = fnv1a(
+-        vp_uc, vp_instrs * 16, 1469598103934665603ull);
+-    if (ld_fp_constants_buffered())
+-        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+-    else
+-        key = fnv1a(fp_uc, fp_size, key);
++    u64 vp_h;   /* patch 2029: FNV of the VP, memoized; also g_ld_current_pso.vp_hash */
++    {
++        const u32 vn = vp_instrs * 16;
++        if (ld_pso_memo() && vn == g_ld_vpm.n && !memcmp(vp_uc, g_ld_vpm.bytes, vn)) {
++            vp_h = g_ld_vpm.h;
++            if (rsx_perf_walk_on()) rsx_perf_add(RSX_PERF_W_PSO_MEMO_N, 1);
++        } else {
++            vp_h = fnv1a(vp_uc, vn, 1469598103934665603ull);
++            if (ld_pso_memo() && vn <= sizeof g_ld_vpm.bytes) {
++                g_ld_vpm.n = vn; g_ld_vpm.h = vp_h; memcpy(g_ld_vpm.bytes, vp_uc, vn);
++            }
++        }
++    }
++    u64 key = vp_h;
++    const u32 fp_hmode = ld_fp_constants_buffered() ? 1u : 2u;
++    if (fp_same && g_ld_fpm.hvalid && g_ld_fpm.hmode == fp_hmode && g_ld_fpm.hseed == key) {
++        key = g_ld_fpm.h;
++    } else {
++        const u64 seed = key;
++        if (fp_hmode == 1u)
++            key = rsx_fp_structural_hash(fp_uc, fp_size, key);
++        else
++            key = fnv1a(fp_uc, fp_size, key);
++        if (ld_pso_memo() && g_ld_fpm.size == fp_size && g_ld_fpm.loc == fp_loc && g_ld_fpm.off == fp_off) {
++            g_ld_fpm.hvalid = 1; g_ld_fpm.hmode = fp_hmode; g_ld_fpm.hseed = seed; g_ld_fpm.h = key;
++        }
++    }
+     if (!key) {
+         LD_PSO_BAIL("shader hash collapsed to zero");
+         return NULL;
+@@ -6188,7 +6266,7 @@ static ID3D12PipelineState* get_pso(
+             if (zi >= 0 && g.zdepths[zi].snapshot &&
+                 g.zdepths[zi].snapshot_w >= ut.width &&
+                 g.zdepths[zi].snapshot_h >= ut.height &&
+-                !getenv("LD_NO_ZALIAS_UNNORM_FIX")) {
++                !ld_no_zalias_unnorm_fix()) {
+                 unnorm_dim[uu][0] = g.zdepths[zi].snapshot_w;
+                 unnorm_dim[uu][1] = g.zdepths[zi].snapshot_h;
+             }
+@@ -6217,10 +6295,11 @@ static ID3D12PipelineState* get_pso(
+     ld_profile_note_fp_variants(
+         fp_uc, fp_size, fp_ctrl_key, cube_mask, &rs);
+ #endif
++    LDW_ADD(RSX_PERF_W_PSO_KEY_T, gp_t2);
++    LDW_T0(gp_t3);
+     g_ld_current_pso.valid = 1;
+     g_ld_current_pso.key = key;
+-    g_ld_current_pso.vp_hash = fnv1a(
+-        vp_uc, vp_instrs * 16, 1469598103934665603ull);
++    g_ld_current_pso.vp_hash = vp_h;   /* patch 2029: the same FNV, computed once */
+     g_ld_current_pso.vp_start = start;
+     g_ld_current_pso.vp_instrs = vp_instrs;
+     g_ld_current_pso.fp_location = fp_loc;
+@@ -6249,9 +6328,11 @@ static ID3D12PipelineState* get_pso(
+ #if defined(YZ_PERF_PROFILE)
+             g_ld_profile.total.pso_hits++;
+ #endif
++            LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
+             return g.psos[i].pso;
+         }
+     }
++    LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.pso_misses++;
+ #endif
+@@ -6389,9 +6470,12 @@ static ID3D12PipelineState* get_pso(
+         snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)live_legacy_pso_key());
+         f = fopen(fn, "wb"); if (f) { fputs(fi > 0 ? ps_hlsl : "<fp fail>", f); fclose(f); }
+       } }
+-    if (vi > 0 && fi > 0)
++    if (vi > 0 && fi > 0) {
++        LDW_T0(bp_t0);
+         pso = build_pso(
+             vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload);
++        if (bp_t0) { LDW_ADD(RSX_PERF_W_PSO_NEW_T, bp_t0); rsx_perf_add(RSX_PERF_W_PSO_NEW_N, 1); }
++    }
+ 
+     g.psos[g.n_psos].key = key;
+     g.psos[g.n_psos].pso = pso;
+@@ -9002,12 +9086,74 @@ void rsx_live_draw_debug_cond_render_stats(u64 out[6])
+     out[3] = g_oq.n_resolve; out[4] = g_oq.n_reports; out[5] = g_oq.n_segments;
+ }
+ 
++/* KZ3 patch 2029: submit without waiting. The walker records a whole frame
++ * into one command list and, before 2029, handed it to the GPU only at a sync
++ * point (NV0039 scene copy, main-surface write-back, ring wrap, present), where
++ * it then waited for ALL of it: the GPU idled while the walker recorded, and
++ * the walker idled while the GPU ran. Now the walker also submits (Close,
++ * Execute, Signal, Reset on the same allocator; no wait) every LD_SUBMIT_CHUNK
++ * draws (default 128, 0 = off) and when it goes idle (caught up with put, or
++ * parked: rsx_live_draw_submit_pending from the FIFO walker), so the GPU runs
++ * behind the walker and a sync point waits only for the tail.
++ * Nothing guest-visible moves: the sync points still wait for the GPU before
++ * any guest memory or semaphore is written, so the SPU/PPU never see older
++ * data than before. The per-frame rings, retired textures and readback slots
++ * are recycled only after a fence wait, as before (a no-wait submit does not
++ * reset them). Every draw re-records its whole state (render targets, PSO,
++ * root signature, heaps, viewport), so a new list after a submit loses
++ * nothing; the submit happens before a draw records anything. Not while an
++ * occlusion query is open: a split query counts as two segments, which patch
++ * 2025 treats as "always draw". */
++static int ld_submit_chunk(void)
++{
++    static int n = -1;
++    if (n < 0) { const char* e = getenv("LD_SUBMIT_CHUNK"); n = e ? atoi(e) : 128; if (n < 0) n = 0; }
++    return n;
++}
++static void ld_submit_nowait(void)
++{
++    if (!g.ready || !g_ld_unsubmitted || g_oq.open) return;
++    LDW_T0(t0);
++    const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
++    if (FAILED(close_hr)) {
++        fprintf(stderr, "[d3d-fail] command-list Close (chunk) hr=0x%08lX frame=%u\n",
++                (unsigned long)close_hr, g_ld_frames);
++        ld_dump_dred("Close", close_hr);
++        g.ready = 0;
++        return;
++    }
++    ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
++    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
++    const u64 v = ++g.fence_value;
++    const HRESULT signal_hr = g.queue->lpVtbl->Signal(g.queue, g.fence, v);
++    if (FAILED(signal_hr)) {
++        fprintf(stderr, "[d3d-fail] queue Signal (chunk) hr=0x%08lX frame=%u\n",
++                (unsigned long)signal_hr, g_ld_frames);
++        ld_dump_dred("Signal", signal_hr);
++        g.ready = 0;
++        return;
++    }
++    ld_rb_stamp(v);   /* patch 2027: queued report copies complete with this fence */
++    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
++    g_ld_unsubmitted = 0;
++    g_ld_chunk_submits++;
++    if (t0) { LDW_ADD(RSX_PERF_W_SUBMIT_T, t0); rsx_perf_add(RSX_PERF_W_CHUNK_N, 1); }
++}
++void rsx_live_draw_submit_pending(void)
++{
++    if (ld_submit_chunk()) ld_submit_nowait();
++}
++/* Patch 2029 (test hook): no-wait submits so far. */
++u64 rsx_live_draw_debug_chunk_submits(void) { return g_ld_chunk_submits; }
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
+     if (!dc.n_packets) { g_ld_stats.groups_empty++; return; }
+     g_ld_stats.groups_seen++;
++    if (ld_submit_chunk() && ++g_ld_unsubmitted > (u32)ld_submit_chunk())
++        ld_submit_nowait();   /* patch 2029: before this draw records anything */
+     /*
+      * a010's native per-mesh constant builder can overwrite the otherwise
+      * valid reconstructed camera with NaNs after the ordinary camera upload.
+@@ -9063,6 +9209,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g_ld_profile.total_used_attribute_max = used_layout.count;
+     const LONGLONG fetch_pack_begin = ld_profile_qpc();
+ #endif
++    LDW_T0(vtx_t0);
+     if (ld_vertex_compact_payload()) {
+         fetch_batches_hoisted(&used_layout, 1);
+     } else if (ld_vertex_hoist_fetch()) {
+@@ -9074,6 +9221,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     }
+     if (!dc.n_source_refs)
+         dc.n_source_refs = dc.n_verts;
++    LDW_ADD(RSX_PERF_W_VTX_T, vtx_t0);
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.vertex_fetch_pack_qpc +=
+         (u64)(ld_profile_qpc() - fetch_pack_begin);
+@@ -9128,6 +9276,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g.srv_ring_used = 0;
+         g.smp_ring_used = 0;
+     }
++    LDW_T0(vcopy_t0);
+     if (draw_vb_bytes)
+         memcpy(
+             g.vb_mapped + g.vb_used, vertex_data,
+@@ -9135,10 +9284,13 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     if (indexed)
+         write_topology_indices(
+             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
++    LDW_ADD(RSX_PERF_W_VTX_T, vcopy_t0);
+ 
++    LDW_T0(pso_t0);
+     ID3D12PipelineState* pso = get_pso(
+         ld_vertex_mask_signature() ? &used_layout : NULL,
+         ld_vertex_compact_payload());
++    LDW_ADD(RSX_PERF_W_PSO_T, pso_t0);
+     if (!pso) {
+ #if defined(YZ_PERF_PROFILE)
+         ld_profile_note_rejected_pso();
+@@ -9175,7 +9327,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     }
+     g.cb_used = vertex_cb_offset;
+     u32 ps_cb_offset = 0;
+-    if (!ld_upload_pixel_constants(&ps_cb_offset)) {
++    LDW_T0(pcb_t0);
++    const int pcb_ok = ld_upload_pixel_constants(&ps_cb_offset);
++    LDW_ADD(RSX_PERF_W_CONST_T, pcb_t0);
++    if (!pcb_ok) {
+         live_draw_csv_emit(prim, n_tri, "drop_ps_cbring");
+         g_ld_stats.group_drop_ring++;
+         return;
+@@ -9604,7 +9759,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 if (!seen && n_zdepth_used < SRV_TABLE_SIZE)
+                     zdepth_used[n_zdepth_used++] = (u32)sampled_depth;
+             } else {
++                LDW_T0(tex_t0);
+                 slots[u] = texture_srv_slot(&t);
++                LDW_ADD(RSX_PERF_W_TEX_T, tex_t0);
+                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
+             }
+         }
+@@ -9622,7 +9779,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         if (!((vtex_mask >> u) & 1u)) continue;
+         rsx_dsp_vertex_texture vt;
+         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
++        LDW_T0(vtex_t0);
+         vtex_slots[u] = vertex_texture_srv_slot(&vt);
++        LDW_ADD(RSX_PERF_W_TEX_T, vtex_t0);
+         if (vtex_slots[u] != SRV_WHITE)
+             g_ld_vtex_binds++;
+         else
+@@ -9738,8 +9897,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         xf[6] = vp.translate[2];
+     }
+     u8* cbdst = g.cb_mapped + g.cb_used;
++    LDW_T0(vcb_t0);
+     memcpy(cbdst, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16);
+     memcpy(cbdst + 512 * 16, xf, sizeof(xf));
++    LDW_ADD(RSX_PERF_W_CONST_T, vcb_t0);
+ 
+     g.list->lpVtbl->SetPipelineState(g.list, pso);
+     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x);
+@@ -9961,13 +10122,22 @@ static void sink_end(void* user, const rsx_dispatch* r)
+ #if defined(YZ_PERF_PROFILE)
+     const LONGLONG begin = ld_profile_qpc();
+ #endif
++    LDW_T0(draw_t0);
+     sink_end_impl(user, r);
++    LDW_ADD(RSX_PERF_W_DRAW_T, draw_t0);
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.sink_end_qpc += (u64)(ld_profile_qpc() - begin);
+ #endif
+ }
+ 
++static void sink_clear_impl(void* user, const rsx_dispatch* r, u32 mask);
+ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
++{
++    LDW_T0(clear_t0);   /* patch 2029 */
++    sink_clear_impl(user, r, mask);
++    LDW_ADD(RSX_PERF_W_CLEAR_T, clear_t0);
++}
++static void sink_clear_impl(void* user, const rsx_dispatch* r, u32 mask)
+ {
+     (void)user; (void)r;
+     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
+@@ -11511,11 +11681,19 @@ static u32 ld_writeback_batch(const u32* idx, u32 n, u32 for_off, u32 for_size)
+                 if (ld_rb_record(i, nrec)) rec[nrec++] = i;
+             }
+             if (!nrec) continue;
+-            ld_flush(LD_FLUSH_READBACK);
++            /* Patch 2029 negative control for the host test (never set it in a
++             * real run): LD_WB_UNSAFE_NOWAIT=1 submits the copies without waiting
++             * for them, so the stores read the readback buffers early. */
++            static int unsafe = -1;
++            if (unsafe < 0) { const char* e = getenv("LD_WB_UNSAFE_NOWAIT"); unsafe = e && atoi(e) ? 1 : 0; }
++            if (unsafe) { g_ld_unsubmitted = 1; ld_submit_nowait(); }
++            else ld_flush(LD_FLUSH_READBACK);
+             g_ld_wb.waits++;
+             if (!g.ready) break;
++            LDW_T0(st_t0);
+             for (u32 k = 0; k < nrec; k++)
+                 done += (u32)ld_rb_store(rec[k], k, for_off ? for_off : g.surfaces[rec[k]].offset, for_size);
++            LDW_ADD(RSX_PERF_W_WB_STORE_T, st_t0);
+         }
+     }
+     QueryPerformanceCounter(&t1);
+@@ -11821,7 +11999,9 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+          * 0x1310400, where SPU MLAA ran); the host AA pass runs on it first. */
+         if (r0 <= s0 && r1 >= s1) ld_host_aa(i);
+     }
++    LDW_T0(wb_t0);
+     done = ld_writeback_batch(idx, n, offset, size);
++    if (wb_t0 && n) { LDW_ADD(RSX_PERF_W_WB_NV0039_T, wb_t0); rsx_perf_add(RSX_PERF_W_WB_NV0039_N, 1); }
+     return done;
+ }
+ 
+@@ -11844,7 +12024,9 @@ u32 rsx_live_draw_before_guest_sync(void)
+         if (g.surfaces[i].tex && g.surfaces[i].location == 1u && g.surfaces[i].gv_gpu_dirty)
+             idx[n++] = i;
+     if (!n) return 0;
++    LDW_T0(wb_t0);
+     const u32 done = ld_writeback_batch(idx, n, 0, 0);   /* patch 2018: one GPU wait */
++    if (wb_t0) { LDW_ADD(RSX_PERF_W_WB_SYNC_T, wb_t0); rsx_perf_add(RSX_PERF_W_WB_SYNC_N, 1); }
+     if (done) {
+         static u64 total; total += done;
+         static u32 nlog;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index fb708b9b..09257c3d 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -223,8 +223,20 @@ enum {
+     RSX_PERF_FLUSH_PRESENT_N, RSX_PERF_FLUSH_REF_N, RSX_PERF_FLUSH_OTHER_N,
+     RSX_PERF_PRESENT_N, RSX_PERF_PRESENT_T, RSX_PERF_SWAP_T,
+     RSX_PERF_USLEEP_GCM_N, RSX_PERF_USLEEP_GCM_T, RSX_PERF_USLEEP_OTHER_T,
++    /* KZ3 patch 2029: walker split, counted only inside the RSX_PERF_PROF=A,B
++     * window (seconds since the first walk; rsx_perf_walk_on()), "[perf-walk]". */
++    RSX_PERF_W_DRAW_T, RSX_PERF_W_VTX_T, RSX_PERF_W_PSO_T, RSX_PERF_W_PSO_NEW_N,
++    RSX_PERF_W_PSO_NEW_T, RSX_PERF_W_CONST_T, RSX_PERF_W_TEX_T, RSX_PERF_W_TEX_NEW_N,
++    RSX_PERF_W_TEX_NEW_T, RSX_PERF_W_CLEAR_T, RSX_PERF_W_SUBMIT_T, RSX_PERF_W_CHUNK_N,
++    RSX_PERF_W_WAIT_RB_T, RSX_PERF_W_WAIT_OTHER_T, RSX_PERF_W_WB_NV0039_N,
++    RSX_PERF_W_WB_NV0039_T, RSX_PERF_W_WB_SYNC_N, RSX_PERF_W_WB_SYNC_T,
++    RSX_PERF_W_WB_STORE_T, RSX_PERF_W_M2MF_T, RSX_PERF_W_TEX_HASH_T,
++    RSX_PERF_W_PSO_PRE_T, RSX_PERF_W_PSO_UNITS_T, RSX_PERF_W_PSO_KEY_T, RSX_PERF_W_PSO_FIND_T,
++    RSX_PERF_W_PSO_MEMO_N, RSX_PERF_W_ON,
+     RSX_PERF_COUNT
+ };
++int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
++void      rsx_live_draw_submit_pending(void);  /* patch 2029: submit recorded work, no wait */
+ int       rsx_perf_enabled(void);
+ long long rsx_perf_now(void);                  /* QPC ticks */
+ void      rsx_perf_add(int idx, long long v);  /* no-op unless RSX_PERF=1 */

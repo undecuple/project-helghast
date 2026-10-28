@@ -1,0 +1,201 @@
+KZ3 patch 1076 (SPU pass 59): KZ3_JM_DEP=1, an opt-in probe (default off, no effect when unset) of the WWS job
+manager's job list under the per-SPU kernel (patch 1074, KZ3_SPURS_KERNEL=1), written to find why KZ3's first
+jm_generic list (wid 8) strands at boot with 1074 + 1062. Lines tagged [jmdep]:
+- ppu-ready: the PPU's ReadyCount imports (first 20 per wid), with the old and new byte.
+- ready: an instance ready byte changed by an SPU PUTLLC (wid 8 always, 30 per other wid), with SPU, r0, LS 0x1500.
+- empty: a module run whose AllocateJob found nothing (LS 0x1440 = 0): LS 0x14E0, LS 0x14C0 and the PM's 16-entry
+  line copy at LS 0xD00 ({u16 size, u16 type, u32 ea}); entries of type != 0/1/3/4 are recorded as dependency words.
+- dep: a recorded dependency word changed by an SPU commit; tick: every 2 s, the recorded words and wid 8's ready
+  count and contention, and the jm_generic list (below).
+- list run / list tick: the list header line (EA from the PM's LS 0x1410), t = [hdr+8], entries [hdr+0x30+4t], the
+  t cursor quad hdr+0x40+16t {u16 high-water, u16 cursor, u16 per-SPU in-flight[6]} and 16 slots from cursor - 4.
+- hdr-commit (KZ3_JM_DEP_HDR=<hex header EA>): every SPU commit on that header line: the cursor quad after it, the PM's
+  cached entry-line EA (LS 0x14C0) and the slot it just passed, as the PM's LS copy and as memory.
+- spu-put: SPU DMA PUTs into [header, header + 0x100) (g_spu_put_hook, chained).
+Layouts: the RE notes Pass 59 (static read of the PM at EA 0x012BF080 and of the PPU list functions 0xA78648,
+0xA7859C, 0xA786E0, 0xA78E54, 0xA79590, 0xA79A08, 0xA79A98).
+
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -487,8 +487,147 @@
+ {
+     for (int j = 0; j < MAX_SPURS_INST; j++) if (s_inst[j].ea == ea && s_kz3_kw_init[j]) kz3_kwake_signal(&s_kz3_kw[j]);
+ }
++/* KZ3 patch 1076 probe (KZ3_JM_DEP=1, diagnostic, default off): the WWS job manager's dependency path. After a
++ * module run whose AllocateJob found nothing (LS 0x1440 = 0) it dumps the PM's job-entry line copy (LS 0xD00, 16
++ * entries of {u16 type, u16, u32 ea}) and records the dependency words of type-2 entries (u16 counter, u8 wid, u8
++ * count at the EA, LS 0x2580); every SPU line commit then logs a change of a recorded dependency word or of an
++ * instance ready byte, with the SPU, r0 and the PM's saved lr (LS 0x1500); every 2 s the recorded words. */
++static u32 s_jd_hdr[16];
++static void kz3_jd_put(uint32_t ea, uint32_t size);
++static void (*s_jd_put_next)(uint32_t, uint32_t);
++static int kz3_jd_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_JM_DEP"); v = (e && *e == '1') ? 1 : 0;
++                 const char* h = getenv("KZ3_JM_DEP_HDR"); if (h) s_jd_hdr[8] = (u32)strtoul(h, 0, 16) & ~127u;
++                 if (v) { extern void (*g_spu_put_hook)(uint32_t, uint32_t); s_jd_put_next = g_spu_put_hook; g_spu_put_hook = kz3_jd_put; } }
++    return v;
++}
++static SPU_THREAD_LOCAL int t_kz3_kt = -1;
++static SPU_THREAD_LOCAL const spu_context* t_kz3_pmc;
++static u8 s_jd_rc[MAX_SPURS_INST][16];
++static u32 s_jd_dep[32];
++static u32 s_jd_val[32];
++static volatile long s_jd_ndep, s_jd_lines;
++static u32 kz3_jd_be32(const u8* p) { return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]; }
++static void kz3_jd_commit(uint32_t line)
++{
++    if (s_jd_lines > 4000) return;
++    const spu_context* c = t_kz3_pmc;
++    const u32 r0 = c ? c->gpr[0]._u32[0] : 0, lr = c ? kz3_jd_be32(c->ls + 0x1500) : 0;
++    for (int j = 0; j < MAX_SPURS_INST; j++) {
++        const u32 ea = s_inst[j].ea;
++        if (!ea || line != ea) continue;
++        for (int w = 0; w < 16; w++) {
++            const u8 v = vm_base[ea + SPURS_WKL_READY1 + w];
++            if (v == s_jd_rc[j][w]) continue;
++            static volatile long s_jd_rcn[16];
++            if (w != 8 && __atomic_add_fetch(&s_jd_rcn[w], 1, __ATOMIC_RELAXED) > 30) { s_jd_rc[j][w] = v; continue; }
++            __atomic_add_fetch(&s_jd_lines, 1, __ATOMIC_RELAXED);
++            fprintf(stderr, "[jmdep] ready wid=%d %u->%u spu=%d r0=0x%05X lr=0x%05X t=%llu\n", w, s_jd_rc[j][w], v, t_kz3_kt,
++                    r0 & 0x3FFFF, lr & 0x3FFFF, (unsigned long long)GetTickCount64());
++            s_jd_rc[j][w] = v;
++        }
++    }
++    if (s_jd_hdr[8] && line == s_jd_hdr[8]) {   /* the jm_generic list header: its t = 3 cursor quad after an SPU commit */
++        const u8* Q = vm_base + line + 0x70;
++        __atomic_add_fetch(&s_jd_lines, 1, __ATOMIC_RELAXED);
++        /* The slot just passed (cursor - 1): the PM's LS copy (LS 0xD00, valid while LS 0x14C0 = its line) and memory. */
++        const u32 cur = (u32)Q[2] << 8 | Q[3], base = kz3_jd_be32(vm_base + line + 0x3C);
++        const u32 se = cur ? base + 8 * (cur - 1) : 0;
++        const u8* LE = c ? c->ls + 0xD00 + (se & 127) : NULL;
++        fprintf(stderr, "[jmdep] hdr-commit spu=%d r0=0x%05X q70=%08X%08X%08X%08X LS14C0=%08X ls=%08X:%08X mem=%08X:%08X t=%llu\n",
++                t_kz3_kt, r0 & 0x3FFFF, kz3_jd_be32(Q), kz3_jd_be32(Q + 4), kz3_jd_be32(Q + 8), kz3_jd_be32(Q + 12),
++                c ? kz3_jd_be32(c->ls + 0x14C0) : 0, LE ? kz3_jd_be32(LE) : 0, LE ? kz3_jd_be32(LE + 4) : 0,
++                se ? kz3_jd_be32(vm_base + se) : 0, se ? kz3_jd_be32(vm_base + se + 4) : 0, (unsigned long long)GetTickCount64());
++    }
++    const long n = s_jd_ndep;
++    for (long i = 0; i < n; i++) {
++        if ((s_jd_dep[i] & ~127u) != line) continue;
++        const u32 v = kz3_jd_be32(vm_base + s_jd_dep[i]);
++        if (v == s_jd_val[i]) continue;
++        __atomic_add_fetch(&s_jd_lines, 1, __ATOMIC_RELAXED);
++        fprintf(stderr, "[jmdep] dep 0x%08X %08X->%08X spu=%d r0=0x%05X lr=0x%05X t=%llu\n", s_jd_dep[i], s_jd_val[i], v, t_kz3_kt,
++                r0 & 0x3FFFF, lr & 0x3FFFF, (unsigned long long)GetTickCount64());
++        s_jd_val[i] = v;
++    }
++}
++/* The list the PM works on: header line EA at LS 0x1410 (AllocateJob 0x3040), t = [hdr+8], entries [hdr+0x30+4t],
++ * the cursor quad hdr+0x40+16t (AllocateJob 0x2400..0x2458). Dumps the header line and 16 slots around the cursor. */
++static void kz3_jd_list(u32 hdr, const char* tag, u32 wid, int kt)
++{
++    if (!hdr || hdr >= 0xF0000000u || (hdr & 127)) return;
++    const u8* H = vm_base + hdr;
++    char hx[260];
++    int o = 0;
++    for (int i = 0; i < 128; i += 4) o += snprintf(hx + o, sizeof hx - o, "%08X%s", kz3_jd_be32(H + i), (i & 15) == 12 ? " " : "");
++    const u32 t = kz3_jd_be32(H + 8) & 3, base = kz3_jd_be32(H + 0x30 + 4 * t);
++    const u32 cur = (u32)H[0x40 + 16 * t + 2] << 8 | H[0x40 + 16 * t + 3];
++    char ex[16 * 18 + 1];
++    int q = 0;
++    const u32 first = cur >= 4 ? cur - 4 : 0;
++    if (base && base < 0xF0000000u)
++        for (u32 e = first; e < first + 16; e++)
++            q += snprintf(ex + q, sizeof ex - q, "%08X:%08X ", kz3_jd_be32(vm_base + base + 8 * e), kz3_jd_be32(vm_base + base + 8 * e + 4));
++    fprintf(stderr, "[jmdep] list %s wid=%u spu=%d t=%llu hdr=0x%08X %s| base=0x%08X cur=%u from %u: %s\n", tag, wid, kt,
++            (unsigned long long)GetTickCount64(), hdr, hx, base, cur, first, ex);
++}
++/* SPU DMA PUTs into the list header / first entry line (chained in front of any other put hook). */
++static void kz3_jd_put(uint32_t ea, uint32_t size)
++{
++    const u32 h = s_jd_hdr[8];
++    if (h && ea < h + 0x100 && ea + size > h && s_jd_lines < 4000) {
++        __atomic_add_fetch(&s_jd_lines, 1, __ATOMIC_RELAXED);
++        const spu_context* c = t_kz3_pmc;
++        fprintf(stderr, "[jmdep] spu-put ea=0x%08X size=0x%X spu=%d lr=0x%05X data=%08X%08X t=%llu\n", ea, size, t_kz3_kt,
++                c ? c->gpr[0]._u32[0] & 0x3FFFF : 0, kz3_jd_be32(vm_base + ea), kz3_jd_be32(vm_base + ea + 4),
++                (unsigned long long)GetTickCount64());
++    }
++    if (s_jd_put_next) s_jd_put_next(ea, size);
++}
++static void kz3_jd_after_run(u32 wid, int kt, const u8* L)
++{
++    if (L && wid == 8) {
++        static volatile long s_ln;
++        const u32 hdr = kz3_jd_be32(L + 0x1410);
++        if (hdr) s_jd_hdr[8] = hdr;
++        if (__atomic_add_fetch(&s_ln, 1, __ATOMIC_RELAXED) <= 40) kz3_jd_list(hdr, "run", wid, kt);
++    }
++    static volatile long s_dumps[16];
++    if (!L || L[0x1440] || L[0x1441] || wid >= 16) return;
++    if (__atomic_add_fetch(&s_dumps[wid], 1, __ATOMIC_RELAXED) > 8) return;
++    char hex[16 * 18 + 1];
++    int o = 0;
++    for (int e = 0; e < 16; e++) {
++        const u8* q = L + 0xD00 + e * 8;
++        o += snprintf(hex + o, sizeof hex - o, "%08X:%08X ", kz3_jd_be32(q), kz3_jd_be32(q + 4));
++        const u32 dep = kz3_jd_be32(q + 4), ty = (u32)q[2] << 8 | q[3];
++        if (ty != 0 && ty != 1 && ty != 3 && ty != 4 && dep && dep < 0xF0000000u) {   /* AllocateJob 0x24E0 */
++            long k, n = s_jd_ndep;
++            for (k = 0; k < n; k++) if (s_jd_dep[k] == dep) break;
++            if (k == n && n < 32) { s_jd_val[n] = kz3_jd_be32(vm_base + dep); s_jd_dep[n] = dep; s_jd_ndep = n + 1; }
++        }
++    }
++    fprintf(stderr, "[jmdep] empty wid=%u spu=%d t=%llu LS14E0=%08X%08X%08X%08X LS14C0=%08X entries %s\n", wid, kt,
++            (unsigned long long)GetTickCount64(), kz3_jd_be32(L + 0x14E0), kz3_jd_be32(L + 0x14E4), kz3_jd_be32(L + 0x14E8),
++            kz3_jd_be32(L + 0x14EC), kz3_jd_be32(L + 0x14C0), hex);
++}
++static void kz3_jd_tick(u32 ea)
++{
++    static uint64_t s_last;
++    const uint64_t t = GetTickCount64();
++    if (t - s_last < 2000) return;
++    s_last = t;
++    static int s_ticks;
++    if (s_jd_hdr[8] && s_ticks++ < 30) kz3_jd_list(s_jd_hdr[8], "tick", 8, 0);
++    const long n = s_jd_ndep;
++    for (long i = 0; i < n; i++)
++        fprintf(stderr, "[jmdep] tick 0x%08X = %08X ready8=%u cont8=%u t=%llu\n", s_jd_dep[i], kz3_jd_be32(vm_base + s_jd_dep[i]),
++                vm_base[ea + SPURS_WKL_READY1 + 8], vm_base[ea + SPURS_WKL_CURCONT + 8], (unsigned long long)t);
++}
+ static void kz3_kern_line_committed(uint32_t line)
+ {
++    if (kz3_jd_on()) kz3_jd_commit(line);
+     for (int j = 0; j < MAX_SPURS_INST; j++) {
+         const u32 ea = s_inst[j].ea;
+         if (ea && s_kz3_kw_init[j] && line - ea < 0x100u) kz3_kwake_signal(&s_kz3_kw[j]);   /* lines 0-1 */
+@@ -2220,6 +2359,7 @@
+         const u8 cont = sel < 16 ? S[SPURS_WKL_CURCONT + sel] : 0;
+         if (sel < 16) spu_coh_notify_write(ea);
+         spu_ll_unlock_mask(llm);
++        if (kz3_jd_on() && kt == 0) kz3_jd_tick(ea);   /* patch 1076 probe */
+         if (sel >= 16) {
+             const uint64_t wa0 = kz3_wacct_begin();
+             kz3_kwake_wait(&s_kz3_kw[j], gen, 1);
+@@ -2237,7 +2377,12 @@
+             const uint64_t wa0 = kz3_wacct_begin();
+             if (wa0 && s_wa_wend[sel]) kz3_wacct_note(KZ3_WA_KGAP, sel, wa0 - s_wa_wend[sel]);
+             const uint64_t kt0 = GetTickCount64();
++            if (kz3_jd_on()) { extern void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num);   /* patch 1076 probe */
++                               t_kz3_kt = kt; t_kz3_pmc = (const spu_context*)spu_pm_ctx_peek(sel, (uint32_t)kt); }
+             spu_run_policy_module(r->fn, r->image_id, pm, s_workloads[sel].sizePm, arg, sel, ea, (uint32_t)kt);
++            if (kz3_jd_on()) { extern void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num);
++                               const spu_context* jc = (const spu_context*)spu_pm_ctx_peek(sel, (uint32_t)kt);
++                               t_kz3_pmc = NULL; kz3_jd_after_run(sel, kt, jc ? jc->ls : NULL); }
+             { extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+               if (st == 0 && rc == 0 && g_spurs_pm_polls == 0) idle_rest = 1; }
+             if (kz3_ktrace_n() && __atomic_add_fetch(&s_kz3_ktr_run[sel], 1, __ATOMIC_RELAXED) <= kz3_ktrace_n()) {
+@@ -2632,6 +2777,12 @@
+     if (wr) { s_workloads[wid].readyCount = value; spu_coh_notify_write(ea); }
+     spu_ll_unlock_mask(m);
+     if (wr) kz3_kern_wake_ea(ea);
++    static volatile long s_jd_ppu[16];
++    if (kz3_jd_on() && wr) for (int j = 0; j < MAX_SPURS_INST; j++) if (s_inst[j].ea == ea) s_jd_rc[j][wid] = (u8)value;
++    if (kz3_jd_on() && wid < 16 && __atomic_add_fetch(&s_jd_ppu[wid], 1, __ATOMIC_RELAXED) <= 20) {   /* patch 1076 probe */
++        fprintf(stderr, "[jmdep] ppu-ready wid=%u mode=%d %u->%u cmp=%u t=%llu\n", wid, mode, old, wr ? value : old, compare,
++                (unsigned long long)GetTickCount64());
++    }
+     return old;
+ }
+ 

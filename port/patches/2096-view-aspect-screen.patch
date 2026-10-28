@@ -1,0 +1,141 @@
+KZ3 patch 2096 (RSX pass 91): view aspect (KZ3_ASPECT, ENHANCEMENT, default screen). The camera hook in
+port/kz3/main.cpp (GameViewGame::vf22 @0x007E5908 re-registered in the indirect-call map) sets the game's camera up
+for the client's aspect; this patch gives it the aspect (rsx_display_view_ratio), stretches frames drawn with that
+camera to the whole client (rsx_display_note_wide), and frees the window's aspect (KZ3_WINDOW_SIZE at its own aspect,
+free drag/maximize). KZ3_ASPECT=16:9 (off, 0) = patch 2095/2062 behaviour.
+diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+--- a/libs/video/rsx_display_mode.h	2026-10-21 07:01:17.231990921 -0500
++++ b/libs/video/rsx_display_mode.h	2026-10-21 07:01:44.041007612 -0500
+@@ -322,4 +322,34 @@
+     return out;
+ }
+ 
++/* KZ3 patch 2096: view aspect (KZ3_ASPECT, ENHANCEMENT, default screen). Screen = the game's camera is set up for the
++ * window's (or the screen's) own aspect (port/kz3/main.cpp hooks GameViewGame::vf22 @0x007E5908: Hor+ above 16:9,
++ * Vert+ below) and every frame drawn with that camera is stretched to the whole client (the guest image stays
++ * 1280x720, its pixels are no longer square), so the scene fills the screen undistorted; other frames (menus,
++ * movies) keep the Image scaling setting. 16:9 (also "off", "0") = the PS3 picture, patch 2095 behaviour. */
++enum { RSX_DM_ASPECT_SCREEN = 0, RSX_DM_ASPECT_16_9 = 1 };
++static inline int rsx_dm_parse_aspect(const char* s)
++{
++    if (!s || !*s) return -1;
++    const size_t n = strlen(s);
++    if (rsx_dm_ieq(s, n, "screen") || rsx_dm_ieq(s, n, "window") || rsx_dm_ieq(s, n, "auto") || !strcmp(s, "1"))
++        return RSX_DM_ASPECT_SCREEN;
++    if (rsx_dm_ieq(s, n, "16:9") || rsx_dm_ieq(s, n, "16x9") || rsx_dm_ieq(s, n, "off") || !strcmp(s, "0"))
++        return RSX_DM_ASPECT_16_9;
++    return -1;
++}
++static inline const char* rsx_dm_aspect_name(int v) { return v == RSX_DM_ASPECT_16_9 ? "16:9" : "screen"; }
++/* The aspect factor the camera hook applies, r = view aspect / (16/9): 1 = unchanged (also for a client within 0.2 %
++ * of 16:9, so a 1280x720 or 1920x1080 window keeps the PS3 numbers bit for bit). */
++static inline double rsx_dm_aspect_ratio(unsigned w, unsigned h)
++{
++    if (!w || !h) return 1.0;
++    const double r = ((double)w / (double)h) / (16.0 / 9.0);
++    return (r > 0.998 && r < 1.002) ? 1.0 : r;
++}
++/* Camera hook scale for one GameViewGame::vf22 result: the frustum width aspect (the store to Camera+0x68) gets r;
++ * every other use divides tan(horizontal FOV / 2) by it to get the vertical FOV and gets min(r, 1): the vertical FOV
++ * stays the PS3's when the view is wider than 16:9 (Hor+), the horizontal FOV stays when it is narrower (Vert+). */
++static inline double rsx_dm_aspect_scale(double r, int frustum_width) { return frustum_width ? r : (r < 1.0 ? r : 1.0); }
++
+ #endif /* RSX_DISPLAY_MODE_H */
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c	2026-10-21 07:01:17.237991054 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-21 07:01:44.046585153 -0500
+@@ -14754,8 +14754,25 @@
+ /* Record: back buffer bb (PRESENT) cleared black, src (state src_state, restored after; a 2D colour texture) drawn
+  * into the letterbox rectangle with linear filtering, bb back to PRESENT. Returns 0 (nothing recorded) when the pass
+  * cannot run; the caller then copies. */
++/* patch 2096 (KZ3_ASPECT=screen): the camera hook (port/kz3/main.cpp) asks for the view aspect and notes each camera
++ * set up with it; a frame presented within 3 presents of such a note is stretched to the whole client (its image was
++ * drawn for that aspect), any other frame keeps the Image scaling setting. */
++int rsx_display_get_aspect(void);   /* rsx_null_backend.c */
++static volatile LONG g_dm_present_n, g_dm_wide_n = -1000;
++double rsx_display_view_ratio(void)
++{
++    if (rsx_display_get_aspect() != RSX_DM_ASPECT_SCREEN) return 1.0;
++    return rsx_dm_aspect_ratio(g_dm_bb_w, g_dm_bb_h);
++}
++void rsx_display_note_wide(void) { g_dm_wide_n = g_dm_present_n; }
++static int ld_dm_scaling_now(void)
++{
++    return (g_dm_present_n - g_dm_wide_n <= 3 && rsx_display_view_ratio() != 1.0) ? RSX_DM_STRETCH : g_dm_scaling;
++}
++
+ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32 bbi)
+ {
++    g_dm_present_n++;
+     if (!src || !ld_dm_pipeline() || g.srv_ring_used >= SRV_RING_TABLES) return 0;
+     D3D12_RESOURCE_DESC sd;
+     src->lpVtbl->GetDesc(src, &sd);
+@@ -14796,7 +14813,7 @@
+     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g_dm_rootsig[g_dm_filter]);
+     LD_SM_INVALIDATE();
+     g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 0, gpu);
+-    const rsx_dm_rect r = rsx_dm_rect_for((int)sd.Width, (int)sd.Height, (int)g_dm_bb_w, (int)g_dm_bb_h, g_dm_scaling,
++    const rsx_dm_rect r = rsx_dm_rect_for((int)sd.Width, (int)sd.Height, (int)g_dm_bb_w, (int)g_dm_bb_h, ld_dm_scaling_now(),
+                                           g_dm_filter);
+     const D3D12_VIEWPORT vp = {(float)r.x, (float)r.y, (float)r.w, (float)r.h, 0.0f, 1.0f};
+     const D3D12_RECT sc = {(LONG)r.x, (LONG)r.y, (LONG)(r.x + r.w), (LONG)(r.y + r.h)};
+diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c	2026-10-21 07:01:17.235991010 -0500
++++ b/libs/video/rsx_null_backend.c	2026-10-21 07:01:44.041679246 -0500
+@@ -95,6 +95,19 @@
+ int rsx_display_get_mode(void) { return s_dm.mode; }
+ int rsx_display_get_scaling(void) { return s_dm_scaling; }
+ int rsx_display_get_filter(void) { return s_dm_filter; }
++/* patch 2096: KZ3_ASPECT (read once; the default is screen) */
++int rsx_display_get_aspect(void)
++{
++    static int v = -2;
++    if (v == -2) {
++        const int p = rsx_dm_parse_aspect(getenv("KZ3_ASPECT"));
++        v = p >= 0 ? p : RSX_DM_ASPECT_SCREEN;
++        printf("[display] view aspect %s (KZ3_ASPECT%s%s)\n", rsx_dm_aspect_name(v), getenv("KZ3_ASPECT") ? "=" : " unset",
++               getenv("KZ3_ASPECT") ? getenv("KZ3_ASPECT") : "");
++        fflush(stdout);
++    }
++    return v;
++}
+ static void rsx_dm_save_now(void) { if (!s_dm_env && s_dm_save) s_dm_save(s_dm.mode, s_dm_scaling, s_dm_filter); }
+ 
+ static void rsx_dm_log_client(const char* why)
+diff -ruN a/libs/video/rsx_window_size.h b/libs/video/rsx_window_size.h
+--- a/libs/video/rsx_window_size.h	2026-10-21 07:01:17.233990966 -0500
++++ b/libs/video/rsx_window_size.h	2026-10-21 07:01:44.041342753 -0500
+@@ -85,6 +85,13 @@
+ #include <windows.h>
+ 
+ static int s_rsx_win_aw = 16, s_rsx_win_ah = 9;     /* the guest output's aspect (set by rsx_win_client_size) */
++/* KZ3 patch 2096: with KZ3_ASPECT=screen (default) the game draws at the client's aspect, so the client need not keep
++ * the guest's: KZ3_WINDOW_SIZE is taken at its own aspect, dragging and maximizing are free. 16:9/off/0 = patch 2062. */
++static int rsx_win_aspect_free(void)
++{
++    const char* e = getenv("KZ3_ASPECT");
++    return !(e && (!strcmp(e, "16:9") || !strcmp(e, "16x9") || !strcmp(e, "0") || !_stricmp(e, "off")));
++}
+ 
+ static void rsx_win_frame_size(int* fw, int* fh)    /* frame + caption around the client area */
+ {
+@@ -111,6 +118,11 @@
+         RECT work;
+         int fw, fh, fitw = 0, fith = 0;
+         rsx_win_frame_size(&fw, &fh);
++        if (rsx_win_aspect_free()) {   /* patch 2096: the requested size's own aspect */
++            unsigned a = (unsigned)rw, b = (unsigned)rh;
++            while (b) { unsigned t = a % b; a = b; b = t; }
++            s_rsx_win_aw = rw / (int)a; s_rsx_win_ah = rh / (int)a;
++        }
+         rsx_win_fit(s_rsx_win_aw, s_rsx_win_ah, rw, rh, &fitw, &fith);   /* 16:10 -> the largest 16:9 inside */
+         *cw = fitw; *ch = fith;
+         if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
+@@ -126,6 +138,7 @@
+ /* WM_SIZING / WM_GETMINMAXINFO for a game window; 1 = handled, *res = the window procedure's result. */
+ static int rsx_win_size_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
+ {
++    if (rsx_win_aspect_free()) return 0;   /* patch 2096: any client aspect; Windows' own drag and maximize */
+     if (msg == WM_SIZING) {            /* dragging keeps the guest aspect, so the scaled present never distorts */
+         RECT* wr = (RECT*)lp;
+         int r[4] = { wr->left, wr->top, wr->right, wr->bottom }, fw, fh;

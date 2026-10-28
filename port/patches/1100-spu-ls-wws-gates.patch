@@ -1,0 +1,93 @@
+KZ3 patch 1100 (SPU pass 73): the WWS LS range probes behind the per-function LS gates.
+
+spu_ls_read_probe's bufferSetArray reads (raw lsa 0xDF0..0xEAF) and spu_ls_write_probe_pre's code-buffer writes
+(0x1320), both in image 2's policy-mode context, the context every WWS job runs in, only print, up to 48 and 6
+lines; the caps are reached in the first seconds of a run (54 lines in a K2 run), after which they do nothing. The
+range tests stayed on every LS load and store of every lifted job (3 and 2 instructions per access; the LS
+accessors were 13 % of the audio SPU thread in SPU pass 72).
+- spu_ls_dbg_armed (the snapshot SPU_LS_LOCALS takes per lifted function, patch 1082) returns two gates: bit 0 for
+  loads (SPU_LS_LOWREAD, a watchpoint, or the read probe below its cap), bit 1 for stores (a watchpoint,
+  SPU_SMC_WATCH, or the code probe below its cap). A set bit sends that kind of access through the full accessor,
+  which keeps every probe; with a clear bit the fast path runs without the range tests, whose probes would have
+  done nothing. The caps are named (SPU_WWS_READ_CAP, SPU_WWS_CODE_CAP).
+Same LS and register results; the probes print the same lines. No relift needed. Upstream candidate.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream gates (#445 merged upstream) + 1100's cap macros.
+
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 0aef6605..51e0e439 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -673,6 +673,8 @@ SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)
+ SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
+ SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
+ SPU_GATE int g_wws_read_probe = 0;
++#define SPU_WWS_READ_CAP 48   /* KZ3 patch 1100: the WWS probes' print caps (their only effect), see spu_ls_dbg_armed */
++#define SPU_WWS_CODE_CAP 6
+ SPU_GATE int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
+ SPU_GATE int g_spu_ls_wdiag   = -1;  /* any write diagnostic armed              */
+ SPU_GATE int g_spu_wws_probe  = -1;  /* SPU_WWS_PROBE: the WWS buffer/code logs */
+@@ -711,7 +713,7 @@ static SPU_NOINLINE_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t
+      * SPU_WWS_PROBE=1 (it was always on, which put a test on every lqd). */
+     if (spu_ls_wws_probe_on() && ctx->image_id == 2 && ctx->policy_mode && lsa >= 0xDF0 && lsa < 0xEB0) {
+         extern int g_wws_read_probe;
+-        if (g_wws_read_probe < 48) {
++        if (g_wws_read_probe < SPU_WWS_READ_CAP) {
+             g_wws_read_probe++;
+             uint32_t off = lsa - 0xDF0;
+             fprintf(stderr, "[wws-res] bufferSetArray read jobNum=%u logBufSet=%u off=0x%X\n",
+@@ -774,7 +776,7 @@ static SPU_NOINLINE_COLD void spu_ls_write_probe_pre(spu_context* ctx, uint32_t
+ {
+     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
+         extern int g_wws_code_probe;   /* defined in spu_channels.c, capped */
+-        if (g_wws_code_probe < 6) {
++        if (g_wws_code_probe < SPU_WWS_CODE_CAP) {
+             g_wws_code_probe++;
+             uint32_t codeLsa = val._u32[0];
+             #define _RD32(o) (((uint32_t)ctx->ls[o]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)| \
+@@ -880,10 +882,20 @@ SPU_HOT void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+  * accessor, which reads the live gates, so the env is still read on first use and every armed probe still fires.
+  * With all gates 0 they stay 0, and the full accessor's gated branches are all not-taken: the _l fast path below
+  * is that accessor with those branches removed. The WWS range probes (no gate: image 2 in policy mode, raw lsa
+- * 0xDF0..0xEAF on reads, 0x1320 on writes) stay on the fast path unchanged. */
++ * 0xDF0..0xEAF on reads, 0x1320 on writes) stayed on the fast path until patch 1100 put them behind the gates. */
++/* KZ3 patch 1100 (SPU pass 73): the WWS range probes (spu_ls_read_probe's bufferSetArray reads, raw lsa
++ * 0xDF0..0xEAF, and spu_ls_write_probe_pre's code-buffer writes at 0x1320, both in image 2's policy-mode context, the
++ * context every WWS job runs in) only print, each up to its cap (48 and 6 lines, reached in the first seconds of
++ * a K2 run); after that they do nothing, yet every LS load and store of every job still tested the range (3 and 2
++ * instructions per access). The snapshot is now two gates: bit 0 for loads (SPU_LS_LOWREAD, a watchpoint, or the
++ * read probe below its cap), bit 1 for stores (a watchpoint, SPU_SMC_WATCH, or the code probe below its cap). A
++ * set bit sends that kind of access through the full accessor (which keeps every probe); a clear bit takes the
++ * fast path, now without the range tests: the probes they guarded would have done nothing. */
+ static inline int spu_ls_dbg_armed(void)
+ {
+-    return (g_spu_ls_probe | g_spu_ls_watch_n | g_spu_smc_watch) != 0;
++    const int w = g_spu_ls_watch_n != 0;
++    return (w | (g_spu_ls_probe != 0) | (g_wws_read_probe < SPU_WWS_READ_CAP)) |
++           ((w | (g_spu_smc_watch != 0) | (g_wws_code_probe < SPU_WWS_CODE_CAP)) << 1);
+ }
+ #define SPU_LS_LOCALS                                                                                  \
+     uint8_t* const spu__ls = ctx->ls;                                                                  \
+@@ -891,9 +903,7 @@ static inline int spu_ls_dbg_armed(void)
+     (void)spu__ls; (void)spu__lsdbg;
+ SPU_HOT u128 spu_ls_read128_l(const spu_context* ctx, const uint8_t* ls, int dbg, uint32_t lsa)
+ {
+-    if (__builtin_expect(dbg, 0)) return spu_ls_read128(ctx, lsa);
+-    if (__builtin_expect((uint32_t)(lsa - 0xDF0u) < 0xC0u && ctx->image_id == 2 && ctx->policy_mode, 0))
+-        spu_ls_read_probe(ctx, lsa);
++    if (__builtin_expect(dbg & 1, 0)) return spu_ls_read128(ctx, lsa);   /* KZ3 patch 1100: read gate */
+     const uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~0xFu));
+     u128 v;
+     uint32_t w0, w1, w2, w3;
+@@ -905,10 +915,8 @@ SPU_HOT u128 spu_ls_read128_l(const spu_context* ctx, const uint8_t* ls, int dbg
+ }
+ SPU_HOT void spu_ls_write128_l(spu_context* ctx, uint8_t* ls, int dbg, uint32_t lsa, u128 val)
+ {
+-    if (__builtin_expect(dbg, 0)) { spu_ls_write128(ctx, lsa, val); return; }
++    if (__builtin_expect(dbg & 2, 0)) { spu_ls_write128(ctx, lsa, val); return; }   /* KZ3 patch 1100: write gate */
+     lsa &= SPU_LS_MASK & ~0xFu;
+-    if (__builtin_expect(lsa == 0x1320, 0) && ctx->image_id == 2 && ctx->policy_mode)
+-        spu_ls_write_probe_pre(ctx, lsa, val);
+     uint8_t* p = ls + lsa;
+     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);

@@ -1,0 +1,135 @@
+rsx_live_draw: full guest sampler state (border colour, anisotropy, LOD bias, convolution as linear) and a
+lossless sampler cache key.
+
+decode_sampler read only min/mag/mip filter and the LOD range: TEXTURE_BORDER_COLOR was ignored (BORDER wrap
+sampled black), as were anisotropy (CONTROL0 [6:4]), LOD bias (FILTER [12:0], signed 4.8) and the convolution
+filters (min 7 / mag 4 fell to point). sampler_key packed a 21-bit LOD field at bit 18 of one u32, dropping its
+top bits, so different LOD ranges shared one descriptor, and it omitted bias/aniso/border. Now the same mapping
+as rsx_d3d12_backend.c's patch-2001 sampler, keyed on four words (filter, wrap, control0, border when used).
+Test: tools/smoke/host_kz3.c --live (four sampler quads through the live engine) under GE-Proton: the BORDER
+quad (unit 15, white border colour) was black, now white; the other three unchanged. KZ3 port RSX, 2026-10-07.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR321 keys filter, wrap and LOD, ours adds bias, aniso and border colour which our sampler decode reads, ours kept.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -332,7 +332,7 @@ typedef struct {
+     ID3D12DescriptorHeap*      smp_heap;
+     u32                        smp_step, smp_ring_used;
+     u32                        smp_ring_slots[SMP_RING_TABLES][SMP_TABLE_SIZE];
+-    u64                        smp_keys[SMP_CACHE_SLOTS];
++    u32                        smp_keys[SMP_CACHE_SLOTS][4];
+     u32                        n_samplers;
+ 
+     ID3D12RootSignature*       rootsig_x;
+@@ -1503,44 +1503,63 @@ static D3D12_TEXTURE_ADDRESS_MODE gcm_wrap(u32 w)
+     }
+ }
+ 
++/* Guest sampler registers -> D3D12 sampler (field layout in rsx_d3d12_backend.c's rsx_sampler_desc, patch 2001).
++ * Was: min/mag/mip filter and LOD range only. Now also LOD bias (FILTER [12:0], signed 4.8), anisotropy
++ * (CONTROL0 [6:4]: 1,2,4,6,8,10,12,16x), the border colour (ARGB8, used by BORDER wrap) and convolution
++ * filters taken as linear (min 7, mag 4) instead of point. */
+ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
+ {
++    static const u32 aniso_tab[8] = { 1, 2, 4, 6, 8, 10, 12, 16 };
+     D3D12_SAMPLER_DESC sd = {0};
+     const u32 minf = (t->filter >> 16) & 0x7;
+     const u32 magf = (t->filter >> 24) & 0x7;
+-    const int min_linear = (minf == 2 || minf == 4 || minf == 6);
+-    const int mag_linear = (magf == 2);
++    const int min_linear = (minf == 2 || minf == 4 || minf == 6 || minf == 7);
++    const int mag_linear = (magf == 2 || magf == 4);
+     const int mip_linear = (minf == 5 || minf == 6);
+-    const int mip_present = (minf >= 3);
++    const int mip_present = (minf >= 3 && minf <= 6);
++    const u32 aniso = aniso_tab[(t->control0 >> 4) & 7u];
+     D3D12_FILTER_TYPE mnf = min_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+     D3D12_FILTER_TYPE mgf = mag_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+     D3D12_FILTER_TYPE mpf = mip_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+-    sd.Filter = D3D12_ENCODE_BASIC_FILTER(mnf, mgf, mpf, D3D12_FILTER_REDUCTION_TYPE_STANDARD);
++    if (aniso > 1 && min_linear) {
++        sd.Filter = D3D12_FILTER_ANISOTROPIC;
++        sd.MaxAnisotropy = aniso;
++    } else {
++        sd.Filter = D3D12_ENCODE_BASIC_FILTER(mnf, mgf, mpf, D3D12_FILTER_REDUCTION_TYPE_STANDARD);
++        sd.MaxAnisotropy = 1;
++    }
+     sd.AddressU = gcm_wrap(t->wrap);
+     sd.AddressV = gcm_wrap(t->wrap >> 8);
+     sd.AddressW = gcm_wrap(t->wrap >> 16);
++    {
++        int32_t bias = (int32_t)(t->filter & 0x1FFFu);
++        if (bias & 0x1000) bias -= 0x2000;
++        sd.MipLODBias = (float)bias / 256.0f;
++    }
++    sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
++    sd.BorderColor[0] = (float)((t->border_color >> 16) & 0xFFu) / 255.0f;   /* R */
++    sd.BorderColor[1] = (float)((t->border_color >>  8) & 0xFFu) / 255.0f;   /* G */
++    sd.BorderColor[2] = (float)( t->border_color        & 0xFFu) / 255.0f;   /* B */
++    sd.BorderColor[3] = (float)((t->border_color >> 24) & 0xFFu) / 255.0f;   /* A */
+     const u32 max_lod_fx = (t->control0 >> 7)  & 0xFFF;
+     const u32 min_lod_fx = (t->control0 >> 19) & 0xFFF;
+     sd.MinLOD = (float)min_lod_fx / 256.0f;
+     sd.MaxLOD = mip_present ? (float)max_lod_fx / 256.0f : 0.0f;
+     if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
+-    sd.MaxAnisotropy = 1;
+     return sd;
+ }
+-/* Cache key of a sampler: exactly the fields decode_sampler reads, so two states share a descriptor only when
+- * they decode alike. The previous key kept wrap bits 0-11 (U and V, none of W at bits 16-19) and shifted the 21-bit
+- * LOD field of control0 left by 18, which drops its top seven bits: min LOD (control0 bits 19-30) above bit 20
+- * and the W address mode were lost, so states differing only there reused another state's descriptor. */
+-static u64 sampler_key(const rsx_dsp_texture* t)
++/* Everything decode_sampler reads, so two states never share a descriptor. The old key packed a 21-bit LOD
++ * field at bit 18 of one u32 and lost its top bits (different LOD ranges collided) and left out bias and
++ * aniso. */
++static void sampler_key(const rsx_dsp_texture* t, u32 key[4])
+ {
+-    const u64 minf    = (t->filter >> 16) & 0x7;
+-    const u64 magf    = (t->filter >> 24) & 0x7;
+-    const u64 wrap_u  = t->wrap & 0xF;
+-    const u64 wrap_v  = (t->wrap >> 8) & 0xF;
+-    const u64 wrap_w  = (t->wrap >> 16) & 0xF;
+-    const u64 max_lod = (t->control0 >> 7) & 0xFFF;
+-    const u64 min_lod = (t->control0 >> 19) & 0xFFF;
+-    return minf | (magf << 3) | (wrap_u << 6) | (wrap_v << 10) | (wrap_w << 14) | (max_lod << 18) | (min_lod << 30);
++    key[0] = t->filter & 0x07071FFFu;                  /* bias, min, mag */
++    key[1] = t->wrap & 0x000F0F0Fu;                    /* wrap s/t/r */
++    key[2] = t->control0 & 0x7FFFFFF0u;                /* LOD range, aniso */
++    {
++        const u32 ws = key[1] & 0xF, wt = (key[1] >> 8) & 0xF, wr = (key[1] >> 16) & 0xF;
++        key[3] = (ws == 4 || wt == 4 || wr == 4) ? t->border_color : 0u;
++    }
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -1655,15 +1674,15 @@ static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
+     h.ptr += (size_t)slot * g.smp_step;
+     return h;
+ }
+-static u32 sampler_slot(const rsx_dsp_texture* t, u64 key)
++static u32 sampler_slot(const rsx_dsp_texture* t, const u32 key[4])
+ {
+     for (u32 i = 0; i < g.n_samplers; i++)
+-        if (g.smp_keys[i] == key) return 1 + i;
++        if (!memcmp(g.smp_keys[i], key, sizeof g.smp_keys[i])) return 1 + i;
+     if (g.n_samplers >= SMP_CACHE_SLOTS) return SMP_DEFAULT;
+     D3D12_SAMPLER_DESC sd = decode_sampler(t);
+     const u32 slot = 1 + g.n_samplers;
+     g.dev->lpVtbl->CreateSampler(g.dev, &sd, smp_cpu(slot));
+-    g.smp_keys[g.n_samplers++] = key;
++    memcpy(g.smp_keys[g.n_samplers++], key, sizeof g.smp_keys[0]);
+     return slot;
+ }
+ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE])
+@@ -7008,7 +7027,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+               t.offset = 0x400000u; }
+         if (!t.enabled) continue;
+         texture_mask |= 1u << u;
+-        smp_slots[u] = sampler_slot(&t, sampler_key(&t));
++        { u32 skey[4]; sampler_key(&t, skey); smp_slots[u] = sampler_slot(&t, skey); }
+         /* Pick WHICH surface at this offset to sample.
+          *
+          * Matching on (location, offset) alone was fine when only one surface

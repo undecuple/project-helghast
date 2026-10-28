@@ -1,0 +1,75 @@
+rsx_live_draw diagnostics for KZ3's text: raw texture dumps and per-surface render-state log.
+
+LD_TEX_RAW_DUMP=<hex offset>|all writes a texture's raw guest bytes (scratch/texraw_*.bin, file name carries
+size/format/remap) when first seen and on each change, max 64 files; tools/smoke/texraw_to_png.py decodes
+DXT1/3/5 and A8R8G8B8 to PNG (LD_TEXRGBA_DUMP skips DXT). LD_RS_LOG=<hex surface offset> prints the render
+state of the first 300 draws into that colour surface: stencil front/back (func, ref, masks, ops), depth,
+cull, colour mask, bound zeta and whether a DSV is bound. Written to debug KZ3's GPU glyph cache at
+0x3A00000 (stencil-then-cover vector text). Off unless the variables are set. KZ3 port RSX, 2026-10-08.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2143,6 +2143,31 @@
+         hash ^= src[i];
+         hash *= 1099511628211ull;
+     }
++    /* LD_TEX_RAW_DUMP=<hex offset>|all: write the texture's raw guest bytes (all mip levels, as the decoder
++     * reads them) to scratch/texraw_<loc>_<offset>_<n>_<w>x<h>_f<fmt>_r<remap>_m<mips>.bin when first seen and
++     * each time they change (max 64 files), so a texture can be inspected offline
++     * (tools/smoke/texraw_to_png.py; LD_TEXRGBA_DUMP skips DXT). "all" dumps every texture. */
++    { static int on = -1, all = 0, n = 0; static u32 want = 0;
++      static struct { u32 off, w, h, fmt; u64 hash; } seen[256]; static int ns = 0;
++      if (on < 0) { const char* e = getenv("LD_TEX_RAW_DUMP"); on = e ? 1 : 0;
++                    all = e && !strcmp(e, "all"); want = (e && !all) ? (u32)strtoul(e, NULL, 16) : 0; }
++      if (on && n < 64 && (all || t->offset == want)) {
++          int k = -1;
++          for (int q = 0; q < ns; q++)
++              if (seen[q].off == t->offset && seen[q].w == t->width && seen[q].h == t->height &&
++                  seen[q].fmt == (t->format & 0xFFu)) { k = q; break; }
++          if (k < 0 && ns < 256) { k = ns++; seen[k].off = t->offset; seen[k].w = t->width;
++                                   seen[k].h = t->height; seen[k].fmt = t->format & 0xFFu; seen[k].hash = ~hash; }
++          if (k >= 0 && seen[k].hash != hash) {
++              char fn[200];
++              snprintf(fn, sizeof fn, "scratch/texraw_%u_%08X_%02d_%ux%u_f%02X_r%04X_m%u.bin", t->location,
++                       t->offset, n, t->width, t->height, t->format & 0xFFu, t->remap & 0xFFFFu, t->mipmaps);
++              FILE* f = fopen(fn, "wb");
++              if (f) { fwrite(src, 1, span, f); fclose(f); }
++              fprintf(stderr, "[tex-raw] %s span=%u frame=%u\n", fn, span, g_ld_frames);
++              seen[k].hash = hash; n++;
++          }
++      } }
+     *readable = 1;
+     return hash;
+ }
+@@ -7209,6 +7234,30 @@
+         g.list->lpVtbl->OMSetRenderTargets(g.list, n_mrt, rtvs, FALSE,
+                                            have_dsv ? &dsv : NULL);
+     }
++    /* LD_RS_LOG=<hex surface offset>: render state of the first 300 draws into that colour surface --
++     * stencil front/back (func, ref, read/write masks, fail/zfail/zpass), depth, cull, colour mask and
++     * whether a depth-stencil view is bound. Written for KZ3's stencil-then-cover glyph pass. */
++    { static int on = -1; static u32 want = 0; static int n = 0;
++      if (on < 0) { const char* e = getenv("LD_RS_LOG"); on = e ? 1 : 0; want = e ? (u32)strtoul(e, NULL, 16) : 0; }
++      if (on && n < 300 && target < g.n_surfaces && g.surfaces[target].offset == want) {
++          n++;
++          fprintf(stderr, "[rs-log] f=%u verts=%u prim=%u dsv=%d zeta=%u:0x%X clip=%ux%u cmask=0x%08X "
++                  "st=%u/2s%u func=%X ref=%X rmask=%X wmask=%X ops=%X/%X/%X back=%X/%X/%X/%X bmask=%X bref=%X "
++                  "bfmask=%X z=%u/%u/%X cull=%u/%X front=%X blend=%u\n",
++                  g_ld_frames, n_tri * 3u, prim, have_dsv, sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h,
++                  rsx_dsp_reg(&g.rsx, M_COLOR_MASK),
++                  rsx_dsp_reg(&g.rsx, M_STENCIL_TEST_ENABLE) & 1u, rsx_dsp_reg(&g.rsx, M_TWO_SIDED_STENCIL) & 1u,
++                  rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC), rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF),
++                  rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_MASK), rsx_dsp_reg(&g.rsx, M_STENCIL_MASK),
++                  rsx_dsp_reg(&g.rsx, M_STENCIL_OP_FAIL), rsx_dsp_reg(&g.rsx, M_STENCIL_OP_ZFAIL),
++                  rsx_dsp_reg(&g.rsx, M_STENCIL_OP_ZPASS),
++                  rsx_dsp_reg(&g.rsx, 0x0350), rsx_dsp_reg(&g.rsx, 0x035C), rsx_dsp_reg(&g.rsx, 0x0360),
++                  rsx_dsp_reg(&g.rsx, 0x0364), rsx_dsp_reg(&g.rsx, 0x034C), rsx_dsp_reg(&g.rsx, 0x0354),
++                  rsx_dsp_reg(&g.rsx, 0x0358),
++                  rsx_dsp_reg(&g.rsx, 0x0A74) & 1u, rsx_dsp_reg(&g.rsx, 0x0A70) & 1u, rsx_dsp_reg(&g.rsx, 0x0A6C),
++                  rsx_dsp_reg(&g.rsx, 0x183C) & 1u, rsx_dsp_reg(&g.rsx, 0x1830), rsx_dsp_reg(&g.rsx, 0x1834),
++                  rsx_dsp_reg(&g.rsx, 0x0310) & 1u);
++      } }
+     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+     const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);

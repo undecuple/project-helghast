@@ -1,0 +1,134 @@
+KZ3 patch 1065 (SPU pass 48, finding network pass 15): the SPU DMA repeat guard (runtime/spu/spu_dma.h) halted an SPU
+after 256 consecutive identical transfers, counted in process-wide statics. A job polling a main-memory word with GET
+until another SPU or the PPU changes it issues exactly that, so in KZ3's level 2 wid 7's job (LS pc 0x1CEAC / 0x1CA50)
+was halted mid-poll, its lane never returned ([pm-end] halted=1, [spurs-stuck] wid=7) and the game froze (339 s and
+538 s into the level, 2 of 2; with the limit out of reach 2 of 2 played 670 s). Now: the counter lives in the context's
+mfc_engine (per lane), the halt is off unless SPU_DMA_REPEAT_LIMIT=N is set, and a long repeat is logged once per
+(image, pc) site after SPU_DMA_REPEAT_LOG transfers (default 4096, 0 = never) as a diagnostic that leaves the SPU alone.
+Host test: tools/spu/test_spu_dma_repeat.sh. Upstream candidate (general).
+
+Rebased on ps3recomp v0.17.0 (SPU pass 95): kept over #383 (process-wide wall-time halt, 1 ms back-off): KZ3's default never reaches the limit.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ours over upstream's per-thread repeat watchdog with yield/back-off (same env name SPU_DMA_REPEAT_LOG, different meaning upstream).
+
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index be76e649..3837abfa 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -116,6 +116,9 @@ typedef struct mfc_engine {
+ 
+     /* Per-tag completion tracking (bitmask: bit N = tag N completed) */
+     uint32_t    tag_completed;
++
++    /* KZ3 patch 1065: the repeat guard's state, per context (was process-wide statics). */
++    uint32_t    rep_ea, rep_lsa, rep_n;
+ } mfc_engine;
+ 
+ /* External: pointer to host mapping of PS3 main memory.
+@@ -1341,72 +1344,44 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+      * count only REJECTED transfers, so once the EA check started committing
+      * pages on demand the counter never advanced and a spinning job simply hung
+      * the chain walker instead. Count repeats whether or not the transfer
+-     * succeeds, and halt at a known pc rather than hanging silently.
+-     * The count alone is not enough: polling a value another agent writes is
+-     * also the same transfer over and over. God of War: Ascension's EDGE
+-     * geometry jobs wait for ring space by re-reading an RSX label until the
+-     * GPU catches up, and 256 reads take well under a millisecond, so a
+-     * count-only rule halted a healthy job and wedged the frame. Halt only once
+-     * the repeats have also lasted SPU_DMA_REPEAT_SECS (default 30) of wall
+-     * time. Below that, back off 1 ms per repeat rather than spinning. */
+-    /* One thread-local object: every Darwin TLV access is a call, and this
+-     * runs on every MFC command. */
+-    { static SPU_THREAD_LOCAL struct { uint32_t last_ea, last_lsa, rep; unsigned long long since; } t_rep;
+-#define s_last_ea  t_rep.last_ea
+-#define s_last_lsa t_rep.last_lsa
+-#define s_rep      t_rep.rep
+-#define s_since    t_rep.since
+-      static uint32_t s_limit = 0; static unsigned long long s_secs, s_backoff_ms;
+-      extern unsigned long long ps3_ms_now(void);
++     * succeeds, and halt at a known pc rather than hanging silently. */
++    /* KZ3 patch 1065 (SPU pass 48): a job that re-issues the same GET is usually POLLING a word another SPU or the
++     * PPU will change (KZ3 level 2, network pass 15: wid 7's job at LS 0x1CEAC / 0x1CA50 polled one word; the halt at
++     * 256 left its lane halted, the workload never returned and the game froze at 339 s and 538 s, 2 of 2; with the
++     * limit out of reach both runs played 670 s). So: the counter is per context (the statics mixed every lane's
++     * transfers), the halt is OFF unless SPU_DMA_REPEAT_LIMIT=N is set, and a long repeat is reported once per
++     * (image, pc) site after SPU_DMA_REPEAT_LOG transfers (default 4096; 0 = never) without touching the SPU. */
++    { static uint32_t s_limit = 0, s_log = 0;
+       if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
+-                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u;
+-                      e = getenv("SPU_DMA_REPEAT_SECS");
+-                      s_secs = e ? strtoull(e, 0, 0) : 30u;
+-                      e = getenv("SPU_DMA_REPEAT_BACKOFF_MS");
+-                      s_backoff_ms = e ? strtoull(e, 0, 0) : 2u; }
+-      /* SPU_DMA_REPEAT_LOG=<n>: report the first n repeat episodes per
+-       * thread as they end (image, pc, transfer, repeats, duration), and a
+-       * per-image total every 4096 episodes. Says what a job is polling and
+-       * how long it waits -- the watchdog's back-off is on the critical path
+-       * only when such episodes are. Unset: no cost beyond the existing test. */
+-      static int64_t s_log = -1;
+-      if (s_log < 0) { const char* e = getenv("SPU_DMA_REPEAT_LOG"); s_log = e ? atoll(e) : 0; }
+-      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
+-          if (++s_rep >= s_limit) {
+-              unsigned long long now = ps3_ms_now();
+-              if (!s_since) {
+-                  s_since = now;
+-                  if (s_log) spu_dma_repeat_log_start(spu);
+-              }
+-              if (now - s_since >= s_secs * 1000u) {
+-                  s_rep = 0; s_since = 0;   /* re-arm: the chain may run this job again */
+-                  extern void spu_halt(spu_context*);
+-                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
+-                          "transfers to ea=0x%08X -- halting the SPU\n",
+-                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
+-                          (uint32_t)ea);
++                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 0u; if (!s_limit) s_limit = 0xFFFFFFFFu; }
++      if (!s_log)   { const char* e = getenv("SPU_DMA_REPEAT_LOG");
++                      s_log = e ? (uint32_t)strtoul(e, 0, 0) : 4096u; if (!s_log) s_log = 0xFFFFFFFFu; }
++      if ((uint32_t)ea == mfc->rep_ea && lsa == mfc->rep_lsa) {
++          mfc->rep_n++;
++          if (mfc->rep_n == s_log) {
++              static uint32_t s_site[16]; static int s_nsite;
++              uint32_t site = ((uint32_t)spu->image_id << 24) | ((uint32_t)spu->pc & SPU_LS_MASK);
++              int seen = 0;
++              for (int i = 0; i < s_nsite; i++) if (s_site[i] == site) { seen = 1; break; }
++              if (!seen) {
++                  if (s_nsite < 16) s_site[s_nsite++] = site;
++                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical transfers to ea=0x%08X (poll loop; not "
++                          "halted: SPU_DMA_REPEAT_LIMIT unset)\n", spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
++                          s_log, (uint32_t)ea);
+                   fflush(stderr);
+-                  spu_halt(spu);
+               }
+-              /* A job re-reading a word another agent writes (an RSX label, a
+-               * ring-space counter, a peer job's completion flag) is bound by
+-               * that write, and a 1 ms sleep per poll lands it up to a
+-               * millisecond late -- on the frame's critical path when the
+-               * poller is the frame's longest job. Yield for the first
+-               * SPU_DMA_REPEAT_BACKOFF_MS (default 2) of an episode, where a
+-               * healthy wait ends, and back off 1 ms per repeat after that. */
+-              else if (now - s_since < s_backoff_ms) SwitchToThread();
+-              else Sleep(1);
+           }
+-      } else {
+-          if (s_log && s_rep >= s_limit) spu_dma_repeat_log_end(spu, s_last_ea, s_last_lsa, s_rep, s_log);
+-          s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0;
+-      }
+-#undef s_last_ea
+-#undef s_last_lsa
+-#undef s_rep
+-#undef s_since
+-    }
++          if (mfc->rep_n >= s_limit) {
++              mfc->rep_n = 0;   /* re-arm: the chain may run this job again */
++              extern void spu_halt(spu_context*);
++              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
++                      "transfers to ea=0x%08X -- halting the SPU (SPU_DMA_REPEAT_LIMIT)\n",
++                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
++                      (uint32_t)ea);
++              fflush(stderr);
++              spu_halt(spu);
++          }
++      } else { mfc->rep_ea = (uint32_t)ea; mfc->rep_lsa = lsa; mfc->rep_n = 0; } }
+ 
+     /* Mark tag as in-progress */
+     mfc->tag_completed &= ~(1u << tag);

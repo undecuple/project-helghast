@@ -1,0 +1,179 @@
+KZ3 patch 1136 (SPU pass 112): host threads that run SPU code (spu_async_thread = the Bink decoder, the SPURS kernel,
+lane, policy-module and job-chain threads) are restricted to the highest efficiency class's logical processors on a
+hybrid CPU (kz3_spu_thread_sched, runtime/spu/kz3_spu_sched.h; a no-op on a uniform CPU; KZ3_SPU_PCORES=0 = off). The default restricts only the spu_async_thread job
+threads (the decoder), through the affinity mask; =all also the SPURS kernel, lane,
+pm and jc threads (pass 112 A/B: worse on 1% low and frame-time spread), =sets uses CPU sets (Proton leaked 1 window in 2 of 3 runs). Pass 112
+measured the Bink decoder at 570 ms/s on a P-core, 650-810 with a busy SMT sibling and 830-870 on an E-core, and the
+scheduler left it on E-cores for seconds at a time: no margin, the loading-screen stall. Upstream candidate (general:
+any recomp with SPU work on a hybrid CPU).
+
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -12,6 +12,7 @@
+ #include "cellSpurs.h"
+ #include "../../runtime/platform/win32_compat.h"
+ #include "../../runtime/ps3_log.h"
++#include "../../runtime/spu/kz3_spu_sched.h"   /* KZ3 patch 1136 */
+ #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+ #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
+ #include "kz3_spurs_attr.h" /* KZ3 patch 1062: the internal AttributeInitialize signature */
+@@ -2123,6 +2124,7 @@
+ 
+ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+ {
++    kz3_spu_thread_sched(0);   /* KZ3 patch 1136 */
+     { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+@@ -2314,6 +2316,7 @@
+ };
+ static DWORD WINAPI kz3_lane_thread(LPVOID p)
+ {
++    kz3_spu_thread_sched(0);   /* KZ3 patch 1136 */
+     { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+@@ -2467,6 +2470,7 @@
+ 
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ {
++    kz3_spu_thread_sched(0);   /* KZ3 patch 1136 */
+     { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+@@ -3777,6 +3781,7 @@
+ 
+ static DWORD WINAPI jc_thread(LPVOID p)
+ {
++    kz3_spu_thread_sched(0);   /* KZ3 patch 1136 */
+     { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+     int slot = (int)(intptr_t)p;
+     ps3_thread_name("spurs jc %d", slot);
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -6,6 +6,7 @@
+  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
+  */
+ #include "spu_workload.h"
++#include "kz3_spu_sched.h"   /* KZ3 patch 1136 */
+ #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+ #include "../ps3_log.h"      /* ps3_log_verbose */
+ #include <stdio.h>
+@@ -1388,6 +1389,7 @@
+ #ifdef _WIN32
+ static DWORD WINAPI spu_async_thread(LPVOID p) {
+     ps3_thread_name("spu job");
++    kz3_spu_thread_sched(1);   /* KZ3 patch 1136 */
+     /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
+      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
+      * instead of killing the process silently with 0x80000001. */
+diff --git a/runtime/spu/kz3_spu_sched.h b/runtime/spu/kz3_spu_sched.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/spu/kz3_spu_sched.h
+@@ -0,0 +1,105 @@
++/* KZ3 patch 1136 (SPU pass 112): the Bink decoder thread stays off the efficiency cores.
++ *
++ * Measured (pass 112, KZ3_CPU_PROBE, i7-12700KF, Proton): the Bink decoder thread (SPU task image 30, one host thread) takes
++ * ~570 ms of CPU per second on a P-core, 650-810 ms while its SMT sibling is busy and 830-870 ms on an E-core, at 30 fps;
++ * the scheduler moved it to E-cores 16-19 for 4-8 s at a time during the loading movie. At 870 ms/s there is no margin
++ * left: any extra load makes the decoder fall behind and the main thread wait (the loading-screen stall).
++ *
++ * kz3_spu_thread_sched(async) restricts the calling thread to the logical processors of the highest efficiency class when
++ * the machine has more than one class (hybrid CPU) and all of them lie in the process's processor group; it does nothing
++ * on a uniform CPU. async=1 marks the spu_async_thread job threads, async=0 the SPURS kernel/lane/pm/jc threads.
++ * KZ3_SPU_PCORES: unset = async threads only, affinity mask (default); all = every SPU host thread (pass 112 A/B: worse 1% low
++ * and frame-time spread, so not the default); 0 = off; sets = async threads with SetThreadSelectedCpuSets (Proton leaked).
++ * The restriction is a set, not one core: the OS still balances over the P-cores and their SMT threads.
++ * Microsoft's guidance for hybrid CPUs prefers CPU sets (SetThreadSelectedCpuSets) over affinity masks.
++ * kz3_pcore_mask() and kz3_sched_scope() are the pure parts (host test tools/spu/test_r112_sched.c). */
++#ifndef KZ3_SPU_SCHED_H
++#define KZ3_SPU_SCHED_H
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* cores[i]: mask of the core's logical processors (group 0), cls[i]: efficiency class (higher = faster). Returns the
++ * union of the masks of the cores with the highest class, or 0 when every core has the same class, when n <= 0, or
++ * when the result equals the union of all masks. */
++static inline uint64_t kz3_pcore_mask(const uint64_t* cores, const int* cls, int n)
++{
++    if (n <= 0) return 0;
++    int hi = cls[0], lo = cls[0];
++    uint64_t all = 0, top = 0;
++    for (int i = 0; i < n; i++) { if (cls[i] > hi) hi = cls[i]; if (cls[i] < lo) lo = cls[i]; all |= cores[i]; }
++    if (hi == lo) return 0;
++    for (int i = 0; i < n; i++) if (cls[i] == hi) top |= cores[i];
++    return top == all ? 0 : top;
++}
++
++/* env = value of KZ3_SPU_PCORES (or NULL). Returns 0 = leave the thread alone, 1 = restrict with CPU sets,
++ * 2 = restrict with the affinity mask (the default: under Proton CPU sets leaked onto E-cores in 2 of 3 probe runs). async = 1 for a spu_async_thread job thread. */
++static inline int kz3_sched_scope(const char* env, int async)
++{
++    if (env && env[0] == '0') return 0;
++    if (env && !strcmp(env, "all")) return 2;
++    if (!async) return 0;
++    if (env && !strcmp(env, "sets")) return 1;
++    return 2;
++}
++
++#ifdef _WIN32
++#include <windows.h>
++#include <stdio.h>
++static inline void kz3_spu_thread_sched(int async)
++{
++    static volatile long s_state;          /* 0 = not computed, 1 = computing, 2 = done */
++    static uint64_t s_mask;
++    static ULONG s_ids[128]; static ULONG s_nids;
++    const char* e = getenv("KZ3_SPU_PCORES");
++    int scope = kz3_sched_scope(e, async);
++    if (!scope) return;
++    if (s_state != 2) {
++        if (__sync_val_compare_and_swap(&s_state, 0, 1) == 0) {
++            uint64_t m = 0;
++            DWORD len = 0;
++            GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
++            char* buf = len ? (char*)malloc(len) : NULL;
++            if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore,
++                                                        (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)buf, &len)) {
++                uint64_t cores[128]; int cls[128]; int n = 0, multi = 0;
++                for (DWORD off = 0; off < len && n < 128; ) {
++                    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* i = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf + off);
++                    if (i->Processor.GroupCount != 1 || i->Processor.GroupMask[0].Group != 0) multi = 1;
++                    cores[n] = (uint64_t)i->Processor.GroupMask[0].Mask; cls[n] = (int)i->Processor.EfficiencyClass; n++;
++                    off += i->Size;
++                }
++                if (!multi) m = kz3_pcore_mask(cores, cls, n);
++            }
++            free(buf);
++            DWORD_PTR pm = 0, sm = 0;
++            if (m && GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm)) m &= (uint64_t)pm;
++            if (m) {   /* CPU set ids of the same logical processors */
++                ULONG cl = 0;
++                GetSystemCpuSetInformation(NULL, 0, &cl, GetCurrentProcess(), 0);
++                char* cb = cl ? (char*)malloc(cl) : NULL;
++                if (cb && GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)cb, cl, &cl, GetCurrentProcess(), 0)) {
++                    for (ULONG off = 0; off < cl && s_nids < 128; ) {
++                        PSYSTEM_CPU_SET_INFORMATION c = (PSYSTEM_CPU_SET_INFORMATION)(cb + off);
++                        if (c->Type == CpuSetInformation && c->CpuSet.Group == 0 && c->CpuSet.LogicalProcessorIndex < 64 &&
++                            ((m >> c->CpuSet.LogicalProcessorIndex) & 1)) s_ids[s_nids++] = c->CpuSet.Id;
++                        off += c->Size;
++                    }
++                }
++                free(cb);
++            }
++            s_mask = m;
++            if (m) fprintf(stderr, "[spu-sched] hybrid CPU: SPU %s threads restricted to the performance cores, mask 0x%llX, %lu cpu sets (KZ3_SPU_PCORES=0 = off, all, sets)\n", e && !strcmp(e, "all") ? "host" : "job", (unsigned long long)m, s_nids);
++            s_state = 2;
++        }
++        while (s_state != 2) Sleep(0);
++    }
++    if (!s_mask) return;
++    if (scope == 1 && s_nids && SetThreadSelectedCpuSets(GetCurrentThread(), s_ids, s_nids)) return;
++    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)s_mask);
++}
++#else
++static inline void kz3_spu_thread_sched(int async) { (void)async; }
++#endif
++#endif

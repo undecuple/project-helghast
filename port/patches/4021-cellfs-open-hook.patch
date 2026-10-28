@@ -1,0 +1,20 @@
+KZ3 patch 4021: cellFsOpen hook (KZ3 only). A port hook is told the guest path of every file the guest opened
+successfully (after the fd exists). port/net/kz3_discord.c uses it to see which level lump the game opens (Discord
+Rich Presence, network pass 33). The hook must be quick and must not block.
+
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -80,4 +80,8 @@
+ /* Host root that the PS3 mount points map into (dir containing PS3_GAME). */
+ extern "C" const char* ppu_vfs_root = ".";
+ 
++/* KZ3 patch 4021: called with the guest path after every successful cellFsOpen. */
++extern "C" void (*g_ps3_fs_open_hook)(const char* guest_path);
++void (*g_ps3_fs_open_hook)(const char* guest_path) = NULL;
++
+ /* CELL_FS return / mode / flag constants. */
+@@ -296,3 +301,4 @@
+           } }
+       else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
++    if (g_ps3_fs_open_hook) g_ps3_fs_open_hook(gpath);
+     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {

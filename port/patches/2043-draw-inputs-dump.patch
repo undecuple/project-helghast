@@ -1,0 +1,134 @@
+KZ3 patch 2043 (RSX pass 43): LD_DRAW_INPUTS=<frame>:<idx>[,<idx>...] dumps draws' fragment-stage inputs.
+rsx_live_draw.c: next to LD_DRAW_DUMP (same frame-relative draw index), the draw named by the switch writes
+inputs_f<frame>_i<idx>.txt (target, blend, viewport, shader control/window registers, every enabled texture
+unit's decoded state and raw registers 0x1A00+u*0x20 / 0x1840+u*4, the fragment program location and size, the
+collected constants, the active vertex attributes with their first vertices as fetched, the non-zero
+transform constants, the non-zero register file), inputs_..._vp.bin (the transform program words), inputs_..._fp.bin (the ucode bytes) and inputs_..._u<unit>.bin
+(each unit's raw guest bytes, texture_source_span) and inputs_..._u<unit>_surf<WxH>.ppm (the GPU copy when the
+unit aliases a live surface: guest memory holds zeros for those), into the LD_DRAW_DUMP directory or scratch. Used by
+tools/smoke/fp_eval.py to run the program on the CPU and compare with the draw's target dump. Log: [draw-inputs].
+
+--- a/libs/video/rsx_live_draw.c	2026-10-12 17:40:26.531764676 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-12 18:03:26.808622360 -0500
+@@ -8510,6 +8510,121 @@
+           snprintf(path, sizeof(path), "%s\\draw_f%06u_i%04u_%08X.ppm", dir, frame, idx, surf);
+           ld_dump_surface_ppm(path, &g.surfaces[target]);
+       }
++      /* Patch 2043 (KZ3 RSX pass 43): LD_DRAW_INPUTS=<frame>:<idx> (idx = the frame-relative draw index
++       * above) writes everything the fragment stage of that one draw reads, so the program can be evaluated
++       * on the CPU (tools/smoke/fp_eval.py): inputs_f<frame>_i<idx>.txt (target, blend, the raw register file
++       * as hex, per enabled unit the decoded state and raw words 0x1A00+u*0x20 / 0x1840+u*4, the fragment
++       * program as hex, the collected constants), inputs_..._fp.bin (ucode) and inputs_..._u<unit>.bin (the
++       * unit's raw guest bytes, texture_source_span). Directory: LD_DRAW_DUMP or scratch. */
++      { static long want_f = -2; static long want_i[16]; static int want_n = 0;
++        if (want_f == -2) { const char* e = getenv("LD_DRAW_INPUTS"); want_f = -1;
++            if (e) { char* q = NULL; want_f = strtol(e, &q, 10);
++                     while (q && (*q == ':' || *q == ',') && want_n < 16) want_i[want_n++] = strtol(q + 1, &q, 10); } }
++        int want = 0;
++        for (int wi = 0; wi < want_n; wi++) if (want_i[wi] == (long)idx) want = 1;
++        if (want_f >= 0 && (u32)want_f == frame && want) {
++            const char* d = dir ? dir : "scratch";
++            char path[MAX_PATH * 2];
++            snprintf(path, sizeof(path), "%s\\inputs_f%06u_i%04u.txt", d, frame, idx);
++            FILE* f = fopen(path, "w");
++            if (f) {
++                render_state_t rsi; decode_render_state(&rsi);
++                rsx_dsp_surface sfi; rsx_dsp_get_surface(&g.rsx, &sfi);
++                rsx_dsp_viewport vpi; rsx_dsp_get_viewport(&g.rsx, &vpi);
++                fprintf(f, "draw frame=%u idx=%u surf=%08X prim=%u\n", frame, idx, surf, prim);
++                fprintf(f, "target loc=%u off=%08X pitch=%u fmt=%u ct=%X clip=%ux%u\n", sfi.color_location[0],
++                        sfi.color_offset[0], sfi.color_pitch[0], sfi.color_format, sfi.color_target, sfi.clip_w, sfi.clip_h);
++                fprintf(f, "blend en=%u sf=%X/%X df=%X/%X eq=%X/%X cmask=%08X at=%u/%X/%X\n", rsi.blend_enable,
++                        rsi.sf_rgb, rsi.sf_a, rsi.df_rgb, rsi.df_a, rsi.eq_rgb, rsi.eq_a, rsi.color_mask,
++                        rsi.alpha_test_enable, rsi.alpha_func, rsi.alpha_ref_raw);
++                fprintf(f, "viewport %u %u %u %u scale %g %g %g trans %g %g %g\n", vpi.x, vpi.y, vpi.w, vpi.h,
++                        vpi.scale[0], vpi.scale[1], vpi.scale[2], vpi.translate[0], vpi.translate[1], vpi.translate[2]);
++                fprintf(f, "reg shader_ctrl=%08X shader_window=%08X scissor=%08X/%08X blend_color=%08X\n",
++                        rsx_dsp_reg(&g.rsx, 0x1D60), rsx_dsp_reg(&g.rsx, 0x1D88),
++                        rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL),
++                        rsx_dsp_reg(&g.rsx, 0x031C));
++                for (u32 u = 0; u < 16; u++) {
++                    rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
++                    if (!t.enabled) continue;
++                    const u32 b = 0x1A00u + u * 0x20u;
++                    fprintf(f, "unit %u loc=%u off=%08X fmt=%02X dim=%u cube=%u mips=%u w=%u h=%u pitch=%u depth=%u "
++                               "wrap=%08X remap=%08X filter=%08X ctl0=%08X border=%08X raw=%08X %08X %08X %08X %08X "
++                               "%08X %08X %08X ctl3=%08X\n", u, t.location, t.offset, t.format, t.dimension, t.cubemap,
++                            t.mipmaps, t.width, t.height, t.pitch, t.depth, t.wrap, t.remap, t.filter, t.control0,
++                            t.border_color, rsx_dsp_reg(&g.rsx, b), rsx_dsp_reg(&g.rsx, b + 4), rsx_dsp_reg(&g.rsx, b + 8),
++                            rsx_dsp_reg(&g.rsx, b + 12), rsx_dsp_reg(&g.rsx, b + 16), rsx_dsp_reg(&g.rsx, b + 20),
++                            rsx_dsp_reg(&g.rsx, b + 24), rsx_dsp_reg(&g.rsx, b + 28), rsx_dsp_reg(&g.rsx, 0x1840u + u * 4u));
++                    const u32 span = texture_source_span(&t);
++                    const u8* src = span ? guest_ptr(t.location, t.offset, span) : NULL;
++                    if (src) {
++                        char tp[MAX_PATH * 2];
++                        snprintf(tp, sizeof(tp), "%s\\inputs_f%06u_i%04u_u%02u.bin", d, frame, idx, u);
++                        FILE* tf = fopen(tp, "wb");
++                        if (tf) { fwrite(src, 1, span, tf); fclose(tf); }
++                    }
++                    /* A unit that aliases a live surface samples the GPU copy, not guest memory: read it back. */
++                    u32 sa = LD_INVALID_SURFACE;
++                    for (u32 s = 0; s < g.n_surfaces; s++)
++                        if (g.surfaces[s].tex && g.surfaces[s].location == t.location && g.surfaces[s].offset == t.offset &&
++                            (sa == LD_INVALID_SURFACE || g.surfaces[s].w == t.width)) sa = s;
++                    if (sa != LD_INVALID_SURFACE) {
++                        char sp[MAX_PATH * 2];
++                        snprintf(sp, sizeof(sp), "%s\\inputs_f%06u_i%04u_u%02u_surf%ux%u.ppm", d, frame, idx, u,
++                                 g.surfaces[sa].w, g.surfaces[sa].h);
++                        ld_dump_surface_ppm(sp, &g.surfaces[sa]);
++                    }
++                    fprintf(f, "unit %u span=%u saved=%d surface=%d\n", u, span, src ? 1 : 0,
++                            sa == LD_INVALID_SURFACE ? -1 : (int)sa);
++                }
++                u32 fl = 0; const u32 fo = rsx_dsp_fragment_program(&g.rsx, &fl);
++                const u8* fu = guest_ptr(fl, fo, 16);
++                const u32 fs = fu ? rsx_fp_program_size(fu, 0x10000) : 0;
++                fu = fs ? guest_ptr(fl, fo, fs) : NULL;
++                fprintf(f, "fp loc=%u off=%08X size=%u\n", fl, fo, fs);
++                if (fu) {
++                    char fp[MAX_PATH * 2];
++                    snprintf(fp, sizeof(fp), "%s\\inputs_f%06u_i%04u_fp.bin", d, frame, idx);
++                    FILE* ff = fopen(fp, "wb");
++                    if (ff) { fwrite(fu, 1, fs, ff); fclose(ff); }
++                }
++                fprintf(f, "fpconst count=%u\n", g.fp_constants.count);
++                for (u32 c = 0; c < g.fp_constants.count; c++)
++                    fprintf(f, "c%u %08X %08X %08X %08X\n", c, g.fp_constants.values[c][0], g.fp_constants.values[c][1],
++                            g.fp_constants.values[c][2], g.fp_constants.values[c][3]);
++                /* The vertex side the fragment inputs come from: active attributes (format + the first vertices
++                 * as the fetch decodes them), the non-zero transform constants, the transform program words. */
++                for (u32 at = 0; at < 16; at++) {
++                    rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(&g.rsx, at, &va);
++                    if (!va.type || !va.size) continue;
++                    fprintf(f, "attr %u type=%u size=%u stride=%u loc=%u off=%08X freq=%u", at, va.type, va.size,
++                            va.stride, va.location, va.offset, va.frequency);
++                    const u32 nv = dc.n_source_refs ? dc.n_source_refs : dc.n_verts;
++                    for (u32 k = 0; k < nv && k < 6; k++) {
++                        const u32 vtx = dc.refs_remapped ? rsx_vertex_remap_index(&dc.ref_remap, k) : k;
++                        float fb[4]; const float* v = dc_vertex_attr_canonical(vtx, at, fb);
++                        fprintf(f, " v%u=%g,%g,%g,%g", k, v[0], v[1], v[2], v[3]);
++                    }
++                    fprintf(f, "\n");
++                }
++                for (u32 c = 0; c < RSX_DSP_NUM_CONSTANTS; c++)
++                    if (g.rsx.constants[c][0] | g.rsx.constants[c][1] | g.rsx.constants[c][2] | g.rsx.constants[c][3]) {
++                        float cf[4]; memcpy(cf, g.rsx.constants[c], 16);
++                        fprintf(f, "vpc%u %08X %08X %08X %08X = %g %g %g %g\n", c, g.rsx.constants[c][0],
++                                g.rsx.constants[c][1], g.rsx.constants[c][2], g.rsx.constants[c][3], cf[0], cf[1], cf[2], cf[3]);
++                    }
++                {
++                    char vpp[MAX_PATH * 2];
++                    snprintf(vpp, sizeof(vpp), "%s\\inputs_f%06u_i%04u_vp.bin", d, frame, idx);
++                    FILE* vf = fopen(vpp, "wb");
++                    if (vf) { fwrite(g.rsx.vp, 1, sizeof g.rsx.vp, vf); fclose(vf); }
++                }
++                fprintf(f, "regs\n");
++                for (u32 r = 0; r < RSX_DSP_NUM_REGS; r++)
++                    if (g.rsx.regs[r]) fprintf(f, "%04X %08X\n", r * 4u, g.rsx.regs[r]);
++                fclose(f);
++                fprintf(stderr, "[draw-inputs] frame %u draw %u written to %s\n", frame, idx, path);
++            }
++        } }
+       idx++; }
+     const u64 regs_hash = fnv1a(
+         g.rsx.regs, RSX_DSP_NUM_REGS * sizeof(g.rsx.regs[0]),

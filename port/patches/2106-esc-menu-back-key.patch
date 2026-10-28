@@ -1,0 +1,202 @@
+diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -42,6 +42,8 @@
+ 
+ /* stick directions: bit index in PadKbState.dirs */
+ enum { PKB_LS_UP, PKB_LS_DOWN, PKB_LS_LEFT, PKB_LS_RIGHT, PKB_RS_UP, PKB_RS_DOWN, PKB_RS_LEFT, PKB_RS_RIGHT };
++/* KZ3 patch 2106: PadKbInput.dir of an input that acts only while a game menu has the focus (its btn then) */
++#define PKB_DIR_MENU (-2)
+ 
+ typedef struct { const char* name; unsigned short btn; signed char dir; const char* what; } PadKbInput;
+ 
+@@ -63,6 +65,9 @@
+     { "r3",       PKB_R3,       -1, "zoom, flashlight" },
+     { "start",    PKB_START,    -1, "pause menu" },
+     { "select",   PKB_SELECT,   -1, "select" },
++    /* KZ3 patch 2106: menu Back (Circle) while a game menu has the focus; nothing in play. Its keys may also be bound
++     * to start (Esc opens the pause menu in play and goes back in menus) or circle without a conflict. */
++    { "back",     PKB_CIRCLE, PKB_DIR_MENU, "menu back (menus only)" },
+     { "ls_up",    0, PKB_LS_UP,    "move forward (left stick up)" },
+     { "ls_down",  0, PKB_LS_DOWN,  "move back" },
+     { "ls_left",  0, PKB_LS_LEFT,  "strafe left" },
+@@ -278,7 +283,7 @@
+     static const struct { const char* in; unsigned char a, b; } d[] = {
+         { "up", 0x26, 0 }, { "down", 0x28, 0 }, { "left", 0x25, 0 }, { "right", 0x27, 0 },
+         { "cross", 0x20, 0x0D },       /* Space, Enter */
+-        { "circle", 0x45, 0x08 },      /* E, Backspace */
++        { "circle", 0x45, 0 },         /* E (patch 2106: Backspace moved to "back") */
+         { "square", 0x52, 0 },         /* R */
+         { "triangle", 0x51, 0 },       /* Q */
+         { "l1", 0x46, 0 },             /* F */
+@@ -289,6 +294,7 @@
+         { "r3", 0x02, 0x56 },          /* Mouse2, V */
+         { "start", 0x1B, 0x50 },       /* Escape, P */
+         { "select", 0x09, 0 },         /* Tab */
++        { "back", 0x1B, 0x08 },        /* Escape, Backspace: menu Back (patch 2106) */
+         { "ls_up", 0x57, 0 }, { "ls_down", 0x53, 0 }, { "ls_left", 0x41, 0 }, { "ls_right", 0x44, 0 },
+         { "rs_up", 0x49, 0x68 }, { "rs_down", 0x4B, 0x62 }, { "rs_left", 0x4A, 0x64 }, { "rs_right", 0x4C, 0x66 },
+     };
+@@ -385,19 +391,50 @@
+ /* Is `vk` held? The poller supplies the host query (GetAsyncKeyState on Windows, a table in the test). */
+ typedef int (*PadKbDown)(void* ctx, int vk);
+ 
+-static PadKbState pad_kb_eval(const PadKeybinds* kb, PadKbDown down, void* ctx)
++/* KZ3 patch 2106: menu = a game menu has the focus. Then the keys of the menu-only inputs ("back") act as those
++ * inputs alone: Esc bound to both back and start goes back in a menu instead of pressing Start. In play (menu = 0)
++ * the menu-only inputs do nothing and their keys keep their other bindings (Esc = Start = pause). */
++static int pad_kb_menu_key(const PadKeybinds* kb, int vk)
++{
++    int i;
++    if (!vk) return 0;
++    for (i = 0; i < PKB_N_INPUTS; i++)
++        if (pad_kb_inputs[i].dir == PKB_DIR_MENU && (kb->key[i][0] == vk || kb->key[i][1] == vk)) return 1;
++    return 0;
++}
++static PadKbState pad_kb_eval_menu(const PadKeybinds* kb, PadKbDown down, void* ctx, int menu)
+ {
+     PadKbState st = { 0, 0 };
+     int i, s;
+-    for (i = 0; i < PKB_N_INPUTS; i++)
+-        for (s = 0; s < PKB_SLOTS; s++)
+-            if (kb->key[i][s] && down(ctx, kb->key[i][s])) {
++    for (i = 0; i < PKB_N_INPUTS; i++) {
++        const int menu_only = pad_kb_inputs[i].dir == PKB_DIR_MENU;
++        if (menu_only && !menu) continue;
++        for (s = 0; s < PKB_SLOTS; s++) {
++            const int vk = kb->key[i][s];
++            if (!vk || (menu && !menu_only && pad_kb_menu_key(kb, vk))) continue;
++            if (down(ctx, vk)) {
+                 if (pad_kb_inputs[i].dir >= 0) st.dirs |= (unsigned char)(1u << pad_kb_inputs[i].dir);
+                 else st.buttons |= pad_kb_inputs[i].btn;
+                 break;
+             }
++        }
++    }
+     return st;
+ }
++/* The poll's evaluation: menu state from pad_kb_menu_state() (cellPad.c, patch 2106), play when it is not linked
++ * (host tests call pad_kb_eval_menu for menus). */
++extern int pad_kb_menu_state(void) __attribute__((weak));
++#if defined(__GNUC__)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Waddress"   /* the weak symbol's address is not "always true" where it is not linked */
++#endif
++static PadKbState pad_kb_eval(const PadKeybinds* kb, PadKbDown down, void* ctx)
++{
++    return pad_kb_eval_menu(kb, down, ctx, pad_kb_menu_state ? pad_kb_menu_state() : 0);
++}
++#if defined(__GNUC__)
++#pragma GCC diagnostic pop
++#endif
+ 
+ /* Stick axis from two opposite directions: both or neither = centre (128), else 0 or 255 (full deflection, also
+  * on a diagonal; ASSUMPTION: the game's own dead zone and response curve want the raw range like a DS3 corner). */
+@@ -498,6 +535,7 @@
+     { "up", "Up", "Up" },                 { "down", "Down", "Down" },
+     { "left", "Left", "Left" },           { "right", "Right", "Right" },
+     { "start", "Pause", 0 },              { "select", "Objectives", "Select" },
++    { "back", "Back (menus)", 0 },        /* patch 2106 */
+ };
+ #define PKB_N_ROWS ((int)(sizeof pad_kb_rows / sizeof pad_kb_rows[0]))
+ 
+@@ -533,6 +571,24 @@
+     for (i = 0; i < PKB_N_INPUTS; i++) if (kb->key[i][0] == vk || kb->key[i][1] == vk) n++;
+     return n;
+ }
++/* Patch 2106: two inputs may share a key when one is menu-only and the other is start or circle (the menu input wins
++ * in menus, the other in play; menu Back = Circle anyway). Every other shared key is a conflict. */
++static int pad_kb_share_ok(int a, int b)
++{
++    const int ma = pad_kb_inputs[a].dir == PKB_DIR_MENU, mb = pad_kb_inputs[b].dir == PKB_DIR_MENU;
++    const int o = ma ? b : a;
++    if (ma == mb) return 0;
++    return pad_kb_inputs[o].btn == PKB_START || pad_kb_inputs[o].btn == PKB_CIRCLE;
++}
++/* 1 when vk, bound to input `in`, is also bound to an input it may not share with */
++static int pad_kb_key_conflicts(const PadKeybinds* kb, int in, int vk)
++{
++    int i;
++    if (!vk || in < 0) return 0;
++    for (i = 0; i < PKB_N_INPUTS; i++)
++        if (i != in && (kb->key[i][0] == vk || kb->key[i][1] == vk) && !pad_kb_share_ok(in, i)) return 1;
++    return 0;
++}
+ 
+ /* Bind vk to (input, slot). The same key in the input's other slot is cleared there (one key, one slot). */
+ static void pad_kb_assign(PadKeybinds* kb, int input, int slot, int vk)
+@@ -615,10 +671,10 @@
+         int a = pad_kb_row_input(i);
+         for (j = 0; j < PKB_SLOTS; j++) {
+             int vk = a >= 0 ? kb->key[a][j] : 0;
+-            if (pad_kb_key_uses(kb, vk) < 2) continue;
++            if (!pad_kb_key_conflicts(kb, a, vk)) continue;
+             for (b = i + 1; b < PKB_N_ROWS; b++) {
+                 int c = pad_kb_row_input(b);
+-                if (c >= 0 && (kb->key[c][0] == vk || kb->key[c][1] == vk)) { *ra = i; *rb = b; return vk; }
++                if (c >= 0 && (kb->key[c][0] == vk || kb->key[c][1] == vk) && !pad_kb_share_ok(a, c)) { *ra = i; *rb = b; return vk; }
+             }
+         }
+     }
+@@ -642,7 +698,8 @@
+     int rs = pad_kb_ui_key_of(kb, "square", 0), bk = pad_kb_ui_key_of(kb, "start", PKB_VK_CANCEL);
+     char cs[48];
+     size_t m;
+-    if (bk != PKB_VK_CANCEL) bk = pad_kb_ui_key_of(kb, "circle", 0);    /* the page's Back is Circle, and Start */
++    if (pad_kb_ui_key_of(kb, "back", PKB_VK_CANCEL)) bk = pad_kb_ui_key_of(kb, "back", PKB_VK_CANCEL);   /* 2106: menu Back */
++    else if (bk != PKB_VK_CANCEL) bk = pad_kb_ui_key_of(kb, "circle", 0);    /* the page's Back is Circle, and Start */
+     snprintf(out, n, "%s%s", ch ? pad_kb_key_short(ch) : "", ch ? " change, " : "");
+     m = strlen(out);
+     snprintf(out + m, n - m, "Delete clear, ");
+@@ -685,7 +742,7 @@
+     if (!strcmp(verb, "key") || !strcmp(verb, "dup")) {
+         if (in < 0 || s < 0 || s >= PKB_SLOTS) { snprintf(out, n, verb[0] == 'k' ? "?" : ""); return 0; }
+         k = kb->key[in][s];
+-        if (verb[0] == 'd') { snprintf(out, n, "%s", pad_kb_key_uses(kb, k) > 1 ? "1" : ""); return 0; }
++        if (verb[0] == 'd') { snprintf(out, n, "%s", pad_kb_key_conflicts(kb, in, k) ? "1" : ""); return 0; }
+         if (u->phase != PKB_UI_IDLE && u->row == r && u->slot == s) { snprintf(out, n, "..."); return 0; }
+         snprintf(out, n, "%s", pad_kb_ui_keytext(k));
+         return 0;
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -23,6 +23,10 @@
+ #include "pad_menu_mouse.h"
+ #include "pad_mouse.h"
+ unsigned (*g_pad_menu_bits_hook)(unsigned pad_buttons, int pad_active) = NULL;
++/* KZ3 patch 2106: a game menu has the focus, so the "back" keys (Esc) are menu Back (pad_keybinds.h pad_kb_eval). Only
++ * when the port tracks the game's menus (2098's hook installed: a GUM context was found for this EBOOT); otherwise
++ * Esc stays Start everywhere. */
++int pad_kb_menu_state(void) { return g_pad_menu_bits_hook != NULL && pad_mouse_menu_on(); }
+ void     (*g_pad_menu_sent_hook)(int delivered) = NULL;
+ 
+ /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
+diff -ruN a/libs/video/rsx_keycaps.h b/libs/video/rsx_keycaps.h
+--- a/libs/video/rsx_keycaps.h
++++ b/libs/video/rsx_keycaps.h
+@@ -123,9 +123,15 @@
+ static int kc_key(const char* input) { int vk = g_kc_src.key_for_input(input, 0); return vk ? vk : g_kc_src.key_for_input(input, 1); }
+ 
+ /* The key a cell shows. Menu atlas: Enter / Backspace / Escape win when bound to that button (what a player presses
+- * in a menu), else the first key. */
++ * in a menu), else the first key. Patch 2106: Circle in the menu atlas is menu Back, so it shows the "back" input's
++ * key (Esc by default; 0 from the source when the port does not track the menus, then Circle's own key). */
+ static int kc_cell_key(const char* input, int menu)
+ {
++    if (menu && !strcmp(input, "circle")) {
++        int vk = g_kc_src.key_for_input("back", 0);
++        if (!vk) vk = g_kc_src.key_for_input("back", 1);
++        if (vk) return vk;
++    }
+     if (menu) {
+         for (int s = 0; s < 2; s++) {
+             int vk = g_kc_src.key_for_input(input, s);
+@@ -142,7 +148,7 @@
+     if (!g_kc_src.keyboard_active()) return 1;
+     static const char* in[] = { "square", "cross", "triangle", "circle", "l1", "r1", "l2", "r2", "l3", "r3", "up", "down",
+                                 "left", "right", "select", "start", "ls_up", "ls_down", "ls_left", "ls_right",
+-                                "rs_up", "rs_down", "rs_left", "rs_right" };
++                                "rs_up", "rs_down", "rs_left", "rs_right", "back" /* 2106 */ };
+     uint32_t h = 2166136261u;
+     for (unsigned i = 0; i < sizeof in / sizeof in[0]; i++)
+         for (int s = 0; s < 2; s++) { h ^= (uint32_t)g_kc_src.key_for_input(in[i], s); h *= 16777619u; }

@@ -1,0 +1,32 @@
+sys_fs: g_ps3_vfs_miss_hook, a port hook called from ps3_vfs_ps3game_fallback (all three path translators) when a
+host path still misses. KZ3 uses it to serve files from data_ps3.psarc.
+
+diff --git a/runtime/syscalls/sys_fs.c b/runtime/syscalls/sys_fs.c
+index f076ef8..75c9772 100644
+--- a/runtime/syscalls/sys_fs.c
++++ b/runtime/syscalls/sys_fs.c
+@@ -93,7 +93,24 @@ static void fs_normalize_sep(char* p) {
+  * only weak reference to it: under COFF each one emits its own fallback. */
+ extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
+ 
++/* Last-chance hook for a host path that still misses after the layout
++ * fallbacks below: a port can serve it from somewhere else (KZ3 answers from
++ * its PSARC archive) by rewriting `path` to a host file that exists. A
++ * function pointer rather than a weak symbol: weak definitions are unreliable
++ * on PE/COFF (MinGW). NULL = no hook. */
++void (*g_ps3_vfs_miss_hook)(char* path, size_t cap) = NULL;
++
++static void ps3game_layout_fallback(char* path, size_t cap);
+ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
++{
++    struct stat st;
++    if (!path || !*path) return;
++    ps3game_layout_fallback(path, cap);
++    if (g_ps3_vfs_miss_hook && stat(path, &st) != 0)
++        g_ps3_vfs_miss_hook(path, cap);
++}
++
++static void ps3game_layout_fallback(char* path, size_t cap)
+ {
+     struct stat st;
+     if (!path || !*path || stat(path, &st) == 0)

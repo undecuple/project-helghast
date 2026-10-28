@@ -1,0 +1,1029 @@
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c	2026-10-20 19:56:31.416929301 -0500
++++ b/libs/input/cellPad.c	2026-10-20 20:02:10.093005758 -0500
+@@ -290,6 +290,8 @@
+     int vk = code;
+     (void)ctx;
+     if (code > 0 && code < 256 && s_kb_layout_ok) vk = s_kb_layout.vk[code];
++    /* KZ3 patch 2095: Alt+Enter switches the display mode (rsx_null_backend.c); its Enter is not a pad press */
++    if (vk == 0x0D && (GetAsyncKeyState(0x12) & 0x8000)) return 0;
+     return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
+ }
+ static int pad_kb_down_none(void* ctx, int vk) { (void)ctx; (void)vk; return 0; }
+@@ -353,6 +355,21 @@
+     wcscpy(s_kb_path, L"keybinds.ini");               /* no APPDATA: the working folder */
+ }
+ 
++/* KZ3 patch 2095: a file beside keybinds.ini (the port's other settings, e.g. display.ini); 1 = *out holds its path. */
++int pad_kb_sibling_path(const wchar_t* name, wchar_t* out, size_t n)
++{
++    const wchar_t* sl;
++    size_t d;
++    if (!s_kb_path[0]) pad_kb_find_path();
++    sl = wcsrchr(s_kb_path, L'\\');
++    if (wcsrchr(s_kb_path, L'/') > sl) sl = wcsrchr(s_kb_path, L'/');
++    d = sl ? (size_t)(sl - s_kb_path) + 1 : 0;
++    if (!out || d + wcslen(name) + 1 > n) return 0;
++    memcpy(out, s_kb_path, d * sizeof(wchar_t));
++    wcscpy(out + d, name);
++    return 1;
++}
++
+ static int pad_kb_stamp(FILETIME* out)
+ {
+     WIN32_FILE_ATTRIBUTE_DATA a;
+diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+--- a/libs/video/rsx_display_mode.h	1969-12-31 18:00:00.000000000 -0600
++++ b/libs/video/rsx_display_mode.h	2026-10-20 20:17:38.986507855 -0500
+@@ -0,0 +1,325 @@
++/*
++ * KZ3 patch 2095 (RSX pass 90): display modes. ENHANCEMENT (display; the feature is on, the default mode is Windowed).
++ *
++ *   Windowed    the normal resizable window (patch 2062 keeps its client at the guest aspect while dragging).
++ *   Borderless  a WS_POPUP window covering the monitor the window is on.
++ *   Fullscreen  DXGI exclusive fullscreen (IDXGISwapChain::SetFullscreenState) on the window's monitor; when DXGI
++ *               refuses it the mode falls back to Borderless for the session (logged).
++ * Alt+Enter toggles Windowed <-> the last fullscreen mode (DXGI's own Alt+Enter is turned off with
++ * MakeWindowAssociation(DXGI_MWA_NO_ALT_ENTER), so there is one behaviour). The swap chain follows the client size
++ * (ResizeBuffers); the guest's 1280x720 image is drawn aspect-correct into it with linear filtering and black bars
++ * (rsx_live_draw.c). The mode comes from KZ3_DISPLAY=windowed|borderless|fullscreen (tests; wins), else display.ini
++ * beside keybinds.ini ([display] mode = ...), else Windowed; the Options > Display rows "Display mode", "Image scaling"
++ * (Fit/Stretch) and "Scaling filter" (Bilinear/Nearest; port/kz3/main.cpp patches common/displaysettings.gum) apply at
++ * once and are saved.
++ *
++ * This header is the platform-free part (host test: tools/smoke/test_display_mode.sh): names, the mode state machine,
++ * the letterbox rectangle, client -> guest mouse mapping, the display.ini text, and the Options row's GUM patch.
++ */
++#ifndef RSX_DISPLAY_MODE_H
++#define RSX_DISPLAY_MODE_H
++
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum { RSX_DM_WINDOWED = 0, RSX_DM_BORDERLESS = 1, RSX_DM_FULLSCREEN = 2 };
++
++static inline const char* rsx_dm_name(int m)
++{
++    return m == RSX_DM_BORDERLESS ? "borderless" : m == RSX_DM_FULLSCREEN ? "fullscreen" : "windowed";
++}
++
++static inline int rsx_dm_ieq(const char* a, size_t n, const char* b)   /* a[0..n) == b, ASCII case-insensitive */
++{
++    size_t i;
++    if (strlen(b) != n) return 0;
++    for (i = 0; i < n; i++) {
++        char c = a[i];
++        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
++        if (c != b[i]) return 0;
++    }
++    return 1;
++}
++
++/* "windowed"/"window", "borderless", "fullscreen"/"exclusive" (any case, surrounding blanks ignored) -> mode, else -1. */
++static inline int rsx_dm_parse(const char* s)
++{
++    size_t n;
++    if (!s) return -1;
++    while (*s == ' ' || *s == '\t') s++;
++    n = strlen(s);
++    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) n--;
++    if (rsx_dm_ieq(s, n, "windowed") || rsx_dm_ieq(s, n, "window")) return RSX_DM_WINDOWED;
++    if (rsx_dm_ieq(s, n, "borderless")) return RSX_DM_BORDERLESS;
++    if (rsx_dm_ieq(s, n, "fullscreen") || rsx_dm_ieq(s, n, "exclusive")) return RSX_DM_FULLSCREEN;
++    return -1;
++}
++
++/* The mode state machine. `mode` is what the window should be, `last_fs` the fullscreen mode Alt+Enter goes to from
++ * Windowed (Borderless until a fullscreen mode was chosen), `no_exclusive` is set once DXGI refused exclusive
++ * fullscreen: Fullscreen then means Borderless for the rest of the session. */
++typedef struct { int mode, last_fs, no_exclusive; } rsx_dm_state;
++
++static inline int rsx_dm_effective(const rsx_dm_state* s, int m)
++{
++    return (m == RSX_DM_FULLSCREEN && s->no_exclusive) ? RSX_DM_BORDERLESS : m;
++}
++
++static inline void rsx_dm_init(rsx_dm_state* s, int mode)
++{
++    if (mode < RSX_DM_WINDOWED || mode > RSX_DM_FULLSCREEN) mode = RSX_DM_WINDOWED;
++    s->mode = mode;
++    s->last_fs = mode == RSX_DM_WINDOWED ? RSX_DM_BORDERLESS : mode;
++    s->no_exclusive = 0;
++}
++
++/* Choose a mode (the Options row, KZ3_DISPLAY). Returns the mode to apply (Borderless for Fullscreen after a refusal). */
++static inline int rsx_dm_set(rsx_dm_state* s, int mode)
++{
++    if (mode < RSX_DM_WINDOWED || mode > RSX_DM_FULLSCREEN) return rsx_dm_effective(s, s->mode);
++    s->mode = mode;
++    if (mode != RSX_DM_WINDOWED) s->last_fs = mode;
++    return rsx_dm_effective(s, mode);
++}
++
++/* Alt+Enter: Windowed -> the last fullscreen mode, any fullscreen mode -> Windowed. Returns the mode to apply. */
++static inline int rsx_dm_toggle(rsx_dm_state* s)
++{
++    return rsx_dm_set(s, s->mode == RSX_DM_WINDOWED ? s->last_fs : RSX_DM_WINDOWED);
++}
++
++/* DXGI refused exclusive fullscreen: Borderless instead, from now on. Returns the mode to apply. */
++static inline int rsx_dm_exclusive_refused(rsx_dm_state* s)
++{
++    s->no_exclusive = 1;
++    return rsx_dm_effective(s, s->mode);
++}
++
++/* The largest rectangle of the source aspect sw:sh inside a dw x dh target, centred (letterbox: bars top/bottom;
++ * pillarbox: bars left/right). Sizes round to the nearest pixel; the bars split the rest, the odd pixel going to the
++ * right/bottom bar. A zero size gives the whole target. */
++typedef struct { int x, y, w, h; } rsx_dm_rect;
++
++static inline rsx_dm_rect rsx_dm_fit(int sw, int sh, int dw, int dh)
++{
++    rsx_dm_rect r = { 0, 0, dw, dh };
++    long long a, b;
++    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return r;
++    a = (long long)dw * sh;   /* target wider than the source when a > b */
++    b = (long long)dh * sw;
++    if (a > b) {
++        r.w = (int)(((long long)dh * sw + sh / 2) / sh);
++        if (r.w > dw) r.w = dw;
++        r.x = (dw - r.w) / 2;
++    } else if (a < b) {
++        r.h = (int)(((long long)dw * sh + sw / 2) / sw);
++        if (r.h > dh) r.h = dh;
++        r.y = (dh - r.h) / 2;
++    }
++    return r;
++}
++
++/* Image scaling (Options row "Image scaling", KZ3_DISPLAY_SCALING): Fit = aspect-correct with bars, Stretch (default) =
++ * the whole client, aspect not kept. Filter (row "Scaling filter", KZ3_DISPLAY_FILTER): Bilinear (default) or Nearest;
++ * Nearest with Fit uses the largest whole-number scale that fits (sharp, even pixels; wider bars), falling back to
++ * the plain fit when even 1x does not fit. Modelled on RPCS3's "stretch to display area" and "output scaling". */
++enum { RSX_DM_FIT = 0, RSX_DM_STRETCH = 1 };
++#define RSX_DM_SCALING_DEFAULT RSX_DM_STRETCH /* interim until the game renders at the screen aspect (RSX pass 91) */
++enum { RSX_DM_BILINEAR = 0, RSX_DM_NEAREST = 1 };
++
++static inline const char* rsx_dm_scaling_name(int v) { return v == RSX_DM_STRETCH ? "stretch" : "fit"; }
++static inline const char* rsx_dm_filter_name(int v) { return v == RSX_DM_NEAREST ? "nearest" : "bilinear"; }
++
++static inline int rsx_dm_trim(const char** s, size_t* n)
++{
++    if (!*s) return 0;
++    while (**s == ' ' || **s == '\t') (*s)++;
++    *n = strlen(*s);
++    while (*n && ((*s)[*n - 1] == ' ' || (*s)[*n - 1] == '\t' || (*s)[*n - 1] == '\r' || (*s)[*n - 1] == '\n')) (*n)--;
++    return 1;
++}
++static inline int rsx_dm_parse_scaling(const char* s)
++{
++    size_t n;
++    if (!rsx_dm_trim(&s, &n)) return -1;
++    if (rsx_dm_ieq(s, n, "fit")) return RSX_DM_FIT;
++    if (rsx_dm_ieq(s, n, "stretch")) return RSX_DM_STRETCH;
++    return -1;
++}
++static inline int rsx_dm_parse_filter(const char* s)
++{
++    size_t n;
++    if (!rsx_dm_trim(&s, &n)) return -1;
++    if (rsx_dm_ieq(s, n, "bilinear") || rsx_dm_ieq(s, n, "linear")) return RSX_DM_BILINEAR;
++    if (rsx_dm_ieq(s, n, "nearest") || rsx_dm_ieq(s, n, "point")) return RSX_DM_NEAREST;
++    return -1;
++}
++
++/* The image rectangle for a scaling and filter choice. */
++static inline rsx_dm_rect rsx_dm_rect_for(int sw, int sh, int dw, int dh, int scaling, int filter)
++{
++    rsx_dm_rect r = { 0, 0, dw, dh };
++    if (scaling == RSX_DM_STRETCH || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return r;
++    if (filter == RSX_DM_NEAREST) {
++        int k = dw / sw < dh / sh ? dw / sw : dh / sh;
++        if (k >= 1) {
++            r.w = k * sw; r.h = k * sh;
++            r.x = (dw - r.w) / 2; r.y = (dh - r.h) / 2;
++            return r;
++        }
++    }
++    return rsx_dm_fit(sw, sh, dw, dh);
++}
++
++/* A client pixel (cx, cy) -> the guest pixel under it (sw x sh image drawn into r). Returns 1 inside the image, 0 on a
++ * bar (the result is then clamped to the nearest edge pixel). Pixel centres map to pixel centres:
++ * g = floor(((c - r.x) + 0.5) * sw / r.w). */
++static inline int rsx_dm_to_guest(const rsx_dm_rect* r, int sw, int sh, int cx, int cy, int* gx, int* gy)
++{
++    int in = cx >= r->x && cx < r->x + r->w && cy >= r->y && cy < r->y + r->h;
++    long long x, y;
++    if (r->w <= 0 || r->h <= 0 || sw <= 0 || sh <= 0) { *gx = cx; *gy = cy; return 0; }
++    x = (2LL * (cx - r->x) + 1) * sw;
++    y = (2LL * (cy - r->y) + 1) * sh;
++    x = x < 0 ? -1 : x / (2LL * r->w);
++    y = y < 0 ? -1 : y / (2LL * r->h);
++    *gx = (int)(x < 0 ? 0 : x >= sw ? sw - 1 : x);
++    *gy = (int)(y < 0 ? 0 : y >= sh ? sh - 1 : y);
++    return in;
++}
++
++/* display.ini: "[display]" then "key = value" lines (mode, scaling, filter); other sections are ignored. The value of
++ * `key` into out (1), or 0 when missing. */
++static inline int rsx_dm_ini_value(const char* t, const char* key, char* out, size_t cap)
++{
++    int in_sec = 0;
++    size_t kl = strlen(key);
++    while (t && *t) {
++        const char* e = strchr(t, '\n');
++        size_t n = e ? (size_t)(e - t) : strlen(t);
++        const char* p = t;
++        while (n && (*p == ' ' || *p == '\t')) { p++; n--; }
++        while (n && (p[n - 1] == '\r' || p[n - 1] == ' ' || p[n - 1] == '\t')) n--;
++        if (n && p[0] == '[') in_sec = rsx_dm_ieq(p, n, "[display]");
++        else if (in_sec && n > kl && rsx_dm_ieq(p, kl, key)) {
++            const char* q = p + kl;
++            size_t m = n - kl;
++            while (m && (*q == ' ' || *q == '\t')) { q++; m--; }
++            if (m && *q == '=') {
++                q++; m--;
++                if (m >= cap) m = cap - 1;
++                memcpy(out, q, m); out[m] = 0;
++                return 1;
++            }
++        }
++        t = e ? e + 1 : NULL;
++    }
++    return 0;
++}
++static inline int rsx_dm_ini_parse(const char* t)          /* the mode, or -1 */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "mode", v, sizeof v) ? rsx_dm_parse(v) : -1;
++}
++static inline int rsx_dm_ini_scaling(const char* t)        /* the scaling, or -1 */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "scaling", v, sizeof v) ? rsx_dm_parse_scaling(v) : -1;
++}
++static inline int rsx_dm_ini_filter(const char* t)         /* the filter, or -1 */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "filter", v, sizeof v) ? rsx_dm_parse_filter(v) : -1;
++}
++
++static inline int rsx_dm_ini_write(char* buf, size_t n, int mode, int scaling, int filter)
++{
++    return snprintf(buf, n,
++                    "# Project Helghast display settings (Options > Display; Alt+Enter toggles the mode).\n"
++                    "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest.\n"
++                    "# KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER override them for one run.\n"
++                    "[display]\nmode = %s\nscaling = %s\nfilter = %s\n", rsx_dm_name(mode), rsx_dm_scaling_name(scaling),
++                    rsx_dm_filter_name(filter));
++}
++
++/* The Options row (Options > Display, common/displaysettings.gum): three <select>s (mode, scaling, filter) before the Brightness row, the same
++ * widget as the page's own rows, and three functions in its settingscript. The value goes to the host through the
++ * Keyboard page's Lua bridge (gPlayerProfile:SetTimeZone("kb:display <v>") / GetTimeZone(), port/kz3/main.cpp), which
++ * applies and saves it; OnPageOn selects the current mode. */
++static inline const char* rsx_dm_find(const char* h, size_t n, size_t from, const char* needle)
++{
++    size_t k = strlen(needle), i;
++    for (i = from; i + k <= n; i++)
++        if (!memcmp(h + i, needle, k)) return h + i;
++    return NULL;
++}
++
++/* The page with the row and the functions added (malloc'd, NUL-terminated, *out_n bytes), or NULL when an anchor is
++ * missing (the Brightness listitem, the settingscript CDATA end), the script already has an OnPageOn, or the row is
++ * already there: the page is then served unchanged. */
++static inline char* rsx_dm_patch_gum(const char* in, size_t n, size_t* out_n)
++{
++    static const char rsx_dm_gum_row[] =
++        "<select id=\"slc_kz3_display\" label=\"Display mode\" onchange=\"script(settingscript,KZ3ChangeDisplay)\"\n"
++        "\t\t\t\tdefault-value=\"windowed\">\n"
++        "\t\t\t\t<selectitem value=\"windowed\">Windowed</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"borderless\">Borderless</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"fullscreen\">Fullscreen</selectitem>\n"
++        "\t\t\t</select>\n\n\t\t\t"
++        "<select id=\"slc_kz3_scaling\" label=\"Image scaling\" onchange=\"script(settingscript,KZ3ChangeScaling)\"\n"
++        "\t\t\t\tdefault-value=\"stretch\">\n"
++        "\t\t\t\t<selectitem value=\"fit\">Fit</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"stretch\">Stretch</selectitem>\n"
++        "\t\t\t</select>\n\n\t\t\t"
++        "<select id=\"slc_kz3_filter\" label=\"Scaling filter\" onchange=\"script(settingscript,KZ3ChangeFilter)\"\n"
++        "\t\t\t\tdefault-value=\"bilinear\">\n"
++        "\t\t\t\t<selectitem value=\"bilinear\">Bilinear</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"nearest\">Nearest</selectitem>\n"
++        "\t\t\t</select>\n\n\t\t\t";
++
++    static const char rsx_dm_gum_lua[] =
++        "\n\t\tgKz3Dm = 0\n\t\tfunction KZ3DisplayCmd(c)\n"
++        "\t\t\tgPlayerProfile:SetTimeZone(\"kb:\"..c)\n"
++        "\t\t\treturn gPlayerProfile:GetTimeZone()\n"
++        "\t\tend\n\n"
++        "\t\tfunction OnPageOn()\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_display\"):SetValue(KZ3DisplayCmd(\"display\"))\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_scaling\"):SetValue(KZ3DisplayCmd(\"scaling\"))\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_filter\"):SetValue(KZ3DisplayCmd(\"filter\"))\n\t\t\tgKz3Dm = 1\n"
++        "\t\tend\n\n"
++        "\t\tfunction KZ3ChangeDisplay(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"display \"..e:GetSender():GetValue()) end\n"
++        "\t\tend\n\n"
++        "\t\tfunction KZ3ChangeScaling(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"scaling \"..e:GetSender():GetValue()) end\n"
++        "\t\tend\n\n"
++        "\t\tfunction KZ3ChangeFilter(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"filter \"..e:GetSender():GetValue()) end\n"
++        "\t\tend\n";
++    const char* row = rsx_dm_find(in, n, 0, "<listitem id=\"lst_gamma_screen\"");
++    const char* scr = rsx_dm_find(in, n, 0, "<script id=\"settingscript\">");
++    const char* cd = scr ? rsx_dm_find(in, n, (size_t)(scr - in), "]]>") : NULL;
++    size_t at_row, at_lua, nr = sizeof rsx_dm_gum_row - 1, nl = sizeof rsx_dm_gum_lua - 1, o = 0;
++    char* out;
++    if (!row || !scr || !cd || row > scr || rsx_dm_find(in, n, 0, "function OnPageOn") ||
++        rsx_dm_find(in, n, 0, "slc_kz3_display")) return NULL;
++    at_row = (size_t)(row - in);
++    at_lua = (size_t)(cd - in);
++    out = (char*)malloc(n + nr + nl + 1);
++    if (!out) return NULL;
++    memcpy(out + o, in, at_row); o += at_row;
++    memcpy(out + o, rsx_dm_gum_row, nr); o += nr;
++    memcpy(out + o, in + at_row, at_lua - at_row); o += at_lua - at_row;
++    memcpy(out + o, rsx_dm_gum_lua, nl); o += nl;
++    memcpy(out + o, in + at_lua, n - at_lua); o += n - at_lua;
++    out[o] = 0;
++    *out_n = o;
++    return out;
++}
++
++#endif /* RSX_DISPLAY_MODE_H */
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c	2026-10-20 19:56:31.579601723 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-20 20:17:06.584966227 -0500
+@@ -72,6 +72,9 @@
+ void rsx_live_draw_present(u32 b) { (void)b; }
+ void rsx_live_draw_set_movie_mode(int on) { (void)on; }
+ void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
++int  rsx_live_draw_set_fullscreen(int on) { (void)on; return -1; }   /* patch 2095 */
++int  rsx_live_draw_is_fullscreen(void) { return 0; }
++void rsx_live_draw_set_scaling(int s, int f) { (void)s; (void)f; }
+ u32  rsx_live_draw_get_frames(void) { return 0; }
+ void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
+ u32  rsx_live_draw_get_last_draws(void) { return 0; }
+@@ -14495,6 +14498,270 @@
+     return SUCCEEDED(hr) ? 0 : -1;
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 2095 (RSX pass 90): display modes, ENHANCEMENT. The back buffers follow the window's client size
++ * (ResizeBuffers at the next present after a size change: GPU idle, back-buffer references released, RTVs
++ * recreated), and the presented guest image (1280x720) is drawn into them, by default aspect-correct with linear
++ * filtering and black bars around it (rsx_display_mode.h rsx_dm_rect_for: Fit/Stretch, Bilinear/Nearest, Nearest + Fit
++ * at a whole-number scale). When the client is exactly the image size the old CopyResource path
++ * runs (bit-identical). Exclusive fullscreen is SetFullscreenState on this swap chain (rsx_null_backend.c decides when;
++ * DXGI's own Alt+Enter is off: MakeWindowAssociation(DXGI_MWA_NO_ALT_ENTER)).
++ * -----------------------------------------------------------------------*/
++#include "rsx_display_mode.h"
++static HWND g_dm_hwnd;
++static u32 g_dm_bb_w, g_dm_bb_h;              /* back-buffer size */
++static ID3D12RootSignature* g_dm_rootsig[2];   /* [filter]: the static sampler differs */
++static ID3D12PipelineState* g_dm_pso[2];
++static int g_dm_failed;
++static int g_dm_scaling = RSX_DM_SCALING_DEFAULT, g_dm_filter = RSX_DM_BILINEAR;
++
++/* Image scaling and filter (rsx_null_backend.c, on the window's thread = the present thread). */
++void rsx_live_draw_set_scaling(int scaling, int filter)
++{
++    g_dm_scaling = scaling == RSX_DM_FIT ? RSX_DM_FIT : scaling == RSX_DM_STRETCH ? RSX_DM_STRETCH : RSX_DM_SCALING_DEFAULT;
++    g_dm_filter = filter == RSX_DM_NEAREST ? RSX_DM_NEAREST : RSX_DM_BILINEAR;
++}
++static ID3D12Resource* g_dm_movie_tex;        /* movie path: guest-size copy target when the image is scaled */
++static u32 g_dm_movie_w, g_dm_movie_h;
++static int g_dm_fs;                           /* swap chain in exclusive fullscreen */
++static u32 g_dm_resizes;
++
++static void ld_dm_client(u32* w, u32* h)
++{
++    RECT rc;
++    *w = g_dm_bb_w; *h = g_dm_bb_h;
++    if (g_dm_hwnd && GetClientRect(g_dm_hwnd, &rc) && rc.right > 0 && rc.bottom > 0) {
++        *w = (u32)rc.right; *h = (u32)rc.bottom;
++    }
++}
++
++static void ld_dm_get_buffers(void)
++{
++    for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {
++        g.swap->lpVtbl->GetBuffer(g.swap, i, &IID_ID3D12Resource, (void**)&g.backbuf[i]);
++        LD_SM_INVALIDATE(), g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.backbuf[i], NULL, rtv_handle(i));
++    }
++}
++
++/* Bring the back buffers to the client size. Called at the start of a present, before the back buffer is used.
++ * A minimized window (client 0x0) keeps the old size. */
++static void ld_dm_sync_size(void)
++{
++    u32 w, h;
++    if (!g.swap) return;
++    ld_dm_client(&w, &h);
++    if (w == g_dm_bb_w && h == g_dm_bb_h) return;
++    ld_wait_fence(g.fence_value);                   /* every submitted list that used a back buffer is done */
++    for (u32 i = 0; i < LD_SWAP_BUFFERS; i++)
++        if (g.backbuf[i]) { g.backbuf[i]->lpVtbl->Release(g.backbuf[i]); g.backbuf[i] = NULL; }
++    const HRESULT hr = g.swap->lpVtbl->ResizeBuffers(g.swap, LD_SWAP_BUFFERS, w, h, DXGI_FORMAT_UNKNOWN, 0);
++    ld_dm_get_buffers();
++    if (FAILED(hr)) {
++        fprintf(stderr, "[display] ResizeBuffers %ux%u failed hr=0x%08lX: %ux%u kept\n", w, h, (unsigned long)hr,
++                g_dm_bb_w, g_dm_bb_h);
++        g_dm_bb_w = w; g_dm_bb_h = h;               /* do not retry every frame; the blit scales into the old size */
++        {
++            D3D12_RESOURCE_DESC d;
++            g.backbuf[0]->lpVtbl->GetDesc(g.backbuf[0], &d);
++            g_dm_bb_w = (u32)d.Width; g_dm_bb_h = d.Height;
++        }
++        return;
++    }
++    g_dm_bb_w = w; g_dm_bb_h = h;
++    const rsx_dm_rect r = rsx_dm_rect_for((int)g.width, (int)g.height, (int)w, (int)h, g_dm_scaling, g_dm_filter);
++    if (g_dm_resizes++ < 64)
++        fprintf(stderr, "[display] swap chain %ux%u (frame %u): image %dx%d at %d,%d%s\n", w, h, g_ld_frames, r.w, r.h,
++                r.x, r.y, (w == g.width && h == g.height) ? " (copy, unscaled)" : g_dm_filter ? " (scaled, nearest)" : " (scaled, linear)");
++}
++
++static int ld_dm_pipeline(void)
++{
++    if (g_dm_pso[0] && g_dm_pso[1]) return 1;
++    if (g_dm_failed) return 0;
++    g_dm_failed = 1;
++    static const char source[] =
++        "Texture2D<float4> src : register(t0);\n"
++        "SamplerState lin : register(s0);\n"
++        "struct VO { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
++        "VO vs(uint id : SV_VertexID) {\n"
++        "  VO o;\n"
++        "  float2 t = float2((float)((id << 1) & 2u), (float)(id & 2u));\n"
++        "  o.pos = float4(t.x * 2.0 - 1.0, 1.0 - t.y * 2.0, 0.0, 1.0);\n"
++        "  o.uv = t;\n"
++        "  return o;\n"
++        "}\n"
++        "float4 ps(VO i) : SV_Target {\n"
++        "  return float4(src.SampleLevel(lin, i.uv, 0).rgb, 1.0);\n"
++        "}\n";
++    ID3DBlob* vsb = NULL; ID3DBlob* psb = NULL; ID3DBlob* err = NULL;
++    HRESULT hr = D3DCompile(source, sizeof(source) - 1u, "display_scale", NULL, NULL, "vs", "vs_5_0",
++                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsb, &err);
++    if (err) { if (FAILED(hr)) fprintf(stderr, "[display] VS: %s\n", (const char*)err->lpVtbl->GetBufferPointer(err));
++               err->lpVtbl->Release(err); err = NULL; }
++    if (SUCCEEDED(hr)) {
++        hr = D3DCompile(source, sizeof(source) - 1u, "display_scale", NULL, NULL, "ps", "ps_5_0",
++                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psb, &err);
++        if (err) { if (FAILED(hr)) fprintf(stderr, "[display] PS: %s\n", (const char*)err->lpVtbl->GetBufferPointer(err));
++                   err->lpVtbl->Release(err); err = NULL; }
++    }
++    if (SUCCEEDED(hr)) {
++        D3D12_DESCRIPTOR_RANGE rg = {0};
++        rg.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg.NumDescriptors = 1;
++        D3D12_ROOT_PARAMETER rp = {0};
++        rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++        rp.DescriptorTable.NumDescriptorRanges = 1;
++        rp.DescriptorTable.pDescriptorRanges = &rg;
++        rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++        for (int f = 0; f < 2 && SUCCEEDED(hr); f++) {
++        D3D12_STATIC_SAMPLER_DESC ss = {0};
++        ss.Filter = f ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++        ss.MaxLOD = D3D12_FLOAT32_MAX;
++        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++        D3D12_ROOT_SIGNATURE_DESC rd = {0};
++        rd.NumParameters = 1; rd.pParameters = &rp;
++        rd.NumStaticSamplers = 1; rd.pStaticSamplers = &ss;
++        ID3DBlob* sig = NULL;
++        hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
++        if (err) { err->lpVtbl->Release(err); err = NULL; }
++        if (SUCCEEDED(hr)) {
++            hr = g.dev->lpVtbl->CreateRootSignature(g.dev, 0, sig->lpVtbl->GetBufferPointer(sig),
++                                                    sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature,
++                                                    (void**)&g_dm_rootsig[f]);
++            sig->lpVtbl->Release(sig);
++        }
++        }
++    }
++    for (int f = 0; f < 2 && SUCCEEDED(hr); f++) {
++        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
++        pd.pRootSignature = g_dm_rootsig[f];
++        pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb);
++        pd.VS.BytecodeLength = vsb->lpVtbl->GetBufferSize(vsb);
++        pd.PS.pShaderBytecode = psb->lpVtbl->GetBufferPointer(psb);
++        pd.PS.BytecodeLength = psb->lpVtbl->GetBufferSize(psb);
++        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++        pd.SampleMask = 0xFFFFFFFFu;
++        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++        pd.RasterizerState.DepthClipEnable = TRUE;
++        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++        pd.NumRenderTargets = 1;
++        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++        pd.SampleDesc.Count = 1;
++        hr = g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd, &IID_ID3D12PipelineState, (void**)&g_dm_pso[f]);
++    }
++    if (vsb) vsb->lpVtbl->Release(vsb);
++    if (psb) psb->lpVtbl->Release(psb);
++    if (FAILED(hr) || !g_dm_pso[0] || !g_dm_pso[1]) {
++        fprintf(stderr, "[display] scale pipeline failed hr=0x%08lX: the image is copied unscaled\n", (unsigned long)hr);
++        return 0;
++    }
++    g_dm_failed = 0;
++    return 1;
++}
++
++/* Record: back buffer bb (PRESENT) cleared black, src (state src_state, restored after; a 2D colour texture) drawn
++ * into the letterbox rectangle with linear filtering, bb back to PRESENT. Returns 0 (nothing recorded) when the pass
++ * cannot run; the caller then copies. */
++static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32 bbi)
++{
++    if (!src || !ld_dm_pipeline() || g.srv_ring_used >= SRV_RING_TABLES) return 0;
++    D3D12_RESOURCE_DESC sd;
++    src->lpVtbl->GetDesc(src, &sd);
++    ID3D12Resource* bb = g.backbuf[bbi];
++    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
++    g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
++    cpu.ptr += (size_t)base * g.srv_step;
++    D3D12_SHADER_RESOURCE_VIEW_DESC vd = {0};
++    vd.Format = sd.Format;
++    vd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    vd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    vd.Texture2D.MipLevels = 1;
++    g.dev->lpVtbl->CreateShaderResourceView(g.dev, src, &vd, cpu);
++    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
++    g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.srv_heap, &gpu);
++    gpu.ptr += (u64)base * g.srv_step;
++
++    D3D12_RESOURCE_BARRIER b[2] = {0};
++    for (int q = 0; q < 2; q++) {
++        b[q].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[q].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    }
++    b[0].Transition.pResource = src;
++    b[0].Transition.StateBefore = src_state;
++    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    b[1].Transition.pResource = bb;
++    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(bbi);
++    static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
++    g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, black, 0, NULL);
++    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
++    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
++    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
++    g.list->lpVtbl->SetPipelineState(g.list, g_dm_pso[g_dm_filter]);
++    g.list->lpVtbl->SetGraphicsRootSignature(g.list, g_dm_rootsig[g_dm_filter]);
++    LD_SM_INVALIDATE();
++    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 0, gpu);
++    const rsx_dm_rect r = rsx_dm_rect_for((int)sd.Width, (int)sd.Height, (int)g_dm_bb_w, (int)g_dm_bb_h, g_dm_scaling,
++                                          g_dm_filter);
++    const D3D12_VIEWPORT vp = {(float)r.x, (float)r.y, (float)r.w, (float)r.h, 0.0f, 1.0f};
++    const D3D12_RECT sc = {(LONG)r.x, (LONG)r.y, (LONG)(r.x + r.w), (LONG)(r.y + r.h)};
++    g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
++    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
++    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
++    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    b[0].Transition.StateAfter = src_state;
++    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    return 1;
++}
++
++/* The movie path's guest-size RGBA8 texture (COPY_DEST between uses); NULL if it cannot be made. */
++static ID3D12Resource* ld_dm_movie_target(u32 w, u32 h)
++{
++    if (g_dm_movie_tex && g_dm_movie_w == w && g_dm_movie_h == h) return g_dm_movie_tex;
++    if (g_dm_movie_tex) { retire_texture(g_dm_movie_tex); g_dm_movie_tex = NULL; }
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC rd = {0};
++    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
++    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
++            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&g_dm_movie_tex)))
++        g_dm_movie_tex = NULL;
++    g_dm_movie_w = w; g_dm_movie_h = h;
++    return g_dm_movie_tex;
++}
++
++/* Exclusive fullscreen on this swap chain (rsx_null_backend.c calls it on the window's thread). 1 = in that state
++ * now, 0 = DXGI refused, -1 = no swap chain. */
++int rsx_live_draw_set_fullscreen(int on)
++{
++    if (!g.ready || !g.swap) return -1;
++    BOOL cur = FALSE;
++    g.swap->lpVtbl->GetFullscreenState(g.swap, &cur, NULL);
++    if ((cur != FALSE) == (on != 0)) { g_dm_fs = on != 0; return 1; }
++    const HRESULT hr = g.swap->lpVtbl->SetFullscreenState(g.swap, on ? TRUE : FALSE, NULL);
++    g.swap->lpVtbl->GetFullscreenState(g.swap, &cur, NULL);
++    g_dm_fs = cur != FALSE;
++    fprintf(stderr, "[display] SetFullscreenState(%s) hr=0x%08lX -> fullscreen state %s\n", on ? "TRUE" : "FALSE",
++            (unsigned long)hr, cur ? "TRUE" : "FALSE");
++    return SUCCEEDED(hr) && (g_dm_fs == (on != 0)) ? 1 : 0;
++}
++
++int rsx_live_draw_is_fullscreen(void)
++{
++    BOOL cur = FALSE;
++    if (!g.ready || !g.swap) return 0;
++    g.swap->lpVtbl->GetFullscreenState(g.swap, &cur, NULL);
++    return cur != FALSE;
++}
++
+ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+                        rsx_live_guest_ptr_fn guest_fn, void* guest_user)
+ {
+@@ -14641,7 +14908,10 @@
+ 
+     /* swap chain bound to the runtime's HWND */
+     DXGI_SWAP_CHAIN_DESC1 scd = {0};
+-    scd.Width = width; scd.Height = height; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    /* patch 2095: the back buffers are the client's size (the guest image is scaled into them at present) */
++    g_dm_hwnd = (HWND)hwnd; g_dm_bb_w = width; g_dm_bb_h = height;
++    ld_dm_client(&g_dm_bb_w, &g_dm_bb_h);
++    scd.Width = g_dm_bb_w; scd.Height = g_dm_bb_h; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+     scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+     scd.BufferCount = LD_SWAP_BUFFERS; scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+     IDXGISwapChain1* sc1 = NULL;
+@@ -14651,6 +14921,11 @@
+     }
+     sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g.swap);
+     sc1->lpVtbl->Release(sc1);
++    {   /* patch 2095: Alt+Enter is the window's (rsx_null_backend.c), not DXGI's */
++        const HRESULT mh = factory->lpVtbl->MakeWindowAssociation(factory, (HWND)hwnd, DXGI_MWA_NO_ALT_ENTER);
++        fprintf(stderr, "[display] swap chain %ux%u for a %ux%u guest image; MakeWindowAssociation(NO_ALT_ENTER) hr=0x%08lX\n",
++                g_dm_bb_w, g_dm_bb_h, width, height, (unsigned long)mh);
++    }
+     factory->lpVtbl->Release(factory);
+ 
+     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
+@@ -14659,10 +14934,7 @@
+     hd.NumDescriptors = LD_SWAP_BUFFERS + MAX_SURFACES;
+     g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g.rtv_heap);
+     g.rtv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+-    for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {
+-        g.swap->lpVtbl->GetBuffer(g.swap, i, &IID_ID3D12Resource, (void**)&g.backbuf[i]);
+-        LD_SM_INVALIDATE(), g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.backbuf[i], NULL, rtv_handle(i));
+-    }
++    ld_dm_get_buffers();   /* patch 2095 */
+ 
+     /* upload arena */
+     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+@@ -15275,8 +15547,12 @@
+         }
+     }
+ 
++    ld_dm_sync_size();   /* patch 2095 */
+     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+     ID3D12Resource* bb = g.backbuf[bbi];
++    /* patch 2095: scaled present: the frame goes into a guest-size texture, which is drawn into the back buffer */
++    ID3D12Resource* dm_tex = (g_dm_bb_w != g.width || g_dm_bb_h != g.height) && ld_dm_pipeline() ? ld_dm_movie_target(w, h) : NULL;
++    if (dm_tex) bb = dm_tex;
+ 
+     D3D12_RESOURCE_BARRIER b = {0};
+     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -15284,7 +15560,7 @@
+     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    if (!dm_tex) g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);   /* patch 2095: dm_tex stays COPY_DEST */
+ 
+     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+     dst.pResource = bb; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
+@@ -15300,7 +15576,18 @@
+ 
+     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    if (!dm_tex) g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    else if (!ld_dm_blit(dm_tex, D3D12_RESOURCE_STATE_COPY_DEST, bbi)) {   /* patch 2095 */
++        b.Transition.pResource = g.backbuf[bbi];         /* no scale pass: an empty (black) frame, not a stale one */
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++        { static const float k0[4] = { 0, 0, 0, 1 };
++          g.list->lpVtbl->ClearRenderTargetView(g.list, rtv_handle(bbi), k0, 0, NULL); }
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    }
+ 
+     ld_flush(LD_FLUSH_MOVIE_PRESENT);
+     {
+@@ -16569,8 +16856,14 @@
+       } }
+     ID3D12Resource* srcimg = presented_surface->tex;
+     ID3D12Resource* gm_copy = ld_gamma_present(target);   /* patch 2070 */
++    ld_dm_sync_size();                                    /* patch 2095: back buffers at the client size */
+     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+     ID3D12Resource* bb = g.backbuf[bbi];
++    /* patch 2095: a client of another size gets the image scaled aspect-correct, else the old copy */
++    const int dm_scaled = (g_dm_bb_w != g.width || g_dm_bb_h != g.height) &&
++        ld_dm_blit(gm_copy ? gm_copy : srcimg,
++                   gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET, bbi);
++    if (!dm_scaled) {
+ 
+     D3D12_RESOURCE_BARRIER bar[2] = {0};
+     bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -16592,6 +16885,7 @@
+     bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
++    }   /* patch 2095 */
+ 
+     ld_flush(LD_FLUSH_PRESENT);
+     {
+@@ -17738,6 +18032,7 @@
+         g.depth_snapshot_rootsig->lpVtbl->Release(
+             g.depth_snapshot_rootsig);
+     if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
++    if (g.swap && g_dm_fs) g.swap->lpVtbl->SetFullscreenState(g.swap, FALSE, NULL);   /* patch 2095 */
+     if (g.swap) g.swap->lpVtbl->Release(g.swap);
+     if (g_ld_info_queue) {
+         g_ld_info_queue->lpVtbl->Release(g_ld_info_queue);
+diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c	2026-10-20 19:56:31.455325701 -0500
++++ b/libs/video/rsx_null_backend.c	2026-10-20 20:16:31.494484203 -0500
+@@ -55,11 +55,251 @@
+ #include "rsx_window_size.h"   /* KZ3 patch 2062: window size apart from the guest output */
+ #include "../input/pad_mouse.h"   /* KZ3 patch 2069: mouse look (Raw Input, cursor clip) */
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 2095 (RSX pass 90): display modes, ENHANCEMENT (rsx_display_mode.h has the rules and the pure parts).
++ * Everything here runs on the window's thread (the frame thread, which also presents): Alt+Enter and the Options row
++ * (posted as RSX_DM_WM_SET from the guest's Lua bridge thread) are handled in the window procedure, so a mode change
++ * never races the present. Exclusive fullscreen is the live-draw swap chain's (rsx_live_draw_set_fullscreen).
++ * -----------------------------------------------------------------------*/
++#include "rsx_display_mode.h"
++extern int rsx_live_draw_set_fullscreen(int on);   /* 1 taken, 0 refused, -1 no swap chain yet (rsx_live_draw.c) */
++extern int rsx_live_draw_is_fullscreen(void);
++extern void rsx_live_draw_set_scaling(int scaling, int filter);   /* Fit/Stretch, Bilinear/Nearest */
++
++#define RSX_DM_WM_SET (WM_APP + 0x95)
++#define RSX_DM_WM_SCALE (WM_APP + 0x96)
++static int s_dm_scaling = RSX_DM_SCALING_DEFAULT, s_dm_filter = RSX_DM_BILINEAR;
++static int s_dm_cfg_scaling = -1, s_dm_cfg_filter = -1;
++static rsx_dm_state s_dm;
++static int s_dm_applied = RSX_DM_WINDOWED;        /* what the window is now */
++static int s_dm_env = 0;                          /* KZ3_DISPLAY given: nothing is saved */
++static int s_dm_cfg = -1;                         /* the saved mode (rsx_display_configure) */
++static void (*s_dm_save)(int mode, int scaling, int filter);   /* writes display.ini (port/kz3/main.cpp) */
++static int s_dm_pending = -1;                     /* exclusive fullscreen waits for the swap chain */
++static WINDOWPLACEMENT s_dm_wp;
++static LONG_PTR s_dm_style, s_dm_exstyle;
++static int s_dm_saved;
++static ULONGLONG s_dm_t0;
++static const char* s_dm_script;                   /* KZ3_TEST_DISPLAY */
++
++/* Called by the port before the window exists: what display.ini holds (-1 = none) and how to save the settings. */
++void rsx_display_configure(int saved_mode, int saved_scaling, int saved_filter,
++                           void (*save)(int mode, int scaling, int filter))
++{
++    s_dm_cfg = saved_mode;
++    s_dm_cfg_scaling = saved_scaling;
++    s_dm_cfg_filter = saved_filter;
++    s_dm_save = save;
++}
++
++int rsx_display_get_mode(void) { return s_dm.mode; }
++int rsx_display_get_scaling(void) { return s_dm_scaling; }
++int rsx_display_get_filter(void) { return s_dm_filter; }
++static void rsx_dm_save_now(void) { if (!s_dm_env && s_dm_save) s_dm_save(s_dm.mode, s_dm_scaling, s_dm_filter); }
++
++static void rsx_dm_log_client(const char* why)
++{
++    RECT rc = {0, 0, 0, 0};
++    rsx_dm_rect r;
++    if (s_state.hwnd) GetClientRect(s_state.hwnd, &rc);
++    r = rsx_dm_rect_for((int)s_state.width, (int)s_state.height, rc.right, rc.bottom, s_dm_scaling, s_dm_filter);
++    printf("[display] %s: mode %s (chosen %s), scaling %s, filter %s, client %ldx%ld, image %dx%d at %d,%d\n", why,
++           rsx_dm_name(s_dm_applied), rsx_dm_name(s_dm.mode), rsx_dm_scaling_name(s_dm_scaling),
++           rsx_dm_filter_name(s_dm_filter), (long)rc.right, (long)rc.bottom, r.w, r.h, r.x, r.y);
++    fflush(stdout);
++}
++
++static void rsx_dm_apply(int m, const char* why)
++{
++    HWND h = s_state.hwnd;
++    if (!h) return;
++    if (s_dm_applied == RSX_DM_FULLSCREEN && m != RSX_DM_FULLSCREEN) rsx_live_draw_set_fullscreen(0);
++    if (m == RSX_DM_WINDOWED) {
++        s_dm_pending = -1;
++        if (s_dm_saved) {
++            SetWindowLongPtrA(h, GWL_STYLE, s_dm_style);
++            SetWindowLongPtrA(h, GWL_EXSTYLE, s_dm_exstyle);
++            SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
++                         SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
++            SetWindowPlacement(h, &s_dm_wp);
++            s_dm_saved = 0;
++        }
++    } else {
++        HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
++        MONITORINFO mi;
++        mi.cbSize = sizeof mi;
++        if (s_dm_applied == RSX_DM_WINDOWED && !s_dm_saved) {
++            s_dm_wp.length = sizeof s_dm_wp;
++            GetWindowPlacement(h, &s_dm_wp);
++            s_dm_style = GetWindowLongPtrA(h, GWL_STYLE);
++            s_dm_exstyle = GetWindowLongPtrA(h, GWL_EXSTYLE);
++            s_dm_saved = 1;
++        }
++        if (mon && GetMonitorInfoA(mon, &mi)) {
++            SetWindowLongPtrA(h, GWL_STYLE,
++                              (s_dm_style & ~(LONG_PTR)(WS_OVERLAPPEDWINDOW | WS_MAXIMIZE | WS_MINIMIZE)) | WS_POPUP |
++                                  WS_VISIBLE);
++            SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
++                         mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
++        }
++        if (m == RSX_DM_FULLSCREEN) {
++            const int r = rsx_live_draw_set_fullscreen(1);
++            if (r < 0 && s_present_suppressed) {           /* live draw not up yet: retry at the next pump */
++                s_dm_pending = RSX_DM_FULLSCREEN;
++                s_dm_applied = RSX_DM_BORDERLESS;
++                rsx_dm_log_client("exclusive fullscreen waits for the swap chain");
++                return;
++            }
++            s_dm_pending = -1;
++            if (r <= 0) {
++                m = rsx_dm_exclusive_refused(&s_dm);
++                printf("[display] exclusive fullscreen refused (%s): borderless for this session\n",
++                       r < 0 ? "no live-draw swap chain" : "SetFullscreenState failed");
++            }
++        }
++    }
++    s_dm_applied = m;
++    rsx_dm_log_client(why);
++}
++
++static void rsx_dm_choose(int m, const char* why)    /* a player's choice: apply, then save */
++{
++    rsx_dm_apply(rsx_dm_set(&s_dm, m), why);
++    rsx_dm_save_now();
++}
++
++/* From any thread (the Options row's Lua bridge): the change itself happens on the window's thread. */
++int rsx_display_set_mode(int m)
++{
++    if (m < RSX_DM_WINDOWED || m > RSX_DM_FULLSCREEN || !s_state.hwnd) return 0;
++    return PostMessageA(s_state.hwnd, RSX_DM_WM_SET, (WPARAM)m, 0) ? 1 : 0;
++}
++
++/* Image scaling / filter (-1 = unchanged), from any thread; applied on the window's thread and saved. */
++int rsx_display_set_scaling(int scaling, int filter)
++{
++    if (!s_state.hwnd) return 0;
++    return PostMessageA(s_state.hwnd, RSX_DM_WM_SCALE, (WPARAM)(scaling + 1), (LPARAM)(filter + 1)) ? 1 : 0;
++}
++
++/* A client pixel -> the guest pixel under it, through the letterbox (1 inside the image, 0 on a bar). For the port's
++ * own mouse-driven UI; the game itself reads no cursor position. */
++int rsx_display_client_to_guest(int cx, int cy, int* gx, int* gy)
++{
++    RECT rc = {0, 0, 0, 0};
++    rsx_dm_rect r;
++    if (s_state.hwnd) GetClientRect(s_state.hwnd, &rc);
++    r = rsx_dm_rect_for((int)s_state.width, (int)s_state.height, rc.right, rc.bottom, s_dm_scaling, s_dm_filter);
++    return rsx_dm_to_guest(&r, (int)s_state.width, (int)s_state.height, cx, cy, gx, gy);
++}
++
++static int rsx_dm_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
++{
++    (void)hwnd;
++    if (msg == WM_SYSKEYDOWN && wp == VK_RETURN && (lp & (1 << 29))) {   /* Alt+Enter */
++        if (!(lp & (1 << 30))) {                                             /* not an auto-repeat */
++            rsx_dm_apply(rsx_dm_toggle(&s_dm), "Alt+Enter");
++            rsx_dm_save_now();
++        }
++        *res = 0;
++        return 1;
++    }
++    if (msg == WM_SYSCHAR && wp == '\r') { *res = 0; return 1; }   /* no beep for Alt+Enter */
++    if (msg == RSX_DM_WM_SET) { rsx_dm_choose((int)wp, "Options"); *res = 0; return 1; }
++    if (msg == RSX_DM_WM_SCALE) {
++        const int sc = (int)wp - 1, f = (int)lp - 1;
++        if (sc == RSX_DM_FIT || sc == RSX_DM_STRETCH) s_dm_scaling = sc;
++        if (f == RSX_DM_BILINEAR || f == RSX_DM_NEAREST) s_dm_filter = f;
++        rsx_live_draw_set_scaling(s_dm_scaling, s_dm_filter);
++        rsx_dm_log_client("Options scaling");
++        rsx_dm_save_now();
++        *res = 0;
++        return 1;
++    }
++    if (msg == WM_ACTIVATEAPP && wp && s_dm_applied == RSX_DM_FULLSCREEN && !rsx_live_draw_is_fullscreen()) {
++        if (rsx_live_draw_set_fullscreen(1) > 0) rsx_dm_log_client("exclusive fullscreen taken back on activation");
++    }
++    return 0;
++}
++
++/* KZ3_TEST_DISPLAY="S:action,S:action,...": at S seconds after the window opened, `altenter` (a WM_SYSKEYDOWN
++ * VK_RETURN with the Alt bit, posted, so the window procedure's own path runs), `windowed|borderless|fullscreen` (as
++ * the Options row), `fit|stretch`, `bilinear|nearest`, `resize=WxH` (client size, windowed), `log`. */
++static void rsx_dm_script_step(void)
++{
++    double t;
++    if (!s_dm_script || !*s_dm_script || !s_state.hwnd) return;
++    t = (double)(GetTickCount64() - s_dm_t0) / 1000.0;
++    while (*s_dm_script) {
++        char* e;
++        double at = strtod(s_dm_script, &e);
++        char act[48];
++        size_t n = 0;
++        if (e == s_dm_script || *e != ':') { s_dm_script = ""; return; }
++        if (t < at) return;
++        e++;
++        while (e[n] && e[n] != ',' && n < sizeof act - 1) { act[n] = e[n]; n++; }
++        act[n] = 0;
++        s_dm_script = e[n] == ',' ? e + n + 1 : e + n;
++        printf("[display] test step at %.1f s: %s\n", t, act);
++        if (!strcmp(act, "altenter")) PostMessageA(s_state.hwnd, WM_SYSKEYDOWN, VK_RETURN, (LPARAM)((1u << 29) | 1u));
++        else if (!strncmp(act, "resize=", 7)) {
++            int w = 0, h = 0;
++            if (rsx_win_parse_size(act + 7, &w, &h) && s_dm_applied == RSX_DM_WINDOWED) {
++                RECT wr = {0, 0, w, h};
++                AdjustWindowRect(&wr, (DWORD)GetWindowLongPtrA(s_state.hwnd, GWL_STYLE), FALSE);
++                SetWindowPos(s_state.hwnd, NULL, 0, 0, wr.right - wr.left, wr.bottom - wr.top,
++                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
++                rsx_dm_log_client("test resize");
++            }
++        } else if (!strcmp(act, "log")) rsx_dm_log_client("test log");
++        else if (rsx_dm_parse(act) >= 0) rsx_display_set_mode(rsx_dm_parse(act));
++        else if (rsx_dm_parse_scaling(act) >= 0) rsx_display_set_scaling(rsx_dm_parse_scaling(act), -1);
++        else if (rsx_dm_parse_filter(act) >= 0) rsx_display_set_scaling(-1, rsx_dm_parse_filter(act));
++        fflush(stdout);
++    }
++}
++
++static void rsx_dm_init_window(void)
++{
++    const char* e = getenv("KZ3_DISPLAY");
++    int m = e && *e ? rsx_dm_parse(e) : -1;
++    const char* src = "default";
++    if (e && *e && m < 0) printf("[display] KZ3_DISPLAY=%s not understood (windowed|borderless|fullscreen)\n", e);
++    if (m >= 0) { s_dm_env = 1; src = "KZ3_DISPLAY"; }
++    else if (s_dm_cfg >= 0) { m = s_dm_cfg; src = "display.ini"; }
++    else m = RSX_DM_WINDOWED;
++    rsx_dm_init(&s_dm, m);
++    {   /* scaling and filter: env (tests, never saved), else display.ini, else Stretch / Bilinear */
++        const char* es = getenv("KZ3_DISPLAY_SCALING");
++        const char* ef = getenv("KZ3_DISPLAY_FILTER");
++        const int vs = es && *es ? rsx_dm_parse_scaling(es) : -1, vf = ef && *ef ? rsx_dm_parse_filter(ef) : -1;
++        if (es && *es && vs < 0) printf("[display] KZ3_DISPLAY_SCALING=%s not understood (fit|stretch)\n", es);
++        if (ef && *ef && vf < 0) printf("[display] KZ3_DISPLAY_FILTER=%s not understood (bilinear|nearest)\n", ef);
++        if (vs >= 0 || vf >= 0) s_dm_env = 1;
++        s_dm_scaling = vs >= 0 ? vs : s_dm_cfg_scaling >= 0 ? s_dm_cfg_scaling : RSX_DM_SCALING_DEFAULT;
++        s_dm_filter = vf >= 0 ? vf : s_dm_cfg_filter >= 0 ? s_dm_cfg_filter : RSX_DM_BILINEAR;
++    }
++    rsx_live_draw_set_scaling(s_dm_scaling, s_dm_filter);
++    s_dm_t0 = GetTickCount64();
++    s_dm_script = getenv("KZ3_TEST_DISPLAY");
++    printf("[display] mode %s from %s (Alt+Enter toggles windowed / %s), scaling %s, filter %s%s\n", rsx_dm_name(m), src,
++           rsx_dm_name(s_dm.last_fs), rsx_dm_scaling_name(s_dm_scaling), rsx_dm_filter_name(s_dm_filter),
++           s_dm_env ? " (KZ3_DISPLAY*: not saved)" : "");
++    if (m == RSX_DM_FULLSCREEN) {          /* the swap chain does not exist yet: borderless now, exclusive at the */
++        rsx_dm_apply(RSX_DM_BORDERLESS, "start");   /* first pump (live draw is up by then) */
++        s_dm_pending = RSX_DM_FULLSCREEN;
++    } else if (m != RSX_DM_WINDOWED) rsx_dm_apply(m, "start");
++    fflush(stdout);
++}
++
+ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     LRESULT sized;
+     if (pad_mouse_wndmsg(hwnd, msg, wp, lp, &sized)) return sized;
+-    if (rsx_win_size_msg(hwnd, msg, wp, lp, &sized)) return sized;
++    if (rsx_dm_wndmsg(hwnd, msg, wp, lp, &sized)) return sized;   /* patch 2095 */
++    /* patch 2062's aspect-keeping drag and maximize: windowed only (patch 2095) */
++    if (s_dm_applied == RSX_DM_WINDOWED && rsx_win_size_msg(hwnd, msg, wp, lp, &sized)) return sized;
+     switch (msg) {
+     case WM_CLOSE:
+         s_state.window_closed = 1;
+@@ -286,6 +526,7 @@
+     rsx_set_backend(&s_null_backend);
+ 
+     printf("[RSX null] Window created: %ux%u (client %dx%d)\n", width, height, cw, ch);
++    rsx_dm_init_window();   /* patch 2095: borderless now, exclusive once the swap chain exists */
+     return 0;
+ }
+ 
+@@ -304,6 +545,8 @@
+ int rsx_null_backend_pump_messages(void)
+ {
+     MSG msg;
++    if (s_dm_pending == RSX_DM_FULLSCREEN) rsx_dm_apply(RSX_DM_FULLSCREEN, "start");   /* patch 2095 */
++    rsx_dm_script_step();
+     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+         if (msg.message == WM_QUIT)
+             return -1;

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Killzone 3",
+  "wikidata": "Q528128",
+  "system": "PS3",
+  "type": "recomp",
+  "original": {
+    "region": "US",
+    "serial": "BCUS98234",
+    "revision": "1.14 (update)"
+  },
+  "project": "Project Helghast",
+  "status": "in-progress",
+  "targets": ["PC (Windows)"],
+  "toolchain": ["ps3recomp"],
+  "approach": "Static recompilation of the PPU and SPU code to C with ps3recomp, HLE system libraries, Direct3D 12 RSX backend",
+  "maintainers": [{"name": "undecuple", "link": "https://github.com/undecuple"}],
+  "links": [
+    {"label": "Site", "url": "https://undecuple.github.io/project-helghast"},
+    {"label": "Features", "url": "https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md"},
+    {"label": "Requirements", "url": "https://github.com/undecuple/project-helghast/blob/main/docs/requirements.md"},
+    {"label": "Building", "url": "https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md"},
+    {"label": "Release criteria", "url": "https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md"}
+  ],
+  "help": ["Testing on real Windows with NVIDIA GPUs", "RSX/graphics performance"],
+  "tags": ["cell", "spurs", "d3d12"],
+  "notes": "Needs your own copy of the game (disc dump, the 1.14 update and its decrypted EBOOT); the build happens on your PC."
+}

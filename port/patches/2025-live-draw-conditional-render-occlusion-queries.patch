@@ -1,0 +1,309 @@
+live-draw: conditional rendering (NV4097 SET_RENDER_ENABLE mode 2) through D3D12 occlusion queries and predication.
+
+KZ3's level frame tests one proxy per light / shadow cascade (CLEAR_REPORT_VALUE 1, one colour-masked draw,
+GET_REPORT type 1 at offset X) and draws the shadow map and the light with SET_RENDER_ENABLE (2 << 24) | X: the RSX
+skips them when the ZPASS count is 0 (395 draws per level frame in the RPCS3 captures). Before, all of them ran.
+
+1. rsx_dispatch: a new sink callback `report` gets CLEAR_REPORT_VALUE (0x17C8), SET_ZPASS_PIXEL_COUNT_ENABLE
+   (0x17CC) and GET_REPORT (0x1800) in FIFO order.
+2. live-draw: the ZPASS counter becomes D3D12 occlusion queries (heap of 8192). A segment (one query) opens at the
+   first draw while ZPASS counting is on and closes at CLEAR_REPORT_VALUE, GET_REPORT, ZPASS off or a command-list
+   flush. GET_REPORT X marks slot X: NEVER (no draw since the clear, count 0: skip on the CPU), PENDING (one
+   segment: resolved into a 1024-slot predication buffer at the first draw that needs it) or ALWAYS (several
+   segments or another report type: draw unconditionally, the conservative answer). Predicated draws run under
+   SetPredication(buffer, slot, EQUAL_ZERO), cleared right after the draw, so host passes are never predicated.
+3. The CPU-visible report value in guest memory is unchanged (cellGcmSys still writes "visible").
+4. LD_COND_RENDER=0 turns it off. Log: "[cond-render] on", and every 256 flips (cellGcmSys.c gcm_flip_request) the counters (predicated, skipped,
+   unconditional, resolves, reports, segments); rsx_live_draw_debug_cond_render_stats() for tests.
+
+Host test tools/smoke/test_cond_render.c (PASS; LD_COND_RENDER=0 FAIL).
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream immediate_vertex sink member added next to ours (PR292), both kept.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -3009,6 +3009,16 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+               fprintf(stderr, "[flip] %llu at %llu ms%c", n, now - t0, 10);
+       } }
+ 
++    { /* KZ3 patch 2025: conditional-render counters every 256 flips (only once live-draw has seen a report). */
++      static unsigned long long nf = 0;
++      if ((++nf & 255ull) == 0) {
++          extern void rsx_live_draw_debug_cond_render_stats(u64 out[6]);
++          u64 st[6]; rsx_live_draw_debug_cond_render_stats(st);
++          if (st[4]) fprintf(stderr, "[cond-render] flips=%llu predicated=%llu skipped=%llu unconditional=%llu "
++                             "resolves=%llu reports=%llu segments=%llu\n", nf, (unsigned long long)st[0],
++                             (unsigned long long)st[1], (unsigned long long)st[2], (unsigned long long)st[3],
++                             (unsigned long long)st[4], (unsigned long long)st[5]);
++      } }
+     { extern void kz3_wacct_flip(void); kz3_wacct_flip(); }   /* KZ3 patch 1032: flips per accounting window */
+     /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips
+      * around n. When a title renders correctly for a while and then stops
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -366,6 +366,12 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
+         return;
+     }
+ 
++    /* KZ3 patch 2025: occlusion reports for conditional rendering. */
++    if ((method == 0x17C8 || method == 0x17CC || method == 0x1800) && rsx->sink.report) {
++        rsx->sink.report(rsx->sink.user, rsx, method, arg);
++        return;
++    }
++
+     switch (method) {
+     case M_CLEAR_BUFFERS:
+         if (rsx->sink.clear)
+diff --git a/libs/video/rsx_dispatch.h b/libs/video/rsx_dispatch.h
+--- a/libs/video/rsx_dispatch.h
++++ b/libs/video/rsx_dispatch.h
+@@ -111,6 +111,10 @@ typedef struct rsx_dispatch_sink {
+      * Snapshot the current attributes now; later register writes replace them.
+      * Array formats, offsets and frequencies do not describe this stream. */
+     void (*immediate_vertex)(void* user, const rsx_dispatch* rsx);
++    /* KZ3 patch 2025: report methods in FIFO order (CLEAR_REPORT_VALUE 0x17C8,
++     * SET_ZPASS_PIXEL_COUNT_ENABLE 0x17CC, GET_REPORT 0x1800), after the
++     * register file holds the new value. Used for conditional rendering. */
++    void (*report)(void* user, const rsx_dispatch* rsx, u32 method, u32 arg);
+ } rsx_dispatch_sink;
+ 
+ struct rsx_dispatch {
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -47,6 +47,7 @@ int  rsx_live_draw_host_aa_mode(void) { return 0; }
+ void rsx_live_draw_host_aa_arm(int on) { (void)on; }
+ int  rsx_live_draw_host_aa_active(void) { return 0; }
+ u32  rsx_live_draw_debug_host_aa_passes(void) { return 0; }
++void rsx_live_draw_debug_cond_render_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] = 0; }
+ void rsx_live_draw_note_guest_write_async(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ u32  rsx_live_draw_before_guest_sync(void) { return 0; }
+@@ -2140,6 +2141,7 @@ static void ld_wait_idle(void)
+     if (g.ready && g.fif_n > 1) ld_wait_fence(g.fence_value);
+ }
+ 
++static void ld_oq_close(void);   /* patch 2025 */
+ static void ld_flush_body(ld_flush_reason reason)
+ {
+ #if defined(YZ_PERF_PROFILE)
+@@ -2149,6 +2151,7 @@ static void ld_flush_body(ld_flush_reason reason)
+ #else
+     (void)reason;
+ #endif
++    ld_oq_close();   /* patch 2025: a query must end in the list it began in */
+     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+     if (FAILED(close_hr)) {
+         fprintf(stderr,
+@@ -8332,6 +8335,168 @@ static void ld_zp_finish(u32 current_zslot, const render_state_t* rs)
+     }
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 2025: conditional rendering (NV4097 SET_RENDER_ENABLE mode 2).
++ *
++ * KZ3's level frame tests a proxy per light / shadow cascade (CLEAR_REPORT_VALUE
++ * ZPASS, one colour-masked draw, GET_REPORT type 1 at offset X) and then draws
++ * the light's shadow map and the light itself with SET_RENDER_ENABLE = (2 << 24) | X:
++ * the RSX skips those draws when the ZPASS count at X is 0 (395 draws per frame in
++ * the RPCS3 level captures). Before this patch every one of them ran.
++ *
++ * Host side: the ZPASS counter becomes D3D12 occlusion queries. A "segment" is one
++ * query, opened at the first draw while ZPASS counting is on and closed at
++ * CLEAR_REPORT_VALUE, GET_REPORT, ZPASS off or a command-list flush. GET_REPORT X
++ * then gives slot X one of: NEVER (no draw since the clear: count 0, skip on the
++ * CPU), PENDING (exactly one segment: its query is resolved into the predication
++ * buffer at the first draw that needs it) or ALWAYS (several segments or another
++ * report type: unknown sum, draw unconditionally -- the conservative answer).
++ * A predicated draw runs under SetPredication(buffer, X, EQUAL_ZERO).
++ * The CPU-visible report value in guest memory is unchanged (cellGcmSys writes
++ * "visible"). LD_COND_RENDER=0 turns the whole path off (old behaviour).
++ * ------------------------------------------------------------------------- */
++#define LD_OQ_N     8192u
++#define LD_OQ_SLOTS 1024u
++enum { OQ_FREE = 0, OQ_ALWAYS, OQ_NEVER, OQ_PENDING, OQ_RESOLVED };
++static struct {
++    int on;                       /* -1 = not decided yet */
++    ID3D12QueryHeap* heap;
++    ID3D12Resource* pred;         /* LD_OQ_SLOTS x u64 */
++    int pred_copy_dest;           /* current state: 1 COPY_DEST, 0 PREDICATION */
++    u64 serial;                   /* queries handed out */
++    int open;                     /* a query is open in the current list */
++    u64 open_serial;
++    u32 segs;                     /* segments since CLEAR_REPORT_VALUE(ZPASS) */
++    u64 last_serial;              /* the newest closed segment */
++    struct { u32 off; u8 used, state; u64 serial; } slot[LD_OQ_SLOTS];
++    u64 n_pred, n_skip, n_always, n_resolve, n_reports, n_segments;
++} g_oq = { .on = -1 };
++
++static int ld_oq_enabled(void)
++{
++    if (g_oq.on >= 0) return g_oq.on;
++    const char* e = getenv("LD_COND_RENDER");
++    g_oq.on = !(e && e[0] == '0');
++    if (!g_oq.on) { fprintf(stderr, "[cond-render] off (LD_COND_RENDER=0)\n"); return 0; }
++    D3D12_QUERY_HEAP_DESC qd = {0};
++    qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION; qd.Count = LD_OQ_N;
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)LD_OQ_SLOTS * 8u;
++    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
++    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    if (FAILED(g.dev->lpVtbl->CreateQueryHeap(g.dev, &qd, &IID_ID3D12QueryHeap, (void**)&g_oq.heap)) ||
++        FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&g_oq.pred))) {
++        fprintf(stderr, "[cond-render] query heap / predication buffer failed: off\n");
++        g_oq.on = 0; return 0;
++    }
++    g_oq.pred_copy_dest = 1;
++    fprintf(stderr, "[cond-render] on: %u occlusion queries, %u report slots\n", LD_OQ_N, LD_OQ_SLOTS);
++    return 1;
++}
++
++static int ld_oq_slot(u32 off, int create)
++{
++    u32 h = (off * 2654435761u) >> 22;   /* 10 bits = LD_OQ_SLOTS */
++    for (u32 i = 0; i < LD_OQ_SLOTS; i++, h = (h + 1) & (LD_OQ_SLOTS - 1)) {
++        if (g_oq.slot[h].used && g_oq.slot[h].off == off) return (int)h;
++        if (!g_oq.slot[h].used) {
++            if (!create) return -1;
++            g_oq.slot[h].used = 1; g_oq.slot[h].off = off; g_oq.slot[h].state = OQ_FREE;
++            return (int)h;
++        }
++    }
++    return -1;
++}
++
++static void ld_oq_close(void)
++{
++    if (!g_oq.open) return;
++    g.list->lpVtbl->EndQuery(g.list, g_oq.heap, D3D12_QUERY_TYPE_OCCLUSION,
++                             (UINT)(g_oq.open_serial % LD_OQ_N));
++    g_oq.last_serial = g_oq.open_serial;
++    g_oq.open = 0;
++}
++
++static void ld_oq_pred_state(int copy_dest)
++{
++    if (g_oq.pred_copy_dest == copy_dest) return;
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition.pResource = g_oq.pred;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.StateBefore = copy_dest ? D3D12_RESOURCE_STATE_PREDICATION : D3D12_RESOURCE_STATE_COPY_DEST;
++    b.Transition.StateAfter  = copy_dest ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_PREDICATION;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    g_oq.pred_copy_dest = copy_dest;
++}
++
++/* Sink: report methods in FIFO order. */
++static void sink_report(void* user, const rsx_dispatch* r, u32 method, u32 arg)
++{
++    (void)user; (void)r;
++    if (!g.ready || !ld_oq_enabled()) return;
++    if (method == 0x17CC) { if (!arg) ld_oq_close(); return; }        /* ZPASS count off */
++    if (method == 0x17C8) { if (arg == 1) { ld_oq_close(); g_oq.segs = 0; } return; }
++    /* 0x1800 GET_REPORT: (type << 24) | offset */
++    ld_oq_close();
++    g_oq.n_reports++;
++    const int i = ld_oq_slot(arg & 0xFFFFFFu, 1);
++    if (i < 0) return;
++    if ((arg >> 24) != 1u || g_oq.segs > 1) g_oq.slot[i].state = OQ_ALWAYS;
++    else if (g_oq.segs == 0) g_oq.slot[i].state = OQ_NEVER;
++    else { g_oq.slot[i].state = OQ_PENDING; g_oq.slot[i].serial = g_oq.last_serial; }
++}
++
++/* Before a draw: 0 = draw, 1 = draw under predication (clear it after), -1 = skip. */
++static int ld_oq_before_draw(void)
++{
++    if (!ld_oq_enabled()) return 0;
++    int ret = 0;
++    const u32 re = g.rsx.regs[0x1E98u >> 2];
++    if ((re >> 24) == 2u) {
++        const int i = ld_oq_slot(re & 0xFFFFFFu, 0);
++        u8 st = i < 0 ? OQ_ALWAYS : g_oq.slot[i].state;
++        if (st == OQ_PENDING) {
++            if (g_oq.slot[i].serial + LD_OQ_N <= g_oq.serial) st = OQ_ALWAYS;   /* query index reused */
++            else {
++                ld_oq_pred_state(1);
++                g.list->lpVtbl->ResolveQueryData(g.list, g_oq.heap, D3D12_QUERY_TYPE_OCCLUSION,
++                    (UINT)(g_oq.slot[i].serial % LD_OQ_N), 1, g_oq.pred, (UINT64)i * 8u);
++                g_oq.n_resolve++;
++                st = OQ_RESOLVED;
++            }
++            g_oq.slot[i].state = st;
++        }
++        if (st == OQ_NEVER) { g_oq.n_skip++; return -1; }
++        if (st == OQ_RESOLVED) {
++            ld_oq_pred_state(0);
++            g.list->lpVtbl->SetPredication(g.list, g_oq.pred, (UINT64)i * 8u, D3D12_PREDICATION_OP_EQUAL_ZERO);
++            g_oq.n_pred++; ret = 1;
++        } else g_oq.n_always++;
++    }
++    if (g.rsx.regs[0x17CCu >> 2] && !g_oq.open) {
++        g.list->lpVtbl->BeginQuery(g.list, g_oq.heap, D3D12_QUERY_TYPE_OCCLUSION,
++                                   (UINT)(g_oq.serial % LD_OQ_N));
++        g_oq.open = 1; g_oq.open_serial = g_oq.serial++; g_oq.segs++; g_oq.n_segments++;
++    }
++    return ret;
++}
++
++static void ld_oq_after_draw(int pred)
++{
++    if (pred == 1)
++        g.list->lpVtbl->SetPredication(g.list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
++}
++
++void rsx_live_draw_debug_cond_render_stats(u64 out[6])
++{
++    out[0] = g_oq.n_pred; out[1] = g_oq.n_skip; out[2] = g_oq.n_always;
++    out[3] = g_oq.n_resolve; out[4] = g_oq.n_reports; out[5] = g_oq.n_segments;
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -9175,7 +9340,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         ld_gc_bind(g_zd_dir != NULL, indexed ? dc.n_verts : n_tri, n_tri,
+                    indexed ? (const u32*)((u8*)g.ib_mapped + g.ib_used) : NULL,
+                    target, current_zslot, &sf, prim, indexed);
+-    if (indexed) {
++    const int oq_pred = ld_oq_before_draw();   /* patch 2025 */
++    if (oq_pred < 0) {
++        /* conditional render: the report says 0 samples, the RSX skips the draw */
++    } else if (indexed) {
+         D3D12_INDEX_BUFFER_VIEW ibv;
+         ibv.BufferLocation =
+             g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
+@@ -9187,6 +9355,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     } else {
+         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
+     }
++    ld_oq_after_draw(oq_pred);
+     ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
+     for (u32 r = 1; r < n_mrt; r++)
+         ld_surface_note_write(mrt[r], LD_SURFACE_WRITE_DRAW);
+@@ -9944,6 +10113,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     sink.inline_array = sink_inline_array;
+     sink.draw_index_array = sink_draw_index;
+     sink.flip = sink_flip;
++    sink.report = sink_report;   /* patch 2025 */
+     rsx_dispatch_init(&g.rsx, &sink);
+ 
+     g.ready = 1;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -123,6 +123,9 @@ int  rsx_live_draw_host_aa_mode(void);
+ void rsx_live_draw_host_aa_arm(int on);
+ int  rsx_live_draw_host_aa_active(void);
+ u32  rsx_live_draw_debug_host_aa_passes(void);
++/* patch 2025: conditional render counters: predicated draws, draws skipped on the CPU (count 0), mode-2 draws
++ * left unconditional (unknown report), query resolves, GET_REPORTs, query segments. */
++void rsx_live_draw_debug_cond_render_stats(u64 out[6]);
+ /* 1:1 NV3089 blit whose source is a live GPU surface: copy it on the GPU.
+  * Addresses are location-relative byte offsets of the rect's top-left.
+  * Returns 1 when handled (the guest-memory copy still runs regardless). */

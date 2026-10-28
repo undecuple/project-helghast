@@ -1,0 +1,367 @@
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ours + `ps3_thread_name("lv2 timer")`.
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 8773e11d..45c0a99b 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -451,6 +451,24 @@ static unsigned s_kz3_blocks, s_kz3_holes_tot, s_kz3_holes_port[CELL_AUDIO_PORT_
+                 s_kz3_fill_max;
+ static int s_kz3_hole_blk[CELL_AUDIO_PORT_MAX] = {-1, -1, -1, -1, -1, -1, -1, -1};
+ static long long s_kz3_late_ms;
++/* KZ3 patch 1054 (SPU pass 37): QPC of the last producer write per ring slot of port 0 (the brbDriver ring), filled
++ * by the port's KZ3_AUDIO_TICK=1 probe (port/spu/kz3_audio_probe.c, 0 = unknown). At a hole the mixer logs the slot's
++ * age: < one ring (8 blocks = 42.7 ms) = written after the previous read but silent, otherwise the producer had not
++ * written it since its previous read (late by the age minus one ring). */
++volatile long long g_kz3_audio_slot_wqpc[32];
++static unsigned s_kz3_age_hist[5];   /* <1 ring, 1-1.5, 1.5-2, 2-4 rings, >= 4 rings or never */
++static unsigned kz3_hole_age_ms(int p, u32 blk, u32 nblock, int count)
++{
++    if (p != 0 || blk >= 32) return 0xFFFFFFFFu;
++    long long w = g_kz3_audio_slot_wqpc[blk];
++    LARGE_INTEGER n, f; QueryPerformanceCounter(&n); QueryPerformanceFrequency(&f);
++    unsigned ms = w ? (unsigned)((n.QuadPart - w) * 1000 / f.QuadPart) : 0xFFFFFFFFu;
++    if (count) {
++        const unsigned ring = nblock * 16u / 3u;   /* nblock x 5.333 ms */
++        s_kz3_age_hist[ms < ring ? 0 : ms < ring * 3 / 2 ? 1 : ms < ring * 2 ? 2 : ms < ring * 4 ? 3 : 4]++;
++    }
++    return ms;
++}
+ static int s_kz3_adiag_on(void) { if (s_kz3_adiag < 0) s_kz3_adiag = getenv("KZ3_AUDIO_DIAG") ? 1 : 0; return s_kz3_adiag; }
+ 
+ /* Mix one block from all active ports into s_mix_buffer (stereo float) */
+@@ -570,6 +588,8 @@ static void audio_mix_one_block(void)
+             /* a hole only inside non-silent audio: the port produced data within the last two ring lengths */
+             else if (s_kz3_last_nz[p] && s_kz3_blocks - s_kz3_last_nz[p] <= 2 * nblock) {
+                 s_kz3_holes_tot++; s_kz3_holes_int++; s_kz3_holes_port[p]++;
++                { static int s_tick = -1; if (s_tick < 0) s_tick = getenv("KZ3_AUDIO_TICK") ? 1 : 0;
++                  if (s_tick) (void)kz3_hole_age_ms(p, block_idx, nblock, 1); }   /* KZ3 patch 1054 */
+                 if (s_kz3_hole_blk[p] < 0) { s_kz3_hole_blk[p] = (int)block_idx; s_kz3_hole_at[p] = s_kz3_blocks; }
+                 if (s_kz3_hole_lines < 24 || (s_kz3_holes_tot % 64) == 0) {
+                     char map[36], runs[200]; int ahead = 0, contiguous = 1; u32 b;
+@@ -587,9 +607,10 @@ static void audio_mix_one_block(void)
+                         else contiguous = 0;
+                     }
+                     runs[0] = 0; kz3_spurs_runs_brief(runs, sizeof runs);
+-                    fprintf(stderr, "[audio-hole] t=%.3f port=%d ridx=%llu blk=%u nblk=%u nch=%u ahead=%d ring=[%s] spurs: %s\n",
++                    fprintf(stderr, "[audio-hole] t=%.3f port=%d ridx=%llu blk=%u nblk=%u nch=%u ahead=%d ring=[%s] age_ms=%d spurs: %s\n",
+                             (double)s_kz3_blocks * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE, p,
+-                            (unsigned long long)port->read_index, block_idx, nblock, nch, ahead, map, runs);
++                            (unsigned long long)port->read_index, block_idx, nblock, nch, ahead, map,
++                            (int)kz3_hole_age_ms(p, block_idx, nblock, 0), runs);
+                 }
+             }
+         }
+@@ -624,6 +645,10 @@ static void audio_mix_one_block(void)
+                 s_kz3_holes_tot, o ? per + 1 : "none", s_kz3_pclip_int, s_kz3_mclip_int, s_kz3_lock_max_us,
+                 s_kz3_late_drops, s_kz3_late_ms, s_kz3_fill_hist[0], s_kz3_fill_hist[1], s_kz3_fill_hist[2],
+                 s_kz3_fill_hist[3], s_kz3_fill_hist[4], s_kz3_fill_hist[5], s_kz3_fill_max);
++        if (g_kz3_audio_slot_wqpc[0] || g_kz3_audio_slot_wqpc[1])   /* KZ3 patch 1054: hole slot age, port 0 */
++            fprintf(stderr, "[audio-age] t=%.1f hole slot age (rings of 42.7 ms): <1=%u 1-1.5=%u 1.5-2=%u 2-4=%u >=4=%u\n",
++                    (double)s_kz3_blocks * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE, s_kz3_age_hist[0],
++                    s_kz3_age_hist[1], s_kz3_age_hist[2], s_kz3_age_hist[3], s_kz3_age_hist[4]);
+         s_kz3_holes_int = s_kz3_pclip_int = s_kz3_mclip_int = s_kz3_lock_max_us = 0;
+     }
+ }
+diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
+index 3a022815..889e8444 100644
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -417,11 +417,40 @@ static uint64_t timer_now_us(void)
+ }
+ 
+ #ifdef _WIN32
+-static DWORD WINAPI timer_thread_proc(LPVOID param)
++/* KZ3 patch 1054 (SPU pass 37; the RE notes 4.3): absolute-deadline periodic timer.
++ *
++ * The old loop waited WaitForSingleObject(stop, period_usec / 1000) after each send: the period was truncated to
++ * whole ms (5333 us -> 5 ms), measured from the end of the previous send, so wake latency added to every period and
++ * was never recovered. KZ3's audio producer (brbDriver, a 5333 us lv2 timer) is paced by it. Now:
++ *  - deadlines are absolute on QPC at the true period (sys_timer_sched.h: deadline(n) = start + n * period);
++ *  - the wait is a high-resolution waitable timer (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, a plain waitable timer
++ *    where that flag is refused) armed for deadline - KZ3_TIMER_TAIL_US (default 300 us), then a QPC spin with
++ *    SwitchToThread for the tail;
++ *  - catch-up: up to KZ3_TIMER_CATCHUP (default 2) missed deadlines are fired back to back, a later wake skips the
++ *    missed ones and keeps the phase (sys_timer_sched.h);
++ *  - the thread runs at THREAD_PRIORITY_TIME_CRITICAL (set in sys_timer_start): it does ~1 queue push per period and
++ *    a <= tail spin, never guest work, so it cannot starve anything, and its wake latency IS the tick jitter;
++ *  - KZ3_TIMER_STATS=1: [lv2-timer] every 10 s per running timer: ticks, lateness histogram (deadline -> push),
++ *    max, skipped deadlines, queue-full drops.
++ * KZ3_TIMER_OLD=1 restores the old relative-ms loop and NORMAL priority (A/B). */
++#include "sys_timer_sched.h"
++
++volatile long g_sys_timer_dropped;
++
++static int timer_env_int(const char* name, int def)
+ {
+-    sys_timer_info* t = (sys_timer_info*)param;
+-    ps3_thread_name("lv2 timer");
++    const char* e = getenv(name);
++    return (e && *e) ? atoi(e) : def;
++}
++static int timer_old_path(void)
++{
++    static int v = -1;
++    if (v < 0) v = timer_env_int("KZ3_TIMER_OLD", 0) ? 1 : 0;
++    return v;
++}
+ 
++static DWORD timer_thread_proc_old(sys_timer_info* t)
++{
+     while (t->running) {
+         DWORD ms = (DWORD)(t->period_usec / 1000);
+         if (ms == 0) ms = 1;
+@@ -438,6 +467,95 @@ static DWORD WINAPI timer_thread_proc(LPVOID param)
+ 
+     return 0;
+ }
++
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++
++static DWORD WINAPI timer_thread_proc(LPVOID param)
++{
++    sys_timer_info* t = (sys_timer_info*)param;
++    ps3_thread_name("lv2 timer");
++    if (timer_old_path()) return timer_thread_proc_old(t);
++
++    ensure_qpc_init();
++    const int64_t freq = s_qpc_freq.QuadPart;
++    const int tail_us = timer_env_int("KZ3_TIMER_TAIL_US", 300);
++    const int catchup = timer_env_int("KZ3_TIMER_CATCHUP", 2);
++    const int stats = timer_env_int("KZ3_TIMER_STATS", 0);
++    const int tid = (int)(t - g_sys_timers) + 1;
++    int hres = 1;
++    t->timer_handle = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++    if (!t->timer_handle) { hres = 0; t->timer_handle = CreateWaitableTimerW(NULL, TRUE, NULL); }
++    if (stats)
++        fprintf(stderr, "[lv2-timer] id=%d start period=%llu us queue=%d waitable=%s tail=%d us catchup=%d\n", tid,
++                (unsigned long long)t->period_usec, (int)t->event_queue_id, t->timer_handle ? (hres ? "hres" : "plain") : "none",
++                tail_us, catchup);
++
++    LARGE_INTEGER now;
++    QueryPerformanceCounter(&now);
++    lv2_tsched s;
++    lv2_tsched_init(&s, now.QuadPart, freq, t->period_usec);
++    const int64_t tail = lv2_tsched_us_to_ticks((uint64_t)(tail_us > 0 ? tail_us : 0), freq);
++    /* stats: lateness (deadline -> push) buckets <0.1 / <0.5 / <1 / <2 / <5 / >=5 ms */
++    unsigned long long n_ticks = 0, n_skip = 0, hist[6] = {0};
++    long long late_max_us = 0;
++    int64_t next_line = now.QuadPart + 10 * freq;
++
++    while (t->running) {
++        const int64_t dl = lv2_tsched_deadline(&s);
++        QueryPerformanceCounter(&now);
++        if (now.QuadPart < dl - tail && t->timer_handle) {
++            /* sleep until deadline - tail; relative due time in 100 ns units */
++            LARGE_INTEGER due;
++            due.QuadPart = -(LONGLONG)(((dl - tail - now.QuadPart) * 10000000LL) / freq);
++            if (due.QuadPart > -1) due.QuadPart = -1;
++            HANDLE hs[2] = { t->stop_event, t->timer_handle };
++            if (!SetWaitableTimer(t->timer_handle, &due, 0, NULL, NULL, FALSE)) {
++                DWORD ms = (DWORD)(((dl - tail - now.QuadPart) * 1000) / freq);
++                if (WaitForSingleObject(t->stop_event, ms) == WAIT_OBJECT_0) break;
++            } else if (WaitForMultipleObjects(2, hs, FALSE, INFINITE) == WAIT_OBJECT_0) {
++                break; /* stop signaled */
++            }
++            continue; /* re-check against the deadline */
++        } else if (now.QuadPart < dl - tail) {
++            DWORD ms = (DWORD)(((dl - tail - now.QuadPart) * 1000) / freq);
++            if (WaitForSingleObject(t->stop_event, ms ? ms : 1) == WAIT_OBJECT_0) break;
++            continue;
++        }
++        while (now.QuadPart < dl && t->running) { /* the tail: QPC-exact */
++            SwitchToThread();
++            QueryPerformanceCounter(&now);
++        }
++        if (!t->running || WaitForSingleObject(t->stop_event, 0) == WAIT_OBJECT_0) break;
++
++        timer_send_event(t);
++        QueryPerformanceCounter(&now);
++        const long long late_us = (long long)lv2_tsched_ticks_to_us(now.QuadPart - dl, freq);
++        hist[late_us < 100 ? 0 : late_us < 500 ? 1 : late_us < 1000 ? 2 : late_us < 2000 ? 3 : late_us < 5000 ? 4 : 5]++;
++        if (late_us > late_max_us) late_max_us = late_us;
++        n_ticks++;
++        n_skip += lv2_tsched_fire(&s, now.QuadPart, (unsigned)(catchup > 0 ? catchup : 0));
++        if (stats && now.QuadPart >= next_line) {
++            next_line = now.QuadPart + 10 * freq;
++            fprintf(stderr, "[lv2-timer] id=%d period=%llu us ticks=%llu late<0.1ms=%llu <0.5=%llu <1=%llu <2=%llu <5=%llu "
++                    ">=5=%llu max=%lld us skipped=%llu dropped(all)=%ld\n", tid, (unsigned long long)t->period_usec,
++                    n_ticks, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], late_max_us, n_skip,
++                    (long)g_sys_timer_dropped);
++            late_max_us = 0;
++        }
++    }
++
++    return 0;
++}
++
++int64_t sys_timer_last_send_qpc(int32_t queue_id)
++{
++    for (int i = 0; i < SYS_TIMER_MAX; i++)
++        if (g_sys_timers[i].active && g_sys_timers[i].running && g_sys_timers[i].event_queue_id == queue_id)
++            return g_sys_timers[i].last_send_qpc;
++    return 0;
++}
+ #else
+ static void* timer_thread_proc(void* param)
+ {
+@@ -508,6 +626,15 @@ static void timer_send_event(sys_timer_info* t)
+         pthread_cond_signal(&q->not_empty);
+ #endif
+     }
++#ifdef _WIN32
++    else {   /* KZ3 patch 1054: count the drop (lv2 drops it too); the first 8 are logged */
++        long d = InterlockedIncrement(&g_sys_timer_dropped);
++        if (d <= 8)
++            fprintf(stderr, "[lv2-timer] queue %d full (%u events): timer event dropped (%ld so far)\n",
++                    (int)t->event_queue_id, (unsigned)q->capacity, d);
++    }
++    { LARGE_INTEGER sq; QueryPerformanceCounter(&sq); t->last_send_qpc = sq.QuadPart; }
++#endif
+ 
+ #ifdef _WIN32
+     LeaveCriticalSection(&q->lock);
+@@ -683,7 +810,11 @@ int64_t sys_timer_start(ppu_context* ctx)
+ 
+ #ifdef _WIN32
+     t->stop_event    = CreateEventA(NULL, TRUE, FALSE, NULL);
++    t->last_send_qpc = 0;
+     t->thread_handle = CreateThread(NULL, 0, timer_thread_proc, t, 0, NULL);
++    /* KZ3 patch 1054: the tick thread only pushes one event per period; its wake latency is the tick jitter */
++    if (t->thread_handle && !timer_old_path())
++        SetThreadPriority(t->thread_handle, THREAD_PRIORITY_TIME_CRITICAL);
+ #else
+     t->stop_flag = 0;
+     pthread_create(&t->thread, NULL, timer_thread_proc, t);
+@@ -724,6 +855,10 @@ int64_t sys_timer_stop(ppu_context* ctx)
+         CloseHandle(t->stop_event);
+         t->stop_event = NULL;
+     }
++    if (t->timer_handle) {   /* KZ3 patch 1054 */
++        CloseHandle(t->timer_handle);
++        t->timer_handle = NULL;
++    }
+ #else
+     pthread_mutex_lock(&t->mtx);
+     t->stop_flag = 1;
+diff --git a/runtime/syscalls/sys_timer.h b/runtime/syscalls/sys_timer.h
+index f3d4163a..8b042347 100644
+--- a/runtime/syscalls/sys_timer.h
++++ b/runtime/syscalls/sys_timer.h
+@@ -65,9 +65,10 @@ typedef struct sys_timer_info {
+     uint64_t next_expire;      /* next expiration, us on the timer clock */
+ 
+ #ifdef _WIN32
+-    HANDLE   timer_handle;
++    HANDLE   timer_handle;     /* KZ3 1054: the thread's waitable timer (high resolution when available) */
+     HANDLE   stop_event;
+     HANDLE   thread_handle;
++    volatile int64_t last_send_qpc; /* KZ3 1054: QPC of the last event pushed (0 = none yet) */
+ #else
+     pthread_t       thread;
+     pthread_mutex_t mtx;
+@@ -79,6 +80,12 @@ typedef struct sys_timer_info {
+ 
+ extern sys_timer_info g_sys_timers[SYS_TIMER_MAX];
+ 
++/* KZ3 patch 1054: periodic-timer events dropped because the target queue was
++ * full (lv2 drops them too; counted so a drop is visible), and the QPC of the
++ * last event a timer posted to `queue_id` (0 = none / no such timer; Windows). */
++extern volatile long g_sys_timer_dropped;
++int64_t sys_timer_last_send_qpc(int32_t queue_id);
++
+ /* Syscall handlers */
+ int64_t sys_timer_usleep(ppu_context* ctx);
+ int64_t sys_timer_sleep(ppu_context* ctx);
+diff --git a/runtime/syscalls/sys_timer_sched.h b/runtime/syscalls/sys_timer_sched.h
+new file mode 100644
+index 00000000..fbb678c1
+--- /dev/null
++++ b/runtime/syscalls/sys_timer_sched.h
+@@ -0,0 +1,85 @@
++/*
++ * ps3recomp - periodic timer schedule arithmetic (KZ3 patch 1054)
++ *
++ * Pure integer arithmetic for lv2 periodic timers (sys_timer_start with a
++ * period): deadlines are ABSOLUTE, deadline(n) = base + n * period, computed
++ * from the tick number n in microseconds and converted to host counter ticks
++ * (QPC) each time, so a period that is not a whole number of counter ticks or
++ * of milliseconds never accumulates rounding error, and a late wake does not
++ * push the following deadlines back (no drift).
++ *
++ * Catch-up policy (lv2_tsched_fire): after the event for deadline n is sent,
++ * the next deadline is n + 1. If the thread woke so late that more than
++ * `catchup` further deadlines have already passed, the missed ones are SKIPPED:
++ * n jumps to the first deadline strictly after `now`, keeping the original
++ * phase (base + k * period). A short hiccup (<= catchup periods) is recovered by
++ * firing the missed deadlines back to back, so titles that count ticks keep the
++ * count; a long stall does not turn into a burst of stale events (the guest
++ * queue would mostly drop them anyway). catchup = 0 never bursts.
++ *
++ * Header-only and free of OS calls so the host test (tools/spu/test_timer_sched.c
++ * in the KZ3 repo) builds it on Linux.
++ */
++#ifndef PS3RECOMP_SYS_TIMER_SCHED_H
++#define PS3RECOMP_SYS_TIMER_SCHED_H
++
++#include <stdint.h>
++
++typedef struct lv2_tsched {
++    int64_t  base;       /* counter value of tick 0 (the start) */
++    int64_t  freq;       /* counter ticks per second (> 0) */
++    uint64_t period_us;  /* period in microseconds (> 0) */
++    uint64_t n;          /* number of the next deadline to wait for (>= 1) */
++} lv2_tsched;
++
++/* us -> counter ticks (split multiply: no overflow while us / 1e6 * freq fits in 64 bits) */
++static inline int64_t lv2_tsched_us_to_ticks(uint64_t us, int64_t freq)
++{
++    const uint64_t f = (uint64_t)freq;
++    return (int64_t)((us / 1000000ULL) * f + ((us % 1000000ULL) * f) / 1000000ULL);
++}
++
++/* counter ticks -> us (truncated); d >= 0 */
++static inline uint64_t lv2_tsched_ticks_to_us(int64_t d, int64_t freq)
++{
++    const uint64_t u = (uint64_t)d, f = (uint64_t)freq;
++    return (u / f) * 1000000ULL + ((u % f) * 1000000ULL) / f;
++}
++
++static inline void lv2_tsched_init(lv2_tsched* s, int64_t now, int64_t freq, uint64_t period_us)
++{
++    s->base = now;
++    s->freq = freq;
++    s->period_us = period_us;
++    s->n = 1;
++}
++
++static inline int64_t lv2_tsched_deadline_n(const lv2_tsched* s, uint64_t n)
++{
++    return s->base + lv2_tsched_us_to_ticks(n * s->period_us, s->freq);
++}
++
++static inline int64_t lv2_tsched_deadline(const lv2_tsched* s)
++{
++    return lv2_tsched_deadline_n(s, s->n);
++}
++
++/* Call after sending the event for deadline s->n at counter value `now`
++ * (now >= deadline). Advances s->n and returns how many deadlines were
++ * skipped (0 = none). */
++static inline uint64_t lv2_tsched_fire(lv2_tsched* s, int64_t now, unsigned catchup)
++{
++    s->n++;
++    if (now < lv2_tsched_deadline_n(s, s->n + catchup))
++        return 0; /* at most `catchup` deadlines already due: fire them in turn */
++    /* first deadline strictly after now, same phase */
++    const uint64_t el = lv2_tsched_ticks_to_us(now - s->base, s->freq);
++    uint64_t m = el / s->period_us + 1;
++    while (lv2_tsched_deadline_n(s, m) <= now) m++;
++    while (m > s->n && lv2_tsched_deadline_n(s, m - 1) > now) m--;
++    const uint64_t skipped = m - s->n;
++    s->n = m;
++    return skipped;
++}
++
++#endif /* PS3RECOMP_SYS_TIMER_SCHED_H */

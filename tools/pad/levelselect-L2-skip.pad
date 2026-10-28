@@ -1,0 +1,14 @@
+# level index 1 (id 201), node offset 0; expected level load at ~63 s: use level-run.sh --load 63
+46:0x0040      # lobby: DOWN from the disabled Continue to Select Chapter
+49:0x4000      # Select Chapter -> campaignlevelselect.gum
+52:0x0040      # level list: DOWN 1/1
+55:0x4000      # pick level index 1 (id 201) -> campaignmissionselect.gum
+58:0x4000      # first node -> campaigndifficulty.gum
+61:0x4000      # difficulty: the highlighted default -> level load (loading cinematic ~73-86 s)
+62:0x4000      # retry
+# Loading-movie skip test (loading.gum: START = PausePressed; the "options" button after the pause, when
+# isloadingdone, = StopMovie + SetMovieSkipped; the RE notes 657 says Square, line 502 says Triangle: try both).
+150:0x0008     # START: pause the loading cutscene (legend should show Skip once the level is loaded)
+155:0x8000     # SQUARE: skip
+161:0x1000     # TRIANGLE: skip (if SQUARE did nothing)
+167:0x8000     # SQUARE retry

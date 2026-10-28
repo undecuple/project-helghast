@@ -1,0 +1,13 @@
+# Dependabot: GitHub Actions versions (weekly), plus security updates. Nix inputs (flake.lock) are updated by hand; the ps3recomp submodule
+# is pinned on purpose (our patches in port/patches are made against that commit) and is updated by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]

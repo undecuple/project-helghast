@@ -1,0 +1,48 @@
+KZ3 crash handler minidump (RSX pass 33): ppu_crash_report writes the minidump through kz3_log_write_minidump.
+
+- Cause of the round-31/32 open item (nothing after MiniDumpWriteDump ran, exit 0xC0000005): patch 2030/2031 passed
+  a hand-rolled `struct { DWORD tid; EXCEPTION_POINTERS* ep; BOOL client; }` as MINIDUMP_EXCEPTION_INFORMATION. The
+  SDK declares that type 4-byte packed (ExceptionPointers at +4, size 16; MinGW's dbghelp.h agrees); the natural
+  layout put the pointer at +8, so dbghelp read padding plus half a pointer (dbghelp!dump_exception_info+0x39:
+  `mov rdx,[rax+4]; mov rcx,[rdx]`) and faulted on its own dump thread; the filter's once-guard let that second
+  fault end the process. Reproduced without the game by tools/smoke/test_crash_dump.exe (variant "bug").
+- Fix: kz3_log_write_minidump (port/kz3/kz3_log.c): the header's MINIDUMP_EXCEPTION_INFORMATION, dbghelp resolved
+  at kz3_log_init, the dump written on a helper thread (Microsoft's guidance), result logged as [CRASH].
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3801,29 +3801,12 @@
+                  g_active_ctx ? (uint32_t)g_active_ctx->cia : 0u, g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u,
+                  (unsigned long)GetCurrentThreadId());
+         const char* crash = kz3_log_write_crash(reason, details);
+-        if (crash && *crash) {
+-            char dmp[600];
+-            snprintf(dmp, sizeof dmp, "%s", crash);
+-            char* dot = strrchr(dmp, '.');
+-            if (dot && (size_t)(dot - dmp) + 5 < sizeof dmp) strcpy(dot, ".dmp");
+-            /* KZ3 patch 2031: name the crash file before the minidump; the line after it never appeared in the
+-             * round-31 test (the process ended with the exception code and a 14 kB dump: ASSUMPTION the dump
+-             * call faults inside the handler), so the path must be on record before the attempt. */
+-            fprintf(stderr, "[CRASH] crash file %s, writing minidump %s\n", crash, dmp);
+-            fflush(stderr);
+-            HANDLE f = CreateFileA(dmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+-            if (f != INVALID_HANDLE_VALUE) {
+-                typedef BOOL (WINAPI *mdw_fn)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+-                struct { DWORD tid; EXCEPTION_POINTERS* ep; BOOL client; } mei = { GetCurrentThreadId(), ep, FALSE };
+-                HMODULE dh = LoadLibraryA("dbghelp.dll");
+-                mdw_fn mdw = dh ? (mdw_fn)(void*)GetProcAddress(dh, "MiniDumpWriteDump") : NULL;
+-                /* MiniDumpNormal (0): thread stacks and module list only; the 4 GB guest reservation stays out. */
+-                BOOL ok = mdw ? mdw(GetCurrentProcess(), GetCurrentProcessId(), f, 0, &mei, NULL, NULL) : FALSE;
+-                CloseHandle(f);
+-                if (!ok) DeleteFileA(dmp);
+-                fprintf(stderr, "[CRASH] minidump %s\n", ok ? "written" : "NOT written");
+-            }
+-        }
++        fprintf(stderr, "[CRASH] crash file %s\n", crash && *crash ? crash : "(not written)");
++        fflush(stderr);
++        /* KZ3 patch 2032: the minidump through kz3_log_write_minidump (helper thread, dbghelp loaded at init, the
++         * SDK's packed MINIDUMP_EXCEPTION_INFORMATION). The hand-rolled struct of 2030/2031 had ExceptionPointers at
++         * +8 where dbghelp reads +4, so dbghelp faulted on its own thread and nothing below ever ran (RSX pass 33). */
++        if (crash && *crash) kz3_log_write_minidump(crash, ep, (unsigned long)GetCurrentThreadId());
+         kz3_crash_notify(crash ? crash : "");
+     }
+ #endif

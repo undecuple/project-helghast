@@ -1,0 +1,70 @@
+rsx_live_draw: initialise under Proton (no RWTexture2D::GetDimensions in the depth-snapshot shader).
+
+Under Proton the engine's init failed: Wine's d3dcompiler rejects RWTexture2D<float>::GetDimensions
+(E5005) in the depth-snapshot compute shader, make_depth_snapshot_pipeline returned -1 and the whole engine
+fell back to rsx_d3d12_backend. The snapshot size now comes from two root constants (b0, root parameter 2)
+set at dispatch from zdepth_t.snapshot_w/h. Audit of the engine's other HLSL (rsx_live_draw.c and the
+decompiler entry points it uses: rsx_vp_decompile(_compact)_ex, rsx_fp_decompile(_buffered)_ex) for methods
+and intrinsics: only Texture2D.Load, SampleLevel, SampleBias, frac, [loop]/[unroll] and SV_VertexID; no other
+GetDimensions/Gather/SampleCmp/bit intrinsics. Verified under GE-Proton with KZ3 (RSX_LIVE_DRAW=1): engine up,
+0 shader compile errors over 3560 draw groups, per-surface depth buffers created. KZ3 port RSX, 2026-10-07.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 25791179..10a9d246 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -3894,6 +3894,10 @@ static int zdepth_snapshot(u32 slot)
+         g.list, 0, source_table);
+     g.list->lpVtbl->SetComputeRootDescriptorTable(
+         g.list, 1, destination_table);
++    {
++        const UINT size[2] = { z->snapshot_w, z->snapshot_h };
++        g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 2, size, 0);
++    }
+     g.list->lpVtbl->Dispatch(
+         g.list, (z->snapshot_w + 7u) / 8u,
+         (z->snapshot_h + 7u) / 8u, 1);
+@@ -8132,12 +8136,15 @@ static int make_root_signature(void)
+ static int make_depth_snapshot_pipeline(void)
+ {
+     static const char source[] =
++        /* The size arrives as two root constants rather than from
++         * RWTexture2D::GetDimensions, which Wine's d3dcompiler (Proton)
++         * rejects (E5005) -- and this pipeline failing aborted the whole
++         * engine's init. */
+         "Texture2D<float> depth_source : register(t0);\n"
+         "RWTexture2D<float> depth_destination : register(u0);\n"
++        "cbuffer snapshot_size : register(b0) { uint width; uint height; };\n"
+         "[numthreads(8, 8, 1)]\n"
+         "void main(uint3 id : SV_DispatchThreadID) {\n"
+-        "    uint width, height;\n"
+-        "    depth_destination.GetDimensions(width, height);\n"
+         "    if (id.x < width && id.y < height)\n"
+         "        depth_destination[id.xy] = "
+         "depth_source.Load(int3(id.xy, 0));\n"
+@@ -8167,7 +8174,7 @@ static int make_depth_snapshot_pipeline(void)
+     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+     ranges[1].NumDescriptors = 1;
+     ranges[1].BaseShaderRegister = 0;
+-    D3D12_ROOT_PARAMETER parameters[2] = {0};
++    D3D12_ROOT_PARAMETER parameters[3] = {0};
+     for (u32 i = 0; i < 2; ++i) {
+         parameters[i].ParameterType =
+             D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+@@ -8175,8 +8182,13 @@ static int make_depth_snapshot_pipeline(void)
+         parameters[i].DescriptorTable.pDescriptorRanges = &ranges[i];
+         parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+     }
++    /* b0: snapshot width, height (see the shader). */
++    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    parameters[2].Constants.ShaderRegister = 0;
++    parameters[2].Constants.Num32BitValues = 2;
++    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+     D3D12_ROOT_SIGNATURE_DESC description = {0};
+-    description.NumParameters = 2;
++    description.NumParameters = 3;
+     description.pParameters = parameters;
+     ID3DBlob* serialized = NULL;
+     ID3DBlob* signature_errors = NULL;

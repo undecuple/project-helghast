@@ -1,0 +1,39 @@
+gcm/live-draw: diagnostic switch LD_SHADOW_CMP_UNREV=1 for the shadow-compare sampler table (default off = unchanged).
+
+Patch 2011's eight static comparison samplers (s16..s23) map the RSX texture zfunc to the reversed D3D12 function
+(GEQUAL -> LESS_EQUAL), as RPCS3's VK backend does (VKDraw.cpp get_compare_func(zfunc, true), and its GL sampler).
+D3D12 SampleCmp passes when `reference FUNC texel`, so the reversed table computes `depth FUNC reference`.
+LD_SHADOW_CMP_UNREV=1 takes the zfunc as the D3D function as is, i.e. `reference FUNC depth` (the OpenGL/ARB_shadow
+order that ps3recomp's fp_shadow_helper uses; ps3recomp issue #403 asks which one the RSX does). The switch exists to
+check that direction in the game: KZ3 binds every shadow map with zfunc 6 (GEQUAL).
+Log: `[shadow-cmp] table=reversed|unreversed` once when the live-draw root signature is built.
+Verification: the RE notes "Pass 86".
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -14060,11 +14060,24 @@
+         D3D12_COMPARISON_FUNC_EQUAL, D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+         D3D12_COMPARISON_FUNC_LESS, D3D12_COMPARISON_FUNC_NOT_EQUAL,
+         D3D12_COMPARISON_FUNC_LESS_EQUAL, D3D12_COMPARISON_FUNC_ALWAYS };
++    /* Patch 2091 (diagnostic, LD_SHADOW_CMP_UNREV=1): the un-reversed table, RSX zfunc taken as the D3D function
++     * as is. D3D12 SampleCmp passes when `reference FUNC texel`, so the reversed table above computes
++     * `depth FUNC reference` (RPCS3's direction) and this one `reference FUNC depth` (the OpenGL/ARB_shadow order
++     * that ps3recomp's fp_shadow_helper uses, issue #403). Default off = the reversed table. */
++    static const D3D12_COMPARISON_FUNC zf_unrev[8] = {
++        D3D12_COMPARISON_FUNC_NEVER, D3D12_COMPARISON_FUNC_LESS,
++        D3D12_COMPARISON_FUNC_EQUAL, D3D12_COMPARISON_FUNC_LESS_EQUAL,
++        D3D12_COMPARISON_FUNC_GREATER, D3D12_COMPARISON_FUNC_NOT_EQUAL,
++        D3D12_COMPARISON_FUNC_GREATER_EQUAL, D3D12_COMPARISON_FUNC_ALWAYS };
++    const char* unrev_env = getenv("LD_SHADOW_CMP_UNREV");
++    const int unrev = unrev_env && atoi(unrev_env) != 0;
++    fprintf(stderr, "[shadow-cmp] table=%s (zfunc 6 GEQUAL -> D3D %s; LD_SHADOW_CMP_UNREV=%d)\n",
++            unrev ? "unreversed" : "reversed", unrev ? "GREATER_EQUAL" : "LESS_EQUAL", unrev);
+     for (u32 f = 0; f < 8; f++) {
+         D3D12_STATIC_SAMPLER_DESC* c = &vsmp[RSX_DSP_NUM_VERTEX_TEXTURES + f];
+         c->Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+         c->AddressU = c->AddressV = c->AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+-        c->ComparisonFunc = zf_rev[f];
++        c->ComparisonFunc = unrev ? zf_unrev[f] : zf_rev[f];
+         c->MaxLOD = D3D12_FLOAT32_MAX;
+         c->ShaderRegister = 16 + f;
+         c->ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;

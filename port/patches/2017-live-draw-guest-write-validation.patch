@@ -1,0 +1,766 @@
+gcm/live-draw: main-memory render targets reach guest memory at sync points; guest writes behind live-draw are seen.
+
+Symptom (Killzone 3, pass 19): live-draw keeps render targets on the GPU and caches textures by a content hash
+taken once per frame. Guest memory is also written outside the FIFO: KZ3 copies its scene target to main memory
+(NV0039, patch 2015), its SPU post jobs process that copy, and the final composite samples main 0x1310400 plus a
+160x90 main-memory image (RPCS3 capture, both level captures). A guest write into the memory of a live colour
+surface was never seen (texture binds that resolve to the surface sampled the stale GPU copy), and a write into an
+already-hashed texture within the same frame was seen only at the next flip.
+
+Second symptom (same captures): right after the copy KZ3 renders four colour surfaces in MAIN memory (640x360
+0x16D0400 and 320x180 0x19AB800 scene downsamples, 640x360 0x1892400 from depth, 320x180 F_X32 0x1A1C000), then
+releases a semaphore for its SPU post jobs. live-draw kept those pixels on the GPU, so the SPUs read stale memory.
+
+Fix:
+- Main-memory colour surfaces the GPU drew since their last write-back are written back into guest memory (RSX
+  layout, the patch 2015 path, now ld_writeback_surface) before the guest can observe a sync point: NV4097
+  0x1D70/0x1D74 semaphore release (rsx_commands.c), NV406E 0x6C release (cellGcmSys.c), flip.
+  rsx_live_draw_before_guest_sync(); LD_MAIN_SURFACE_WRITEBACK=0 disables.
+- Live colour surfaces (RGBA8, FP16, F_X32): a sampled hash of the guest bytes per band of 16 rows. Baseline after
+  GPU writes (first texture bind or the flip); at most one compare per frame when the surface is bound as a
+  texture; changed bands are converted to the host layout (inverse of the patch 2015 write-back) and uploaded into
+  the surface before the draw. LD_GUEST_HASH_STRIDE (default 1024: one 64-byte chunk per 1 KB per row, phase
+  stepping so a band's 16 rows cover every chunk column; 0 = whole rows). An NV0039 write-back first takes guest
+  bytes that are newer than the GPU's, then re-baselines.
+- Exact path: rsx_live_draw_note_guest_write (rsx thread) now also marks the written rows of live surfaces;
+  rsx_live_draw_note_guest_write_async (any thread, lock-free ring drained before texture binds) and
+  cellGcm_note_guest_write_ea(ea, size) (EA -> local offset or IO offset) are the hook for SPU DMA puts.
+- LD_GUEST_WRITE_DBG=1: [guest-write] lines say whether an NV0039 copy destination was rewritten between the copy
+  and the next texture bind that reads it (KZ3: did the SPU post chain run before the composite).
+- [guest-validate] cost line every 300 frames (KB hashed and microseconds per frame). LD_GUEST_WRITE_CHECK=0 = off.
+
+Verified: tools/smoke/test_guest_write.c under Proton (cases S, N, H, T, M; PASS; negative controls
+LD_GUEST_WRITE_CHECK=0 and LD_MAIN_SURFACE_WRITEBACK=0 FAIL); test_nv0039, test_surface_aa, test_tex_float PASS.
+
+Rebased on ps3recomp v0.17.0 (SPU pass 95): the 0x6C RELEASE keeps #401's get publish + fence after the live-draw sync; 0x1D70/74 sync before #381's FEED0001 path; #395's swin fields kept.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 7390639c..673b87fc 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1414,6 +1414,9 @@ static void nv0039_copy(u32 notify)
+     if (rsx_live_draw_enabled())
+         marked = rsx_live_draw_note_guest_write(dl ? 0u : 1u, (u32)(lo_out - (s64)dst) + s_nv0039.off_out,
+                                                 (u32)(hi_out - lo_out));
++    if (rsx_live_draw_enabled())   /* patch 2017 diagnostic, LD_GUEST_WRITE_DBG=1 */
++        rsx_live_draw_watch_copy(dl ? 0u : 1u, (u32)(lo_out - (s64)dst) + s_nv0039.off_out,
++                                 (u32)(hi_out - lo_out));
+     s_nv0039_copies++;
+     s_nv0039_bytes += (unsigned long long)len * n;
+     s_nv0039_dir[(sl ? 0 : 2) | (dl ? 0 : 1)]++;
+@@ -2740,7 +2743,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         }
+                     }
+                     if (m == 0x64u)      s_sema_offset = v;
+-                    else if (m == 0x6Cu) {
++                    else if (m == 0x6Cu) {   /* patch 2017: RSX output in main memory first */
++                        if (rsx_live_draw_enabled()) rsx_live_draw_before_guest_sync();
+                         /* The RSX has fetched past a RELEASE before its
+                          * semaphore write lands, so a guest that sees the
+                          * label must also see `get` past the command. `get`
+@@ -3985,6 +3989,23 @@ u32 cellGcmResolveOffset(u32 offset)
+  * that builds its textures in main memory on pages whose numbers happen to
+  * collide. Returns 0 when the IO table has no mapping, so a caller can tell
+  * "not IO-mapped" from "IO-mapped at 0". */
++/* Patch 2017: a guest write at effective address `ea` that the RSX did not
++ * issue (an SPU DMA put, a PPU copy into a mapped texture or render target).
++ * Safe from any thread; live-draw applies it before its next texture bind.
++ * Local memory -> location 0, IO-mapped main memory -> location 1; other
++ * addresses are not visible to the RSX and are ignored. */
++void cellGcm_note_guest_write_ea(u32 ea, u32 size)
++{
++    if (!size || !rsx_live_draw_enabled()) return;
++    if (ea >= s_config.localAddress && ea - s_config.localAddress < s_config.localSize) {
++        rsx_live_draw_note_guest_write_async(0u, ea - s_config.localAddress, size);
++        return;
++    }
++    const u16 io_page = s_io_address_table[ea >> 20];
++    if (io_page != 0xFFFF)   /* as cellGcmAddressToOffset */
++        rsx_live_draw_note_guest_write_async(1u, ((u32)io_page << 20) | (ea & 0xFFFFFu), size);
++}
++
+ u32 cellGcmResolveIO(u32 offset)
+ {
+     u32 page = offset >> 20;
+diff --git a/libs/video/cellGcmSys.h b/libs/video/cellGcmSys.h
+index eab83e18..1892231e 100644
+--- a/libs/video/cellGcmSys.h
++++ b/libs/video/cellGcmSys.h
+@@ -456,6 +456,11 @@ void cellGcmSortRemapEaIoAddress(void);
+ CellGcmReportData* cellGcmGetReportDataAddressLocation(u32 index, u32 location);
+ u32 cellGcmGetReportDataLocation(u32 index, u32 location);
+ 
++/* Patch 2017: a guest write at effective address `ea` the RSX did not issue
++ * (SPU DMA put, PPU copy into a texture or render target). Any thread; the
++ * live renderer re-reads the range before its next texture bind. */
++void cellGcm_note_guest_write_ea(u32 ea, u32 size);
++
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index 099c3407..317f7822 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -398,6 +398,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+               fprintf(stderr, "[SEMA4097] #%u m=0x%04X data=0x%08X off=0x%X ea=0x%08X\n", sl, method, data,
+                       s_sem_off, VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu)); } }
+       if (method == 0x1D6C) { g_rsx_sem_off_4097 = data; return 0; }
++      if (method == 0x1D70 || method == 0x1D74) {   /* patch 2017: RSX output in main memory first */
++        extern u32 rsx_live_draw_before_guest_sync(void);
++        extern int rsx_live_draw_enabled(void);
++        if (rsx_live_draw_enabled()) rsx_live_draw_before_guest_sync();
++      }
+       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
+         extern void vm_write32(uint32_t a, uint32_t v);
+         extern u32 gcm_io_offset_to_ea(u32 io);
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 853a5426..e3d7a84b 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -44,6 +44,9 @@ void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
+ { (void)d; (void)o; (void)v; }
+ u32  rsx_live_draw_note_guest_write(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; return 0; }
+ u32  rsx_live_draw_writeback_range(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; return 0; }
++void rsx_live_draw_note_guest_write_async(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
++void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
++u32  rsx_live_draw_before_guest_sync(void) { return 0; }
+ int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u32 h)
+ { (void)sl; (void)sa; (void)sp; (void)dl; (void)da; (void)dp; (void)w; (void)h; return 0; }
+ int  rsx_live_draw_resolve_blit(u32 sl, u32 sa, u32 sp, u32 ds, u32 dt, u32 dl, u32 da,
+@@ -219,6 +222,14 @@ typedef struct {
+     /* Top-left windows of the surface for smaller aliasing textures (see surface_window). */
+     struct { ID3D12Resource* tex; ID3D12Resource* src; u32 w, h, wgen, used; } swin[LD_SWIN_PER];
+     u32 swin_wgen;            /* bumped by every write into the surface; a window older than it is recopied */
++    /* Patch 2017: guest-write validation (see ld_gv_validate). */
++    u32* gv_band;             /* sampled hash of the guest bytes per band of LD_GV_BAND rows */
++    u32 gv_bands, gv_w, gv_h, gv_pitch;
++    u32 gv_frame;             /* frame of the last compare */
++    u32 gv_dirty_y0, gv_dirty_y1;   /* rows an explicit guest write covered */
++    u8 gv_pending;            /* the GPU wrote since the last baseline */
++    u8 gv_dirty;              /* explicit hook: the guest wrote after the last GPU write */
++    u8 gv_gpu_dirty;          /* the GPU wrote since the last write-back (main-memory surfaces) */
+ #if !defined(YZ_PERF_CLEAN)
+     u32 resource_serial;
+     u32 last_write_generation;
+@@ -514,10 +525,21 @@ enum {
+     LD_SURFACE_WRITE_OTHER = 7
+ };
+ 
++/* Patch 2017: every GPU write to a surface makes its guest-byte baseline stale
++ * and cancels an earlier explicit guest write (the GPU wrote over it). */
++static inline void ld_gv_note_gpu_write(u32 target)
++{
++    if (target >= MAX_SURFACES) return;
++    g.surfaces[target].gv_pending = 1;
++    g.surfaces[target].gv_dirty = 0;
++    g.surfaces[target].gv_gpu_dirty = 1;
++}
++
+ static void ld_surface_note_write(u32 target, u32 kind)
+ {
+     if (target >= MAX_SURFACES)
+         return;
++    ld_gv_note_gpu_write(target);
+     surface_t* surface = &g.surfaces[target];
+     const u32 generation = ++g_ld_surface_generation;
+     surface->swin_wgen++;
+@@ -549,7 +571,7 @@ static void ld_surface_note_write(u32 target, u32 kind)
+ }
+ #else
+ #define ld_surface_note_write(target, kind) \
+-    do { if ((target) < MAX_SURFACES) g.surfaces[(target)].swin_wgen++; } while (0)
++    do { if ((target) < MAX_SURFACES) g.surfaces[(target)].swin_wgen++; ld_gv_note_gpu_write(target); } while (0)
+ #endif
+ 
+ #define LD_LAYOUT_CACHE_CAP 256u
+@@ -3198,6 +3220,357 @@ static int tex_zalias_kind(const rsx_dsp_texture* t)
+     return ZALIAS_SHADOW;
+ }
+ 
++
++/* ---------------------------------------------------------------------------
++ * Patch 2017: guest writes live-draw did not issue.
++ *
++ * Live surfaces keep their pixels on the GPU; the guest bytes under them are
++ * whatever was there before (live-draw writes them only for an NV0039 copy,
++ * patch 2015). When the guest (PPU code, SPU DMA, an HLE copy) writes those
++ * bytes after the GPU's last write, real hardware samples the new bytes; a
++ * texture bind that resolves to the live surface sampled the stale host copy.
++ *
++ * Detection without SPU-side changes: a sampled hash of the guest bytes per
++ * band of LD_GV_BAND rows. Baseline after the GPU writes (at the first sample
++ * as a texture, or at the flip, whichever comes first); compare at most once
++ * per frame when the surface is bound as a texture; bands that changed are
++ * converted to the host layout and uploaded into the surface before the draw.
++ * Sampling (LD_GUEST_HASH_STRIDE, default 1024 bytes): per row one 64-byte
++ * chunk per stride window, at a phase that steps by 5 chunks per row, so the 16
++ * rows of a band visit every 64-byte column chunk once: any write that covers
++ * an aligned 64-byte chunk on all rows of a band is always seen; a smaller
++ * write may be missed. LD_GUEST_HASH_STRIDE=0 hashes whole rows.
++ * Exact path: rsx_live_draw_note_guest_write (rsx thread) and
++ * rsx_live_draw_note_guest_write_async (any thread, e.g. SPU DMA) mark the
++ * written rows, which are uploaded at the next bind even in the same frame.
++ * Textures that are not live surfaces keep the per-frame content hash
++ * (texture_srv_slot); the same hooks mark them for a re-hash.
++ * LD_GUEST_WRITE_CHECK=0 disables all of it (negative control).
++ * ASSUMPTION: a write that changes part of a band replaces the whole band with
++ * guest bytes (the rest of those rows comes back as the stale guest bytes, not
++ * the GPU's); guest writes behind the renderer are whole images (SPU post
++ * output, streaming into reused memory). Colour surfaces only (RGBA8, FP16,
++ * F_X32); depth surfaces are not validated.
++ * -------------------------------------------------------------------------*/
++#define LD_GV_BAND 16u
++static int g_gv_on = -1;
++static u32 g_gv_stride = 1024;
++static struct {
++    u64 checks, baselines, uploads_bands, upload_events, explicit_uploads, hashed_bytes, ticks;
++    u64 frame_hashed_bytes, frame_ticks, max_frame_ticks;
++    u32 frames;
++} g_gv;
++static LARGE_INTEGER g_gv_qpf;
++
++static int ld_gv_enabled(void)
++{
++    if (g_gv_on < 0) {
++        const char* e = getenv("LD_GUEST_WRITE_CHECK");
++        g_gv_on = e ? atoi(e) != 0 : 1;
++        const char* st = getenv("LD_GUEST_HASH_STRIDE");
++        if (st) g_gv_stride = (u32)strtoul(st, NULL, 0);
++        if (g_gv_stride && g_gv_stride < 128) g_gv_stride = 128;
++        g_gv_stride &= ~63u;
++        QueryPerformanceFrequency(&g_gv_qpf);
++        fprintf(stderr, "[guest-validate] %s, stride %u bytes (0 = full rows), band %u rows\n",
++                g_gv_on ? "ON" : "OFF (LD_GUEST_WRITE_CHECK=0)", g_gv_stride, LD_GV_BAND);
++    }
++    return g_gv_on;
++}
++
++static inline u64 ld_gv_mix(u64 h, const u8* p, u32 n)
++{
++    u32 i = 0;
++    for (; i + 8 <= n; i += 8) { u64 w; memcpy(&w, p + i, 8); h = (h ^ w) * 1099511628211ull; }
++    for (; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
++    return h;
++}
++
++static int ld_gv_geometry(const surface_t* s, u32* texel, u32* gp)
++{
++    const u32 t = s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++    const u32 p = s->pitch ? s->pitch : s->w * t;
++    if (!s->tex || !s->w || !s->h || p < s->w * t) return 0;
++    *texel = t; *gp = p;
++    return 1;
++}
++
++static u32 ld_gv_band_hash(const u8* gm, u32 gp, u32 row_bytes, u32 y0, u32 y1)
++{
++    u64 h = 1469598103934665603ull ^ y0;
++    const u32 windows = g_gv_stride / 64u;
++    for (u32 y = y0; y < y1; y++) {
++        const u8* row = gm + (size_t)y * gp;
++        if (!g_gv_stride || row_bytes <= g_gv_stride) {
++            h = ld_gv_mix(h, row, row_bytes);
++            g_gv.frame_hashed_bytes += row_bytes;
++            continue;
++        }
++        for (u32 o = ((y * 5u) % windows) * 64u; o < row_bytes; o += g_gv_stride) {
++            const u32 n = row_bytes - o < 64u ? row_bytes - o : 64u;
++            h = ld_gv_mix(h, row + o, n);
++            g_gv.frame_hashed_bytes += n;
++        }
++    }
++    return (u32)(h ^ (h >> 32));
++}
++
++/* Recompute the band hashes. changed (optional) gets 1 per band that differs
++ * from the stored baseline. Returns 0 if the guest range is unreadable. */
++static int ld_gv_hash_bands(surface_t* s, u8* changed)
++{
++    u32 texel, gp;
++    if (!ld_gv_geometry(s, &texel, &gp)) return 0;
++    const u8* gm = guest_ptr(s->location, s->offset, gp * (s->h - 1u) + s->w * texel);
++    if (!gm) return 0;
++    const u32 bands = (s->h + LD_GV_BAND - 1u) / LD_GV_BAND;
++    if (bands != s->gv_bands || !s->gv_band) {
++        free(s->gv_band);
++        s->gv_band = (u32*)calloc(bands, sizeof(u32));
++        s->gv_bands = s->gv_band ? bands : 0;
++        if (!s->gv_band) return 0;
++        changed = NULL;
++    }
++    LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
++    for (u32 b = 0; b < bands; b++) {
++        const u32 y0 = b * LD_GV_BAND, y1 = y0 + LD_GV_BAND < s->h ? y0 + LD_GV_BAND : s->h;
++        const u32 hsh = ld_gv_band_hash(gm, gp, s->w * texel, y0, y1);
++        if (changed) changed[b] = hsh != s->gv_band[b];
++        s->gv_band[b] = hsh;
++    }
++    QueryPerformanceCounter(&t1);
++    g_gv.frame_ticks += (u64)(t1.QuadPart - t0.QuadPart);
++    return 1;
++}
++
++static void ld_gv_baseline(surface_t* s)
++{
++    if (ld_gv_hash_bands(s, NULL)) {
++        s->gv_w = s->w; s->gv_h = s->h; s->gv_pitch = s->pitch;
++        g_gv.baselines++;
++    } else {
++        s->gv_w = 0;
++    }
++    s->gv_pending = 0;
++    s->gv_dirty = 0;
++    s->gv_frame = g_ld_frames;
++}
++
++/* Guest rows [y0, y1) of surface s -> host layout -> the surface (RENDER_TARGET
++ * state outside a draw, as rsx_live_draw_debug_read_surface assumes). */
++static int ld_gv_upload_rows(surface_t* s, u32 y0, u32 y1)
++{
++    u32 texel, gp;
++    if (y1 > s->h) y1 = s->h;
++    if (y0 >= y1 || !ld_gv_geometry(s, &texel, &gp)) return 0;
++    const u8* gm = guest_ptr(s->location, s->offset, gp * (s->h - 1u) + s->w * texel);
++    if (!gm) return 0;
++    const u32 rows = y1 - y0, pitch = (s->w * texel + 255u) & ~255u;
++    if ((u64)pitch * rows > UPLOAD_SIZE) return 0;
++    u32 start = (g.upload_used + 511u) & ~511u;
++    if ((u64)start + (u64)pitch * rows > UPLOAD_SIZE) {
++        ld_flush(LD_FLUSH_READBACK);
++        start = 0;
++    }
++    for (u32 y = 0; y < rows; y++) {
++        const u8* sp = gm + (size_t)(y0 + y) * gp;
++        u8* dp = g.upload_mapped + start + (size_t)y * pitch;
++        for (u32 x = 0; x < s->w; x++, sp += texel, dp += texel) {
++            if (s->fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {          /* guest A,R,G,B -> host R,G,B,A */
++                dp[0] = sp[1]; dp[1] = sp[2]; dp[2] = sp[3]; dp[3] = sp[0];
++            } else if (texel == 8) {                             /* BE halves, X first -> LE */
++                for (u32 c = 0; c < 4; c++) { dp[c * 2] = sp[c * 2 + 1]; dp[c * 2 + 1] = sp[c * 2]; }
++            } else {                                             /* R32_FLOAT BE -> LE */
++                dp[0] = sp[3]; dp[1] = sp[2]; dp[2] = sp[1]; dp[3] = sp[0];
++            }
++        }
++    }
++    g.upload_used = start + pitch * rows;
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition.pResource = s->tex;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
++    src.pResource = g.upload; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    src.PlacedFootprint.Offset = start;
++    src.PlacedFootprint.Footprint.Format = s->fmt;
++    src.PlacedFootprint.Footprint.Width = s->w;
++    src.PlacedFootprint.Footprint.Height = rows;
++    src.PlacedFootprint.Footprint.Depth = 1;
++    src.PlacedFootprint.Footprint.RowPitch = pitch;
++    dst.pResource = s->tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, y0, 0, &src, NULL);
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    g_gv.uploads_bands += (rows + LD_GV_BAND - 1u) / LD_GV_BAND;
++    return 1;
++}
++
++/* Bring surface i up to date with guest writes made after the GPU's last
++ * write. Returns the number of row ranges uploaded (0 = host copy current). */
++static u32 ld_gv_validate(u32 i)
++{
++    if (i >= g.n_surfaces || !ld_gv_enabled()) return 0;
++    surface_t* s = &g.surfaces[i];
++    if (!s->tex) return 0;
++    u32 uploads = 0;
++    if (s->gv_dirty) {                      /* exact: an explicit hook saw the write */
++        uploads += (u32)ld_gv_upload_rows(s, s->gv_dirty_y0, s->gv_dirty_y1);
++        if (uploads) g_gv.explicit_uploads++;
++        ld_gv_baseline(s);
++        g_gv.upload_events += uploads;
++        return uploads;
++    }
++    if (s->gv_pending || s->gv_w != s->w || s->gv_h != s->h || s->gv_pitch != s->pitch) {
++        ld_gv_baseline(s);
++        return 0;
++    }
++    if (s->gv_frame == g_ld_frames) return 0;    /* compared this frame already */
++    s->gv_frame = g_ld_frames;
++    g_gv.checks++;
++    u8 changed_stack[256];
++    u8* changed = s->gv_bands <= sizeof changed_stack ? changed_stack : (u8*)malloc(s->gv_bands);
++    if (!changed) return 0;
++    const u32 bands = s->gv_bands;
++    if (ld_gv_hash_bands(s, changed)) {
++        for (u32 b = 0; b < bands; ) {
++            if (!changed[b]) { b++; continue; }
++            u32 e = b;
++            while (e < bands && changed[e]) e++;
++            uploads += (u32)ld_gv_upload_rows(s, b * LD_GV_BAND, e * LD_GV_BAND);
++            b = e;
++        }
++    }
++    if (changed != changed_stack) free(changed);
++    if (uploads) {
++        g_gv.upload_events += uploads;
++        static u32 logs;
++        if (logs++ < 16 || (logs & 255u) == 0)
++            fprintf(stderr, "[guest-validate] surface %u:0x%08X %ux%u fmt=%d: guest wrote behind live-draw,"
++                            " %u row range(s) re-uploaded (frame %u)\n",
++                    s->location, s->offset, s->w, s->h, (int)s->fmt, uploads, g_ld_frames);
++    }
++    return uploads;
++}
++
++/* Explicit write notes from other threads (SPU DMA): a small MPSC ring drained
++ * on the rsx thread. Overflow marks everything (as a write to all memory). */
++#define LD_GV_RING 256u
++static struct { volatile LONG loc, off, size; } g_gv_ring[LD_GV_RING];
++static volatile LONG g_gv_ring_head, g_gv_ring_ready[LD_GV_RING];
++static LONG g_gv_ring_tail;
++static volatile LONG g_gv_ring_overflow;
++static void ld_gv_mark(u32 location, u32 offset, u32 size);
++
++void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size)
++{
++    if (!g.ready || !size || !ld_gv_enabled()) return;
++    LONG slot;
++    for (;;) {                                           /* claim a slot unless the ring is full */
++        slot = g_gv_ring_head;
++        if (slot - *(volatile LONG*)&g_gv_ring_tail >= (LONG)LD_GV_RING) {
++            InterlockedExchange(&g_gv_ring_overflow, 1);   /* the consumer re-checks everything */
++            return;
++        }
++        if (InterlockedCompareExchange(&g_gv_ring_head, slot + 1, slot) == slot) break;
++    }
++    const u32 k = (u32)slot % LD_GV_RING;
++    g_gv_ring[k].loc = (LONG)location; g_gv_ring[k].off = (LONG)offset; g_gv_ring[k].size = (LONG)size;
++    InterlockedExchange(&g_gv_ring_ready[k], 1);
++}
++
++static void ld_gv_drain(void)
++{
++    if (g_gv_ring_overflow) {
++        InterlockedExchange(&g_gv_ring_overflow, 0);
++        ld_gv_mark(0, 0, 0xFFFFFFFFu); ld_gv_mark(1, 0, 0xFFFFFFFFu);
++    }
++    while (g_gv_ring_tail != g_gv_ring_head) {
++        const u32 k = (u32)g_gv_ring_tail % LD_GV_RING;
++        if (!g_gv_ring_ready[k]) break;                  /* producer still writing */
++        ld_gv_mark((u32)g_gv_ring[k].loc, (u32)g_gv_ring[k].off, (u32)g_gv_ring[k].size);
++        InterlockedExchange(&g_gv_ring_ready[k], 0);
++        g_gv_ring_tail++;
++    }
++}
++
++/* Patch 2017 diagnostic (LD_GUEST_WRITE_DBG=1): did anything rewrite an NV0039
++ * copy destination between the copy and the next texture bind that reads it?
++ * (Killzone 3: the scene copy at main 0x1310400 is sampled by the final
++ * composite; SPU post-processing is expected to change it in between.) */
++static struct { u32 loc, off, size, frame; u64 hash; int armed; } g_gv_watch[8];
++static u64 g_gv_watch_changed, g_gv_watch_same;
++
++void rsx_live_draw_watch_copy(u32 location, u32 offset, u32 size)
++{
++    static int dbg = -1;
++    if (dbg < 0) dbg = getenv("LD_GUEST_WRITE_DBG") ? 1 : 0;
++    if (!dbg || !g.ready || !size) return;
++    const u8* p = guest_ptr(location, offset, size);
++    if (!p) return;
++    u32 k = 0;
++    for (u32 i = 0; i < 8; i++) if (g_gv_watch[i].loc == location && g_gv_watch[i].off == offset) { k = i; goto set; }
++    for (k = 0; k < 8 && g_gv_watch[k].armed; k++) {}
++    if (k == 8) k = 0;
++set:
++    g_gv_watch[k].loc = location; g_gv_watch[k].off = offset; g_gv_watch[k].size = size;
++    g_gv_watch[k].frame = g_ld_frames; g_gv_watch[k].hash = ld_gv_mix(1469598103934665603ull, p, size);
++    g_gv_watch[k].armed = 1;
++}
++
++static void ld_gv_watch_bind(u32 location, u32 offset, u32 span)
++{
++    for (u32 k = 0; k < 8; k++) {
++        if (!g_gv_watch[k].armed || g_gv_watch[k].loc != location) continue;
++        const u64 a0 = g_gv_watch[k].off, a1 = a0 + g_gv_watch[k].size, b0 = offset, b1 = b0 + (span ? span : 1u);
++        if (!(a0 < b1 && b0 < a1)) continue;
++        const u8* p = guest_ptr(location, g_gv_watch[k].off, g_gv_watch[k].size);
++        if (!p) continue;
++        const int changed = ld_gv_mix(1469598103934665603ull, p, g_gv_watch[k].size) != g_gv_watch[k].hash;
++        if (changed) g_gv_watch_changed++; else g_gv_watch_same++;
++        const u64 n = g_gv_watch_changed + g_gv_watch_same;
++        if (n <= 16 || (n & 255u) == 0)
++            fprintf(stderr, "[guest-write] NV0039 dst %u:0x%08X+0x%X (copied frame %u) bound as texture %u:0x%08X"
++                            " in frame %u: %s since the copy (changed %llu, unchanged %llu)\n",
++                    location, g_gv_watch[k].off, g_gv_watch[k].size, g_gv_watch[k].frame, location, offset,
++                    g_ld_frames, changed ? "REWRITTEN by the guest" : "unchanged",
++                    (unsigned long long)g_gv_watch_changed, (unsigned long long)g_gv_watch_same);
++        g_gv_watch[k].armed = 0;
++    }
++}
++
++/* At the flip: baselines for surfaces the GPU wrote this frame (so a later
++ * guest write into them, e.g. memory reused for streaming, is seen), and a
++ * cost line every 300 frames. */
++static void ld_gv_flip(void)
++{
++    if (!ld_gv_enabled()) return;
++    ld_gv_drain();
++    for (u32 i = 0; i < g.n_surfaces; i++)
++        if (g.surfaces[i].tex && g.surfaces[i].gv_pending && !g.surfaces[i].gv_dirty)
++            ld_gv_baseline(&g.surfaces[i]);
++    g_gv.hashed_bytes += g_gv.frame_hashed_bytes;
++    g_gv.ticks += g_gv.frame_ticks;
++    if (g_gv.frame_ticks > g_gv.max_frame_ticks) g_gv.max_frame_ticks = g_gv.frame_ticks;
++    g_gv.frame_hashed_bytes = 0; g_gv.frame_ticks = 0;
++    if (++g_gv.frames % 300u == 0 && g_gv_qpf.QuadPart) {
++        const double us = 1e6 / (double)g_gv_qpf.QuadPart;
++        fprintf(stderr, "[guest-validate] frames=%u hashed %.1f KB/frame, %.1f us/frame avg, %.1f us max;"
++                        " checks=%llu baselines=%llu uploads=%llu (bands %llu, explicit %llu)\n",
++                g_gv.frames, (double)g_gv.hashed_bytes / 1024.0 / g_gv.frames,
++                (double)g_gv.ticks * us / g_gv.frames, (double)g_gv.max_frame_ticks * us,
++                (unsigned long long)g_gv.checks, (unsigned long long)g_gv.baselines,
++                (unsigned long long)g_gv.upload_events, (unsigned long long)g_gv.uploads_bands,
++                (unsigned long long)g_gv.explicit_uploads);
++        g_gv.hashed_bytes = 0; g_gv.ticks = 0; g_gv.max_frame_ticks = 0;
++        g_gv.frames = 0;
++    }
++}
++
+ /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
+  * descriptor-only cache, re-hash the source once per frame and refresh the
+  * D3D resource when the game rewrites the same guest address. */
+@@ -3207,6 +3580,10 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+     static int refresh_enabled = -1;
+     if (refresh_enabled < 0)
+         refresh_enabled = getenv("RSX_NO_TEX_REFRESH") ? 0 : 1;
++    if (g_gv_on) ld_gv_drain();   /* patch 2017: explicit writes from other threads */
++    if (g_gv_watch[0].armed | g_gv_watch[1].armed | g_gv_watch[2].armed | g_gv_watch[3].armed |
++        g_gv_watch[4].armed | g_gv_watch[5].armed | g_gv_watch[6].armed | g_gv_watch[7].armed)
++        ld_gv_watch_bind(t->location, t->offset, texture_source_span(t));
+ 
+     for (u32 i = 0; i < g.n_textures; i++) {
+         texcache_t* entry = &g.textures[i];
+@@ -7153,6 +7530,8 @@ static void ld_movie_capture_overlay(void)
+ 
+     /* A guest flip still marks a new texture-generation boundary even though
+      * the guest surface is not sent to the swap chain. */
++    rsx_live_draw_before_guest_sync();   /* patch 2017 */
++    ld_gv_flip();
+     g_ld_frames++;
+     ld_movie_reset_rings();
+ }
+@@ -8428,6 +8807,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             slots[u] = surface_feedback_srv(target);
+             g_ld_bind_surf++;
+         } else if (sampled >= 0) {
++            if (g_gv_on) { ld_gv_drain(); ld_gv_validate((u32)sampled); }   /* patch 2017 */
+             /* LD_ALIAS_DBG also reports the HIT. A texture that aliases a render
+              * surface when it should not is exactly as interesting as one that
+              * fails to alias when it should, and only the miss was visible --
+@@ -9704,9 +10084,52 @@ static int ld_range_overlaps(u32 loc_a, u32 off_a, u32 span_a, u32 loc_b, u64 b0
+     const u64 a0 = off_a, a1 = a0 + (span_a ? span_a : 0x4000000u);
+     return a0 < b1 && b0 < a1;
+ }
++/* Patch 2017: mark textures (re-hash at the next bind) and live colour
++ * surfaces (upload the written rows at the next bind) under a guest write. */
++static void ld_gv_mark(u32 location, u32 offset, u32 size)
++{
++    if (!size) return;
++    const u64 b0 = offset, b1 = b0 + size;
++    const u32 stale = g_ld_frames - 1u;
++    for (u32 i = 0; i < g.n_textures; i++) {
++        texcache_t* e = &g.textures[i];
++        if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1))
++            e->last_hash_frame = stale;
++    }
++    for (u32 i = 0; i < g.n_vtex; i++) {
++        vtexcache_t* e = &g.vtex[i];
++        if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1))
++            e->last_hash_frame = stale;
++    }
++    for (u32 i = 0; i < g.n_surfaces; i++) {
++        surface_t* s = &g.surfaces[i];
++        u32 texel, gp;
++        if (s->location != location || !ld_gv_geometry(s, &texel, &gp)) continue;
++        const u64 s0 = s->offset, s1 = s0 + (u64)gp * (s->h - 1u) + (u64)s->w * texel;
++        if (!(s0 < b1 && b0 < s1)) continue;
++        const u32 y0 = b0 <= s0 ? 0u : (u32)((b0 - s0) / gp);
++        const u32 y1 = b1 >= s1 ? s->h : (u32)((b1 - s0 + gp - 1u) / gp);
++        if (s->gv_dirty) {
++            if (y0 < s->gv_dirty_y0) s->gv_dirty_y0 = y0;
++            if (y1 > s->gv_dirty_y1) s->gv_dirty_y1 = y1;
++        } else {
++            s->gv_dirty = 1; s->gv_dirty_y0 = y0; s->gv_dirty_y1 = y1 > s->h ? s->h : y1;
++        }
++    }
++}
++
+ u32 rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size)
+ {
+     if (!g.ready || !size) return 0;
++    if (ld_gv_enabled()) {
++        for (u32 i = 0; i < g.n_surfaces; i++) {
++            surface_t* s = &g.surfaces[i];
++            u32 texel, gp;
++            if (s->location != location || !ld_gv_geometry(s, &texel, &gp)) continue;
++            const u64 s0 = s->offset, s1 = s0 + (u64)gp * (s->h - 1u) + (u64)s->w * texel;
++            if (s0 < (u64)offset + size && (u64)offset < s1) { ld_gv_mark(location, offset, size); break; }
++        }
++    }
+     const u64 b0 = offset, b1 = b0 + size;
+     const u32 stale = g_ld_frames - 1u;   /* any value != g_ld_frames forces a re-hash */
+     u32 marked = 0;
+@@ -10169,6 +10592,52 @@ int rsx_live_draw_debug_read_surface(u32 location, u32 offset, void* out,
+  * target (local 0x1300000) to main memory with one NV0039 copy per frame
+  * (RPCS3 capture, pass 18); live-draw never writes surfaces to guest memory,
+  * so the copy moved stale VRAM. LD_NV0039_WRITEBACK=0 disables. */
++/* Write live colour surface i back into guest memory in the RSX layout
++ * (blocking GPU readback). Returns 1 when written. */
++static int ld_writeback_surface(u32 i, u32 for_off, u32 for_size)
++{
++    const surface_t* sf = &g.surfaces[i];
++    const u32 location = sf->location;
++    const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++    const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
++    if (!sf->tex || gp < sf->w * texel) return 0;
++    const u64 s0 = sf->offset, s1 = s0 + (u64)gp * (sf->h - 1u) + (u64)sf->w * texel;
++    /* Patch 2017: guest bytes newer than the GPU's (a guest write behind
++     * live-draw) go into the surface first, so the write-back keeps them. */
++    ld_gv_validate(i);
++    u8* gm = (u8*)guest_ptr(location, sf->offset, (u32)(s1 - s0));
++    const size_t n = (size_t)sf->w * sf->h * texel;
++    u8* buf = gm ? (u8*)malloc(n) : NULL;
++    if (!buf) return 0;
++    int ok = 0;
++    u32 w = 0, h = 0;
++    const int got = rsx_live_draw_debug_read_surface(location, sf->offset, buf, (u32)n, &w, &h);
++    if (got == (int)texel && w == sf->w && h == sf->h) {
++        for (u32 y = 0; y < h; y++) {
++            const u8* sp = buf + (size_t)y * w * texel;
++            u8* dp = gm + (size_t)y * gp;
++            for (u32 x = 0; x < w; x++, sp += texel, dp += texel) {
++                if (sf->fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {        /* host R,G,B,A -> guest A,R,G,B */
++                    dp[0] = sp[3]; dp[1] = sp[0]; dp[2] = sp[1]; dp[3] = sp[2];
++                } else if (texel == 8) {                           /* LE halves -> BE, X first */
++                    for (u32 c = 0; c < 4; c++) { dp[c * 2] = sp[c * 2 + 1]; dp[c * 2 + 1] = sp[c * 2]; }
++                } else {                                           /* R32_FLOAT LE -> BE */
++                    dp[0] = sp[3]; dp[1] = sp[2]; dp[2] = sp[1]; dp[3] = sp[0];
++                }
++            }
++        }
++        ok = 1;
++        g.surfaces[i].gv_gpu_dirty = 0;
++        if (ld_gv_enabled()) ld_gv_baseline(&g.surfaces[i]);   /* guest bytes == host now */
++        static int logged;
++        if (logged++ < 8)
++            fprintf(stderr, "[surface-writeback] surface %u:0x%08X %ux%u fmt=%d pitch=%u for 0x%08X+0x%X\n",
++                    location, sf->offset, w, h, (int)sf->fmt, gp, for_off, for_size);
++    }
++    free(buf);
++    return ok;
++}
++
+ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+ {
+     static int en = -1;
+@@ -10184,33 +10653,35 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+         if (gp < sf->w * texel) continue;
+         const u64 s0 = sf->offset, s1 = s0 + (u64)gp * (sf->h - 1u) + (u64)sf->w * texel;
+         if (!(s0 < r1 && r0 < s1)) continue;
+-        u8* gm = (u8*)guest_ptr(location, sf->offset, (u32)(s1 - s0));
+-        const size_t n = (size_t)sf->w * sf->h * texel;
+-        u8* buf = gm ? (u8*)malloc(n) : NULL;
+-        if (!buf) continue;
+-        u32 w = 0, h = 0;
+-        const int got = rsx_live_draw_debug_read_surface(location, sf->offset, buf, (u32)n, &w, &h);
+-        if (got == (int)texel && w == sf->w && h == sf->h) {
+-            for (u32 y = 0; y < h; y++) {
+-                const u8* sp = buf + (size_t)y * w * texel;
+-                u8* dp = gm + (size_t)y * gp;
+-                for (u32 x = 0; x < w; x++, sp += texel, dp += texel) {
+-                    if (sf->fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {        /* host R,G,B,A -> guest A,R,G,B */
+-                        dp[0] = sp[3]; dp[1] = sp[0]; dp[2] = sp[1]; dp[3] = sp[2];
+-                    } else if (texel == 8) {                           /* LE halves -> BE, X first */
+-                        for (u32 c = 0; c < 4; c++) { dp[c * 2] = sp[c * 2 + 1]; dp[c * 2 + 1] = sp[c * 2]; }
+-                    } else {                                           /* R32_FLOAT LE -> BE */
+-                        dp[0] = sp[3]; dp[1] = sp[2]; dp[2] = sp[1]; dp[3] = sp[0];
+-                    }
+-                }
+-            }
+-            done++;
+-            static int logged;
+-            if (logged++ < 4)
+-                fprintf(stderr, "[nv0039-writeback] surface %u:0x%08X %ux%u fmt=%d pitch=%u for copy 0x%08X+0x%X\n",
+-                        location, sf->offset, w, h, (int)sf->fmt, gp, offset, size);
+-        }
+-        free(buf);
++        done += (u32)ld_writeback_surface(i, offset, size);
++    }
++    return done;
++}
++
++/* Patch 2017: colour surfaces in MAIN memory are rendered for the CPU/SPU side.
++ * Killzone 3 draws four of them right after its NV0039 scene copy (RPCS3
++ * capture: 640x360 0x16D0400 and 320x180 0x19AB800 downsamples of the scene,
++ * 640x360 0x1892400 from depth, 320x180 F_X32 0x1A1C000), then releases a
++ * semaphore for its SPU post jobs. live-draw kept those pixels on the GPU, so
++ * the SPUs read stale memory. Write every main-memory surface the GPU drew
++ * since its last write-back back to guest memory before the guest can observe
++ * a sync point: NV4097 back-end/texture-read semaphore release, NV406E
++ * semaphore release, flip. LD_MAIN_SURFACE_WRITEBACK=0 disables. */
++u32 rsx_live_draw_before_guest_sync(void)
++{
++    static int en = -1;
++    if (en < 0) { const char* e = getenv("LD_MAIN_SURFACE_WRITEBACK"); en = e ? atoi(e) : 1; }
++    if (!en || !g.ready) return 0;
++    u32 done = 0;
++    for (u32 i = 0; i < g.n_surfaces; i++)
++        if (g.surfaces[i].tex && g.surfaces[i].location == 1u && g.surfaces[i].gv_gpu_dirty)
++            done += (u32)ld_writeback_surface(i, g.surfaces[i].offset, 0);
++    if (done) {
++        static u64 total; total += done;
++        static u32 n;
++        if (n++ < 8 || (n & 1023u) == 0)
++            fprintf(stderr, "[main-surface-writeback] %u surface(s) at a guest sync point (frame %u, total %llu)\n",
++                    done, g_ld_frames, (unsigned long long)total);
+     }
+     return done;
+ }
+@@ -10636,6 +11107,8 @@ static void ld_present_body(u32 buffer_id)
+     { static unsigned long long packets_at_last_frame = 0;
+       g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
+       packets_at_last_frame = g_ld_stats.packets_seen; }
++    rsx_live_draw_before_guest_sync();   /* patch 2017 */
++    ld_gv_flip();
+     g_ld_frames++;
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_present(g_ld_frames);
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 8ce60d44..41b0e648 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -85,6 +85,21 @@ void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value);
+  * even within the frame that already hashed them. Returns how many entries
+  * were marked. */
+ u32  rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size);
++/* Patch 2017: the same note from any thread (SPU DMA puts, PPU-side copies):
++ * queued and applied on the rsx thread before the next texture bind. Live
++ * colour surfaces under the range get the written rows uploaded from guest
++ * memory at their next bind as a texture; cached textures are re-hashed.
++ * cellGcm_note_guest_write_ea() takes an effective address instead. */
++void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size);
++/* Patch 2017 diagnostic (LD_GUEST_WRITE_DBG=1): remember the contents of an
++ * NV0039 copy destination; the next texture bind that reads it logs whether the
++ * guest rewrote it in between ([guest-write] lines). */
++void rsx_live_draw_watch_copy(u32 location, u32 offset, u32 size);
++/* Patch 2017: write every main-memory colour surface the GPU drew since its
++ * last write-back into guest memory (blocking readback). Called before the
++ * guest can observe a sync point (semaphore/label release, flip), so CPU/SPU
++ * readers of RSX output in main memory see it. Returns surfaces written. */
++u32  rsx_live_draw_before_guest_sync(void);
+ /* Patch 2015: before the guest reads [offset, offset+size) of `location`
+  * (an NV0039 copy out of local memory), write every live colour surface that
+  * overlaps it back into guest memory in the RSX layout (A8R8G8B8 as A,R,G,B

@@ -1,0 +1,40 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+--- a/runtime/ppu/ppu_loader.cpp	2026-10-08 10:49:40.010342044 -0500
++++ b/runtime/ppu/ppu_loader.cpp	2026-10-08 10:49:40.037050873 -0500
+@@ -2788,6 +2788,36 @@
+     last = cur; streak = 0;
+     fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X (tid=%llu lr=0x%08X)\n",
+             (uint32_t)ctx->ctr, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
++    /* PPU_UNRES_DUMP="rN+OFF:LEN,...": dump guest words at register-relative addresses on the first 3
++     * unresolved calls (e.g. "r7+0xEA0:0x10,r7+0x16B0:0x700" shows a table the bad slot was read from
++     * next to its neighbours: a whole table of bad slots and one bad slot have different causes). */
++    { static const char* s_ud = (const char*)-1; static int s_udn = 0;
++      if (s_ud == (const char*)-1) s_ud = getenv("PPU_UNRES_DUMP");
++      if (s_ud && vm_base && s_udn++ < 3) {
++          const char* p = s_ud;
++          while (*p) {
++              unsigned r = 0; unsigned long off = 0, len = 0x40; char* e;
++              if (*p == 'r') p++;
++              r = (unsigned)strtoul(p, &e, 10); p = e;
++              if (*p == '+') { off = strtoul(p + 1, &e, 0); p = e; }
++              if (*p == ':') { len = strtoul(p + 1, &e, 0); p = e; }
++              if (r < 32) {
++                  uint32_t base = (uint32_t)ctx->gpr[r] + (uint32_t)off;
++                  if (len > 0x1000) len = 0x1000;
++                  for (uint32_t i = 0; i < len; i += 0x20) {
++                      char ln[200]; int k = snprintf(ln, sizeof ln, "      UDUMP r%u+0x%lX @%08X:", r, off + i, base + i);
++                      for (uint32_t j = 0; j < 0x20 && i + j < len; j += 4) {
++                          uint32_t ea = base + i + j;
++                          uint32_t w = ea < 0xFFFFFFF0u ? __builtin_bswap32(*(volatile uint32_t*)(vm_base + ea)) : 0;
++                          k += snprintf(ln + k, sizeof ln - k, " %08X", w);
++                      }
++                      fprintf(stderr, "%s\n", ln);
++                  }
++              }
++              while (*p && *p != ',') p++;
++              if (*p == ',') p++;
++          }
++      } }
+     /* With no NID table the very first one of these is the expected outcome
+      * rather than a mystery, so name the cause instead of the symptom. */
+     { extern uint32_t ps3_hle_count(void);

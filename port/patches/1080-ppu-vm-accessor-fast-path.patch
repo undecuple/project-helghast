@@ -1,0 +1,130 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream vm_inline_ok gate (inline guest loads) added next to it, both kept.
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1593,7 +1593,60 @@ static struct VmInlineInit {
+     }
+ } s_vm_inline_init;
+ 
+-uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
++/* ---- KZ3 patch 1080 (SPU pass 62): one gate in front of the guest accessors' diagnostics ----
++ * Every guest load and store of the lifted PPU code is a call into vm_read* / vm_write*, and each of them walked
++ * a dozen debug hooks first (PPU_RWATCH, PPU_FORCE_READ_ADDR, YDKJ_RWATCH, PPU_RVAL, PPU_HOTMAP, PPU_READ_DIAG,
++ * PT, PPU_RVAL64 on the read side; PPU_WVAL and PPU_WWATCH in barrier_watch_hit on the write side): one cached
++ * static and branch each, plus the address special cases. KZ3's level profile of the main PPU thread (spu round
++ * 62, K4, 44,170 samples over 131-180 s) had vm_read32 alone at 7.1 % of all samples and the accessors with the
++ * watch hooks at 47 % of the thread's non-waiting time, more than the lifted game code (10.3 %).
++ * s_vm_rd_fast = 1 when none of those read variables is set (read once, at the first slow-path call); then a read
++ * of a plain address (not the null page, not a raw SPU problem-state register, not the GCM ref word that
++ * GCM_REFPOLL publishes on) is the load and byte swap alone. With no write watch set and no barrier sync watch
++ * armed (g_barrier_sync_watch, set at run time), barrier_watch_hit is skipped; the store itself (null-page drop,
++ * SPU reservation coherence, raw SPU registers, PT) is unchanged. A variable set means the old full path, so every
++ * diagnostic works as before. Opt-in, KZ3_VM_FAST=1 (SPU pass 62: main-thread compute -20 %, no frame-rate change
++ * in the walker-bound K4 scene, and one of its two runs stalled at 172 s in a main-thread flag wait, cause open; see
++ * the RE notes Pass 62). On POSIX (ppu_vm_size != 0, a real range check) the gate stays off. */
++static int s_vm_rd_fast = -1, s_vm_wr_fast = -1;
++static void vm_fast_init(void)
++{
++    const char* en = getenv("KZ3_VM_FAST");
++    int on = en && *en && *en != '0' && ppu_vm_size == 0;
++#ifdef VM_SAMPLE_READS
++    on = 0;
++#endif
++    static const char* const rd[] = {"PPU_RWATCH", "PPU_FORCE_READ_ADDR", "YDKJ_RWATCH", "PPU_RVAL", "PPU_RVAL64",
++                                     "PPU_HOTMAP", "PPU_READ_DIAG", "PT"};
++    int rdf = on;
++    for (unsigned i = 0; i < sizeof rd / sizeof rd[0]; i++) if (getenv(rd[i])) rdf = 0;
++    const int wrf = on && !getenv("PPU_WVAL") && !getenv("PPU_WWATCH");
++    s_vm_wr_fast = wrf;
++    __atomic_store_n(&s_vm_rd_fast, rdf, __ATOMIC_RELEASE);
++    static volatile long once = 0;   /* several threads may get here first; the values are the same, print once */
++    if (__sync_lock_test_and_set(&once, 1) == 0)
++        fprintf(stderr, "[vm-fast] guest accessor fast path: reads %s, writes %s (KZ3 patch 1080)\n",
++                rdf ? "on" : "off", wrf ? "on" : "off");
++}
++static inline int vm_rd_plain(uint32_t a)
++{
++    return a >= 0x10000u && !spu_raw_is_reg(a) && a != VM_HLE_INJECT_BASE + 0x2008u;
++}
++#define VM_RD_FAST(a, T, n, swap)                                                                                    \
++    do {                                                                                                             \
++        if (__builtin_expect(s_vm_rd_fast > 0, 1) && __builtin_expect(vm_rd_plain((uint32_t)(a)), 1)) {              \
++            T _v; memcpy(&_v, vm_base + (uint32_t)(a), n); return swap(_v);                                          \
++        }                                                                                                            \
++        if (__builtin_expect(s_vm_rd_fast < 0, 0)) vm_fast_init();                                                   \
++    } while (0)
++#define VM_SWAP8(x) (x)
++/* barrier_watch_hit unless the write side is known quiet */
++#define VM_WW(a, v, w, ra)                                                                                           \
++    do {                                                                                                             \
++        if (!(__builtin_expect(s_vm_wr_fast > 0, 1) && !g_barrier_sync_watch)) barrier_watch_hit(a, v, w, ra);       \
++    } while (0)
++uint8_t  vm_read8 (uint64_t a) { VM_RD_FAST(a, uint8_t, 1, VM_SWAP8);   /* patch 1080 */
++    if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
+     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
+ #ifdef VM_SAMPLE_READS
+     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
+@@ -1629,11 +1682,13 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
+           n=0; } }
+       else { last=(uint32_t)a; n=0; } }
+     return vm_base[(uint32_t)a]; }
+-uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
++uint16_t vm_read16(uint64_t a) { VM_RD_FAST(a, uint16_t, 2, __builtin_bswap16);   /* patch 1080 */
++    if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+     if (ppu_read_diag()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
+     return __builtin_bswap16(v); }
+-uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
++uint32_t vm_read32(uint64_t a) { VM_RD_FAST(a, uint32_t, 4, __builtin_bswap32);   /* patch 1080 */
++    if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
+     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
+      * cannot be served out of memory. Everything else in the window the SPU
+@@ -1746,7 +1801,8 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
+       } }
+       else { last=(uint32_t)a; n=0; } }
+     return __builtin_bswap32(v); }
+-uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8);
++uint64_t vm_read64(uint64_t a) { VM_RD_FAST(a, uint64_t, 8, __builtin_bswap64);   /* patch 1080 */
++    if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8);
+     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 8, __builtin_return_address(0)); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
+ #ifdef VM_SAMPLE_READS
+     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
+@@ -1947,7 +2003,8 @@ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* r
+ {
+     barrier_watch_hit(ea, val, width, ra);
+ }
+-void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
++void vm_write8 (uint64_t a, uint8_t  v) { VM_WW((uint32_t)a, v, 1, __builtin_return_address(0));   /* patch 1080 */
++    if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
+ #ifdef _WIN32
+     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
+     { if(g_pt_val==-2){const char*e=getenv("PT"); g_pt_val=e?(int64_t)strtoul(e,0,16):-1;}
+@@ -1957,9 +2014,11 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
+         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
+ #endif
+     VM_WRITE_COH(a, &v, 1); }
+-void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
++void vm_write16(uint64_t a, uint16_t v) { VM_WW((uint32_t)a, v, 2, __builtin_return_address(0));   /* patch 1080 */
++    if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
+     v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
+-void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
++void vm_write32(uint64_t a, uint32_t v) { VM_WW((uint32_t)a, v, 4, __builtin_return_address(0));   /* patch 1080 */
++    if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
+ #ifdef _WIN32
+     /* PT restore: a full-word store of a valid pointer (high byte set) to a
+      * previously-truncated slot clears the record (that truncation was transient). */
+@@ -1977,8 +2036,8 @@ void vm_write64(uint64_t a, uint64_t v) {
+      * every 64-bit struct field is written with std, so a watch on one would
+      * report nothing and read as "nobody writes this". Two halves so an
+      * 8-byte store still shows up when only its low or high word is watched. */
+-    barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
+-    barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
++    VM_WW((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));   /* patch 1080 */
++    VM_WW((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
+     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
+     v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
+ }

@@ -1,0 +1,23 @@
+KZ3 patch 1051 (SPU pass 35): g_kz3_putllc_hook(ea) after every committed PUTLLC, for the culling probe's sync-word watch (the DMA put hook never sees atomics).
+
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -137,6 +137,9 @@
+  * stream is, so the only evidence is the DMA that writes it. NULL until
+  * installed, so a title with no SPU-built FIFO pays nothing. */
+ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
++/* KZ3 patch 1051 (SPU pass 35): called after every committed PUTLLC with the line EA (the DMA put hook above
++ * never sees atomics); the culling probe (port/spu/kz3_cull_probe.c) watches the frame's sync word with it. */
++void (*g_kz3_putllc_hook)(uint32_t ea) = 0;
+ 
+ void spu_halt(spu_context* ctx)
+ {
+@@ -733,6 +736,8 @@
+               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
+             kz3_curcont_check(ctx, ea, mem, ls, "PUTLLC");   /* KZ3 patch 1013 */
+             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
++            { extern void (*g_kz3_putllc_hook)(uint32_t ea);   /* KZ3 patch 1051 */
++              if (g_kz3_putllc_hook) g_kz3_putllc_hook((uint32_t)ea); }
+             /* A committing PUTLLC is a line write like any other, so every
+              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
+              * Silent, this is the same lost update the PPU half was added to

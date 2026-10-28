@@ -1,0 +1,278 @@
+live-draw: zeta reads as textures: snapshot grows with the largest clip, depth formats prefer the zeta over a colour
+surface at the same address, a draw that does not write depth reads its own zeta's snapshot; LD_ZPROBE diagnostic.
+
+Symptom (Killzone 3, rounds 22-23): in the first level the depth-of-field inputs were flat (the 320x180 F_X32
+DepthToFuzzy target 0x1A1C000 one value, 4.88e-5 = every depth read 0) and the deferred lighting read depth 0.
+
+Cause 1: the R32F snapshot of a zeta was sized from the clip of the first pass that bound it. KZ3 first binds its
+1280x720 Z24S8 scene zeta (0x25C0000) with a 512x512 clip, so the snapshot stayed 512x512 and later 1280x720 reads
+(half-res depth downsample, lighting, DoF) got 0 outside the top-left corner. The snapshot now grows to the largest
+clip bound since (LD_NO_ZSNAP_GROW=1 = old).
+Cause 2: 0x2980000 is both the shadow map's colour target and a zeta; its X16 / DEPTH16 reads matched the colour
+surface first (zeros). A depth-format read at an address with a written host zeta now binds the zeta snapshot
+(LD_NO_ZETA_PREFER=1 = old).
+Cause 3: a draw that samples the zeta it has bound fell back to guest VRAM (never written). With depth write off
+(KZ3 deferred lighting, soft particles) it now reads the snapshot, as RSX does (LD_NO_ZSELF_SNAP=1 = old).
+Diagnostic: LD_ZPROBE=<n> [LD_ZPROBE_GATE=<file>] logs, once per (shader control, colour target) per frame, which
+resource each zeta-aliased unit got and three texels of the snapshot and guest VRAM, and the zeta a depth-export
+draw wrote. Off by default.
+
+Verified: tools/smoke/test_zeta_reads.c (Proton) PASS 256/256; each LD_NO_* control FAILs.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR280 depth textures, our zeta-alias kinds, switches and probe kept over it.
+Pass 83: v0.15.0 has zdepth_grow_snapshot itself (from our PR 280); this patch only adds the LD_NO_ZSNAP_GROW
+switch to it (pass 81 had added a second copy: redefinition, the Windows build failed).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -4372,7 +4372,10 @@ static D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle(u32 slot)
+ static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
+ {
++    /* Patch 2022: LD_NO_ZSNAP_GROW=1 = old behaviour (snapshot keeps its first clip). */
++    static int off = -1;
++    if (off < 0) off = getenv("LD_NO_ZSNAP_GROW") ? 1 : 0;
+     zdepth_t* z = &g.zdepths[i];
+-    if (!z->snapshot) return;
++    if (off || !z->snapshot) return;
+     u32 nw = rt_w < z->w ? rt_w : z->w, nh = rt_h < z->h ? rt_h : z->h;
+     if (nw < z->snapshot_w) nw = z->snapshot_w;
+     if (nh < z->snapshot_h) nh = z->snapshot_h;
+@@ -7887,6 +7890,145 @@ static void write_topology_indices(u32 prim, u32* indices)
+     }
+ }
+ 
++/* Patch 2022: LD_ZPROBE=<n> (off by default) logs up to n draws that bind a
++ * zeta as a texture (patch 2011 aliasing: X16 / DEPTH16 / A8R8G8B8 at a host
++ * zeta) and every depth-export draw (SHADER_CONTROL & 0xE with depth write):
++ * which resource the unit got (snapshot, own zeta -> guest VRAM, no write),
++ * and the values at three texels of the snapshot and of guest VRAM.
++ * LD_ZPROBE_GATE=<file> limits it to while <file> exists. Blocking readbacks:
++ * diagnosis only. */
++typedef struct { u32 unit; rsx_dsp_texture t; int zi; int why; } ld_zp_note_t;
++enum { LD_ZP_SNAP = 0, LD_ZP_SELF, LD_ZP_NOWRITE };
++static ld_zp_note_t g_zp_notes[16];
++static u32 g_zp_n_notes;
++static int ld_zp_active(void)
++{
++    static int lim = -1; static const char* gate = (const char*)-1;
++    if (lim < 0) { const char* e = getenv("LD_ZPROBE"); lim = e ? atoi(e) : 0; }
++    if (lim <= 0) return 0;
++    if (gate == (const char*)-1) gate = getenv("LD_ZPROBE_GATE");
++    if (gate) { FILE* f = fopen(gate, "rb"); if (!f) return 0; fclose(f); }
++    return 1;
++}
++static void ld_zp_note(u32 unit, const rsx_dsp_texture* t, int zi, int why)
++{
++    if (g_zp_n_notes >= 16) return;
++    g_zp_notes[g_zp_n_notes].unit = unit; g_zp_notes[g_zp_n_notes].t = *t;
++    g_zp_notes[g_zp_n_notes].zi = zi; g_zp_notes[g_zp_n_notes].why = why;
++    g_zp_n_notes++;
++}
++/* Read n R32F texels of zeta i's snapshot (blocking). */
++static int ld_zp_read_snapshot(zdepth_t* z, u32 n, const u32* xs, const u32* ys, float* out)
++{
++    if (!z->snapshot || !z->snapshot_valid || n > 4) return 0;
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 512u * 4u;
++    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
++    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    ID3D12Resource* rb = NULL;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb)))
++        return 0;
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition.pResource = z->snapshot;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.StateBefore = z->snapshot_state;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    for (u32 k = 0; k < n; k++) {
++        D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
++        src.pResource = z->snapshot; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++        dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++        dst.PlacedFootprint.Offset = 512u * k;
++        dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
++        dst.PlacedFootprint.Footprint.Width = 1;
++        dst.PlacedFootprint.Footprint.Height = 1;
++        dst.PlacedFootprint.Footprint.Depth = 1;
++        dst.PlacedFootprint.Footprint.RowPitch = 256;
++        const u32 x = xs[k] < z->snapshot_w ? xs[k] : z->snapshot_w - 1u;
++        const u32 y = ys[k] < z->snapshot_h ? ys[k] : z->snapshot_h - 1u;
++        D3D12_BOX box = { x, y, 0, x + 1u, y + 1u, 1 };
++        g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &box);
++    }
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    b.Transition.StateAfter = z->snapshot_state;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    ld_flush(LD_FLUSH_READBACK);
++    int ok = 0; u8* px = NULL; D3D12_RANGE rr = {0, 512u * 4u};
++    if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
++        for (u32 k = 0; k < n; k++) memcpy(&out[k], px + 512u * k, 4);
++        D3D12_RANGE wr = {0, 0}; rb->lpVtbl->Unmap(rb, 0, &wr); ok = 1;
++    }
++    rb->lpVtbl->Release(rb);
++    return ok;
++}
++static void ld_zp_points(u32 w, u32 h, u32* xs, u32* ys)
++{
++    for (u32 k = 0; k < 3; k++) { xs[k] = w * (k + 1u) / 4u; ys[k] = h * (k + 1u) / 4u; }
++}
++/* After the draw: log the noted binds and, for a depth-export draw, the zeta it wrote. */
++static void ld_zp_finish(u32 current_zslot, const render_state_t* rs)
++{
++    const u32 ctrl = rsx_dsp_shader_control(&g.rsx);
++    const int dexp = (ctrl & 0xEu) && rs->depth_write;
++    if (!g_zp_n_notes && !dexp) return;
++    if (!ld_zp_active()) { g_zp_n_notes = 0; return; }
++    rsx_dsp_surface sf; rsx_dsp_get_surface(&g.rsx, &sf);
++    {   /* one line per (shader control, colour target) per frame */
++        static u32 seen_frame = ~0u, n_seen = 0; static u64 seen[64];
++        const u64 key = (u64)ctrl << 32 | sf.color_offset[0];
++        if (seen_frame != g_ld_frames) { seen_frame = g_ld_frames; n_seen = 0; }
++        for (u32 k = 0; k < n_seen; k++) if (seen[k] == key) { g_zp_n_notes = 0; return; }
++        if (n_seen < 64) seen[n_seen++] = key;
++    }
++    static u32 used = 0;
++    if (++used > (u32)atoi(getenv("LD_ZPROBE"))) { g_zp_n_notes = 0; return; }
++    fprintf(stderr, "[zprobe] frame=%u ctrl=0x%08X surf=0x%X zeta=%u:0x%X clip=%ux%u zslot=%u "
++            "dtest=%u dwrite=%u dfunc=0x%X\n", g_ld_frames, ctrl, sf.color_offset[0],
++            sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h, current_zslot,
++            rs->depth_test, rs->depth_write, rs->depth_func);
++    for (u32 k = 0; k < g_zp_n_notes; k++) {
++        const ld_zp_note_t* n = &g_zp_notes[k];
++        u32 xs[3], ys[3]; ld_zp_points(n->t.width, n->t.height, xs, ys);
++        char vals[160] = "", gvs[160] = "";
++        if (n->zi >= 0 && n->why == LD_ZP_SNAP) {
++            zdepth_t* z = &g.zdepths[n->zi]; float f[3];
++            if (ld_zp_read_snapshot(z, 3, xs, ys, f))
++                snprintf(vals, sizeof vals, "snap %ux%u [%.6f %.6f %.6f]",
++                         z->snapshot_w, z->snapshot_h, f[0], f[1], f[2]);
++        }
++        const u32 base = n->t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
++        const u32 bpp = base == TEX_FMT_A8R8G8B8 ? 4u : 2u;
++        const u32 pitch = n->t.pitch ? n->t.pitch : n->t.width * bpp;
++        const u8* gm = guest_ptr(n->t.location, n->t.offset, pitch * n->t.height);
++        if (gm) {
++            u32 v[3];
++            for (u32 j = 0; j < 3; j++) {
++                const u8* p = gm + (size_t)ys[j] * pitch + (size_t)xs[j] * bpp;
++                v[j] = bpp == 4 ? ((u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3])
++                                : ((u32)p[0] << 8 | p[1]);
++            }
++            snprintf(gvs, sizeof gvs, "vram [%08X %08X %08X]", v[0], v[1], v[2]);
++        }
++        fprintf(stderr, "[zprobe]   unit%u tex %u:0x%X fmt=0x%02X %ux%u pitch=%u remap=0x%04X -> %s zeta#%d "
++                "%s %s\n", n->unit, n->t.location, n->t.offset, n->t.format, n->t.width,
++                n->t.height, n->t.pitch, n->t.remap & 0xFFFFu,
++                n->why == LD_ZP_SNAP ? "snapshot" : n->why == LD_ZP_SELF ? "OWN-ZETA(vram)" : "NO-WRITE(vram)",
++                n->zi, vals, gvs);
++    }
++    g_zp_n_notes = 0;
++    if (dexp && current_zslot) {
++        zdepth_t* z = &g.zdepths[current_zslot - 1];
++        u32 xs[3], ys[3]; float f[3]; ld_zp_points(sf.clip_w, sf.clip_h, xs, ys);
++        if (zdepth_snapshot(current_zslot) && ld_zp_read_snapshot(z, 3, xs, ys, f))
++            fprintf(stderr, "[zprobe]   depth-export wrote zeta#%u %ux%u (snap %ux%u) [%.6f %.6f %.6f]\n",
++                    current_zslot - 1, z->w, z->h, z->snapshot_w, z->snapshot_h, f[0], f[1], f[2]);
++    }
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -8196,15 +8338,21 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     u32 texture_mask = 0;
+     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) slots[u] = SRV_WHITE;
+     for (u32 u = 0; u < SMP_TABLE_SIZE; u++) smp_slots[u] = SMP_DEFAULT;
+-    /* A draw that samples its own zeta while not writing depth (deferred
+-     * lighting reading the scene depth it also depth-tests against, soft
+-     * particles) reads the snapshot: the zeta does not change during such a
+-     * draw, so that is what RSX returns. Before, it fell back to guest VRAM,
+-     * which the host-side depth never reaches (depth 0). A draw that writes
+-     * the zeta it reads keeps that fallback. */
+-    const int self_zeta_read = current_zslot &&
+-        !((rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) &&
+-          (rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1u));
++    g_zp_n_notes = 0;
++    /* Patch 2022: a draw that samples its own zeta while not writing depth
++     * (Killzone 3: deferred lighting reads the scene depth bound for its
++     * depth test, soft particles read the half-res depth they test against)
++     * reads the snapshot; that is what RSX gives (the zeta does not change
++     * during the draw). Before, it fell back to guest VRAM (never written:
++     * depth 0). With depth writes on it keeps the old fallback.
++     * LD_NO_ZSELF_SNAP=1 = old behaviour. */
++    int self_zeta_read = 0;
++    if (current_zslot) {
++        static int off = -1;
++        if (off < 0) off = getenv("LD_NO_ZSELF_SNAP") ? 1 : 0;
++        self_zeta_read = !off && !((rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) &&
++                                   (rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1u));
++    }
+     /* LD_UNITS=1: every enabled texture unit of every draw that samples PS1
+      * VRAM, once per distinct combination.
+      *
+@@ -8276,20 +8424,17 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+          * descriptor actually declares; failing that, the most recently drawn
+          * one, which is the only other defensible answer. */
+         int sampled = -1;
+-        /* An address can be both a colour target and a zeta (a shadow map
+-         * pass that binds the same memory as both, colour writes masked).
+-         * A depth-format read of an address with a written host zeta is a
+-         * depth read: try the zeta first. Before, the colour surface at the
+-         * same address was taken (zeros). */
++        /* Patch 2022: Killzone 3's 0x2980000 is both the shadow map's colour
++         * target (colour writes masked) and a zeta (shadow map, then the
++         * half-res depth). Its X16 / DEPTH16 reads took the colour surface
++         * (zeros) because the colour alias is tried first. A depth-format read
++         * of an address with a written host zeta is a depth read.
++         * LD_NO_ZETA_PREFER=1 = old behaviour. */
+         int zeta_pref = 0;
+-        if ((t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) == TEX_FMT_DEPTH24_D8)
+-            for (u32 i = 0; i < g.n_zdepths; i++)
+-                if (g.zdepths[i].location == t.location &&
+-                    g.zdepths[i].offset == t.offset &&
+-                    (g.zdepths[i].had_write || g.zdepths[i].snapshot_valid)) {
+-                    zeta_pref = 1;
+-                    break;
+-                }
++        { static int off = -1;
++          if (off < 0) off = getenv("LD_NO_ZETA_PREFER") ? 1 : 0;
++          const int zk = off ? ZALIAS_NONE : tex_zalias_kind(&t);
++          zeta_pref = zk == ZALIAS_VALUE || zk == ZALIAS_SHADOW; }
+         if (!zeta_pref) { u32 best_gen = 0;
+           for (u32 i = 0; i < g.n_surfaces; i++) {
+               const surface_t* sf_i = &g.surfaces[i];
+@@ -8459,6 +8604,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                         }
+                         break;
+                     }
++            if (tex_zalias_kind(&t) != ZALIAS_NONE) {   /* patch 2022 probe */
++                int zi = -1, why = LD_ZP_NOWRITE;
++                for (u32 i = 0; i < g.n_zdepths; i++)
++                    if (g.zdepths[i].location == t.location && g.zdepths[i].offset == t.offset) {
++                        zi = (int)i; break; }
++                if (sampled_depth >= 0) why = LD_ZP_SNAP;
++                else if (zi >= 0 && current_zslot == 1u + (u32)zi && !self_zeta_read) why = LD_ZP_SELF;
++                ld_zp_note(u, &t, zi, why);
++            }
+             if (sampled_depth >= 0) {
+                 slots[u] = SRV_ZDEPTH_BASE + sampled_depth;
+                 g_ld_zdepth_srv_binds++;
+@@ -8744,6 +8898,13 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         if (depth_state.depth_test && depth_state.depth_write)
+             z->had_write = 1;
+     }
++    static int zp_on = -1;   /* patch 2022: LD_ZPROBE */
++    if (zp_on < 0) zp_on = getenv("LD_ZPROBE") != NULL;
++    if (zp_on) {
++        render_state_t zp_state;
++        decode_render_state(&zp_state);
++        ld_zp_finish(current_zslot, &zp_state);
++    }
+     g_ld_stats.groups_executed++;
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.input_vertices += dc.n_source_refs;

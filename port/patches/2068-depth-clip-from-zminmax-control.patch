@@ -1,0 +1,45 @@
+KZ3 patch 2068 (RSX pass 64): NV4097_SET_ZMIN_MAX_CONTROL (0x1D78) bit 0 sets the PSO's DepthClipEnable (LD_DEPTH_CLIP=0 = old).
+rsx_live_draw.c zero-fills the PSO desc and never set RasterizerState.DepthClipEnable, so every draw had depth
+clipping off (D3D12 then clamps depth to the viewport range): geometry in front of the near plane or behind the far
+plane was drawn at the clamped depth instead of being clipped. cellGcmSetZMinMaxControl(cullNearFar, zclamp,
+cullIgnoreW) = bits 0, 4, 8; KZ3 sets 1 (clip) on almost every draw and 0x10 (clamp) on a few (Pyrrhus Outskirts
+captures: 2101/27 and 1763/12 draws). D3D12 clamps whenever clipping is off, so bit 0 alone decides; bit 8 is not
+mapped. A register the guest never wrote leaves clipping off, as before. render_state_t gains depth_clip, so the
+PSO key and the pso_keys.bin record size change (an older preload file is skipped once). Log: [depth-clip] on/off.
+Upstream candidate (general: the zeroed rasterizer desc disables depth clipping for every title).
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1510,6 +1510,8 @@
+     u32 depth_bounds;
+     u32 poly_scale_bits, poly_bias_bits;
+     u32 blend_mrt, color_mask_mrt;
++    /* Patch 2068: NV4097_SET_ZMIN_MAX_CONTROL (0x1D78) bit 0 (cull near/far = clip) -> DepthClipEnable. */
++    u32 depth_clip;
+ } render_state_t;
+ 
+ /* Device capabilities used by patch 2006 (filled at init). */
+@@ -1608,6 +1610,15 @@
+         const u32 cm = g.rsx.seen[M_COLOR_MASK_MRT >> 2] ? rsx_dsp_reg(&g.rsx, M_COLOR_MASK_MRT) : 0xFFF0u;
+         rs->color_mask_mrt = cm & ((rs->rt_count >= 4) ? 0xFFF0u : (rs->rt_count == 3) ? 0x0FF0u : 0x00F0u);
+     }
++    /* Patch 2068 (KZ3 RSX pass 64): SET_ZMIN_MAX_CONTROL bit 0 = cull outside [near, far] (clip), bit 4 = clamp,
++     * bit 8 = ignore W (cellGcmSetZMinMaxControl). D3D12 clamps to the viewport depth range whenever clipping is
++     * off, so bit 0 alone decides DepthClipEnable. KZ3 sets 1 on almost every draw and 0x10 (clamp) on a few
++     * (K2 capture: 2101 / 27). Before, the zeroed PSO desc left clipping off for every draw. LD_DEPTH_CLIP=0 = old.
++     * Never written by the guest: off, as before. */
++    { static int on = -1;
++      if (on < 0) { const char* e = getenv("LD_DEPTH_CLIP"); on = (e && e[0] == '0') ? 0 : 1;
++                    fprintf(stderr, "[depth-clip] %s (LD_DEPTH_CLIP)\n", on ? "on" : "off"); }
++      if (on && g.rsx.seen[0x1D78 >> 2]) rs->depth_clip = rsx_dsp_reg(&g.rsx, 0x1D78) & 1u; }
+ }
+ 
+ /* GL stencil-op enums (the NV4097 payload) -> D3D12. Zero (never seeded by
+@@ -1696,6 +1707,7 @@
+     /* Y-negating viewport epilogue mirrors winding; take the front sense
+      * straight from the guest value (validated in B1). */
+     pd->RasterizerState.FrontCounterClockwise = (rs->front_face == 0x0901);
++    pd->RasterizerState.DepthClipEnable = rs->depth_clip ? TRUE : FALSE;   /* patch 2068 */
+     if (has_depth) {
+         pd->DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+         pd->DepthStencilState.DepthEnable = rs->depth_test ? TRUE : FALSE;

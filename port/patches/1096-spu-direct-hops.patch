@@ -1,0 +1,405 @@
+KZ3 patch 1096 (SPU pass 71): direct hops between lifted SPU functions, and a memo for spu_lookup.
+
+Every cross-function transfer in lifted SPU code set the pending trampoline and returned to the enclosing drain
+loop, which ran its per-hop hooks and called the target; a computed branch (bi rX that is not a return) went
+through the full resolver spu_indirect_branch and spu_lookup, which walks a hash chain holding every image
+registered at that LS address (5.4 entries on average for KZ3's 106 images). Software-pipelined SPU loops close
+with a computed `bi` (rX = selb(head, exit, cond)), so the audio mixer's hot loops paid a trampoline return, the
+drain hooks, the resolver and the chain walk on every iteration: ~20 % of the LoPrio SPU thread in K2 (spu round
+70 profile: spu_drain_call_body 7.7, spu_lookup 5.6, spu_indirect_branch 4.2, launch check 3.1 %).
+
+Now (needs a guaranteed tail call: clang or GCC >= 15 musttail; otherwise the old path is compiled):
+- static transfers emit SPU_HOP(ctx, A, F): when the drain's hooks would only do bookkeeping (no lockstep, no
+  launch diagnostics, no stack-reset entry that could match, no pending enabled interrupt) the lifted code does
+  that bookkeeping itself (recent-pc ring, step count, drain_ret_pc) and tail-calls F; else the trampoline as before;
+- computed transfers emit SPU_IB_HOP: spu_ib_direct() returns what the resolver would dispatch to when all it would
+  do is dispatch (every early path is excluded by state, see its comment), else the trampoline to the resolver;
+- ctx->hop_ret_pc holds the innermost call bracket's return pc (lifted brsl/bisl and spu_drain_call_full set and
+  restore it), so a computed transfer to that address still goes to the drain, which returns there;
+- spu_lookup keeps exact (addr, image) hits in a 16 K-slot memo (one 64-bit word each; the registry is append-only
+  and a lookup returns the first match in registration order, so a hit never changes); misses and wildcard
+  answers take the walk as before.
+KZ3_SPU_HOP=0 = old dispatch; dispatch diagnostic switches (SPU_TAILRET, SPU_JOBTRACE, SPU_JOBEXEC, SPU_POLLTRACE,
+SPU_IBCOV, YDKJ_POLTRACE, LBP_HLE_JOBDONE, SPU_PCHIST, KZ3_PMEND_IB) also select it. KZ3_HOP_STATS=1 prints `[hop-stats]` every 10 s: direct computed hops, the fallbacks by reason, resolver calls.
+Needs a relift (tools/spu/lift_spu.sh). Upstream candidate.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (SPU_HOP / SPU_IB_HOP) over upstream SPU_DIRECT in the lifter; both context fields.
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 79067ca5..75bdf90a 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -357,6 +357,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+     ctx->host_depth = 0;
+     ctx->irq_frame = 0;
+     ctx->drain_ret_pc = 0;
++    ctx->hop_ret_pc = 0;   /* KZ3 patch 1096 */
++    { extern int g_spu_hop_on; extern void spu_hop_init(void); if (g_spu_hop_on < 0) spu_hop_init(); }
+     /* Nest-safe: a job run synchronously from inside another SPU's execution
+      * re-enters here on the same host thread. The halt target is per-thread,
+      * so save the outer one and put it back on the way out -- otherwise the
+@@ -381,6 +383,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+         /* A one-way guest stack reset invalidates every lifted host caller.
+          * Re-enter its target with the same guest state on the driver stack. */
+         ctx->host_depth = 0;
++        ctx->hop_ret_pc = 0;   /* KZ3 patch 1096 */
+         g_spu_trampoline_fn = 0;
+         spu_recent_mark(ctx, 5, ctx->pc);   /* KZ3 patch 1068 */
+         spu_indirect_branch(ctx);
+@@ -1820,8 +1823,22 @@ static void spu_report_cross_image(uint32_t addr, int want, int got)
+             "issue #59.\n", addr, want, got);
+ }
+ 
++/* KZ3 patch 1096: memo of exact hits. The registry is append-only and a lookup returns the FIRST entry in
++ * registration order that matches, so a found entry stays the answer for that (addr, image) forever; misses and
++ * wildcard answers (which also report) are not kept. One 64-bit word per slot (key | registry index << 32): a
++ * torn or stale slot only fails the key test. The chain walk crossed every image registered at the address
++ * (5.4 entries on average for KZ3's 106 images, more at common job addresses) on every dispatch. */
++#define SPU_LK_MEMO_BITS 14
++static volatile uint64_t s_lk_memo[1u << SPU_LK_MEMO_BITS];
+ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
+ {
++    const int memo = image_id > 0 && image_id < (1 << 14) && addr <= 0x3FFFFu;   /* KZ3 patch 1096 */
++    const uint32_t key = addr | ((uint32_t)image_id << 18);
++    const uint32_t slot = (key * 2654435761u) >> (32 - SPU_LK_MEMO_BITS);
++    if (memo) {
++        const uint64_t m = s_lk_memo[slot];
++        if ((uint32_t)m == key) return s_registry[(uint32_t)(m >> 32)].fn;
++    }
+     /* Match the context's active image; image_id 0 (context or entry) matches
+      * any, for back-compat with single-image contexts. */
+     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
+@@ -1831,6 +1848,8 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
+             /* One compare on the return path; the report itself is rare. */
+             if (e->image_id != image_id)
+                 spu_report_cross_image(addr, image_id, e->image_id);
++            else if (memo)
++                s_lk_memo[slot] = key | ((uint64_t)(n - 1) << 32);   /* KZ3 patch 1096 */
+             return e->fn;
+         }
+     }
+@@ -3019,8 +3038,102 @@ void kz3_jobcall_close(spu_context* ctx, uint32_t pc)
+     t_kz3_jc.t0 = 0;
+ }
+ 
++/* KZ3 patch 1096: what spu_indirect_branch would run for pc = t when all it would do is dispatch, else 0. Every
++ * early path of the resolver below is excluded by state: its diagnostics (pmend ring, trace context, the overlay
++ * skip / entry hook when it could act,
++ * job bracket of the frame trace; the env-gated ones turn g_spu_hop_on off), the IRQ register restore (only when t
++ * is the saved resume pc with interrupts enabled: spu_irq_regs_maybe_restore does nothing else), the policy
++ * kernel services, the taskset syscall, the resolver-only image, the taskset task region, resident code slots, a
++ * task image, LS 0 (job end), the job return address, 0xA00, 0x4A40, and the address the innermost drain returns
++ * at. What is left is the resolver's own lookup order (resident overlay, then the context's image), no side effect. */
++/* KZ3_HOP_STATS=1: per 10 s, why computed hops went to the resolver and how many resolver calls there were
++ * (counters shared by all SPU threads without locks: approximate). */
++static int s_hop_stats = -1;
++static volatile unsigned long long s_hs[16];   /* 0 direct, 1 hop_ok(int), 2 hop_ok(other), 3 diag, 4 task, 5 pc,
++                                                 * 6 ret pc, 7 taskset, 8 code slot, 9 no fn, 10 resolver calls,
++                                                 * 11 irq restore pc, 12 pmend/trace ctx, 13 frame trace */
++static void spu_hop_stats_tick(void)
++{
++    static uint64_t s_t0;
++    const uint64_t now = spu_host_ns() / 1000u;
++    if (!s_t0) s_t0 = now;
++    if (now - s_t0 < 10000000u) return;
++    s_t0 = now;
++    fprintf(stderr, "[hop-stats] direct=%llu fallback: int=%llu ok=%llu diag=%llu (irq %llu pmend/trace %llu ftrace "
++            "%llu) task=%llu pc=%llu ret=%llu taskset=%llu slot=%llu nofn=%llu | resolver calls=%llu\n",
++            s_hs[0], s_hs[1], s_hs[2], s_hs[3], s_hs[11], s_hs[12], s_hs[13], s_hs[4], s_hs[5], s_hs[6], s_hs[7],
++            s_hs[8], s_hs[9], s_hs[10]);
++    for (int i = 0; i < 16; i++) s_hs[i] = 0;
++}
++#define SPU_HS(i) do { if (__builtin_expect(s_hop_stats > 0, 0)) s_hs[i]++; } while (0)
++spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
++{
++    extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
++    if (!spu_hop_ok(ctx)) {
++        SPU_HS(ctx->int_enable && (spu_event_load(ctx) & ctx->event_mask) ? 1 : 2);
++        return NULL;
++    }
++    /* the IRQ register restore acts only when the target is the saved resume pc with interrupts enabled */
++    if (ctx->irq_saved && ctx->int_enable && t == (ctx->irq_resume_pc & SPU_LS_MASK)) {
++        SPU_HS(11);
++        return NULL;
++    }
++    if (g_kz3_pmend_ib != 0 || g_kz3_trace_ctx == (void*)ctx) {
++        SPU_HS(12);
++        return NULL;
++    }
++    if (g_kz3_wtrace != 0) {
++        SPU_HS(13);
++        return NULL;
++    }
++    /* patch 1043/1044 skip or entry hook: acts only on the job manager's call of a marked module's entry
++     * (the same test as spu_overlay_skip_entry before it reads the hook) */
++    if (g_spu_ovl_skip_any && ctx->resident_ovl > 0 && ctx->resident_ovl < (int)KZ3_OVL_SKIP_MAX &&
++        s_ovl_skip[ctx->resident_ovl] && ctx->image_id == 2 && t >= 0x4000 && t < 0x3E000 &&
++        (ctx->gpr[0]._u32[0] & SPU_LS_MASK) < 0x4000) {
++        SPU_HS(3);
++        return NULL;
++    }
++    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID) {
++        SPU_HS(3);
++        return NULL;
++    }
++    if (ctx->resident_task) {
++        SPU_HS(4);
++        return NULL;
++    }
++    if (t == 0 || t == 0xA00u || t == SPURS_TASKSET_PM_SYSCALL_LS || t == SPU_JOB_RETURN_LS || t == 0x4A40u ||
++        (ctx->policy_mode && (t == SPURS_PM_EXIT_TO_KERNEL_LS || t == SPURS_PM_SELECT_WORKLOAD_LS))) {
++        SPU_HS(5);
++        return NULL;
++    }
++    if (t == ctx->hop_ret_pc) {
++        SPU_HS(6);
++        return NULL;
++    }
++    if (t >= SPU_TASKSET_TASK_LO && (spu_taskset_resident_image(ctx) || spu_taskset_task_image(t))) {
++        SPU_HS(7);
++        return NULL;
++    }
++    for (unsigned slot = 0; slot < 4; ++slot)
++        if (ctx->resident_code[slot].image_id && t >= ctx->resident_code[slot].lsa &&
++            t - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
++            SPU_HS(8);
++            return NULL;
++        }
++    spu_fn fn = ctx->resident_ovl ? spu_lookup(t, ctx->resident_ovl) : NULL;
++    if (!fn) fn = spu_lookup(t, ctx->image_id);
++    SPU_HS(fn ? 0 : 9);
++    return fn;
++}
++
+ void spu_indirect_branch(spu_context* ctx)
+ {
++    if (__builtin_expect(g_spu_hop_on < 0, 0)) spu_hop_init();   /* KZ3 patch 1096 */
++    if (__builtin_expect(s_hop_stats != 0, 0)) {
++        if (s_hop_stats < 0) { const char* e = getenv("KZ3_HOP_STATS"); s_hop_stats = (e && *e == '1') ? 1 : 0; }
++        if (s_hop_stats) { s_hs[10]++; spu_hop_stats_tick(); }
++    }
+     if (__builtin_expect(g_kz3_pmend_ib != 0, 0)) {
+         if (g_kz3_pmend_ib < 0) { const char* e = getenv("KZ3_PMEND_IB"); g_kz3_pmend_ib = (e && *e == '1') ? 1 : 0; }
+         if (g_kz3_pmend_ib) { spu_recent_mark(ctx, 6, ctx->pc); spu_recent_mark(ctx, 7, ctx->gpr[0]._u32[0]); }
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 53a95786..9dbac9e6 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -438,6 +438,9 @@ typedef struct spu_context {
+      * spu_coh_reserve_fast). Written under that lock, read by the context's
+      * own thread. */
+     int coh_listed;
++    /* KZ3 patch 1096: return pc of the innermost open call bracket (lifted brsl/bisl, spu_drain_call_full), or 0 at
++     * top level. A direct indirect hop to this address is left to the drain, which returns there. */
++    uint32_t hop_ret_pc;
+ } spu_context;
+ 
+ /* event_status is written from more than one host thread: the SPU's own
+@@ -1082,6 +1085,62 @@ static inline __attribute__((always_inline)) void spu_drain_call(spu_context* ct
+     }
+     spu_drain_call_full(ctx, return_pc);
+ }
++
++/* KZ3 patch 1096 (SPU pass 71): direct hops between lifted functions. A cross-function transfer used to set the
++ * pending trampoline and return to the enclosing drain loop, which ran its per-hop hooks and called the target
++ * (indirect transfers: the full resolver spu_indirect_branch, then spu_lookup over every image registered at that
++ * LS address). In the audio mixer jobs that round trip was ~20 % of the SPU thread (the RE notes Pass 70/71).
++ * With a guaranteed tail call (clang, GCC >= 15 musttail) the lifted code now jumps to the target itself whenever
++ * the drain's hooks would do nothing but bookkeeping: no lockstep, no launch diagnostics, no stack-reset entry
++ * that could match, no pending enabled interrupt. It then does the same bookkeeping (recent-pc ring, step count,
++ * drain_ret_pc). Indirect hops also need the resolver's answer to be a plain lookup: spu_ib_direct (spu_channels.c)
++ * checks every condition under which spu_indirect_branch would do anything else and returns its lookup result,
++ * or 0 (then the old trampoline path runs). The host stack does not grow (tail calls). KZ3_SPU_HOP=0 = old path;
++ * any dispatch diagnostic switch (SPU_TAILRET, SPU_JOBTRACE, SPU_POLLTRACE, ...) also turns it off. */
++typedef void (*spu_hop_fn)(spu_context*);
++extern int g_spu_hop_on;                                  /* -1 = not decided yet, 0 = off, 1 = on (spu_drain.c) */
++void spu_hop_init(void);                                  /* spu_drain.c: decides g_spu_hop_on (env) */
++spu_hop_fn spu_ib_direct(spu_context* ctx, uint32_t t);   /* spu_channels.c */
++static inline __attribute__((always_inline)) int spu_hop_ok(const spu_context* ctx)
++{
++    return __builtin_expect(g_spu_hop_on > 0, 1) && !g_yz_lockstep_on && !g_spu_launch_diag &&
++           g_pm_flow_ctx != (void*)ctx && !(g_spu_stack_reset_n && ctx->host_depth && !ctx->policy_mode) &&
++           !(ctx->int_enable && (spu_event_load(ctx) & ctx->event_mask));
++}
++static inline __attribute__((always_inline)) void spu_hop_note(spu_context* ctx, uint32_t pc)
++{
++    ctx->recent_pc[ctx->recent_n++ & 255] = pc;
++    ctx->steps++;
++    ctx->drain_ret_pc = ctx->hop_ret_pc;
++}
++#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 15)
++#  define SPU_HOP_DIRECT 1
++#  define SPU_HOP_TAIL(call) __attribute__((musttail)) return call
++#else
++#  define SPU_HOP_DIRECT 0
++#  define SPU_HOP_TAIL(call) do { call; return; } while (0)
++#endif
++/* static transfer to lifted function F at LS address A (A != 0) */
++#define SPU_HOP(ctx, A, F) do {                                                                  \
++        (ctx)->pc = (A);                                                                         \
++        if (SPU_HOP_DIRECT && spu_hop_ok(ctx)) { spu_hop_note((ctx), (A)); SPU_HOP_TAIL(F(ctx)); } \
++        g_spu_trampoline_fn = (F);                                                               \
++        return;                                                                                  \
++    } while (0)
++/* computed transfer (bi/biz/binz... not a return) to the address in T */
++#define SPU_IB_HOP(ctx, T) do {                                                                  \
++        (ctx)->pc = (T);                                                                         \
++        if (SPU_HOP_DIRECT && g_spu_hop_on > 0) {                                                \
++            const spu_hop_fn _hf = spu_ib_direct((ctx), (uint32_t)(ctx)->pc & SPU_LS_MASK);      \
++            if (_hf) {                                                                           \
++                (ctx)->pc &= SPU_LS_MASK;                                                        \
++                spu_hop_note((ctx), (uint32_t)(ctx)->pc);                                        \
++                SPU_HOP_TAIL(_hf(ctx));                                                          \
++            }                                                                                    \
++        }                                                                                        \
++        g_spu_trampoline_fn = spu_indirect_branch;                                               \
++        return;                                                                                  \
++    } while (0)
+ /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
+  *
+  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 5d42b459..121b2e17 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -664,6 +664,21 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
+ }
+ 
+ /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
++/* KZ3 patch 1096: direct hops (spu_context.h). Decided once: KZ3_SPU_HOP=0 turns them off, and so does every
++ * switch that makes the drain loop or spu_indirect_branch do more than dispatch (their diagnostics need every hop). */
++int g_spu_hop_on = -1;
++void spu_hop_init(void)
++{
++    static const char* const diag[] = {"SPU_TAILRET", "SPU_JOBTRACE", "SPU_JOBEXEC", "SPU_POLLTRACE", "SPU_IBCOV",
++                                       "YDKJ_POLTRACE", "LBP_HLE_JOBDONE", "SPU_PCHIST", "KZ3_PMEND_IB"};
++    const char* e = getenv("KZ3_SPU_HOP");
++    int on = !(e && e[0] == '0');
++    for (unsigned i = 0; on && i < sizeof diag / sizeof diag[0]; i++)
++        if (getenv(diag[i])) on = 0;
++    if (g_spu_hop_on < 0) fprintf(stderr, "[spu] direct hops %s (KZ3 patch 1096)\n", on ? "on" : "off");
++    g_spu_hop_on = on;
++}
++
+ int spu_tailret_enabled(void)
+ {
+     static int s_on = -1;
+@@ -695,7 +710,11 @@ static void spu_drain_call_body(spu_context* ctx, uint32_t return_pc);
+ /* KZ3 patch 1085: a WWS job call that ran on as trampolines ends when the PM's drain returns at its link */
+ void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
+ {
++    /* KZ3 patch 1096: this drain returns at return_pc, so a direct indirect hop to it must not happen inside */
++    const uint32_t hop_ret_saved = ctx->hop_ret_pc;
++    ctx->hop_ret_pc = return_pc & SPU_LS_MASK;
+     spu_drain_call_body(ctx, return_pc);
++    ctx->hop_ret_pc = hop_ret_saved;
+     extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
+     if (__builtin_expect(g_kz3_wtrace != 0, 0)) {
+         extern void kz3_jobcall_close(spu_context*, uint32_t);
+@@ -756,6 +775,7 @@ static void spu_drain_call_body(spu_context* ctx, uint32_t return_pc)
+                     } else {
+                         /* iret fired deeper: registers restored, pc = srr0 */
+                         ctx->host_depth = f.depth;
++                        ctx->hop_ret_pc = return_pc & SPU_LS_MASK;   /* KZ3 patch 1096 */
+                         ctx->image_id = f.image_id;
+                         *tramp = spu_indirect_branch;
+                         SPU_DRAIN_POP_IRQ();
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index d34d5604..cb21309e 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -541,8 +541,7 @@ class SPULifter:
+         _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
+         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
+                 and end in getattr(self, "func_starts", set())):
+-            func.body_lines.append(
+-                f"    {{ SPU_DIRECT(ctx, 0x{end:X}, {self.prefix}spu_func_{end:08X}); }}")
++            func.body_lines.append(f"    {self._hop(end)}")
+ 
+         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
+         # whole body is nops + an unconditional branch back into itself does
+@@ -879,8 +878,10 @@ class SPULifter:
+                 # `bi $r0` returns via host return) + SPU_DRAIN (drains the
+                 # callee's own tail-chains so they don't grow the caller frame)
+                 # + image save/restore (adopt-on-serve cannot leak upward).
+-                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+-                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
++                # KZ3 patch 1096: hop_ret_pc = this bracket's return point while the callee runs (direct hops).
++                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; const uint32_t _hr = ctx->hop_ret_pc; "
++                        f"ctx->hop_ret_pc = 0x{addr + 4:X}; "
++                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); ctx->hop_ret_pc = _hr; "
+                         f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+             return f"{link} /* TODO spu: brsl unresolved target */;"
+         if mn in _COND_BR:
+@@ -892,11 +893,9 @@ class SPULifter:
+             if func.start_addr <= tgt < func.end_addr:
+                 return f"if ({cond}) goto loc_{tgt:08X};"
+             self.branch_targets.add(tgt)
+-            # Cross-function conditional branch = conditional tail: a direct
+-            # tail call when the drain has nothing to do on this step, else
+-            # the trampoline and unwind (SPU_DIRECT, spu_context.h).
+-            return (f"if ({cond}) {{ SPU_DIRECT(ctx, 0x{tgt:X}, "
+-                    f"{self.prefix}spu_func_{tgt:08X}); }}")
++            # Cross-function conditional branch = conditional tail: hand the
++            # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
++            return f"if ({cond}) {{ {self._hop(tgt)} }}"
+         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
+         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
+         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
+@@ -924,8 +923,8 @@ class SPULifter:
+                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
+                 return f"{_ied}SPU_RET(ctx);"
+             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
+-            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+-                    f"g_spu_trampoline_fn = spu_indirect_branch; return;")
++            # KZ3 patch 1096: direct hop when the resolver would only dispatch (SPU_IB_HOP, spu_context.h)
++            return f"{_ied}SPU_IB_HOP(ctx, {g(tgt_reg)}._u32[0]);"
+         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
+         if mn == "iret":
+             return (f"{_ied}ctx->pc = ctx->srr0; "
+@@ -944,8 +943,9 @@ class SPULifter:
+             # here and its `bi $r0` returns via host return.
+             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
+                     f"{{ int32_t _si = (int32_t)ctx->image_id; "
+-                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
+-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
++                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; const uint32_t _hr = ctx->hop_ret_pc; "
++                    f"ctx->hop_ret_pc = 0x{addr + 4:X}; ctx->host_depth++; "
++                    f"spu_indirect_branch(ctx); ctx->hop_ret_pc = _hr; spu_drain_call(ctx, 0x{addr + 4:X}); "
+                     f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+         # bisled: set link, branch to RA only if an external event is pending.
+         if mn in ("bisled",):
+@@ -969,8 +969,7 @@ class SPULifter:
+                 if tgt_reg != "0":
+                     return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
+                 return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
+-            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+-                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
++            return f"if ({cond}) {{ {_ied}SPU_IB_HOP(ctx, {g(tgt_reg)}._u32[0]); }}"
+ 
+         # hint-for-branch: pure performance hint, safe to drop
+         if mn in ("hbr", "hbra", "hbrr"):
+@@ -1003,11 +1002,18 @@ class SPULifter:
+         if func.start_addr <= tgt < func.end_addr:
+             return f"goto loc_{tgt:08X};"
+         self.branch_targets.add(tgt)
+-        # Cross-function unconditional tail: a direct tail call when the
+-        # drain has nothing to do on this step, else hand the target to the
+-        # trampoline and unwind so the enclosing SPU_DRAIN re-enters (no
+-        # host-stack growth either way; SPU_DIRECT, spu_context.h).
+-        return (f"{{ SPU_DIRECT(ctx, 0x{tgt:X}, {self.prefix}spu_func_{tgt:08X}); }}")
++        # Cross-function unconditional tail: hand the target to the trampoline
++        # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
++        return self._hop(tgt)
++
++    def _hop(self, tgt) -> str:
++        """KZ3 patch 1096: a static cross-function transfer. SPU_HOP (spu_context.h) tail-calls the target when
++        the drain loop's per-hop hooks would only do bookkeeping, else sets the trampoline as before. LS 0 keeps
++        the trampoline (the drain's job-end test)."""
++        if tgt == 0:
++            return (f"{{ ctx->pc = 0x{tgt:X}; "
++                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
++        return f"SPU_HOP(ctx, 0x{tgt:X}, {self.prefix}spu_func_{tgt:08X});"
+ 
+     # ------------------------------------------------------------------ #
+     def emit_header(self) -> str:

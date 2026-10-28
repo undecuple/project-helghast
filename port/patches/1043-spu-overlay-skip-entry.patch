@@ -1,0 +1,86 @@
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1673,6 +1673,40 @@
+  * at LS 0x3000 (below it is the SPURS kernel/policy/context, 0x290..0x2FFF). */
+ #define SPU_TASKSET_TASK_LO 0x3000u
+ 
++/* KZ3 patch 1043 (SPU pass 30): skip a streamed overlay module at its entry (A/B aid for KZ3's SPU
++ * visibility culling jobs, KZ3_SPU_SKIP_OVL / KZ3_CULL_AB in the port's generated registration). When the
++ * job manager (image 2) branches into a code module whose image id is marked here, and the link register
++ * points back below the module buffer (i.e. this is the manager's call of the module's entry, not a call
++ * inside the module), the branch is redirected to the link: the module "returns" at once and does no work.
++ * Tested on both dispatch paths (spu_dispatch_mt.c fast path and the resolver below); one global load on the
++ * fast path when nothing is marked. kz3-ovl-skip begin */
++#define KZ3_OVL_SKIP_MAX 512u   /* image ids: ELFs 1..43, policy modules, job modules 200..290 */
++int g_spu_ovl_skip_any = 0;
++static uint8_t s_ovl_skip[KZ3_OVL_SKIP_MAX];
++void spu_overlay_set_skip(int image_id, int on)
++{
++    if (image_id <= 0 || image_id >= (int)KZ3_OVL_SKIP_MAX) return;
++    s_ovl_skip[image_id] = (uint8_t)(on != 0);
++    g_spu_ovl_skip_any = 0;
++    for (unsigned i = 0; i < KZ3_OVL_SKIP_MAX; i++) if (s_ovl_skip[i]) g_spu_ovl_skip_any = 1;
++}
++/* Returns 1 after redirecting ctx->pc to the link register (masked). Call only when g_spu_ovl_skip_any. */
++int spu_overlay_skip_entry(spu_context* ctx, int img)
++{
++    uint32_t pc = ctx->pc & SPU_LS_MASK;
++    if (img <= 0 || img >= (int)KZ3_OVL_SKIP_MAX || !s_ovl_skip[img]) return 0;
++    if (ctx->image_id != 2 || pc < 0x4000 || pc >= 0x3E000) return 0;
++    uint32_t link = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++    if (link >= 0x4000) return 0;                 /* a call inside the module: not its entry */
++    static unsigned s_n[KZ3_OVL_SKIP_MAX];
++    if (s_n[img]++ < 2)
++        fprintf(stderr, "[spu-ovl-skip] image %d entry pc=0x%05X skipped, returning to link 0x%05X (%u so far)\n",
++                img, pc, link, s_n[img]);
++    ctx->pc = link;
++    return 1;
++}
++/* kz3-ovl-skip end */
++
+ /* Content-signature variant: FMOD COPIES codec overlays to the heap before
+  * streaming them into the swap slot, so the source EA is unknowable ahead of
+  * time -- match the first 16 bytes of the streamed content instead. */
+@@ -2196,6 +2230,8 @@
+ void spu_indirect_branch(spu_context* ctx)
+ {
+     if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "ib", 0, ctx->gpr[0]._u32[0]);
++    if (__builtin_expect(g_spu_ovl_skip_any, 0) && ctx->resident_ovl > 0)
++        spu_overlay_skip_entry(ctx, ctx->resident_ovl);   /* KZ3 patch 1043 */
+     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
+      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
+      * Without this, any indirect branch through such a value fails the lookup
+@@ -2494,6 +2530,11 @@
+         if (codeBase + 16 <= SPU_LS_SIZE) {
+             extern int spu_overlay_match_sig(const uint8_t hdr[16]);
+             int img = spu_overlay_match_sig(&ctx->ls[codeBase]);
++            if (img && g_spu_ovl_skip_any && spu_overlay_skip_entry(ctx, img)) {   /* KZ3 patch 1043 */
++                ctx->resident_ovl = img;
++                fn = spu_lookup(ctx->pc, ctx->image_id);
++                img = 0;
++            }
+             if (img) {
+                 { extern void kz3_wacct_job(int); extern int g_kz3_wacct; if (g_kz3_wacct > 0) kz3_wacct_job(img); }   /* patch 1032 */
+                 if (ctx->resident_ovl != img) {
+--- a/runtime/spu/spu_dispatch_mt.c
++++ b/runtime/spu/spu_dispatch_mt.c
+@@ -20,6 +20,8 @@
+ typedef void (*spu_dispatch_fn)(spu_context*);
+ spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
+ void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
++extern int g_spu_ovl_skip_any;                            /* KZ3 patch 1043 */
++int spu_overlay_skip_entry(spu_context* ctx, int img);
+ 
+ void spu_indirect_branch_mt(spu_context* ctx)
+ {
+@@ -55,6 +57,10 @@
+                   || pc == SPURS_TASKSET_PM_SYSCALL_LS
+                   || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID;
+     if (!special) {
++        /* KZ3 patch 1043: a marked module's entry returns at once (see spu_channels.c). */
++        if (__builtin_expect(g_spu_ovl_skip_any, 0) && ctx->resident_ovl > 0 &&
++            spu_overlay_skip_entry(ctx, ctx->resident_ovl))
++            pc = ctx->pc & SPU_LS_MASK;
+         /* Resident overlay first (mirrors the full resolver): streamed plugin
+          * code owns its LS range; base-image entries at the same address are
+          * stale bytes and must lose. */

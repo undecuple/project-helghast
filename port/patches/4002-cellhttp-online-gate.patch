@@ -1,0 +1,83 @@
+KZ3 4002: cellHttpSendRequest honours the online switch and the network policy. Before, it resolved and connected
+for real with no online gate (unlike sys_net and NetCtl), so a title's HTTP telemetry reached the internet in
+"offline" mode. Offline: CONNECTION_FAILED, no resolver call, no socket. Online: the policy's name map first (a
+refused name never reaches the resolver; a mapped one resolves numerically), then the allowlist on the address.
+Upstream candidate. Test: tools/net/test_net.sh (test_cellhttp_gate).
+
+diff --git a/libs/network/cellHttp.c b/libs/network/cellHttp.c
+index d39d88d..524b232 100644
+--- a/libs/network/cellHttp.c
++++ b/libs/network/cellHttp.c
+@@ -11,6 +11,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
++#include "net_policy.h"   /* KZ3 4002: online switch, name map, egress allowlist */
+ 
+ /* ---------------------------------------------------------------------------
+  * Platform socket abstraction
+@@ -484,24 +485,61 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
+     /* Close any previously open socket (re-send scenario) */
+     http_close_slot_socket(t);
+ 
+-    /* ---- Resolve hostname ---- */
++    /* KZ3 4002: offline (the default) means no real connection at all, as sys_net and NetCtl already do.
++     * Before this gate a title's HTTP telemetry reached the internet in "offline" mode. */
++    if (!ps3_net_online()) {
++        static int said;
++        if (!said) { said = 1; printf("[cellHttp]   offline: no connection (online switch off)\n"); }
++        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
++        return CELL_HTTP_ERROR_CONNECTION_FAILED;
++    }
++
++    /* ---- Resolve hostname (the policy's map first: a refused name never reaches the resolver) ---- */
+     char port_str[8];
+     snprintf(port_str, sizeof(port_str), "%u", t->port);
+ 
++    char host_str[64];
++    const char* host = t->hostname;
++    uint8_t mip[4];
++    int pr = ps3_net_policy_resolve(t->hostname, mip);
++    if (pr == 0) {
++        printf("[cellHttp]   '%s' refused by the network policy\n", t->hostname);
++        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
++        return CELL_HTTP_ERROR_CONNECTION_FAILED;
++    }
++
+     struct addrinfo hints;
+     memset(&hints, 0, sizeof(hints));
+-    hints.ai_family   = AF_UNSPEC;
++    hints.ai_family   = ps3_net_policy_strict() ? AF_INET : AF_UNSPEC;
+     hints.ai_socktype = SOCK_STREAM;
+     hints.ai_protocol = IPPROTO_TCP;
++    if (pr == 1) {
++        snprintf(host_str, sizeof(host_str), "%u.%u.%u.%u", mip[0], mip[1], mip[2], mip[3]);
++        host = host_str;
++        hints.ai_flags = AI_NUMERICHOST;
++    }
+ 
+     struct addrinfo* result = NULL;
+-    int gai = getaddrinfo(t->hostname, port_str, &hints, &result);
++    int gai = getaddrinfo(host, port_str, &hints, &result);
+     if (gai != 0 || !result) {
+         printf("[cellHttp]   getaddrinfo failed for '%s': %d\n", t->hostname, gai);
+         if (result) freeaddrinfo(result);
+         if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
+         return CELL_HTTP_ERROR_CONNECTION_FAILED;
+     }
++    if (result->ai_family != AF_INET && ps3_net_policy_strict()) {
++        freeaddrinfo(result);
++        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
++        return CELL_HTTP_ERROR_CONNECTION_FAILED;
++    }
++    if (t->port > 65535 || (result->ai_family == AF_INET &&
++        !ps3_net_policy_check(PS3_NET_PROTO_TCP,
++                              (const uint8_t*)&((const struct sockaddr_in*)result->ai_addr)->sin_addr,
++                              (uint16_t)t->port))) {
++        freeaddrinfo(result);
++        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
++        return CELL_HTTP_ERROR_CONNECTION_FAILED;
++    }
+ 
+     /* ---- Create socket and connect ---- */
+     http_socket_t sock = socket(result->ai_family, result->ai_socktype,

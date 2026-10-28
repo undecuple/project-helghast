@@ -1,0 +1,168 @@
+EDAT reader: writable cache. edat_resolve wrote "<file>.dec" beside the source, which is read-only in a game install
+and in the sandbox. With $PS3_EDAT_CACHE or edat_set_cache_dir(dir) the plaintext goes to <dir>/<content id>/<name>.dec,
+reused while a "<name>.dec.key" sidecar (header digest + dev_hash + size) matches the source; written via ".part" +
+rename. Without a cache directory the old beside-the-source behaviour stays. Applies after 5001. Test:
+port/vfs/test_vfs_overlay.sh (step 1). Upstream candidate.
+
+--- a/libs/filesystem/edat.c
++++ b/libs/filesystem/edat.c
+@@ -24,6 +24,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#ifdef _WIN32
++#include <direct.h>   /* _mkdir */
++#endif
+ 
+ /* ---------------------------------------------------------------------------
+  * AES-128
+@@ -668,6 +671,112 @@
+     return rc;
+ }
+ 
++/* Writable cache for decrypted EDATs.
++ *
++ * The source usually sits in a read-only place (a game install, a sandbox), so
++ * "<file>.dec" beside it cannot be written. With a cache directory set
++ * ($PS3_EDAT_CACHE, else edat_set_cache_dir) the plaintext goes to
++ *   <cache>/<content id>/<file name>.dec
++ * plus a "<...>.dec.key" sidecar holding header bytes 0x40..0x6F (digest and
++ * dev_hash) and the plaintext size. The cache is reused only when the sidecar
++ * matches the source's header and the .dec has the header's size, so a changed
++ * source (new update, different file with the same name) is decrypted again.
++ * Writes go to "<...>.part" and are renamed into place. Without a cache
++ * directory the old behaviour stays: "<file>.dec" beside the source, reused
++ * while it is newer than the source. */
++static char s_edat_cache_dir[1024];
++
++void edat_set_cache_dir(const char* dir)
++{
++    snprintf(s_edat_cache_dir, sizeof s_edat_cache_dir, "%s", dir ? dir : "");
++}
++
++static const char* edat_cache_dir(void)
++{
++    const char* e = getenv("PS3_EDAT_CACHE");
++    if (e && *e) return e;
++    return s_edat_cache_dir[0] ? s_edat_cache_dir : NULL;
++}
++
++static void edat_mkdirs(const char* file_path)   /* every parent directory of file_path */
++{
++    char tmp[1024];
++    snprintf(tmp, sizeof tmp, "%s", file_path);
++    for (char* p = tmp + 1; *p; p++) {
++        if (*p != '/' && *p != '\\') continue;
++        char c = *p; *p = 0;
++#ifdef _WIN32
++        _mkdir(tmp);
++#else
++        mkdir(tmp, 0755);
++#endif
++        *p = c;
++    }
++}
++
++/* Cache key: header digest + dev_hash (0x40..0x6F) and the plaintext size (BE). */
++static void edat_cache_key(const uint8_t hdr[0x90], uint8_t key[0x38])
++{
++    memcpy(key, hdr + 0x40, 0x30);
++    memcpy(key + 0x30, hdr + 0x88, 8);
++}
++
++static int edat_cache_valid(const char* dec, const char* keyf, const uint8_t key[0x38], uint64_t size)
++{
++    struct stat ds;
++    if (stat(dec, &ds) != 0 || (uint64_t)ds.st_size != size) return 0;
++    FILE* k = fopen(keyf, "rb");
++    if (!k) return 0;
++    uint8_t got[0x38];
++    size_t n = fread(got, 1, sizeof got, k);
++    fclose(k);
++    return n == sizeof got && memcmp(got, key, sizeof got) == 0;
++}
++
++/* Decrypt into the cache directory. Returns buf on success, NULL to fall back. */
++static const char* edat_resolve_cached(const char* dir, const char* host_path, char* buf, size_t cap)
++{
++    uint8_t hdr[0x90];
++    FILE* f = fopen(host_path, "rb");
++    if (!f) return NULL;
++    size_t n = fread(hdr, 1, sizeof hdr, f);
++    fclose(f);
++    if (n != sizeof hdr) return NULL;
++
++    /* Content id (NUL-padded, 0x30 bytes at 0x10) as a directory name; anything
++     * outside [A-Za-z0-9_-] becomes '_' so a hostile header cannot climb out. */
++    char cid[0x31];
++    int ci = 0;
++    for (; ci < 0x30 && hdr[0x10 + ci]; ci++) {
++        char c = (char)hdr[0x10 + ci];
++        int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
++        cid[ci] = ok ? c : '_';
++    }
++    if (ci == 0) cid[ci++] = '_';
++    cid[ci] = 0;
++    const char* base = host_path;
++    for (const char* p = host_path; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
++
++    char keyf[1100], part[1100];
++    if ((size_t)snprintf(buf, cap, "%s/%s/%s.dec", dir, cid, base) >= cap) return NULL;
++    snprintf(keyf, sizeof keyf, "%s.key", buf);
++    snprintf(part, sizeof part, "%s.part", buf);
++    uint8_t key[0x38];
++    edat_cache_key(hdr, key);
++    if (edat_cache_valid(buf, keyf, key, be64(hdr + 0x88))) return buf;   /* cache hit */
++
++    edat_mkdirs(buf);
++    if (edat_decrypt_file(host_path, part) != 0) return NULL;
++    remove(buf);                                   /* rename does not replace on Windows */
++    if (rename(part, buf) != 0) { remove(part); return NULL; }
++    FILE* k = fopen(keyf, "wb");
++    int ok = k && fwrite(key, 1, sizeof key, k) == sizeof key;
++    if (k) ok = (fclose(k) == 0) && ok;
++    if (!ok) remove(keyf);                         /* plaintext still usable this run */
++    fprintf(stderr, "[edat] cached %s\n", buf);
++    return buf;
++}
++
+ const char* edat_resolve(const char* host_path, char* buf, size_t cap)
+ {
+     static int enabled = -1;
+@@ -677,6 +786,13 @@
+     }
+     if (!enabled || !host_path || !edat_is_npd(host_path)) return host_path;
+ 
++    const char* dir = edat_cache_dir();
++    if (dir) {
++        const char* r = edat_resolve_cached(dir, host_path, buf, cap);
++        if (r) return r;
++        fprintf(stderr, "[edat] cache %s unusable for %s; trying beside the source\n", dir, host_path);
++    }
++
+     if ((size_t)snprintf(buf, cap, "%s.dec", host_path) >= cap) return host_path;
+ 
+     struct stat ss, ds;
+--- a/libs/filesystem/edat.h
++++ b/libs/filesystem/edat.h
+@@ -43,10 +43,18 @@
+  * Returns host_path unchanged when it is not an EDAT, or when decryption fails (the
+  * caller then opens the original and the guest reports its own error -- better than
+  * an open() failure it cannot attribute). Otherwise returns a cache path, written
+- * into `buf`. The cache lives beside the source as "<name>.dec" and is reused while
+- * it is newer than the source. Set PS3_EDAT=0 to disable the whole path. */
++ * into `buf`. With a cache directory ($PS3_EDAT_CACHE, else edat_set_cache_dir) the
++ * cache is <dir>/<content id>/<name>.dec, reused while its sidecar <name>.dec.key
++ * matches the source header (digest, dev_hash, size). Without one it lives beside
++ * the source as "<name>.dec" and is reused while it is newer than the source.
++ * Set PS3_EDAT=0 to disable the whole path. */
+ const char* edat_resolve(const char* host_path, char* buf, size_t cap);
+ 
++/* Where edat_resolve writes plaintext when $PS3_EDAT_CACHE is not set: a
++ * writable directory of the port (game installs are often read-only). NULL or
++ * "" = beside the source. */
++void edat_set_cache_dir(const char* dir);
++
+ /* Hand the runtime a klicensee the guest supplied. On hardware a game that owns
+  * free (license type 3) or disc-bound EDATs passes its own klicensee to
+  * sceNpDrmIsAvailable / sceNpDrmIsAvailable2 before opening them; the kernel keeps

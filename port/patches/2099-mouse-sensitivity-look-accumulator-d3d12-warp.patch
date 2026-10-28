@@ -1,0 +1,423 @@
+KZ3 patch 2099 (RSX pass 94): PC-style mouse look sensitivity, a frame-stamped look accumulator, and a D3D12 WARP
+fallback (the RE notes "Pass 94").
+libs/input/pad_mouse.{h,c}: sensitivity = user factor (KZ3_MOUSE_SENS, default 2.5) x degrees per count
+(KZ3_MOUSE_YAW, default 0.022 = Quake/Source m_yaw) -> 0.055 deg/count, no acceleration, no smoothing; ADS keeps the
+weapon's own factor times KZ3_MOUSE_ZOOM_SENS; kz3.ini [input] keys mouse_sensitivity / mouse_ads_sensitivity /
+mouse_invert_y (table pad_mouse_ini_keys, read by port/kz3/main.cpp). The accumulator (PadLookAcc, pure) stamps adds
+and takes with the guest frame (cellGcm_flip_request_count): with no take in the last 4 frames only the current
+frame's counts are kept, so the first look update after a menu, pause, cutscene or load no longer gets the mouse
+travel of the whole break (Windows hand test: d=-3665,-1057 in the first on-foot update); a stall keeps every count.
+libs/video/rsx_d3d12_device.h (new): rsx_d3d12_create_device: the default adapter as before, WARP
+(IDXGIFactory4::EnumWarpAdapter) only when that gives no device, RSX_D3D12_WARP=1 forces WARP, =0 never; one
+"[d3d12] device" line (adapter, vendor, software, max feature level, binding tier, highest shader model).
+rsx_live_draw.c and rsx_d3d12_backend.c create their device through it. Host tests tools/smoke/test_mouse_look.sh,
+tools/smoke/test_d3d12_warp.sh.
+
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+--- a/libs/input/pad_mouse.c	2026-10-21 23:08:51.373628162 -0500
++++ b/libs/input/pad_mouse.c	2026-10-21 23:09:31.575314767 -0500
+@@ -16,7 +16,9 @@
+ static PadMouseEv  s_ev[PAD_MOUSE_SCRIPT_MAX];
+ static int         s_nev;
+ static double      s_t0 = -1.0;
+-static long        s_dx, s_dy;   /* counts since the last take (under s_lock) */
++static PadLookAcc  s_acc;        /* counts kept for the next take (under s_lock; patch 2099) */
++static unsigned    pm_flip_clock(void);
++static unsigned  (*s_frame_clock)(void) = pm_flip_clock;
+ #ifdef _WIN32
+ static SRWLOCK     s_lock = SRWLOCK_INIT;
+ #define PM_LOCK()   AcquireSRWLockExclusive(&s_lock)
+@@ -42,8 +44,17 @@
+     const char* look = getenv("KZ3_MOUSE_LOOK");
+     const char* e;
+     int on = look && *look ? atoi(look) > 0 : 1;   /* patch 2097: default on (KZ3_MOUSE_LOOK=0 / kz3.ini mouse_look = 0 off) */
+-    s_cfg.sens = pm_envf("KZ3_MOUSE_SENS", PAD_MOUSE_SENS_DEFAULT);
++    /* patch 2099: user sensitivity x degrees per count (pad_mouse.h) */
++    const float user = pm_envf("KZ3_MOUSE_SENS", PAD_MOUSE_USER_SENS_DEF);
++    const float deg = pm_envf("KZ3_MOUSE_YAW", PAD_MOUSE_DEG_PER_COUNT);
++    int bad = 0;
++    s_cfg.sens = pad_mouse_rad_per_count(user, deg, &bad);
++    if (bad) fprintf(stderr, "[mouse] WARNING: KZ3_MOUSE_SENS/KZ3_MOUSE_YAW must be positive numbers: defaults used\n");
+     s_cfg.zoom_sens = pm_envf("KZ3_MOUSE_ZOOM_SENS", 1.0f);
++    if (!(s_cfg.zoom_sens > 0.0f)) {
++        fprintf(stderr, "[mouse] WARNING: KZ3_MOUSE_ZOOM_SENS must be positive: 1.0 used\n");
++        s_cfg.zoom_sens = 1.0f;
++    }
+     e = getenv("KZ3_MOUSE_INVERT");
+     s_cfg.invert = e && atoi(e) > 0;
+     e = getenv("KZ3_MOUSE_LOG");
+@@ -55,8 +66,11 @@
+         if (bad) fprintf(stderr, "[mouse] WARNING: KZ3_MOUSE_SCRIPT: %d token(s) not read\n", bad);
+     }
+     if (on)
+-        fprintf(stderr, "[mouse] look on%s: sens=%.5f rad/count zoom=%.3f invert=%d script=%d event(s)\n",
+-                look && *look ? " (KZ3_MOUSE_LOOK)" : " (default)", s_cfg.sens, s_cfg.zoom_sens, s_cfg.invert, s_nev);
++        fprintf(stderr, "[mouse] look on%s: sensitivity=%.3g x %.4g deg/count = %.6f rad/count (%.4f deg), ads=%.3f "
++                        "invert=%d accel=none smoothing=none script=%d event(s)\n",
++                look && *look ? " (KZ3_MOUSE_LOOK)" : " (default)", bad ? PAD_MOUSE_USER_SENS_DEF : user,
++                bad ? PAD_MOUSE_DEG_PER_COUNT : deg, s_cfg.sens, s_cfg.sens * 57.29578f, s_cfg.zoom_sens, s_cfg.invert,
++                s_nev);
+     else
+         fprintf(stderr, "[mouse] look off (KZ3_MOUSE_LOOK=%s)\n", look);
+     s_on = on;
+@@ -69,22 +83,33 @@
+ const PadMouseCfg* pad_mouse_cfg(void) { pm_init(); return &s_cfg; }
+ int pad_mouse_log_each(void) { pm_init(); return s_log_each; }
+ 
++/* Patch 2099: the accumulator's frame clock = the guest's flip requests (cellGcmSys.c; cellPad.c uses it too). */
++extern unsigned cellGcm_flip_request_count(void);
++static unsigned pm_flip_clock(void) { return cellGcm_flip_request_count(); }
++void pad_mouse_set_frame_clock(unsigned (*fn)(void)) { s_frame_clock = fn ? fn : pm_flip_clock; }
++
+ void pad_mouse_add(int dx, int dy)
+ {
++    const unsigned f = s_frame_clock();
+     PM_LOCK();
+-    s_dx += dx;
+-    s_dy += dy;
++    pad_look_acc_add(&s_acc, dx, dy, f);
+     PM_UNLOCK();
+ }
+ 
+ int pad_mouse_take(double now, int* dx, int* dy)
+ {
+     pm_init();
++    const unsigned f = s_frame_clock();
++    long long dropped = 0;
+     PM_LOCK();
+-    *dx = (int)s_dx;
+-    *dy = (int)s_dy;
+-    s_dx = s_dy = 0;
++    pad_look_acc_take(&s_acc, f, dx, dy, &dropped);
+     PM_UNLOCK();
++    if (dropped) {
++        static unsigned s_ndrop;
++        if (s_ndrop++ < 20)
++            fprintf(stderr, "[mouse] dropped %lld count(s) moved while no on-foot look update ran (frame %u)\n",
++                    dropped, f);
++    }
+     if (s_nev) {
+         if (s_t0 < 0.0) s_t0 = now;
+         pad_mouse_script_due(s_ev, s_nev, now - s_t0, dx, dy);
+diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+--- a/libs/input/pad_mouse.h	2026-10-21 23:08:51.373628162 -0500
++++ b/libs/input/pad_mouse.h	2026-10-21 23:56:28.393384892 -0500
+@@ -11,16 +11,29 @@
+  * limits E+0x1C4/+0x1C8. Mouse right (dx > 0) = negative yaw delta, mouse up (dy < 0) = positive pitch.
+  * scale = the weapon's own look scale (weapon->vf163(), 1.0 hip-fire, the designers' factor for scopes; the same
+  * factor the stick path multiplies by) times the user's zoom factor while the weapon reports zoom.
+- * Sensitivity model from KAMI (isJuhn/KAMI, MIT): radians per count, default 0.003 (about 0.17 degrees per count).
++ * Sensitivity (patch 2099, RSX pass 94): PC-shooter practice, no acceleration, no smoothing. A base of degrees per
++ * count (Quake/Source m_yaw = 0.022, KZ3_MOUSE_YAW) times the user's sensitivity (KZ3_MOUSE_SENS, kz3.ini
++ * mouse_sensitivity; default 2.5 = 0.055 deg/count, Counter-Strike's default; ASSUMPTION: a pick, not a measurement)
++ * -> radians per count; the same factor on both axes. Patch 2069's 0.003 rad/count (0.17 deg/count, KAMI's model)
++ * was 3.1x faster than that and turned 11 rad on the Windows hand test's first update.
++ * Accumulation (patch 2099): counts are kept only while a look update consumes them. A take stamps the guest frame
++ * (cellGcm_flip_request_count); when no take happened in the last PAD_LOOK_IDLE_FRAMES frames (menus, pause,
++ * cutscenes, loading, a vehicle) only the counts of the current frame are kept, so the first update after one never
++ * gets the mouse travel of the whole break (the hand test's first on-foot update carried d=-3665,-1057). A stall
++ * (no flip) keeps every count: the motion of a slow frame is applied in full, once.
+  *
+  * Switches (read once; pad_mouse.c):
+  *   KZ3_MOUSE_LOOK=0        off (default on since patch 2097, project decision 2026-10-21; kz3.ini
+  *                           `mouse_look = 0` does the same, the environment wins). A pad works the same either way:
+  *                           no counts = the game's own look values untouched.
+  *   KZ3_CURSOR_HIDE=0       keep the cursor visible over the game window (patch 2097; default hidden, below).
+- *   KZ3_MOUSE_SENS=<f>      radians per count (0.003).
+- *   KZ3_MOUSE_ZOOM_SENS=<f> extra factor while zoomed (1.0; the weapon's own factor already applies).
+- *   KZ3_MOUSE_INVERT=1      inverted Y.
++ *   KZ3_MOUSE_SENS=<f>      user sensitivity, a factor on KZ3_MOUSE_YAW (2.5; kz3.ini mouse_sensitivity). Patch
++ *                           2069's meaning (radians per count) is gone: 0.003 now means a near-frozen view.
++ *   KZ3_MOUSE_YAW=<f>       degrees per count at sensitivity 1 (0.022, Quake/Source m_yaw; copy another game's
++ *                           m_yaw-style base here to match its feel).
++ *   KZ3_MOUSE_ZOOM_SENS=<f> extra factor while zoomed (1.0; kz3.ini mouse_ads_sensitivity; the weapon's own factor
++ *                           already applies on top).
++ *   KZ3_MOUSE_INVERT=1      inverted Y (kz3.ini mouse_invert_y).
+  *   KZ3_MOUSE_SCRIPT=<s>    test input, "T:dx,dy[*N]" events separated by ',' ';' or spaces. T = seconds since
+  *                           the first on-foot look update; each event adds dx,dy counts to N consecutive look
+  *                           updates (default 1). Example "20:1047,0 30:0,-200*10".
+@@ -39,12 +52,83 @@
+ #endif
+ 
+ typedef struct {
+-    float sens;       /* radians per count */
++    float sens;       /* radians per count = user * deg_per_count * pi/180 (pad_mouse_rad_per_count) */
+     float zoom_sens;  /* extra factor while zoomed */
+     int   invert;     /* 1 = mouse up looks down */
+ } PadMouseCfg;
+ 
+-#define PAD_MOUSE_SENS_DEFAULT 0.003f
++#define PAD_MOUSE_DEG_PER_COUNT  0.022f   /* Quake/Source m_yaw */
++#define PAD_MOUSE_USER_SENS_DEF  2.5f
++#define PAD_MOUSE_SENS_DEFAULT   (PAD_MOUSE_USER_SENS_DEF * PAD_MOUSE_DEG_PER_COUNT * 0.017453292519943295f)
++#define PAD_LOOK_IDLE_FRAMES     4u       /* frames without a take = no look consumer */
++
++/* kz3.ini [input] keys -> the switches above (port/kz3/main.cpp copies a key into its variable when that is unset;
++ * the environment wins). */
++typedef struct { const char* key; const char* env; } PadMouseIniKey;
++#if defined(__GNUC__)
++__attribute__((unused))
++#endif
++static const PadMouseIniKey pad_mouse_ini_keys[] = {
++    {"mouse_sensitivity", "KZ3_MOUSE_SENS"},          /* x 0.022 deg/count (2.5) */
++    {"mouse_ads_sensitivity", "KZ3_MOUSE_ZOOM_SENS"}, /* extra factor while zoomed (1.0) */
++    {"mouse_invert_y", "KZ3_MOUSE_INVERT"},           /* 1 = mouse up looks down */
++};
++#define PAD_MOUSE_NINI (sizeof pad_mouse_ini_keys / sizeof pad_mouse_ini_keys[0])
++
++/* Radians per count from the user's sensitivity and the degrees-per-count base; a value that is not a finite
++ * positive number falls back to its default (*bad set to 1 when either did). */
++static inline float pad_mouse_rad_per_count(float user, float deg_per_count, int* bad)
++{
++    int b = 0;
++    if (!(user > 0.0f) || !isfinite(user)) { user = PAD_MOUSE_USER_SENS_DEF; b = 1; }
++    if (!(deg_per_count > 0.0f) || !isfinite(deg_per_count)) { deg_per_count = PAD_MOUSE_DEG_PER_COUNT; b = 1; }
++    if (bad) *bad = b;
++    return user * deg_per_count * 0.017453292519943295f;
++}
++
++/* The look accumulator (pure; pad_mouse.c holds one under its lock). frame = the guest frame counter now. */
++typedef struct {
++    long long dx, dy;      /* counts kept for the next take */
++    unsigned  add_frame;   /* frame of the last add */
++    unsigned  take_frame;  /* frame of the last take */
++    int       taken;       /* a take has happened */
++    long long dropped;     /* |dx|+|dy| dropped since the last take (stale counts of an idle stretch) */
++} PadLookAcc;
++
++static inline int pad_look_acc_idle(const PadLookAcc* a, unsigned frame)
++{
++    return !a->taken || (unsigned)(frame - a->take_frame) >= PAD_LOOK_IDLE_FRAMES;
++}
++/* Counts kept from an earlier frame while no consumer runs are stale: drop them. */
++static inline void pad_look_acc_age(PadLookAcc* a, unsigned frame)
++{
++    if (pad_look_acc_idle(a, frame) && a->add_frame != frame && (a->dx || a->dy)) {
++        a->dropped += (a->dx < 0 ? -a->dx : a->dx) + (a->dy < 0 ? -a->dy : a->dy);
++        a->dx = a->dy = 0;
++    }
++}
++static inline void pad_look_acc_add(PadLookAcc* a, int dx, int dy, unsigned frame)
++{
++    pad_look_acc_age(a, frame);
++    a->add_frame = frame;
++    a->dx += dx;
++    a->dy += dy;
++}
++/* Everything kept, once (cleared); *dropped = counts dropped since the previous take. */
++static inline void pad_look_acc_take(PadLookAcc* a, unsigned frame, int* dx, int* dy, long long* dropped)
++{
++    pad_look_acc_age(a, frame);
++    long long x = a->dx, y = a->dy;
++    if (x > 0x7FFFFFFF) x = 0x7FFFFFFF; else if (x < -0x7FFFFFFF) x = -0x7FFFFFFF;
++    if (y > 0x7FFFFFFF) y = 0x7FFFFFFF; else if (y < -0x7FFFFFFF) y = -0x7FFFFFFF;
++    *dx = (int)x;
++    *dy = (int)y;
++    if (dropped) *dropped = a->dropped;
++    a->dx = a->dy = 0;
++    a->dropped = 0;
++    a->take_frame = frame;
++    a->taken = 1;
++}
+ 
+ /* New yaw delta and pitch for one look update. yaw/pitch hold the game's values on entry. ads = the weapon's look
+  * scale (1.0 without a weapon); pitch limits are applied when pmin <= pmax and both are finite (the game's pitch
+@@ -200,6 +284,9 @@
+ /* Takes (and clears) the counts since the last call, plus the script's due events; `now` = seconds on the caller's
+  * clock (the script's clock starts at the first call). Returns 1 when either count is non-zero. */
+ int  pad_mouse_take(double now, int* dx, int* dy);
++/* Patch 2099: the guest frame clock of the accumulator (cellGcm_flip_request_count unless set; host tests). pad_mouse.c
++ * references cellGcm_flip_request_count (cellGcmSys.c): a standalone link (host test) defines a stub, as cellPad.c's tests do. */
++void pad_mouse_set_frame_clock(unsigned (*fn)(void));
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+diff -ruN a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c	2026-10-21 23:08:51.374628185 -0500
++++ b/libs/video/rsx_d3d12_backend.c	2026-10-21 23:12:04.975007192 -0500
+@@ -704,6 +704,7 @@
+  * Win32 window
+  * -----------------------------------------------------------------------*/
+ 
++#include "rsx_d3d12_device.h"  /* KZ3 patch 2099: WARP fallback */
+ #include "rsx_window_size.h"   /* KZ3 patch 2062: window size apart from the guest output */
+ #include "../input/pad_mouse.h"   /* KZ3 patch 2069: mouse look (Raw Input, cursor clip) */
+ 
+@@ -797,7 +798,8 @@
+      * (for A/B testing a suspected iGPU-driver stall). */
+     {
+         IDXGIFactory6* factory6 = NULL;
+-        if (SUCCEEDED(factory->lpVtbl->QueryInterface(
++        if (rsx_warp_mode_parse(getenv("RSX_D3D12_WARP"), NULL) != RSX_WARP_FORCE &&   /* patch 2099 */
++            SUCCEEDED(factory->lpVtbl->QueryInterface(
+                 factory, &IID_IDXGIFactory6, (void**)&factory6))) {
+             DXGI_GPU_PREFERENCE pref = getenv("CELLMARK_IGPU")
+                 ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
+@@ -824,14 +826,12 @@
+         }
+     }
+     if (!s_d3d.device) {
+-        hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0,
+-                               &IID_ID3D12Device, (void**)&s_d3d.device);
+-        if (FAILED(hr)) {
+-            printf("[D3D12] ERROR: D3D12CreateDevice failed (0x%08lX)\n", hr);
++        /* patch 2099: the default adapter, then WARP (RSX_D3D12_WARP; rsx_d3d12_device.h) */
++        if (rsx_d3d12_create_device(factory, &s_d3d.device, "d3d12 backend") < 0) {
++            printf("[D3D12] ERROR: no D3D12 device\n");
+             factory->lpVtbl->Release(factory);
+             return -1;
+         }
+-        printf("[D3D12] Device created on default adapter (feature level 11.0)\n");
+     }
+ 
+     /* Create command queue */
+diff -ruN a/libs/video/rsx_d3d12_device.h b/libs/video/rsx_d3d12_device.h
+--- a/libs/video/rsx_d3d12_device.h	1969-12-31 18:00:00.000000000 -0600
++++ b/libs/video/rsx_d3d12_device.h	2026-10-21 23:27:50.203767762 -0500
+@@ -0,0 +1,125 @@
++/* KZ3 patch 2099 (RSX pass 94): D3D12 device creation with a WARP fallback.
++ *
++ * Hardware stays the default and the only path while it works: D3D12CreateDevice(NULL, FL 11_0) as before (the
++ * default adapter). Only when that fails (a Windows VM with no GPU, a broken driver) is the device created on the
++ * WARP adapter (IDXGIFactory4::EnumWarpAdapter, Microsoft's software rasteriser), logged once. RSX_D3D12_WARP=1
++ * forces WARP (tests), RSX_D3D12_WARP=0 never uses it (the old failure).
++ *
++ * What the renderer needs from a device (checked pass 94 across rsx_live_draw.c and rsx_d3d12_backend.c): feature
++ * level 11_0, FXC shader model 5.0 bytecode (vs/ps/cs_5_0), root signature 1.0, typed UAV stores only (no typed UAV
++ * loads), no vendor checks. The optional features (depth bounds, per-face stencil masks, alpha blend factor, pipeline
++ * library) are queried and switched off by ld_caps_init / the pipeline library code when missing. WARP covers FL
++ * 12_1 and resource binding tier 3, so nothing degrades beyond speed; every device logs one "[d3d12] device" line
++ * (adapter, vendor, software flag, max feature level, binding tier, highest shader model) so a log names its device.
++ *
++ * Pure part first (host test tools/smoke/test_d3d12_warp.sh); the Windows part needs d3d12.h and dxgi1_4.h. */
++#ifndef RSX_D3D12_DEVICE_H
++#define RSX_D3D12_DEVICE_H
++
++#include <stdio.h>
++#include <string.h>
++
++enum { RSX_WARP_AUTO = 0, RSX_WARP_FORCE = 1, RSX_WARP_NEVER = 2 };
++
++/* RSX_D3D12_WARP: unset/empty = auto (hardware, WARP only when no hardware device), "1" = WARP only, "0" = never.
++ * Anything else = auto, *bad = 1. */
++static inline int rsx_warp_mode_parse(const char* e, int* bad)
++{
++    if (bad) *bad = 0;
++    if (!e || !*e) return RSX_WARP_AUTO;
++    if (e[0] == '1' && !e[1]) return RSX_WARP_FORCE;
++    if (e[0] == '0' && !e[1]) return RSX_WARP_NEVER;
++    if (bad) *bad = 1;
++    return RSX_WARP_AUTO;
++}
++static inline int rsx_warp_try_hw(int mode) { return mode != RSX_WARP_FORCE; }
++static inline int rsx_warp_try_warp(int mode, int hw_ok) { return mode == RSX_WARP_FORCE || (mode == RSX_WARP_AUTO && !hw_ok); }
++
++#ifdef _WIN32
++#include <stdlib.h>
++
++/* One "[d3d12] device" line: who, how it was made, the adapter and the capabilities that matter. -> the adapter's
++ * DXGI_ADAPTER_FLAG_SOFTWARE (-1 = unknown). */
++static int rsx_d3d12_log_device(ID3D12Device* dev, IDXGIFactory4* f, const char* who, const char* how)
++{
++    char name[256] = "?";
++    unsigned vendor = 0, device = 0;
++    int software = -1;
++    unsigned long long vram = 0;
++    LUID luid = {0, 0};
++    dev->lpVtbl->GetAdapterLuid(dev, &luid);   /* MinGW's C binding: the struct return is an out pointer */
++    IDXGIAdapter1* ad = NULL;
++    if (f && SUCCEEDED(f->lpVtbl->EnumAdapterByLuid(f, luid, &IID_IDXGIAdapter1, (void**)&ad)) && ad) {
++        DXGI_ADAPTER_DESC1 d;
++        if (SUCCEEDED(ad->lpVtbl->GetDesc1(ad, &d))) {
++            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, (int)sizeof name, NULL, NULL);
++            vendor = d.VendorId; device = d.DeviceId; software = (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
++            vram = (unsigned long long)d.DedicatedVideoMemory;
++        }
++        ad->lpVtbl->Release(ad);
++    }
++    static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
++                                               D3D_FEATURE_LEVEL_12_1};
++    D3D12_FEATURE_DATA_FEATURE_LEVELS fl;
++    memset(&fl, 0, sizeof fl);
++    fl.NumFeatureLevels = (UINT)(sizeof levels / sizeof levels[0]);
++    fl.pFeatureLevelsRequested = levels;
++    const int have_fl = SUCCEEDED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof fl));
++    D3D12_FEATURE_DATA_D3D12_OPTIONS o;
++    memset(&o, 0, sizeof o);
++    const int have_o = SUCCEEDED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
++    D3D12_FEATURE_DATA_SHADER_MODEL sm;
++    sm.HighestShaderModel = (D3D_SHADER_MODEL)0x60;   /* 6_0; the answer is the highest one up to the request */
++    if (FAILED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm)))
++        sm.HighestShaderModel = (D3D_SHADER_MODEL)0x51;   /* runtimes that predate SM 6 know 5_1 */
++    fprintf(stderr, "[d3d12] device (%s, %s): adapter \"%s\" vendor=0x%04X device=0x%04X software=%d vram=%llu MB "
++                    "max-fl=0x%X binding-tier=%d typed-uav-load-x=%d highest-sm=0x%X (needs: fl 11_0, sm 5.0)\n",
++            who, how, name, vendor, device, software, vram >> 20, have_fl ? (unsigned)fl.MaxSupportedFeatureLevel : 0u,
++            have_o ? (int)o.ResourceBindingTier : -1, have_o ? (int)o.TypedUAVLoadAdditionalFormats : -1,
++            (unsigned)sm.HighestShaderModel);
++    return software;
++}
++
++/* The device by the RSX_D3D12_WARP rule (above). -> 0 = hardware/default adapter, 1 = WARP, -1 = no device. */
++static int rsx_d3d12_create_device(IDXGIFactory4* f, ID3D12Device** out, const char* who)
++{
++    *out = NULL;
++    int bad = 0;
++    const int mode = rsx_warp_mode_parse(getenv("RSX_D3D12_WARP"), &bad);
++    if (bad) fprintf(stderr, "[d3d12] RSX_D3D12_WARP=%s not understood (1 = WARP only, 0 = never): auto\n", getenv("RSX_D3D12_WARP"));
++    HRESULT hw = E_FAIL;
++    if (rsx_warp_try_hw(mode)) {
++        hw = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)out);
++        if (SUCCEEDED(hw) && *out) {
++            rsx_d3d12_log_device(*out, f, who, "default adapter");
++            return 0;
++        }
++        *out = NULL;
++        fprintf(stderr, "[d3d12] D3D12CreateDevice on the default adapter failed (hr=0x%08lX)%s\n", (unsigned long)hw,
++                mode == RSX_WARP_NEVER ? "; RSX_D3D12_WARP=0: no WARP fallback" : "; trying WARP");
++    }
++    if (!rsx_warp_try_warp(mode, 0)) return -1;
++    IDXGIAdapter* warp = NULL;
++    HRESULT hr = f ? f->lpVtbl->EnumWarpAdapter(f, &IID_IDXGIAdapter, (void**)&warp) : E_POINTER;
++    if (FAILED(hr) || !warp) {
++        fprintf(stderr, "[d3d12] ERROR: EnumWarpAdapter failed (hr=0x%08lX): no D3D12 device\n", (unsigned long)hr);
++        return -1;
++    }
++    hr = D3D12CreateDevice((IUnknown*)warp, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)out);
++    warp->lpVtbl->Release(warp);
++    if (FAILED(hr) || !*out) {
++        *out = NULL;
++        fprintf(stderr, "[d3d12] ERROR: D3D12CreateDevice on WARP failed (hr=0x%08lX): no D3D12 device\n", (unsigned long)hr);
++        return -1;
++    }
++    const int sw = rsx_d3d12_log_device(*out, f, who, mode == RSX_WARP_FORCE ? "WARP, forced" : "WARP, fallback");
++    if (sw == 0)   /* DXVK's DXGI (Proton) answers EnumWarpAdapter with the first hardware adapter */
++        fprintf(stderr, "[d3d12] WARP requested (%s) but EnumWarpAdapter gave a hardware adapter (Proton/DXVK has no "
++                        "WARP): this run is not a WARP test\n", mode == RSX_WARP_FORCE ? "RSX_D3D12_WARP=1" : "fallback");
++    else
++        fprintf(stderr, "[d3d12] WARP (software rasteriser) in use: %s; expect a few fps\n",
++                mode == RSX_WARP_FORCE ? "RSX_D3D12_WARP=1" : "no hardware D3D12 device");
++    return 1;
++}
++#endif /* _WIN32 */
++#endif
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c	2026-10-21 23:08:51.374628185 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-21 23:11:57.540839040 -0500
+@@ -222,6 +222,7 @@
+ #include "rsx_pace.h"           /* patch 2072 */
+ #include "rsx_tex_lru.h"        /* patch 2075 */
+ #include "rsx_gpupass.h"        /* patch 2086 */
++#include "rsx_d3d12_device.h"   /* patch 2099: WARP fallback */
+ #include <sys/stat.h>
+ 
+ #pragma comment(lib, "d3d12.lib")
+@@ -15286,7 +15287,8 @@
+     ld_enable_dred();
+     IDXGIFactory4* factory = NULL;
+     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory))) return -1;
+-    if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&g.dev))) {
++    /* patch 2099: the default adapter as before; WARP only when it gives no device or RSX_D3D12_WARP=1 */
++    if (rsx_d3d12_create_device(factory, &g.dev, "live renderer") < 0) {
+         factory->lpVtbl->Release(factory); return -1;
+     }
+ #if defined(YZ_PERF_PROFILE)

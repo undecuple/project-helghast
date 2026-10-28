@@ -1,0 +1,54 @@
+KZ3 patch 1086 (SPU pass 66): spu_depth_guard (spu_drain.c, on every full drain of every SPU host thread) wrote a
+24-entry ring of drain sites and its counter as process-wide statics: a data race, and a cache line bouncing between
+the cores of the five HiPrio kernel threads. spu_depth_guard was 2.3 % of the K4 SPU samples (run spu-66-trace2,
+KZ3_PROF 131-180 s) for a limit test and two stores. The ring is gone; the depth report (the only reader) prints the
+tripping context's own step ring (ctx->recent_pc, written per drain step by spu_task_launch_check and patch 1068's
+marks), which names that SPU's loop instead of a mix of all SPUs' sites. Host microbenchmark (work/spu/r66/mb.c, not
+committed): 6 threads, 1.8 -> 10.3 ns per call with the shared ring vs 0.4 ns without. Upstream candidate.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (no shared ring) over upstream's upper-half ring.
+
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index b0015141..8186d3c0 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -537,19 +537,11 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
+     }
+     const uint32_t s_max = g_spu_depth_guard_limit;
+ 
+-    /* Ring of recent drain sites. When the depth trips, the useful question is
+-     * not "where are we" but "what cycle got us here" -- one pc names a point,
+-     * a ring names the loop. */
+-    enum { RING = 24 };
+-    static uint32_t s_ring[RING];
+-    static uint32_t s_n;
+-    /* Record only in the upper half of the budget: a runaway passes through it
+-     * on its way to the limit, and ordinary transfers from every SPU thread no
+-     * longer write this shared line. */
+-    if (ctx->host_depth < s_max / 2) return;
+-    s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
+-    s_n++;
+-
++    /* KZ3 patch 1086 (SPU pass 66): the ring of recent drain sites was one static array and counter written here
++     * by every SPU host thread on every full drain: a data race, and a cache line bouncing between the cores of the
++     * five HiPrio kernel threads (spu_depth_guard was 2.3 % of the K4 SPU samples, spu-66-trace2). The report reads
++     * this context's own step ring instead (recent_pc: every drain step, spu_task_launch_check and patch 1068's
++     * marks), which names the loop of the SPU that tripped rather than a mix of all of them. */
+     if (ctx->host_depth < s_max) return;
+     static int s_reported = 0;
+     if (s_reported < 1) {   /* one report: five SPU threads all trip together */
+@@ -558,10 +550,10 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
+                         " -- lifted call recursion, halting the SPU\n",
+                 ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth);
+-        fprintf(stderr, "[spu-depth] recent drain sites (oldest first):");
+-        uint32_t start = (s_n > RING) ? (s_n - RING) : 0;
+-        for (uint32_t k = start; k < s_n; k++)
+-            fprintf(stderr, " %05X", s_ring[k % RING]);
++        fprintf(stderr, "[spu-depth] this SPU's last 24 drain steps (oldest first; kind<<28|depth<<20|pc for marks):");
++        const unsigned n = ctx->recent_n, k0 = n > 24u ? n - 24u : 0u;
++        for (unsigned k = k0; k < n; k++)
++            fprintf(stderr, " %05X", ctx->recent_pc[k & 255]);
+         fprintf(stderr, "\n");
+         fflush(stderr);
+     }

@@ -1,0 +1,393 @@
+KZ3 patch 1098 (SPU pass 73): lift-time guesses for computed hops between lifted SPU functions.
+
+Software-pipelined SPU loops close with `bi rX`, rX = selb(head, exit, cond), the head loaded by `ila` before the
+loop (KZ3's audio mixer jobs: 0xD100 -> 0xD2DC -> 0xD100 ...). Since patch 1096 every such hop went through
+spu_ib_direct: an out-of-line call, the lookup memo's hash and load, the registry load and an indirect jump, 9.9 %
+of the audio SPU thread (SPU pass 72 profile).
+- tools/spu_lifter.py compute_ib_guesses: from each computed-hop site, scan back in address order for the target
+  register's writer, following selb (both value operands) and copies down to il/ila constants that start a lifted
+  function of the image (at most two per site; never the runtime's special addresses). Such sites emit
+  SPU_IB_HOP_G(ctx, T, SPU_IB_GUESS(ctx, G, F) ...); the TU registers its guesses after its functions
+  (spu_ib_guess_register) and keeps its image id in s_spu_ib_gid only when spu_lookup(G, id) is F for each.
+- spu_context.h: SPU_IB_GUESS tail-calls F directly when the target is G and spu_ib_guess_ok() holds: each of
+  spu_ib_direct's tests for that constant, the same or stricter, and an image test in place of the lookup (the
+  resident overlay is the TU's image, or there is none and the context's image is), so a guess hop runs exactly
+  what spu_ib_direct would have returned; any other case takes the old path.
+KZ3_SPU_IBGUESS=0 = old path (same exe); KZ3_HOP_STATS=1 adds `guess=` (guess hops per 10 s) to [hop-stats].
+Needs a relift. Upstream candidate (with 1096).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): both.
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 274023ba..1e995446 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1891,6 +1891,31 @@ static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
+     return m->fn;
+ }
+ 
++/* KZ3 patch 1098: a lifted TU's computed-hop guesses (spu_ib_guess_ok, spu_context.h). Called by the TU's
++ * spu_recomp_register right after it registered its functions: returns the image being registered when, for every
++ * guess, spu_lookup's answer (the first registry entry at that address whose image is this one or the wildcard 0)
++ * is the TU's own function; else 0 (the TU's guesses stay off). The registry is append-only, so that answer is
++ * final. Quiet: the chain walk is spu_lookup's without the cross-image report and the memo. */
++volatile unsigned long long g_spu_ib_guess_n;
++int spu_ib_guess_register(const uint32_t* addrs, void (*const* fns)(spu_context*), int n)
++{
++    const int id = s_reg_image;
++    if (id <= 0) return 0;
++    for (int i = 0; i < n; i++) {
++        spu_fn got = NULL;
++        for (uint32_t k = s_hash_head[spu_fn_hash(addrs[i])]; k; k = s_hash_next[k - 1]) {
++            const spu_reg_entry* e = &s_registry[k - 1];
++            if (e->addr == addrs[i] && (e->image_id == 0 || e->image_id == id)) { got = e->fn; break; }
++        }
++        if (got != fns[i]) {
++            fprintf(stderr, "[spu] image %d: computed-hop guess 0x%05X is not this image's function: guesses off "
++                    "(KZ3 patch 1098)\n", id, addrs[i]);
++            return 0;
++        }
++    }
++    return id;
++}
++
+ /* KZ3 patch 1028: exact-image probe for the interpreter's rejoin (no image-0
+  * wildcard, no cross-image report): is there a lifted function of THIS overlay
+  * image at addr? */
+@@ -2335,17 +2360,17 @@ static int s_task_entry_count = 0;
+ /* KZ3 patch 1097: filters for spu_ib_direct (direct hops): a bit per registered task entry (hashed LS address) and
+  * per taskset policy image id, so a job overlay's computed hop skips the LS read and the table scans. A clear bit
+  * means no match; a set bit runs the scan as before. */
+-static uint64_t s_task_entry_bits[16];
++uint64_t g_spu_task_entry_bits[16];   /* KZ3 patch 1098: not static (spu_ib_guess_ok, spu_context.h) */
+ #define SPU_TASK_POL_BITS 1024u
+-static uint64_t s_task_pol_bits[SPU_TASK_POL_BITS / 64];
+-static int s_task_pol_big;   /* a policy image id >= SPU_TASK_POL_BITS was registered: no filter */
++uint64_t g_spu_task_pol_bits[SPU_TASK_POL_BITS / 64];
++int g_spu_task_pol_big;   /* a policy image id >= SPU_TASK_POL_BITS was registered: no filter */
+ void spu_taskset_register_task_entry(uint32_t entry, int image_id)
+ {
+     if (s_task_entry_count < SPU_TASK_ENTRY_MAX) {
+         s_task_entry[s_task_entry_count].entry = entry & SPU_LS_MASK;
+         s_task_entry[s_task_entry_count].image_id = image_id;
+         s_task_entry_count++;
+-        s_task_entry_bits[(entry >> 2) & 15] |= 1ull << ((entry >> 6) & 63);   /* KZ3 patch 1097 */
++        g_spu_task_entry_bits[(entry >> 2) & 15] |= 1ull << ((entry >> 6) & 63);   /* KZ3 patch 1097 */
+     }
+ }
+ static int spu_taskset_task_image(uint32_t entry)
+@@ -2366,9 +2391,9 @@ void spu_taskset_register_task_elf(uint32_t elf_ea, int image_id, int policy_ima
+         s_task_elf[s_task_elf_count].image_id = image_id;
+         s_task_elf[s_task_elf_count++].policy_image_id = policy_image_id;
+         if ((unsigned)policy_image_id < SPU_TASK_POL_BITS)   /* KZ3 patch 1097 */
+-            s_task_pol_bits[(unsigned)policy_image_id / 64] |= 1ull << ((unsigned)policy_image_id % 64);
++            g_spu_task_pol_bits[(unsigned)policy_image_id / 64] |= 1ull << ((unsigned)policy_image_id % 64);
+         else
+-            s_task_pol_big = 1;
++            g_spu_task_pol_big = 1;
+     }
+ }
+ static int spu_taskset_resident_image(const spu_context* ctx)
+@@ -2385,6 +2410,8 @@ static int spu_taskset_resident_image(const spu_context* ctx)
+ /* Lowest LS address of the shared task-code region: the taskset tasks all lift
+  * at LS 0x3000 (below it is the SPURS kernel/policy/context, 0x290..0x2FFF). */
+ #define SPU_TASKSET_TASK_LO 0x3000u
++_Static_assert(SPU_TASKSET_TASK_LO == SPU_IBG_TASKSET_TASK_LO && SPU_TASK_POL_BITS == 1024u &&
++               SPU_JOB_RETURN_LS == SPU_IBG_JOB_RETURN_LS, "KZ3 patch 1098: spu_ib_guess_ok's copies");
+ 
+ /* KZ3 patch 1043 (SPU pass 30): skip a streamed overlay module at its entry (A/B aid for KZ3's SPU
+  * visibility culling jobs, KZ3_SPU_SKIP_OVL / KZ3_CULL_AB in the port's generated registration). When the
+@@ -2394,8 +2421,10 @@ static int spu_taskset_resident_image(const spu_context* ctx)
+  * Tested on both dispatch paths (spu_dispatch_mt.c fast path and the resolver below); one global load on the
+  * fast path when nothing is marked. kz3-ovl-skip begin */
+ #define KZ3_OVL_SKIP_MAX 512u   /* image ids: ELFs 1..43, policy modules, job modules 200..290 */
++_Static_assert(KZ3_OVL_SKIP_MAX == 512u, "KZ3 patch 1098: g_spu_ovl_skip's size in spu_context.h");
+ int g_spu_ovl_skip_any = 0;
+-static uint8_t s_ovl_skip[KZ3_OVL_SKIP_MAX];   /* 0 off, 1 return at entry, 2 ask the entry hook (patch 1044) */
++uint8_t g_spu_ovl_skip[KZ3_OVL_SKIP_MAX];   /* KZ3 patch 1098: not static (spu_ib_guess_ok) */
++#define s_ovl_skip g_spu_ovl_skip   /* 0 off, 1 return at entry, 2 ask the entry hook (patch 1044) */
+ /* KZ3 patch 1044 (SPU pass 31): an entry hook in place of the plain skip. It runs at the same point (the job
+  * manager's call of the module entry; ctx->gpr[3] = the job context, LS[ctx+0x20] = the job's parameters) and
+  * may edit the local store before the module runs; it returns 1 to skip the module after all, 0 to let it run
+@@ -3084,10 +3113,11 @@ static void spu_hop_stats_tick(void)
+     if (now - s_t0 < 10000000u) return;
+     s_t0 = now;
+     fprintf(stderr, "[hop-stats] direct=%llu fallback: int=%llu ok=%llu diag=%llu (irq %llu pmend/trace %llu ftrace "
+-            "%llu) task=%llu pc=%llu ret=%llu taskset=%llu slot=%llu nofn=%llu | resolver calls=%llu\n",
++            "%llu) task=%llu pc=%llu ret=%llu taskset=%llu slot=%llu nofn=%llu | resolver calls=%llu guess=%llu\n",
+             s_hs[0], s_hs[1], s_hs[2], s_hs[3], s_hs[11], s_hs[12], s_hs[13], s_hs[4], s_hs[5], s_hs[6], s_hs[7],
+-            s_hs[8], s_hs[9], s_hs[10]);
++            s_hs[8], s_hs[9], s_hs[10], g_spu_ib_guess_n);   /* guess: KZ3 patch 1098 */
+     for (int i = 0; i < 16; i++) s_hs[i] = 0;
++    g_spu_ib_guess_n = 0;
+ }
+ #define SPU_HS(i) do { if (__builtin_expect(s_hop_stats > 0, 0)) s_hs[i]++; } while (0)
+ spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
+@@ -3137,8 +3167,8 @@ spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
+     }
+     if (t >= SPU_TASKSET_TASK_LO) {   /* KZ3 patch 1097: the filters first (exact: a clear bit = no table match) */
+         const unsigned ov = (unsigned)ctx->resident_ovl;
+-        const int pol = s_task_pol_big || ov >= SPU_TASK_POL_BITS || (s_task_pol_bits[ov / 64] >> (ov % 64) & 1);
+-        const int ent = (int)(s_task_entry_bits[(t >> 2) & 15] >> ((t >> 6) & 63) & 1);
++        const int pol = g_spu_task_pol_big || ov >= SPU_TASK_POL_BITS || (g_spu_task_pol_bits[ov / 64] >> (ov % 64) & 1);
++        const int ent = (int)(g_spu_task_entry_bits[(t >> 2) & 15] >> ((t >> 6) & 63) & 1);
+         if ((pol && spu_taskset_resident_image(ctx)) || (ent && spu_taskset_task_image(t))) {
+             SPU_HS(7);
+             return NULL;
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 3a0f3d3d..3e009208 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -1150,6 +1150,82 @@ static inline __attribute__((always_inline)) void spu_hop_note(spu_context* ctx,
+         g_spu_trampoline_fn = spu_indirect_branch;                                               \
+         return;                                                                                  \
+     } while (0)
++/* KZ3 patch 1098 (SPU pass 73): lift-time guesses for computed hops. A software-pipelined SPU loop closes with
++ * `bi rX` where rX = selb(head, exit, cond) and head was loaded by `ila` (the audio mixer jobs' loops: 0xD100 ->
++ * 0xD2DC -> 0xD100 ...); every iteration went through spu_ib_direct (an out-of-line call, the memo hash and load,
++ * the registry load and an indirect jump: 9.9 % of the audio SPU thread in SPU pass 72). The lifter now finds
++ * such constants (tools/spu_lifter.py compute_ib_guesses) and emits SPU_IB_HOP_G(ctx, T, SPU_IB_GUESS(ctx, G, F)...):
++ * when the target equals G and spu_ib_guess_ok() holds, it is a direct tail call of F, the lifted function at G of
++ * the same image. spu_ib_guess_ok() is spu_ib_direct's tests for that constant, each the same or stricter (a
++ * stricter one only sends the hop down the old path), and the lookup is replaced by an image test: the lifted
++ * TU's s_spu_ib_gid is its image id, set at registration only when spu_lookup(G, id) returns F for every guess
++ * of the TU (spu_ib_guess_register; the registry is append-only and a lookup returns the first match in
++ * registration order, so that answer never changes); spu_ib_direct asks the resident overlay first, then the
++ * context's image, so the guess runs only when the resident overlay is that image, or there is none and the
++ * context's image is. KZ3_SPU_IBGUESS=0 = the old path (one exe for an A/B); KZ3_HOP_STATS=1 counts guess hops. */
++extern int g_spu_ib_guess;                 /* 0 off/undecided, 1 on, 2 on and counted (spu_drain.c spu_hop_init) */
++extern volatile unsigned long long g_spu_ib_guess_n;
++extern int g_kz3_pmend_ib;                 /* spu_channels.c */
++extern void* volatile g_kz3_trace_ctx;     /* spu_channels.c */
++extern int g_spu_ovl_skip_any;             /* spu_channels.c */
++extern uint8_t g_spu_ovl_skip[512];        /* spu_channels.c s_ovl_skip (KZ3_OVL_SKIP_MAX) */
++extern uint64_t g_spu_task_entry_bits[16]; /* spu_channels.c (patch 1097 filters) */
++extern uint64_t g_spu_task_pol_bits[16];
++extern int g_spu_task_pol_big;
++#define SPU_IBG_TASKSET_TASK_LO 0x3000u    /* = SPU_TASKSET_TASK_LO (spu_channels.c, static assert there) */
++#define SPU_IBG_JOB_RETURN_LS   0x3FF00u   /* = SPU_JOB_RETURN_LS */
++int spu_ib_guess_register(const uint32_t* addrs, void (*const* fns)(spu_context*), int n);
++static inline __attribute__((always_inline)) int spu_ib_guess_ok(const spu_context* ctx, uint32_t g, int gid)
++{
++    if (g == 0 || g == 0xA00u || g == SPURS_TASKSET_PM_SYSCALL_LS || g == SPU_IBG_JOB_RETURN_LS || g == 0x4A40u ||
++        g == SPURS_PM_EXIT_TO_KERNEL_LS || g == SPURS_PM_SELECT_WORKLOAD_LS)
++        return 0;   /* constant: folds away (the lifter does not guess these) */
++    if (__builtin_expect(g_spu_ib_guess <= 0 || gid <= 0, 0)) return 0;
++    if (!(ctx->resident_ovl ? ctx->resident_ovl == gid : ctx->image_id == gid)) return 0;
++    if (!spu_hop_ok(ctx)) return 0;
++    if (ctx->irq_saved || g_kz3_pmend_ib != 0 || g_kz3_trace_ctx == (const void*)ctx || g_kz3_wtrace != 0 ||
++        ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID || ctx->resident_task)
++        return 0;
++    /* patch 1043/1044 skip or entry hook: spu_ib_direct's own test (the job manager's call of a marked module) */
++    if (g_spu_ovl_skip_any && ctx->resident_ovl > 0 && ctx->resident_ovl < 512 && g_spu_ovl_skip[ctx->resident_ovl] &&
++        ctx->image_id == 2 && g >= 0x4000 && g < 0x3E000 && (ctx->gpr[0]._u32[0] & SPU_LS_MASK) < 0x4000)
++        return 0;
++    if (g >= SPU_IBG_TASKSET_TASK_LO) {
++        const unsigned ov = (unsigned)ctx->resident_ovl;
++        if (g_spu_task_pol_big || ov >= 1024u || (g_spu_task_pol_bits[ov / 64] >> (ov % 64) & 1)) return 0;
++        if (g_spu_task_entry_bits[(g >> 2) & 15] >> ((g >> 6) & 63) & 1) return 0;
++    }
++    for (unsigned slot = 0; slot < 4; ++slot)
++        if (ctx->resident_code[slot].image_id && g >= ctx->resident_code[slot].lsa &&
++            g - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
++            return 0;
++    return 1;
++}
++/* one guess: target G, lifted function F of this image (inside SPU_IB_HOP_G only; s_spu_ib_gid is the lifted TU's) */
++#define SPU_IB_GUESS(ctx, G, F)                                                                  \
++        if (((uint32_t)(ctx)->pc & SPU_LS_MASK) == (G) && spu_ib_guess_ok((ctx), (G), s_spu_ib_gid)) { \
++            if (__builtin_expect(g_spu_ib_guess > 1, 0)) g_spu_ib_guess_n++;                     \
++            (ctx)->pc = (G);                                                                     \
++            spu_hop_note((ctx), (G));                                                            \
++            SPU_HOP_TAIL(F(ctx));                                                                \
++        }
++/* SPU_IB_HOP with lift-time guesses (GUESSES = SPU_IB_GUESS(...) ...), tried after the bracket-return test */
++#define SPU_IB_HOP_G(ctx, T, GUESSES) do {                                                       \
++        (ctx)->pc = (T);                                                                         \
++        if (SPU_HOP_DIRECT && g_spu_hop_on > 0) {                                                \
++            if (((uint32_t)(ctx)->pc & SPU_LS_MASK) == (ctx)->hop_ret_pc && (ctx)->hop_ret_pc &&  \
++                !g_kz3_wtrace) return;   /* KZ3 patch 1097: the drain would only return */      \
++            if (SPU_HOP_DIRECT) { GUESSES }                                                      \
++            const spu_hop_fn _hf = spu_ib_direct((ctx), (uint32_t)(ctx)->pc & SPU_LS_MASK);      \
++            if (_hf) {                                                                           \
++                (ctx)->pc &= SPU_LS_MASK;                                                        \
++                spu_hop_note((ctx), (uint32_t)(ctx)->pc);                                        \
++                SPU_HOP_TAIL(_hf(ctx));                                                          \
++            }                                                                                    \
++        }                                                                                        \
++        g_spu_trampoline_fn = spu_indirect_branch;                                               \
++        return;                                                                                  \
++    } while (0)
+ /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
+  *
+  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 121b2e17..d5a4bbfd 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -667,6 +667,7 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
+ /* KZ3 patch 1096: direct hops (spu_context.h). Decided once: KZ3_SPU_HOP=0 turns them off, and so does every
+  * switch that makes the drain loop or spu_indirect_branch do more than dispatch (their diagnostics need every hop). */
+ int g_spu_hop_on = -1;
++int g_spu_ib_guess = 0;   /* KZ3 patch 1098 */
+ void spu_hop_init(void)
+ {
+     static const char* const diag[] = {"SPU_TAILRET", "SPU_JOBTRACE", "SPU_JOBEXEC", "SPU_POLLTRACE", "SPU_IBCOV",
+@@ -676,6 +677,11 @@ void spu_hop_init(void)
+     for (unsigned i = 0; on && i < sizeof diag / sizeof diag[0]; i++)
+         if (getenv(diag[i])) on = 0;
+     if (g_spu_hop_on < 0) fprintf(stderr, "[spu] direct hops %s (KZ3 patch 1096)\n", on ? "on" : "off");
++    /* KZ3 patch 1098: lift-time computed-hop guesses (KZ3_SPU_IBGUESS=0 = off; KZ3_HOP_STATS=1 counts them) */
++    { const char* g = getenv("KZ3_SPU_IBGUESS"); const char* st = getenv("KZ3_HOP_STATS");
++      const int gon = on && !(g && g[0] == '0');
++      if (g_spu_hop_on < 0) fprintf(stderr, "[spu] computed-hop guesses %s (KZ3 patch 1098)\n", gon ? "on" : "off");
++      g_spu_ib_guess = gon ? ((st && st[0] == '1') ? 2 : 1) : 0; }
+     g_spu_hop_on = on;
+ }
+ 
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index cb21309e..3658efc5 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -342,6 +342,64 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
+     return jumps
+ 
+ 
++# KZ3 patch 1098: addresses a computed hop never guesses (runtime specials, spu_ib_guess_ok in spu_context.h)
++_IB_GUESS_EXCLUDE = {0, 0xA00, 0x9C0, 0x9D0, 0xA70, 0x4A40, 0x3FF00}
++
++
++def compute_ib_guesses(insns, func_starts, sites, window=512, max_guesses=2) -> dict:
++    """KZ3 patch 1098: likely targets of computed hops, for SPU_IB_HOP_G.
++
++    A software-pipelined SPU loop closes with `bi rX`, rX = selb(head, exit, cond), head loaded by `ila` before the
++    loop (the audio mixer jobs: `ila $r38,0xD100` ... `selb $r42,$r38,$r0,$r35` ... `bi $r42` in the next function).
++    From each site, scan back in address order (not control flow: a guess is only a hint, checked at run time) for
++    the nearest writer of the target register; follow selb (both value operands), copies (ori/ai with 0) and stop at
++    il/ila constants that start a lifted function. Returns {site addr: [guess addrs]} for sites with a guess."""
++    ordered = sorted(insns, key=lambda x: x.addr)
++    idx_of = {ins.addr: i for i, ins in enumerate(ordered)}
++
++    def resolve(reg, start_idx, depth, out):
++        if depth > 4 or len(out) >= max_guesses:
++            return
++        for j in range(start_idx, max(-1, start_idx - window), -1):
++            w = ordered[j]
++            if w.mnemonic in _NO_RT_WRITE or _dest_reg(w) != reg or _is_identity_move(w):
++                continue
++            ops = _ops(w.operands)
++            if w.mnemonic in ("il", "ila") and len(ops) >= 2:
++                try:
++                    c = int(ops[1], 0) & 0x3FFFF
++                except ValueError:
++                    return
++                if c in func_starts and c not in _IB_GUESS_EXCLUDE and c not in out:
++                    out.append(c)
++                return
++            if w.mnemonic == "selb" and len(ops) >= 3:
++                for r in (ops[1], ops[2]):
++                    rr = _reg(r)
++                    if rr.isdigit():
++                        resolve(int(rr), j - 1, depth + 1, out)
++                return
++            if w.mnemonic in ("ori", "ai") and len(ops) == 3 and ops[2].strip() in ("0", "0x0"):
++                rr = _reg(ops[1])
++                if rr.isdigit():
++                    resolve(int(rr), j - 1, depth + 1, out)
++                return
++            return
++        return
++
++    guesses = {}
++    for a in sorted(sites):
++        insn = ordered[idx_of[a]]
++        r = _bi_target_reg(insn)
++        if r is None or not r.isdigit():
++            continue
++        out = []
++        resolve(int(r), idx_of[a] - 1, 0, out)
++        if out:
++            guesses[a] = out
++    return guesses
++
++
+ def compute_link_returns(insns, bounds) -> set:
+     """A `bi $rN` / conditional `bi{z,nz,hz,hnz} $rC,$rN` with N != 0 is emitted
+     as a generic indirect branch, but Sony's SPU compiler also uses a NON-r0
+@@ -467,6 +525,8 @@ class SPULifter:
+         self.branch_targets: set[int] = set()
+         self.unsupported: dict[str, int] = {}
+         self.trace = trace
++        self.ib_guesses: dict = {}          # KZ3 patch 1098: site -> [guess addrs] (compute_ib_guesses)
++        self.ib_guess_targets: set = set()
+         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
+         # Lets multiple lifted SPU images link into one binary without collisions
+         # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
+@@ -924,7 +984,7 @@ class SPULifter:
+                 return f"{_ied}SPU_RET(ctx);"
+             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
+             # KZ3 patch 1096: direct hop when the resolver would only dispatch (SPU_IB_HOP, spu_context.h)
+-            return f"{_ied}SPU_IB_HOP(ctx, {g(tgt_reg)}._u32[0]);"
++            return f"{_ied}{self._ib_hop(addr, g(tgt_reg) + '._u32[0]')}"
+         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
+         if mn == "iret":
+             return (f"{_ied}ctx->pc = ctx->srr0; "
+@@ -969,7 +1029,7 @@ class SPULifter:
+                 if tgt_reg != "0":
+                     return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
+                 return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
+-            return f"if ({cond}) {{ {_ied}SPU_IB_HOP(ctx, {g(tgt_reg)}._u32[0]); }}"
++            return f"if ({cond}) {{ {_ied}{self._ib_hop(addr, g(tgt_reg) + '._u32[0]')} }}"
+ 
+         # hint-for-branch: pure performance hint, safe to drop
+         if mn in ("hbr", "hbra", "hbrr"):
+@@ -1006,6 +1066,15 @@ class SPULifter:
+         # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
+         return self._hop(tgt)
+ 
++    def _ib_hop(self, addr, texpr) -> str:
++        """KZ3 patch 1098: a computed hop, with the lift-time guesses of compute_ib_guesses when there are any."""
++        gs = getattr(self, "ib_guesses", {}).get(addr)
++        if not gs:
++            return f"SPU_IB_HOP(ctx, {texpr});"
++        self.ib_guess_targets.update(gs)
++        body = " ".join(f"SPU_IB_GUESS(ctx, 0x{t:X}u, {self.prefix}spu_func_{t:08X})" for t in gs)
++        return f"SPU_IB_HOP_G(ctx, {texpr}, {body});"
++
+     def _hop(self, tgt) -> str:
+         """KZ3 patch 1096: a static cross-function transfer. SPU_HOP (spu_context.h) tail-calls the target when
+         the drain loop's per-hop hooks would only do bookkeeping, else sets the trampoline as before. LS 0 keeps
+@@ -1035,6 +1104,9 @@ class SPULifter:
+ 
+     def emit_source(self,header_name: str) -> str:
+         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
++        # KZ3 patch 1098: this image's id for the computed-hop guesses (0 = off; set by spu_ib_guess_register)
++        lines.append("static int s_spu_ib_gid;")
++        lines.append("")
+         for f in self.functions:
+             lines.append(f"void {f.name}(spu_context* ctx) {{")
+             # KZ3 patch 1082: one LS base / debug-gate snapshot per function that touches LS (see SOURCE_PREAMBLE).
+@@ -1075,6 +1147,12 @@ class SPULifter:
+         lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
+         lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
+         lines.append("        spu_register_function(e->addr, e->func);")
++        tg = sorted(getattr(self, "ib_guess_targets", set()))
++        if tg:   # KZ3 patch 1098
++            lines.append("    static const uint32_t ga[] = { " + ", ".join(f"0x{t:X}u" for t in tg) + " };")
++            lines.append("    static void (*const gf[])(spu_context*) = { "
++                         + ", ".join(f"{self.prefix}spu_func_{t:08X}" for t in tg) + " };")
++            lines.append(f"    s_spu_ib_gid = s_spu_ib_gid ? -1 : spu_ib_guess_register(ga, gf, {len(tg)});")
+         lines.append("}")
+         lines.append("")
+         return "\n".join(lines)
+@@ -1249,6 +1327,10 @@ def main() -> None:
+               f"(`bi $rN` where rN is a brsl/bisl link reg): "
+               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
+     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
++    # KZ3 patch 1098: computed-hop guesses (sites: every bi/biz/binz... that is not a return)
++    _sites = {i.addr for i in insns if _bi_target_reg(i) is not None}
++    lifter.ib_guesses = compute_ib_guesses(insns, lifter.func_starts, _sites)
++    lifter.ib_guess_targets = set()
+     for s, e in bounds:
+         lifter.lift_function(insns, s, e)
+ 

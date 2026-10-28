@@ -1,0 +1,59 @@
+Rebased on ps3recomp v0.17.0 (SPU pass 95): partly absorbed: the scan/exit bitsets under the lock-line lock are #388 (KZ3's PR); left: the exit-code notify under the lock, spu_taskset_dump_tracked.
+
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index d1509499..06eb9596 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -466,8 +466,8 @@ void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_co
+         e[10] = (uint8_t)((uint32_t)exit_code >> 8); e[11] = (uint8_t)exit_code;
+         e[14] = 0; e[15] = (uint8_t)((e[15] & 0xF0u) | 2u);
+     }
++    spu_coh_notify_write(ea);              /* under the lock-line lock, as the notify expects (KZ3 patch 1030) */
+     spu_lockline_unlock();
+-    spu_coh_notify_write(ea);
+     static int n;
+     if (n++ < 16)
+         fprintf(stderr, "[task2] taskset 0x%08X task %u %s exit_code[%u] state 0x%02X code %d\n", taskset_ea,
+@@ -542,6 +542,30 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
+     if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu, 0);
+ }
+ 
++/* KZ3 patch 1030 (diagnostic): one line per tracked taskset with its bitsets, the runtime's running marks and
++ * every enabled task's ELF/context and taskset2 exit-code state; called from the SEMDUMP periodic dump. */
++void spu_taskset_dump_tracked(const char* why)
++{
++    extern uint8_t* vm_base;
++    if (!vm_base) return;
++    for (int i = 0; i < TS_TRACK; i++) {
++        uint32_t ea = s_ts_run[i].ea;
++        if (!ea) continue;
++        const uint8_t* t = vm_base + ea; const uint8_t* r = s_ts_run[i].running;
++        fprintf(stderr, "[ts-dump] %s ts=0x%08X run=%02X%02X ready=%02X%02X pend=%02X%02X en=%02X%02X sig=%02X%02X wait=%02X%02X\n",
++                why, ea, r[0], r[1], t[0x10], t[0x11], t[0x20], t[0x21], t[0x30], t[0x31], t[0x40], t[0x41], t[0x50], t[0x51]);
++        uint32_t size = ((uint32_t)t[0x1890] << 24) | ((uint32_t)t[0x1891] << 16) | ((uint32_t)t[0x1892] << 8) | t[0x1893];
++        for (int k = 0; k < 16; k++) {
++            const uint8_t* ti = t + 0x80 + 0x30 * k;
++            uint32_t elf = ((uint32_t)ti[0x14] << 24) | ((uint32_t)ti[0x15] << 16) | ((uint32_t)ti[0x16] << 8) | ti[0x17];
++            if (!elf) continue;
++            const uint8_t* xc = t + 0x1980 + 16 * k;
++            fprintf(stderr, "[ts-dump]   task %d elf=%08X ctx=%02X%02X%02X%02X exit=%s%02X%02X%02X%02X/%02X\n", k, elf,
++                    ti[0x1C], ti[0x1D], ti[0x1E], ti[0x1F], size == 0x2900u ? "" : "(n/a)", xc[8], xc[9], xc[10], xc[11], xc[15]);
++        }
++    }
++}
++
+ /* A PUTLLC landed in the first 0x1900 bytes of a taskset the runtime tracks (bitsets, task_info): SPU code
+  * may have created a task or made one ready (KZ3's Havok task calls the SPU-side cellSpursCreateTask2,
+  * elf_00f6b900 LS 0x1C710, then joins it). The real taskset policy module would schedule it; scan the
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index c3a49075..75e02833 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -310,6 +310,7 @@ static void kz3_semdump_now(const char* why)
+ {
+     uint32_t r28 = s_sd_r[0], r29 = s_sd_r[1], r30 = s_sd_r[2], r31 = s_sd_r[3];
+     fprintf(stderr, "[semdump] %s r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", why, r28, r29, r30, r31);
++    { extern void spu_taskset_dump_tracked(const char* why); spu_taskset_dump_tracked(why); }   /* KZ3 patch 1030 */
+     kz3_semdump_region("sem", r30, 0x10);
+     /* KZ3 patch 1029: a Havok semaphore (0x8E88E4) keeps its (waiters << 16 | count) word at [r30+4]. */
+     if (r30 >= 0x10000u && r30 < 0xF0000000u) { uint32_t wp = sd_rd32(r30 + 4u);

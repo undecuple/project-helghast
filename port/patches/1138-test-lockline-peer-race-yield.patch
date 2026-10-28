@@ -1,0 +1,69 @@
+KZ3 patch 1138 (SPU pass 114; upstream candidate): runtime/spu/tests/test_spu_lockline_peer.c's racing-write test
+(RACE_ROUNDS = 200000) hands off between three threads (main, reader, writer) with bare `while (flag != k) { }` spins.
+With fewer CPUs than threads each hand-off waits for the spinner's scheduler slice to end: on the 2-vCPU GitHub runner
+t_lockline_peer took ~10 min (locally seconds; under taskset -c 0,1 it ran past 550 s). Fix: the three waits become
+RACE_WAIT, a short pause spin (200) then sched_yield / SwitchToThread. Same rounds, same checks (75 passed, 2 failed,
+the two patch-1056 expected ones). Not a runtime issue: the runtime code under test does not spin like this.
+
+--- a/runtime/spu/tests/test_spu_lockline_peer.c
++++ b/runtime/spu/tests/test_spu_lockline_peer.c
+@@ -51,6 +51,9 @@
+  */
+ 
+ #include <pthread.h>
++#ifndef _WIN32
++#include <sched.h>
++#endif
+ #include <stdatomic.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -365,13 +368,28 @@
+ #define RACE_ROUNDS 200000
+ static atomic_int g_race_go, g_race_reader_done, g_race_writer_done;
+ 
++/* Wait for cond with a bounded busy spin, then give the CPU away. The three race threads
++ * (main, reader, writer) hand off 200000 rounds; with fewer CPUs than threads a pure spin
++ * burns a whole scheduler slice per hand-off (2 vCPUs: > 10 min instead of seconds). */
++static inline void race_relax(unsigned* spins)
++{
++    if (++*spins < 200) { YieldProcessor(); return; }
++    *spins = 0;
++#ifdef _WIN32
++    SwitchToThread();
++#else
++    sched_yield();
++#endif
++}
++#define RACE_WAIT(cond) do { unsigned sp_ = 0; while (cond) race_relax(&sp_); } while (0)
++
+ static void race_delay(unsigned n) { for (unsigned i = 0; i < n; i++) YieldProcessor(); }
+ 
+ static void* race_reader(void* arg)
+ {
+     (void)arg;
+     for (int k = 1; k <= RACE_ROUNDS; k++) {
+-        while (atomic_load(&g_race_go) != k) { }
++        RACE_WAIT(atomic_load(&g_race_go) != k);
+         race_delay((unsigned)(k * 7) & 31u);
+         spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+         atomic_store(&g_race_reader_done, k);
+@@ -383,7 +401,7 @@
+ {
+     (void)arg;
+     for (int k = 1; k <= RACE_ROUNDS; k++) {
+-        while (atomic_load(&g_race_go) != k) { }
++        RACE_WAIT(atomic_load(&g_race_go) != k);
+         race_delay((unsigned)(k * 13) & 31u);
+         const uint8_t v = (uint8_t)(k % 255 + 1);
+         if (k & 1) {
+@@ -422,8 +440,8 @@
+     for (int k = 1; k <= RACE_ROUNDS; k++) {
+         g_a.event_status = 0;
+         atomic_store(&g_race_go, k);
+-        while (atomic_load(&g_race_reader_done) != k ||
+-               atomic_load(&g_race_writer_done) != k) { }
++        RACE_WAIT(atomic_load(&g_race_reader_done) != k ||
++                  atomic_load(&g_race_writer_done) != k);
+         const uint8_t v = (uint8_t)(k % 255 + 1);
+         int whole = 1;
+         for (int i = 0; i < 128; i++)

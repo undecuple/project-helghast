@@ -1,0 +1,85 @@
+KZ3 patch 4015 (diagnostics, network pass 28: the network error on the settings pages; every switch unset = no change).
+KZ3_PAD_MOTION=0: the host pad's motion sensors are never turned on (the game reads a DS3 at rest).
+KZ3_PAD_TEST_SENSORS=X,Y,Z,G[,J] (test only): fixed SIXAXIS words (+-J counts of noise per read) on port 0 while the game has
+SENSOR_ON, and the prompts and motion tips see a DualShock 4 with sensors, so an Xvfb run looks like a held DS4.
+KZ3_WATCH32=EA[,EA...] (test only): logs every change of up to 8 guest words, checked on each SENSOR_ON pad read.
+
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -753,7 +753,13 @@
+  * opened the pad decides whether it can report motion at all). */
+ static void pad_sdl_open_log(int p, PadSdlGamepad* gc, uint32_t id, unsigned long long now)
+ {
+-    pad_sensor_open(&s_sdl_sensors[p], now, pad_sdl_has_sensor, pad_sdl_enable_sensor, gc);
++    {   /* 4015: KZ3_PAD_MOTION=0 leaves the pad's sensors off (SDL's default): the game then reads a DS3 at rest */
++        static int motion = -1;
++        if (motion < 0) { const char* e = getenv("KZ3_PAD_MOTION"); motion = !(e && !strcmp(e, "0"));
++                          if (!motion) { printf("[pad] KZ3_PAD_MOTION=0: motion sensors left off\n"); fflush(stdout); } }
++        if (motion) pad_sensor_open(&s_sdl_sensors[p], now, pad_sdl_has_sensor, pad_sdl_enable_sensor, gc);
++        else memset(&s_sdl_sensors[p], 0, sizeof s_sdl_sensors[p]);
++    }
+     s_port_dev[p] = pad_dev_from_sdl_type(PSDL(SDL_GetGamepadType)(gc));   /* 4011: prompts */
+     const char* name = PSDL(SDL_GetGamepadName)(gc);
+     printf("[pad] port %d: %s (%s), face %s/%s/%s/%s, sensors %s\n", p,
+@@ -1045,8 +1051,17 @@
+ }
+ 
+ /* PAD_DEV_* of the device the prompts follow (the last input; before any, the first connected host pad). */
++/* 4015 (test only): KZ3_PAD_TEST_SENSORS set = the prompts and motion tips see a DualShock 4 with sensors on port 0. */
++static int pad_test_ds4(void)
++{
++    static int t = -1;
++    if (t < 0) { const char* e = getenv("KZ3_PAD_TEST_SENSORS"); t = e && *e ? 1 : 0; }
++    return t;
++}
++
+ int pad_prompt_device(void)
+ {
++    if (pad_test_ds4()) return PAD_DEV_PS4;
+     return pad_last_device_current(&s_last_dev, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS, NULL);
+ }
+ 
+@@ -1054,6 +1069,7 @@
+  * keyboard, XInput pads, pads without sensors and no device. For the motion tips (port/net/kz3_text_overrides.h). */
+ int pad_prompt_motion(void)
+ {
++    if (pad_test_ds4()) return 1;
+     int port = -1;
+     int dev = pad_last_device_current(&s_last_dev, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS, &port);
+     if (dev == PAD_DEV_KEYBOARD || port < 0 || port >= PAD_MAX_HOST_PORTS) return 0;
+@@ -1799,6 +1815,35 @@
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = hs->has_sensor ? hs->sensor_y : 399;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = hs->has_sensor ? hs->sensor_z : 512;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = hs->has_sensor ? hs->sensor_g : 512;
++        /* 4015 (test only): KZ3_PAD_TEST_SENSORS=X,Y,Z,G[,J] puts these SIXAXIS words on port 0 (J = +-J counts of
++         * noise per read), so an Xvfb run without a host pad sees what a held DualShock 4 with sensors sends. */
++        {
++            static int tst = -1; static int tv[5]; static unsigned lcg = 12345u;
++            if (tst < 0) {
++                const char* e = getenv("KZ3_PAD_TEST_SENSORS");
++                tst = e && sscanf(e, "%d,%d,%d,%d,%d", &tv[0], &tv[1], &tv[2], &tv[3], &tv[4]) >= 4;
++                if (tst) { printf("[pad] test sensors on port 0: %d %d %d %d, noise %d\n", tv[0], tv[1], tv[2], tv[3], tv[4]); fflush(stdout); }
++            }
++            {   /* 4015 (test only): KZ3_WATCH32=EA[,EA...] logs every change of these guest words, checked per read */
++                static int nw = -1; static uint32_t wa[8], wv[8];
++                if (nw < 0) {
++                    nw = 0;
++                    const char* w = getenv("KZ3_WATCH32");
++                    while (w && *w && nw < 8) { char* e2; unsigned long a = strtoul(w, &e2, 0); if (e2 == w) break;
++                        wa[nw] = (uint32_t)a; wv[nw] = vm_read32(wa[nw]); nw++; w = *e2 == ',' ? e2 + 1 : e2; }
++                }
++                for (int k = 0; k < nw; k++) {
++                    uint32_t v = vm_read32(wa[k]);
++                    if (v != wv[k]) { printf("[watch32] t=%llu ms 0x%08X: 0x%08X -> 0x%08X\n", (unsigned long long)GetTickCount64(), wa[k], wv[k], v); fflush(stdout); wv[k] = v; }
++                }
++            }
++            if (tst && port_no == 0)
++                for (int k = 0; k < 4; k++) {
++                    lcg = lcg * 1103515245u + 12345u;
++                    int v = tv[k] + (tv[4] > 0 ? (int)((lcg >> 16) % (unsigned)(2 * tv[4] + 1)) - tv[4] : 0);
++                    data->button[CELL_PAD_BTN_OFFSET_SENSOR_X + k] = (u16)(v < 0 ? 0 : v > 1023 ? 1023 : v);
++                }
++        }
+     }
+     }  /* end connected block */
+ 

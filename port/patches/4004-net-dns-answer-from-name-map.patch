@@ -1,0 +1,239 @@
+KZ3 4004: a title's own DNS client answered locally from the name map. KZ3's Medius rt_socket resolves the MUIS host
+itself: it reads the primary DNS from cellNetCtl (GetInfo code 19) and sends a UDP query to port 53 (seen in a Proton
+run, network pass 4: "refused UDP 8.8.8.8:53", login stuck on "Connecting.."). In strict mode a UDP datagram to port 53
+(sendto, or send on a socket connect()ed to port 53) never reaches the host: net_policy parses the question (bounded:
+one question, plain labels, <= 512 bytes) and builds the reply (mapped name: one A record with the server's address;
+anything else: NXDOMAIN); the next recv/recvfrom on that socket returns it from the queried address, and poll/select
+report the socket readable. Also in strict mode, a UDP datagram to a refused destination is dropped and reported as
+sent (logged once) instead of failing with EHOSTUNREACH: KZ3's NAT code sends a UPnP search to 239.255.255.250:1900,
+and a send error there may end the login (ASSUMPTION; a lost datagram is normal UDP). Outside strict mode nothing
+changes. Test: tools/net/test_net.sh (test_kz3_net part 7).
+
+diff -ruN a/libs/network/net_policy.c b/libs/network/net_policy.c
+diff --git a/libs/network/net_policy.c b/libs/network/net_policy.c
+--- a/libs/network/net_policy.c
++++ b/libs/network/net_policy.c
+@@ -122,6 +122,53 @@ int ps3_net_policy_resolve(const char* name, uint8_t ip[4])
+     return s_strict ? 0 : -1;
+ }
+ 
++/* KZ3 4004: the DNS answer (RFC 1035 wire format). Only the question is read: header (12 bytes), one QNAME of
++ * plain labels (no compression pointers, at most 253 characters), QTYPE, QCLASS. */
++size_t ps3_net_policy_dns_answer(const uint8_t* q, size_t qlen, uint8_t* out, size_t cap)
++{
++    char name[256];
++    size_t off = 12, nl = 0;
++    if (!s_strict || !q || !out || qlen < 12 + 5 || qlen > PS3_NET_DNS_MAX || cap < PS3_NET_DNS_MAX) return 0;
++    if ((q[2] & 0x80) || (q[2] & 0x78) != 0) return 0;          /* a response, or not a standard query */
++    if (q[4] != 0 || q[5] != 1) return 0;                        /* exactly one question */
++    for (;;) {
++        if (off >= qlen) return 0;
++        uint8_t l = q[off++];
++        if (l == 0) break;
++        if (l > 63 || off + l > qlen || nl + l + 1 > 253) return 0;   /* also refuses compression (0xC0) */
++        if (nl) name[nl++] = '.';
++        for (uint8_t i = 0; i < l; i++) {
++            char ch = (char)q[off + i];
++            if (!ch) return 0;
++            name[nl++] = ch;
++        }
++        off += l;
++    }
++    name[nl] = 0;
++    if (off + 4 > qlen) return 0;
++    uint16_t qtype = (uint16_t)(q[off] << 8 | q[off + 1]), qclass = (uint16_t)(q[off + 2] << 8 | q[off + 3]);
++    size_t qend = off + 4;
++    uint8_t ip[4];
++    int mapped = nl && ps3_net_policy_resolve(name, ip) == 1;
++    int answer = mapped && (qclass == 1 || qclass == 255) && (qtype == 1 || qtype == 255);
++    memcpy(out, q, qend);                                        /* id, flags, counts, question */
++    out[2] = (uint8_t)(0x80 | (q[2] & 0x01));                    /* QR, opcode 0, RD copied */
++    out[3] = (uint8_t)(0x80 | (mapped ? 0 : 3));                 /* RA, NOERROR / NXDOMAIN */
++    out[6] = 0; out[7] = (uint8_t)answer;                        /* ANCOUNT */
++    out[8] = out[9] = out[10] = out[11] = 0;                     /* NSCOUNT, ARCOUNT */
++    size_t n = qend;
++    if (answer) {
++        static const uint8_t rr[12] = { 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4 };
++        memcpy(out + n, rr, sizeof(rr)); n += sizeof(rr);
++        memcpy(out + n, ip, 4); n += 4;
++    }
++    static unsigned said;                                        /* a resolver retries: log the first 32 */
++    if (said < 32)
++        printf("[net] DNS %s (type %u) -> %s (answered locally, nothing sent)%s\n", name, (unsigned)qtype,
++               answer ? "server" : mapped ? "no record" : "not found", ++said == 32 ? "; further answers not logged" : "");
++    return n;
++}
++
+ static void log_refusal(int proto, const uint8_t ip[4], uint16_t port)
+ {
+     int say = 1;
+diff --git a/libs/network/net_policy.h b/libs/network/net_policy.h
+--- a/libs/network/net_policy.h
++++ b/libs/network/net_policy.h
+@@ -20,6 +20,7 @@
+ #ifndef PS3_NET_POLICY_H
+ #define PS3_NET_POLICY_H
+ 
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #ifdef __cplusplus
+@@ -61,6 +62,13 @@ int  ps3_net_policy_resolve(const char* name, uint8_t ip[4]);
+  * Outside strict mode always 1. */
+ int  ps3_net_policy_check(int proto, const uint8_t ip[4], uint16_t port);
+ 
++/* KZ3 4004: a title's own DNS query (UDP to port 53) answered locally from the name map, in strict mode only;
++ * nothing is sent. q[0..qlen) is the guest's datagram (untrusted). Writes the reply to out[0..cap) and returns its
++ * length, or 0 to drop the query (malformed, not a standard query, or not strict). Mapped name, type A or ANY:
++ * one A record (TTL 60); mapped name, other type: no answer, NOERROR; anything else: NXDOMAIN. */
++#define PS3_NET_DNS_MAX 512
++size_t ps3_net_policy_dns_answer(const uint8_t* q, size_t qlen, uint8_t* out, size_t cap);
++
+ /* Refusals logged so far (tests). */
+ unsigned ps3_net_policy_refusals_logged(void);
+ 
+diff --git a/libs/network/sysNet.c b/libs/network/sysNet.c
+--- a/libs/network/sysNet.c
++++ b/libs/network/sysNet.c
+@@ -84,6 +84,12 @@ typedef struct {
+     int           stream;   /* SOCK_STREAM or SOCK_STREAM_P2P */
+     uint16_t      vport;    /* the P2P vport it was bound to */
+     int           listening;
++    /* KZ3 4004: a DNS reply answered locally (net_policy), handed to the next recv/recvfrom */
++    uint16_t      dns_len;
++    uint8_t       dns_buf[PS3_NET_DNS_MAX];
++    struct sockaddr_in dns_from;
++    int           dns_connected;   /* connect()ed to port 53 in strict mode: send() goes to the local answer */
++    struct sockaddr_in dns_peer;
+ } net_socket_slot;
+ 
+ static net_socket_slot s_sockets[SYS_NET_MAX_SOCKETS];
+@@ -100,6 +106,7 @@ static int32_t  s_errno = 0;   /* ponytail: one errno for every thread, per-thre
+ #define HOSTENT_SCRATCH 320u
+ 
+ static int net_trace(void);   /* PS3_NET_TRACE; defined with the send/recv paths */
++static int dns_intercept(int32_t s, const struct sockaddr_in* a);   /* KZ3 4004, with the send paths */
+ 
+ static uint32_t scratch(uint32_t* ea, uint32_t size)
+ {
+@@ -180,6 +187,8 @@ static int alloc_slot(host_socket_t fd)
+             s_sockets[i].stream = 0;
+             s_sockets[i].vport = 0;
+             s_sockets[i].listening = 0;
++            s_sockets[i].dns_len = 0;          /* KZ3 4004 */
++            s_sockets[i].dns_connected = 0;
+             return i;
+         }
+     return -1;
+@@ -237,6 +246,7 @@ static void sleep_ms(int ms)
+ static int would_block(int32_t s, int32_t flags, short ev)
+ {
+     if (!(flags & SYS_NET_MSG_DONTWAIT) || s_sockets[s].nonblocking) return 0;
++    if (ev == POLLIN && s_sockets[s].dns_len) return 0;   /* KZ3 4004 */
+     host_pollfd p;
+     p.fd = s_sockets[s].host_fd;
+     p.events = ev;
+@@ -524,6 +534,11 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
+ 
+     char ip[16];
+     printf("[sys_net] connect(%d, %s:%u)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port));
++    if (dns_intercept(s, &a)) {                    /* KZ3 4004: a UDP resolver socket; send() answers locally */
++        s_sockets[s].dns_connected = 1;
++        s_sockets[s].dns_peer = a;
++        return 0;
++    }
+     if (!ps3_net_policy_check(s_sockets[s].stream ? PS3_NET_PROTO_TCP : PS3_NET_PROTO_UDP,
+                               (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
+         return fail(SYS_NET_ECONNREFUSED);   /* KZ3 4001: not an allowed destination */
+@@ -606,9 +621,36 @@ static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a)
+            op, s, ip, a ? ntohs(a->sin_port) : 0, n, err);
+ }
+ 
++/* KZ3 4004: a strict-mode DNS query: answered from the name map into the socket's pending reply. */
++static int32_t dns_local(int32_t s, const void* buf, uint32_t len, const struct sockaddr_in* to)
++{
++    uint8_t q[PS3_NET_DNS_MAX];
++    if (len > sizeof(q)) return (int32_t)len;                  /* not a plain DNS query: dropped, nothing sent */
++    vm_memcpy_from(q, EA(buf), len);
++    size_t n = ps3_net_policy_dns_answer(q, len, s_sockets[s].dns_buf, sizeof(s_sockets[s].dns_buf));
++    if (n) { s_sockets[s].dns_len = (uint16_t)n; s_sockets[s].dns_from = *to; }
++    return (int32_t)len;
++}
++
++static int dns_take(int32_t s, void* buf, uint32_t len, struct sockaddr_in* from)
++{
++    uint32_t n = s_sockets[s].dns_len;
++    if (n > len) n = len;                                       /* datagram semantics: the rest is dropped */
++    vm_memcpy_to(EA(buf), s_sockets[s].dns_buf, n);
++    if (from) *from = s_sockets[s].dns_from;
++    s_sockets[s].dns_len = 0;
++    return (int)n;
++}
++
++static int dns_intercept(int32_t s, const struct sockaddr_in* a)
++{
++    return ps3_net_policy_strict() && !s_sockets[s].stream && !s_sockets[s].p2p && ntohs(a->sin_port) == 53;
++}
++
+ int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flags)
+ {
+     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
++    if (s_sockets[s].dns_connected) return dns_local(s, buf, len, &s_sockets[s].dns_peer);   /* KZ3 4004 */
+     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
+     int n = send(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, PS3_NET_HOST_SEND_FLAGS);
+     if (net_trace()) trace("send", s, n, NULL);
+@@ -623,9 +665,14 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
+     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+     if (!to) return sys_net_bnet_send(s, buf, len, flags);   /* connected socket */
+     if (read_sockaddr(EA(to), &a)) return fail(SYS_NET_EINVAL);
++    if (dns_intercept(s, &a)) return dns_local(s, buf, len, &a);   /* KZ3 4004: never leaves the machine */
+     if (!ps3_net_policy_check(s_sockets[s].stream ? PS3_NET_PROTO_TCP : PS3_NET_PROTO_UDP,
+-                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
+-        return fail(SYS_NET_EHOSTUNREACH);   /* KZ3 4001: e.g. a title's own DNS query to port 53 */
++                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port))) {
++        /* KZ3 4004: a refused datagram is dropped as the network may drop any (e.g. a UPnP search to
++         * 239.255.255.250:1900 then simply finds no router), not failed: titles treat a send error as fatal. */
++        if (!s_sockets[s].stream) return (int32_t)len;
++        return fail(SYS_NET_EHOSTUNREACH);   /* KZ3 4001 */
++    }
+     if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
+                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
+         return (int32_t)len;   /* went through psnr's relay */
+@@ -639,6 +686,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
+ int32_t sys_net_bnet_recv(int32_t s, void* buf, uint32_t len, int32_t flags)
+ {
+     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
++    if (s_sockets[s].dns_len) return dns_take(s, buf, len, NULL);   /* KZ3 4004 */
+     if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
+     int n = recv(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len, host_recv_flags(flags));
+     if (net_trace() && n != HOST_SOCKET_ERROR) trace("recv", s, n, NULL);
+@@ -652,6 +700,11 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
+     socklen_t alen;
+     int n;
+     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
++    if (s_sockets[s].dns_len) {                                    /* KZ3 4004 */
++        n = dns_take(s, buf, len, &a);
++        write_sockaddr(EA(from), EA(fromlen), &a);
++        return n;
++    }
+ 
+     /* psnr's own packets (probe replies, peers' punches) are consumed here;
+      * the title only ever sees its own traffic. */
+@@ -843,7 +896,7 @@ static int run_poll(const int32_t* gfd, const short* gev, short* grev, int n, in
+     }
+     int relayed = 0;
+     for (int i = 0; i < n; i++)
+-        if ((gev[i] & SYS_NET_POLLIN) && valid_socket(gfd[i]) && relayed_pending(gfd[i])) relayed++;
++        if ((gev[i] & SYS_NET_POLLIN) && valid_socket(gfd[i]) && (relayed_pending(gfd[i]) || s_sockets[gfd[i]].dns_len)) relayed++;
+     if (nval || relayed) timeout_ms = 0;
+     if (nh == 0) { sleep_ms(timeout_ms); return nval; }
+ 
+@@ -858,7 +911,7 @@ static int run_poll(const int32_t* gfd, const short* gev, short* grev, int n, in
+         if (h & POLLERR)  rv |= SYS_NET_POLLERR;
+         if (h & POLLHUP)  rv |= SYS_NET_POLLHUP;
+         if (h & POLLNVAL) rv |= SYS_NET_POLLNVAL;
+-        if ((gev[map[k]] & SYS_NET_POLLIN) && relayed_pending(gfd[map[k]])) rv |= SYS_NET_POLLIN;
++        if ((gev[map[k]] & SYS_NET_POLLIN) && (relayed_pending(gfd[map[k]]) || s_sockets[gfd[map[k]]].dns_len)) rv |= SYS_NET_POLLIN;
+         grev[map[k]] = rv;
+         if (rv) ready++;
+     }

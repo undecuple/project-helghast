@@ -1,0 +1,362 @@
+gcm/live-draw: NV0039 buffer copy (cellGcmSetTransferData) on subchannel 1, with texture invalidation and surface write-back.
+
+Symptom (Killzone 3, RPCS3 capture of the first level, pass 18): libgcm's cellGcmSetTransferData (KZ3 0x008D2DAC)
+emits NV0039 on subchannel 1 (0x2184 x2 DMA in/out, 0x230C x8 OFFSET_IN..BUFFER_NOTIFY, FORMAT 0x101). Once per
+frame KZ3 copies its 1280x720 scene target (local 0x1300000, 0x384000 bytes, one line) into main memory (IO
+offset 0x1310400). The walker routed subchannel 1 to the 3D engine (a Twisted Metal workaround), so the copy never
+ran and its eight words were processed as NV4097 0x30C..0x328 (ALPHA_REF, BLEND_ENABLE, BLEND_FUNC, BLEND_COLOR,
+BLEND_EQUATION, COLOR_MASK, STENCIL_TEST_ENABLE).
+
+Fix:
+- cellGcmSys walker: SET_OBJECT bindings are recorded per subchannel. On subchannel 1, NV0039's own methods
+  (0x180/0x184/0x188, 0x30C..0x328) go to a new NV0039 engine; all other methods still go to NV4097, and binding
+  subchannel 1 to the same handle as subchannel 0 turns the split off. GCM_SUBCH1_NV0039=0 restores the old routing.
+- NV0039 engine: DMA in/out (0xFEED0000 local, 0xFEED0001 main), signed pitches, LINE_LENGTH_IN x LINE_COUNT,
+  FORMAT increments (1/1 = memmove per line; others byte-strided, ASSUMPTION), BUFFER_NOTIFY triggers. Notifier
+  writes are not implemented (logged). Range-checked against the 4 GB guest space.
+- Before copying out of local memory, rsx_live_draw_writeback_range writes every live colour surface overlapping
+  the source back into guest memory (GPU readback; A8R8G8B8 as A,R,G,B bytes, the inverse of the texture decode;
+  FP16/FP32 big-endian). Surfaces now remember their guest pitch. LD_NV0039_WRITEBACK=0 disables.
+- After the copy, rsx_live_draw_note_guest_write marks cached textures / vertex textures overlapping the
+  destination so their next bind re-hashes even within the same frame (texture entries record their span).
+  Vertex data needs nothing (uploaded per draw).
+- Diagnostics: NV0039_DBG=<N> logs the first N copies; copies #1, 2, 4, 8, ... print running totals.
+
+Verified with tools/smoke/test_nv0039.c under Proton (main->local copy then draw, same-frame overwrite and redraw,
+local->main with pitches, negative pitch, FP16 and RGBA8 surfaces copied out, all bit-exact).
+
+Rebased on ps3recomp v0.17.0 (SPU pass 95): partly absorbed: the surface pitch field is #395's.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): SET_OBJECT memo inside upstream's wdiag-gated block; nv0039 exclusion added to upstream's gcm_3d_method dispatch.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index d7133a18..27442759 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1401,8 +1401,133 @@ static void nv3089_blit(void)
+                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Patch 2015: NV0039 buffer copy (memory-to-memory format, libgcm subchannel 1).
++ *
++ * cellGcmSetTransferData (Killzone 3: 0x008D2DAC) emits on subchannel 1:
++ *   0x0184 count 2  SET_CONTEXT_DMA_BUFFER_IN / _OUT (0xFEED0000 local,
++ *                   0xFEED0001 main)
++ *   0x030C count 8  OFFSET_IN, OFFSET_OUT, PITCH_IN, PITCH_OUT,
++ *                   LINE_LENGTH_IN, LINE_COUNT, FORMAT, BUFFER_NOTIFY
++ * in chunks of at most 0x7FF lines, FORMAT 0x101 (in/out increment 1).
++ * BUFFER_NOTIFY triggers the copy. Pitches are signed. 0x0180 is the notify
++ * DMA; notifier writes are not implemented (cellGcmSetTransferData passes 0).
++ *
++ * Before this, subchannel 1 went to the 3D engine by default (Twisted Metal
++ * binds NV4097 there), so every copy was dropped and its words landed on
++ * NV4097 0x30C..0x328: ALPHA_REF, BLEND_ENABLE, BLEND_FUNC_SFACTOR/DFACTOR,
++ * BLEND_COLOR, BLEND_EQUATION, COLOR_MASK (= FORMAT 0x101) and
++ * STENCIL_TEST_ENABLE (ASSUMPTION: without visible effect on live-draw).
++ * -----------------------------------------------------------------------*/
++static u32 s_subch_obj[8];
++static u8  s_subch_obj_set[8];
++static struct {
++    u32 notify_dma, src_dma, dst_dma;
++    u32 off_in, off_out;
++    s32 pitch_in, pitch_out;
++    u32 line_len, line_count, format;
++} s_nv0039 = { 0, 0xFEED0000u, 0xFEED0000u, 0, 0, 0, 0, 0, 0, 0x101u };
++static unsigned long long s_nv0039_copies, s_nv0039_bytes, s_nv0039_dir[4], s_nv0039_marked, s_nv0039_wb;
++
++/* Does method `m` on subchannel 1 belong to NV0039? Only NV0039's own method
++ * numbers are claimed, so a title that drives NV4097 through subchannel 1
++ * (texture offsets, SET_SHADER_PROGRAM) keeps working; a SET_OBJECT that binds
++ * subchannel 1 to the same handle as subchannel 0 turns it off entirely.
++ * GCM_SUBCH1_NV0039=0 restores the old routing. */
++static int gcm_subch1_nv0039(u32 m)
++{
++    static int en = -1;
++    if (en < 0) { const char* e = getenv("GCM_SUBCH1_NV0039"); en = e ? atoi(e) : 1; }
++    if (!en) return 0;
++    if (s_subch_obj_set[0] && s_subch_obj_set[1] && s_subch_obj[0] == s_subch_obj[1]) return 0;
++    return m == 0x0180u || m == 0x0184u || m == 0x0188u || (m >= 0x030Cu && m <= 0x0328u);
++}
++
++static void nv0039_copy(u32 notify)
++{
++    const u32 len = s_nv0039.line_len, n = s_nv0039.line_count;
++    u32 in_inc = s_nv0039.format & 0xFFu, out_inc = (s_nv0039.format >> 8) & 0xFFu;
++    if (!in_inc) in_inc = 1;
++    if (!out_inc) out_inc = 1;
++    if (!len || !n) return;
++    const int sl = s_nv0039.src_dma != 0xFEED0001u, dl = s_nv0039.dst_dma != 0xFEED0001u;
++    const u32 src = cellGcmResolveLocated(sl, s_nv0039.off_in);
++    const u32 dst = cellGcmResolveLocated(dl, s_nv0039.off_out);
++    const s64 pin = s_nv0039.pitch_in, pout = s_nv0039.pitch_out;
++    extern u8* vm_base;
++    if (!vm_base || !src || !dst) return;
++    const s64 last_in = (s64)src + (s64)(n - 1) * pin, last_out = (s64)dst + (s64)(n - 1) * pout;
++    const s64 lo_in = last_in < (s64)src ? last_in : (s64)src, hi_in = (last_in > (s64)src ? last_in : (s64)src) + (s64)len * in_inc;
++    const s64 lo_out = last_out < (s64)dst ? last_out : (s64)dst, hi_out = (last_out > (s64)dst ? last_out : (s64)dst) + (s64)len * out_inc;
++    if (lo_in < 0 || lo_out < 0 || hi_in > 0x100000000ll || hi_out > 0x100000000ll) {
++        static int bad; if (bad++ < 8)
++            printf("[NV0039] copy out of range: src=0x%08X pitch %d dst=0x%08X pitch %d %ux%u%c",
++                   src, (int)pin, dst, (int)pout, len, n, 10);
++        return;
++    }
++    /* A copy out of a surface the live renderer drew: its pixels exist only on
++     * the GPU. Write the surface back into guest memory first (Killzone 3 copies
++     * its 1280x720 scene target to main memory once per frame, RPCS3 capture,
++     * ASSUMPTION: for SPU post-processing), then copy in guest memory. No GPU
++     * surface is created at the destination (unlike NV3089): the CPU/SPU side
++     * owns that copy, and texture binds re-read it from guest memory. */
++    u32 wb = 0;
++    if (rsx_live_draw_enabled())
++        wb = rsx_live_draw_writeback_range(sl ? 0u : 1u, (u32)(lo_in - (s64)src) + s_nv0039.off_in,
++                                           (u32)(hi_in - lo_in));
++    s_nv0039_wb += wb;
++    for (u32 y = 0; y < n; y++) {
++        u8* d = vm_base + (u32)((s64)dst + (s64)y * pout);
++        const u8* sp = vm_base + (u32)((s64)src + (s64)y * pin);
++        if (in_inc == 1 && out_inc == 1) memmove(d, sp, len);
++        else  /* ASSUMPTION: FORMAT is the byte increment on each side (NV m2mf). */
++            for (u32 x = 0; x < len; x++) d[(size_t)x * out_inc] = sp[(size_t)x * in_inc];
++    }
++    u32 marked = 0;
++    if (rsx_live_draw_enabled())
++        marked = rsx_live_draw_note_guest_write(dl ? 0u : 1u, (u32)(lo_out - (s64)dst) + s_nv0039.off_out,
++                                                (u32)(hi_out - lo_out));
++    s_nv0039_copies++;
++    s_nv0039_bytes += (unsigned long long)len * n;
++    s_nv0039_dir[(sl ? 0 : 2) | (dl ? 0 : 1)]++;
++    s_nv0039_marked += marked;
++    /* NV0039_DBG=<N>: log the first N copies. Copy #1, #2, #4, ... always get a
++     * one-line running total (direction counts: L->L, L->M, M->L, M->M). */
++    { static int cap = -1; static int nd;
++      if (cap < 0) { const char* e = getenv("NV0039_DBG"); cap = e ? atoi(e) : 0; }
++      if (nd < cap) { nd++;
++          printf("[NV0039] %s 0x%08X pitch %d -> %s 0x%08X pitch %d, %u x %u fmt 0x%X notify %u, %u tex marked, %u surf written back%c",
++                 sl ? "local" : "main", s_nv0039.off_in, (int)pin, dl ? "local" : "main",
++                 s_nv0039.off_out, (int)pout, len, n, s_nv0039.format, notify, marked, wb, 10); }
++      if ((s_nv0039_copies & (s_nv0039_copies - 1)) == 0)
++          printf("[NV0039] copies=%llu bytes=%llu L>L=%llu L>M=%llu M>L=%llu M>M=%llu tex-marked=%llu surf-writebacks=%llu%c",
++                 s_nv0039_copies, s_nv0039_bytes, s_nv0039_dir[0], s_nv0039_dir[1], s_nv0039_dir[2],
++                 s_nv0039_dir[3], s_nv0039_marked, s_nv0039_wb, 10); }
++    if (notify) { static int nw; if (nw++ < 4)
++        printf("[NV0039] BUFFER_NOTIFY %u with notify DMA 0x%08X: notifier write not implemented%c",
++               notify, s_nv0039.notify_dma, 10); }
++}
++
++static void nv0039_method(u32 method, u32 data)
++{
++    switch (method) {
++    case 0x0180: s_nv0039.notify_dma = data; return;
++    case 0x0184: s_nv0039.src_dma    = data; return;
++    case 0x0188: s_nv0039.dst_dma    = data; return;
++    case 0x030C: s_nv0039.off_in     = data; return;
++    case 0x0310: s_nv0039.off_out    = data; return;
++    case 0x0314: s_nv0039.pitch_in   = (s32)data; return;
++    case 0x0318: s_nv0039.pitch_out  = (s32)data; return;
++    case 0x031C: s_nv0039.line_len   = data; return;
++    case 0x0320: s_nv0039.line_count = data; return;
++    case 0x0324: s_nv0039.format     = data; return;
++    case 0x0328: nv0039_copy(data); return;
++    }
++}
++
+ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+ {
++    if (subch == 1) { nv0039_method(method, data); return; }
+     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
+      * subchannel a title binds each 2D object to is libgcm-version-specific and
+      * SET_OBJECT binds are not tracked, so state landing on an unexpected
+@@ -3099,6 +3224,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                  * title binds to a subchannel is what says which engine that
+                  * subchannel drives; comparing subchannel 1 against subchannel 0
+                  * turns the routing below from a guess into a reading. */
++                if (m == 0 && subch < 8) {   /* patch 2015: remember SET_OBJECT bindings */
++                    s_subch_obj[subch] = vm_read32(dea); s_subch_obj_set[subch] = 1; }
+                 if (wdiag) { static int od = -1;
+                   if (od < 0) { const char* e = getenv("GCM_OBJDBG"); od = e ? 1 : 0; }
+                   if (od && m == 0) {
+@@ -3210,7 +3337,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                     cellGcmQueueUserCommand(vm_read32(dea));
+                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
+                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
+-                } else if (subch == 0 || (subch == 1 && !s1_2d)) {
++                } else if (subch == 0 || (subch == 1 && !s1_2d && !gcm_subch1_nv0039(m))) {
+                     gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
+                 } else
+                     gcm_2d_method(subch, m, vm_read32(dea));
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 846e4037..fe150b8c 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -42,6 +42,8 @@ unsigned long long rsx_perf_fifo_flips(void) { return 0; }
+ void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
+ void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
+ { (void)d; (void)o; (void)v; }
++u32  rsx_live_draw_note_guest_write(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; return 0; }
++u32  rsx_live_draw_writeback_range(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; return 0; }
+ int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u32 h)
+ { (void)sl; (void)sa; (void)sp; (void)dl; (void)da; (void)dp; (void)w; (void)h; return 0; }
+ int  rsx_live_draw_resolve_blit(u32 sl, u32 sa, u32 sp, u32 ds, u32 dt, u32 dl, u32 da,
+@@ -262,12 +264,14 @@ typedef struct {
+     u64 content_hash;
+     u32 last_hash_frame;
+     u64 last_use_serial;
++    u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
+ } texcache_t;
+ typedef struct {
+     u32 location, offset, format, width, height, pitch;
+     ID3D12Resource* tex;
+     u64 content_hash;
+     u32 last_hash_frame;
++    u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
+ } vtexcache_t;
+ typedef struct { u64 key; ID3D12PipelineState* pso; } psocache_t;
+ typedef struct {
+@@ -3330,6 +3334,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+     replacement.depth = t->depth;
+     replacement.last_hash_frame = g_ld_frames;
+     replacement.last_use_serial = ++g_ld_texture_use_serial;
++    replacement.span = texture_source_span(t);
+     {
+         int readable = 0;
+         replacement.content_hash = texture_content_hash(t, &readable);
+@@ -3556,6 +3561,8 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
+     e->height = vt->height;
+     e->pitch = vt->pitch;
+     e->last_hash_frame = g_ld_frames;
++    /* Conservative: up to 16 bytes per texel (W32Z32Y32X32_FLOAT). */
++    e->span = (vt->pitch ? vt->pitch : vt->width * 16u) * vt->height;
+     e->tex = decode_vertex_texture(vt, &e->content_hash);
+     if (e->tex) {
+         write_vertex_texture_srv(index, e->tex);
+@@ -8208,6 +8215,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                                       msf.clip_w, msf.clip_h,
+                                       ld_color_dxgi(msf.color_format));
+             if (s == LD_INVALID_SURFACE || s == target) break;
++            g.surfaces[s].pitch = msf.color_pitch[r];
+             mrt[n_mrt++] = s;
+         }
+     }
+@@ -9691,6 +9699,41 @@ void rsx_live_draw_set_fifo_position(u32 get, u32 put)
+ #endif
+ }
+ 
++/* Patch 2015 (NV0039 buffer copy): textures are re-hashed once per frame, so a
++ * copy into a texture that was already bound this frame (stream in, draw, copy
++ * the next block over it, draw again) used the stale decode until the next
++ * flip. Mark every cache entry whose guest source overlaps the written range so
++ * its next bind re-hashes and, on a change, re-decodes. Vertex data needs
++ * nothing: it is uploaded from guest memory per draw. An entry with an unknown
++ * span (compressed or exotic formats return 0) counts as overlapping from its
++ * offset onwards (ASSUMPTION: at most 64 MB, the size of local memory). */
++static int ld_range_overlaps(u32 loc_a, u32 off_a, u32 span_a, u32 loc_b, u64 b0, u64 b1)
++{
++    if (loc_a != loc_b) return 0;
++    const u64 a0 = off_a, a1 = a0 + (span_a ? span_a : 0x4000000u);
++    return a0 < b1 && b0 < a1;
++}
++u32 rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size)
++{
++    if (!g.ready || !size) return 0;
++    const u64 b0 = offset, b1 = b0 + size;
++    const u32 stale = g_ld_frames - 1u;   /* any value != g_ld_frames forces a re-hash */
++    u32 marked = 0;
++    for (u32 i = 0; i < g.n_textures; i++) {
++        texcache_t* e = &g.textures[i];
++        if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1)) {
++            e->last_hash_frame = stale; marked++;
++        }
++    }
++    for (u32 i = 0; i < g.n_vtex; i++) {
++        vtexcache_t* e = &g.vtex[i];
++        if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1)) {
++            e->last_hash_frame = stale; marked++;
++        }
++    }
++    return marked;
++}
++
+ void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value)
+ {
+ #if defined(YZ_PERF_CLEAN)
+@@ -10131,6 +10174,56 @@ int rsx_live_draw_debug_read_surface(u32 location, u32 offset, void* out,
+     return ret;
+ }
+ 
++/* Patch 2015: see rsx_live_draw.h. Killzone 3 copies its 1280x720 scene
++ * target (local 0x1300000) to main memory with one NV0039 copy per frame
++ * (RPCS3 capture, pass 18); live-draw never writes surfaces to guest memory,
++ * so the copy moved stale VRAM. LD_NV0039_WRITEBACK=0 disables. */
++u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
++{
++    static int en = -1;
++    if (en < 0) { const char* e = getenv("LD_NV0039_WRITEBACK"); en = e ? atoi(e) : 1; }
++    if (!en || !g.ready || !size) return 0;
++    const u64 r0 = offset, r1 = r0 + size;
++    u32 done = 0;
++    for (u32 i = 0; i < g.n_surfaces; i++) {
++        const surface_t* sf = &g.surfaces[i];
++        if (!sf->tex || sf->location != location) continue;
++        const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++        const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
++        if (gp < sf->w * texel) continue;
++        const u64 s0 = sf->offset, s1 = s0 + (u64)gp * (sf->h - 1u) + (u64)sf->w * texel;
++        if (!(s0 < r1 && r0 < s1)) continue;
++        u8* gm = (u8*)guest_ptr(location, sf->offset, (u32)(s1 - s0));
++        const size_t n = (size_t)sf->w * sf->h * texel;
++        u8* buf = gm ? (u8*)malloc(n) : NULL;
++        if (!buf) continue;
++        u32 w = 0, h = 0;
++        const int got = rsx_live_draw_debug_read_surface(location, sf->offset, buf, (u32)n, &w, &h);
++        if (got == (int)texel && w == sf->w && h == sf->h) {
++            for (u32 y = 0; y < h; y++) {
++                const u8* sp = buf + (size_t)y * w * texel;
++                u8* dp = gm + (size_t)y * gp;
++                for (u32 x = 0; x < w; x++, sp += texel, dp += texel) {
++                    if (sf->fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {        /* host R,G,B,A -> guest A,R,G,B */
++                        dp[0] = sp[3]; dp[1] = sp[0]; dp[2] = sp[1]; dp[3] = sp[2];
++                    } else if (texel == 8) {                           /* LE halves -> BE, X first */
++                        for (u32 c = 0; c < 4; c++) { dp[c * 2] = sp[c * 2 + 1]; dp[c * 2 + 1] = sp[c * 2]; }
++                    } else {                                           /* R32_FLOAT LE -> BE */
++                        dp[0] = sp[3]; dp[1] = sp[2]; dp[2] = sp[1]; dp[3] = sp[0];
++                    }
++                }
++            }
++            done++;
++            static int logged;
++            if (logged++ < 4)
++                fprintf(stderr, "[nv0039-writeback] surface %u:0x%08X %ux%u fmt=%d pitch=%u for copy 0x%08X+0x%X\n",
++                        location, sf->offset, w, h, (int)sf->fmt, gp, offset, size);
++        }
++        free(buf);
++    }
++    return done;
++}
++
+ int rsx_live_draw_debug_dump_surface(
+     u32 location, u32 offset, const char* path)
+ {
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 5f24f8dd..8ce60d44 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -79,6 +79,18 @@ void rsx_live_draw_set_fifo_position(u32 get, u32 put);
+  * surface.  Guest memory changes are deliberately tracked separately from
+  * actual D3D render-target mutations. */
+ void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value);
++/* Patch 2015: the guest wrote [offset, offset+size) of `location` (RSX_LOCATION_*)
++ * behind the renderer's back (NV0039 buffer copy). Cached textures and vertex
++ * textures whose source overlaps the range are re-hashed at their next bind,
++ * even within the frame that already hashed them. Returns how many entries
++ * were marked. */
++u32  rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size);
++/* Patch 2015: before the guest reads [offset, offset+size) of `location`
++ * (an NV0039 copy out of local memory), write every live colour surface that
++ * overlaps it back into guest memory in the RSX layout (A8R8G8B8 as A,R,G,B
++ * bytes; FP16/FP32 big-endian). Blocks on a GPU readback. Returns the number
++ * of surfaces written back. */
++u32  rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size);
+ /* 1:1 NV3089 blit whose source is a live GPU surface: copy it on the GPU.
+  * Addresses are location-relative byte offsets of the rect's top-left.
+  * Returns 1 when handled (the guest-memory copy still runs regardless). */

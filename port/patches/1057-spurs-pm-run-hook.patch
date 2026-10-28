@@ -1,0 +1,31 @@
+KZ3 patch 1057 (SPU pass 39): g_kz3_pm_run_hook(spurs_ea, wid, end) at the start and end of every policy-module run of the SPURS kernel thread, for the audio probe's per-list timeline (KZ3_AUDIO_SPU=1).
+
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -493,6 +493,10 @@
+ }
+ 
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
++/* KZ3 patch 1057 (SPU pass 39): called by the kernel thread when a workload's policy-module run starts (end 0,
++ * after the contention byte is set) and ends (end 1, after it is cleared, all lanes joined); NULL = off. The
++ * port's audio probe (port/spu/kz3_audio_probe.c, KZ3_AUDIO_SPU=1) times the wid 9 job lists with it. */
++void (*g_kz3_pm_run_hook)(u32 spurs_ea, u32 wid, int end) = 0;
+ 
+ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+ {
+@@ -2197,6 +2201,7 @@
+                 s_fs = e ? atoi(e) : -1; }
+               if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
+             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
++            if (g_kz3_pm_run_hook) g_kz3_pm_run_hook(ea, wid, 0);   /* KZ3 patch 1057 */
+             {
+                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
+                 uint32_t sz = s_workloads[wid].sizePm;
+@@ -2256,6 +2261,7 @@
+             }
+             s_run_t0[si - s_inst][kt & 7] = 0;   /* patch 1011 */
+             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
++            if (g_kz3_pm_run_hook) g_kz3_pm_run_hook(ea, wid, 1);   /* KZ3 patch 1057 */
+             /* "Found work" heuristic: a module that did something polls the
+              * kernel for MORE work before exiting (selectWorkload calls >0);
+              * an idle module exits immediately with polls==0. Grow the idle

@@ -1,0 +1,70 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream SDCRZ handling added at the same spot, both kept.
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -75,6 +75,10 @@ void spu_taskset_line_committed(uint32_t line);
+  * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
+ #define SPU_WATCH_MAX 4
+ int g_spu_ls_watch_n = -1;
++/* DMA watch windows set at run time (spu_dma.h, mfc_do_transfer). */
++volatile uint32_t g_spu_dma_watch_lo[SPU_DMA_WATCH_SLOTS], g_spu_dma_watch_hi[SPU_DMA_WATCH_SLOTS];
++volatile long g_spu_dma_watch_hits[SPU_DMA_WATCH_SLOTS];
++volatile int g_spu_dma_watch_on;
+ static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
+ unsigned* spu_ls_watch_list(int* out_n)
+ {
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -166,6 +166,16 @@ static inline int mfc_is_fence(uint32_t cmd)
+  * Execute a single DMA transfer between local store and main memory.
+  * Returns 0 on success, -1 on error.
+  */
++/* Runtime-set DMA watch windows (spu_channels.c): host code (or SPU_DMAW at start) sets [lo, hi) per
++ * slot while the game runs, for buffers whose address is only known at run time.
++ * Every transfer touching a window is reported (per slot: the first 24, then every 256th), list
++ * elements included (they come through here too). For a PUT the LS word that lands on `lo` is shown,
++ * for a GET the guest word at the first watched byte. */
++#define SPU_DMA_WATCH_SLOTS 8
++extern volatile uint32_t g_spu_dma_watch_lo[SPU_DMA_WATCH_SLOTS], g_spu_dma_watch_hi[SPU_DMA_WATCH_SLOTS];
++extern volatile long g_spu_dma_watch_hits[SPU_DMA_WATCH_SLOTS];
++extern volatile int g_spu_dma_watch_on;
++
+ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                    uint32_t size, uint32_t cmd)
+ {
+@@ -202,6 +212,31 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+         spu_lockline_unlock();
+         return 0;
+     }
++    /* SPU_DMAW=lo-hi[,lo-hi...] (hex EAs, up to 8): the same windows from the environment. */
++    { static int s_dw = -1;
++      if (s_dw < 0) { const char* e = getenv("SPU_DMAW"); s_dw = 0;
++          for (int i = 0; e && *e && i < SPU_DMA_WATCH_SLOTS; i++) {
++              char* d; uint32_t lo = (uint32_t)strtoul(e, &d, 16), hi = lo + 4;
++              if (*d == '-') hi = (uint32_t)strtoul(d + 1, &d, 16);
++              g_spu_dma_watch_lo[i] = lo; g_spu_dma_watch_hi[i] = hi; g_spu_dma_watch_on = 1;
++              e = (*d == ',') ? d + 1 : d; } } }
++    if (g_spu_dma_watch_on) {
++        for (int i = 0; i < SPU_DMA_WATCH_SLOTS; i++) {
++            uint32_t lo = g_spu_dma_watch_lo[i], hi = g_spu_dma_watch_hi[i];
++            if (!hi || (uint32_t)ea >= hi || (uint32_t)ea + size <= lo) continue;
++            long c = __atomic_add_fetch(&g_spu_dma_watch_hits[i], 1, __ATOMIC_RELAXED);
++            if (c > 24 && (c & 255) != 0) continue;
++            uint32_t first = (uint32_t)ea > lo ? (uint32_t)ea : lo, v = 0;
++            if (mfc_is_put(cmd)) {
++                if (lo >= (uint32_t)ea) { const uint8_t* q = spu->ls + ((lsa + (lo - (uint32_t)ea)) & SPU_LS_MASK);
++                                          v = (uint32_t)q[0] << 24 | q[1] << 16 | q[2] << 8 | q[3]; }
++            } else if (vm_base) { const uint8_t* q = vm_base + first; v = (uint32_t)q[0] << 24 | q[1] << 16 | q[2] << 8 | q[3]; }
++            fprintf(stderr, "[dmaw] w%d n=%ld spu%u img=%d %s cmd=0x%02X ea=0x%08X size=0x%X lsa=0x%05X pc=0x%05X"
++                            " off=0x%X word=0x%08X\n", i, c, spu->spu_id & 7u, spu->image_id,
++                    mfc_is_put(cmd) ? "PUT" : "GET", cmd & 0xFFu, (uint32_t)ea, size, lsa,
++                    (uint32_t)spu->pc & SPU_LS_MASK, first - lo, v);
++        }
++    }
+     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
+      * this guest address. A DMA landing in the loaded ELF image is always a
+      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job

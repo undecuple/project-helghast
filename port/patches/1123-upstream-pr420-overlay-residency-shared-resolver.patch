@@ -1,0 +1,64 @@
+KZ3 patch 1123 (SPU pass 105): upstream ps3recomp PR #420 by tekulvw (MIT), "resident code and interpreter
+rejoining": overlay residency verified once per load, then dispatch by residency.
+
+- spu_lifted_lookup (the interpreter's rejoin probe and the drain's rejoin test) now resolves with the ownership order
+  indirect dispatch uses: a bounded resident code span (authoritative: a miss there stays a miss, a span registered
+  with its code bytes is compared once per load and rejected on a mismatch), then the resident task, the resident
+  overlay, the primary image. spu_indirect_branch delegates to it.
+- New spu_overlay_register_verified_region (spu_overlay_residency.h): a streamed overlay registered with the code
+  bytes it was lifted from; a GET from its source EA to its load address marks it pending, the first dispatch into
+  the span compares the bytes, any later GET into the span resets (continuation) or clears it.
+- The PR's test cases in runtime/spu/tests/test_spu_lifted_start.c and its docs/spu-resident-interpreter-rejoin.md.
+Adapted to the KZ3 patch set (the hunks that did not apply): patch 1090's spu_ovl_find returns the first matching
+source only, so a verified source GET to another load address is ignored (upstream skips to the next source; a
+source EA is registered once); spu_indirect_branch keeps patch 1078's located lookup after the shared resolver,
+outside resident code spans only (as before); the rejoin probe (patch 1028's overlay probe, 1078's located lookup)
+defers to spu_lifted_lookup inside a resident code span; the PR test's g_spu_trampoline_fn line in a helper without
+ctx writes c->tramp_fn (patch 1017's macro). KZ3 registers no resident code spans today: the change for KZ3 is the
+rejoin's task-then-overlay order. Tests: tools/spu/test_r105_dcache.sh (the PR test, 124 checks with this patch alone).
+Upstream: the PR itself.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): #420 upstream: shrinks to nothing but the 1078/1090 pieces above; upstream's per-thread lookup memo (`spu_lookup_memoized`, SPU_TLS) bypassed on MinGW (`spu_lookup` has 1096's process-wide memo; `-DKZ3_SPU_TLS_MEMO` builds it).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 331d5d15..1756a14b 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1891,12 +1891,17 @@ static inline __attribute__((always_inline)) spu_fn spu_lookup_memo(uint32_t add
+  * invalidates every cached entry, including cached misses. The generation is
+  * read before the walk, so a registration that races the walk leaves the entry
+  * stale and the next lookup redoes it. */
+-typedef struct { uint32_t addr, gen; int image; spu_fn fn; } spu_lookup_memo;
++typedef struct { uint32_t addr, gen; int image; spu_fn fn; } spu_lookup_memo_ent;   /* KZ3: renamed, 1096 has a function spu_lookup_memo */
+ #define SPU_LOOKUP_MEMO_SIZE 512   /* power of two */
+-static SPU_TLS spu_lookup_memo t_lookup_memo[SPU_LOOKUP_MEMO_SIZE];
++static SPU_TLS spu_lookup_memo_ent t_lookup_memo[SPU_LOOKUP_MEMO_SIZE];
+ static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
+ {
+-    spu_lookup_memo* m = &t_lookup_memo[((addr >> 2) ^ ((uint32_t)image_id * 0x9E3779B1u)) &
++#if defined(__MINGW32__) && !defined(KZ3_SPU_TLS_MEMO)
++    /* KZ3: MinGW GCC emulates TLS (one __emutls_get_address call per access, SPU pass 100), and spu_lookup
++     * already answers exact hits from patch 1096's process-wide memo. -DKZ3_SPU_TLS_MEMO builds the thread memo. */
++    return spu_lookup(addr, image_id);
++#endif
++    spu_lookup_memo_ent* m = &t_lookup_memo[((addr >> 2) ^ ((uint32_t)image_id * 0x9E3779B1u)) &
+                                         (SPU_LOOKUP_MEMO_SIZE - 1)];
+     const uint32_t gen = s_registry_count + 1;   /* +1: zero-init never matches */
+     if (m->gen != gen || m->addr != addr || m->image != image_id) {
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index 951e4e48..ce1baa4f 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -532,6 +532,12 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+ static int s_ovl_rejoin = -1;
+ static spu_lifted_fn spu_interp_rejoin_lookup(const spu_context* ctx, uint32_t pc) {
+     if (s_ovl_rejoin < 0) { const char* e = getenv("SPU_INTERP_OVL_REJOIN"); s_ovl_rejoin = (e && *e == '0') ? 0 : 1; }
++    /* KZ3 patch 1123 (upstream #420): a bounded resident code span is authoritative, as in indirect dispatch:
++     * neither the overlay probe nor patch 1078's located lookup may serve another image's function inside it. */
++    for (unsigned slot = 0; slot < 4; ++slot)
++        if (ctx->resident_code[slot].image_id && pc >= ctx->resident_code[slot].lsa &&
++            pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
++            return spu_lifted_lookup(ctx, pc);
+     if (s_ovl_rejoin && ctx->resident_ovl && pc >= 0x4000) {
+         extern spu_lifted_fn spu_lookup_ovl_exact(uint32_t addr, int image_id);
+         spu_lifted_fn f = spu_lookup_ovl_exact(pc, ctx->resident_ovl);

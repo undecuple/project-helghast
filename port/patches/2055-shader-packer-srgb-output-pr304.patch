@@ -1,0 +1,43 @@
+Integer framebuffer sRGB output, default on since pass 58 (LD_SRGB_OUT=0 turns it off): NV4097_SET_SHADER_PACKER (0x1FEC) non-zero encodes the RGB of every colour export (linear to sRGB) when the program exports halves, on integer colour surfaces. Adapted from sp00nznet/ps3recomp PR #304 by tekulvw (RPCS3 RSXROPEpilogue semantics).
+
+KZ3 sets 0x1FEC in ~15 % of the draws that sample a texture (pass 56 counter, patch 2054). The PR's engine splice does not apply to the live-draw path, so rsx_fp_apply_srgb_output renames the generated entry point to _rsx_main and appends a wrapper main that encodes t0..t3 (alpha and SV_Depth untouched); it runs after every other post-pass, works on both output shapes and leaves the source untouched on failure. rsx_fp_srgb_output_enabled (PR): packer != 0, not 32-bit exports (SHADER_CONTROL 0x40), surface format not 0x0B/0x0C/0x0D. The flag is part of the PSO key.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR304 sRGB output in the decompiler, the D3D12 live-draw call site kept.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 922523db..0a2a456d 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8022,6 +8022,12 @@ static ID3D12PipelineState* get_pso(
+             cube_mask |= 1u << (16 + unit);
+     }
+     const u32 vtex_mask = vertex_texture_mask();
++    /* Patch 2055 (PR #304): SET_SHADER_PACKER output sRGB, default on, LD_SRGB_OUT=0 off. Part of the PSO key (baked in the HLSL). */
++    static int srgb_sw = -1;
++    if (srgb_sw < 0) { const char* e = getenv("LD_SRGB_OUT"); srgb_sw = (e && e[0] == '0') ? 0 : 1;
++                       fprintf(stderr, "[srgb-out] %s (LD_SRGB_OUT)\n", srgb_sw ? "on" : "off"); }
++    const u32 srgb_out = srgb_sw && rsx_fp_srgb_output_enabled(rsx_dsp_reg(&g.rsx, 0x1FEC), fp_ctrl,
++                                                               rsx_dsp_reg(&g.rsx, 0x0208) & 0x1Fu);
+     const u32 txl_mask = vp_txl_unit_mask(vp_uc, vp_instrs);
+     if (txl_mask && !(txl_mask & vtex_mask)) {
+         g_ld_vtex_missing_for_txl++;
+@@ -8102,6 +8108,7 @@ static ID3D12PipelineState* get_pso(
+     if (vp_branch_bits_used)
+         key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
+     if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
++    if (srgb_out) key = fnv1a(&srgb_out, sizeof(srgb_out), key);   /* patch 2055 */
+     if (shadow_mask) {
+         key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
+         key = fnv1a(shadow_zfunc, sizeof(shadow_zfunc), key);
+@@ -8281,6 +8288,9 @@ static ID3D12PipelineState* get_pso(
+         fi = -1;
+     if (fi > 0 && rsx_fp_apply_depth_argb(ps_hlsl, sizeof(ps_hlsl), argb_mask, argb_remap) < 0)
+         fi = -1;
++    if (fi > 0 && srgb_out && rsx_fp_apply_srgb_output(ps_hlsl, sizeof(ps_hlsl)) < 0) {   /* patch 2055 */
++        static int said; if (!said++) fprintf(stderr, "[srgb-out] apply failed: PSO left linear\n");
++    }
+     if (fi > 0 && (shadow_mask || argb_mask)) {
+         static u32 n_log = 0;
+         if (n_log++ < 8)

@@ -1,0 +1,597 @@
+KZ3 patch 2039 (hooks D/E, RSX pass 39): keycap prompts.
+rsx_keycaps.h (new, included by rsx_live_draw.c): recognises the game's two prompt atlases by an FNV-1a 64 hash
+(HUD 1024x512 DXT5, menu 512x128 DXT5) and, while the last input came from the keyboard/mouse, uploads a copy
+whose pad-button cells (the game's own ButtonIcon / ImageMap rectangles) hold keycaps with the bound key: a dark
+rounded body with a light rim like the game's L1/R1 cells, the key name (text drawn by the exe's UI font through
+rsx_keycaps_set_source), a mouse picture for Mouse1-3, a triangle for arrow keys, "WASD"-style labels on the stick
+cells. BC3 blocks under the cells are decoded, drawn and re-encoded; nothing else changes.
+rsx_live_draw.c: the DXT5 upload path applies it; texcache_t remembers the atlas kind and the device/bindings
+signature it was drawn for, and a cache hit re-uploads (in place, patch 2035) when the signature changes.
+cellPad.c: pad_kb_key_for_input(name, slot) for the lookups. KZ3_KEYCAPS=0 off; LD_KEYCAP_DBG=1 logs the
+fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/test_keycaps.sh.
+
+--- a/libs/input/cellPad.c	2026-10-12 11:12:41.495991794 -0500
++++ b/libs/input/cellPad.c	2026-10-12 11:25:57.970054607 -0500
+@@ -292,6 +292,11 @@
+ {
+     static int force = -1;
+     if (force < 0) { const char* e = getenv("KZ3_KB_PROMPTS"); force = e ? atoi(e) : -1; if (force < 0) force = 2; }
++    {   /* patch 2039: KZ3_KB_PROMPTS_FLIP=N (tests): pad pictures for N s, keycaps for N s, and so on */
++        static int flip = -1; static unsigned long long t0;
++        if (flip < 0) { const char* e = getenv("KZ3_KB_PROMPTS_FLIP"); flip = e ? atoi(e) : 0; t0 = GetTickCount64(); }
++        if (flip > 0) return (int)(((GetTickCount64() - t0) / (1000ull * (unsigned)flip)) & 1);
++    }
+     return force == 2 ? s_kb_last_keys : force;
+ }
+ 
+@@ -308,6 +313,18 @@
+ 
+ const char* pad_kb_key_label(int vk) { return pad_kb_key_name(vk); }
+ 
++/* patch 2039: the key in one slot of a keybinds.ini input ("cross", "ls_up", ...), 0 when unbound or before the
++ * file is read. For keycap prompts (rsx_keycaps.h through port/kz3/main.cpp). */
++int pad_kb_key_for_input(const char* name, int slot)
++{
++    int i = pad_kb_input_by_name(name, strlen(name)), vk = 0;
++    if (i < 0 || slot < 0 || slot >= PKB_SLOTS) return 0;
++    AcquireSRWLockShared(&s_kb_lock);
++    if (s_kb_ready) vk = s_kb.key[i][slot];
++    ReleaseSRWLockShared(&s_kb_lock);
++    return vk;
++}
++
+ /* KZ3_KB_TEST_KEY=<key name>: a capture that waits for a key gets this one after 0.7 s (Xvfb runs have no keyboard
+  * focus; the page's capture is otherwise untestable there). */
+ static int pad_kb_test_key(void)
+--- /dev/null
++++ b/libs/video/rsx_keycaps.h	2026-10-12 11:25:57.969485039 -0500
+@@ -0,0 +1,434 @@
++/* KZ3 patch 2039 (RSX pass 39 hooks D/E): keycap prompts.
++ *
++ * Killzone 3 draws its button prompts as cells of two DXT5 atlases (the RE notes "Button icon atlases"):
++ * the HUD atlas (1024x512, ButtonIconCollection #416 of defaultsp_default_assets, used by the in-level
++ * `[ICON group=gamefunction id=X]` hints through 0x808D00 -> 0x808C4C) and the menu atlas (512x128, ImageMap #104
++ * of menu.basemenu_styles, used by `<icon name=X>` in menu legends through 0x12BF90). When the player's last
++ * input came from the keyboard/mouse, the live-draw texture cache uploads a copy of each atlas whose pad-button
++ * cells are replaced by keycaps showing the key bound to that pad button; when the pad is used again the original
++ * atlas is uploaded again. No game code is touched: the game keeps resolving actions to pad buttons, the picture
++ * of the button changes.
++ *
++ * Included once by rsx_live_draw.c (static functions; no new translation unit, so no CMake glob change). The
++ * key lookups and the text rasteriser come from the exe (port/kz3/main.cpp) through rsx_keycaps_set_source():
++ * without a source the atlases are never changed. KZ3_KEYCAPS=0 turns the feature off; LD_KEYCAP_DBG=1 logs the
++ * fingerprint of every 1024x512 / 512x128 DXT5 upload (to identify the atlases in another game version).
++ *
++ * The atlases are recognised by an FNV-1a 64 hash over their little-endian u32 words, computed from the decoded
++ * game data (pass 39: HUD = Texture #314 of menu.basemenu_styles / #195 of application_assets, menu = #308 of
++ * menu.basemenu_styles, the 1.00 disc). Cell rectangles are the game's own (ButtonIcon.TextureRect, ImageRects).
++ */
++#ifndef RSX_KEYCAPS_H
++#define RSX_KEYCAPS_H
++
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++#include <math.h>
++
++typedef struct rsx_keycap_source {
++    int (*keyboard_active)(void);                       /* 1 = last input from keyboard/mouse */
++    int (*key_for_input)(const char* input, int slot);  /* keybinds.ini input name, slot 0/1 -> Windows VK or 0 */
++    const char* (*key_name)(int vk);                    /* keybinds.ini key name ("Space", "Mouse1", ...) */
++    /* Rasterise `text` (bold UI face) into an 8-bit coverage mask w x h (zeroed by the caller), as large as fits
++     * w x h with the cap height at most max_px; any placement (the caller re-centres on the ink). 0 = nothing. */
++    int (*text_mask)(const char* text, int max_px, unsigned char* mask, int w, int h);
++} rsx_keycap_source;
++
++static rsx_keycap_source g_kc_src;
++static int g_kc_have_src;
++
++void rsx_keycaps_set_source(const rsx_keycap_source* s)
++{
++    if (s) { g_kc_src = *s; g_kc_have_src = 1; } else g_kc_have_src = 0;
++}
++
++static int kc_enabled(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("KZ3_KEYCAPS"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on && g_kc_have_src;
++}
++
++enum { KC_NONE = 0, KC_HUD = 1, KC_MENU = 2 };
++
++#define KC_HUD_W 1024u
++#define KC_HUD_H 512u
++#define KC_HUD_FNV 0x0774cfb9ed7991daull
++#define KC_MENU_W 512u
++#define KC_MENU_H 128u
++#define KC_MENU_FNV 0x6211cf01ca168d67ull
++
++/* One cell: the keybinds.ini input whose key it shows, and the rectangle (inclusive). "ls"/"rs" = a stick's four
++ * directions. */
++typedef struct { const char* input; uint16_t l, t, r, b; } kc_cell;
++
++/* ButtonIconCollection #416 (defaultsp_default_assets): TextureRect, right/bottom inclusive (Square 0..37 = 38 px). */
++static const kc_cell kc_hud_cells[] = {
++    { "square", 0, 248, 37, 285 },   { "cross", 38, 248, 75, 285 },  { "triangle", 76, 248, 113, 285 },
++    { "circle", 114, 248, 151, 285 }, { "l1", 514, 211, 563, 234 },  { "r1", 514, 269, 563, 292 },
++    { "l2", 513, 353, 564, 381 },    { "r2", 513, 382, 564, 410 },    { "l3", 646, 271, 687, 311 },
++    { "r3", 688, 271, 729, 311 },    { "up", 566, 276, 597, 314 },    { "down", 598, 276, 629, 314 },
++    { "left", 566, 243, 605, 275 },  { "right", 606, 243, 645, 275 }, { "select", 513, 411, 564, 439 },
++    { "start", 513, 440, 564, 469 }, { "ls", 646, 243, 687, 270 },    { "rs", 688, 243, 729, 270 },
++};
++/* ImageMap #104 (menu.basemenu_styles): ImageRects in <icon name=..> index order; right inclusive, bottom
++ * exclusive (rows are 28 px apart and each rect is Top..Top+28). Index: 0 cross, 1 triangle, 2 square, 3 circle,
++ * 4 left, 5 right, 6 up, 7 down, 8 L1, 9 L2, 10 L3, 11 R1, 12 R2, 13 R3, 21 LAnalog, 22 RAnalog, 23 select,
++ * 24 start (bottom stored here already minus one). */
++static const kc_cell kc_menu_cells[] = {
++    { "cross", 0, 0, 27, 27 },     { "triangle", 28, 0, 55, 27 }, { "square", 56, 0, 83, 27 },
++    { "circle", 84, 0, 111, 27 },  { "left", 112, 0, 139, 27 },   { "right", 140, 0, 167, 27 },
++    { "up", 168, 0, 191, 27 },     { "down", 192, 0, 215, 27 },   { "l1", 216, 0, 251, 27 },
++    { "l2", 252, 0, 288, 27 },     { "l3", 289, 0, 316, 27 },     { "r1", 317, 0, 353, 27 },
++    { "r2", 0, 28, 37, 55 },       { "r3", 38, 28, 67, 55 },      { "ls", 188, 28, 221, 55 },
++    { "rs", 222, 28, 255, 55 },    { "select", 256, 28, 306, 55 }, { "start", 308, 28, 355, 55 },
++};
++
++static uint64_t kc_fnv(const uint8_t* p, size_t n)
++{
++    uint64_t h = 0xcbf29ce484222325ull;
++    for (size_t i = 0; i + 4 <= n; i += 4) {
++        uint32_t w = (uint32_t)p[i] | ((uint32_t)p[i + 1] << 8) | ((uint32_t)p[i + 2] << 16) | ((uint32_t)p[i + 3] << 24);
++        h ^= w; h *= 0x100000001b3ull;
++    }
++    return h;
++}
++
++/* Which atlas (KC_NONE when not one). Only DXT5 textures of the two sizes are hashed. */
++static int rsx_keycaps_kind(const uint8_t* src, uint32_t w, uint32_t h, uint32_t bytes)
++{
++    static int dbg = -1;
++    if (dbg < 0) { const char* e = getenv("LD_KEYCAP_DBG"); dbg = (e && e[0] == '1') ? 1 : 0; }
++    if (!src || !((w == KC_HUD_W && h == KC_HUD_H) || (w == KC_MENU_W && h == KC_MENU_H))) return KC_NONE;
++    if (bytes < w * h) return KC_NONE;
++    const uint64_t f = kc_fnv(src, (size_t)w * h);
++    const int kind = (w == KC_HUD_W && f == KC_HUD_FNV) ? KC_HUD : (w == KC_MENU_W && f == KC_MENU_FNV) ? KC_MENU : KC_NONE;
++    if (dbg) fprintf(stderr, "[keycap] dxt5 %ux%u fnv=%016llx kind=%d\n", w, h, (unsigned long long)f, kind);
++    return kind;
++}
++
++/* ---- the keys ------------------------------------------------------------------------------------------------ */
++
++static int kc_key(const char* input) { int vk = g_kc_src.key_for_input(input, 0); return vk ? vk : g_kc_src.key_for_input(input, 1); }
++
++/* The key a cell shows. Menu atlas: Enter / Backspace / Escape win when bound to that button (what a player presses
++ * in a menu), else the first key. */
++static int kc_cell_key(const char* input, int menu)
++{
++    if (menu) {
++        for (int s = 0; s < 2; s++) {
++            int vk = g_kc_src.key_for_input(input, s);
++            if (vk == 0x0D || vk == 0x08 || vk == 0x1B) return vk;
++        }
++    }
++    return kc_key(input);
++}
++
++/* Bindings + device as one number; 1 = pad pictures (original atlas), 0 = no source. */
++static uint32_t rsx_keycaps_sig(void)
++{
++    if (!kc_enabled()) return 0;
++    if (!g_kc_src.keyboard_active()) return 1;
++    static const char* in[] = { "square", "cross", "triangle", "circle", "l1", "r1", "l2", "r2", "l3", "r3", "up", "down",
++                                "left", "right", "select", "start", "ls_up", "ls_down", "ls_left", "ls_right",
++                                "rs_up", "rs_down", "rs_left", "rs_right" };
++    uint32_t h = 2166136261u;
++    for (unsigned i = 0; i < sizeof in / sizeof in[0]; i++)
++        for (int s = 0; s < 2; s++) { h ^= (uint32_t)g_kc_src.key_for_input(in[i], s); h *= 16777619u; }
++    return h < 2 ? h + 2 : h;
++}
++
++/* Short label of a key name (the keycap face). Mouse1-3, arrows, Enter and Backspace are drawn as pictures. */
++static void kc_label(int vk, char* out, size_t n)
++{
++    static const struct { const char* name; const char* lab; } t[] = {
++        { "Backspace", "BKSP" }, { "Escape", "ESC" }, { "CapsLock", "CAPS" }, { "PageUp", "PGUP" },
++        { "PageDown", "PGDN" }, { "Insert", "INS" }, { "Delete", "DEL" }, { "LeftShift", "SHIFT" },
++        { "RightShift", "SHIFT" }, { "LeftCtrl", "CTRL" }, { "RightCtrl", "CTRL" }, { "LeftAlt", "ALT" },
++        { "RightAlt", "ALT" }, { "NumpadMultiply", "NUM*" }, { "NumpadAdd", "NUM+" }, { "NumpadSubtract", "NUM-" },
++        { "NumpadDecimal", "NUM." }, { "NumpadDivide", "NUM/" }, { "Semicolon", ";" }, { "Equals", "=" },
++        { "Comma", "," }, { "Minus", "-" }, { "Period", "." }, { "Slash", "/" }, { "Grave", "`" },
++        { "LeftBracket", "[" }, { "Backslash", "\\" }, { "RightBracket", "]" }, { "Apostrophe", "'" },
++        { "Mouse4", "M4" }, { "Mouse5", "M5" },
++    };
++    const char* nm = g_kc_src.key_name(vk);
++    out[0] = 0;
++    if (!nm) return;
++    for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++)
++        if (!strcmp(nm, t[i].name)) { snprintf(out, n, "%s", t[i].lab); return; }
++    if (!strncmp(nm, "Numpad", 6)) { snprintf(out, n, "NUM%s", nm + 6); return; }
++    size_t i = 0;
++    for (; nm[i] && i + 1 < n; i++) out[i] = (char)((nm[i] >= 'a' && nm[i] <= 'z') ? nm[i] - 32 : nm[i]);
++    out[i] = 0;
++}
++
++/* ---- BC3 ----------------------------------------------------------------------------------------------------- */
++
++static void kc_565(uint16_t v, int c[3]) { c[0] = ((v >> 11) & 31) * 255 / 31; c[1] = ((v >> 5) & 63) * 255 / 63; c[2] = (v & 31) * 255 / 31; }
++
++static void kc_bc3_decode(const uint8_t* b, uint8_t px[16][4])
++{
++    int al[8]; al[0] = b[0]; al[1] = b[1];
++    if (al[0] > al[1]) for (int k = 0; k < 6; k++) al[2 + k] = ((6 - k) * al[0] + (k + 1) * al[1]) / 7;
++    else { for (int k = 0; k < 4; k++) al[2 + k] = ((4 - k) * al[0] + (k + 1) * al[1]) / 5; al[6] = 0; al[7] = 255; }
++    uint64_t ab = 0; for (int i = 0; i < 6; i++) ab |= (uint64_t)b[2 + i] << (8 * i);
++    uint16_t c0 = (uint16_t)(b[8] | (b[9] << 8)), c1 = (uint16_t)(b[10] | (b[11] << 8));
++    int p[4][3]; kc_565(c0, p[0]); kc_565(c1, p[1]);
++    for (int k = 0; k < 3; k++) {
++        if (c0 > c1) { p[2][k] = (2 * p[0][k] + p[1][k]) / 3; p[3][k] = (p[0][k] + 2 * p[1][k]) / 3; }
++        else { p[2][k] = (p[0][k] + p[1][k]) / 2; p[3][k] = 0; }
++    }
++    uint32_t cb = (uint32_t)b[12] | ((uint32_t)b[13] << 8) | ((uint32_t)b[14] << 16) | ((uint32_t)b[15] << 24);
++    for (int i = 0; i < 16; i++) {
++        const int ci = (cb >> (2 * i)) & 3;
++        px[i][0] = (uint8_t)p[ci][0]; px[i][1] = (uint8_t)p[ci][1]; px[i][2] = (uint8_t)p[ci][2];
++        px[i][3] = (uint8_t)al[(ab >> (3 * i)) & 7];
++    }
++}
++
++static uint16_t kc_to565(const int c[3])
++{
++    return (uint16_t)((((c[0] * 31 + 127) / 255) << 11) | (((c[1] * 63 + 127) / 255) << 5) | ((c[2] * 31 + 127) / 255));
++}
++
++/* Plain range-fit encoder: alpha endpoints = min/max (8-level mode), colour endpoints = the brightest and darkest
++ * visible texel (4-colour mode). Good enough for grey keycaps; the game's own neighbours in a shared block lose a
++ * little precision (they were DXT5 already). */
++static void kc_bc3_encode(uint8_t px[16][4], uint8_t* b)
++{
++    int amin = 255, amax = 0;
++    for (int i = 0; i < 16; i++) { if (px[i][3] < amin) amin = px[i][3]; if (px[i][3] > amax) amax = px[i][3]; }
++    b[0] = (uint8_t)amax; b[1] = (uint8_t)amin;
++    uint64_t ab = 0;
++    if (amax > amin) {
++        int al[8]; al[0] = amax; al[1] = amin;
++        for (int k = 0; k < 6; k++) al[2 + k] = ((6 - k) * amax + (k + 1) * amin) / 7;
++        for (int i = 0; i < 16; i++) {
++            int best = 0, bd = 1 << 30;
++            for (int k = 0; k < 8; k++) { int d = abs(al[k] - px[i][3]); if (d < bd) { bd = d; best = k; } }
++            ab |= (uint64_t)best << (3 * i);
++        }
++    }
++    for (int i = 0; i < 6; i++) b[2 + i] = (uint8_t)(ab >> (8 * i));
++    int lo = -1, hi = -1, llo = 1 << 30, lhi = -1;
++    for (int i = 0; i < 16; i++) {
++        if (px[i][3] == 0 && amax > 0) continue;
++        int l = px[i][0] * 2 + px[i][1] * 5 + px[i][2];
++        if (l < llo) { llo = l; lo = i; }
++        if (l > lhi) { lhi = l; hi = i; }
++    }
++    if (lo < 0) { lo = hi = 0; }
++    int e0[3] = { px[hi][0], px[hi][1], px[hi][2] }, e1[3] = { px[lo][0], px[lo][1], px[lo][2] };
++    uint16_t c0 = kc_to565(e0), c1 = kc_to565(e1);
++    uint32_t cb = 0;
++    if (c0 < c1) { uint16_t t = c0; c0 = c1; c1 = t; }
++    if (c0 != c1) {
++        int p[4][3]; kc_565(c0, p[0]); kc_565(c1, p[1]);
++        for (int k = 0; k < 3; k++) { p[2][k] = (2 * p[0][k] + p[1][k]) / 3; p[3][k] = (p[0][k] + 2 * p[1][k]) / 3; }
++        for (int i = 0; i < 16; i++) {
++            int best = 0, bd = 1 << 30;
++            for (int k = 0; k < 4; k++) {
++                int d0 = p[k][0] - px[i][0], d1 = p[k][1] - px[i][1], d2 = p[k][2] - px[i][2];
++                int d = d0 * d0 * 2 + d1 * d1 * 5 + d2 * d2;
++                if (d < bd) { bd = d; best = k; }
++            }
++            cb |= (uint32_t)best << (2 * i);
++        }
++    }
++    b[8] = (uint8_t)c0; b[9] = (uint8_t)(c0 >> 8); b[10] = (uint8_t)c1; b[11] = (uint8_t)(c1 >> 8);
++    b[12] = (uint8_t)cb; b[13] = (uint8_t)(cb >> 8); b[14] = (uint8_t)(cb >> 16); b[15] = (uint8_t)(cb >> 24);
++}
++
++/* ---- drawing ------------------------------------------------------------------------------------------------- */
++
++static float kc_clamp01(float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; }
++
++/* Signed distance from (x, y) to a rounded box centred at (cx, cy), half sizes (hx, hy), radius r. */
++static float kc_rbox(float x, float y, float cx, float cy, float hx, float hy, float r)
++{
++    float qx = fabsf(x - cx) - (hx - r), qy = fabsf(y - cy) - (hy - r);
++    float ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0;
++    float in = qx > qy ? qx : qy; if (in > 0) in = 0;
++    return sqrtf(ox * ox + oy * oy) + in - r;
++}
++
++/* Over-composite colour c with coverage a onto pixel p (RGBA, straight alpha). */
++static void kc_over(uint8_t* p, float r, float g, float b, float a)
++{
++    if (a <= 0.f) return;
++    const float da = p[3] / 255.f, oa = a + da * (1.f - a);
++    if (oa <= 0.f) return;
++    const float c[3] = { r, g, b };
++    for (int k = 0; k < 3; k++) p[k] = (uint8_t)((c[k] * a + p[k] * da * (1.f - a)) / oa + 0.5f);
++    p[3] = (uint8_t)(oa * 255.f + 0.5f);
++}
++
++/* Inner glyphs (white) for keys drawn as pictures: mouse buttons and arrow keys. Coverage into mask (w x h). */
++static int kc_picture(int vk, unsigned char* m, int w, int h)
++{
++    const float cx = w * 0.5f, cy = h * 0.5f;
++    if (vk >= 0x25 && vk <= 0x28) {   /* Left, Up, Right, Down: a filled triangle */
++        const float s = (w < h ? w : h) * 0.30f;
++        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
++            float acc = 0;
++            for (int sy = 0; sy < 4; sy++) for (int sx = 0; sx < 4; sx++) {
++                float u = x + (sx + 0.5f) / 4 - cx, v = y + (sy + 0.5f) / 4 - cy, a, bb;
++                switch (vk) { case 0x26: a = u; bb = v; break; case 0x28: a = u; bb = -v; break;
++                              case 0x25: a = v; bb = u; break; default: a = v; bb = -u; break; }
++                /* pointing towards -bb: apex at bb = -s, base at bb = +0.7 s, half width at base s */
++                if (bb >= -s && bb <= 0.7f * s && fabsf(a) <= (bb + s) / 1.7f) acc += 1;
++            }
++            m[y * w + x] = (unsigned char)(acc * 255 / 16);
++        }
++        return 1;
++    }
++    if (vk == 0x0D || vk == 0x08) {   /* Enter: a return arrow; Backspace: a long left arrow */
++        const float s = (w < h ? w : h) * 0.80f, t = s * 0.15f > 1.5f ? s * 0.15f : 1.5f;
++        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
++            float acc = 0;
++            for (int sy = 0; sy < 4; sy++) for (int sx = 0; sx < 4; sx++) {
++                const float px = x + (sx + 0.5f) / 4, py = y + (sy + 0.5f) / 4;
++                const float ay = vk == 0x0D ? cy + 0.14f * s : cy;          /* the shaft's height */
++                const float ax = cx - 0.46f * s, bx = cx - 0.12f * s, hh = 0.26f * s;   /* head: apex, base, half */
++                int on = 0;
++                if (px >= ax && px <= bx && fabsf(py - ay) <= hh * (px - ax) / (bx - ax)) on = 1;
++                if (px >= bx - 0.5f && px <= cx + 0.40f * s && fabsf(py - ay) <= t * 0.5f) on = 1;
++                if (vk == 0x0D && fabsf(px - (cx + 0.40f * s - t * 0.5f)) <= t * 0.5f && py >= cy - 0.40f * s &&
++                    py <= ay + t * 0.5f) on = 1;
++                acc += on;
++            }
++            m[y * w + x] = (unsigned char)(acc * 255 / 16);
++        }
++        return 1;
++    }
++    if (vk == 0x01 || vk == 0x02 || vk == 0x04) {   /* Mouse1/2/3: a mouse with the pressed button filled */
++        const float mh = h * (h < 24 ? 0.98f : 0.82f), mw = mh * 0.64f, hx = mw * 0.5f, hy = mh * 0.5f, r = hx * 0.95f, lw = h > 30 ? 1.6f : 1.2f;
++        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
++            float acc = 0;
++            for (int sy = 0; sy < 4; sy++) for (int sx = 0; sx < 4; sx++) {
++                float px = x + (sx + 0.5f) / 4, py = y + (sy + 0.5f) / 4;
++                float d = kc_rbox(px, py, cx, cy, hx, hy, r);
++                int on = d <= 0 && d > -lw;                                  /* outline */
++                float split = cy - hy * 0.12f;                               /* buttons above this line */
++                if (d <= 0 && fabsf(py - split) < lw * 0.5f) on = 1;         /* button line */
++                if (d <= 0 && py < split && fabsf(px - cx) < lw * 0.5f) on = 1;   /* middle line */
++                if (d <= -lw && py < split - lw * 0.5f) {                     /* the pressed button */
++                    if (vk == 0x01 && px < cx - lw * 0.5f) on = 1;
++                    if (vk == 0x02 && px > cx + lw * 0.5f) on = 1;
++                    if (vk == 0x04 && fabsf(px - cx) < mw * 0.12f && py > cy - hy * 0.72f) on = 1;
++                }
++                acc += on;
++            }
++            m[y * w + x] = (unsigned char)(acc * 255 / 16);
++        }
++        return 1;
++    }
++    return 0;
++}
++
++/* Draw one keycap into the RGBA cell (cw x ch, row stride cw). Style: the game's own shoulder-button cells (L1/R1:
++ * near-black rounded body, a lighter rim, bold white letters). */
++static void kc_draw_cap(uint8_t* cell, int cw, int ch, const char* text, int vk)
++{
++    memset(cell, 0, (size_t)cw * ch * 4);
++    const float m = 1.0f, hx = cw * 0.5f - m, hy = ch * 0.5f - m, cx = cw * 0.5f, cy = ch * 0.5f;
++    const float r = (cw < ch ? cw : ch) * 0.22f;
++    for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
++        const float d = kc_rbox(x + 0.5f, y + 0.5f, cx, cy, hx, hy, r);
++        const float cov = kc_clamp01(0.5f - d);
++        if (cov <= 0) continue;
++        const float t = (float)y / (ch - 1);                 /* 0 top, 1 bottom */
++        const float body = 46.f - 34.f * t;                  /* #2E -> #0C */
++        const float rim = kc_clamp01(1.0f - fabsf(d + 1.0f));   /* a 1 px ring just inside the edge */
++        const float rc = 150.f - 80.f * t;
++        const float v = body * (1 - rim) + rc * rim;
++        uint8_t* p = cell + ((size_t)y * cw + x) * 4;
++        p[0] = p[1] = p[2] = (uint8_t)v; p[3] = (uint8_t)(cov * 242.f);
++    }
++    /* the face: text or picture, re-centred on its ink */
++    const int iw = cw - 5 > 4 ? cw - 5 : 4, ih = ch - 5 > 4 ? ch - 5 : 4;
++    unsigned char* mk = (unsigned char*)calloc((size_t)iw * ih, 1);
++    if (!mk) return;
++    int ok = kc_picture(vk, mk, iw, ih);
++    if (!ok && text && text[0]) {
++        const size_t len = strlen(text);
++        int cap = (int)(ih * (len <= 1 ? 0.62f : len <= 3 ? 0.52f : 0.50f) + 0.5f);   /* the face shrinks long names to the width */
++        ok = g_kc_src.text_mask(text, cap, mk, iw, ih);
++    }
++    if (ok) {
++        int x0 = iw, x1 = -1, y0 = ih, y1 = -1;
++        for (int y = 0; y < ih; y++) for (int x = 0; x < iw; x++)
++            if (mk[y * iw + x] > 24) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
++        if (x1 >= x0) {
++            const int ox = (cw - (x1 - x0 + 1)) / 2 - x0, oy = (ch - (y1 - y0 + 1)) / 2 - y0;
++            for (int y = 0; y < ih; y++) for (int x = 0; x < iw; x++) {
++                const int tx = x + ox, ty = y + oy;
++                if (tx < 0 || ty < 0 || tx >= cw || ty >= ch || !mk[y * iw + x]) continue;
++                kc_over(cell + ((size_t)ty * cw + tx) * 4, 240.f, 240.f, 240.f, mk[y * iw + x] / 255.f);
++            }
++        }
++    }
++    free(mk);
++}
++
++/* The label of a stick cell: the four direction keys when they are single characters ("WASD"), else the up key. */
++static int kc_stick_label(const char* stick, char* out, size_t n)
++{
++    const char* dir[4] = { "_up", "_left", "_down", "_right" };
++    char nm[16], lab[4][16]; int vk0 = 0, single = 1;
++    for (int i = 0; i < 4; i++) {
++        snprintf(nm, sizeof nm, "%s%s", stick, dir[i]);
++        int vk = kc_key(nm);
++        if (i == 0) vk0 = vk;
++        lab[i][0] = 0;
++        if (vk) kc_label(vk, lab[i], sizeof lab[i]);
++        if (strlen(lab[i]) != 1) single = 0;
++    }
++    if (single && n > 4) { for (int i = 0; i < 4; i++) out[i] = lab[i][0]; out[4] = 0; }
++    else kc_label(vk0, out, n);
++    return vk0;
++}
++
++/* A patched copy of an atlas (malloc'd, `bytes` long) for the current bindings, or NULL (pad mode, no keys). */
++static uint8_t* rsx_keycaps_patch(const uint8_t* src, uint32_t w, uint32_t h, uint32_t bytes, int kind, int* n_cells)
++{
++    *n_cells = 0;
++    if (kind == KC_NONE || rsx_keycaps_sig() < 2) return NULL;
++    const kc_cell* cells = kind == KC_HUD ? kc_hud_cells : kc_menu_cells;
++    const unsigned nc = kind == KC_HUD ? sizeof kc_hud_cells / sizeof kc_hud_cells[0] : sizeof kc_menu_cells / sizeof kc_menu_cells[0];
++    uint8_t* out = (uint8_t*)malloc(bytes);
++    if (!out) return NULL;
++    memcpy(out, src, bytes);
++    const uint32_t bw = w / 4;
++    for (unsigned c = 0; c < nc; c++) {
++        const kc_cell* k = &cells[c];
++        char lab[24]; int vk;
++        if (!strcmp(k->input, "ls") || !strcmp(k->input, "rs")) vk = kc_stick_label(k->input, lab, sizeof lab);
++        else { vk = kc_cell_key(k->input, kind == KC_MENU); lab[0] = 0; if (vk) kc_label(vk, lab, sizeof lab); }
++        if (!vk) continue;
++        const int cw = k->r - k->l + 1, ch = k->b - k->t + 1;
++        uint8_t* cap = (uint8_t*)malloc((size_t)cw * ch * 4);
++        if (!cap) continue;
++        /* stick cells show text only (no arrow picture for a single arrow key) */
++        kc_draw_cap(cap, cw, ch, lab, (!strcmp(k->input, "ls") || !strcmp(k->input, "rs")) ? 0 : vk);
++        for (uint32_t by = k->t / 4; by <= (uint32_t)k->b / 4 && by < h / 4; by++)
++            for (uint32_t bx = k->l / 4; bx <= (uint32_t)k->r / 4 && bx < bw; bx++) {
++                uint8_t* blk = out + ((size_t)by * bw + bx) * 16;
++                uint8_t px[16][4];
++                kc_bc3_decode(blk, px);
++                for (int i = 0; i < 16; i++) {
++                    const int x = (int)bx * 4 + (i & 3), y = (int)by * 4 + (i >> 2);
++                    if (x < k->l || x > k->r || y < k->t || y > k->b) continue;
++                    memcpy(px[i], cap + ((size_t)(y - k->t) * cw + (x - k->l)) * 4, 4);
++                }
++                kc_bc3_encode(px, blk);
++            }
++        free(cap);
++        (*n_cells)++;
++    }
++    return out;
++}
++
++#endif
+--- a/libs/video/rsx_live_draw.c	2026-10-12 11:12:41.494991772 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-12 11:15:24.963663414 -0500
+@@ -123,6 +123,7 @@
+ #include <dxgi1_4.h>
+ #include <d3dcompiler.h>
+ #include "rsx_vertex_formats.h"
++#include "rsx_keycaps.h"   /* patch 2039: keycap prompts */
+ #include <sys/stat.h>
+ 
+ #pragma comment(lib, "d3d12.lib")
+@@ -289,6 +290,8 @@
+     u32 quiet;  /* patch 2033: consecutive hashes that found the same bytes (saturating) */
+     u32 written;   /* patch 2033: a tracked writer touched the span since the last hash */
+     u32 skip_frame;   /* patch 2033: frame of the last counted skip */
++    int kc_kind;      /* patch 2039: KC_HUD / KC_MENU when this is a prompt atlas */
++    u32 kc_sig;       /* patch 2039: rsx_keycaps_sig() its upload was made for */
+ } texcache_t;
+ typedef struct {
+     u32 location, offset, format, width, height, pitch;
+@@ -2428,6 +2431,15 @@
+  * the copy), later draws the new ones, the same as a new resource gave. LD_TEX_INPLACE=0 restores the old path.
+  * Cube, 3D and vertex textures keep the old path. Counted in [tex-hash] as inplace=N. */
+ static ID3D12Resource* g_ld_tex_reuse;
++/* patch 2039: what the last decode_guest_texture found (prompt atlas kind, signature it drew for) */
++static int g_ld_kc_kind;
++static u32 g_ld_kc_sig;
++static u32 g_ld_kc_sig_frame = 0xFFFFFFFFu, g_ld_kc_sig_now;
++static u32 ld_keycaps_sig_frame(u32 frame)   /* once per frame: device + bindings */
++{
++    if (g_ld_kc_sig_frame != frame) { g_ld_kc_sig_frame = frame; g_ld_kc_sig_now = rsx_keycaps_sig(); }
++    return g_ld_kc_sig_now;
++}
+ static unsigned long long g_ld_tex_inplace_n;
+ static unsigned long long g_ld_b8_direct_n;   /* patch 2036 */
+ static int ld_tex_inplace_on(void)
+@@ -3151,6 +3163,20 @@
+             }
+             return create_texture_cube(dxgi, cube_levels, n_mips);
+         }
++        /* patch 2039: a prompt atlas gets keycaps in its pad-button cells while the keyboard is in use */
++        u8* kc_copy = NULL;
++        if (base_fmt == TEX_FMT_DXT45 && kc_enabled()) {
++            g_ld_kc_kind = rsx_keycaps_kind(src, w, h, total);
++            if (g_ld_kc_kind) {
++                int cells = 0;
++                g_ld_kc_sig = rsx_keycaps_sig();
++                kc_copy = rsx_keycaps_patch(src, w, h, total, g_ld_kc_kind, &cells);
++                fprintf(stderr, "[keycap] %s atlas %ux%u src=%u:0x%08X upload %s (%d cells, sig %08X)\n",
++                        g_ld_kc_kind == KC_HUD ? "hud" : "menu", w, h, t->location, t->offset,
++                        kc_copy ? "keycaps" : "pad glyphs", cells, g_ld_kc_sig);
++                if (kc_copy) src = kc_copy;
++            }
++        }
+         tex_level_t levels[14];
+         u32 mw = w, mh = h, off = 0, n = 0;
+         for (u32 m = 0; m < n_mips; m++) {
+@@ -3166,7 +3192,9 @@
+             mw = mw > 1 ? mw >> 1 : 1;
+             mh = mh > 1 ? mh >> 1 : 1;
+         }
+-        return create_texture_mipped(dxgi, levels, n);
++        ID3D12Resource* kc_res = create_texture_mipped(dxgi, levels, n);
++        free(kc_copy);
++        return kc_res;
+     }
+ 
+     if (ld_is_float_tex(base_fmt))   /* patch 2014 */
+@@ -3931,6 +3959,24 @@
+ 
+     for (u32 i = ld_tex_index_find(t, remap); i != UINT32_MAX; i = UINT32_MAX) {   /* patch 2033: indexed */
+         texcache_t* entry = &g.textures[i];
++        if (entry->kc_kind && entry->tex && ld_keycaps_sig_frame(g_ld_frames) != entry->kc_sig) {   /* patch 2039 */
++            const u32 want = g_ld_kc_sig_now;
++            g_ld_tex_reuse = ld_tex_inplace_on() ? entry->tex : NULL;
++            g_ld_kc_kind = 0;
++            ID3D12Resource* r = decode_guest_texture_profiled(t, remap);
++            g_ld_tex_reuse = NULL;
++            entry->kc_sig = want;   /* also on failure: no retry storm; the next change retries */
++            if (r && g_ld_kc_kind) entry->kc_sig = g_ld_kc_sig;
++            if (!g_ld_kc_kind) entry->kc_kind = 0;   /* the bytes there are no longer the atlas */
++            if (r && r != entry->tex) {
++                ID3D12Resource* old = entry->tex;
++                entry->tex = r;
++                write_texture_srv(i, entry);
++                retire_texture(old);
++            }
++            fprintf(stderr, "[keycap] refresh frame=%u src=%u:0x%08X sig %08X (%s)\n", g_ld_frames, t->location,
++                    t->offset, want, r ? "uploaded" : "decode failed");
++        }
+         if (refresh_enabled && entry->tex &&
+             entry->last_hash_frame != g_ld_frames &&
+             ld_tex_hash_due(entry->location, entry->offset, entry->span, entry->last_hash_frame,
+@@ -3988,9 +4034,11 @@
+             if (readable && hash != entry->content_hash) {
+                 /* patch 2035: offer the current resource for an in-place update */
+                 g_ld_tex_reuse = ld_tex_inplace_on() ? entry->tex : NULL;
++                g_ld_kc_kind = 0;
+                 ID3D12Resource* replacement =
+                     decode_guest_texture_profiled(t, remap);
+                 g_ld_tex_reuse = NULL;
++                if (replacement) { entry->kc_kind = g_ld_kc_kind; entry->kc_sig = g_ld_kc_sig; }   /* patch 2039 */
+                 if (replacement && replacement == entry->tex) {
+                     entry->content_hash = hash;   /* same resource, same SRV: nothing to rewrite or retire */
+                     g_ld_tex_inplace_n++;
+@@ -4066,7 +4114,10 @@
+         int readable = 0;
+         replacement.content_hash = texture_content_hash(t, &readable);
+     }
++    g_ld_kc_kind = 0;
+     replacement.tex = decode_guest_texture_profiled(t, remap);
++    replacement.kc_kind = g_ld_kc_kind;   /* patch 2039 */
++    replacement.kc_sig = g_ld_kc_sig;
+     if (replacement.tex) {
+         texcache_t* entry = &g.textures[index];
+         if (evicted)

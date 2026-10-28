@@ -1,0 +1,93 @@
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+--- a/libs/input/pad_mouse.c
++++ b/libs/input/pad_mouse.c
+@@ -138,6 +138,13 @@
+ static void pm_feed_start(void);
+ 
+ int pad_mouse_take(double now, int* dx, int* dy) { return pm_take(now, 0, 0, dx, dy); }
++void pad_mouse_peek(int* dx, int* dy)   /* patch 2112 */
++{
++    const unsigned f = s_frame_clock();
++    PM_LOCK();
++    pad_look_acc_peek(&s_acc, f, dx, dy);
++    PM_UNLOCK();
++}
+ int pad_mouse_take_until(double now, unsigned long long cut, int* dx, int* dy) { return pm_take(now, 1, cut, dx, dy); }
+ 
+ static int pm_take(double now, int until, unsigned long long cut, int* dx, int* dy)
+diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+--- a/libs/input/pad_mouse.h
++++ b/libs/input/pad_mouse.h
+@@ -247,6 +247,63 @@
+     a->taken = 1;
+ }
+ 
++/* Patch 2112 (RSX pass 105): the counts the next take would hand out, without taking them (the late-latch view
++ * rotation shows them before the logic step applies them). Counts the next take would drop as stale give 0. */
++static inline void pad_look_acc_peek(const PadLookAcc* a, unsigned frame, int* dx, int* dy)
++{
++    long long x = a->dx, y = a->dy;
++    if (pad_look_acc_idle(a, frame) && a->add_frame != frame) x = y = 0;
++    if (x > 0x7FFFFFFF) x = 0x7FFFFFFF; else if (x < -0x7FFFFFFF) x = -0x7FFFFFFF;
++    if (y > 0x7FFFFFFF) y = 0x7FFFFFFF; else if (y < -0x7FFFFFFF) y = -0x7FFFFFFF;
++    *dx = (int)x;
++    *dy = (int)y;
++}
++
++/* Patch 2112 (RSX pass 105), ENHANCEMENT (display only): the late-latch view rotation. The camera writer copies a
++ * pose (rows: 0 right, 1 forward, 2 up; world z-up) into the drawn Camera; KZ3 refreshes that pose only at its logic
++ * step, so the view turns in steps. pad_look_latch_delta: the yaw/pitch the next look update will add for the counts
++ * not taken yet, with the same scale as pad_mouse_look_apply (k = rad per count incl. ADS/zoom) and the same clamps:
++ * pitch to [pmin, pmax] from the logic pitch p0, yaw to [ymin, ymax] from the logic yaw y0 when ymin <= ymax (a gun's
++ * limited range; ymin > ymax = free). pad_look_latch_rotate: yaw dyaw about world +Z, then pitch dpitch about the
++ * rotated right axis (forward x up; positive = up: run r103-k4m1 showed a lower pitch argument lowering row1.z). Row 3 (position)
++ * is not touched. */
++static inline void pad_look_latch_delta(float k, int invert, int dx, int dy, float y0, float ymin, float ymax,
++                                        float p0, float pmin, float pmax, float* dyaw, float* dpitch)
++{
++    float y = y0 + -(float)dx * k;
++    if (ymin <= ymax) y = y < ymin ? ymin : y > ymax ? ymax : y;
++    float p = p0 + -(float)dy * k * (invert ? -1.0f : 1.0f);
++    if (pmin <= pmax) p = p < pmin ? pmin : p > pmax ? pmax : p;
++    *dyaw = y - y0;
++    *dpitch = p - p0;
++}
++static inline void pad_look_rot_axis(float v[3], const float ax[3], float c, float s)
++{
++    /* Rodrigues: v c + (ax x v) s + ax (ax.v)(1 - c) */
++    const float d = ax[0] * v[0] + ax[1] * v[1] + ax[2] * v[2];
++    const float x = ax[1] * v[2] - ax[2] * v[1], y = ax[2] * v[0] - ax[0] * v[2], z = ax[0] * v[1] - ax[1] * v[0];
++    const float o[3] = {v[0] * c + x * s + ax[0] * d * (1 - c), v[1] * c + y * s + ax[1] * d * (1 - c),
++                        v[2] * c + z * s + ax[2] * d * (1 - c)};
++    v[0] = o[0]; v[1] = o[1]; v[2] = o[2];
++}
++static inline void pad_look_latch_rotate(float r[3][3], float dyaw, float dpitch)
++{
++    if (dyaw != 0.0f) {
++        const float z[3] = {0.0f, 0.0f, 1.0f}, c = cosf(dyaw), s = sinf(dyaw);
++        for (int i = 0; i < 3; i++) pad_look_rot_axis(r[i], z, c, s);
++    }
++    if (dpitch != 0.0f) {
++        /* axis = forward x up: a turn of +dpitch about it moves forward toward up whatever the basis handedness */
++        float ax[3] = {r[1][1] * r[2][2] - r[1][2] * r[2][1], r[1][2] * r[2][0] - r[1][0] * r[2][2],
++                       r[1][0] * r[2][1] - r[1][1] * r[2][0]};
++        const float n = sqrtf(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
++        if (!(n > 1e-6f)) return;
++        ax[0] /= n; ax[1] /= n; ax[2] /= n;
++        const float c = cosf(dpitch), s = sinf(dpitch);
++        for (int i = 1; i < 3; i++) pad_look_rot_axis(r[i], ax, c, s);
++    }
++}
++
+ /* Patch 2108 (RSX pass 103): look counts on the game's clock. KZ3's look update runs once per logic slot (1/15 s of
+  * game time, the RE notes s.6.2), but the slot runs at whatever wall time the frame loop reaches it, so a
+  * take of "everything since the last take" hands each slot a wall-time share that swings with the frame cadence
+@@ -471,6 +528,8 @@
+ void pad_mouse_set_time_clock(unsigned long long (*fn)(void));
+ int  pad_mouse_take_until(double now, unsigned long long cut, int* dx, int* dy);
+ int  pad_mouse_feed_active(void);
++/* Patch 2112: pad_look_acc_peek on the accumulator (under its lock), no take. */
++void pad_mouse_peek(int* dx, int* dy);
+ 
+ #ifdef _WIN32
+ #include <windows.h>

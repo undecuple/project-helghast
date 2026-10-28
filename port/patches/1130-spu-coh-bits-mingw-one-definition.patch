@@ -1,0 +1,44 @@
+KZ3 patch 1130 (SPU pass 108 part 3; upstream candidate): v0.18.0's spu_coh_bitmap.h defines g_spu_coh_bits in the
+header, `__declspec(selectany)` on MSVC and `__attribute__((weak))` elsewhere, meaning one merged definition. MinGW's GNU
+ld (PE/COFF weak externals) does not merge them: every object that includes the header gets its own
+`.weak.g_spu_coh_bits.<symbol>` storage (shown with x86_64-w64-mingw32-nm on a two-file test: two BSS slots), so the
+PPU store paths in ppu_loader.cpp read a NULL copy spu_coherency.c never publishes (PPU stores would never see a
+reserved line), and the lifted PPU code's plain `extern` (ppu_recomp.h) failed to link (undefined reference). Fix: on
+MinGW (_WIN32 without _MSC_VER) the header declares it extern and spu_coherency.c holds the one strong definition.
+MSVC (selectany) and ELF (weak, merged) are unchanged.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/runtime/spu/spu_coh_bitmap.h b/runtime/spu/spu_coh_bitmap.h
+index 79bffe73..d716d110 100644
+--- a/runtime/spu/spu_coh_bitmap.h
++++ b/runtime/spu/spu_coh_bitmap.h
+@@ -31,7 +31,14 @@ extern "C" {
+ 
+ /* One bit per line over the 32-bit guest address space; spu_coherency.c
+  * publishes it on the first reservation and only ever sets bits. */
++#if defined(_WIN32) && !defined(_MSC_VER)
++/* KZ3 patch 1130: MinGW (GNU ld, PE/COFF) does not merge weak definitions: each object gets its own
++ * `.weak.g_spu_coh_bits.<symbol>` storage, so the PPU store paths (ppu_loader.cpp) read a copy spu_coherency.c
++ * never publishes, and a plain `extern` reference finds no definition at all. One strong definition there. */
++extern const unsigned char* g_spu_coh_bits;
++#else
+ SPU_COH_SHARED const unsigned char* g_spu_coh_bits = 0;
++#endif
+ 
+ static inline int spu_coh_line_reserved(uint32_t addr)
+ {
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 0e4beb37..d778cc55 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -14,6 +14,9 @@
+ #include <stdlib.h>
+ #include "spu_coherency.h"
+ #include "spu_coh_bitmap.h"
++#if defined(_WIN32) && !defined(_MSC_VER)
++const unsigned char* g_spu_coh_bits = 0;   /* KZ3 patch 1130: the one MinGW definition (spu_coh_bitmap.h) */
++#endif
+ 
+ #include <stdint.h>
+ #include <stdio.h>

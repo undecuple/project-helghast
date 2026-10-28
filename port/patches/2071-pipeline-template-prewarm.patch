@@ -1,0 +1,1031 @@
+KZ3 patch 2071 (RSX pass 67): the shared pipeline template, the RE notes "Pass 67".
+A template is a list of pipeline records of hashes and numeric state only (libs/video/rsx_pso_template.h): FNV /
+structural hashes and fingerprints of the vertex and fragment programs, the variant state words (texture-unit masks,
+sRGB, vertex layout), the render state and the pipeline key. No shader text, microcode, address or string derived from
+game data, so it can be shared.
+1. Export: LD_PSO_TEMPLATE_OUT=<file> writes a record for every pipeline key the walker looks up (once per key), every
+   5 s when it grew and at exit.
+2. Prewarm: LD_PSO_TEMPLATE=<file> starts a scout thread that searches the running guest's committed memory for the
+   programs the template lists (16-byte aligned, fingerprint of the first 16 bytes, then a full hash check); when a
+   record's vertex and fragment program are both found, worker threads (LD_PSO_TEMPLATE_THREADS, 3) translate them with
+   the walker's own translator, compile (shader disk cache first), create the pipeline through the pipeline library and
+   stage it like a preloaded one. The walker merges staged pipelines at its next lookup; a pipeline that is not ready
+   is built by the walker as before (no draw is skipped).
+3. get_pso's translation step is now one function, ld_xlate (under a lock: the decompilers keep static scratch), shared
+   by the walker and the prewarm; the walker's output is unchanged.
+Merge tool: tools/smoke/pso_template.py; host test tools/smoke/test_pso_template.sh.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ld_xlate/ld_pso_key_tail (2071's shared translator) take upstream's VP branch bits (new ld_xl_in.vp_branch_bits, set_branch_bits in ld_xlate, hashed when the VP uses them; prewarm passes 0) and unnorm_dim[16][3] (records keep [16][2]; key hashes w,h only as before).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index fe4eea10..b4ef697c 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -126,7 +126,9 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ #include <d3dcompiler.h>
+ #include "rsx_vertex_formats.h"
+ #include "rsx_keycaps.h"   /* patch 2039: keycap prompts */
+-#include "rsx_pso_async.h"   /* patch 2048: asynchronous PSO build bookkeeping */
++#include "rsx_pso_async.h"
++/* patch 2048: asynchronous PSO build bookkeeping */
++#include "rsx_pso_template.h"   /* patch 2071 */
+ #include <sys/stat.h>
+ 
+ #pragma comment(lib, "d3d12.lib")
+@@ -7229,7 +7231,7 @@ typedef struct {
+     u8  attrs[RSX_DSP_NUM_VERTEX_ATTR];
+     render_state_t rs;
+ } ld_pl_rec;
+-typedef struct { u64 key; ID3D12PipelineState* pso; } ld_pl_staged;
++typedef struct { u64 key; ID3D12PipelineState* pso; u8 src; } ld_pl_staged;   /* src: 1 preload, 2 template (patch 2071) */
+ static struct {
+     int on, opened, started;
+     char path[MAX_PATH], lib_path[MAX_PATH];
+@@ -7455,7 +7457,7 @@ static void ld_pl_save_library(int wait)
+     if (!g_ld_pl.save_thread) ld_pl_save_thread(NULL);
+ }
+ 
+-static void ld_pl_stage(u64 key, ID3D12PipelineState* pso)
++static void ld_pl_stage(u64 key, ID3D12PipelineState* pso, u8 src)
+ {
+     EnterCriticalSection(&g_ld_pl.cs);
+     if (g_ld_pl.n_staged == g_ld_pl.cap_staged) {
+@@ -7466,6 +7468,7 @@ static void ld_pl_stage(u64 key, ID3D12PipelineState* pso)
+     }
+     g_ld_pl.staged[g_ld_pl.n_staged].key = key;
+     g_ld_pl.staged[g_ld_pl.n_staged].pso = pso;
++    g_ld_pl.staged[g_ld_pl.n_staged].src = src;
+     g_ld_pl.n_staged++;
+     InterlockedExchange(&g_ld_pl.staged_flag, 1);
+     LeaveCriticalSection(&g_ld_pl.cs);
+@@ -7504,7 +7507,7 @@ static DWORD WINAPI ld_pl_worker(LPVOID arg)
+         else if (SUCCEEDED(hr) && pso) { g_ld_pl.n_created++; g_ld_pl.create_us += cus; }
+         else g_ld_pl.n_failed++;
+         LeaveCriticalSection(&g_ld_pl.cs);
+-        if (SUCCEEDED(hr) && pso) ld_pl_stage(r->key, pso);
++        if (SUCCEEDED(hr) && pso) ld_pl_stage(r->key, pso, 1);
+     }
+     if (InterlockedDecrement(&g_ld_pl.workers_left) == 0) {
+         fprintf(stderr, "[pso-preload] done: %u records, %u from library (%.1f ms), %u created (%.1f ms), %u failed, "
+@@ -7577,7 +7580,7 @@ static void ld_pl_drain(void)
+         if (i < g.n_psos || g.n_psos >= MAX_PSOS) { pso->lpVtbl->Release(pso); g_ld_pl.n_dup++; continue; }
+         g.psos[g.n_psos].key = key;
+         g.psos[g.n_psos].pso = pso;
+-        g.psos[g.n_psos].preloaded = 1;
++        g.psos[g.n_psos].preloaded = g_ld_pl.staged[s].src ? g_ld_pl.staged[s].src : 1;
+         g.n_psos++;
+     }
+     g_ld_pl.n_staged = 0;
+@@ -7610,6 +7613,588 @@ static void ld_pl_shutdown(void)
+ }
+ /* ===================== end of patch 2031 block ===================== */
+ 
++
++/* ===== KZ3 patch 2071: the walker's translation step (VP and FP microcode + variant state -> HLSL), one function
++ * shared by get_pso and the template prewarm threads. The decompilers keep static scratch buffers and the VP branch
++ * base, so the whole step runs under one lock. ===== */
++typedef struct {
++    const u8* vp_uc; u32 vp_instrs, vp_start;
++    const rsx_vertex_layout_plan* layout;      /* masked layout, or NULL */
++    u32 vtex_mask;
++    const u8* fp_uc; u32 fp_size, fp_ctrl, cube_mask;
++    const render_state_t* rs;
++    u32 shadow_mask; const u8* shadow_zfunc;
++    u32 unnorm_mask; const u32 (*unnorm_dim)[3];   /* v0.18.0: w, h, depth (00c2999d) */
++    u32 vp_branch_bits;                        /* v0.18.0: BRB/CLB outcomes baked into the VP (0x1FF8) */
++    u64 gamma_mask; u32 argb_mask; const u16* argb_remap; u32 srgb_out;
++    u32 fp_const_count; u32 fp_alpha_ref;
++} ld_xl_in;
++static CRITICAL_SECTION g_ld_xl_cs;
++static volatile LONG g_ld_xl_state;
++static void ld_xl_lock(void)
++{
++    if (g_ld_xl_state != 2) {
++        if (InterlockedCompareExchange(&g_ld_xl_state, 1, 0) == 0) { InitializeCriticalSection(&g_ld_xl_cs); g_ld_xl_state = 2; }
++        else while (g_ld_xl_state != 2) Sleep(0);
++    }
++    EnterCriticalSection(&g_ld_xl_cs);
++}
++static void ld_xlate(const ld_xl_in* in, char* vs_hlsl, size_t vs_sz, char* ps_hlsl, size_t ps_sz, int* vi_out, int* fi_out)
++{
++    const u8* vp_uc = in->vp_uc; const u32 vp_instrs = in->vp_instrs; const u32 vtex_mask = in->vtex_mask;
++    const rsx_vertex_layout_plan* masked_layout = in->layout;
++    const u8* fp_uc = in->fp_uc; const u32 fp_size = in->fp_size, fp_ctrl = in->fp_ctrl, cube_mask = in->cube_mask;
++    const render_state_t rs = *in->rs;
++    const u32 shadow_mask = in->shadow_mask, unnorm_mask = in->unnorm_mask, argb_mask = in->argb_mask, srgb_out = in->srgb_out;
++    const u8* shadow_zfunc = in->shadow_zfunc; const u32 (*unnorm_dim)[3] = in->unnorm_dim;
++    const u64 gamma_mask = in->gamma_mask; const u16* argb_remap = in->argb_remap;
++    ld_xl_lock();
++    rsx_vp_set_branch_base(in->vp_start);
++    rsx_vp_set_branch_bits(in->vp_branch_bits);
++    const int vi = masked_layout
++        ? rsx_vp_decompile_compact_ex(
++            vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
++            vs_hlsl, vs_sz)
++        : rsx_vp_decompile_ex(
++            vp_uc, vp_instrs * 16, vtex_mask, vs_hlsl, vs_sz);
++    u32 decompiled_constant_count = 0;
++    int fi;
++    if (ld_fp_constants_buffered()) {
++        fi = rsx_fp_decompile_buffered_ex(
++            fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
++            ps_sz, &decompiled_constant_count);
++        if (fi > 0 &&
++            decompiled_constant_count != in->fp_const_count)
++            fi = -1;
++        if (fi > 0 && rs.alpha_test_enable &&
++            rsx_fp_apply_alpha_test_buffered(
++                ps_hlsl, ps_sz, rs.alpha_func) < 0)
++            fi = -1;
++        if (fi > 0 && rsx_fp_apply_shadow_compare(
++                ps_hlsl, ps_sz, shadow_mask, shadow_zfunc) < 0)
++            fi = -1;
++        if (fi > 0) {
++            const int np = rsx_fp_apply_unnorm_scale(
++                ps_hlsl, ps_sz, unnorm_mask, unnorm_dim, cube_mask, 0u);
++            { static int n = 0;
++              if (PS3_LOG_FIRST(n, 8))
++                  fprintf(stderr, "[unnorm] mask=0x%X cube=0x%X dim0=%ux%u"
++                                  " patched=%d\n",
++                          unnorm_mask, cube_mask, unnorm_dim[0][0],
++                          unnorm_dim[0][1], np); }
++            if (np < 0) fi = -1;
++        }
++    } else {
++        fi = rsx_fp_decompile_ex(
++            fp_uc, fp_size, fp_ctrl, cube_mask,
++            ps_hlsl, ps_sz);
++        if (fi > 0 && rs.alpha_test_enable &&
++            rsx_fp_apply_alpha_test(
++                ps_hlsl, ps_sz, rs.alpha_func,
++                in->fp_alpha_ref) < 0)
++            fi = -1;
++        if (fi > 0 && rsx_fp_apply_shadow_compare(
++                ps_hlsl, ps_sz, shadow_mask, shadow_zfunc) < 0)
++            fi = -1;
++        if (fi > 0 && rsx_fp_apply_unnorm_scale(
++                ps_hlsl, ps_sz, unnorm_mask,
++                unnorm_dim, cube_mask, 0u) < 0)
++            fi = -1;
++    }
++    if (fi > 0 && rsx_fp_apply_gamma(ps_hlsl, ps_sz, gamma_mask) < 0)
++        fi = -1;
++    if (fi > 0 && rsx_fp_apply_depth_argb(ps_hlsl, ps_sz, argb_mask, argb_remap) < 0)
++        fi = -1;
++    if (fi > 0 && srgb_out && rsx_fp_apply_srgb_output(ps_hlsl, ps_sz) < 0) {   /* patch 2055 */
++        static int said; if (!said++) fprintf(stderr, "[srgb-out] apply failed: PSO left linear\n");
++    }
++    if (fi > 0 && (shadow_mask || argb_mask)) {
++        static u32 n_log = 0;
++        if (n_log++ < 8)
++            fprintf(stderr, "[zalias] pso shadow=0x%04X argb=0x%04X\n", shadow_mask, argb_mask);
++    }
++    LeaveCriticalSection(&g_ld_xl_cs);
++    *vi_out = vi; *fi_out = fi;
++}
++
++/* Patch 2071: the part of the pipeline key that follows the program hashes (fp_ctrl, the texture-unit masks, sRGB, the
++ * vertex layout, the render state), shared by get_pso and the template prewarm, which recomputes each record's key
++ * from the programs it found and refuses a record whose stored key disagrees (a stale, edited or mismatched file never
++ * stands in for the wrong pipeline). key in = FNV chain after the vertex and fragment program hashes. */
++static u64 ld_pso_key_tail(u64 key, const ld_xl_in* xi, int packed_payload, u64* kl_pre_rs)
++{
++    const u32 fp_ctrl = xi->fp_ctrl, cube_mask = xi->cube_mask, vtex_mask = xi->vtex_mask, srgb_out = xi->srgb_out;
++    const u64 gamma_mask = xi->gamma_mask;
++    const u32 shadow_mask = xi->shadow_mask, argb_mask = xi->argb_mask, unnorm_mask = xi->unnorm_mask;
++    const u8* shadow_zfunc = xi->shadow_zfunc; const u16* argb_remap = xi->argb_remap; const u32 (*unnorm_dim)[3] = xi->unnorm_dim;
++    const rsx_vertex_layout_plan* masked_layout = xi->layout;
++    const render_state_t rs = *xi->rs;
++    u64 dummy; if (!kl_pre_rs) kl_pre_rs = &dummy;
++    const u32 fp_ctrl_key = fp_ctrl & 0x4Eu;   /* patch 2021: + depth export */
++    key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
++    key = fnv1a(&cube_mask, sizeof(cube_mask), key);
++    key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
++    /* v0.18.0: BRB/CLB outcomes are baked into the program (rsx_vp_set_branch_bits). The template records do not
++     * store them: the prewarm passes 0, so only records made with 0 bits keep their key. */
++    if (rsx_vp_uses_branch_bits(xi->vp_uc, xi->vp_instrs * 16))
++        key = fnv1a(&xi->vp_branch_bits, sizeof(xi->vp_branch_bits), key);
++    if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
++    if (srgb_out) key = fnv1a(&srgb_out, sizeof(srgb_out), key);   /* patch 2055 */
++    { static int s2a = -1;   /* patch 2057: the SRC2 abs switch changes shader text, so it changes the key */
++      if (s2a < 0) { const char* e = getenv("LD_SRC2_ABS"); s2a = (e && e[0] == '1') ? 1 : 0; }
++      if (s2a) { const u32 tag = 0x5A2Au; key = fnv1a(&tag, sizeof(tag), key); } }
++    if (shadow_mask) {
++        key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
++        key = fnv1a(shadow_zfunc, 16, key);
++    }
++    if (argb_mask) {
++        key = fnv1a(&argb_mask, sizeof(argb_mask), key);
++        key = fnv1a(argb_remap, 32, key);
++    }
++    key = fnv1a(&unnorm_mask, sizeof(unnorm_mask), key);
++    if (unnorm_mask) {   /* w, h per unit (128 bytes, as the [16][2] records store them) */
++        u32 wh[16][2];
++        for (int u = 0; u < 16; u++) { wh[u][0] = unnorm_dim[u][0]; wh[u][1] = unnorm_dim[u][1]; }
++        key = fnv1a(wh, sizeof wh, key);
++    }
++    if (masked_layout) {
++        static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
++        const u32 payload_stride =
++            packed_payload ? masked_layout->stride : VERT_STRIDE;
++        key = fnv1a(
++            &masked_layout_tag, sizeof(masked_layout_tag), key);
++        key = fnv1a(
++            &masked_layout->mask, sizeof(masked_layout->mask), key);
++        key = fnv1a(
++            &payload_stride, sizeof(payload_stride), key);
++        key = fnv1a(
++            &packed_payload, sizeof(packed_payload), key);
++    }
++    *kl_pre_rs = key;   /* patch 2042 */
++    if (ld_fp_constants_buffered())
++        key = ld_hash_structural_render_state(&rs, key);
++    else
++        key = fnv1a(&rs, sizeof(rs), key);
++    return key;
++}
++
++/* ===================== KZ3 patch 2071: shared pipeline template (RSX pass 67) =====================
++ * Cold-cache level starts stall the walker: every new pipeline is translated, compiled and created while the
++ * frame waits (K4: 245 pipelines, 16 s). A template (rsx_pso_template.h) lists the pipelines of an earlier session
++ * as hashes and numeric state only, no shader text and no microcode, so players can share it. At init
++ * (LD_PSO_TEMPLATE=<file>) a scout thread searches the running guest's memory for the programs whose hashes the
++ * template lists (the player's own game loaded them, long before the level draws with them); once a record's vertex
++ * and fragment program are both found, worker threads translate them with the walker's own translator (ld_xlate),
++ * compile (disk cache first), create the pipeline and stage it like a preloaded one. The walker finds it ready at
++ * its next lookup; a pipeline that is not ready is built by the walker as before (no draw is skipped or dropped).
++ * LD_PSO_TEMPLATE_OUT=<file> writes this session's pipelines in the same format (every 5 s when it grew, at exit). */
++#define LD_PT_FP_PAD 64u
++typedef struct { u64 hash, first; u32 size; u8* bytes; } ld_pt_prog;   /* bytes: VP host order / FP guest bytes + pad */
++typedef struct { u32 stage; u64 hash; u32 len; ID3DBlob* blob; int done; } ld_pt_blobent;
++static struct {
++    int out_on, in_on, started, stop;
++    char out_path[MAX_PATH], in_path[MAX_PATH];
++    /* export (walker thread) */
++    rsx_pt_set seen; rsx_pt_rec* out; u32 n_out, cap_out; int dirty; LONGLONG last_write; u32 writes;
++    /* prewarm */
++    rsx_pt_rec* in; u32 n_in, n_dropped;
++    ld_pt_prog *vp, *fp; u32 n_vp, n_fp, vp_found, fp_found;
++    u32 *rec_vp, *rec_fp; u8* rec_state;        /* 0 waiting, 1 queued */
++    CRITICAL_SECTION cs; CONDITION_VARIABLE cv;
++    u32* q; u32 q_head, q_tail, n_queued; HANDLE sem;
++    ld_pt_blobent* blobs; u32 n_blobs, cap_blobs;
++    HANDLE scout, workers[8]; u32 n_workers;
++    LONGLONG t0, qpf;
++    volatile LONG built, failed_xlate, failed_blob, failed_pso, failed_key, lib_hits, staged;
++    volatile LONG used;                          /* walker lookups that found a template pipeline ready */
++    unsigned passes; unsigned long long scan_us, xlate_us, compile_us, create_us;
++} g_pt;
++
++static LONGLONG ld_pt_qpc(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart; }
++static double ld_pt_secs(void) { return (double)(ld_pt_qpc() - g_pt.t0) / (double)(g_pt.qpf ? g_pt.qpf : 1); }
++
++/* ---- export (walker thread) ---- */
++static void ld_pt_note(u64 key, const ld_xl_in* xi, int packed, int depth)
++{
++    if (!rsx_pt_set_add(&g_pt.seen, key)) return;
++    if (!ld_fp_constants_buffered()) return;
++    if (g_pt.n_out == g_pt.cap_out) {
++        const u32 cap = g_pt.cap_out ? 2u * g_pt.cap_out : 512u;
++        rsx_pt_rec* n = (rsx_pt_rec*)realloc(g_pt.out, cap * sizeof(rsx_pt_rec));
++        if (!n) return;
++        g_pt.out = n; g_pt.cap_out = cap;
++    }
++    rsx_pt_rec* r = &g_pt.out[g_pt.n_out];
++    memset(r, 0, sizeof *r);
++    r->key = key;
++    r->vp_hash = fnv1a(xi->vp_uc, xi->vp_instrs * 16u, 1469598103934665603ull);
++    { u8 b[16]; const u32* w = (const u32*)xi->vp_uc;
++      for (int k = 0; k < 4; k++) { b[4*k] = (u8)(w[k] >> 24); b[4*k+1] = (u8)(w[k] >> 16); b[4*k+2] = (u8)(w[k] >> 8); b[4*k+3] = (u8)w[k]; }
++      r->vp_first = rsx_pt_quick(b); }
++    r->fp_hash = rsx_fp_structural_hash(xi->fp_uc, xi->fp_size, RSX_PT_FP_SEED);
++    r->fp_first = rsx_pt_quick(xi->fp_uc);
++    r->gamma_mask = xi->gamma_mask;
++    r->vp_instrs = xi->vp_instrs; r->vp_start = xi->vp_start; r->fp_size = xi->fp_size; r->fp_ctrl = xi->fp_ctrl;
++    r->cube_mask = xi->cube_mask; r->vtex_mask = xi->vtex_mask; r->srgb_out = xi->srgb_out;
++    r->shadow_mask = xi->shadow_mask; r->argb_mask = xi->argb_mask; r->unnorm_mask = xi->unnorm_mask;
++    r->flags = RSX_PT_FLAG_BUFFERED | (xi->layout ? RSX_PT_FLAG_LAYOUT : 0u) | (xi->layout && packed ? RSX_PT_FLAG_PACKED : 0u) |
++               (depth ? RSX_PT_FLAG_DEPTH : 0u);
++    if (xi->layout) {
++        r->layout_mask = xi->layout->mask; r->layout_stride = xi->layout->stride; r->layout_count = xi->layout->count;
++        memcpy(r->attrs, xi->layout->attrs, sizeof r->attrs);
++    }
++    r->rs_words = (u32)(sizeof(render_state_t) / 4u);
++    memcpy(r->rs, xi->rs, sizeof(render_state_t));
++    memcpy(r->shadow_zfunc, xi->shadow_zfunc, 16);
++    memcpy(r->argb_remap, xi->argb_remap, sizeof r->argb_remap);
++    for (int u = 0; u < 16; u++) { r->unnorm_dim[u][0] = xi->unnorm_dim[u][0]; r->unnorm_dim[u][1] = xi->unnorm_dim[u][1]; }
++    g_pt.n_out++;
++    g_pt.dirty = 1;
++}
++
++static void ld_pt_write_out(const char* why)
++{
++    if (!g_pt.out_on || !g_pt.dirty) return;
++    g_pt.dirty = 0;
++    g_pt.last_write = ld_pt_qpc();
++    if (rsx_pt_write(g_pt.out_path, g_pt.out, g_pt.n_out, RSX_PT_FLAG_BUFFERED) == 0) {
++        g_pt.writes++;
++        if (!strcmp(why, "exit") || g_pt.writes == 1)
++            fprintf(stderr, "[pso-template] wrote %u pipelines to '%s' (%s)\n", g_pt.n_out, g_pt.out_path, why);
++    } else {
++        fprintf(stderr, "[pso-template] cannot write '%s'\n", g_pt.out_path);
++    }
++}
++
++/* ---- prewarm ---- */
++/* A template is a shared file: refuse records with impossible numbers before anything is sized from them. */
++static int ld_pt_rec_ok(const rsx_pt_rec* r)
++{
++    if (r->rs_words != sizeof(render_state_t) / 4u || !(r->flags & RSX_PT_FLAG_BUFFERED)) return 0;
++    if (r->vp_instrs < 1u || r->vp_instrs > RSX_DSP_VP_INSTR || r->vp_start >= RSX_DSP_VP_INSTR) return 0;
++    if (r->fp_size < 16u || r->fp_size > 0x10000u || (r->fp_size & 15u)) return 0;
++    if (r->layout_count > RSX_DSP_NUM_VERTEX_ATTR) return 0;
++    for (u32 i = 0; i < r->layout_count; i++) if (r->attrs[i] >= RSX_DSP_NUM_VERTEX_ATTR) return 0;
++    return 1;
++}
++
++static ID3DBlob* ld_pt_blob(u32 stage, const char* src, u32 len)
++{
++    const u64 hash = fnv1a(src, len, 1469598103934665603ull);
++    u32 idx = 0;
++    EnterCriticalSection(&g_pt.cs);
++    for (idx = 0; idx < g_pt.n_blobs; idx++)
++        if (g_pt.blobs[idx].hash == hash && g_pt.blobs[idx].len == len && g_pt.blobs[idx].stage == stage) break;
++    if (idx < g_pt.n_blobs) {
++        while (!g_pt.blobs[idx].done) SleepConditionVariableCS(&g_pt.cv, &g_pt.cs, INFINITE);
++        ID3DBlob* b = g_pt.blobs[idx].blob;
++        if (b) b->lpVtbl->AddRef(b);
++        LeaveCriticalSection(&g_pt.cs);
++        return b;
++    }
++    if (g_pt.n_blobs == g_pt.cap_blobs) {
++        const u32 cap = g_pt.cap_blobs ? 2u * g_pt.cap_blobs : 512u;
++        ld_pt_blobent* n = (ld_pt_blobent*)realloc(g_pt.blobs, cap * sizeof(ld_pt_blobent));
++        if (!n) { LeaveCriticalSection(&g_pt.cs); return NULL; }
++        g_pt.blobs = n; g_pt.cap_blobs = cap;
++    }
++    idx = g_pt.n_blobs++;
++    g_pt.blobs[idx].stage = stage; g_pt.blobs[idx].hash = hash; g_pt.blobs[idx].len = len;
++    g_pt.blobs[idx].blob = NULL; g_pt.blobs[idx].done = 0;
++    LeaveCriticalSection(&g_pt.cs);
++
++    const LONGLONG t0 = ld_pt_qpc();
++    ID3DBlob* blob = ld_pl_load_blob(stage, hash, len);
++    if (!blob) {
++        ID3DBlob* err = NULL;
++        if (FAILED(D3DCompile(src, len, stage == 'V' ? "xvs" : "xps", NULL, NULL, "main", stage == 'V' ? "vs_5_0" : "ps_5_0",
++                              0, 0, &blob, &err)))
++            blob = NULL;
++        if (err) err->lpVtbl->Release(err);
++        if (blob) shader_disk_cache_store(stage, src, len, hash, blob);
++        EnterCriticalSection(&g_pt.cs);
++        g_pt.compile_us += (unsigned long long)((ld_pt_qpc() - t0) * 1000000 / g_pt.qpf);
++        LeaveCriticalSection(&g_pt.cs);
++    }
++    EnterCriticalSection(&g_pt.cs);
++    g_pt.blobs[idx].blob = blob; g_pt.blobs[idx].done = 1;   /* the table keeps this reference */
++    if (blob) blob->lpVtbl->AddRef(blob);
++    LeaveCriticalSection(&g_pt.cs);
++    WakeAllConditionVariable(&g_pt.cv);
++    return blob;
++}
++
++static void ld_pt_build(u32 ri, char* vs_hlsl, char* ps_hlsl, rsx_fp_constant_block* cb)
++{
++    const rsx_pt_rec* r = &g_pt.in[ri];
++    const ld_pt_prog* vp = &g_pt.vp[g_pt.rec_vp[ri]];
++    const ld_pt_prog* fp = &g_pt.fp[g_pt.rec_fp[ri]];
++    render_state_t rs;
++    if (r->rs_words != sizeof rs / 4u) { InterlockedIncrement(&g_pt.failed_xlate); return; }
++    memcpy(&rs, r->rs, sizeof rs);
++    rsx_vertex_layout_plan lay; memset(&lay, 0, sizeof lay);
++    const int masked = (r->flags & RSX_PT_FLAG_LAYOUT) != 0;
++    if (masked) { lay.mask = r->layout_mask; lay.stride = r->layout_stride; lay.count = (u8)r->layout_count;
++                  memcpy(lay.attrs, r->attrs, sizeof lay.attrs); }
++    const int fc = rsx_fp_collect_constants(fp->bytes, fp->size, cb);
++    if (fc < 0) { InterlockedIncrement(&g_pt.failed_xlate); return; }
++    ld_xl_in xi; memset(&xi, 0, sizeof xi);
++    xi.vp_uc = vp->bytes; xi.vp_instrs = r->vp_instrs; xi.vp_start = r->vp_start;
++    xi.layout = masked ? &lay : NULL; xi.vtex_mask = r->vtex_mask;
++    xi.fp_uc = fp->bytes; xi.fp_size = fp->size; xi.fp_ctrl = r->fp_ctrl; xi.cube_mask = r->cube_mask;
++    u8 zf[16]; u16 remap[16]; u32 unn[16][3] = {{0}};   /* copies: the record is packed */
++    memcpy(zf, r->shadow_zfunc, sizeof zf); memcpy(remap, r->argb_remap, sizeof remap);
++    for (int u = 0; u < 16; u++) { unn[u][0] = r->unnorm_dim[u][0]; unn[u][1] = r->unnorm_dim[u][1]; }
++    xi.rs = &rs; xi.shadow_mask = r->shadow_mask; xi.shadow_zfunc = zf;
++    xi.unnorm_mask = r->unnorm_mask; xi.unnorm_dim = unn; xi.gamma_mask = r->gamma_mask;
++    xi.argb_mask = r->argb_mask; xi.argb_remap = remap; xi.srgb_out = r->srgb_out;
++    xi.fp_const_count = (u32)fc; xi.fp_alpha_ref = 0;
++    {   /* the record's key must be what the walker derives from these programs and this state */
++        const u64 fh = rsx_fp_structural_hash(fp->bytes, fp->size, r->vp_hash);
++        if (!fh || ld_pso_key_tail(fh, &xi, (r->flags & RSX_PT_FLAG_PACKED) != 0, NULL) != r->key) {
++            InterlockedIncrement(&g_pt.failed_key); return;
++        }
++    }
++    const LONGLONG t0 = ld_pt_qpc();
++    int vi = 0, fi = 0;
++    ld_xlate(&xi, vs_hlsl, 256u * 1024u, ps_hlsl, 256u * 1024u, &vi, &fi);
++    if (vi <= 0 || fi <= 0) { InterlockedIncrement(&g_pt.failed_xlate); return; }
++    ID3DBlob* vs = ld_pt_blob('V', vs_hlsl, (u32)strlen(vs_hlsl));
++    ID3DBlob* ps = vs ? ld_pt_blob('P', ps_hlsl, (u32)strlen(ps_hlsl)) : NULL;
++    if (!vs || !ps) { if (vs) vs->lpVtbl->Release(vs); InterlockedIncrement(&g_pt.failed_blob); return; }
++    D3D12_INPUT_ELEMENT_DESC il[16];
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
++    ld_pso_desc_fill(&pd, il, vs, ps, &rs, masked ? r->layout_count : RSX_DSP_NUM_VERTEX_ATTR, r->attrs,
++                     masked, (r->flags & RSX_PT_FLAG_PACKED) != 0, (r->flags & RSX_PT_FLAG_DEPTH) != 0);
++    ID3D12PipelineState* pso = NULL;
++    int lib_hit = 0;
++    const LONGLONG tc = ld_pt_qpc();
++    const HRESULT hr = ld_pl_create(&pd, &rs, r->key, &pso, &lib_hit);
++    const unsigned long long cus = (unsigned long long)((ld_pt_qpc() - tc) * 1000000 / g_pt.qpf);
++    vs->lpVtbl->Release(vs); ps->lpVtbl->Release(ps);
++    EnterCriticalSection(&g_pt.cs);
++    g_pt.create_us += cus; g_pt.xlate_us += (unsigned long long)((tc - t0) * 1000000 / g_pt.qpf);
++    LeaveCriticalSection(&g_pt.cs);
++    if (FAILED(hr) || !pso) { InterlockedIncrement(&g_pt.failed_pso); return; }
++    if (lib_hit) InterlockedIncrement(&g_pt.lib_hits);
++    InterlockedIncrement(&g_pt.built);
++    ld_pl_stage(r->key, pso, 2);
++    InterlockedIncrement(&g_pt.staged);
++}
++
++static DWORD WINAPI ld_pt_worker(LPVOID arg)
++{
++    (void)arg;
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++    char* vs = (char*)malloc(256u * 1024u);
++    char* ps = (char*)malloc(256u * 1024u);
++    rsx_fp_constant_block* cb = (rsx_fp_constant_block*)malloc(sizeof *cb);
++    for (;;) {
++        WaitForSingleObject(g_pt.sem, INFINITE);
++        u32 ri = 0xFFFFFFFFu;
++        EnterCriticalSection(&g_pt.cs);
++        if (g_pt.q_head != g_pt.q_tail) ri = g_pt.q[g_pt.q_head++];
++        LeaveCriticalSection(&g_pt.cs);
++        if (g_pt.stop) break;
++        if (ri != 0xFFFFFFFFu && vs && ps && cb) ld_pt_build(ri, vs, ps, cb);
++    }
++    free(vs); free(ps); free(cb);
++    return 0;
++}
++
++static void ld_pt_hit(void* user, const u8* p, size_t remaining, uint32_t kind, uint32_t id)
++{
++    (void)user;
++    if (kind == 0) {
++        ld_pt_prog* t = &g_pt.vp[id];
++        if (t->bytes || remaining < t->size) return;
++        u8* host = (u8*)malloc(t->size + LD_PT_FP_PAD);
++        if (!host) return;
++        for (u32 k = 0; k < t->size / 4u; k++) {
++            host[4*k] = p[4*k+3]; host[4*k+1] = p[4*k+2]; host[4*k+2] = p[4*k+1]; host[4*k+3] = p[4*k];
++        }
++        memset(host + t->size, 0, LD_PT_FP_PAD);
++        if (fnv1a(host, t->size, 1469598103934665603ull) == t->hash) { t->bytes = host; g_pt.vp_found++; }
++        else free(host);
++    } else {
++        ld_pt_prog* t = &g_pt.fp[id];
++        if (t->bytes) return;
++        const u32 lim = remaining > 0x10000u ? 0x10000u : (u32)remaining;
++        const u32 sz = rsx_fp_program_size(p, lim);
++        if (sz != t->size) return;
++        if (rsx_fp_structural_hash(p, sz, RSX_PT_FP_SEED) != t->hash) return;
++        u8* c = (u8*)malloc(sz + LD_PT_FP_PAD);
++        if (!c) return;
++        memcpy(c, p, sz); memset(c + sz, 0, LD_PT_FP_PAD);
++        t->bytes = c; g_pt.fp_found++;
++    }
++}
++
++/* One pass over the committed pages of the guest's address space (host base = the VirtualAlloc'd reservation,
++ * found through any guest pointer). Returns the bytes scanned. */
++static size_t ld_pt_scan_pass(const rsx_pt_qtab* qt)
++{
++    const u8* any = g.guest_ptr ? g.guest_ptr(g.guest_user, 0u, 0u, 1u) : NULL;
++    if (!any) any = g.guest_ptr ? g.guest_ptr(g.guest_user, 1u, 0u, 1u) : NULL;
++    if (!any) return 0;
++    MEMORY_BASIC_INFORMATION mi;
++    if (!VirtualQuery(any, &mi, sizeof mi) || !mi.AllocationBase) return 0;
++    const u8* base = (const u8*)mi.AllocationBase;
++    size_t total = 0;
++    const u8* p = base + 0x10000u;
++    const u8* end = base + 0xE0000000ull;
++    while (p < end && !g_pt.stop) {
++        if (!VirtualQuery(p, &mi, sizeof mi)) break;
++        const u8* rb = (const u8*)mi.BaseAddress;
++        size_t rs = mi.RegionSize;
++        if (rb + rs > end) rs = (size_t)(end - rb);
++        if (mi.State == MEM_COMMIT && (mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
++                                                      PAGE_WRITECOPY)) && !(mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
++            const u8* s = rb < p ? p : rb;
++            const size_t len = (size_t)((rb + rs) - s) & ~(size_t)15;
++            total += len;
++            rsx_pt_scan(s, len, qt, ld_pt_hit, NULL);
++        }
++        p = rb + rs;
++    }
++    return total;
++}
++
++static DWORD WINAPI ld_pt_scout(LPVOID arg)
++{
++    (void)arg;
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++    rsx_pt_qtab qt; memset(&qt, 0, sizeof qt);
++    if (!rsx_pt_qtab_build(&qt, g_pt.n_vp + g_pt.n_fp)) return 0;
++    for (u32 i = 0; i < g_pt.n_vp; i++) rsx_pt_qtab_add(&qt, g_pt.vp[i].first, 0, i);
++    for (u32 i = 0; i < g_pt.n_fp; i++) rsx_pt_qtab_add(&qt, g_pt.fp[i].first, 1, i);
++    u32 last_vp = 0, last_fp = 0, queued = 0;
++    while (!g_pt.stop && queued < g_pt.n_in) {
++        const LONGLONG t0 = ld_pt_qpc();
++        const size_t bytes = ld_pt_scan_pass(&qt);
++        const unsigned long long us = (unsigned long long)((ld_pt_qpc() - t0) * 1000000 / g_pt.qpf);
++        g_pt.scan_us += us; g_pt.passes++;
++        /* Queue every record whose two programs are known. */
++        u32 newq = 0;
++        EnterCriticalSection(&g_pt.cs);
++        for (u32 i = 0; i < g_pt.n_in; i++) {
++            if (g_pt.rec_state[i] || !g_pt.vp[g_pt.rec_vp[i]].bytes || !g_pt.fp[g_pt.rec_fp[i]].bytes) continue;
++            g_pt.rec_state[i] = 1;
++            g_pt.q[g_pt.q_tail++] = i; newq++; queued++;
++        }
++        LeaveCriticalSection(&g_pt.cs);
++        if (newq) ReleaseSemaphore(g_pt.sem, (LONG)newq, NULL);
++        if (g_pt.passes <= 3 || g_pt.vp_found != last_vp || g_pt.fp_found != last_fp)
++            fprintf(stderr, "[pso-template] scan %u at %.1f s: %.0f MB in %.0f ms; programs found vp %u/%u fp %u/%u; "
++                            "%u/%u pipelines queued (+%u)\n",
++                    g_pt.passes, ld_pt_secs(), bytes / 1048576.0, us / 1e3, g_pt.vp_found, g_pt.n_vp, g_pt.fp_found,
++                    g_pt.n_fp, queued, g_pt.n_in, newq);
++        last_vp = g_pt.vp_found; last_fp = g_pt.fp_found;
++        unsigned wait_ms = 1500;
++        if (g_pt.passes > 200) wait_ms = 15000; else if (g_pt.passes > 40) wait_ms = 5000;
++        if ((unsigned)(us / 1000 * 3) > wait_ms) wait_ms = (unsigned)(us / 1000 * 3);
++        for (unsigned w = 0; w < wait_ms && !g_pt.stop; w += 50) Sleep(50);
++    }
++    free(qt.e);
++    return 0;
++}
++
++/* Init thread, after ld_pl_start (the pipeline library exists by then). */
++static void ld_pt_start(void)
++{
++    if (g_pt.started) return;
++    g_pt.started = 1;
++    { LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_pt.qpf = f.QuadPart; g_pt.t0 = ld_pt_qpc(); }
++    const char* o = getenv("LD_PSO_TEMPLATE_OUT");
++    if (o && *o && snprintf(g_pt.out_path, sizeof g_pt.out_path, "%s", o) < (int)sizeof g_pt.out_path) {
++        g_pt.out_on = 1; g_pt.last_write = ld_pt_qpc();
++        fprintf(stderr, "[pso-template] export on: '%s'\n", g_pt.out_path);
++    }
++    const char* i = getenv("LD_PSO_TEMPLATE");
++    if (!i || !*i) return;
++    if (snprintf(g_pt.in_path, sizeof g_pt.in_path, "%s", i) >= (int)sizeof g_pt.in_path) return;
++    if (!ld_fp_constants_buffered()) { fprintf(stderr, "[pso-template] off: literal fragment constants\n"); return; }
++    if (!g_ld_pl.opened || !g_ld_pl.on) { fprintf(stderr, "[pso-template] off: the PSO preload is off (LD_PSO_PRELOAD=0)\n"); return; }
++    uint32_t flags = 0;
++    const int rc = rsx_pt_read(g_pt.in_path, &g_pt.in, &g_pt.n_in, &g_pt.n_dropped, &flags);
++    if (rc) { fprintf(stderr, "[pso-template] cannot use '%s' (%s)\n", g_pt.in_path, rc == -1 ? "missing" : "another format or key version"); return; }
++    /* Records of another render-state layout cannot be rebuilt. */
++    { u32 k = 0;
++      for (u32 j = 0; j < g_pt.n_in; j++)
++          if (ld_pt_rec_ok(&g_pt.in[j])) g_pt.in[k++] = g_pt.in[j];
++          else g_pt.n_dropped++;
++      g_pt.n_in = k; }
++    g_pt.rec_vp = (u32*)calloc(g_pt.n_in + 1u, sizeof(u32));
++    g_pt.rec_fp = (u32*)calloc(g_pt.n_in + 1u, sizeof(u32));
++    g_pt.rec_state = (u8*)calloc(g_pt.n_in + 1u, 1);
++    g_pt.vp = (ld_pt_prog*)calloc(g_pt.n_in + 1u, sizeof(ld_pt_prog));
++    g_pt.fp = (ld_pt_prog*)calloc(g_pt.n_in + 1u, sizeof(ld_pt_prog));
++    g_pt.q = (u32*)calloc(g_pt.n_in + 1u, sizeof(u32));
++    if (!g_pt.rec_vp || !g_pt.rec_fp || !g_pt.rec_state || !g_pt.vp || !g_pt.fp || !g_pt.q || !g_pt.n_in) {
++        fprintf(stderr, "[pso-template] '%s': %u usable pipelines (%u dropped), nothing to prewarm\n", g_pt.in_path, g_pt.n_in, g_pt.n_dropped);
++        return;
++    }
++    for (u32 j = 0; j < g_pt.n_in; j++) {
++        const rsx_pt_rec* r = &g_pt.in[j];
++        u32 v = 0, f = 0;
++        while (v < g_pt.n_vp && g_pt.vp[v].hash != r->vp_hash) v++;
++        if (v == g_pt.n_vp) { g_pt.vp[v].hash = r->vp_hash; g_pt.vp[v].first = r->vp_first; g_pt.vp[v].size = r->vp_instrs * 16u; g_pt.n_vp++; }
++        while (f < g_pt.n_fp && g_pt.fp[f].hash != r->fp_hash) f++;
++        if (f == g_pt.n_fp) { g_pt.fp[f].hash = r->fp_hash; g_pt.fp[f].first = r->fp_first; g_pt.fp[f].size = r->fp_size; g_pt.n_fp++; }
++        g_pt.rec_vp[j] = v; g_pt.rec_fp[j] = f;
++    }
++    InitializeCriticalSection(&g_pt.cs);
++    InitializeConditionVariable(&g_pt.cv);
++    g_pt.sem = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
++    const char* te = getenv("LD_PSO_TEMPLATE_THREADS");
++    int nt = te && *te ? atoi(te) : 3;
++    if (nt < 1) nt = 1;
++    if (nt > 8) nt = 8;
++    g_pt.in_on = 1;
++    fprintf(stderr, "[pso-template] prewarm on: '%s' %u pipelines (%u dropped), %u vertex / %u fragment programs to find, %d threads\n",
++            g_pt.in_path, g_pt.n_in, g_pt.n_dropped, g_pt.n_vp, g_pt.n_fp, nt);
++    for (int k = 0; k < nt; k++) {
++        g_pt.workers[g_pt.n_workers] = CreateThread(NULL, 0, ld_pt_worker, NULL, 0, NULL);
++        if (g_pt.workers[g_pt.n_workers]) g_pt.n_workers++;
++    }
++    g_pt.scout = CreateThread(NULL, 0, ld_pt_scout, NULL, 0, NULL);
++}
++
++static void ld_pt_tick(void)   /* present */
++{
++    if (g_pt.out_on && g_pt.dirty && (ld_pt_qpc() - g_pt.last_write) > 5 * g_pt.qpf) ld_pt_write_out("periodic");
++    if (g_pt.in_on) {   /* progress line, at most every 10 s while the counts change */
++        static LONG reported; static LONGLONG last;
++        const LONG done = g_pt.built + g_pt.failed_xlate + g_pt.failed_key + g_pt.failed_blob + g_pt.failed_pso;
++        const LONGLONG now = ld_pt_qpc();
++        if (done != reported && (now - last) > 10 * g_pt.qpf) {
++            reported = done; last = now;
++            fprintf(stderr, "[pso-template] at %.1f s: built %ld (%ld from the library), translate failed %ld, key mismatch %ld, blob failed %ld, "
++                            "create failed %ld, walker used %ld\n", ld_pt_secs(), (long)g_pt.built, (long)g_pt.lib_hits,
++                    (long)g_pt.failed_xlate, (long)g_pt.failed_key, (long)g_pt.failed_blob, (long)g_pt.failed_pso, (long)g_pt.used);
++        }
++    }
++}
++
++static void ld_pt_shutdown(void)
++{
++    if (!g_pt.started) return;
++    ld_pt_write_out("exit");
++    if (!g_pt.in_on) return;
++    g_pt.stop = 1;
++    if (g_pt.scout) { WaitForSingleObject(g_pt.scout, 5000); CloseHandle(g_pt.scout); g_pt.scout = NULL; }
++    ReleaseSemaphore(g_pt.sem, (LONG)(g_pt.n_workers + 1u), NULL);
++    for (u32 i = 0; i < g_pt.n_workers; i++) { WaitForSingleObject(g_pt.workers[i], 10000); CloseHandle(g_pt.workers[i]); }
++    g_pt.n_workers = 0;
++    fprintf(stderr, "[pso-template] done: %u pipelines in the template, programs found vp %u/%u fp %u/%u, built %ld (%ld from the library), "
++                    "translate failed %ld, key mismatch %ld, blob failed %ld, create failed %ld, walker used %ld; scans %u (%.0f ms total), "
++                    "translate+blobs %.0f ms (of which compile %.0f ms), create %.0f ms (summed over threads)\n",
++            g_pt.n_in, g_pt.vp_found, g_pt.n_vp, g_pt.fp_found, g_pt.n_fp, (long)g_pt.built, (long)g_pt.lib_hits,
++            (long)g_pt.failed_xlate, (long)g_pt.failed_key, (long)g_pt.failed_blob, (long)g_pt.failed_pso, (long)g_pt.used, g_pt.passes,
++            g_pt.scan_us / 1e3, g_pt.xlate_us / 1e3, g_pt.compile_us / 1e3, g_pt.create_us / 1e3);
++}
++/* ===================== end of patch 2071 block ===================== */
++
+ static ID3D12PipelineState* build_pso(
+     const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
+     const rsx_vertex_layout_plan* masked_layout, int packed_offsets, u64 key)
+@@ -8444,28 +9029,7 @@ static ID3D12PipelineState* get_pso(
+         return NULL;
+     }
+     const u64 kl_fp = key;   /* patch 2042: LD_PSO_KEYLOG component */
+-    const u32 fp_ctrl_key = fp_ctrl & 0x4Eu;   /* patch 2021: + depth export */
+-    key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
+-    key = fnv1a(&cube_mask, sizeof(cube_mask), key);
+-    key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+-    /* BRB/CLB outcomes are baked into the program (rsx_vp_set_branch_bits). */
+-    const int vp_branch_bits_used = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16);
+-    const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
+-    if (vp_branch_bits_used)
+-        key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
+-    if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
+-    if (srgb_out) key = fnv1a(&srgb_out, sizeof(srgb_out), key);   /* patch 2055 */
+-    { static int s2a = -1;   /* patch 2057: the SRC2 abs switch changes shader text, so it changes the key */
+-      if (s2a < 0) { const char* e = getenv("LD_SRC2_ABS"); s2a = (e && e[0] == '1') ? 1 : 0; }
+-      if (s2a) { const u32 tag = 0x5A2Au; key = fnv1a(&tag, sizeof(tag), key); } }
+-    if (shadow_mask) {
+-        key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
+-        key = fnv1a(shadow_zfunc, sizeof(shadow_zfunc), key);
+-    }
+-    if (argb_mask) {
+-        key = fnv1a(&argb_mask, sizeof(argb_mask), key);
+-        key = fnv1a(argb_remap, sizeof(argb_remap), key);
+-    }
++    const u32 fp_ctrl_key = fp_ctrl & 0x4Eu;   /* the key tail's value, for the keylog */
+     /* Texel-addressed (RSX_TEX_FMT_UNNORM) units need their coordinates divided
+      * by the texture size in the shader -- D3D12 has no unnormalised addressing
+      * mode. The divisor is baked into the HLSL, so the sizes are part of the
+@@ -8497,30 +9061,20 @@ static ID3D12PipelineState* get_pso(
+             }
+         }
+     }
+-    key = fnv1a(&unnorm_mask, sizeof(unnorm_mask), key);
+-    if (unnorm_mask) key = fnv1a(unnorm_dim, sizeof(unnorm_dim), key);
+-    if (masked_layout) {
+-        static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
+-        const u32 payload_stride =
+-            packed_payload ? masked_layout->stride : VERT_STRIDE;
+-        key = fnv1a(
+-            &masked_layout_tag, sizeof(masked_layout_tag), key);
+-        key = fnv1a(
+-            &masked_layout->mask, sizeof(masked_layout->mask), key);
+-        key = fnv1a(
+-            &payload_stride, sizeof(payload_stride), key);
+-        key = fnv1a(
+-            &packed_payload, sizeof(packed_payload), key);
+-    }
+-    const u64 kl_pre_rs = key;   /* patch 2042 */
+-    if (ld_fp_constants_buffered())
+-        key = ld_hash_structural_render_state(&rs, key);
+-    else
+-        key = fnv1a(&rs, sizeof(rs), key);
++    ld_xl_in xi;   /* patch 2071 */
++    xi.vp_uc = vp_uc; xi.vp_instrs = vp_instrs; xi.vp_start = start; xi.layout = masked_layout; xi.vtex_mask = vtex_mask;
++    xi.fp_uc = fp_uc; xi.fp_size = fp_size; xi.fp_ctrl = fp_ctrl; xi.cube_mask = cube_mask; xi.rs = &rs;
++    xi.shadow_mask = shadow_mask; xi.shadow_zfunc = shadow_zfunc; xi.unnorm_mask = unnorm_mask; xi.unnorm_dim = unnorm_dim;
++    xi.vp_branch_bits = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16) ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;   /* v0.18.0 */
++    xi.gamma_mask = gamma_mask; xi.argb_mask = argb_mask; xi.argb_remap = argb_remap; xi.srgb_out = srgb_out;
++    xi.fp_const_count = g.fp_constants.count; xi.fp_alpha_ref = g.fp_alpha_ref;
++    u64 kl_pre_rs = 0;
++    key = ld_pso_key_tail(key, &xi, packed_payload, &kl_pre_rs);   /* patch 2071: shared with the prewarm */
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_note_fp_variants(
+         fp_uc, fp_size, fp_ctrl_key, cube_mask, &rs);
+ #endif
++    if (g_pt.out_on) ld_pt_note(key, &xi, masked_layout && packed_payload, g.depth != NULL);
+     LDW_ADD(RSX_PERF_W_PSO_KEY_T, gp_t2);
+     LDW_T0(gp_t3);
+     g_ld_current_pso.valid = 1;
+@@ -8556,7 +9110,7 @@ static ID3D12PipelineState* get_pso(
+ #if defined(YZ_PERF_PROFILE)
+             g_ld_profile.total.pso_hits++;
+ #endif
+-            if (g.psos[i].preloaded) { g.psos[i].preloaded = 0; g_ld_pl_used++; }
++            if (g.psos[i].preloaded) { if (g.psos[i].preloaded == 2) g_pt.used++; g.psos[i].preloaded = 0; g_ld_pl_used++; }
+             LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
+             if (g.psos[i].pending) return ld_apso_await(i);   /* RSX pass 57: wait, never skip */
+             return g.psos[i].pso;
+@@ -8581,70 +9135,8 @@ static ID3D12PipelineState* get_pso(
+ #if defined(YZ_PERF_PROFILE)
+     const LONGLONG decompile_begin = ld_profile_qpc();
+ #endif
+-    rsx_vp_set_branch_base(rsx_dsp_vp_start(&g.rsx));
+-    rsx_vp_set_branch_bits(vp_branch_bits);
+-    const int vi = masked_layout
+-        ? rsx_vp_decompile_compact_ex(
+-            vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
+-            vs_hlsl, sizeof(vs_hlsl))
+-        : rsx_vp_decompile_ex(
+-            vp_uc, vp_instrs * 16, vtex_mask, vs_hlsl, sizeof(vs_hlsl));
+-    u32 decompiled_constant_count = 0;
+-    int fi;
+-    if (ld_fp_constants_buffered()) {
+-        fi = rsx_fp_decompile_buffered_ex(
+-            fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
+-            sizeof(ps_hlsl), &decompiled_constant_count);
+-        if (fi > 0 &&
+-            decompiled_constant_count != g.fp_constants.count)
+-            fi = -1;
+-        if (fi > 0 && rs.alpha_test_enable &&
+-            rsx_fp_apply_alpha_test_buffered(
+-                ps_hlsl, sizeof(ps_hlsl), rs.alpha_func) < 0)
+-            fi = -1;
+-        if (fi > 0 && rsx_fp_apply_shadow_compare(
+-                ps_hlsl, sizeof(ps_hlsl), shadow_mask, shadow_zfunc) < 0)
+-            fi = -1;
+-        if (fi > 0) {
+-            const int np = rsx_fp_apply_unnorm_scale(
+-                ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask, 0u);
+-            { static int n = 0;
+-              if (PS3_LOG_FIRST(n, 8))
+-                  fprintf(stderr, "[unnorm] mask=0x%X cube=0x%X dim0=%ux%u"
+-                                  " patched=%d\n",
+-                          unnorm_mask, cube_mask, unnorm_dim[0][0],
+-                          unnorm_dim[0][1], np); }
+-            if (np < 0) fi = -1;
+-        }
+-    } else {
+-        fi = rsx_fp_decompile_ex(
+-            fp_uc, fp_size, fp_ctrl, cube_mask,
+-            ps_hlsl, sizeof(ps_hlsl));
+-        if (fi > 0 && rs.alpha_test_enable &&
+-            rsx_fp_apply_alpha_test(
+-                ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
+-                g.fp_alpha_ref) < 0)
+-            fi = -1;
+-        if (fi > 0 && rsx_fp_apply_shadow_compare(
+-                ps_hlsl, sizeof(ps_hlsl), shadow_mask, shadow_zfunc) < 0)
+-            fi = -1;
+-        if (fi > 0 && rsx_fp_apply_unnorm_scale(
+-                ps_hlsl, sizeof(ps_hlsl), unnorm_mask,
+-                unnorm_dim, cube_mask, 0u) < 0)
+-            fi = -1;
+-    }
+-    if (fi > 0 && rsx_fp_apply_gamma(ps_hlsl, sizeof(ps_hlsl), gamma_mask) < 0)
+-        fi = -1;
+-    if (fi > 0 && rsx_fp_apply_depth_argb(ps_hlsl, sizeof(ps_hlsl), argb_mask, argb_remap) < 0)
+-        fi = -1;
+-    if (fi > 0 && srgb_out && rsx_fp_apply_srgb_output(ps_hlsl, sizeof(ps_hlsl)) < 0) {   /* patch 2055 */
+-        static int said; if (!said++) fprintf(stderr, "[srgb-out] apply failed: PSO left linear\n");
+-    }
+-    if (fi > 0 && (shadow_mask || argb_mask)) {
+-        static u32 n_log = 0;
+-        if (n_log++ < 8)
+-            fprintf(stderr, "[zalias] pso shadow=0x%04X argb=0x%04X\n", shadow_mask, argb_mask);
+-    }
++    int vi, fi;
++    ld_xlate(&xi, vs_hlsl, sizeof(vs_hlsl), ps_hlsl, sizeof(ps_hlsl), &vi, &fi);   /* patch 2071: shared with the prewarm */
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.decompile_qpc +=
+         (u64)(ld_profile_qpc() - decompile_begin);
+@@ -13668,6 +14160,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+         make_depth_snapshot_pipeline() != 0)
+         return -1;
+     ld_pl_start();   /* patch 2031: PSO preload workers (LD_PSO_PRELOAD=0 records only) */
++    ld_pt_start();   /* patch 2071: pipeline template export / prewarm */
+ 
+     static const u8 white[4] = {255, 255, 255, 255};
+     g.white_tex = create_texture_rgba(white, 1, 1);
+@@ -16319,6 +16812,7 @@ static void ld_present_body(u32 buffer_id)
+ void rsx_live_draw_present(u32 buffer_id)
+ {
+     ld_pl_tick();                                   /* patch 2031 */
++    ld_pt_tick();                                   /* patch 2071 */
+     if (ld_pstat_on()) ld_pstat_flush_if_new_minute();   /* patch 2031: close the minute line on flips too */
+     if (!rsx_perf_enabled()) { ld_present_body(buffer_id); return; }
+     const long long t0 = rsx_perf_now();
+@@ -16538,6 +17032,7 @@ void rsx_live_draw_shutdown(void)
+                 (unsigned long long)g_ld_shader_disk_writes[1],
+                 (unsigned long long)g_ld_shader_disk_rejects);
+     }
++    ld_pt_shutdown();   /* patch 2071: before the library goes */
+     ld_pl_shutdown();   /* patch 2031 */
+     for (u32 i = 0; i < g.n_psos; i++) if (g.psos[i].pso) g.psos[i].pso->lpVtbl->Release(g.psos[i].pso);
+     shader_blob_cache_release(&g.vs_blobs);
+diff --git a/libs/video/rsx_pso_template.h b/libs/video/rsx_pso_template.h
+new file mode 100644
+index 00000000..3259e182
+--- /dev/null
++++ b/libs/video/rsx_pso_template.h
+@@ -0,0 +1,181 @@
++/* KZ3 patch 2071 (RSX pass 67): the shared pipeline template -- file format, record set and the guest-memory
++ * shader finder, platform-neutral so a host test can check them with no GPU (tools/smoke/test_pso_template.c) and
++ * the merge tool (tools/smoke/pso_template.py) reads the same layout.
++ *
++ * A template is a list of pipeline records. Each record holds ONLY hashes and render state:
++ *   - FNV / structural hashes of the vertex and fragment program microcode (one-way; the microcode is not stored),
++ *     their lengths, and a "first" fingerprint (a 64-bit mix of the program's first 16 bytes) that the finder uses
++ *     to locate the program in the player's own guest memory;
++ *   - the numeric state words that select the shader variant and the pipeline (texture-unit masks, gamma / shadow /
++ *     ARGB / unnormalised-size masks, sRGB output, vertex layout) and the render state (blend, depth, raster,
++ *     formats), all plain integers;
++ *   - the pipeline key the walker looks the pipeline up by (itself a hash of the above).
++ * No shader text, no microcode, no texture, no address of the game, no string derived from game data. A template
++ * therefore carries nothing the public repository must not hold; the player's own game supplies the programs (the
++ * finder searches the running guest's memory for programs whose hashes the template lists) and the player's own
++ * translator and driver build the pipelines.
++ *
++ * Layout (little endian, packed): rsx_pt_hdr, then count records of rec_size bytes. rsx_pt_rec has the pipeline key
++ * as its first 8 bytes, which is all the merge tool needs for dedupe; the other fields are listed for --info. */
++#ifndef RSX_PSO_TEMPLATE_H
++#define RSX_PSO_TEMPLATE_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define RSX_PT_MAGIC     0x54505A4Bu   /* bytes "KZPT" */
++#define RSX_PT_VERSION   1u
++/* Bump when the meaning of a record or the way the walker derives the pipeline key changes: a file with another
++ * key version is ignored (its keys would never match, its records would build pipelines nothing asks for). */
++#define RSX_PT_KEYVER    1u
++#define RSX_PT_RS_WORDS  64
++#define RSX_PT_FLAG_LAYOUT 1u    /* masked vertex layout (layout_* and attrs are valid) */
++#define RSX_PT_FLAG_PACKED 2u    /* packed payload offsets */
++#define RSX_PT_FLAG_DEPTH  4u    /* a depth surface was bound when the pipeline was first seen */
++#define RSX_PT_FLAG_BUFFERED 8u  /* fragment constants in a constant buffer (the only mode the prewarm builds) */
++#define RSX_PT_FP_SEED   0x4B5A50545F465031ull   /* seed of the template's fragment-program structural hash */
++#define RSX_PT_MAX_RECS  65536u
++
++#pragma pack(push, 1)
++typedef struct {
++    uint32_t magic, version, rec_size, key_version, flags, count;
++} rsx_pt_hdr;
++
++typedef struct {
++    uint64_t key;                       /* the walker's pipeline key */
++    uint64_t vp_hash, vp_first;         /* FNV of the VP words (host order), fingerprint of its first 16 guest bytes */
++    uint64_t fp_hash, fp_first;         /* structural hash (seed RSX_PT_FP_SEED), fingerprint of its first 16 bytes */
++    uint64_t gamma_mask;
++    uint32_t vp_instrs, vp_start, fp_size, fp_ctrl, cube_mask, vtex_mask, srgb_out;
++    uint32_t shadow_mask, argb_mask, unnorm_mask, flags;
++    uint32_t layout_mask, layout_stride, layout_count;
++    uint32_t rs_words;                  /* used words of rs[] (sizeof the walker's render state / 4) */
++    uint8_t  shadow_zfunc[16];
++    uint16_t argb_remap[16];
++    uint32_t unnorm_dim[16][2];
++    uint8_t  attrs[16];
++    uint32_t rs[RSX_PT_RS_WORDS];
++} rsx_pt_rec;
++#pragma pack(pop)
++
++/* Fingerprint of 16 bytes (never 0). */
++static inline uint64_t rsx_pt_quick(const uint8_t* p)
++{
++    uint64_t a, b;
++    memcpy(&a, p, 8); memcpy(&b, p + 8, 8);
++    uint64_t h = a * 0x9E3779B97F4A7C15ull;
++    h ^= ((b * 0xC2B2AE3D27D4EB4Full) << 31) | ((b * 0xC2B2AE3D27D4EB4Full) >> 33);
++    h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
++    return h ? h : 1ull;
++}
++
++/* ---- key set (the walker thread notes each pipeline key once) ---- */
++typedef struct { uint64_t* a; uint32_t cap, n; } rsx_pt_set;
++/* 1 when the key was new (and is now in the set), 0 when present or on allocation failure. */
++static inline int rsx_pt_set_add(rsx_pt_set* s, uint64_t key)
++{
++    if (!key) key = 1;
++    if (!s->a || (s->n + 1u) * 2u > s->cap) {
++        const uint32_t ncap = s->cap ? s->cap * 2u : 4096u;
++        uint64_t* na = (uint64_t*)calloc(ncap, sizeof(uint64_t));
++        if (!na) return 0;
++        for (uint32_t i = 0; i < s->cap; i++) if (s->a[i]) {
++            uint32_t j = (uint32_t)(s->a[i] ^ (s->a[i] >> 29)) & (ncap - 1u);
++            while (na[j]) j = (j + 1u) & (ncap - 1u);
++            na[j] = s->a[i];
++        }
++        free(s->a); s->a = na; s->cap = ncap;
++    }
++    uint32_t i = (uint32_t)(key ^ (key >> 29)) & (s->cap - 1u);
++    for (;; i = (i + 1u) & (s->cap - 1u)) {
++        if (s->a[i] == key) return 0;
++        if (!s->a[i]) { s->a[i] = key; s->n++; return 1; }
++    }
++}
++
++/* ---- file ---- */
++/* Write recs to path (temporary file, then replace). 0 = ok. */
++static inline int rsx_pt_write(const char* path, const rsx_pt_rec* recs, uint32_t n, uint32_t flags)
++{
++    char tmp[1024];
++    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return -1;
++    FILE* f = fopen(tmp, "wb");
++    if (!f) return -1;
++    rsx_pt_hdr h = { RSX_PT_MAGIC, RSX_PT_VERSION, (uint32_t)sizeof(rsx_pt_rec), RSX_PT_KEYVER, flags, n };
++    int ok = fwrite(&h, sizeof h, 1, f) == 1 && (!n || fwrite(recs, sizeof(rsx_pt_rec), n, f) == n);
++    ok = (fclose(f) == 0) && ok;
++    if (!ok) { remove(tmp); return -1; }
++    remove(path);
++    if (rename(tmp, path) != 0) { remove(tmp); return -1; }
++    return 0;
++}
++
++/* Read a template: 0 = ok (*out malloc'ed, *n records with duplicate keys dropped, *dropped counts them and the
++ * records another layout or key version made unusable), -1 = missing file, -2 = header mismatch. */
++static inline int rsx_pt_read(const char* path, rsx_pt_rec** out, uint32_t* n, uint32_t* dropped, uint32_t* flags)
++{
++    *out = NULL; *n = 0; if (dropped) *dropped = 0;
++    FILE* f = fopen(path, "rb");
++    if (!f) return -1;
++    rsx_pt_hdr h;
++    if (fread(&h, sizeof h, 1, f) != 1 || h.magic != RSX_PT_MAGIC || h.version != RSX_PT_VERSION ||
++        h.rec_size != sizeof(rsx_pt_rec) || h.key_version != RSX_PT_KEYVER || h.count > RSX_PT_MAX_RECS) {
++        fclose(f); return -2;
++    }
++    if (flags) *flags = h.flags;
++    rsx_pt_rec* r = (rsx_pt_rec*)malloc((h.count ? h.count : 1u) * sizeof(rsx_pt_rec));
++    if (!r) { fclose(f); return -2; }
++    rsx_pt_set seen; memset(&seen, 0, sizeof seen);
++    uint32_t k = 0, drop = 0;
++    for (uint32_t i = 0; i < h.count; i++) {
++        rsx_pt_rec t;
++        if (fread(&t, sizeof t, 1, f) != 1) break;
++        if (t.rs_words > RSX_PT_RS_WORDS || t.layout_count > 16u || !t.key || !rsx_pt_set_add(&seen, t.key)) { drop++; continue; }
++        r[k++] = t;
++    }
++    fclose(f); free(seen.a);
++    *out = r; *n = k; if (dropped) *dropped = drop;
++    return 0;
++}
++
++/* ---- finder ---- */
++/* Fingerprint table: open addressing on the fingerprint, several entries may share one (kind, id distinguish). */
++typedef struct { uint64_t q; uint32_t kind, id; } rsx_pt_qent;
++typedef struct { rsx_pt_qent* e; uint32_t cap; } rsx_pt_qtab;
++static inline int rsx_pt_qtab_build(rsx_pt_qtab* t, uint32_t n_entries)
++{
++    uint32_t cap = 64u;
++    while (cap < n_entries * 4u) cap <<= 1;
++    t->e = (rsx_pt_qent*)calloc(cap, sizeof(rsx_pt_qent));
++    t->cap = t->e ? cap : 0;
++    return t->e != NULL;
++}
++static inline void rsx_pt_qtab_add(rsx_pt_qtab* t, uint64_t q, uint32_t kind, uint32_t id)
++{
++    uint32_t i = (uint32_t)(q ^ (q >> 31)) & (t->cap - 1u);
++    while (t->e[i].q) i = (i + 1u) & (t->cap - 1u);
++    t->e[i].q = q; t->e[i].kind = kind; t->e[i].id = id;
++}
++/* Calls hit(user, ptr, remaining_bytes, kind, id) for every 16-byte aligned block whose fingerprint is in the
++ * table. Returns the number of blocks inspected. */
++typedef void (*rsx_pt_hit_fn)(void* user, const uint8_t* p, size_t remaining, uint32_t kind, uint32_t id);
++static inline size_t rsx_pt_scan(const uint8_t* base, size_t len, const rsx_pt_qtab* t, rsx_pt_hit_fn hit, void* user)
++{
++    if (!t->cap) return 0;
++    const uint32_t mask = t->cap - 1u;
++    size_t blocks = 0;
++    for (size_t o = 0; o + 16u <= len; o += 16u, blocks++) {
++        const uint8_t* p = base + o;
++        const uint64_t q = rsx_pt_quick(p);
++        uint32_t i = (uint32_t)(q ^ (q >> 31)) & mask;
++        while (t->e[i].q) {
++            if (t->e[i].q == q) hit(user, p, len - o, t->e[i].kind, t->e[i].id);
++            i = (i + 1u) & mask;
++        }
++    }
++    return blocks;
++}
++
++#endif /* RSX_PSO_TEMPLATE_H */

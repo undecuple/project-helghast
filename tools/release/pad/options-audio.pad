@@ -1,0 +1,25 @@
+# Options list (row Audio) -> Audio page; Music row LEFT x2, DOWN to Speech, LEFT; back (CIRCLE).
+key X
+wait audiosettings.gum
+sleep 3
+mark audio page default
+key LEFT
+sleep 2
+key LEFT
+sleep 2
+mark audio Music lowered
+key DOWN
+sleep 2
+key LEFT
+sleep 2
+mark audio Speech lowered
+key DOWN
+sleep 2
+key DOWN
+sleep 2
+key LEFT
+sleep 2
+mark audio Headset lowered
+key O
+sleep 3
+mark back on the options list

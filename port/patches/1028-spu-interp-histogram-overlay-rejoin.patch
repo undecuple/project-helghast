@@ -1,0 +1,171 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream moved the run wrapper, overlay rejoin probe still not upstream.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream's SPU_INTERP_STATS entry bump + 1028's SPU_INTERP_HIST wrapper; memo and `spu_lookup_ovl_exact` both.
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 5f8fe53f..f4ffe6cd 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1769,6 +1769,18 @@ static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
+     return m->fn;
+ }
+ 
++/* KZ3 patch 1028: exact-image probe for the interpreter's rejoin (no image-0
++ * wildcard, no cross-image report): is there a lifted function of THIS overlay
++ * image at addr? */
++spu_fn spu_lookup_ovl_exact(uint32_t addr, int image_id)
++{
++    for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
++        const spu_reg_entry* e = &s_registry[n - 1];
++        if (e->addr == addr && e->image_id == image_id) return e->fn;
++    }
++    return NULL;
++}
++
+ /* Which image registered a function at this LS address, or -1 if none did.
+  *
+  * Deliberately NOT spu_lookup(addr, 0): that call means "dispatch here in a
+@@ -2684,10 +2696,19 @@ static int spu_smc_microstep(spu_context* ctx)
+          * ordinary instruction the interpreter handles -- and with it the
+          * decompression job it was running never completes. */
+         { static int _n = 0;
+-          if (PS3_LOG_FIRST(_n, 8))
++          if (PS3_LOG_FIRST(_n, 8)) {
++              /* KZ3 patch 1028: which overlay was resident and what the WWS code
++               * buffer (LS[0x1320]) holds, so a miss can be told apart from a
++               * mid-function return or code outside any lifted module. */
++              extern int spu_overlay_match_sig(const uint8_t hdr[16]);
++              uint32_t cb = (((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16) |
++                             ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323]) & 0x3FFF0;
+               fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
+-                      " microstep set -- handing to the interpreter (steps=%d)\n",
+-                      ctx->image_id, pc, w, steps); }
++                      " microstep set -- handing to the interpreter (steps=%d start=0x%05X lr=0x%05X"
++                      " ovl=%d cb=0x%05X sig=%d)\n",
++                      ctx->image_id, pc, w, steps, ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
++                      ctx->resident_ovl, cb, spu_overlay_match_sig(&ctx->ls[cb]));
++          } }
+         ctx->pc = pc;
+         /* Stop at the drain's return point too: it sits mid-function, so it is
+          * no lifted entry, and a job's return would otherwise run on through
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index 1e38f019..0ff2abfc 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -442,6 +442,62 @@ static void interp_stats_step(const spu_context* ctx)
+     s_is_tot = 0; s_is_t0 = now;
+ }
+ 
++/* KZ3 patch 1028: which code runs interpreted, and for how long.
++ * SPU_INTERP_HIST=1 keys every interpreter entry by (image, resident overlay,
++ * start pc, WWS code buffer LS[0x1320], overlay signature match there) and adds
++ * up calls, steps and host time; every 10 s it prints the interpreted share of
++ * the window and the top entries (cumulative). */
++#include <time.h>
++#include <string.h>
++typedef struct { int img, ovl, sig; uint32_t start, cb, lo, hi, w0; uint64_t calls, steps, ns; } spu_ih_ent;
++static spu_ih_ent s_ih[256]; static int s_ih_n = 0, s_ih_on = -1; static volatile int s_ih_lock = 0;
++static uint64_t s_ih_t0 = 0, s_ih_last = 0, s_ih_win_ns = 0, s_ih_win_steps = 0, s_ih_win_calls = 0;
++#ifdef _WIN32
++__declspec(dllimport) int __stdcall QueryPerformanceCounter(long long* c);
++__declspec(dllimport) int __stdcall QueryPerformanceFrequency(long long* f);
++static uint64_t spu_ih_now(void) { static long long f = 0; long long c; if (!f) QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c); return (uint64_t)((double)c * 1e9 / (double)f); }
++#else
++static uint64_t spu_ih_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
++#endif
++static uint32_t spu_ih_be(const spu_context* c, uint32_t o) { o &= 0x3FFFC;
++    return ((uint32_t)c->ls[o]<<24)|((uint32_t)c->ls[o+1]<<16)|((uint32_t)c->ls[o+2]<<8)|c->ls[o+3]; }
++static void spu_ih_note(const spu_context* ctx, uint32_t start, uint64_t steps, uint64_t t0, uint32_t lo, uint32_t hi) {
++    extern int spu_overlay_match_sig(const uint8_t hdr[16]);
++    uint64_t t1 = spu_ih_now(), dt = t1 - t0;
++    uint32_t cb = spu_ih_be(ctx, 0x1320) & 0x3FFF0;
++    int sig = (cb + 16 <= 0x40000) ? spu_overlay_match_sig(&ctx->ls[cb]) : 0;
++    while (__atomic_exchange_n(&s_ih_lock, 1, __ATOMIC_ACQUIRE)) {}
++    if (!s_ih_t0) { s_ih_t0 = s_ih_last = t0; }
++    s_ih_win_ns += dt; s_ih_win_steps += steps; s_ih_win_calls++;
++    int i;
++    for (i = 0; i < s_ih_n; i++) { spu_ih_ent* e = &s_ih[i];
++        if (e->img == ctx->image_id && e->ovl == ctx->resident_ovl && e->start == start && e->cb == cb && e->sig == sig) break; }
++    if (i == s_ih_n && s_ih_n < 256) { spu_ih_ent* e = &s_ih[s_ih_n++]; memset(e, 0, sizeof *e);
++        e->img = ctx->image_id; e->ovl = ctx->resident_ovl; e->start = start; e->cb = cb; e->sig = sig;
++        e->lo = lo; e->hi = hi; e->w0 = spu_ih_be(ctx, start); }
++    if (i < 256 && i < s_ih_n) { spu_ih_ent* e = &s_ih[i]; e->calls++; e->steps += steps; e->ns += dt;
++        if (lo < e->lo) e->lo = lo; if (hi > e->hi) e->hi = hi; }
++    if (t1 - s_ih_last >= 10000000000ull) {
++        uint64_t win = t1 - s_ih_last;
++        fprintf(stderr, "[interp-hist] t=%llus window %llu ms: interpreted %llu ms (%.1f%% of one thread), %llu entries, %llu steps (%.1f M/s)\n",
++                (unsigned long long)((t1 - s_ih_t0) / 1000000000ull), (unsigned long long)(win / 1000000ull),
++                (unsigned long long)(s_ih_win_ns / 1000000ull), 100.0 * (double)s_ih_win_ns / (double)win,
++                (unsigned long long)s_ih_win_calls, (unsigned long long)s_ih_win_steps,
++                (double)s_ih_win_steps * 1000.0 / (double)(s_ih_win_ns ? s_ih_win_ns : 1));
++        int used[256] = {0};
++        for (int k = 0; k < 12; k++) { int b = -1;
++            for (int j = 0; j < s_ih_n; j++) if (!used[j] && (b < 0 || s_ih[j].ns > s_ih[b].ns)) b = j;
++            if (b < 0) break; used[b] = 1; spu_ih_ent* e = &s_ih[b];
++            fprintf(stderr, "[interp-hist]   img=%d ovl=%d start=0x%05X w0=%08X cb=0x%05X sig=%d pc=0x%05X-0x%05X calls=%llu steps=%llu ms=%llu\n",
++                    e->img, e->ovl, e->start, e->w0, e->cb, e->sig, e->lo, e->hi, (unsigned long long)e->calls,
++                    (unsigned long long)e->steps, (unsigned long long)(e->ns / 1000000ull)); }
++        s_ih_last = t1; s_ih_win_ns = s_ih_win_steps = s_ih_win_calls = 0;
++    }
++    __atomic_store_n(&s_ih_lock, 0, __ATOMIC_RELEASE);
++}
++static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa, uint64_t* nsteps, uint32_t* lo, uint32_t* hi);
+ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+     if (interp_stats_on()) {
+         /* Credit an entry inside a resident code region to the image that
+@@ -453,6 +509,32 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+                 owner = ctx->resident_code[s].image_id;
+         interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, pc);
+     }
++    if (s_ih_on < 0) { const char* e = getenv("SPU_INTERP_HIST"); s_ih_on = (e && *e && *e != '0') ? 1 : 0; }
++    if (!s_ih_on) return spu_interp_run_until_body(ctx, start_lsa, stop_lsa, 0, 0, 0);
++    uint64_t t0 = spu_ih_now(), n = 0; uint32_t lo = 0x3FFFF, hi = 0;
++    uint32_t r = spu_interp_run_until_body(ctx, start_lsa, stop_lsa, &n, &lo, &hi);
++    spu_ih_note(ctx, start_lsa & 0x3FFFC, n, t0, lo, hi);
++    return r;
++}
++
++/* KZ3 patch 1028: the rejoin probe. A WWS job module the policy module (image 2)
++ * runs is registered under its own overlay image (resident_ovl), so probing
++ * image 2 alone never finds the job's lifted functions: once a job fell into the
++ * interpreter it stayed there to its end. Probe the resident overlay first, as
++ * SPU_DRAIN's resume does (spu_drain.c); SPU_INTERP_OVL_REJOIN=0 restores the old
++ * probe. */
++static int s_ovl_rejoin = -1;
++static spu_lifted_fn spu_interp_rejoin_lookup(const spu_context* ctx, uint32_t pc) {
++    if (s_ovl_rejoin < 0) { const char* e = getenv("SPU_INTERP_OVL_REJOIN"); s_ovl_rejoin = (e && *e == '0') ? 0 : 1; }
++    if (s_ovl_rejoin && ctx->resident_ovl && pc >= 0x4000) {
++        extern spu_lifted_fn spu_lookup_ovl_exact(uint32_t addr, int image_id);
++        spu_lifted_fn f = spu_lookup_ovl_exact(pc, ctx->resident_ovl);
++        if (f) return f;
++    }
++    return spu_lifted_lookup(ctx, pc);
++}
++
++static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa, uint64_t* nsteps, uint32_t* plo, uint32_t* phi) {
+     ctx->pc = start_lsa & 0x3FFFC;
+     ctx->status = SPU_STATUS_RUNNING;
+     uint64_t steps = 0;
+@@ -489,7 +571,8 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
+          * another image's functions that happen to share an LS address. */
+         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
+-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
++        if (plo) { if (ctx->pc < *plo) *plo = ctx->pc; if (ctx->pc > *phi) *phi = ctx->pc; if (nsteps) *nsteps = steps; }
++        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_interp_rejoin_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+         g_spu_interp_last_pc = ctx->pc;
+         if (_g1>0) {
+             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
+@@ -555,7 +638,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+ void spu_dispatch(spu_context* ctx, uint32_t target) {
+     for (;;) {
+         target &= 0x3FFFC;
+-        spu_lifted_fn fn = spu_lifted_lookup(ctx, target);
++        spu_lifted_fn fn = spu_interp_rejoin_lookup(ctx, target);   /* KZ3 patch 1028: same probe as the rejoin */
+         if (fn) { ctx->pc = target; fn(ctx); return; }
+         uint32_t next = spu_interp_run(ctx, target);
+         if (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))

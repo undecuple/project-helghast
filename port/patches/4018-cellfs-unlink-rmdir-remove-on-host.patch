@@ -1,0 +1,84 @@
+KZ3 patch 4018: cellFsUnlink and cellFsRmdir remove the file or directory on the host (they were CELL_OK stubs).
+FIOS deletes a cache it rejects and opens it again with O_CREAT to build a new one (KZ3 v1.00 @0x00DA18E0); with the
+stubs the rejected cache.idx stayed and FIOS went round open / read 512 / close forever (first native Windows run,
+2026-10-21: 17-51 thousand rounds, black screen). Only the writable mounts (/dev_hdd0, /dev_hdd1, /dev_usb*) can be
+changed (else CELL_EROFS), a ".." component is refused (CELL_EINVAL), errors map to CELL_ENOENT/EISDIR/ENOTDIR/
+ENOTEMPTY/EBUSY/EACCES/EIO, and every call logs one "[fs] unlink|rmdir" line. Test: tools/net/test_fs_cache.sh
+(KZ3 network pass 30, the RE notes s.26). Upstream candidate.
+
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -839,8 +839,71 @@
+     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
+     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
+ }
+-static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
+-static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
++/* cellFsUnlink(path) / cellFsRmdir(path) (KZ3 patch 4018). Both were stubs that answered CELL_OK and removed
++ * nothing. FIOS validates its HDD cache on start (KZ3 v1.00 @0x00DA18E0): when the stored header does not match,
++ * it closes cache.idx and cache.dat, unlinks both and returns failure, and its caller opens them again with
++ * O_CREAT to build a new cache. With the stub the files stayed, the reopened index carried the same rejected
++ * header, and FIOS went round open / read 512 / close forever (black screen; 17-51 thousand rounds in one
++ * Windows session). Removal is limited to the writable mounts (/dev_hdd0, /dev_hdd1, /dev_usb*): the disc and
++ * the game directory are read-only on a PS3 (CELL_EROFS), and a path with a ".." component never reaches the
++ * host. The CRT opens files without FILE_SHARE_DELETE on Windows, so unlinking a file that is still open fails
++ * there (CELL_EBUSY) where a PS3 would allow it; FIOS closes first. */
++#define CELL_FS_EINVAL_    ((int32_t)0x80010002)
++#define CELL_FS_EBUSY_     ((int32_t)0x8001000A)
++#define CELL_FS_EROFS_     ((int32_t)0x80010026)
++#define CELL_FS_EACCES_    ((int32_t)0x80010029)
++#define CELL_FS_EIO_       ((int32_t)0x8001002B)
++#define CELL_FS_ENOTDIR_   ((int32_t)0x8001002E)
++#define CELL_FS_ENOTEMPTY_ ((int32_t)0x80010036)
++static int fs_path_removable(const char* g)
++{
++    if (strncmp(g, "/dev_hdd0/", 10) && strncmp(g, "/dev_hdd1/", 10) && strncmp(g, "/dev_usb", 8)) return CELL_FS_EROFS_;
++    for (const char* p = g; *p; ) {   /* reject any ".." component, '/' or '\' separated */
++        const char* e = p; while (*e && *e != '/' && *e != '\\') e++;
++        if (e - p == 2 && p[0] == '.' && p[1] == '.') return CELL_FS_EINVAL_;
++        p = *e ? e + 1 : e;
++    }
++    return 0;
++}
++static int32_t fs_errno_to_cell(int e)
++{
++    switch (e) {
++    case ENOENT:    return CELL_FS_ENOENT;
++    case EISDIR:    return CELL_FS_EISDIR;
++    case ENOTDIR:   return CELL_FS_ENOTDIR_;
++    case ENOTEMPTY: return CELL_FS_ENOTEMPTY_;
++#if defined(EEXIST) && EEXIST != ENOTEMPTY
++    case EEXIST:    return CELL_FS_ENOTEMPTY_;   /* rmdir of a non-empty dir on some hosts */
++#endif
++    case EBUSY:     return CELL_FS_EBUSY_;
++#ifdef _WIN32
++    case EACCES:    return CELL_FS_EBUSY_;       /* still open somewhere (no FILE_SHARE_DELETE) */
++#else
++    case EACCES:
++#endif
++    case EPERM:     return CELL_FS_EACCES_;
++    case EROFS:     return CELL_FS_EROFS_;
++    default:        return CELL_FS_EIO_;
++    }
++}
++static void fs_remove(ppu_context* ctx, int dir)
++{
++    char gpath[1024], hpath[1100];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    int32_t r = fs_path_removable(gpath);
++    if (!r) {
++        host_path(hpath, sizeof hpath, gpath);
++        fs_stat64_t st;
++        if (FS_STAT64(hpath, &st) != 0)                        r = CELL_FS_ENOENT;
++        else if (!dir && (st.st_mode & S_IFMT) == S_IFDIR)     r = CELL_FS_EISDIR;
++        else if (dir && (st.st_mode & S_IFMT) != S_IFDIR)      r = CELL_FS_ENOTDIR_;
++        else if ((dir ? rmdir(hpath) : remove(hpath)) != 0)    r = fs_errno_to_cell(errno);
++    }
++    fprintf(stderr, "[fs] %s '%s' -> %s (0x%08X)\n", dir ? "rmdir" : "unlink", gpath, r ? "FAIL" : "OK", (uint32_t)r);
++    ctx->gpr[3] = (uint64_t)(int64_t)r;
++}
++static void cellFsRmdir(ppu_context* ctx)  { fs_remove(ctx, 1); }
++static void cellFsUnlink(ppu_context* ctx) { fs_remove(ctx, 0); }
+ static void cellFsFsync(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];

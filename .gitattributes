@@ -1,0 +1,5 @@
+# No global text/eol normalisation: several ps3recomp sources are CRLF and our patches carry that context byte for
+# byte (a global `text=auto eol=lf` made `git apply` reject them in CI).
+*.png binary
+*.patch -text linguist-generated=true
+re/data/*.tsv linguist-generated=true

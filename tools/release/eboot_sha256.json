@@ -1,0 +1,11 @@
+{
+ "comment": "Expected SHA-256 of the decrypted EBOOT (EBOOT.elf). A hash is a number. The maintainer fills sha256 from a known-good work/bin/EBOOT.elf; empty = unknown yet, and firstrun_check.py only warns (H1). Sizes from firstrun_check.EBOOT_ELF_SIZES.",
+ "1.14": {
+  "size": 21228256,
+  "sha256": "7ad9e4fe357469c15ad61091a5368035957436bd361f388670fc8b9d808bf7e4"
+ },
+ "1.00": {
+  "size": 20745952,
+  "sha256": "faaa30432b7fec8529c25558ededc0568b6d630ec5c93842ae17b89b6a0bf611"
+ }
+}

@@ -1,0 +1,260 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream line-commit wake and PR266 rejoin next to it.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): `spu_honour_stop_request` (raw SPU RunCntl stop) at the top of 1014's spu_rdch wrapper.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 0c4e68d0..3e7aa647 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -443,6 +443,7 @@ static struct SpursInst {
+     volatile long kernel_live; /* poll thread started */
+     int           nthreads;    /* kernel threads (KZ3_SPURS_THREADS, patch 1006) */
+ } s_inst[MAX_SPURS_INST];
++static DWORD WINAPI spurs_watch_thread(LPVOID p);   /* KZ3 patch 1013 */
+ /* KZ3 patch 1011: the policy-module run in progress per instance (kernel thread 0). */
+ static volatile u32 s_run_wid[MAX_SPURS_INST];
+ static volatile u64 s_run_t0[MAX_SPURS_INST], s_run_rep[MAX_SPURS_INST];
+@@ -499,6 +500,11 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+ 
+     if (!si->kernel_live) {
+         si->kernel_live = 1;
++        { extern uint32_t g_kz3_spurs_line[4];         /* KZ3 patch 1013 */
++          g_kz3_spurs_line[si - s_inst] = spurs_ea & ~127u; }
++        { static volatile long s_watch_started = 0;   /* KZ3 patch 1013 */
++          if (InterlockedCompareExchange(&s_watch_started, 1, 0) == 0)
++              CreateThread(NULL, 1u << 20, spurs_watch_thread, NULL, 0, NULL); }
+         /* KZ3_SPURS_THREADS=n (KZ3, patch 1006): n kernel threads per instance,
+          * at most nSpus -- the instance's virtual SPUs. Each claims one workload
+          * at a time, so different workloads run in parallel as on hardware.
+@@ -1688,6 +1694,77 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+     return 0;
+ }
+ 
++/* KZ3 patch 1013 (diagnostic, SPURS_STUCK_MS, default 3000; 0 = off): one watcher thread for every
++ * instance. Patch 1011 ran this check inside the kernel threads, each looking at the OTHER instances,
++ * so a stuck HiPrio run went unseen while LoPrio's only thread sat in its endless wid 9 run.
++ * [spurs-stuck]: a policy-module run that has not returned for SPURS_STUCK_MS.
++ * [spurs-curcont]: a wklCurrentContention byte (+0x20+wid) that is nonzero while no run of that
++ * workload is in progress (the HLE sets it before a run and clears it after). */
++static DWORD WINAPI spurs_watch_thread(LPVOID p)
++{
++    (void)p;
++    int sm = 3000;
++    { const char* e = getenv("SPURS_STUCK_MS"); if (e) sm = atoi(e); }
++    if (sm <= 0) return 0;
++    u64 s_t_start = GetTickCount64();   /* t= below: ms since the first cellSpursInitialize */
++    static u64 cc_since[MAX_SPURS_INST][16], cc_rep[MAX_SPURS_INST][16];
++    for (;;) {
++        Sleep(50);
++        u64 now = GetTickCount64();
++        for (int j = 0; j < MAX_SPURS_INST; j++) {
++            u32 ea = s_inst[j].ea;
++            if (!ea) continue;
++            u64 t0 = s_run_t0[j];
++            u32 rw = s_run_wid[j];
++            if (t0) {
++                u64 d = now - t0;
++                if (d >= (u64)sm && now - s_run_rep[j] >= 5000) {
++                    s_run_rep[j] = now;
++                    extern void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num);
++                    extern void spu_pm_ctx_describe(void* ctx, char* out, int n);
++                    char b[512] = "";
++                    spu_pm_ctx_describe(spu_pm_ctx_peek(rw, 0), b, sizeof b);
++                    /* where the run spends its time: 300 pc samples, 1 ms apart, top 4 */
++                    extern uint32_t spu_pm_ctx_pc(void* ctx);
++                    void* cx = spu_pm_ctx_peek(rw, 0);
++                    /* arm a 600-event trace of this context (first two reports per instance) */
++                    { extern void* volatile g_kz3_trace_ctx; extern volatile long g_kz3_trace_n;
++                      static int s_tr[MAX_SPURS_INST];
++                      if (cx && !g_kz3_trace_ctx && s_tr[j] < 2) { s_tr[j]++; g_kz3_trace_n = 600; g_kz3_trace_ctx = cx; } }
++                    u32 pcs[8] = {0}, cnt[8] = {0};
++                    for (int k = 0; k < 300 && cx; k++) {
++                        u32 pc = spu_pm_ctx_pc(cx); int m;
++                        for (m = 0; m < 8 && cnt[m] && pcs[m] != pc; m++) ;
++                        if (m < 8) { pcs[m] = pc; cnt[m]++; }
++                        Sleep(1);
++                    }
++                    char h[160] = ""; int ho = 0;
++                    for (int m = 0; m < 8 && cnt[m]; m++)
++                        ho += snprintf(h + ho, sizeof h - ho, " 0x%05X:%u", pcs[m], cnt[m]);
++                    fprintf(stderr, "[spurs-stuck] t=%llu \"%s\" wid=%u PM run not returned for %llu ms: %s pcs:%s\n",
++                            (unsigned long long)(now - s_t_start), s_inst[j].prefix, rw, (unsigned long long)d, b, h);
++                    fflush(stderr);
++                }
++            }
++            for (u32 w = 0; w < 16; w++) {
++                u8 cc = *(vm_base + ea + SPURS_WKL_CURCONT + w);
++                int running = t0 && rw == w;
++                if (!cc || running) { cc_since[j][w] = 0; continue; }
++                if (!cc_since[j][w]) { cc_since[j][w] = now; continue; }
++                if (now - cc_since[j][w] >= 1000 && now - cc_rep[j][w] >= 10000) {
++                    cc_rep[j][w] = now;
++                    fprintf(stderr, "[spurs-curcont] t=%llu \"%s\" wid=%u contention=%u for %llu ms with no run of it "
++                            "(running wid=%d) ready=%u state=%u\n", (unsigned long long)(now - s_t_start), s_inst[j].prefix, w, cc,
++                            (unsigned long long)(now - cc_since[j][w]), t0 ? (int)rw : -1,
++                            *(vm_base + ea + SPURS_WKL_READY1 + w), *(vm_base + ea + SPURS_WKL_STATE1 + w));
++                    fflush(stderr);
++                }
++            }
++        }
++    }
++    return 0;
++}
++
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ {
+ #ifdef _WIN32
+@@ -1720,29 +1797,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+         Sleep(1);
+         u32 ea = si->ea;
+         if (!ea || s_pm_off) continue;
+-        /* KZ3 patch 1011 diagnostic (SPURS_STUCK_MS, default 3000; 0 = off): report a
+-         * policy-module run on ANOTHER instance that has not returned for that long --
+-         * its workload's contention byte stays set and nothing else on that instance runs. */
+-        { static int s_sm = -1;
+-          if (s_sm < 0) { const char* e = getenv("SPURS_STUCK_MS"); s_sm = e ? atoi(e) : 3000; }
+-          if (s_sm > 0) {
+-            u64 now = GetTickCount64();
+-            for (int j = 0; j < MAX_SPURS_INST; j++) {
+-              if (&s_inst[j] == si || !s_run_t0[j]) continue;
+-              u64 d = now - s_run_t0[j];
+-              if (d >= (u64)s_sm && now - s_run_rep[j] >= 5000) {
+-                s_run_rep[j] = now;
+-                extern void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num);
+-                extern void spu_pm_ctx_describe(void* ctx, char* out, int n);
+-                char b[512] = "";
+-                spu_pm_ctx_describe(spu_pm_ctx_peek(s_run_wid[j], 0), b, sizeof b);
+-                fprintf(stderr, "[spurs-stuck] \"%s\" wid=%u PM run not returned for %llu ms: %s\n",
+-                        s_inst[j].prefix, s_run_wid[j], (unsigned long long)d, b);
+-                fflush(stderr);
+-              }
+-            }
+-          } }
+-
++        /* KZ3 patch 1013: the [spurs-stuck] check moved to spurs_watch_thread. */
+         if (watch) {
+             const unsigned char* live = (const unsigned char*)vm_base + ea;
+             if (!shadow_primed) { memcpy(shadow, live, WATCH_LEN); shadow_primed = 1; }
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index f018a4f7..bf047d47 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -576,6 +576,28 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
+  * completion. Chosen above the context/descriptor we park near the top of LS. */
+ #define SPU_JOB_RETURN_LS   0x3FF00u
+ 
++/* KZ3 patch 1013 (diagnostic): the SPURS instance lines (set by cellSpurs.c). An SPU atomic store
++ * that changes a wklCurrentContention byte (+0x20..+0x2F) is logged: only the HLE kernel should write
++ * those, so a change here is a stale-copy write-back. */
++uint32_t g_kz3_spurs_line[4];
++static void kz3_curcont_check(spu_context* ctx, uint32_t ea, const uint8_t* mem, const uint8_t* ls, const char* how)
++{
++    uint32_t line = ea & ~127u;
++    if (!line || (line != g_kz3_spurs_line[0] && line != g_kz3_spurs_line[1] &&
++                  line != g_kz3_spurs_line[2] && line != g_kz3_spurs_line[3])) return;
++    if (memcmp(mem + 0x20, ls + 0x20, 16) == 0) return;
++    static long s_n = 0;
++    long n = __atomic_add_fetch(&s_n, 1, __ATOMIC_RELAXED);
++    if (n > 64) return;
++    char b[160]; int o = 0;
++    for (int i = 0; i < 16; i++)
++        if (mem[0x20 + i] != ls[0x20 + i])
++            o += snprintf(b + o, sizeof b - o, " wid%d:%u->%u", i, mem[0x20 + i], ls[0x20 + i]);
++    fprintf(stderr, "[spurs-curcont] %s img=%d pc=0x%05X lr=0x%05X line=0x%08X changes contention:%s\n",
++            how, ctx->image_id, ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK, line, b);
++    fflush(stderr);
++}
++
+ /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
+ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+ {
+@@ -842,6 +864,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
+               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
++            kz3_curcont_check(ctx, ea, mem, ls, "PUTLLC");   /* KZ3 patch 1013 */
+             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+             /* A committing PUTLLC is a line write like any other, so every
+              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
+@@ -939,6 +962,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+         spu_lockline_lock();
+         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
+           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
++        kz3_curcont_check(ctx, ea, mem, ls, "PUTLLUC");  /* KZ3 patch 1013 */
+         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+         /* Unconditional, so it invalidates EVERY reservation on the line --
+          * this SPU's included, which is why the notify runs before the
+@@ -974,7 +998,27 @@ static int channel_is_mfc(uint32_t ch)
+ /* ===========================================================================
+  * Channel write
+  * ===========================================================================*/
++/* KZ3 patch 1013 (diagnostic): a short event trace of one SPU context, armed by the
++ * [spurs-stuck] watcher (cellSpurs.c): indirect branches and channel reads/writes. */
++void* volatile g_kz3_trace_ctx = 0;
++volatile long g_kz3_trace_n = 0;
++static void kz3_trace(spu_context* ctx, const char* what, uint32_t ch, uint32_t v)
++{
++    if ((void*)ctx != g_kz3_trace_ctx) return;
++    long n = __atomic_sub_fetch(&g_kz3_trace_n, 1, __ATOMIC_RELAXED);
++    if (n < 0) { g_kz3_trace_ctx = 0; return; }
++    fprintf(stderr, "[pmtrace] %s pc=0x%05X ch=%u v=0x%08X ev=0x%X/0x%X ie=%u parked=0x%X sstat=0x%X 12A0=%02X%02X 12C0=%02X%02X%02X%02X\n",
++            what, ctx->pc & SPU_LS_MASK, ch, v, ctx->event_status, ctx->event_mask, ctx->int_enable,
++            ctx->list_stall_mask, ctx->list_stall_stat, ctx->ls[0x12A2], ctx->ls[0x12A3],
++            ctx->ls[0x12C0], ctx->ls[0x12C1], ctx->ls[0x12C2], ctx->ls[0x12C3]);
++}
++static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value);
+ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
++{
++    if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "wr", channel, value._u32[0]);
++    spu_wrch_impl(ctx, channel, value);
++}
++static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
+ {
+     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
+      * worker that never issues an MFC command is either not being handed its
+@@ -1220,9 +1264,16 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+ /* ===========================================================================
+  * Channel read (returns value in the preferred word slot)
+  * ===========================================================================*/
++static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel);
+ u128 spu_rdch(spu_context* ctx, uint32_t channel)
+ {
+     spu_honour_stop_request(ctx);
++    u128 r = spu_rdch_impl(ctx, channel);
++    if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "rd", channel, r._u32[0]);
++    return r;
++}
++static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel)
++{
+     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
+           r[channel & 127]++;
+@@ -2633,6 +2684,7 @@ static int spu_smc_microstep(spu_context* ctx)
+ 
+ void spu_indirect_branch(spu_context* ctx)
+ {
++    if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "ib", 0, ctx->gpr[0]._u32[0]);
+     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
+      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
+      * Without this, any indirect branch through such a value fails the lookup
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 2ff2d9c3..5fd0e88e 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -61,7 +61,14 @@ void spu_pm_ctx_describe(void* p, char* out, int n)
+              c->image_id, c->pc & SPU_LS_MASK, c->gpr[0]._u32[0] & SPU_LS_MASK, c->gpr[1]._u32[0] & SPU_LS_MASK,
+              c->status, c->host_depth, c->mfc_tag_status, c->event_status,
+              w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++    /* KZ3 patch 1013: interrupt and stall-and-notify state (a parked DMA list never acked
++     * keeps its tag incomplete). */
++    int o = (int)strlen(out);
++    if (o < n) snprintf(out + o, n - o, " ie=%u emask=0x%X parked=0x%X sstat=0x%X tagmask=0x%X srr0=0x%05X",
++                        c->int_enable, c->event_mask, c->list_stall_mask, c->list_stall_stat,
++                        c->mfc_tag_mask, c->srr0 & SPU_LS_MASK);
+ }
++uint32_t spu_pm_ctx_pc(void* p) { return p ? (((spu_context*)p)->pc & SPU_LS_MASK) : 0; }  /* KZ3 patch 1013 */
+ 
+ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+                           const uint8_t* pm_host, uint32_t pm_size,

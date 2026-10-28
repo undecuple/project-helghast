@@ -1,0 +1,377 @@
+live-draw: zeta dumps and a geometry-capture spike (diagnostics only, all off by default).
+
+1. LD_SURF_DUMP also writes zetas. At the end of the frame after the dump fires, every tracked zeta's R32F
+   snapshot is written as a PFM (f<frame>_zeta_<slot>_<offset>_d<depth fmt>_<w>x<h>.pfm, rows bottom to top) and
+   logged as "[zeta-dump] slot=...". During that frame every zeta snapshot a draw samples (shadow compare, X16 value
+   or ARGB byte reads) is written when the draw has run (f<frame>_zread_<seq>_u<unit>_...pfm, at most 8 per zeta
+   except shadow-compare reads, 64 in all) with the draw's inline fragment constants next to it (.pfm.fpc), so the
+   lookup can be recomputed offline. Shadow maps are reused inside a frame, so the state at the present is not the
+   one a light read.
+   Why (Killzone 3): checking the sun shadow maps (0x2980000 / 0x2DA0000, Z16 1408x1408) against what the deferred
+   sun shader computes (RSX pass 25).
+
+2. LD_GEOM_CAPTURE=1 (with LD_SURF_DUMP): in the same frame, the generated vertex shader writes each vertex's guest
+   clip position o[0] and its host clip position (Out.pos) to a typed UAV (RWBuffer<float4> u0, root table 5;
+   guard constants b2 in root parameter 6: base element, vertex count, on). The root signature only grows when the
+   variable is set. Written next to the zeta dumps: geom_meta.tsv (one row per draw: target, zeta, clip, topology,
+   counts, PSO key, depth test/write), geom_verts.bin, geom_idx.bin (triangle-list indices of indexed draws), and
+   "[geom-cap] frame=... draws=... vertices=..." in the log. 192 MB buffer (6 M vertices); draws past it are counted
+   as overflow.
+   Why (Killzone 3): the spike (ray-traced shadows/AO need world-space geometry; a recompiled game only has draw
+   calls).
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index c4c13fbe..ad52024a 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -177,7 +177,8 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ #define SRV_SURF_WIN_BASE (SRV_FEEDBACK_BASE + MAX_SURFACES)
+ /* Patch 2023: UAV of the host AA pass's output texture (see ld_host_aa). */
+ #define UAV_HOST_AA       (SRV_SURF_WIN_BASE + MAX_SURFACES * LD_SWIN_PER)
+-#define SRV_CPU_HEAP_SLOTS (UAV_HOST_AA + 1)
++#define UAV_GEOM_CAP      (UAV_HOST_AA + 1)   /* patch 2024: LD_GEOM_CAPTURE */
++#define SRV_CPU_HEAP_SLOTS (UAV_GEOM_CAP + 1)
+ #define SRV_TABLE_SIZE   16
+ #define SRV_RING_TABLES  4096
+ 
+@@ -5070,6 +5071,154 @@ static int zdepth_snapshot(u32 slot)
+     return 1;
+ }
+ 
++/* Patch 2024 (spike, diagnostic): LD_GEOM_CAPTURE=1 with LD_SURF_DUMP
++ * captures, in the frame after the dump fires, the guest clip-space position
++ * (o[0], before the host's posscale/offset) and the host clip position (Out.pos,
++ * what the rasteriser uses) of every vertex
++ * every draw shades. The generated vertex shader gets a typed UAV write
++ * (RWBuffer<float4> u0, root table 5) guarded by root constants (b2, param 6:
++ * base element, vertex count, on). Written next to the zeta dumps:
++ * geom_meta.tsv (one row per draw), geom_verts.bin (float4 o0, float4 host
++ * clip position per vertex) and geom_idx.bin (the u32 triangle-list indices of indexed draws). */
++#define LD_GC_ELEMS (12u * 1024u * 1024u)   /* float4 elements: 192 MB, 6 M vertices */
++static int g_gc_on = -1;
++static ID3D12Resource* g_gc_buf;
++static u32 g_gc_used, g_gc_draws, g_gc_overflow, g_gc_nopatch;
++static FILE* g_gc_meta; static FILE* g_gc_idx; static u64 g_gc_idx_n;
++static int ld_gc_enabled(void)
++{
++    if (g_gc_on < 0) { const char* e = getenv("LD_GEOM_CAPTURE"); g_gc_on = e && e[0] && e[0] != '0'; }
++    return g_gc_on;
++}
++/* Returns 1 when the shader was patched. */
++static int ld_gc_patch_vs(char* hlsl, u32 size)
++{
++    char* in = strstr(hlsl, "struct VSInput {\n");
++    char* mn = strstr(hlsl, "VSOutput main(");
++    char* out = strstr(hlsl, "    return Out;\n");
++    if (!in || !mn || !out || strstr(out + 1, "    return Out;\n")) return 0;
++    static const char a[] = "    uint cap_vid:SV_VertexID;\n";
++    static const char b[] = "RWBuffer<float4> rsx_cap : register(u0);\ncbuffer CapC : register(b2) { uint4 cap_c; };\n";
++    static const char c[] = "    if (cap_c.z != 0u && input.cap_vid < cap_c.y) {\n"
++        "        rsx_cap[cap_c.x + input.cap_vid * 2u] = o[0];\n"
++        "        rsx_cap[cap_c.x + input.cap_vid * 2u + 1u] = Out.pos; }\n";
++    const u32 used = (u32)strlen(hlsl);
++    if (used + sizeof a + sizeof b + sizeof c > size) return 0;
++    /* back to front so the earlier pointers stay valid */
++    memmove(out + sizeof c - 1, out, strlen(out) + 1); memcpy(out, c, sizeof c - 1);
++    memmove(mn + sizeof b - 1, mn, strlen(mn) + 1); memcpy(mn, b, sizeof b - 1);
++    in += strlen("struct VSInput {\n");
++    memmove(in + sizeof a - 1, in, strlen(in) + 1); memcpy(in, a, sizeof a - 1);
++    return 1;
++}
++static int ld_gc_buffer(void)
++{
++    if (g_gc_buf) return 1;
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)LD_GC_ELEMS * 16u;
++    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
++    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&g_gc_buf))) {
++        fprintf(stderr, "[geom-cap] buffer allocation failed\n"); g_gc_on = 0; return 0;
++    }
++    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
++    ud.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
++    ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++    ud.Buffer.NumElements = LD_GC_ELEMS;
++    g.dev->lpVtbl->CreateUnorderedAccessView(g.dev, g_gc_buf, NULL, &ud, srv_cpu(UAV_GEOM_CAP));
++    return 1;
++}
++/* Before each draw while LD_GEOM_CAPTURE is set: bind the UAV table and the
++ * guard constants (capture off outside the capture frame). */
++static void ld_gc_bind(int capture, u32 nverts, u32 n_idx, const u32* idx, u32 target, u32 zslot,
++                       const rsx_dsp_surface* sf, u32 prim, int indexed)
++{
++    if (!ld_gc_buffer() || g.srv_ring_used >= SRV_RING_TABLES) return;
++    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
++    g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
++    cpu.ptr += (size_t)base * g.srv_step;
++    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(UAV_GEOM_CAP),
++                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
++    g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.srv_heap, &gpu);
++    gpu.ptr += (u64)base * g.srv_step;
++    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 5, gpu);
++    UINT c[4] = { g_gc_used, nverts, 0, 0 };
++    if (capture && g_gc_meta) {
++        if (g_gc_used + 2u * nverts > LD_GC_ELEMS) g_gc_overflow++;
++        else {
++            c[2] = 1;
++            render_state_t rs; decode_render_state(&rs);
++            fprintf(g_gc_meta, "%u\t%u\t0x%X\t%ux%u\t0x%X\t%u\t%ux%u\t%u\t%u\t%u\t%u\t%u\t%llu\t%016llx\t%u\t%u\t%u\t%u\t%u\n",
++                    g_gc_draws, g_ld_frames, target < g.n_surfaces ? g.surfaces[target].offset : 0u,
++                    target < g.n_surfaces ? g.surfaces[target].w : 0u, target < g.n_surfaces ? g.surfaces[target].h : 0u,
++                    zslot ? g.zdepths[zslot - 1u].offset : 0u, zslot ? g.zdepths[zslot - 1u].depth_format : 0u,
++                    sf->clip_w, sf->clip_h, prim, indexed, n_idx, nverts, g_gc_used,
++                    (unsigned long long)(indexed ? g_gc_idx_n : 0ull),
++                    (unsigned long long)g_ld_current_pso.key, g_ld_current_pso.vp_start,
++                    rs.depth_test, rs.depth_write, rs.cull_enable, rs.color_mask);
++            if (indexed && g_gc_idx) { fwrite(idx, 4, n_idx, g_gc_idx); g_gc_idx_n += n_idx; }
++            g_gc_used += 2u * nverts; g_gc_draws++;
++        }
++    }
++    g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 6, 4, c, 0);
++}
++static void ld_gc_start(const char* dir)
++{
++    if (!ld_gc_enabled() || !ld_gc_buffer()) return;
++    char path[MAX_PATH * 2];
++    snprintf(path, sizeof path, "%s\\geom_meta.tsv", dir); g_gc_meta = fopen(path, "wb");
++    snprintf(path, sizeof path, "%s\\geom_idx.bin", dir); g_gc_idx = fopen(path, "wb");
++    if (g_gc_meta) fprintf(g_gc_meta, "draw\tframe\tsurf\tsurf_wh\tzeta\tzfmt\tclip\tprim\tindexed\tn_idx\tnverts\tbase\tidx_off\tpso\tvp_start\tdtest\tdwrite\tcull\tcmask\n");
++    g_gc_used = g_gc_draws = g_gc_overflow = 0; g_gc_idx_n = 0;
++}
++static void ld_gc_finish(const char* dir)
++{
++    if (!g_gc_meta) return;
++    fclose(g_gc_meta); g_gc_meta = NULL;
++    if (g_gc_idx) { fclose(g_gc_idx); g_gc_idx = NULL; }
++    const UINT64 bytes = (UINT64)g_gc_used * 16u;
++    if (bytes) {
++        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++        D3D12_RESOURCE_DESC bd = {0};
++        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes;
++        bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
++        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++        ID3D12Resource* rb = NULL;
++        if (SUCCEEDED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb))) {
++            D3D12_RESOURCE_BARRIER b = {0};
++            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++            b.Transition.pResource = g_gc_buf;
++            b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++            g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++            g.list->lpVtbl->CopyBufferRegion(g.list, rb, 0, g_gc_buf, 0, bytes);
++            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++            b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++            g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++            ld_flush(LD_FLUSH_READBACK);
++            u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)bytes};
++            if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
++                char path[MAX_PATH * 2];
++                snprintf(path, sizeof path, "%s\\geom_verts.bin", dir);
++                FILE* f = fopen(path, "wb");
++                if (f) { fwrite(px, 1, (size_t)bytes, f); fclose(f); }
++                D3D12_RANGE wr = {0, 0}; rb->lpVtbl->Unmap(rb, 0, &wr);
++            }
++            rb->lpVtbl->Release(rb);
++        }
++    }
++    fprintf(stderr, "[geom-cap] frame=%u draws=%u vertices=%u indices=%llu overflow=%u unpatched_vs=%u\n",
++            g_ld_frames, g_gc_draws, g_gc_used / 2u, (unsigned long long)g_gc_idx_n, g_gc_overflow, g_gc_nopatch);
++}
++
+ /* ---------------------------------------------------------------------------
+  * PSO cache (VP+FP+render-state keyed)
+  * -----------------------------------------------------------------------*/
+@@ -6212,6 +6361,8 @@ static ID3D12PipelineState* get_pso(
+       char* c0 = fc && vi > 0 && (!fk || fk == live_legacy_pso_key())
+                  ? strstr(vs_hlsl, "Out.col0 = o[1];") : NULL;
+       if (c0) memcpy(c0, "Out.col0=1+0*_p;", 16); }   /* same length, in place */
++    if (vi > 0 && ld_gc_enabled() && !ld_gc_patch_vs(vs_hlsl, sizeof vs_hlsl))   /* patch 2024 */
++        g_gc_nopatch++;
+     /* LD_HLSL_DUMP=<dir>: files named by the PSO key the draw CSV prints. */
+     { static const char* hd = (const char*)-1;
+       if (hd == (const char*)-1) hd = getenv("LD_HLSL_DUMP");
+@@ -8391,6 +8542,108 @@ static int ld_zp_read_snapshot(zdepth_t* z, u32 n, const u32* xs, const u32* ys,
+     rb->lpVtbl->Release(rb);
+     return ok;
+ }
++/* Patch 2024: LD_SURF_DUMP also writes zetas. Reads the R32F snapshot of
++ * zeta i whole and writes it as a PFM (little-endian float, rows bottom to
++ * top). Returns the texels below 1.0, or UINT64_MAX on failure; *mn / *mx get
++ * the range of those texels. */
++static u64 ld_dump_zeta_pfm(const char* path, zdepth_t* z, float* mn, float* mx)
++{
++    *mn = 1.0f; *mx = 0.0f;
++    if (!z->snapshot || !z->snapshot_valid || !z->snapshot_w || !z->snapshot_h) return UINT64_MAX;
++    const u32 w = z->snapshot_w, h = z->snapshot_h, pitch = (w * 4u + 255u) & ~255u;
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)pitch * h;
++    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
++    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    ID3D12Resource* rb = NULL;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb)))
++        return UINT64_MAX;
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition.pResource = z->snapshot;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.StateBefore = z->snapshot_state;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
++    src.pResource = z->snapshot; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
++    dst.PlacedFootprint.Footprint.Width = w;
++    dst.PlacedFootprint.Footprint.Height = h;
++    dst.PlacedFootprint.Footprint.Depth = 1;
++    dst.PlacedFootprint.Footprint.RowPitch = pitch;
++    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    b.Transition.StateAfter = z->snapshot_state;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    ld_flush(LD_FLUSH_READBACK);
++    u64 below = UINT64_MAX; u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * h};
++    if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
++        FILE* f = fopen(path, "wb");
++        below = 0;
++        if (f) fprintf(f, "Pf\n%u %u\n-1.0\n", w, h);
++        for (u32 y = 0; y < h; y++) {
++            const float* row = (const float*)(px + (size_t)pitch * (h - 1u - y));
++            if (f) fwrite(row, 4, w, f);
++            for (u32 x = 0; x < w; x++)
++                if (row[x] < 1.0f) { below++; if (row[x] < *mn) *mn = row[x]; if (row[x] > *mx) *mx = row[x]; }
++        }
++        if (f) fclose(f);
++        D3D12_RANGE wr = {0, 0}; rb->lpVtbl->Unmap(rb, 0, &wr);
++    }
++    rb->lpVtbl->Release(rb);
++    return below;
++}
++/* Dump directory while the frame after a LD_SURF_DUMP trigger runs: every
++ * zeta snapshot a draw samples is written then (the shadow maps are reused
++ * within a frame, so the state at the present is not the one the lights read). */
++static const char* g_zd_dir;
++static u32 g_zd_seq;
++static void ld_zd_after_draw(void)
++{
++    if (g_zd_dir) {
++        static u32 last_zi_frame[64]; static u32 dumped_draw[64];
++        for (u32 k = 0; k < g_zp_n_notes && g_zd_seq < 64; k++) {
++            const ld_zp_note_t* n = &g_zp_notes[k];
++            if (n->zi < 0 || n->why != LD_ZP_SNAP) continue;
++            zdepth_t* z = &g.zdepths[n->zi];
++            /* once per zeta per write generation: snapshot_valid with no new write */
++            const u32 zi = (u32)n->zi & 63u;
++            if (last_zi_frame[zi] == g_ld_frames + 1u && dumped_draw[zi] == (u32)z->draws) continue;
++            static u32 per_zeta[64], per_frame;
++            if (per_frame != g_ld_frames + 1u) { per_frame = g_ld_frames + 1u; memset(per_zeta, 0, sizeof per_zeta); }
++            if (++per_zeta[zi] > 8u && tex_zalias_kind(&n->t) != ZALIAS_SHADOW) continue;
++            last_zi_frame[zi] = g_ld_frames + 1u; dumped_draw[zi] = (u32)z->draws;
++            char path[MAX_PATH * 2]; float mn, mx;
++            snprintf(path, sizeof(path), "%s\\f%06u_zread_%02u_u%u_%08X_fmt%02X_%ux%u.pfm", g_zd_dir,
++                     g_ld_frames, g_zd_seq++, n->unit, z->offset, n->t.format & 0xFFu,
++                     z->snapshot_w, z->snapshot_h);
++            const u64 nb = ld_dump_zeta_pfm(path, z, &mn, &mx);
++            {   /* the draw's inline fragment constants, to recompute the lookup offline */
++                char cp[MAX_PATH * 2];
++                snprintf(cp, sizeof(cp), "%s.fpc", path);
++                FILE* cf = fopen(cp, "wb");
++                if (cf) {
++                    fprintf(cf, "draw %llu frame %u count %u\n", (unsigned long long)g_ld_recent_draw_total,
++                            g_ld_frames, g.fp_constants.count);
++                    for (u32 c = 0; c < g.fp_constants.count; c++)
++                        fprintf(cf, "%08X %08X %08X %08X\n", g.fp_constants.values[c][0], g.fp_constants.values[c][1],
++                                g.fp_constants.values[c][2], g.fp_constants.values[c][3]);
++                    fclose(cf);
++                }
++            }
++            fprintf(stderr, "[zeta-dump] draw=%llu read u%u %u:0x%08X tex=%ux%u fmt=0x%02X zfunc=%u filt=0x%08X "
++                    "pso=%016llx snap=%ux%u below1=%llu min=%.6f max=%.6f\n",
++                    (unsigned long long)g_ld_recent_draw_total, n->unit, z->location, z->offset, n->t.width, n->t.height, n->t.format & 0xFFu,
++                    (n->t.wrap >> 28) & 7u, n->t.filter, (unsigned long long)live_legacy_pso_key(),
++                    z->snapshot_w, z->snapshot_h, (unsigned long long)(nb == UINT64_MAX ? 0 : nb), mn, mx);
++        }
++    }
++}
+ static void ld_zp_points(u32 w, u32 h, u32* xs, u32* ys)
+ {
+     for (u32 k = 0; k < 3; k++) { xs[k] = w * (k + 1u) / 4u; ys[k] = h * (k + 1u) / 4u; }
+@@ -9303,6 +9556,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         draw->cb_used = g.cb_used;
+         draw->vb_used = g.vb_used;
+     }
++    if (ld_gc_enabled())   /* patch 2024 */
++        ld_gc_bind(g_zd_dir != NULL, indexed ? dc.n_verts : n_tri, n_tri,
++                   indexed ? (const u32*)((u8*)g.ib_mapped + g.ib_used) : NULL,
++                   target, current_zslot, &sf, prim, indexed);
+     if (indexed) {
+         D3D12_INDEX_BUFFER_VIEW ibv;
+         ibv.BufferLocation =
+@@ -9335,6 +9592,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     }
+     static int zp_on = -1;   /* patch 2022: LD_ZPROBE */
+     if (zp_on < 0) zp_on = getenv("LD_ZPROBE") != NULL;
++    ld_zd_after_draw();   /* patch 2024 */
++    if (!zp_on) g_zp_n_notes = 0;
+     if (zp_on) {
+         render_state_t zp_state;
+         decode_render_state(&zp_state);
+@@ -9593,8 +9852,20 @@ static int make_root_signature(void)
+         vsmp[i].ShaderRegister = i;
+         vsmp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+     }
++    /* Patch 2024 (LD_GEOM_CAPTURE): u0 table and b2 guard constants for the vertex stage. */
++    D3D12_ROOT_PARAMETER xp7[7]; D3D12_DESCRIPTOR_RANGE gcrange = {0};
++    memcpy(xp7, xp, sizeof xp); memset(&xp7[5], 0, 2 * sizeof xp7[0]);
++    gcrange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; gcrange.NumDescriptors = 1;
++    xp7[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    xp7[5].DescriptorTable.NumDescriptorRanges = 1;
++    xp7[5].DescriptorTable.pDescriptorRanges = &gcrange;
++    xp7[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
++    xp7[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    xp7[6].Constants.ShaderRegister = 2; xp7[6].Constants.Num32BitValues = 4;
++    xp7[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+     D3D12_ROOT_SIGNATURE_DESC rsd = {0};
+     rsd.NumParameters = 5; rsd.pParameters = xp;
++    if (ld_gc_enabled()) { rsd.NumParameters = 7; rsd.pParameters = xp7; }
+     /* Patch 2011: comparison samplers for shadow-compare units at s16 + F,
+      * F = RSX texture zfunc. RPCS3 reverses the function (VKDraw.cpp
+      * get_compare_func(..., true)): GEQUAL -> LESS_EQUAL. Linear (PCF),
+@@ -11443,8 +11714,27 @@ static void ld_present_body(u32 buffer_id)
+         /* Re-arms when the file goes away, so each appearance dumps once. */
+         if (gf && sd) { FILE* f = fopen(gf, "rb"); gate = f != NULL; if (f) fclose(f);
+                         if (!gate) done = 0; } }
++      if (g_zd_dir) {   /* patch 2024: end of the capture frame */
++          const char* sd = g_zd_dir;
++          for (u32 i = 0; i < g.n_zdepths; i++) {   /* patch 2024: zetas as PFM */
++              zdepth_t* z = &g.zdepths[i];
++              zdepth_snapshot(1 + i);
++              char path[MAX_PATH * 2]; float mn, mx;
++              snprintf(path, sizeof(path), "%s\\f%06u_zeta_%02u_%08X_d%u_%ux%u.pfm",
++                       sd, g_ld_frames, i, z->offset, z->depth_format, z->snapshot_w, z->snapshot_h);
++              const u64 nb = ld_dump_zeta_pfm(path, z, &mn, &mx);
++              fprintf(stderr, "[zeta-dump] slot=%u %u:0x%08X backing=%ux%u snap=%ux%u depth_fmt=%u "
++                      "draws=%llu below1=%llu min=%.6f max=%.6f\n", i, z->location, z->offset, z->w, z->h,
++                      z->snapshot_w, z->snapshot_h, z->depth_format, (unsigned long long)z->draws,
++                      (unsigned long long)(nb == UINT64_MAX ? 0 : nb), mn, mx);
++          }
++          ld_gc_finish(sd);
++      }
++      g_zd_dir = NULL;   /* patch 2024: the read dumps and the capture cover one frame */
+       if (sd && sd[0] && !done && gate) {
+           done = 1;
++          g_zd_dir = sd; g_zd_seq = 0;
++          ld_gc_start(sd);
+           for (u32 i = 0; i < g.n_surfaces; i++) {
+               char path[MAX_PATH * 2];
+               snprintf(path, sizeof(path), "%s\\f%06u_surf_%02u_%08X_%ux%u.ppm",

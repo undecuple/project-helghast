@@ -1,0 +1,207 @@
+# Release build: the Inno Setup installer and the portable zip on a GitHub Windows runner.
+#
+# Triggers: a pushed tag vMAJOR.MINOR.PATCH (publishes a GitHub release) and workflow_dispatch (a dry run: builds and
+# uploads the workflow artifact, never publishes). Nothing runs on a push to a branch or on a pull request.
+# Release rules: the version comes from the tag and must equal tools/release/names.py VERSION (the same string as the
+# exe, installer, launcher and CITATION.cff, tools/release/test_version_agree.py); the release is a pre-release
+# while the major version is 0; its title is the tag; SHA256SUMS sits beside the assets; an existing release is never
+# touched, no tag is created, moved or deleted, and no asset is overwritten.
+# The release is created as a draft: the maintainer reads the notes and publishes it.
+#
+# Third-party pieces: actions/checkout and actions/upload-artifact (GitHub, MIT), Inno Setup 6.7.3 (Inno Setup
+# License; the vendor installer, pinned by SHA-256, when the runner image lacks it), the gh CLI (MIT, on the image); downloads at build time,
+# each pinned by SHA-256 in tools/release/toolchain.json or installer/art/art.json: llvm-mingw (Apache-2.0 WITH
+# LLVM-exception; mingw-w64 and winpthreads licences), the Python embeddable package (PSF), CMake (BSD-3-Clause),
+# Ninja (Apache-2.0), Rajdhani (SIL OFL 1.1).
+# Nothing of the game is used or produced here: the installer carries sources, the toolkit and the toolchain only.
+#
+# Published files (names from tools/release/names.py, checked by tools/release/test_names.py):
+#   Project-Helghast-setup.exe, Project-Helghast-setup.exe.sha256,
+#   Project-Helghast-<version>-portable.zip, Project-Helghast-<version>-portable.zip.sha256
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:   # dry run only: no inputs, version = names.py VERSION, publishing is skipped
+
+permissions:
+  contents: read    # default for every job; only the publishing job below gets write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  installer:
+    permissions:
+      contents: write   # gh release create/upload on a tag; nothing else is written
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      INNO_VERSION: "6.7.3"   # WizardStyle dark needs 6.6.0+; 6.7.3 is the version tested under Proton
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash          # Git Bash on the image: the same scripts as the Linux build
+    steps:
+      # Git for Windows checks text files out with CRLF by default: the bash scripts would stop on "\r", and the
+      # ps3recomp patches carry their sources' line ends byte for byte. Keep the repository's bytes.
+      - name: Line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      # The scripts call python3; the image has python.exe (a WindowsApps python3 may be the store stub).
+      - name: python3 on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\nexec python "$@"\n' > "$RUNNER_TEMP/bin/python3"
+          chmod +x "$RUNNER_TEMP/bin/python3"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Version (from the tag; must equal names.py VERSION)
+        id: ver
+        run: |
+          want=$(python3 -c 'import sys; sys.path.insert(0, "tools/release"); import names; print(names.VERSION)')
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            v="${GITHUB_REF_NAME#v}"
+            case "$v" in
+              *[!0-9.]*|.*|*.|*..*|"") echo "::error::tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH"; exit 1 ;;
+            esac
+            if [ "$v" != "$want" ]; then
+              echo "::error::tag $GITHUB_REF_NAME says $v but tools/release/names.py VERSION is $want"; exit 1
+            fi
+          else
+            v="$want"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Host tests of the release tools
+        # every test runs; the step fails at the end and names the failed ones
+        run: |
+          failed=""
+          for t in tools/release/test_*.py; do
+            python3 "$t" || failed="$failed $t"
+          done
+          if [ -n "$failed" ]; then echo "::error::failed host tests:$failed"; exit 1; fi
+
+      - name: Toolchain manifest (every download pinned)
+        run: python3 tools/release/fetch_toolchain.py --check --strict
+
+      - name: Toolkit (ps3recomp at its pinned commit with port/patches applied)
+        run: tools/ps3recomp-patched.sh
+
+      - name: Fonts (Rajdhani Medium + Bold, SIL OFL; hash-checked against installer/art/art.json)
+        # setup's headings and the game's error notice (payload fonts/, assemble_payload.py checks the pins again)
+        run: python3 tools/release/installer_art.py --fetch-fonts
+
+      - name: Toolchain (llvm-mingw, Python, CMake, Ninja; SHA-256 checked)
+        run: python3 tools/release/fetch_toolchain.py
+
+      - name: Launcher (built with the bundled llvm-mingw)
+        run: |
+          B=work/release/toolchain-cache/trees/llvm-mingw/bin
+          # windres runs its preprocessor (gcc/clang) from PATH, so the bundled bin folder goes first
+          export PATH="$PWD/$B:$PATH"
+          CC="$B/x86_64-w64-mingw32-gcc.exe" WINDRES="$B/x86_64-w64-mingw32-windres.exe" \
+            tools/release/build_launcher.sh build/launcher
+
+      - name: SDL3 (official libsdl-org release zip, SHA-256 pinned in toolchain.json)
+        # the DLL the game loads for native pads; hash-checked through the same fetch path as the toolchain
+        run: |
+          python3 tools/release/fetch_toolchain.py --only sdl3
+          T=work/release/toolchain-cache/trees/sdl3
+          python3 tools/release/stage_sdl3.py --dll "$T/SDL3.dll" --license "$T/LICENSE.txt"
+
+      - name: Assemble the payload
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 tools/release/assemble_payload.py --out build/release-payload --version "$VERSION" \
+            --toolchain work/release/toolchain-cache --launcher "build/launcher/Project Helghast.exe"
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          # Always the pinned version: an older Inno Setup on the image would stop kz3.iss at its 6.6.0 #error.
+          # ISCC.exe carries no ProductVersion; the uninstaller (unins000.exe) next to it does.
+          $dir = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          $iscc = Join-Path $dir "ISCC.exe"
+          $unins = Join-Path $dir "unins000.exe"
+          $have = if ((Test-Path $iscc) -and (Test-Path $unins)) { (Get-Item $unins).VersionInfo.ProductVersion } else { "" }
+          Write-Host "Inno Setup on the image: '$have'"
+          if (-not "$have".StartsWith($env:INNO_VERSION)) {
+            # Official installer from jrsoftware.org, checked against the SHA-256 pinned in tools/release/toolchain.json
+            # (build_tools); a mismatch fails the job before anything is run (no unverified download runs).
+            $pin = (Get-Content tools/release/toolchain.json -Raw | ConvertFrom-Json).build_tools | Where-Object name -eq innosetup
+            if ($pin.version -ne $env:INNO_VERSION) { Write-Error "INNO_VERSION $env:INNO_VERSION != pinned $($pin.version)"; exit 1 }
+            $exe = Join-Path $env:RUNNER_TEMP "innosetup-$($pin.version).exe"
+            Invoke-WebRequest -Uri $pin.url.Replace("{version}", $pin.version) -OutFile $exe
+            $got = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $pin.sha256) { Write-Error "Inno Setup SHA-256 mismatch: got $got, pinned $($pin.sha256)"; exit 1 }
+            $p = Start-Process $exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER" -Wait -PassThru
+            if ($p.ExitCode) { Write-Error "Inno Setup install exit $($p.ExitCode)"; exit 1 }
+            # /CURRENTUSER installs under %LOCALAPPDATA%\Programs
+            $iscc = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) { Write-Error "ISCC not found"; exit 1 }
+          (Get-Item (Join-Path (Split-Path $iscc) "unins000.exe")).VersionInfo.ProductVersion
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build the installer
+        shell: pwsh
+        # Crash reports (opt-in, the installer's Advanced page): kz3.iss reads the address from this secret at compile
+        # time; it is never in the repository. Unset = the setup's crash-report box is greyed out.
+        env:
+          # Tag builds only: a manual dispatch from a branch gets no DSN.
+          VERSION: ${{ steps.ver.outputs.version }}
+          KZ3_SENTRY_DSN: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.KZ3_SENTRY_DSN || '' }}
+        run: |
+          & $env:ISCC "/DAppVersion=$env:VERSION" "/DPayload=$PWD\build\release-payload" installer\kz3.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $exe = Get-Item installer\Output\Project-Helghast-setup.exe
+          $h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          # "HASH  NAME" with LF and no BOM, the same bytes as pack_zip.py's .sha256 (sha256sum -c reads both)
+          [IO.File]::WriteAllText("$PWD\installer\Output\Project-Helghast-setup.exe.sha256", "$h  $($exe.Name)`n", (New-Object Text.UTF8Encoding $false))
+          Get-Content installer\Output\Project-Helghast-setup.exe.sha256
+
+      - name: Portable zip (and its .sha256)
+        run: |
+          python3 tools/release/pack_zip.py --payload build/release-payload --out installer/Output
+          ls -l installer/Output
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: Project-Helghast-${{ steps.ver.outputs.version }}
+          path: |
+            installer/Output/Project-Helghast-setup.exe
+            installer/Output/Project-Helghast-setup.exe.sha256
+            installer/Output/Project-Helghast-*-portable.zip
+            installer/Output/Project-Helghast-*-portable.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      # Tag pushes only; a dispatch never publishes. A draft pre-release (major 0) titled with the tag. If a release for
+      # the tag already exists the job fails: nothing is edited, re-uploaded or clobbered, and no tag is touched
+      # (--verify-tag refuses to create one).
+      - name: Draft release with SHA256SUMS (tag pushes only)
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          cd installer/Output
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::error::a release for $GITHUB_REF_NAME already exists; refusing to touch it"; exit 1
+          fi
+          sha256sum Project-Helghast-setup.exe Project-Helghast-*-portable.zip > SHA256SUMS
+          cat SHA256SUMS
+          pre=""; case "$VERSION" in 0.*) pre="--prerelease" ;; esac
+          printf '%s\n' "Project Helghast $VERSION. Windows installer and portable zip. You need your own Killzone 3 disc dump and the 1.14 update; neither is included or downloaded. SHA-256 sums: SHA256SUMS (and the .sha256 files). See the README for what it does and what goes online." > notes.txt
+          gh release create "$GITHUB_REF_NAME" --draft $pre --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.txt \
+            Project-Helghast-setup.exe Project-Helghast-setup.exe.sha256 \
+            Project-Helghast-*-portable.zip Project-Helghast-*-portable.zip.sha256 SHA256SUMS

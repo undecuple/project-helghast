@@ -1,0 +1,98 @@
+KZ3 patch 1049 (SPU pass 35): count the cellSpursReadyCountStore/Swap/CompareAndSwap calls per workload and how often the instance ready byte actually changes ([spurs-ready] every 10 s from the watcher; patch 1045's witness), plus kz3_spurs_runs_brief() for the audio diagnostics.
+
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -449,6 +449,14 @@
+ #define KZ3_KT_MAX 8
+ static volatile u32 s_run_wid[MAX_SPURS_INST][KZ3_KT_MAX];
+ static volatile u64 s_run_t0[MAX_SPURS_INST][KZ3_KT_MAX], s_run_rep[MAX_SPURS_INST][KZ3_KT_MAX];
++/* KZ3 patch 1049 (SPU pass 35): how often the three ReadyCount imports are called per wid and how often the
++ * instance byte actually changes (patch 1045's witness: the POKE scan is consumed by the dispatch loop first).
++ * [0] = Store, [1] = Swap, [2] = CompareAndSwap; printed by the watcher every 10 s as [spurs-ready]. */
++static volatile long s_kz3_ready_calls[3][CELL_SPURS_MAX_WORKLOAD], s_kz3_ready_chg[3][CELL_SPURS_MAX_WORKLOAD];
++#define KZ3_READY_WRITE(kind, spurs_, wid_, value_) do {                                                           \
++        volatile u8* _p = vm_base + (u32)(uintptr_t)(spurs_) + SPURS_WKL_READY1 + (wid_);                          \
++        u8 _old = *_p; *_p = (u8)(value_);                                                                          \
++        s_kz3_ready_calls[kind][wid_]++; if (_old != (u8)(value_)) s_kz3_ready_chg[kind][wid_]++; } while (0)
+ static volatile int s_run_join[MAX_SPURS_INST][KZ3_KT_MAX];
+ /* kz3-spurs-runstate end */
+ static struct { struct SpursInst* si; int k; } s_kt_arg[MAX_SPURS_INST][8];
+@@ -1843,9 +1851,28 @@
+ }
+ /* kz3-spurs-report end */
+ 
++/* KZ3 patch 1049: one line per kernel thread of every live instance: "k0:w5/12ms k1:-" (wid in a run and its
++ * elapsed ms, or "-" idle); for the audio diagnostics (patch 1050: what SPURS was doing when a mix block was empty). */
++int kz3_spurs_runs_brief(char* buf, int n)
++{
++    int o = 0; u64 now = GetTickCount64();
++    for (int j = 0; j < MAX_SPURS_INST && o < n - 24; j++) {
++        if (!s_inst[j].ea) continue;
++        for (int kt = 0; kt < KZ3_KT_MAX && kt < s_inst[j].nthreads && o < n - 24; kt++) {
++            u64 t0 = s_run_t0[j][kt];
++            if (t0) o += snprintf(buf + o, (size_t)(n - o), "%sk%d:w%u/%llums", o ? " " : "", kt, s_run_wid[j][kt],
++                                  (unsigned long long)kz3_spurs_elapsed_ms(now, t0));
++            else o += snprintf(buf + o, (size_t)(n - o), "%sk%d:-", o ? " " : "", kt);
++        }
++    }
++    if (!o && n) buf[0] = 0;
++    return o;
++}
++
+ static DWORD WINAPI spurs_watch_thread(LPVOID p)
+ {
+     (void)p;
++    static u64 s_kz3_ready_rep = 0;   /* KZ3 patch 1049 */
+     int sm = 3000;
+     { const char* e = getenv("SPURS_STUCK_MS"); if (e) sm = atoi(e); }
+     if (sm <= 0) return 0;
+@@ -1868,6 +1895,22 @@
+                     kz3_spurs_report_stuck_run(j, kt, rw, d, "[spurs-stuck]");
+                 }
+             }
++            /* KZ3 patch 1049: ReadyCount import calls and instance-byte changes, every 10 s. */
++            if (j == 0 && now - s_kz3_ready_rep >= 10000) {
++                char line[400]; int o = 0; long tot[3] = {0, 0, 0}, chg[3] = {0, 0, 0};
++                s_kz3_ready_rep = now;
++                for (u32 w = 0; w < CELL_SPURS_MAX_WORKLOAD; w++) {
++                    long c = s_kz3_ready_calls[0][w] + s_kz3_ready_calls[1][w] + s_kz3_ready_calls[2][w];
++                    for (int k = 0; k < 3; k++) { tot[k] += s_kz3_ready_calls[k][w]; chg[k] += s_kz3_ready_chg[k][w]; }
++                    if (c && o < (int)sizeof line - 48)
++                        o += snprintf(line + o, sizeof line - (size_t)o, " w%u:%ld/%ld,%ld/%ld,%ld/%ld", w,
++                                      s_kz3_ready_calls[0][w], s_kz3_ready_chg[0][w], s_kz3_ready_calls[1][w],
++                                      s_kz3_ready_chg[1][w], s_kz3_ready_calls[2][w], s_kz3_ready_chg[2][w]);
++                }
++                fprintf(stderr, "[spurs-ready] t=%llus store=%ld/%ld swap=%ld/%ld cas=%ld/%ld (calls/byte changed) per wid:%s\n",
++                        (unsigned long long)((now - s_t_start) / 1000), tot[0], chg[0], tot[1], chg[1], tot[2], chg[2],
++                        o ? line : " none");
++            }
+             for (u32 w = 0; w < 16; w++) {
+                 u8 cc = *(vm_base + ea + SPURS_WKL_CURCONT + w);
+                 int running = 0, run_wid = -1;   /* patch 1047: any kernel thread in a run of w / the last running wid */
+@@ -2224,7 +2267,7 @@
+ 
+     s_workloads[wid].readyCount = value;
+     /* The real store: the instance byte the kernel (poll thread) watches. */
+-    *(vm_base + (u32)(uintptr_t)spurs + SPURS_WKL_READY1 + wid) = (u8)value;
++    KZ3_READY_WRITE(0, spurs, wid, value);   /* KZ3 patch 1049: counted */
+     {   static int _n = 0;
+         if (_n < 32)
+             printf("[cellSpurs] ReadyCountStore(wid=%u, value=%u)\n", wid, value);
+@@ -2248,7 +2291,7 @@
+      * (SPURS_WKL_READY1 + wid), which ReadyCountStore writes; Swap and CompareAndSwap only kept the host copy, so
+      * a title kicking through these imports (KZ3's WWS job queues, func_0008978C) ran its job managers on the
+      * idle cadence only (zero POKE lines in a whole run). Upstream candidate. */
+-    *(vm_base + (u32)(uintptr_t)spurs + SPURS_WKL_READY1 + wid) = (u8)value;
++    KZ3_READY_WRITE(1, spurs, wid, value);   /* KZ3 patch 1049: counted */
+     return CELL_OK;
+ }
+ 
+@@ -2295,7 +2338,7 @@
+     vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
+     if (s_workloads[wid].readyCount == compare) {
+         s_workloads[wid].readyCount = value;
+-        *(vm_base + (u32)(uintptr_t)spurs + SPURS_WKL_READY1 + wid) = (u8)value;   /* KZ3 patch 1045 */
++        KZ3_READY_WRITE(2, spurs, wid, value);   /* KZ3 patch 1045, counted by 1049 */
+     }
+ 
+     return CELL_OK;

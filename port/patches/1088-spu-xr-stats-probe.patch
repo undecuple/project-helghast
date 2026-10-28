@@ -1,0 +1,167 @@
+KZ3 patch 1088 (SPU pass 67, diagnostic, opt-in): KZ3_SPU_XRSTATS=1 counts the exponent-255 recompute lanes of
+patch 1071/1079 (spu__xr_fix, and the fma family's slow path) by op and operand class, by call site (the cold
+function's return address, i.e. the lifted function) and by exponent-255 word; kz3_spu_xr_note in spu_drain.c prints a
+summary every 2^20 lanes ([spu-xr] lines). Off by default: one load on the cold path. Results unchanged either way.
+
+--- a/runtime/spu/spu_drain.c	2026-10-14 13:13:30.463890021 -0500
++++ b/runtime/spu/spu_drain.c	2026-10-14 13:51:08.646448366 -0500
+@@ -45,8 +45,100 @@
+         fprintf(stderr, "[spu-fma] fallback vectors=%llu lanes: naninf=%llu overflow=%llu subnormal=%llu midpoint=%llu ftz=%d\n",
+                 n, g_kz3_fma_fb[0], g_kz3_fma_fb[1], g_kz3_fma_fb[2], g_kz3_fma_fb[3], g_kz3_spu_slowcg == 0);
+ }
++/* KZ3 patch 1088 (SPU pass 67, diagnostic): KZ3_SPU_XRSTATS=1. Per recomputed lane: op and the class of each
++ * operand (0 exponent 0, 1 normal, 2 0xFFFFFFFF, 3 0x7FFFFFFF, 4 other +exp255, 5 other -exp255; c only for fma),
++ * the host call site (return address of the cold function = the lifted function's code) and every exponent-255
++ * operand word. Shared tables, relaxed atomics (opt-in, perturbs the run). A summary every 2^20 lanes. */
++int g_kz3_xr_stats = 0;
++#define XRS_SITES 1024
++#define XRS_WORDS 512
++static unsigned long long s_xrs_key[32 * 216], s_xrs_lanes, s_xrs_vec;
++static uintptr_t s_xrs_ra[XRS_SITES]; static unsigned long long s_xrs_ran[XRS_SITES];
++static uint32_t s_xrs_w[XRS_WORDS]; static unsigned long long s_xrs_wn[XRS_WORDS];
++static int xrs_cls(uint32_t x)
++{
++    const uint32_t e = x & 0x7F800000u;
++    if (!e) return 0;
++    if (e != 0x7F800000u) return 1;
++    if (x == 0xFFFFFFFFu) return 2;
++    if (x == 0x7FFFFFFFu) return 3;
++    return x >> 31 ? 5 : 4;
++}
++static void xrs_word(uint32_t w)
++{
++    unsigned h = (w * 2654435761u) >> 23;
++    for (int k = 0; k < 16; k++, h = (h + 1) & (XRS_WORDS - 1)) {
++        uint32_t cur = __atomic_load_n(&s_xrs_w[h], __ATOMIC_RELAXED);
++        if (cur == 0 && __atomic_compare_exchange_n(&s_xrs_w[h], &cur, w, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) cur = w;
++        if (cur == w) { __atomic_fetch_add(&s_xrs_wn[h], 1, __ATOMIC_RELAXED); return; }
++    }
++}
++static void xrs_dump(void)
++{
++#if defined(_WIN32)
++    extern char __ImageBase;   /* sites as rva: subtract the exe's load address */
++    const uintptr_t base = (uintptr_t)&__ImageBase;
++#else
++    const uintptr_t base = 0;
++#endif
++    fprintf(stderr, "[spu-xr] lanes=%llu vectors=%llu base=%p (op ca cb cc: lanes; classes 0 exp0 1 normal 2 FFFFFFFF 3 7FFFFFFF 4 +e255 5 -e255)\n",
++            s_xrs_lanes, s_xrs_vec, (void*)base);
++    for (int t = 0; t < 12; t++) {
++        int bi = -1; unsigned long long bn = 0;
++        for (int i = 0; i < 32 * 216; i++) if (!(s_xrs_key[i] >> 62) && s_xrs_key[i] > bn) { bn = s_xrs_key[i]; bi = i; }
++        if (bi < 0) break;
++        fprintf(stderr, "[spu-xr]  key op=%d ca=%d cb=%d cc=%d n=%llu\n", bi / 216, bi / 36 % 6, bi / 6 % 6, bi % 6, bn);
++        s_xrs_key[bi] |= 1ull << 62;
++    }
++    for (int i = 0; i < 32 * 216; i++) s_xrs_key[i] &= ~(1ull << 62);
++    for (int t = 0; t < 10; t++) {
++        int bi = -1; unsigned long long bn = 0;
++        for (int i = 0; i < XRS_SITES; i++) if (!(s_xrs_ran[i] >> 62) && s_xrs_ran[i] > bn) { bn = s_xrs_ran[i]; bi = i; }
++        if (bi < 0) break;
++        fprintf(stderr, "[spu-xr]  site rva=0x%llx n=%llu\n", (unsigned long long)(s_xrs_ra[bi] - base), bn);
++        s_xrs_ran[bi] |= 1ull << 62;
++    }
++    for (int i = 0; i < XRS_SITES; i++) s_xrs_ran[i] &= ~(1ull << 62);
++    for (int t = 0; t < 10; t++) {
++        int bi = -1; unsigned long long bn = 0;
++        for (int i = 0; i < XRS_WORDS; i++) if (!(s_xrs_wn[i] >> 62) && s_xrs_wn[i] > bn) { bn = s_xrs_wn[i]; bi = i; }
++        if (bi < 0) break;
++        fprintf(stderr, "[spu-xr]  word 0x%08X n=%llu\n", s_xrs_w[bi], bn);
++        s_xrs_wn[bi] |= 1ull << 62;
++    }
++    for (int i = 0; i < XRS_WORDS; i++) s_xrs_wn[i] &= ~(1ull << 62);
++}
++void kz3_spu_xr_note(int op, unsigned m, const uint32_t* a, const uint32_t* b, const uint32_t* c, const uint32_t* r,
++                     const void* ra)
++{
++    (void)r;
++    unsigned nl = 0;
++    for (int i = 0; i < 4; i++) {
++        if (!(m >> i & 1)) continue;
++        nl++;
++        const int ca = xrs_cls(a[i]), cb = xrs_cls(b[i]), cc = c ? xrs_cls(c[i]) : 0;
++        __atomic_fetch_add(&s_xrs_key[(op & 31) * 216 + ca * 36 + cb * 6 + cc], 1, __ATOMIC_RELAXED);
++        if (ca >= 2) xrs_word(a[i]);
++        if (cb >= 2) xrs_word(b[i]);
++        if (cc >= 2) xrs_word(c[i]);
++    }
++    const uintptr_t p = (uintptr_t)ra;
++    unsigned h = (unsigned)((p >> 2) * 2654435761u) & (XRS_SITES - 1);
++    for (int k = 0; k < 32; k++, h = (h + 1) & (XRS_SITES - 1)) {
++        uintptr_t cur = __atomic_load_n(&s_xrs_ra[h], __ATOMIC_RELAXED);
++        if (cur == 0 && __atomic_compare_exchange_n(&s_xrs_ra[h], &cur, p, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) cur = p;
++        if (cur == p) { __atomic_fetch_add(&s_xrs_ran[h], nl, __ATOMIC_RELAXED); break; }
++    }
++    __atomic_fetch_add(&s_xrs_vec, 1, __ATOMIC_RELAXED);
++    const unsigned long long before = __atomic_fetch_add(&s_xrs_lanes, nl, __ATOMIC_RELAXED);
++    if ((before >> 20) != ((before + nl) >> 20)) {
++        static volatile int s_lock;
++        if (!__atomic_exchange_n(&s_lock, 1, __ATOMIC_ACQUIRE)) { xrs_dump(); __atomic_store_n(&s_lock, 0, __ATOMIC_RELEASE); }
++    }
++}
+ __attribute__((constructor)) static void kz3_spu_fastcg_init(void)
+ {
++    g_kz3_xr_stats = getenv("KZ3_SPU_XRSTATS") && *getenv("KZ3_SPU_XRSTATS") == '1';   /* patch 1088 */
+     const char* e = getenv("KZ3_SPU_FASTCG");
+     if (e && *e >= '0' && *e <= '9') g_kz3_spu_fastcg_level = atoi(e);
+     if (e && *e == '1' && !e[1]) g_kz3_spu_fastcg_level = 1 << 30;   /* "1" = on (round-27 runs used 0/1) */
+--- a/runtime/spu/spu_helpers.h	2026-10-14 13:13:30.466890088 -0500
++++ b/runtime/spu/spu_helpers.h	2026-10-14 13:13:42.608905030 -0500
+@@ -242,7 +242,13 @@
+ #  define SPU_XR_COLD static __attribute__((noinline, cold))
+ #endif
+ enum { SPU_XR_FA, SPU_XR_FS, SPU_XR_FM, SPU_XR_FCEQ, SPU_XR_FCGT, SPU_XR_FCMEQ, SPU_XR_FCMGT,
+-       SPU_XR_CFLTS, SPU_XR_CFLTU, SPU_XR_CSFLT, SPU_XR_CUFLT };
++       SPU_XR_CFLTS, SPU_XR_CFLTU, SPU_XR_CSFLT, SPU_XR_CUFLT, SPU_XR_FMA };
++/* KZ3 patch 1088 (SPU pass 67, diagnostic, opt-in): KZ3_SPU_XRSTATS=1 counts the exponent-255 recompute lanes by op
++ * and operand class, call site and word (kz3_spu_xr_note in spu_drain.c; one summary every 2^20 lanes). Off: one
++ * well-predicted load on the cold path only. */
++extern int g_kz3_xr_stats;
++void kz3_spu_xr_note(int op, unsigned m, const uint32_t* a, const uint32_t* b, const uint32_t* c, const uint32_t* r,
++                     const void* ra);
+ /* Bit i set when word i of a, b or c has biased exponent 255 (spu__xr_mask(a) | spu__xr_mask(b) | spu__xr_mask(c)). */
+ static inline unsigned spu__xr_mask3(u128 a, u128 b, u128 c) {
+ #if defined(__SSE2__)
+@@ -256,8 +262,9 @@
+ #endif
+ }
+ /* The lanes of r selected by m, recomputed exactly (the expressions of the 1071 macros, x = a lane, y = b lane). */
+-SPU_XR_COLD u128 spu__xr_fix(u128 r, u128 a, u128 b, unsigned m, int op, int imm) {
++static inline u128 spu__xr_fix_ra(u128 r, u128 a, u128 b, unsigned m, int op, int imm, const void* ra) {
+     if (!g_kz3_spu_xr) return r;
++    if (__builtin_expect(g_kz3_xr_stats, 0)) kz3_spu_xr_note(op, m, a._u32, b._u32, 0, r._u32, ra);   /* patch 1088 */
+     for (int i = 0; i < 4; i++) {
+         if (!(m >> i & 1)) continue;
+         const uint32_t x = a._u32[i], y = b._u32[i];
+@@ -281,6 +288,9 @@
+     }
+     return r;
+ }
++SPU_XR_COLD u128 spu__xr_fix(u128 r, u128 a, u128 b, unsigned m, int op, int imm) {
++    return spu__xr_fix_ra(r, a, b, m, op, imm, __builtin_return_address(0));
++}
+ /* KZ3 patch 1082 (SPU pass 65): the recompute is called with vector arguments. A u128 argument (a union of integer and
+  * float arrays) is passed in two general registers on SysV x86-64 and by a stack copy on Windows x64; the compiler
+  * built that argument on the inlined op's main path (result stored to the stack and reloaded into rdi/rsi before the
+@@ -290,7 +300,7 @@
+ #if defined(__SSE2__)
+ SPU_XR_COLD __m128 spu__xr_fixv(__m128 r, __m128 a, __m128 b, unsigned m, int op, int imm) {
+     u128 R, A, B; memcpy(&R, &r, 16); memcpy(&A, &a, 16); memcpy(&B, &b, 16);
+-    R = spu__xr_fix(R, A, B, m, op, imm);
++    R = spu__xr_fix_ra(R, A, B, m, op, imm, __builtin_return_address(0));
+     memcpy(&r, &R, 16); return r;
+ }
+ #  define SPU_XR_RET(m, r, a, b, op, imm) do { const unsigned _xm = (m); \
+@@ -641,6 +651,11 @@
+         double sv[4]; _mm_storeu_pd(sv, sl); _mm_storeu_pd(sv + 2, sh);
+         kz3_spu_fma_note(sv, ftz);
+     }
++    if (__builtin_expect(g_kz3_xr_stats, 0)) {   /* patch 1088 */
++        u128 a, b, c; memcpy(&a, &av, 16); memcpy(&b, &bv, 16); memcpy(&c, &cv, 16);
++        const unsigned xm = spu__xr_mask3(a, b, c);
++        if (xm) kz3_spu_xr_note(SPU_XR_FMA | negb << 4 | negc << 5, xm, a._u32, b._u32, c._u32, 0, __builtin_return_address(0));
++    }
+     return spu__fma4_refv(av, bv, cv, negb, negc, cgm);
+ }
+ SPU_HOT u128 spu__fma4(u128 a, u128 b, u128 c, int negb, int negc) {

@@ -1,0 +1,133 @@
+KZ3 patch 2079 (RSX pass 74): texture hashes are skipped while the page bitmap shows no write.
+the RE notes "Pass 74".
+With every writer the walker does not execute itself reporting pages (SPU DMA puts 2033, host file reads 2078), a
+cached texture whose span has no write since its last hash keeps its hash without hashing, at any size and location
+(the 2046 rule hashed every texture under 64 KB every frame: K4's ~500 small entries). Nets for recompiled PPU stores,
+which the bitmap cannot see: a periodic re-hash after P/2+1..P frames per entry (LD_TEX_CLEAN_PERIOD, default 30), and
+an entry whose hash changed with no tracked write is hashed every frame until unchanged for P hashes (dyn bit 2).
+LD_TEX_CLEAN=0: the 2046 rule. LD_TEX_HASH_CHECK=1: hash clean entries anyway and count "bitmap clean, hash differs"
+([tex-clean] miss0/miss1, [tex-clean-miss] lines); [tex-clean] prints every 256 frames under RSX_PERF or the check.
+Host test: tools/smoke/test_guest_write.c KZ3_GW_TIER=3 (Proton); tiers 0-2 run with LD_TEX_CLEAN=0.
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -3290,15 +3290,75 @@
+     return 0;
+ }
+ 
++/* KZ3 patch 2079: clean-bitmap skip. With every guest writer that the renderer cannot execute itself reporting
++ * its pages (SPU DMA puts: 2033; host file reads: 2078; the walker's own stores: 2015/2017/2033), a cached
++ * texture whose span shows no write since its last hash (live bitmap at the bind, the flip-carried `written`
++ * flag) keeps its hash without hashing, whatever its size or location. What the bitmap cannot see are
++ * recompiled PPU stores, so two nets stay:
++ *  - LD_TEX_CLEAN_PERIOD=P (default 30 frames): a clean entry is re-hashed after P/2+1..P frames (a per-entry
++ *    phase from its offset spreads the level-start crowd over the period), so a texture filled by PPU stores is
++ *    at most P frames stale. 30 frames = 1-2 s at K4's 15-30 fps, at 1/16-1/30 of the per-frame cost.
++ *  - an entry whose hash changed with no tracked write (an unseen writer: PPU stores, a movie plane decoded by
++ *    the PPU) is hashed every frame until it stayed unchanged for P hashes in a row (dyn bit 2).
++ * LD_TEX_HASH_CHECK=1 hashes every clean entry anyway and counts "bitmap clean, hash differs" per location
++ * ([tex-clean] miss0/miss1 and [tex-clean-miss] lines); it must stay 0 where the bitmap is exact.
++ * LD_TEX_CLEAN=0: the patch-2046 rule (size tier, LD_TEX_HASH_SPAN/BIG). */
++#define LD_TEX_CLEAN_PERIOD_DEFAULT 30u
++static int ld_tex_clean_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_TEX_CLEAN"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++static u32 ld_tex_clean_period(void)
++{
++    static long long per = -1;
++    if (per < 0) {
++        const char* e = getenv("LD_TEX_CLEAN_PERIOD");
++        per = e ? atoll(e) : (long long)LD_TEX_CLEAN_PERIOD_DEFAULT;
++        if (per < 0) per = 0;   /* 0 = no periodic net */
++        if (per > 0xFFFFll) per = 0xFFFFll;
++    }
++    return (u32)per;
++}
++static int ld_tex_hash_check(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_TEX_HASH_CHECK"); on = (e && e[0] && e[0] != '0') ? 1 : 0; }
++    return on;
++}
++/* Frames a clean entry may go unhashed: P/2+1..P by offset (2079). */
++static u32 ld_tex_clean_limit(u32 offset, u32 per)
++{
++    const u32 half = (per + 1u) / 2u;
++    return per - (((offset >> 6) * 2654435761u) >> 16) % half;
++}
++static u32 g_ld_tc_pending;   /* walker: 0, or the clean-rule reason of the decision in flight (1 net, 2 check) */
++static struct { u64 skipped, net, checked, pinned, miss_net[2], miss_check[2]; } g_ld_tc;
++
+ /* Walker, at a hash decision: hash now, or keep the cached decode for this frame? */
+ static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_frame, u32 quiet, u32* written,
+                            u32* skip_frame, u32* dyn)
+ {
+     const int n = ld_tex_hash_span();
+     const u32 big = ld_tex_hash_big();   /* patch 2046 */
++    g_ld_tc_pending = 0;
+     if (location > 1u || !span) return 1;   /* never rate-limited; `written` stays as it is for the stat */
+     if (*written) return 1;
+     if (ld_td_test((const u32*)g_ld_td[location], offset, span)) { *written = 1; return 1; }
++    if (ld_tex_clean_on()) {   /* patch 2079 */
++        const u32 per = ld_tex_clean_period();
++        if (*dyn & 2u) {
++            if (quiet < (per ? per : 1u)) { g_ld_tc.pinned++; return 1; }
++            *dyn &= ~2u;   /* the unseen writer went quiet */
++        }
++        if (ld_tex_hash_check()) { g_ld_tc_pending = 2; g_ld_tc.checked++; return 1; }
++        if (per && g_ld_frames - last_hash_frame >= ld_tex_clean_limit(offset, per)) {
++            g_ld_tc_pending = 1; g_ld_tc.net++; return 1;
++        }
++        if (*skip_frame != g_ld_frames) { *skip_frame = g_ld_frames; g_ld_th.skipped++; g_ld_tc.skipped++; }
++        return 0;
++    }
+     const int due = !n || (big && (span < big || *dyn)) || quiet < (u32)n || g_ld_frames - last_hash_frame >= (u32)n;
+     if (due && n && big && *dyn && span >= big && quiet >= (u32)n && g_ld_frames - last_hash_frame < (u32)n)
+         g_ld_th.dyn_forced++;   /* patch 2046 stat: hashed only because the texture changed once */
+@@ -3318,9 +3378,18 @@
+     g_ld_th.hashes++;
+     if (readable && changed) {
+         g_ld_th.changes++;
+-        if (ld_tex_hash_big()) *dyn = 1;   /* patch 2046: a change means a writer: every frame from now on */
++        if (ld_tex_hash_big()) *dyn |= 1u;   /* patch 2046: a change means a writer: every frame from now on */
+         if (*written) g_ld_th.tracked++;
+         else {
++            *dyn |= 2u;   /* patch 2079: an unseen writer: hashed every frame until quiet */
++            if (g_ld_tc_pending && location < 2u) {   /* patch 2079: the bitmap said clean */
++                static u32 n_miss = 0;
++                if (g_ld_tc_pending == 2u) g_ld_tc.miss_check[location]++; else g_ld_tc.miss_net[location]++;
++                if (++n_miss <= 64 || (n_miss & 1023u) == 0)
++                    fprintf(stderr, "[tex-clean-miss] n=%u by=%s frame=%u src=%u:0x%08X %ux%u fmt=0x%02X span=%u\n",
++                            n_miss, g_ld_tc_pending == 2u ? "check" : "net", g_ld_frames, location, offset, w, h,
++                            fmt, span);
++            }
+             static u32 n_untracked = 0;   /* patch 2046: who the untracked writers are (the evidence for the tier) */
+             g_ld_th.untracked++;
+             if (++n_untracked <= 64 || (n_untracked & 1023u) == 0)
+@@ -3333,6 +3402,7 @@
+         if (*written) g_ld_th.wr_unchanged++;   /* patch 2046 stat: a tracked page flag with no change (64 KB pages) */
+     }
+     *written = 0;
++    g_ld_tc_pending = 0;   /* patch 2079 */
+ }
+ 
+ /* Walker, at the flip: move the live bits aside and flag the entries under them. */
+@@ -3377,6 +3447,16 @@
+         g_ld_b8_direct_n = 0;
+         g_ld_argb_direct_n = 0;
+     }
++    if (ld_tex_clean_on() && (rsx_perf_enabled() || ld_tex_hash_check()) && (g_ld_frames % 256u) == 255u) {
++        fprintf(stderr, "[tex-clean] period=%u check=%d frame=%u skipped=%llu net=%llu checked=%llu pinned=%llu"
++                        " miss0=%llu miss1=%llu net-miss0=%llu net-miss1=%llu\n",   /* patch 2079, per 256 frames */
++                ld_tex_clean_period(), ld_tex_hash_check(), g_ld_frames, (unsigned long long)g_ld_tc.skipped,
++                (unsigned long long)g_ld_tc.net, (unsigned long long)g_ld_tc.checked,
++                (unsigned long long)g_ld_tc.pinned, (unsigned long long)g_ld_tc.miss_check[0],
++                (unsigned long long)g_ld_tc.miss_check[1], (unsigned long long)g_ld_tc.miss_net[0],
++                (unsigned long long)g_ld_tc.miss_net[1]);
++        memset(&g_ld_tc, 0, sizeof g_ld_tc);
++    }
+ }
+ 
+ /* KZ3 patch 2045 diagnostic (RSX_PERF window only): which textures get re-decoded, by source. Patch 2046: exact

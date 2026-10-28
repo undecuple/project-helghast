@@ -1,0 +1,338 @@
+KZ3 patch 2083: review fixes for 2078-2082 (pass 77).
+
+- NV3089 source origin: IMAGE_IN_POINT is u (low 16) / v (high 16) in 12.4 and ds_dx/dt_dy are 12.20, but the
+  guest-memory copies (swizzled and linear) and 2080's row copy added u << 8 (a 12.12 value), reading column u >> 12;
+  the GPU mirror uses (u & 0xFFFF) >> 4. Now u << 16 (row copy: u >> 4). Blits with a source origin >= 16 px wrote
+  the wrong pixels into guest memory. Upstream candidate (cellGcmSys.c nv3089_blit).
+- Location 1 (IO-mapped main memory), where the clean-page hash skip is on by default (2080): PPU stores there noted
+  nothing. The walker now NOTE-marks the EA pages behind each location-1 span it would skip
+  (cellGcm_ppu_note_io_span; ppu_store_note_pages returns the pages it changed, and a span with a fresh page hashes
+  once), the PPU store hook notes IO-mapped EAs as location 1, and an unmap clears the bits.
+- LD_TEX_WRITER diagnostic: one packed u64 per page (frame, mark sequence, source) written in one store, and the
+  verdict compares the mark sequence with the entry's sequence before its last hash (rsx_tex_writer.h), so a tracked
+  write in the hash's own frame is no longer reported as an untracked writer.
+
+Host tests: tools/smoke/test_nv3089_rows.sh (origin check vs the IMAGE_IN_POINT definition), test_tex_writer.sh.
+Refreshed for v0.15.0 (SPU pass 85): upstream's new nv3089_engine_read (draw engine source read-back) had the same
+12.12 end point (u << 8), so for u0 >= 16 px sx1 < sx0 and the read-back was skipped; it now uses << 16 as well.
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 0a4d4ab..9f09b19 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -421,6 +421,8 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
+     }
+ }
+ 
++static int s_ppu_note_on;   /* patch 2083, set by cellGcm_ppu_note_install */
++extern int ppu_store_note_pages(uint32_t ea, uint32_t size, int on) __attribute__((weak));
+ /* Clear offset table entries for an IO mapping */
+ static void clear_offset_table(u32 ea, u32 io, u32 size)
+ {
+@@ -432,6 +434,9 @@ static void clear_offset_table(u32 ea, u32 io, u32 size)
+         s_io_address_table[ea_page + i] = 0xFFFF;
+         s_ea_address_table[io_page + i] = 0xFFFF;
+     }
++    /* KZ3 patch 2083: an unmapped range is no longer location 1: its PPU store NOTE bits go (main memory only;
++     * the local window keeps its bits). */
++    if (s_ppu_note_on && pages && ppu_store_note_pages) ppu_store_note_pages(ea, pages << 20, 0);
+ }
+ 
+ /* Find an IO mapping by EA */
+@@ -1037,7 +1042,10 @@ static struct {
+ } s_nv309e;
+ 
+ /* Execute one NV3089 blit into the currently-bound NV3062 destination surface.
+- * Point-sampled: ds/dx and dt/dy are 20.12 fixed point and are 0x100000 (1.0)
++ * Point-sampled: ds/dx and dt/dy are 12.20 fixed point and are 0x100000 (1.0)
++ * for the straight uploads; IMAGE_IN_POINT is u (low 16) and v (high 16) in 12.4, so a source coordinate is
++ * (u << 16) + x * ds_dx in 12.20 (KZ3 patch 2083: the copies added u << 8, a 12.12 value, so u0 >= 16 px
++ * read 1/256 of the origin and disagreed with the GPU mirror's (u & 0xFFFF) >> 4)
+  * for the straight uploads this exists for; a scaled blit still lands, just
+  * without filtering. */
+ /* Morton/Z-order offset for an NV309E swizzled surface: interleave the low
+@@ -4034,17 +4042,41 @@ void cellGcm_spu_guest_write_hook_install(void)
+  * mip spans). Weak references: host tests link without the PPU runtime. LD_PPU_STORE_NOTE=0 leaves the bits clear
+  * (the old behaviour: PPU stores into local memory note nothing). */
+ extern void ppu_set_store_note_hook(void (*hook)(uint32_t ea, uint32_t size)) __attribute__((weak));
+-extern void ppu_store_note_pages(uint32_t ea, uint32_t size, int on) __attribute__((weak));
++extern int ppu_store_note_pages(uint32_t ea, uint32_t size, int on) __attribute__((weak));
+ static int s_ppu_note_tag;   /* LD_TEX_WRITER on: tag the notes "ppu-store" */
+ static void gcm_ppu_note_pages_ea(uint32_t ea, uint32_t size)
+ {
+-    const u32 off = ea - s_config.localAddress;
+-    if (off >= s_config.localSize) return;
+-    if (size > s_config.localSize - off) size = s_config.localSize - off;
+     if (s_ppu_note_tag) rsx_live_draw_set_write_source(8u);
+-    rsx_live_draw_note_guest_write_pages(0u, off, size);
++    const u32 off = ea - s_config.localAddress;
++    if (off < s_config.localSize) {
++        if (size > s_config.localSize - off) size = s_config.localSize - off;
++        rsx_live_draw_note_guest_write_pages(0u, off, size);
++    } else {
++        gcm_note_pages_ea(ea, size);   /* patch 2083: IO-mapped main memory (location 1) */
++    }
+     if (s_ppu_note_tag) rsx_live_draw_set_write_source(0u);
+ }
++/* KZ3 patch 2083: location 1 (IO-mapped main memory) for the texture cache's clean-page skip, default on there
++ * (2080): PPU stores into IO-mapped pages noted nothing, so a texture a PPU thread rewrote stayed stale up to the
++ * LD_TEX_CLEAN_PERIOD net. The walker calls this for the IO span of each location-1 texture it would skip: the EA
++ * pages behind the span get the PPU store NOTE bit (a whole-map NOTE would send every command-buffer store through
++ * the hook). Returns 1 when every page had the bit already (the bitmap has seen every PPU store since), 0 when it
++ * set one now (the caller hashes once). 1 without the hook (LD_PPU_STORE_NOTE=0: the old rule). */
++int cellGcm_ppu_note_io_span(u32 io, u32 size)
++{
++    if (!s_ppu_note_on || !size) return 1;
++    int fresh = 0;
++    u64 a = io;
++    const u64 end = (u64)io + size;
++    while (a < end) {
++        const u64 next = (a | 0xFFFFFull) + 1u;
++        const u32 n = (u32)((next < end ? next : end) - a);
++        const u16 ea_page = (a >> 20) < 4096u ? s_ea_address_table[a >> 20] : 0xFFFF;
++        if (ea_page != 0xFFFF) fresh += ppu_store_note_pages(((u32)ea_page << 20) | ((u32)a & 0xFFFFFu), n, 1);
++        a = next;
++    }
++    return fresh == 0;
++}
+ void cellGcm_ppu_store_note_install(void)
+ {
+     const char* e = getenv("LD_PPU_STORE_NOTE");
+@@ -4053,6 +4085,7 @@ void cellGcm_ppu_store_note_install(void)
+     s_ppu_note_tag = (w && w[0] && w[0] != '0') ? 1 : 0;
+     ppu_set_store_note_hook(gcm_ppu_note_pages_ea);
+     ppu_store_note_pages(s_config.localAddress, s_config.localSize, 1);
++    s_ppu_note_on = 1;   /* patch 2083 */
+     printf("[cellGcmSys] PPU stores into local memory 0x%08X+0x%X mark texture pages (patch 2082)\n",
+            s_config.localAddress, s_config.localSize);
+ }
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index de93fb1..ee891b1 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -311,6 +311,7 @@ typedef struct {
+     ID3D12Resource* tex;
+     u64 content_hash;
+     u32 last_hash_frame;
++    u32 hash_seq;   /* patch 2083: LD_TEX_WRITER mark sequence read before the last hash */
+     u64 last_use_serial;
+     u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
+     u32 quiet;  /* patch 2033: consecutive hashes that found the same bytes (saturating) */
+@@ -326,6 +327,7 @@ typedef struct {
+     ID3D12Resource* tex;
+     u64 content_hash;
+     u32 last_hash_frame;
++    u32 hash_seq;   /* patch 2083, as texcache_t */
+     u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
+     u32 quiet, written, skip_frame;   /* patch 2033, as texcache_t */
+     u32 dyn;   /* patch 2046, as texcache_t (content change seen) */
+@@ -3281,8 +3283,9 @@ enum { LD_WS_OTHER = 0, LD_WS_SPU, LD_WS_FS, LD_WS_NV0039, LD_WS_NV3089, LD_WS_N
+ static const char* const g_ld_ws_name[LD_WS_N] = { "other", "spu-put", "fs-read", "nv0039", "nv3089", "nv308a",
+                                                    "writeback", "ea-note", "ppu-store" };
+ #define LD_WS_PAGES 4096u
+-static u8 g_ld_ws_src[LD_WS_PAGES];
+-static u32 g_ld_ws_frame[LD_WS_PAGES];
++#include "rsx_tex_writer.h"   /* patch 2083: one packed stamp per page (frame, mark sequence, source) */
++static volatile u64 g_ld_ws[LD_WS_PAGES];
++static volatile LONG g_ld_ws_seq;
+ static __thread u32 t_ld_ws;
+ void rsx_live_draw_set_write_source(u32 src) { t_ld_ws = src < LD_WS_N ? src : 0u; }
+ static int ld_tex_writer_on(void)
+@@ -3298,8 +3301,10 @@ static void ld_td_mark(u32 location, u32 offset, u32 size)
+     if (location > 1u || !size) return;
+     const u64 end = (u64)offset + size - 1u;
+     const u32 p0 = offset >> 16, p1 = (u32)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
+-    if (location == 0u && ld_tex_writer_on())   /* patch 2081 diagnostic */
+-        for (u32 p = p0; p <= p1 && p < LD_WS_PAGES; p++) { g_ld_ws_src[p] = (u8)t_ld_ws; g_ld_ws_frame[p] = g_ld_frames; }
++    if (location == 0u && ld_tex_writer_on()) {   /* patch 2081 diagnostic; 2083: one store per page */
++        const u64 v = ld_ws_pack(g_ld_frames, (u32)InterlockedIncrement(&g_ld_ws_seq), t_ld_ws);
++        for (u32 p = p0; p <= p1 && p < LD_WS_PAGES; p++) g_ld_ws[p] = v;
++    }
+     volatile LONG* td = g_ld_td[location];
+     for (u32 p = p0; ; p++) {
+         const LONG bit = (LONG)(1u << (p & 31u));
+@@ -3376,10 +3381,24 @@ static u32 ld_tex_clean_limit(u32 offset, u32 per)
+ }
+ static u32 g_ld_tc_pending;   /* walker: 0, or the clean-rule reason of the decision in flight (1 net, 2 check) */
+ static u32 g_ld_tc_last_hash;   /* patch 2081: last_hash_frame of the decision in flight */
++static u32 g_ld_tc_last_seq;    /* patch 2083: the entry's hash_seq (mark sequence before its last hash) */
+ static struct { u64 skipped, net, checked, pinned, miss_net[2], miss_check[2]; } g_ld_tc;
+ 
+-/* Walker, at a hash decision: hash now, or keep the cached decode for this frame? */
++static int ld_tex_hash_due_body(u32 location, u32 offset, u32 span, u32 last_hash_frame, u32 quiet, u32* written,
++                                u32* skip_frame, u32* dyn);
++extern int cellGcm_ppu_note_io_span(u32 io, u32 size) __attribute__((weak));   /* patch 2083, cellGcmSys.c */
++/* Walker, at a hash decision: hash now, or keep the cached decode for this frame? Patch 2083: *hash_seq is the
++ * entry's mark sequence before its last hash; it becomes the sequence read now when the caller is told to hash. */
+ static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_frame, u32 quiet, u32* written,
++                           u32* skip_frame, u32* dyn, u32* hash_seq)
++{
++    const u32 now = (u32)g_ld_ws_seq;
++    g_ld_tc_last_seq = *hash_seq;
++    const int due = ld_tex_hash_due_body(location, offset, span, last_hash_frame, quiet, written, skip_frame, dyn);
++    if (due) *hash_seq = now;
++    return due;
++}
++static int ld_tex_hash_due_body(u32 location, u32 offset, u32 span, u32 last_hash_frame, u32 quiet, u32* written,
+                            u32* skip_frame, u32* dyn)
+ {
+     const int n = ld_tex_hash_span();
+@@ -3399,6 +3418,10 @@ static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_fra
+         if (per && g_ld_frames - last_hash_frame >= ld_tex_clean_limit(offset, per)) {
+             g_ld_tc_pending = 1; g_ld_tc.net++; return 1;
+         }
++        /* Patch 2083: location 1 is IO-mapped main memory, where recompiled PPU stores land too. The skip trusts the
++         * bitmap only once the span's EA pages carry the PPU store NOTE bit; a page noted just now may have had an
++         * unseen store since the last hash, so this decision hashes. */
++        if (location == 1u && cellGcm_ppu_note_io_span && !cellGcm_ppu_note_io_span(offset, span)) return 1;
+         if (*skip_frame != g_ld_frames) { *skip_frame = g_ld_frames; g_ld_th.skipped++; g_ld_tc.skipped++; }
+         return 0;
+     }
+@@ -3444,19 +3467,23 @@ static LONG CALLBACK ld_tw_handler(PEXCEPTION_POINTERS xp)
+ static void ld_tex_writer_report(u32 location, u32 offset, u32 span)
+ {
+     if (location != 0u || !ld_tex_writer_on() || !span) return;
+-    char buf[256]; int k = 0; u32 shown = 0, newest = 0;
++    char buf[256]; int k = 0; u32 shown = 0, newest = 0, after = 0;
+     const u32 p0 = offset >> 16, p1 = (offset + span - 1u) >> 16;
++    u64 prev = 0;
+     for (u32 p = p0; p <= p1 && p < LD_WS_PAGES; p++) {
+-        if (g_ld_ws_frame[p] > newest) newest = g_ld_ws_frame[p];
+-        if (shown < 6 && k < 200 && (p == p0 || g_ld_ws_src[p] != g_ld_ws_src[p - 1] || g_ld_ws_frame[p] != g_ld_ws_frame[p - 1])) {
+-            k += snprintf(buf + k, sizeof buf - (size_t)k, " p%X=%s@%u", p, g_ld_ws_frame[p] ? g_ld_ws_name[g_ld_ws_src[p]] : "never",
+-                          g_ld_ws_frame[p]);
++        const u64 v = g_ld_ws[p];   /* patch 2083: one load: frame, sequence and source of the same mark */
++        if (ld_ws_frame(v) > newest) newest = ld_ws_frame(v);
++        if (ld_ws_after(v, g_ld_tc_last_seq)) after = 1;
++        if (shown < 6 && k < 200 && (p == p0 || v != prev)) {
++            k += snprintf(buf + k, sizeof buf - (size_t)k, " p%X=%s@%u", p, v ? g_ld_ws_name[ld_ws_src(v) % LD_WS_N] : "never",
++                          ld_ws_frame(v));
+             shown++;
+         }
++        prev = v;
+     }
+     fprintf(stderr, "[tex-clean-writer] src=0:0x%08X span=%u last-hash=%u frame=%u newest-tracked=%u -> %s |%s\n", offset,
+             span, g_ld_tc_last_hash, g_ld_frames, newest,
+-            newest > g_ld_tc_last_hash ? "tracked write lost between bitmap and entry" : "untracked writer", buf);
++            after ? "tracked write lost between bitmap and entry" : "untracked writer", buf);
+     static int watch = -1;
+     if (watch < 0) { const char* e = getenv("LD_TEX_WATCH"); watch = (e && e[0] && e[0] != '0') ? 1 : 0; }
+     if (!watch || g_ld_tw_n >= (LONG)LD_TW_MAX) return;
+@@ -4957,7 +4984,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+         if (refresh_enabled && entry->tex &&
+             entry->last_hash_frame != g_ld_frames &&
+             ld_tex_hash_due(entry->location, entry->offset, entry->span, entry->last_hash_frame,
+-                            entry->quiet, &entry->written, &entry->skip_frame, &entry->dyn)) {   /* patch 2033 */
++                            entry->quiet, &entry->written, &entry->skip_frame, &entry->dyn,
++                            &entry->hash_seq)) {   /* patch 2033; hash_seq 2083 */
+             int readable = 0;
+             LDW_T0(th_t0);
+             const u64 hash = texture_content_hash(t, &readable);
+@@ -5105,6 +5133,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+     replacement.dimension = t->dimension;
+     replacement.depth = t->depth;
+     replacement.last_hash_frame = g_ld_frames;
++    replacement.hash_seq = (u32)g_ld_ws_seq;   /* patch 2083 (after the decode: a mark in between reads as untracked) */
+     replacement.last_use_serial = ++g_ld_texture_use_serial;
+     replacement.span = texture_source_span(t);
+     {
+@@ -5322,7 +5351,7 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
+             continue;
+         if (e->tex && e->last_hash_frame != g_ld_frames &&
+             ld_tex_hash_due(e->location, e->offset, e->span, e->last_hash_frame, e->quiet, &e->written, &e->skip_frame,
+-                            &e->dyn)) {
++                            &e->dyn, &e->hash_seq)) {
+             const u64 hash = vertex_texture_hash(vt, NULL, NULL);
+             ld_tex_hash_note(hash != 0, hash && hash != e->content_hash, &e->quiet, &e->written, &e->dyn, e->location,
+                              e->offset, e->width, e->height, e->format, e->span);
+@@ -5354,6 +5383,7 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
+     e->height = vt->height;
+     e->pitch = vt->pitch;
+     e->last_hash_frame = g_ld_frames;
++    e->hash_seq = (u32)g_ld_ws_seq;   /* patch 2083 */
+     /* Conservative: up to 16 bytes per texel (W32Z32Y32X32_FLOAT). */
+     e->span = (vt->pitch ? vt->pitch : vt->width * 16u) * vt->height;
+     e->tex = decode_vertex_texture(vt, &e->content_hash);
+diff --git a/libs/video/rsx_nv3089_rows.h b/libs/video/rsx_nv3089_rows.h
+index 201a312..d1dce61 100644
+--- a/libs/video/rsx_nv3089_rows.h
++++ b/libs/video/rsx_nv3089_rows.h
+@@ -1,8 +1,9 @@
+ /* KZ3 patch 2080: NV3089 unscaled blits as row copies (LD_NV3089_ROWS=1; default off until the A/B).
+  *
+  * cellGcmSys.c's nv3089_blit copies the guest bytes one pixel at a time (vm_read32 + vm_write32, two byte swaps
+- * that cancel). For ds_dx == dt_dy == 1.0 (0x100000, 12.20) the source column is sx = ((u0 << 8) >> 20) + x and
+- * the row sy = ((v0 << 8) >> 20) + y exactly (x << 20 has no low bits), so every clipped destination row is one
++ * that cancel). For ds_dx == dt_dy == 1.0 (0x100000, 12.20) and the 12.4 IMAGE_IN_POINT u0/v0 the source column
++ * is sx = (u0 >> 4) + x and the row sy = (v0 >> 4) + y exactly ((u0 << 16) + (x << 20) in 12.20; patch 2083: was
++ * (u0 << 8) >> 20, a 12.12 origin, wrong for u0 >= 16 px), so every clipped destination row is one
+  * contiguous run of the source row: a memmove of the same bytes. Same idea as upstream PR 334 (erikomis), but the
+  * caller keeps its guest-write note for the destination (texture tracking, patches 2033/2079) and falls back to the
+  * per-pixel loop whenever the two could differ:
+@@ -33,7 +34,7 @@ static inline int nv3089_rows_copy(uint8_t* base, uint32_t src, uint32_t in_pitc
+     if (xa >= xb || ya >= yb) return 1;   /* the per-pixel loop writes nothing either */
+     const uint64_t len = (xb - xa) * bpp;
+     *bytes = len * (yb - ya);
+-    const uint64_t sx0 = (((uint64_t)u0 << 8) >> 20) + (xa - out_x), sy0 = (((uint64_t)v0 << 8) >> 20) + (ya - out_y);
++    const uint64_t sx0 = ((uint64_t)u0 >> 4) + (xa - out_x), sy0 = ((uint64_t)v0 >> 4) + (ya - out_y);
+     const uint64_t s_lo = src + sy0 * in_pitch + sx0 * bpp, s_hi = s_lo + (yb - ya - 1u) * in_pitch + len;
+     const uint64_t d_lo = dst + ya * dst_pitch + xa * bpp, d_hi = d_lo + (yb - ya - 1u) * dst_pitch + len;
+     if (s_hi > 0x100000000ull || d_hi > 0x100000000ull) return 0;   /* u32 wrap in the per-pixel loop */
+diff --git a/libs/video/rsx_tex_writer.h b/libs/video/rsx_tex_writer.h
+new file mode 100644
+index 0000000..aaf4c9e
+--- /dev/null
++++ b/libs/video/rsx_tex_writer.h
+@@ -0,0 +1,23 @@
++/* KZ3 patch 2083: the LD_TEX_WRITER diagnostic's per-page write stamp (patch 2081 kept the source tag and the frame in
++ * two arrays written by separate stores from any thread, and judged "tracked write lost" by newest frame >
++ * last-hash frame, so a tracked write in the hash's own frame read as an untracked writer).
++ * One u64 per 64 KB page, written with one aligned store: frame (24 bits) << 40 | mark sequence (32) << 8 | source
++ * tag (8). The sequence is a global counter taken at every mark; an entry records the counter just before its hash
++ * reads the guest bytes, so a mark with a later sequence came after the hash began (its bytes may be missing from
++ * that hash: a tracked write the bitmap lost), and an earlier one was already in the hash.
++ * Host test: tools/smoke/test_tex_writer.sh. */
++#pragma once
++#include <stdint.h>
++
++static inline uint64_t ld_ws_pack(uint32_t frame, uint32_t seq, uint32_t src)
++{
++    return ((uint64_t)(frame & 0xFFFFFFu) << 40) | ((uint64_t)seq << 8) | (src & 0xFFu);
++}
++static inline uint32_t ld_ws_frame(uint64_t v) { return (uint32_t)(v >> 40); }
++static inline uint32_t ld_ws_seq(uint64_t v) { return (uint32_t)(v >> 8); }
++static inline uint32_t ld_ws_src(uint64_t v) { return (uint32_t)(v & 0xFFu); }
++/* Was the mark v made after the hash that recorded hash_seq? (wrap-safe; v == 0: never marked) */
++static inline int ld_ws_after(uint64_t v, uint32_t hash_seq)
++{
++    return v != 0 && (int32_t)(ld_ws_seq(v) - hash_seq) > 0;
++}
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 713a1a3..2b816b1 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1646,15 +1646,22 @@ static void vm_inline_open(void)
+  * to leave location 0 out, RSX pass 75). Other pages pay one byte load and a not-taken branch per store. */
+ static void (*volatile s_ppu_store_note_hook)(uint32_t ea, uint32_t size);
+ extern "C" void ppu_set_store_note_hook(void (*hook)(uint32_t ea, uint32_t size)) { s_ppu_store_note_hook = hook; }
+-extern "C" void ppu_store_note_pages(uint32_t ea, uint32_t size, int on)
++/* Patch 2083: returns the number of pages whose bit changed (the renderer's location-1 skip hashes once when a
++ * page was noted just now); a page that already has the wanted state is only read. */
++extern "C" int ppu_store_note_pages(uint32_t ea, uint32_t size, int on)
+ {
+-    if (!size) return;
++    if (!size) return 0;
++    int changed = 0;
+     const uint64_t end = (uint64_t)ea + size - 1u;
+     for (uint64_t pg = ea >> 16; pg <= (end >> 16) && pg < 65536u; pg++) {
++        const int has = (__atomic_load_n(&g_ppu_vm_page[pg], __ATOMIC_RELAXED) & PPU_VM_PAGE_NOTE) != 0;
++        if (has == (on != 0)) continue;
+         if (on) __atomic_or_fetch(&g_ppu_vm_page[pg], (unsigned char)PPU_VM_PAGE_NOTE, __ATOMIC_RELAXED);
+         else    __atomic_and_fetch(&g_ppu_vm_page[pg], (unsigned char)~PPU_VM_PAGE_NOTE, __ATOMIC_RELAXED);
++        changed++;
+     }
+-    __atomic_thread_fence(__ATOMIC_RELEASE);
++    if (changed) __atomic_thread_fence(__ATOMIC_RELEASE);
++    return changed;
+ }
+ extern "C" __attribute__((noinline)) void ppu_store_note(uint32_t ea, uint32_t size)
+ {

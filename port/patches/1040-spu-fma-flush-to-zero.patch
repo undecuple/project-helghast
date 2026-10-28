@@ -1,0 +1,125 @@
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -286,7 +286,7 @@
+     A = _mm_shuffle_epi8(A, idx);
+     u128 r; memcpy(&r, &A, 16); return r;
+ }
+-#  define SPU_FASTPERM(expr) if (__builtin_expect(!g_kz3_spu_slowcg, 1)) return (expr)
++#  define SPU_FASTPERM(expr) if (__builtin_expect(g_kz3_spu_slowcg != 1, 1)) return (expr)   /* 1040: 2 = fast, no FTZ */
+ #else
+ #  define SPU_FASTPERM(expr) ((void)0)
+ #endif
+@@ -348,8 +348,24 @@
+  * A lane outside the rule (float subnormal/overflow range, NaN/inf, a rounding midpoint) runs all four
+  * lanes through spu__fmaf as before. KZ3_SPU_FASTCG=0 keeps the old per-lane path. */
+ #if defined(__SSE4_1__) && !defined(__FMA__)
++/* KZ3 patch 1040 (SPU pass 28): SPU single-precision flush-to-zero for fma/fms/fnms results.
++ * g_kz3_spu_slowcg == 0 (KZ3_SPU_FASTCG >= 1040, the default; 2 = the 1038 fast paths without FTZ, 1 = the old
++ * paths; one variable, so each op still loads one flag): a result that would be a float subnormal is +-0 with the
++ * sign of the IEEE result. ASSUMPTION (not confirmed from ISA text available in this repo; the RE notes
++ * "Known deviations" records the SPU single-precision unit as flushing denormals): this matches the SPU, so the
++ * change only moves results that were IEEE-subnormal on the host towards the hardware's. Why: a decaying IIR tail
++ * (silence through a filter or reverb) stays at a non-zero subnormal fixed point under IEEE rounding (e.g.
++ * y = 0.99 * y keeps 2^-149 forever), and each such lane sent the whole vector to libm fmaf (SPU pass 27:
++ * 2,608 samples left in fmaf). Inputs are not flushed (DAZ); a subnormal input only changes a non-tiny result
++ * in its last bit at most. One |s| value (2^-126 - 2^-150, where the double sum's own rounding could decide
++ * between FLT_MIN and a subnormal) still takes the exact path.
++ * g_kz3_fma_stats (KZ3_SPU_FMASTATS=1, or set by a test): count the fallback lanes by reason
++ * (kz3_spu_fma_note, out of line in spu_drain.c; prints a line every 2^18 fallback vectors). */
++extern int g_kz3_fma_stats;
++void kz3_spu_fma_note(const double s[4], int ftz);
+ SPU_HOT u128 spu__fma4(u128 a, u128 b, u128 c, int negb, int negc) {
+-    if (__builtin_expect(!g_kz3_spu_slowcg, 1)) {
++    const int cgm = g_kz3_spu_slowcg;
++    if (__builtin_expect(cgm != 1, 1)) {
+         __m128 A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+         const __m128 sgn = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));
+         if (negb) B = _mm_xor_ps(B, sgn);
+@@ -361,18 +377,38 @@
+         const __m128d lo = _mm_set1_pd(0x1p-126), hi = _mm_set1_pd(0x1p128), z = _mm_setzero_pd();
+         const __m128i m29 = _mm_set1_epi64x(0x1FFFFFFFll), mid = _mm_set1_epi64x(0x10000000ll);
+         const __m128d al = _mm_and_pd(sl, absm), ah = _mm_and_pd(sh, absm);
+-        const __m128d okl = _mm_or_pd(_mm_andnot_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_and_si128(_mm_castpd_si128(sl), m29), mid)),
++        __m128d okl = _mm_or_pd(_mm_andnot_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_and_si128(_mm_castpd_si128(sl), m29), mid)),
+                                                     _mm_and_pd(_mm_cmpge_pd(al, lo), _mm_cmplt_pd(al, hi))), _mm_cmpeq_pd(sl, z));
+-        const __m128d okh = _mm_or_pd(_mm_andnot_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_and_si128(_mm_castpd_si128(sh), m29), mid)),
+-                                                    _mm_and_pd(_mm_cmpge_pd(ah, lo), _mm_cmplt_pd(ah, hi))), _mm_cmpeq_pd(sh, z));
+-        if (__builtin_expect((_mm_movemask_pd(okl) & _mm_movemask_pd(okh)) == 3, 1)) {
++        __m128d okh = _mm_or_pd(_mm_andnot_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_and_si128(_mm_castpd_si128(sh), m29), mid)),
++                                              _mm_and_pd(_mm_cmpge_pd(ah, lo), _mm_cmplt_pd(ah, hi))), _mm_cmpeq_pd(sh, z));
++        if (__builtin_expect((_mm_movemask_pd(okl) & _mm_movemask_pd(okh)) == 3, 1)) {   /* as patch 1038 */
+             const __m128 r4 = _mm_movelh_ps(_mm_cvtpd_ps(sl), _mm_cvtpd_ps(sh));
+             u128 r; memcpy(&r, &r4, 16); return r;
+         }
++        const int ftz = cgm == 0;
++        if (ftz) {   /* off the common path: tiny sums are fine too, their result is flushed */
++            const __m128d edge = _mm_set1_pd(0x1p-126 - 0x1p-150);
++            okl = _mm_or_pd(okl, _mm_andnot_pd(_mm_cmpeq_pd(al, edge), _mm_cmplt_pd(al, lo)));
++            okh = _mm_or_pd(okh, _mm_andnot_pd(_mm_cmpeq_pd(ah, edge), _mm_cmplt_pd(ah, lo)));
++            if ((_mm_movemask_pd(okl) & _mm_movemask_pd(okh)) == 3) {
++                __m128 r4 = _mm_movelh_ps(_mm_cvtpd_ps(sl), _mm_cvtpd_ps(sh));
++                const __m128 fsgn = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));   /* |r| < FLT_MIN -> +-0 */
++                const __m128 tiny = _mm_cmplt_ps(_mm_andnot_ps(fsgn, r4), _mm_set1_ps(0x1p-126f));
++                r4 = _mm_blendv_ps(r4, _mm_and_ps(r4, fsgn), tiny);
++                u128 r; memcpy(&r, &r4, 16); return r;
++            }
++        }
++        if (__builtin_expect(g_kz3_fma_stats, 0)) {
++            double sv[4]; _mm_storeu_pd(sv, sl); _mm_storeu_pd(sv + 2, sh);
++            kz3_spu_fma_note(sv, ftz);
++        }
+     }
+     u128 r;
+     for (int i = 0; i < 4; i++)
+         r._f32[i] = spu__fmaf(a._f32[i], negb ? -b._f32[i] : b._f32[i], negc ? -c._f32[i] : c._f32[i]);
++    if (cgm == 0)
++        for (int i = 0; i < 4; i++)
++            if (r._f32[i] != 0.0f && __builtin_fabsf(r._f32[i]) < 0x1p-126f) r._u32[i] &= 0x80000000u;
+     return r;
+ }
+ SPU_HOT u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__fma4(a, b, c, 0, 0); }
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -17,6 +17,33 @@
+ int g_kz3_spu_fastcg_level = 1 << 30;
+ int g_kz3_spu_fastdisp = 1;
+ int g_spu_launch_diag = 0;
++int g_kz3_fma_stats = 0;   /* patch 1040: KZ3_SPU_FMASTATS=1 counts the fma fallback lanes by reason */
++/* Lanes that left patch 1038's inline fma path, by reason: [0] NaN/inf sum, [1] float overflow, [2] float
++ * subnormal result (with FTZ: only the one edge value), [3] rounding midpoint; [4] fallback vectors. Shared by
++ * all SPU host threads (relaxed atomics, slow path only). */
++unsigned long long g_kz3_fma_fb[5];
++void kz3_spu_fma_note(const double s[4], int ftz)
++{
++    for (int i = 0; i < 4; i++) {
++        const double a = __builtin_fabs(s[i]);
++        int k;
++        if (a != a || a == __builtin_inf()) k = 0;
++        else if (a >= 0x1p128) k = 1;
++        else if (a == 0) continue;
++        else if (a < 0x1p-126) k = 2;
++        else {
++            uint64_t u; memcpy(&u, &s[i], 8);
++            if ((u & 0x1FFFFFFFull) != 0x10000000ull) continue;   /* a lane inside the rule */
++            k = 3;
++        }
++        __atomic_fetch_add(&g_kz3_fma_fb[k], 1, __ATOMIC_RELAXED);
++    }
++    (void)ftz;
++    const unsigned long long n = __atomic_add_fetch(&g_kz3_fma_fb[4], 1, __ATOMIC_RELAXED);
++    if ((n & ((1u << 18) - 1)) == 0 && getenv("KZ3_SPU_FMASTATS"))
++        fprintf(stderr, "[spu-fma] fallback vectors=%llu lanes: naninf=%llu overflow=%llu subnormal=%llu midpoint=%llu ftz=%d\n",
++                n, g_kz3_fma_fb[0], g_kz3_fma_fb[1], g_kz3_fma_fb[2], g_kz3_fma_fb[3], g_kz3_spu_slowcg == 0);
++}
+ __attribute__((constructor)) static void kz3_spu_fastcg_init(void)
+ {
+     const char* e = getenv("KZ3_SPU_FASTCG");
+@@ -24,6 +51,8 @@
+     if (e && *e == '1' && !e[1]) g_kz3_spu_fastcg_level = 1 << 30;   /* "1" = on (round-27 runs used 0/1) */
+     g_kz3_spu_slowcg = g_kz3_spu_fastcg_level < 1038;
+     g_kz3_spu_fastdisp = g_kz3_spu_fastcg_level >= 1039;
++    if (!g_kz3_spu_slowcg && g_kz3_spu_fastcg_level < 1040) g_kz3_spu_slowcg = 2;   /* 1038 paths without FTZ */
++    g_kz3_fma_stats = getenv("KZ3_SPU_FMASTATS") && *getenv("KZ3_SPU_FMASTATS") == '1';
+     g_spu_launch_diag = !g_kz3_spu_fastdisp || getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
+                         getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
+ }

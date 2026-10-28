@@ -1,0 +1,188 @@
+Rebased on ps3recomp v0.18.0 (SPU pass 108): include list, both.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index a8ba15b9..bca5da4f 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -16,6 +16,7 @@
+ #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+ #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
++#include "../../runtime/ppu/ppu_context.h"  /* g_active_ctx: 9th argument on the guest stack */
+ #include <stdio.h>
+ #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+ #include <string.h>
+@@ -440,7 +441,28 @@ static struct SpursInst {
+     u32           nspus;
+     char          prefix[16];
+     volatile long kernel_live; /* poll thread started */
++    int           nthreads;    /* kernel threads (KZ3_SPURS_THREADS, patch 1006) */
+ } s_inst[MAX_SPURS_INST];
++static struct { struct SpursInst* si; int k; } s_kt_arg[MAX_SPURS_INST][8];
++/* One kernel thread at a time per workload (patch 1006): the persistent PM
++ * contexts are per (workload, lane), and a lane must not run twice at once. */
++static volatile long s_wkl_busy[CELL_SPURS_MAX_WORKLOAD];
++static int wkl_claim(u32 wid)
++{
++#if defined(_MSC_VER)
++    return InterlockedCompareExchange(&s_wkl_busy[wid], 1, 0) == 0;
++#else
++    return __sync_bool_compare_and_swap(&s_wkl_busy[wid], 0, 1);
++#endif
++}
++static void wkl_release(u32 wid)
++{
++#if defined(_MSC_VER)
++    InterlockedExchange(&s_wkl_busy[wid], 0);
++#else
++    __sync_lock_release(&s_wkl_busy[wid]);
++#endif
++}
+ 
+ static struct SpursInst* spurs_inst_find(u32 ea)
+ {
+@@ -474,7 +496,21 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+ 
+     if (!si->kernel_live) {
+         si->kernel_live = 1;
+-        CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
++        /* KZ3_SPURS_THREADS=n (KZ3, patch 1006): n kernel threads per instance,
++         * at most nSpus -- the instance's virtual SPUs. Each claims one workload
++         * at a time, so different workloads run in parallel as on hardware.
++         * Default 1 = the original single poll thread. */
++        int n = 1;
++        { const char* e = getenv("KZ3_SPURS_THREADS"); if (e) n = atoi(e); }
++        if (n < 1) n = 1;
++        if (n > (int)si->nspus) n = (int)si->nspus;
++        if (n > 8) n = 8;
++        si->nthreads = n;
++        for (int k = 0; k < n; k++) {
++            s_kt_arg[si - s_inst][k].si = si;
++            s_kt_arg[si - s_inst][k].k  = k;
++            CreateThread(NULL, 1u << 20, spurs_kernel_thread, &s_kt_arg[si - s_inst][k], 0, NULL);
++        }
+     }
+     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
+            si->prefix, spurs_ea, si->nspus);
+@@ -1498,6 +1534,18 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
+             prio_ea ? *(vm_base + (u32)prio_ea + i) : 0;
+     vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
+     vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);   /* 9th arg is beyond the 8-GPR adapter */
++    /* KZ3_SPURS_MAXCONT=1 (KZ3, patch 1006): read the 9th argument where the
++     * PPU64 ABI puts it, the caller's parameter save area at sp+0x70 (48-byte
++     * frame header + 8 doublewords). KZ3's WWS setup (0x00A78918) stores
++     * maxContention there right before the call. */
++    { static int s_mc = -1;
++      if (s_mc < 0) s_mc = getenv("KZ3_SPURS_MAXCONT") ? 1 : 0;
++      extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++      if (s_mc && g_active_ctx) {
++          u32 mc = (u32)vm_read64((u32)g_active_ctx->gpr[1] + 0x70);
++          if (mc >= 1 && mc <= CELL_SPURS_MAX_SPU) vm_write32((u32)attr_ea + WKATTR_MAX_CONT, mc);
++          printf("[cellSpurs] _WorkloadAttributeInitialize: maxContention from stack = %u\n", mc);
++      } }
+     vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, 0);
+     vm_write32((u32)attr_ea + WKATTR_NAME_INST,  0);
+     vm_write32((u32)attr_ea + WKATTR_HOOK,     0);
+@@ -1642,12 +1690,14 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+ #endif
+-    struct SpursInst* si = (struct SpursInst*)p;
++    struct SpursInst* si = ((struct { struct SpursInst* si; int k; }*)p)->si;
++    const int kt = ((struct { struct SpursInst* si; int k; }*)p)->k;   /* kernel thread index */
++    const int multi = si->nthreads > 1;
+     static volatile long s_pm_off = -1;
+     if (s_pm_off < 0) s_pm_off = getenv("PS3_NO_SPURS_PM") ? 1 : 0;
+ 
+-    fprintf(stderr, "[spurs-kern] \"%s\" poll thread live: ea=0x%08X pm=%s\n",
+-            si->prefix, si->ea, s_pm_off ? "DISABLED (PS3_NO_SPURS_PM)" : "enabled");
++    fprintf(stderr, "[spurs-kern] \"%s\" poll thread %d/%d live: ea=0x%08X pm=%s\n",
++            si->prefix, kt + 1, si->nthreads, si->ea, s_pm_off ? "DISABLED (PS3_NO_SPURS_PM)" : "enabled");
+     fflush(stderr);
+ 
+     /* Instance change detector (SPURS_KERN_WATCH=1).
+@@ -1660,7 +1710,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+     static const u32 WATCH_LEN = 0xC0;
+     unsigned char shadow[0xC0];
+     int shadow_primed = 0;
+-    int watch = getenv("SPURS_KERN_WATCH") ? 1 : 0;
++    int watch = (getenv("SPURS_KERN_WATCH") && kt == 0) ? 1 : 0;
+     int changes_logged = 0;
+ 
+     for (;;) {
+@@ -1711,10 +1761,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+         }
+         if (!enabled) continue;
+ 
+-        for (u32 wid = 0; wid < 16; wid++) {
++        for (u32 wi = 0; wi < 16; wi++) {
++            const u32 wid = multi ? (wi + (u32)kt * 8u) % 16u : wi;   /* threads start at different workloads */
++            int claimed = 0;
+             if (!(enabled & (0x80000000u >> wid))) continue;
+             if (*(vm_base + ea + SPURS_WKL_STATE1 + wid) != 2) continue;
+             if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
++            if (multi) { if (!wkl_claim(wid)) continue; claimed = 1; }
+ 
+             /* A SPURS policy module is a PERSISTENT SPU program. The real kernel
+              * schedules an ENABLED, runnable workload onto an SPU and the module
+@@ -1742,7 +1795,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                            (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
+ 
+             WklPm* r = spurs_resolve_pm(wid);
+-            if (!r) continue;
++            if (!r) goto kz3_next_wid;
+ 
+             /* Idle backoff: running EVERY enabled workload's module EVERY 1ms
+              * pass (x N instance threads) burned ~5 host cores on modules that
+@@ -1757,8 +1810,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 if (wid == 0) s_pass_no++;
+                 if (kicked) s_idle[wid] = 0;
+                 u32 cad = 1u << (s_idle[wid] > 4 ? 4 : s_idle[wid]);
+-                if (!kicked && (s_pass_no & (cad - 1)) != 0) continue;
+-                extern volatile unsigned g_spurs_pm_polls;
++                if (!kicked && (s_pass_no & (cad - 1)) != 0) goto kz3_next_wid;
++                extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+                 u32 polls_before = g_spurs_pm_polls;   /* heuristic only */
+                 (void)polls_before;
+ 
+@@ -1839,6 +1892,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+             if (g_spurs_pm_polls == 0) { if (s_idle[wid] < 8) s_idle[wid]++; }
+             else s_idle[wid] = 0;
+             }
++        kz3_next_wid:
++            if (claimed) wkl_release(wid);
+         }
+     }
+ }
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 00d66c6e..f018a4f7 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2654,7 +2654,7 @@ void spu_indirect_branch(spu_context* ctx)
+      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
+      * the SpursKernelContext (spurs_policy.c). */
+     if (ctx->policy_mode) {
+-        extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
++        extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
+             /* Module exit: the workload returned to the kernel (drained/yield).
+              * Print gated: fires once per policy run = thousands/sec. */
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 31d93fb2..de8e84ca 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -34,8 +34,12 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+ 
+ /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
+  * (single writer per run; reads are diagnostic). */
+-volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
+-volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
++/* Thread-local (KZ3, patch 1006): a policy-module run happens entirely on one
++ * host thread, and with several kernel threads per SPURS instance
++ * (KZ3_SPURS_THREADS) two runs overlap; shared counters let one run's reset
++ * clear the other's exit flag. */
++SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
++SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
+ volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
+ 
+ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,

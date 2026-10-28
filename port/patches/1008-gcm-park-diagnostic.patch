@@ -1,0 +1,36 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1707,6 +1707,33 @@
+                       { static int pn = 0; if (pw > 0 && pn++ < 8)
+                           fprintf(stderr, "[cellGcmSys] park 0x%08X not patched within %d ms -- resyncing\n",
+                                   s_fifo_getoff, pw); }
++                      /* KZ3 patch 1008 diagnostic, GCM_PARK_DIAG=<hex label offset>: the park's
++                       * three words (park, refcount, patch jump), the label, and every
++                       * NV4097 SET_SEMAPHORE_OFFSET (0x1D6C) with that offset in IO memory. */
++                      { static int pd = -2; static u32 poff;
++                        if (pd == -2) { const char* e = getenv("GCM_PARK_DIAG"); pd = e ? 1 : 0;
++                                        poff = e ? (u32)strtoul(e, 0, 16) : 0; }
++                        if (pd) {
++                            u32 pe = gcm_io2ea(s_fifo_getoff);
++                            fprintf(stderr, "[park-diag] park io=0x%08X words %08X %08X %08X put=0x%08X label[0x%X]=0x%08X\n",
++                                    s_fifo_getoff, vm_read32(pe), vm_read32(pe + 4), vm_read32(pe + 8), put,
++                                    poff, vm_read32(0x20000000u + poff));
++                            u32 base = s_config.ioAddress, sz = s_config.ioSize; int hits = 0;
++                            for (u32 o = 0; o + 16 <= sz && hits < 48; o += 4)
++                                if (vm_read32(base + o) == 0x00041D6Cu && vm_read32(base + o + 4) == poff) {
++                                    hits++;
++                                    fprintf(stderr, "[park-diag] 1D6C=0x%X at io 0x%08X then %08X %08X\n",
++                                            poff, o, vm_read32(base + o + 8), vm_read32(base + o + 12));
++                                    /* Which JUMP/CALL in IO memory leads into the 0x400 bytes before it. */
++                                    for (u32 q = 0; q + 4 <= sz; q += 4) {
++                                        u32 w = vm_read32(base + q), t = w & 0x1FFFFFFCu;
++                                        if (((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 2u) &&
++                                            t + 0x400 > o && t <= o && t != q)
++                                            fprintf(stderr, "[park-diag]   %s at io 0x%08X -> 0x%08X\n",
++                                                    (w & 3u) == 2u ? "CALL" : "JUMP", q, t);
++                                    }
++                                }
++                        } }
+                       gcm_fifo_dump_around(s_fifo_getoff);
+                       gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                   break;

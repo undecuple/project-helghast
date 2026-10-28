@@ -1,0 +1,46 @@
+# CI without the game: the exe cannot be built here (the lifted code comes from the player's own EBOOT and is never
+# committed), so this checks what can be checked without game data: lint, that every patch applies to the pinned
+# ps3recomp, the self-contained host tests, and the Nix flake.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: true
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+      - name: Flake check
+        run: nix flake check --no-build
+      - name: Lint (shellcheck strict, ruff report-only for now)
+        run: |
+          nix develop .#ci --command bash -c '
+            git ls-files "*.sh" | xargs shellcheck -S warning
+            ruff check --exit-zero --output-format=github tools re'
+      - name: Patches apply to the pinned ps3recomp
+        run: nix develop .#ci --command bash tools/ps3recomp-patched.sh
+      - name: Host tests (no game data; list in tools/host-tests.txt)
+        run: nix develop .#ci --command bash tools/run-host-tests.sh --gh
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Gitleaks (full history)
+        run: |
+          curl -sSfL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.24.0/gitleaks_8.24.0_linux_x64.tar.gz
+          echo "cb49b7de5ee986510fe8666ca0273a6cc15eb82571f2f14832c9e8920751f3a4  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks git --redact --verbose --exit-code 1 .

@@ -1,0 +1,12 @@
+# Our hand-written C/C++ only (port/kz3, port/spu, port/vfs, tools/**/*.c), checked on changed files by tools/lint.sh.
+# Not applied to port/patches (they follow upstream ps3recomp's style), generated code or third_party.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+PointerAlignment: Left
+SortIncludes: Never
+ReflowComments: false

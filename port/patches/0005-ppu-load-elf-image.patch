@@ -1,0 +1,53 @@
+ppu_loader: ppu_load_elf_image(data, size), the ELF loader over bytes already in host memory; ppu_load_elf(path)
+reads the file and calls it. KZ3's release build links the player's own EBOOT.elf into kz3.exe (step 9s) and loads
+it from there. Upstream candidate (general: no KZ3 names).
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream PR263 image ranges added next to it.
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index fac4bdc4..4ef8e05e 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3407,6 +3407,7 @@ static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
+         if (addr < r.end && r.begin < end && r.end > next) next = r.end;
+     return next;
+ }
++extern "C" uint32_t ppu_load_elf_image(const uint8_t* file, uint64_t fsz);
+ 
+ extern "C" uint32_t ppu_load_elf(const char* path)
+ {
+@@ -3415,14 +3416,22 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+     fseek(f, 0, SEEK_END);
+     long sz = ftell(f);
+     fseek(f, 0, SEEK_SET);
+-    uint8_t* file = (uint8_t*)malloc(sz);
++    uint8_t* file = sz > 0 ? (uint8_t*)malloc(sz) : NULL;
+     if (!file || fread(file, 1, sz, f) != (size_t)sz) { fclose(f); free(file); return 0; }
+     fclose(f);
++    uint32_t entry = ppu_load_elf_image(file, (uint64_t)sz);
++    free(file);
++    return entry;
++}
+ 
+-    if (sz < 64 || memcmp(file, "\x7F""ELF", 4) != 0 || file[4] != 2 /*ELFCLASS64*/ || file[5] != 2 /*MSB*/) {
+-        fprintf(stderr, "[ppu] not a 64-bit big-endian ELF\n"); free(file); return 0;
++/* The same loader over an ELF image already in host memory (a game that carries its executable inside the host
++ * binary, or reads it from an archive). The caller keeps ownership of the bytes; nothing points into them after
++ * the call returns. */
++extern "C" uint32_t ppu_load_elf_image(const uint8_t* file, uint64_t fsz)
++{
++    if (!file || fsz < 64 || memcmp(file, "\x7F""ELF", 4) != 0 || file[4] != 2 /*ELFCLASS64*/ || file[5] != 2 /*MSB*/) {
++        fprintf(stderr, "[ppu] not a 64-bit big-endian ELF\n"); return 0;
+     }
+-    uint64_t fsz = (uint64_t)sz;
+     uint32_t entry = (uint32_t)be64(file + 24);
+     uint64_t phoff = be64(file + 32);
+     uint16_t phentsize = be16(file + 54);
+@@ -3474,7 +3483,6 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+         g_ppu_image_ranges.push_back({p_vaddr, p_vaddr + (p_memsz > p_filesz ? p_memsz : p_filesz)});
+         loaded++;
+     }
+-    free(file);
+     fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
+ 
+     /* Arm PPU_GUARD_EA here as well as in lv2_syscall. The syscall path only

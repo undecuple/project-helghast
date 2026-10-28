@@ -1,0 +1,234 @@
+Live-draw applies the RSX texture gamma bits: sRGB-to-linear decode on fetch for units whose TEXTURE_ADDRESS [22:20] R/G/B bits are set.
+
+Killzone 3 sets gamma 0x7 on its menu/UI textures (A8R8G8B8 swizzled and linear, DXT45) and on the render surfaces
+it samples back (1280x720 scene, 320x180 glow), with SET_SHADER_PACKER sRGB output off. Live-draw ignored the bits,
+so the main menu came out brighter than RPCS3 with reds turned yellow and the 3D emblem a bright dotted fill.
+rsx_fp_apply_gamma (rsx_fp_decompiler.c) is an HLSL post-pass beside rsx_fp_apply_unnorm_scale: every Sample /
+SampleBias / SampleLevel of a gamma unit is wrapped in rsx_srgb(c, float3 mask). The per-unit mask (3 bits per unit)
+is part of the PSO key. ASSUMPTION: bits 0/1/2 = R/G/B; the alpha bit is not applied; the decode runs after filtering.
+Switches: LD_NO_GAMMA=1 turns the decode off; LD_GAMMA_NO_SURF=1 (diagnostic A/B) skips units that sample a render
+surface; LD_GAMMA_LOG=1 prints each new (unit, format, gamma) combination, the units that sample a surface, and
+SET_SHADER_PACKER (0x1FBC, ASSUMPTION: the sRGB-output register) / SET_SURFACE_FORMAT values.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): PSO key: upstream's VP branch bits then gamma_mask.
+
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 87cf639c..7f87d76c 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -1648,6 +1648,73 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
+     return h;
+ }
+ 
++/*
++ * Texture gamma (patch 2009). RSX TEXTURE_ADDRESS bits [23:20] ask the
++ * texture unit to convert sRGB-encoded channels to linear on fetch (RPCS3
++ * fragment_texture::gamma()). Killzone 3 sets 0x7 on its menu/UI textures
++ * (A8R8G8B8 and DXT45) and leaves SET_SHADER_PACKER sRGB output off, so the
++ * linear values are written straight to the RGBA8 surface: without the decode
++ * every gamma texture comes out brighter and its reds turn yellow.
++ * ASSUMPTION: bits 0/1/2 = R/G/B; bit 3 (alpha) is not applied. The decode
++ * runs after filtering, not before as on the hardware.
++ */
++static int fp_insert(char* hlsl, u32 hlsl_size, char* at, const char* text)
++{
++    const u32 tlen = (u32)strlen(text);
++    const u32 used = (u32)strlen(hlsl);
++    if (used + tlen + 1 > hlsl_size) return -1;
++    memmove(at + tlen, at, used - (u32)(at - hlsl) + 1);
++    memcpy(at, text, tlen);
++    return 0;
++}
++
++int rsx_fp_apply_gamma(char* hlsl, u32 hlsl_size, u64 gamma_mask)
++{
++    if (!hlsl || !gamma_mask) return 0;
++    int patched = 0;
++    for (u32 u = 0; u < 16; u++) {
++        const u32 bits = (u32)(gamma_mask >> (u * 3)) & 7u;
++        if (!bits) continue;
++        char needles[2][24];
++        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].", u);
++        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.", u);
++        char tail[48];
++        snprintf(tail, sizeof tail, ", float3(%u, %u, %u))",
++                 bits & 1u, (bits >> 1) & 1u, (bits >> 2) & 1u);
++        for (int nidx = 0; nidx < 2; nidx++) {
++            for (;;) {
++                char* at = strstr(hlsl, needles[nidx]);
++                if (!at) break;
++                char* open = strchr(at, '(');
++                if (!open) break;
++                int depth = 0;
++                char* p = open;
++                for (; *p; p++) {
++                    if (*p == '(') depth++;
++                    else if (*p == ')') { depth--; if (!depth) break; }
++                }
++                if (*p != ')') break;
++                if (fp_insert(hlsl, hlsl_size, p + 1, tail) < 0) return -1;
++                if (fp_insert(hlsl, hlsl_size, at, "rsx_srgb(") < 0) return -1;
++                at += 9;
++                memcpy(at, "rsx_TEX", 7);   /* done marker, restored below */
++                patched++;
++            }
++        }
++    }
++    for (char* q = hlsl; (q = strstr(q, "rsx_TEX")) != NULL; )
++        memcpy(q, "rsx_tex", 7);
++    if (patched) {
++        static const char helper[] =
++            "float4 rsx_srgb(float4 c, float3 m) {\n"
++            "    float3 l = c.rgb <= 0.04045 ? c.rgb / 12.92 : pow((max(c.rgb, 0.0) + 0.055) / 1.055, 2.4);\n"
++            "    return float4(lerp(c.rgb, l, m), c.a);\n"
++            "}\n";
++        if (fp_insert(hlsl, hlsl_size, hlsl, helper) < 0) return -1;
++    }
++    return patched;
++}
++
+ /* Scale texel-space coordinates to the 0..1 range HLSL sampling expects.
+  *
+  * An RSX texture whose format carries RSX_TEX_FMT_UNNORM (0x40) is addressed in
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index e55bcc19..16c89fcc 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -90,6 +90,12 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
+  * depth}; cube units are skipped and volume_mask units (Texture3D) are divided
+  * by their depth as well. Returns the number of Sample sites patched, or -1 if
+  * the buffer would overflow. A no-op when unnorm_mask is 0. */
++/* Texture gamma (TEXTURE_ADDRESS bits [23:20], patch 2009): wraps every
++ * sample of a unit whose R/G/B gamma bits are set in rsx_srgb(), an sRGB to
++ * linear decode of those channels after the fetch. gamma_mask holds 3 bits
++ * per unit (unit u at bits 3u..3u+2: R, G, B). Returns the number of sample
++ * sites wrapped, or -1 if the buffer is too small. */
++int rsx_fp_apply_gamma(char* hlsl, u32 hlsl_size, u64 gamma_mask);
+ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+                               const u32 dim[][3], u32 cube_mask, u32 volume_mask);
+ 
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 1c1cae2e..fef94121 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -22,7 +22,7 @@
+ #include "rsx_live_draw.h"
+ #include "ps3emu/yz_runtime_config.h"
+ #include "ps3emu/yz_frontier_trace.h"
+-#include "ps3emu/log_first.h"
++#include "ps3emu/log_first.h"
+ 
+ #if !defined(_WIN32)
+ 
+@@ -90,9 +90,9 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ #if defined(YZ_PERF_CLEAN) || defined(_MSC_VER)
+ #define LD_DIAG_ENABLED(name) 0
+ #else
+-/* Cached per call site: several of these sit on per-draw paths. */
+-#define LD_DIAG_ENABLED(name) ({ static int _ld_diag = -1; \
+-    if (_ld_diag < 0) _ld_diag = getenv(name) != NULL; _ld_diag; })
++/* Cached per call site: several of these sit on per-draw paths. */
++#define LD_DIAG_ENABLED(name) ({ static int _ld_diag = -1; \
++    if (_ld_diag < 0) _ld_diag = getenv(name) != NULL; _ld_diag; })
+ #endif
+ #include <string.h>
+ 
+@@ -5105,6 +5105,37 @@ static void ld_pso_bail(int* said, const char* reason)
+ #define LD_PSO_BAIL(reason) \
+     do { static int _said_ = 0; ld_pso_bail(&_said_, (reason)); } while (0)
+ 
++/* Patch 2009 (diagnostic, off by default): LD_GAMMA_LOG=1 prints each new
++ * (unit, format, gamma) combination of an enabled fragment texture whose
++ * TEXTURE_ADDRESS gamma bits [23:20] are set, and every new value of
++ * SET_SHADER_PACKER (0x1FBC, sRGB output) and SET_SURFACE_FORMAT (0x208).
++ * Live-draw ignores both (probe: the menu is brighter/yellower than RPCS3). */
++static void ld_gamma_log(u32 unit, const rsx_dsp_texture* t)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("LD_GAMMA_LOG") ? 1 : 0;
++    if (!on) return;
++    static u32 seen[256]; static u32 nseen; static u32 last_packer = ~0u, last_surf = ~0u;
++    static unsigned long long draws, gdraws;
++    const u32 packer = rsx_dsp_reg(&g.rsx, 0x1FBC), surf = rsx_dsp_reg(&g.rsx, 0x208);
++    if (unit == 0) {
++        draws++;
++        if (packer != last_packer || surf != last_surf) {
++            fprintf(stderr, "[gamma] packer=0x%08x surface_format=0x%08x (draw %llu, gamma-tex draws %llu)\n",
++                    packer, surf, draws, gdraws);
++            last_packer = packer; last_surf = surf;
++        }
++    }
++    const u32 gam = (t->wrap >> 20) & 0xF;
++    if (!gam) return;
++    gdraws++;
++    const u32 key = (unit << 16) | (t->format << 8) | gam;
++    for (u32 i = 0; i < nseen; i++) if (seen[i] == key) return;
++    if (nseen < 256) seen[nseen++] = key;
++    fprintf(stderr, "[gamma] unit %u format 0x%02x gamma 0x%x addr 0x%08x (draw %llu)\n",
++            unit, t->format, gam, t->wrap, draws);
++}
++
+ static ID3D12PipelineState* get_pso(
+     const rsx_vertex_layout_plan* masked_layout, int packed_payload)
+ {
+@@ -5173,9 +5204,34 @@ static ID3D12PipelineState* get_pso(
+     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
+     const u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : rsx_dsp_shader_control(&g.rsx);
+     u32 cube_mask = 0;
++    /* Patch 2009: per-unit texture gamma (R/G/B bits of TEXTURE_ADDRESS
++     * [22:20]); the sRGB decode is baked into the HLSL, so it is part of the
++     * PSO key. LD_NO_GAMMA=1 turns it off for an A/B. */
++    static int no_gamma = -1;
++    if (no_gamma < 0) no_gamma = getenv("LD_NO_GAMMA") ? 1 : 0;
++    u64 gamma_mask = 0;
+     for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
+         rsx_dsp_texture texture;
+         rsx_dsp_get_texture(&g.rsx, unit, &texture);
++        if (texture.enabled || unit == 0) ld_gamma_log(unit, &texture);
++        if (texture.enabled && !no_gamma && ((texture.wrap >> 20) & 7u)) {
++            /* LD_GAMMA_NO_SURF=1 (diagnostic A/B): no decode on units that
++             * sample a render surface (same location + offset). */
++            static int no_surf = -1;
++            if (no_surf < 0) no_surf = getenv("LD_GAMMA_NO_SURF") ? 1 : 0;
++            int is_surf = 0;
++            for (u32 si = 0; si < g.n_surfaces; si++)
++                if (g.surfaces[si].location == texture.location &&
++                    g.surfaces[si].offset == texture.offset) { is_surf = 1; break; }
++            { static u32 n_log = 0;
++              if (getenv("LD_GAMMA_LOG") && n_log < 24 && is_surf) {
++                  n_log++;
++                  fprintf(stderr, "[gamma] unit %u samples a render surface (0x%08x fmt 0x%02x %ux%u)\n",
++                          unit, texture.offset, texture.format, texture.width, texture.height);
++              } }
++            if (!(no_surf && is_surf))
++                gamma_mask |= (u64)((texture.wrap >> 20) & 7u) << (unit * 3);
++        }
+         if (texture.enabled && texture.cubemap)
+             cube_mask |= 1u << unit;
+     }
+@@ -5235,6 +5291,7 @@ static ID3D12PipelineState* get_pso(
+     const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
+     if (vp_branch_bits_used)
+         key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
++    if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
+     /* Texel-addressed (RSX_TEX_FMT_UNNORM) units need their coordinates divided
+      * by the texture size in the shader -- D3D12 has no unnormalised addressing
+      * mode. The divisor is baked into the HLSL, so the sizes are part of the
+@@ -5394,6 +5451,8 @@ static ID3D12PipelineState* get_pso(
+                 unnorm_dim, cube_mask, 0u) < 0)
+             fi = -1;
+     }
++    if (fi > 0 && rsx_fp_apply_gamma(ps_hlsl, sizeof(ps_hlsl), gamma_mask) < 0)
++        fi = -1;
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.decompile_qpc +=
+         (u64)(ld_profile_qpc() - decompile_begin);
+@@ -8023,7 +8082,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                   }
+               }
+           } }
+-        if (sampled < 0 && LD_DIAG_ENABLED("LD_ALIAS_DBG")) {
++        if (sampled < 0 && LD_DIAG_ENABLED("LD_ALIAS_DBG")) {
+             static u32 n_dbg = 0;
+             if (PS3_LOG_FIRST(n_dbg, 24)) {
+                 fprintf(stderr, "[alias-miss] tex %u:0x%08X fmt=0x%02X %ux%u target=%u surf:",

@@ -1,0 +1,164 @@
+gcm/live-draw: fragment WPOS counts pixels, not samples, on an antialiased target (LD_WPOS_AA=0 old).
+
+From our Killzone 2 port (its patch 2088), with the PSO template carrying the new key component.
+
+Cause: live-draw keeps an antialiased surface at its sample resolution (patch 2016; rsx_dispatch.h:
+DIAGONAL_CENTERED_2 = 2x1 samples per pixel, SQUARE_* = 2x2) and maps the guest's pixel viewport over it, so
+SV_Position, which the fragment decompiler returns for WPOS, counts samples. The RSX runs the fragment program once
+per pixel and WPOS counts pixels. Killzone 2's deferred lighting on 2560x720 sample surfaces read its G-buffer from
+WPOS and showed the scene squeezed into the left half of the screen.
+
+KZ3: the 320x180 SQUARE_ROTATED_4 pass (SURFACE_FORMAT 0x5128, colour 0x16C0000 / 0x1882000, zeta 0x2980000,
+viewport 320x180; 82-83 draws per frame in both RPCS3 level captures of 2026-10-08) runs fragment programs of which
+most read WPOS as pixels: fp 0x70cf02 builds a view ray as WPOS.x/160 - 1 and a sample address WPOS*2 + 0.5 into
+the 640x360 sample grid. In samples the ray spans -1..3 and the address runs past the surface.
+
+Fix: a fragment program built for an antialiased target reads WPOS as the centre of the pixel that holds the sample,
+(floor(p.xy / aa) + 0.5, p.z, p.w) (text substitution of input.position after decompilation). The sample grid is in
+the pipeline key only when it is not 1x1, so other pipelines keep their keys (warm caches stay warm). PSO template
+records (patch 2071) carry it in flags bits 8-23 (RSX_PT_WPOS_AA_SHIFT), so the prewarm builds the same key; an
+older template's antialiased records build pipelines nothing asks for (no harm).
+ASSUMPTION: the guest does not shade per sample (NV47 runs one fragment per pixel).
+
+Upstream candidate (general: any title that reads WPOS while rendering into a multisampled surface).
+Verification: host test tools/smoke/test_wpos_aa.sh; Killzone 2 under Proton (their runtime pass 20); KZ3 see
+the RE notes "Pass 84".
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): wpos tag after the rebased unnorm w,h hash.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 04ebae0d..c562e479 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8043,6 +8043,7 @@ typedef struct {
+     u64 gamma_mask; u32 argb_mask; const u16* argb_remap; u32 srgb_out;
+     u32 fp_const_count; u32 fp_alpha_ref;
+     int vgpu;                                  /* patch 2076: GPU-fetch vertex shader (packed payload 2) */
++    u32 wpos_aa;                               /* patch 2088: aa_sx | aa_sy << 8 of the target, 0 = 1x1 */
+ } ld_xl_in;
+ static CRITICAL_SECTION g_ld_xl_cs;
+ static volatile LONG g_ld_xl_state;
+@@ -8054,6 +8055,60 @@ static void ld_xl_lock(void)
+     }
+     EnterCriticalSection(&g_ld_xl_cs);
+ }
++/* Patch 2088 (from our Killzone 2 port): WPOS in pixels on an antialiased target.
++ *
++ * Live-draw keeps an antialiased surface at its sample resolution (rsx_dispatch.h: DIAGONAL_CENTERED_2 is 2x1 samples
++ * per pixel, SQUARE_* 2x2) and maps the guest's pixel viewport over it, so SV_Position, which the decompiler hands
++ * out as WPOS, counts samples. The RSX runs the fragment program once per pixel and its WPOS counts pixels.
++ * Killzone 2 renders its G-buffer and deferred lighting into 2560x720 sample surfaces (1280x720 pixels, 2x1) and
++ * addresses the G-buffer from WPOS: with WPOS in samples the picture was squeezed into the left half. KZ3's
++ * 320x180 SQUARE_ROTATED_4 pass (colour 0x16C0000 / 0x1882000, zeta 0x2980000, viewport 320x180) runs fragment
++ * programs that take WPOS in pixels (RPCS3 capture, fp 0x70cf02: x/160 - 1 for a -1..1 view ray, WPOS*2 + 0.5 as the
++ * 640x360 sample address): in samples the ray spans -1..3 and the sample address runs past the surface.
++ * Fix: in a program built for an antialiased target, every read of input.position becomes the centre of the pixel
++ * that holds the sample: (floor(p.xy / aa) + 0.5, p.z, p.w). The scale is part of the pipeline key only when it is
++ * not 1x1, so the keys of other pipelines do not change; PSO template records carry it in flags bits 8-23.
++ * LD_WPOS_AA=0 = old behaviour (WPOS in samples).
++ * ASSUMPTION: per-sample shading is not used by the guest (one fragment per pixel on NV47). */
++static int ld_wpos_aa_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("LD_WPOS_AA");
++        on = e ? atoi(e) != 0 : 1;
++        fprintf(stderr, "[wpos-aa] fragment WPOS in pixels on antialiased targets: %s\n", on ? "on" : "off (LD_WPOS_AA=0)");
++    }
++    return on;
++}
++static int ld_wpos_aa_apply(char* hlsl, size_t size, u32 wpos_aa)
++{
++    const u32 ax = wpos_aa & 0xFFu, ay = (wpos_aa >> 8) & 0xFFu;
++    if (!hlsl || !wpos_aa || (ax <= 1u && ay <= 1u)) return 0;
++    static const char key[] = "input.position";
++    char rep[160];
++    snprintf(rep, sizeof rep, "float4(floor(input.position.xy / float2(%u.0, %u.0)) + 0.5, input.position.zw)",
++             ax ? ax : 1u, ay ? ay : 1u);
++    const size_t kl = sizeof key - 1, rl = strlen(rep);
++    size_t n = 0;
++    for (const char* p = strstr(hlsl, key); p; p = strstr(p + kl, key)) n++;
++    if (!n) return 0;
++    const size_t len = strlen(hlsl), need = len + n * (rl - kl) + 1;
++    if (need > size) return -1;
++    char* out = (char*)malloc(need);
++    if (!out) return -1;
++    char* o = out; const char* p = hlsl;
++    for (const char* q = strstr(p, key); q; q = strstr(p, key)) {
++        memcpy(o, p, (size_t)(q - p)); o += q - p;
++        memcpy(o, rep, rl); o += rl;
++        p = q + kl;
++    }
++    strcpy(o, p);
++    memcpy(hlsl, out, need);
++    free(out);
++    static u32 logs;
++    if (logs++ < 8) fprintf(stderr, "[wpos-aa] %u WPOS read(s) scaled to pixels (%ux%u samples per pixel)\n", (u32)n, ax, ay);
++    return (int)n;
++}
+ static void ld_xlate(const ld_xl_in* in, char* vs_hlsl, size_t vs_sz, char* ps_hlsl, size_t ps_sz, int* vi_out, int* fi_out)
+ {
+     const u8* vp_uc = in->vp_uc; const u32 vp_instrs = in->vp_instrs; const u32 vtex_mask = in->vtex_mask;
+@@ -8124,6 +8179,8 @@ static void ld_xlate(const ld_xl_in* in, char* vs_hlsl, size_t vs_sz, char* ps_h
+         fi = -1;
+     if (fi > 0 && rsx_fp_apply_depth_argb(ps_hlsl, ps_sz, argb_mask, argb_remap) < 0)
+         fi = -1;
++    if (fi > 0 && in->wpos_aa && ld_wpos_aa_apply(ps_hlsl, ps_sz, in->wpos_aa) < 0)   /* patch 2088 */
++        fi = -1;
+     if (fi > 0 && srgb_out && rsx_fp_apply_srgb_output(ps_hlsl, ps_sz) < 0) {   /* patch 2055 */
+         static int said; if (!said++) fprintf(stderr, "[srgb-out] apply failed: PSO left linear\n");
+     }
+@@ -8178,6 +8235,8 @@ static u64 ld_pso_key_tail(u64 key, const ld_xl_in* xi, int packed_payload, u64*
+         for (int u = 0; u < 16; u++) { wh[u][0] = unnorm_dim[u][0]; wh[u][1] = unnorm_dim[u][1]; }
+         key = fnv1a(wh, sizeof wh, key);
+     }
++    if (xi->wpos_aa) { const u32 tag = 0x57504F00u | 0x41u; key = fnv1a(&tag, sizeof tag, key);   /* patch 2088 */
++                       key = fnv1a(&xi->wpos_aa, sizeof xi->wpos_aa, key); }
+     if (masked_layout) {
+         static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
+         const u32 payload_stride =
+@@ -8259,7 +8318,8 @@ static void ld_pt_note(u64 key, const ld_xl_in* xi, int packed, int depth)
+     r->cube_mask = xi->cube_mask; r->vtex_mask = xi->vtex_mask; r->srgb_out = xi->srgb_out;
+     r->shadow_mask = xi->shadow_mask; r->argb_mask = xi->argb_mask; r->unnorm_mask = xi->unnorm_mask;
+     r->flags = RSX_PT_FLAG_BUFFERED | (xi->layout ? RSX_PT_FLAG_LAYOUT : 0u) | (xi->layout && packed ? RSX_PT_FLAG_PACKED : 0u) |
+-               (depth ? RSX_PT_FLAG_DEPTH : 0u);
++               (depth ? RSX_PT_FLAG_DEPTH : 0u) |
++               ((xi->wpos_aa & 0xFFFFu) << RSX_PT_WPOS_AA_SHIFT);   /* patch 2088 */
+     if (xi->layout) {
+         r->layout_mask = xi->layout->mask; r->layout_stride = xi->layout->stride; r->layout_count = xi->layout->count;
+         memcpy(r->attrs, xi->layout->attrs, sizeof r->attrs);
+@@ -8370,6 +8430,8 @@ static void ld_pt_build(u32 ri, char* vs_hlsl, char* ps_hlsl, rsx_fp_constant_bl
+     xi.unnorm_mask = r->unnorm_mask; xi.unnorm_dim = unn; xi.gamma_mask = r->gamma_mask;
+     xi.argb_mask = r->argb_mask; xi.argb_remap = remap; xi.srgb_out = r->srgb_out;
+     xi.fp_const_count = (u32)fc; xi.fp_alpha_ref = 0;
++    /* patch 2088: the walker keys pipelines of antialiased targets by their sample grid; the record carries it. */
++    xi.wpos_aa = ld_wpos_aa_on() ? (r->flags >> RSX_PT_WPOS_AA_SHIFT) & 0xFFFFu : 0u;
+     u64 key = r->key;
+     int packed = (r->flags & RSX_PT_FLAG_PACKED) != 0;
+     {   /* the record's key must be what the walker derives from these programs and this state */
+@@ -9534,6 +9596,12 @@ static ID3D12PipelineState* get_pso(
+     xi.gamma_mask = gamma_mask; xi.argb_mask = argb_mask; xi.argb_remap = argb_remap; xi.srgb_out = srgb_out;
+     xi.fp_const_count = g.fp_constants.count; xi.fp_alpha_ref = g.fp_alpha_ref;
+     xi.vgpu = masked_layout && packed_payload == 2;   /* patch 2076 */
++    xi.wpos_aa = 0;   /* patch 2088 */
++    if (ld_wpos_aa_on()) {
++        rsx_dsp_surface wsf;
++        rsx_dsp_get_surface(&g.rsx, &wsf);
++        if (wsf.aa_sx != 1u || wsf.aa_sy != 1u) xi.wpos_aa = wsf.aa_sx | (wsf.aa_sy << 8);
++    }
+     u64 kl_pre_rs = 0;
+     key = ld_pso_key_tail(key, &xi, packed_payload, &kl_pre_rs);   /* patch 2071: shared with the prewarm */
+ #if defined(YZ_PERF_PROFILE)
+diff --git a/libs/video/rsx_pso_template.h b/libs/video/rsx_pso_template.h
+index 3259e182..0059fb32 100644
+--- a/libs/video/rsx_pso_template.h
++++ b/libs/video/rsx_pso_template.h
+@@ -35,6 +35,8 @@
+ #define RSX_PT_FLAG_PACKED 2u    /* packed payload offsets */
+ #define RSX_PT_FLAG_DEPTH  4u    /* a depth surface was bound when the pipeline was first seen */
+ #define RSX_PT_FLAG_BUFFERED 8u  /* fragment constants in a constant buffer (the only mode the prewarm builds) */
++#define RSX_PT_WPOS_AA_SHIFT 8u  /* patch 2088: flags bits 8-23 = sample grid of the target (aa_sx | aa_sy << 8),
++                                  * 0 = 1x1; the walker keys WPOS-in-pixels pipelines by it */
+ #define RSX_PT_FP_SEED   0x4B5A50545F465031ull   /* seed of the template's fragment-program structural hash */
+ #define RSX_PT_MAX_RECS  65536u
+ 

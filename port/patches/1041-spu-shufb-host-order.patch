@@ -1,0 +1,30 @@
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -191,7 +191,27 @@
+ /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
+  * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
+  * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
++/* KZ3 patch 1041 (SPU pass 28): shufb in host byte order, without the three word swaps. Result host byte h is
++ * SPU byte h ^ 3, so its control is host byte h of c as it stands; SPU source byte k (k = control & 0x1F) is
++ * host byte (k & 15) ^ 3 of a (k < 16) or b. t = (control & 0x1F) ^ 3 keeps bit 4 (the a/b choice):
++ * pshufb(a, t + 0x70) zeroes the b bytes (bit 7 set), pshufb(b, t - 0x10) zeroes the a bytes. Controls with
++ * bit 7 set (10x -> 0x00, 110 -> 0xFF, 111 -> 0x80) come from a 16-entry table on the high nibble, selected by
++ * the control's own sign bit. 11 vector ops instead of ~20. Bit-identical to the reference (host test
++ * tools/spu/test_spu_fastcg.sh), so no runtime switch (a flag load per op cost more than it was worth in the
++ * round-28 bench); spu_shufb_1035 keeps the previous version for the test's timing comparison. */
+ SPU_HOT u128 spu_shufb(u128 a, u128 b, u128 c) {   /* patch 1035: forced inline */
++    {
++        __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
++        const __m128i t = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x1F)), _mm_set1_epi8(3));
++        __m128i r = _mm_or_si128(_mm_shuffle_epi8(A, _mm_add_epi8(t, _mm_set1_epi8(0x70))),
++                                 _mm_shuffle_epi8(B, _mm_add_epi8(t, _mm_set1_epi8((char)0xF0))));
++        const __m128i lut = _mm_setr_epi8(0,0,0,0, 0,0,0,0, 0,0,0,0, (char)0xFF,(char)0xFF,(char)0x80,(char)0x80);
++        const __m128i sp = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 4), _mm_set1_epi8(0x0F)));
++        r = _mm_blendv_epi8(r, sp, C);
++        u128 out; memcpy(&out, &r, 16); return out;
++    }
++}
++static inline u128 spu_shufb_1035(u128 a, u128 b, u128 c) {
+     const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+     A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);

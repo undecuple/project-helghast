@@ -1,0 +1,11 @@
+# Gitleaks configuration for this repository: the default rules, plus one allowlist for the port's environment switch
+# names. Code comments and docs name switches like KZ3_KB_PROMPTS_FLIP=N or LD_VTX_DEV=1, which the generic-api-key
+# rule reads as a key assignment. Only lines whose match is such a switch name are allowed; every other finding still
+# fails the scan. [allowlist] (singular) is the form gitleaks 8.24 (the CI's pinned version) reads; [[allowlists]] needs 8.25+.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Port environment switch names (KZ3_*, LD_*, RSX_*, PAD_*, SPU_*, PPU_*) in comments and docs"
+regexTarget = "match"
+regexes = ['''\b(KZ3|LD|RSX|PAD|SPU|PPU|SPURS|GCM)_[A-Z0-9_]+\s*[=:]\s*[A-Za-z0-9_.,:-]{0,16}\b''']

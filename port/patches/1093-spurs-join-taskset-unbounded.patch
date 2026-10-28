@@ -1,0 +1,75 @@
+KZ3 patch 1093 (SPU pass 69): cellSpursJoinTaskset waits for the taskset's running tasks with no bound. Patch 1066
+bounded the wait at 1000 ms (KZ3_JOIN_TASKSET_MS) and then cut the still-running tasks off; the bound never fired
+in the K4/T7 runs of rounds 62-69 (0 of ~800 joins, longest wait 4 ms), and libsre's join waits for the workload's
+real shutdown. Join now returns when every running task of the taskset has exited or parked; a join still waiting
+logs "[ts-join] taskset X: still waiting after N ms, R running (marked: ids; P parked)" once per second (diagnostic
+only). KZ3_JOIN_TASKSET_MS is gone; KZ3_JOIN_TASKSET_OLD=1 (no wait at all) stays. Host test
+tools/spu/test_spurs_join.sh: a running task keeps join waiting past 1.3 s and its exit releases it. Upstream
+candidate (with 1066).
+
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -394,7 +394,11 @@
+  * in; Join waits (bounded) for the taskset's running, not parked, tasks to finish, then bumps the generation. A
+  * parked task of an older generation never consumes a signal again (it stays parked: on real SPURS a shut-down
+  * taskset's waiting tasks are never resumed) and its exit, if any, leaves the new tasks' state alone.
+- * KZ3_JOIN_TASKSET_OLD=1 = the old behaviour; KZ3_JOIN_TASKSET_MS = the wait bound (default 1000). */
++ * KZ3_JOIN_TASKSET_OLD=1 = the old behaviour.
++ * KZ3 patch 1093 (SPU pass 69): the wait has no bound any more (it was 1000 ms, KZ3_JOIN_TASKSET_MS): Join returns
++ * when the taskset's running tasks have exited or parked, as libsre's cellSpursJoinTaskset waits for the workload's
++ * shutdown. The bound never fired in the K4/T7 runs of rounds 62-69 (0 of ~800 joins; the longest wait 4 ms). A
++ * join still waiting logs "[ts-join] ... still waiting" with the running task ids once per second. */
+ static _Thread_local uint32_t t_task_ts, t_task_gen;
+ /* KZ3 patch 1067 (opt-in, KZ3_JOIN_CUTOFF_EXIT=1): a cut-off parked task leaves WAIT_SIGNAL and ends its host thread
+  * instead of staying parked forever (1066: one leaked parked thread per cut-off, about 1 join in 70 in pass 49-50
+@@ -433,8 +437,6 @@
+ int spu_taskset_join_wait(uint32_t taskset_ea)
+ {
+     if (ts_join_old() || !taskset_ea) return -1;
+-    static unsigned max_ms = 0;
+-    if (!max_ms) { const char* e = getenv("KZ3_JOIN_TASKSET_MS"); max_ms = e && atoi(e) > 0 ? (unsigned)atoi(e) : 1000u; }
+     unsigned waited = 0; int busy = 0, parked = 0, marks = 0;
+     for (;;) {
+         ts_lock();
+@@ -445,7 +447,14 @@
+             parked = s_ts_run[i].parked;
+         }
+         busy = marks - parked;
+-        if (busy <= 0 || waited >= max_ms) {
++        if (busy > 0 && waited > 0 && waited % 1000 == 0) {   /* 1093: diagnostic only, the wait goes on */
++            char ids[160]; int n = 0; ids[0] = 0;
++            for (int t = 0; t < 128 && n < (int)sizeof ids - 6; t++)
++                if (s_ts_run[i].running[t / 8] & (0x80u >> (t & 7))) n += snprintf(ids + n, sizeof ids - n, " %d", t);
++            fprintf(stderr, "[ts-join] taskset 0x%08X: still waiting after %u ms, %d running (marked:%s; %d parked)\n",
++                    taskset_ea, waited, busy, ids, parked);
++        }
++        if (busy <= 0) {
+             if (i >= 0) {                       /* new generation: older tasks are cut off */
+                 s_ts_run[i].gen++;
+                 s_ts_run[i].parked = 0;
+@@ -460,10 +469,10 @@
+     }
+     static volatile LONG n;
+     LONG k = InterlockedIncrement(&n);
+-    if (k <= 32 || (k % 64) == 0 || busy > 0)
+-        fprintf(stderr, "[ts-join] #%ld taskset 0x%08X: waited %u ms, %d running, %d parked task(s) cut off%s\n",
+-                (long)k, taskset_ea, waited, busy > 0 ? busy : 0, parked, busy > 0 ? " (TIMEOUT)" : "");
+-    return busy > 0 ? busy : 0;
++    if (k <= 32 || (k % 64) == 0 || waited >= 1000)
++        fprintf(stderr, "[ts-join] #%ld taskset 0x%08X: waited %u ms, %d parked task(s) cut off\n",
++                (long)k, taskset_ea, waited, parked);
++    return 0;
+ }
+ 
+ /* KZ3 patch 1072 (SPU pass 57, KZ3_JOIN2_PROBE=1, logs only): the T7 quit stalls in cellSpursJoinTask2 (Havok pool dtor,
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1343,7 +1343,7 @@
+         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+ 
+     printf("[cellSpurs] JoinTaskset()\n");
+-    /* KZ3 patch 1066: wait (bounded) for the taskset's running tasks, then cut off the parked ones, so a taskset
++    /* KZ3 patch 1066 (+1093: no bound): wait for the taskset's running tasks, then cut off the parked ones, so a taskset
+      * re-created at the same address does not share task ids with the old tasks (spu_taskset_join_wait). */
+     { extern int spu_taskset_join_wait(uint32_t); spu_taskset_join_wait(taskset_ea); }
+     return CELL_OK;

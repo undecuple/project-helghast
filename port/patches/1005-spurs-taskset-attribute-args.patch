@@ -1,0 +1,63 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): rebased onto upstream taskset size checks, args side table still needed.
+Spu pass 82: the round-81 rebase put the side table before cellSpursCreateTaskset's closing brace (tsattr_remember and
+the functions after it became nested: "invalid storage class for function"); the brace is back.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -808,6 +808,27 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+ {
+     return spurs_create_taskset(spurs, taskset, args, priority, maxContention,
+                                 CSTS_STRUCT_END);
++}
++
++/* What _cellSpursTasksetAttributeInitialize was given, keyed by the guest EA of
++ * the attribute (KZ3, patch 1005). The attribute used to be dropped here, so a
++ * taskset created WithAttribute always had args = 0 -- and a SPURS task receives
++ * its taskset's args in r4 (spursTasksetStartTask: r4 = {taskset->args,
++ * spurs}). KZ3's Bink SPU tasks (elf 0xF3D300) get their per-SPU control block
++ * only that way (the PPU passes argTaskset = control block, task argument NULL)
++ * and never signal completion without it, so the PPU waits forever. A side
++ * table, not the native struct: the guest owns the real attribute layout. */
++static struct { u32 attr_ea; u64 args; u32 priority_ea; u32 max_contention; } s_tsattr[64];
++static unsigned s_tsattr_next;
++static void tsattr_remember(u32 attr_ea, u64 args, u32 priority_ea, u32 max_contention)
++{
++    for (unsigned i = 0; i < 64; i++)
++        if (s_tsattr[i].attr_ea == attr_ea) {
++            s_tsattr[i].args = args; s_tsattr[i].priority_ea = priority_ea;
++            s_tsattr[i].max_contention = max_contention; return; }
++    unsigned i = s_tsattr_next++ % 64;
++    s_tsattr[i].attr_ea = attr_ea; s_tsattr[i].args = args;
++    s_tsattr[i].priority_ea = priority_ea; s_tsattr[i].max_contention = max_contention;
+ }
+ 
+ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
+@@ -821,6 +840,14 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
+     const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
+     u32 size = attr_h->tasksetSize;
+     if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
++    for (unsigned i = 0; i < 64; i++)
++        if (s_tsattr[i].attr_ea == attr_ea) {
++            printf("[cellSpurs] CreateTasksetWithAttribute attr=0x%08X args=0x%016llX maxContention=%u\n",
++                   attr_ea, (unsigned long long)s_tsattr[i].args, s_tsattr[i].max_contention);
++            return spurs_create_taskset(spurs, taskset, s_tsattr[i].args,
++                                        (const u8*)(uintptr_t)s_tsattr[i].priority_ea,
++                                        s_tsattr[i].max_contention, size);
++        }
+     return spurs_create_taskset(spurs, taskset, 0, NULL, 0, size);
+ }
+ 
+@@ -1174,8 +1201,9 @@ s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
+                                          u32 revision, u32 sdkVersion, u64 argTaskset,
+                                          u64 priority, u32 maxContention)
+ {
+-    (void)sdkVersion; (void)argTaskset; (void)priority; (void)maxContention;
++    (void)sdkVersion;
+     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
++    tsattr_remember((u32)(uintptr_t)attr, argTaskset, (u32)priority, maxContention);
+     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
+     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
+     attr->revision = revision ? revision : 1;

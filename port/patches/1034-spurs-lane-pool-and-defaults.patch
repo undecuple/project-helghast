@@ -1,0 +1,120 @@
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -506,7 +506,9 @@
+          * at most nSpus -- the instance's virtual SPUs. Each claims one workload
+          * at a time, so different workloads run in parallel as on hardware.
+          * Default 1 = the original single poll thread. */
+-        int n = 1;
++        /* KZ3 patch 1034: default = one thread per virtual SPU (was 1); KZ3_SPURS_THREADS=1 restores the
++         * single poll thread. SPU pass 21: level 0.83 vs 0.34 flips/s with busy no-sleep (the RE notes). */
++        int n = 8;
+         { const char* e = getenv("KZ3_SPURS_THREADS"); if (e) n = atoi(e); }
+         if (n < 1) n = 1;
+         if (n > (int)si->nspus) n = (int)si->nspus;
+@@ -1616,7 +1618,8 @@
+      * frame header + 8 doublewords). KZ3's WWS setup (0x00A78918) stores
+      * maxContention there right before the call. */
+     { static int s_mc = -1;
+-      if (s_mc < 0) s_mc = getenv("KZ3_SPURS_MAXCONT") ? 1 : 0;
++      /* patch 1034: on by default (lanes capped at the instance's nSpus); KZ3_SPURS_MAXCONT=0 = always 1 */
++      if (s_mc < 0) { const char* e = getenv("KZ3_SPURS_MAXCONT"); s_mc = (e && *e == '0') ? 0 : 1; }
+       extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+       if (s_mc && g_active_ctx) {
+           u32 mc = (u32)vm_read64((u32)g_active_ctx->gpr[1] + 0x70);
+@@ -1824,6 +1827,36 @@
+     return 0;
+ }
+ 
++/* KZ3 patch 1034: persistent lane workers. A workload with maxContention > 1 ran lanes 1..N-1 on
++ * threads created and joined every pass (one CreateThread per lane per ~3 ms run). Each kernel
++ * thread now keeps up to 7 lane threads that wait on an event, run one policy-module pass for the
++ * lane they are given, and signal completion; the kernel joins them as before. Policy-module contexts
++ * are per (wid, spuNum) in spurs_policy.c, not per host thread, so a lane thread may serve any
++ * workload. KZ3_SPURS_LANE_POOL=0: the old per-pass threads. */
++struct kz3_lane {
++    HANDLE th, go, done;
++    struct spurs_pm_worker_arg a;
++    int kt; const char* prefix;
++};
++static DWORD WINAPI kz3_lane_thread(LPVOID p)
++{
++#ifdef _WIN32
++    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
++#endif
++    struct kz3_lane* L = (struct kz3_lane*)p;
++    if (kz3_wacct_on()) { char nm[40]; snprintf(nm, sizeof nm, "pm-worker:%s/k%d/spu%u", L->prefix, L->kt, (unsigned)L->a.spu_num); kz3_wacct_name(nm); }
++    for (;;) {
++        WaitForSingleObject(L->go, INFINITE);
++        const uint64_t wa0 = kz3_wacct_begin();
++        spu_run_policy_module(L->a.fn, L->a.image_id, L->a.pm, L->a.pm_size,
++                              L->a.arg, L->a.wid, L->a.ea, L->a.spu_num);
++        kz3_wacct_job(0);
++        kz3_wacct_end(KZ3_WA_PMRUN, L->a.wid, wa0);
++        SetEvent(L->done);
++    }
++    return 0;
++}
++
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ {
+ #ifdef _WIN32
+@@ -1856,8 +1889,14 @@
+     /* KZ3_SPURS_BUSY_NOSLEEP=1 (patch 1032): skip the 1 ms pass sleep after a pass in which a policy
+      * module found work (Sleep(1) costs ~1.05 ms under Wine, ~20 % of a busy kernel thread in the level). */
+     static int s_busy_nosleep = -1;
+-    if (s_busy_nosleep < 0) { const char* e = getenv("KZ3_SPURS_BUSY_NOSLEEP"); s_busy_nosleep = (e && *e == '1') ? 1 : 0; }
++    /* patch 1034: on by default; KZ3_SPURS_BUSY_NOSLEEP=0 restores the sleep after every pass. */
++    if (s_busy_nosleep < 0) { const char* e = getenv("KZ3_SPURS_BUSY_NOSLEEP"); s_busy_nosleep = (e && *e == '0') ? 0 : 1; }
+     int kz3_busy_prev = 0;
++    static struct kz3_lane s_lanes[MAX_SPURS_INST][8][7];   /* patch 1034: per (instance, kernel thread) */
++    struct kz3_lane* lanes = s_lanes[si - s_inst][kt & 7];
++    static int s_lane_pool = -1;
++    if (s_lane_pool < 0) { const char* e = getenv("KZ3_SPURS_LANE_POOL"); s_lane_pool = (e && *e == '0') ? 0 : 1; }
++    const int lane_pool = s_lane_pool;
+     for (;;) {
+         if (!(s_busy_nosleep && kz3_busy_prev))
+         { const uint64_t wa0 = kz3_wacct_begin(); Sleep(1); kz3_wacct_end(KZ3_WA_KSLEEP, 0, wa0); }   /* patch 1032 */
+@@ -1981,6 +2020,8 @@
+             u8 maxcont = *(vm_base + ea + SPURS_WKL_MAXCONT + wid);
+             if (maxcont < 1) maxcont = 1;
+             if (maxcont > 6) maxcont = 6;
++            /* patch 1034: never more lanes than the instance has SPUs (rows +0x40+16*spuNum, see below) */
++            if (si->nspus >= 1 && maxcont > si->nspus) maxcont = (u8)si->nspus;
+             /* Do NOT exceed the workload's own contention: per-SPU rows in
+              * the WWS sync struct live at +0x40+16*spuNum, and dispatching
+              * spuNum >= nSpus made virtual SPU 3 write its bookkeeping row
+@@ -2022,6 +2063,25 @@
+                      * lanes 1..N-1 and run lane 0 on this thread, then join. */
+                     HANDLE th[8]; struct spurs_pm_worker_arg wa[8];
+                     unsigned nth = 0;
++                    if (lane_pool) {   /* patch 1034 */
++                        for (u32 sn = 1; sn < maxcont && nth < 7; sn++, nth++) {
++                            struct kz3_lane* L = &lanes[nth];
++                            L->a.fn = r->fn; L->a.image_id = r->image_id;
++                            L->a.pm = pm; L->a.pm_size = sz;
++                            L->a.arg = arg; L->a.wid = wid; L->a.ea = ea; L->a.spu_num = sn;
++                            if (!L->th) {
++                                L->kt = kt; L->prefix = si->prefix;
++                                L->go = CreateEventA(NULL, FALSE, FALSE, NULL);
++                                L->done = CreateEventA(NULL, FALSE, FALSE, NULL);
++                                L->th = CreateThread(NULL, 1u << 20, kz3_lane_thread, L, 0, NULL);
++                            }
++                            th[nth] = L->done;
++                            SetEvent(L->go);
++                        }
++                        spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
++                        if (nth) WaitForMultipleObjects(nth, th, TRUE, INFINITE);
++                        nth = 0;
++                    } else
+                     for (u32 sn = 1; sn < maxcont && nth < 7; sn++, nth++) {
+                         wa[nth].fn = r->fn; wa[nth].image_id = r->image_id;
+                         wa[nth].pm = pm; wa[nth].pm_size = sz;
+@@ -2029,7 +2089,7 @@
+                         wa[nth].spu_num = sn;
+                         th[nth] = CreateThread(NULL, 1u << 20, spurs_pm_worker, &wa[nth], 0, NULL);
+                     }
+-                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
++                    if (!lane_pool) spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                     if (nth) {
+                         WaitForMultipleObjects(nth, th, TRUE, INFINITE);
+                         for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);

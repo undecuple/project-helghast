@@ -1,0 +1,408 @@
+KZ3 patch 1116 (SPU pass 101): host frames for guest setjmp/longjmp. A lifted guest longjmp restored the guest
+registers and then returned to its lifted caller (KZ3: longjmp 0xABBD8C back into luaD_throw 0x9EE30, so a caught
+Lua error ran on as if none happened). The lifter's --setjmp ADDR[:STATUS_OFF] / --longjmp ADDR (or `setjmp ADDR
+[status=OFF]` / `longjmp ADDR` rows in the --overrides file) make every `bl` to a setjmp a PPU_SJ_CALL (a host setjmp
+recorded per thread under the guest jmp_buf, r1 and host frame) and emit each longjmp as <name>__ljbody plus a wrapper
+that host-longjmps to the matching record (frameless _setjmp(buf, NULL) on MinGW x64), restoring the dispatch-depth
+and vcall-sp counters at the landing; no record = the old return, logged. Log `[ljmp] caught status=N (#count ...)`.
+KZ3_LJMP=0 = the old behaviour. Host test tools/spu/test_r101_setjmp.sh. Notes the RE notes Pass 101.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): `setjmp_marks` after upstream's `insn_patches` in the worker signature; PPU_MM_SNAP after the body opening.
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index b24248f6..dec8ce9f 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -4539,3 +4539,6 @@ extern "C" void ppu_guest_callstack(const char* tag)
+ #endif
+ }
+ 
++
++/* KZ3 patch 1116 (SPU pass 101): host frames for guest setjmp/longjmp (the lifter's --setjmp/--longjmp). */
++#include "ppu_setjmp_rt.inc"
+diff --git a/runtime/ppu/ppu_setjmp.h b/runtime/ppu/ppu_setjmp.h
+new file mode 100644
+index 00000000..f4b882aa
+--- /dev/null
++++ b/runtime/ppu/ppu_setjmp.h
+@@ -0,0 +1,90 @@
++/* ppu_setjmp.h -- host frames for guest setjmp/longjmp (KZ3 patch 1116, SPU pass 101).
++ *
++ * A lifted function cannot leave its host frame, so a lifted guest longjmp restores the guest registers from
++ * the jmp_buf and then RETURNS to its lifted caller (on the console it never returns). The lifter's
++ * --setjmp/--longjmp marks fix that in the generated code:
++ *   - every `bl` to a function marked setjmp becomes PPU_SJ_CALL: a host setjmp is taken first and recorded
++ *     on this thread under the guest jmp_buf address (r3 rounded up to 16, as the PS3 libc setjmp does), the
++ *     guest r1 and the host frame;
++ *   - a function marked longjmp is emitted as <name>__ljbody plus a wrapper <name> that runs the body (guest
++ *     registers restored, r3 = the longjmp value) and calls ppu_sj_longjmp, which host-longjmps to the record
++ *     of that jmp_buf. Control lands back at the call site, which goes on with the lifted code after the `bl`
++ *     with r3 != 0, as on the console.
++ *   - no record (or KZ3_LJMP=0): the longjmp returns as before and logs it.
++ * The host jump is the frameless form on MinGW x64 (_setjmp(buf, NULL): longjmp restores registers only, no
++ * RtlUnwindEx over lifted frames; same reason as SPU_SETJMP, patch 1099), _setjmp/_longjmp (no signal mask)
++ * elsewhere. Host frames between the setjmp site and the longjmp run no cleanups, as with the guest's own
++ * longjmp; the runtime's per-thread counters a skipped frame leaves (ps3_indirect_call dispatch depth, vcall sp)
++ * are restored at the landing. */
++#ifndef PPU_SETJMP_H
++#define PPU_SETJMP_H
++
++#include <setjmp.h>
++#include <stdint.h>
++
++#if defined(_WIN64) && defined(__MINGW64__)
++#  define PPU_SJ_HOST_SETJMP(b)    _setjmp((b), NULL)
++#  define PPU_SJ_HOST_LONGJMP(b, v) longjmp((b), (v))
++#elif defined(_WIN32)
++#  define PPU_SJ_HOST_SETJMP(b)    setjmp(b)
++#  define PPU_SJ_HOST_LONGJMP(b, v) longjmp((b), (v))
++#else
++#  define PPU_SJ_HOST_SETJMP(b)    _setjmp(b)
++#  define PPU_SJ_HOST_LONGJMP(b, v) _longjmp((b), (v))
++#endif
++
++#if defined(_MSC_VER) && !defined(__clang__)
++#  include <intrin.h>
++#  define PPU_SJ_FRAME() _AddressOfReturnAddress()
++#else
++#  define PPU_SJ_FRAME() __builtin_frame_address(0)
++#endif
++
++#ifndef PPU_SJ_MAX
++#  define PPU_SJ_MAX 64   /* live setjmp records per thread (Lua: one per nested pcall) */
++#endif
++
++struct ppu_context;
++
++typedef struct ppu_sj_rec {
++    jmp_buf   hb;          /* host frame of the call site */
++    uint32_t  jb;          /* guest jmp_buf, (r3 + 15) & ~15; 0 = free slot */
++    uint32_t  raw_jb;      /* r3 at the call */
++    uint64_t  r1;          /* guest r1 at the call (= the r1 setjmp saves) */
++    uintptr_t key;         /* host stack the record belongs to (ppu_sj_stack_key) */
++    uintptr_t hframe;      /* host frame address of the lifted caller */
++    int       depth0, vsp0;/* ps3_indirect_call dispatch depth, vcall sp at the call */
++    uint32_t  site;        /* guest address of the `bl` */
++    int32_t   status_off;  /* -1, or the offset from raw_jb of a status word the log prints (Lua: 0x220) */
++} ppu_sj_rec;
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Record the call site; NULL = no record (switch off, or PPU_SJ_MAX live records): plain call. */
++ppu_sj_rec* ppu_sj_push(struct ppu_context* ctx, uint32_t site, int32_t status_off, void* hframe);
++/* At a landing: restores the runtime counters of the record being landed on, counts and logs. */
++void ppu_sj_landed(struct ppu_context* ctx);
++/* Called by a lifted longjmp's wrapper after its body: jb_arg = r3 at the longjmp's entry. Does not return when
++ * a record matches; returns (old behaviour) otherwise. */
++void ppu_sj_longjmp(struct ppu_context* ctx, uint64_t jb_arg);
++/* Host stack identity: a coroutine layer that runs guest code on several host stacks of one thread (and is not
++ * Windows fibers, which the default key follows through the TEB stack base) sets this to name the current one. */
++extern uintptr_t (*ppu_sj_stack_key_fn)(void);
++/* Counters (any thread): landings, longjmps with no record, pushes refused (table full). */
++unsigned long long ppu_sj_stat(int which);
++#ifdef __cplusplus
++}
++#endif
++
++/* The call-site form the lifter emits for `bl <setjmp>`. The host setjmp must be in the lifted caller's own
++ * frame, hence a macro. The guest state lives in *ctx and is not cached across the call by the lifted code
++ * (its _cs_ entry copies do not change after the prologue), so nothing is lost by the host jump. */
++#define PPU_SJ_CALL(ctx, fn, site, soff) do {                                              \
++        ppu_sj_rec* _sj_r = ppu_sj_push((ctx), (site), (soff), PPU_SJ_FRAME());        \
++        if (!_sj_r) { fn(ctx); break; }                                                    \
++        if (PPU_SJ_HOST_SETJMP(_sj_r->hb) == 0) fn(ctx);                                   \
++        else ppu_sj_landed(ctx);                                                           \
++    } while (0)
++
++#endif /* PPU_SETJMP_H */
+diff --git a/runtime/ppu/ppu_setjmp_rt.inc b/runtime/ppu/ppu_setjmp_rt.inc
+new file mode 100644
+index 00000000..7d841e22
+--- /dev/null
++++ b/runtime/ppu/ppu_setjmp_rt.inc
+@@ -0,0 +1,113 @@
++/* ppu_setjmp_rt.inc -- the runtime half of ppu_setjmp.h (KZ3 patch 1116, SPU pass 101). Included at the end of
++ * ppu_loader.cpp (it needs ppu_context, vm_read32, g_trampoline_fn and the dispatch-depth / vcall-sp slots);
++ * tools/spu/test_r101_setjmp.sh includes it with stubs.
++ *
++ * Records: a per-thread table (PPU_THREAD_LOCAL, i.e. __thread: never one table shared by threads, the patch
++ * 1012 lesson). Live records never move (the host jmp_buf stays where its setjmp wrote it); a dead record is
++ * freed in place (jb = 0) and free slots are popped from the top. A record is dead when, on the same host stack
++ * (key), its guest frame is gone (its r1 below the current one: the guest stack grows down), its host frame is
++ * gone (frame address below the current one), or the same frame sets the same jmp_buf again. A longjmp only
++ * takes a record whose host frame is still live and whose r1 equals the r1 the guest longjmp restored. */
++#include "ppu_setjmp.h"
++
++#ifndef PPU_SJ_ENV
++#  define PPU_SJ_ENV "KZ3_LJMP"   /* =0: the call sites call plainly and longjmp returns (the old behaviour) */
++#endif
++
++static PPU_THREAD_LOCAL ppu_sj_rec  t_sj[PPU_SJ_MAX];
++static PPU_THREAD_LOCAL int         t_sj_n;      /* slots in use from the bottom (live or freed) */
++static PPU_THREAD_LOCAL ppu_sj_rec* t_sj_land;   /* the record ppu_sj_longjmp is landing on */
++static unsigned long long g_sj_stat[3];          /* caught, unmatched, full (atomic adds) */
++extern "C" uintptr_t (*ppu_sj_stack_key_fn)(void) = nullptr;
++
++static int ppu_sj_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv(PPU_SJ_ENV); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++static uintptr_t ppu_sj_key(void)
++{
++    if (ppu_sj_stack_key_fn) return ppu_sj_stack_key_fn();
++#if defined(_WIN32) && !defined(PPU_SJ_NO_TEB)
++    return (uintptr_t)((NT_TIB*)NtCurrentTeb())->StackBase;   /* per Windows fiber: SwitchToFiber updates it */
++#else
++    return 0;
++#endif
++}
++
++extern "C" unsigned long long ppu_sj_stat(int which)
++{
++    return (which >= 0 && which < 3) ? __atomic_load_n(&g_sj_stat[which], __ATOMIC_RELAXED) : 0;
++}
++
++extern "C" ppu_sj_rec* ppu_sj_push(ppu_context* ctx, uint32_t site, int32_t status_off, void* hframe)
++{
++    if (!ppu_sj_on()) return nullptr;
++    const uintptr_t key = ppu_sj_key(), hf = (uintptr_t)hframe;
++    const uint64_t r1 = ctx->gpr[1];
++    const uint32_t raw = (uint32_t)ctx->gpr[3], jb = (uint32_t)((raw + 0xFu) & ~0xFu);
++    for (int i = 0; i < t_sj_n; i++) {
++        ppu_sj_rec* r = &t_sj[i];
++        if (!r->jb || r->key != key) continue;
++        if (r->r1 < r1 || r->hframe < hf || (r->hframe == hf && r->jb == jb)) r->jb = 0;
++    }
++    while (t_sj_n > 0 && !t_sj[t_sj_n - 1].jb) t_sj_n--;
++    if (t_sj_n >= PPU_SJ_MAX) {
++        if (__atomic_add_fetch(&g_sj_stat[2], 1, __ATOMIC_RELAXED) <= 8)
++            fprintf(stderr, "[ljmp] setjmp site 0x%08X: %d live records on this thread, not recorded\n", site, t_sj_n);
++        return nullptr;
++    }
++    ppu_sj_rec* r = &t_sj[t_sj_n++];
++    r->jb = jb; r->raw_jb = raw; r->r1 = r1; r->key = key; r->hframe = hf;
++    r->depth0 = *ps3_ppu_dispatch_depth_slot(); r->vsp0 = *ps3_ppu_vcall_sp_slot();
++    r->site = site; r->status_off = status_off;
++    return r;
++}
++
++extern "C" void ppu_sj_landed(ppu_context* ctx)
++{
++    ppu_sj_rec* r = t_sj_land;
++    t_sj_land = nullptr;
++    if (!r) return;   /* cannot happen: only ppu_sj_longjmp jumps here */
++    *ps3_ppu_dispatch_depth_slot() = r->depth0;
++    *ps3_ppu_vcall_sp_slot() = r->vsp0;
++    const unsigned long long n = __atomic_add_fetch(&g_sj_stat[0], 1, __ATOMIC_RELAXED);
++    if (n <= 64 || n % 1000 == 0) {
++        const int32_t val = (int32_t)ctx->gpr[3];
++        const int32_t st = r->status_off >= 0 ? (int32_t)vm_read32((uint64_t)r->raw_jb + (uint32_t)r->status_off) : val;
++        fprintf(stderr, "[ljmp] caught status=%d (#%llu, val=%d, site 0x%08X, jmp_buf 0x%08X)\n", st, n, val, r->site, r->jb);
++    }
++}
++
++extern "C" void ppu_sj_longjmp(ppu_context* ctx, uint64_t jb_arg)
++{
++    if (!ppu_sj_on()) return;
++    const uint32_t jb = (uint32_t)((jb_arg + 0xFu) & ~0xFull);
++    const uintptr_t key = ppu_sj_key();
++    char here;
++    const uintptr_t hsp = (uintptr_t)&here;
++    int found = -1, r1_off = 0;
++    for (int i = t_sj_n - 1; i >= 0; i--) {
++        ppu_sj_rec* r = &t_sj[i];
++        if (r->jb != jb || r->key != key) continue;
++        if (r->hframe <= hsp) { r->jb = 0; continue; }          /* its host frame returned: stale */
++        if (r->r1 != ctx->gpr[1]) { r1_off = 1; continue; }     /* the guest buffer was set again elsewhere */
++        found = i;
++        break;
++    }
++    if (found < 0) {
++        if (__atomic_add_fetch(&g_sj_stat[1], 1, __ATOMIC_RELAXED) <= 16)
++            fprintf(stderr, "[ljmp] longjmp to jmp_buf 0x%08X with no host frame (records=%d%s) -- returns as before\n",
++                    jb, t_sj_n, r1_off ? ", r1 mismatch" : "");
++        return;
++    }
++    /* The frames between are gone: free the same-stack records above the target. */
++    for (int i = found + 1; i < t_sj_n; i++)
++        if (t_sj[i].key == key) t_sj[i].jb = 0;
++    while (t_sj_n > found + 1 && !t_sj[t_sj_n - 1].jb) t_sj_n--;
++    t_sj_land = &t_sj[found];
++    g_trampoline_fn = nullptr;   /* a continuation queued by a skipped frame must not run at the landing */
++    PPU_SJ_HOST_LONGJMP(t_sj[found].hb, 1);
++}
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index d47ff973..372b6274 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -1052,6 +1052,7 @@ class LiftedFunction:
+     body_lines: list[str] = field(default_factory=list)
+     calls: list[int] = field(default_factory=list)  # addresses of bl targets
+     fallthrough_to: int = 0  # if it falls off the end, the continuation address
++    uses_setjmp: bool = False  # KZ3 patch 1116: has a `bl` to a --setjmp function (PPU_SJ_CALL)
+ 
+ 
+ # Max span (bytes) for a mid-function tail-entry / gap wrapper. A real interior
+@@ -1133,6 +1134,13 @@ class PPULifter:
+         # PPU_OVERRIDE_<addr> so the host can compile its replacement only
+         # against a lift that made room for it.
+         self.overrides: set[int] = set()
++        # KZ3 patch 1116 (--setjmp / --longjmp, or `setjmp ADDR [status=OFF]` / `longjmp ADDR` rows in the
++        # --overrides file): guest setjmp/longjmp entry points. Every `bl` to a setjmp address takes a host
++        # frame (PPU_SJ_CALL, runtime/ppu/ppu_setjmp.h); a longjmp is emitted as <name>__ljbody plus a wrapper
++        # that host-longjmps to the matching frame. Value: offset from the jmp_buf argument of a status word
++        # the landing log prints (-1 = print the longjmp value).
++        self.setjmp_marks: dict[int, int] = {}
++        self.longjmp_marks: set[int] = set()
+         # Module primary TOC (r2). Set by main() only when the ELF yields exactly
+         # one TOC candidate; enables the `ld r2, N(r1)` restore lowering below.
+         self.toc_base: int = 0
+@@ -2227,6 +2235,8 @@ class PPULifter:
+                     # stack-growing recursion when backward branches re-enter
+                     # a fragment's prologue (stack allocation).
+                     self.branch_targets.add(tgt)
++                    if tgt in self.setjmp_marks:
++                        print(f"  WARNING: tail branch to --setjmp 0x{tgt:08X} at 0x{insn.addr:08X}: no host frame", flush=True)
+                     return f"{{ g_trampoline_fn = (void(*)(void*)){self.prefix}func_{tgt:08X}; return; }}"
+             except ValueError:
+                 return f"goto {target}; /* branch */"
+@@ -2247,6 +2257,10 @@ class PPULifter:
+                     return f"/* bl -> non-code 0x{tgt:08X} */;"
+                 func.calls.append(tgt)
+                 self.call_targets.add(tgt)
++                if tgt in self.setjmp_marks:
++                    func.uses_setjmp = True
++                    return (f"ctx->lr = 0x{insn.addr + 4:08X}; PPU_SJ_CALL(ctx, {self.prefix}func_{tgt:08X}, "
++                            f"0x{insn.addr:08X}u, {self.setjmp_marks[tgt]}); DRAIN_TRAMPOLINE(ctx);  /* --setjmp */")
+                 # PPC `bl` sets LR = return address (next instr). Emit it so mflr
+                 # reads the correct value AND stack-saved LRs are real return
+                 # addresses -> reliable back-chain unwinding for diagnostics.
+@@ -4297,7 +4311,18 @@ class PPULifter:
+             lines += ["#ifdef __cplusplus", f'extern "C" int {g};', "#else",
+                       f"extern int {g};", "#endif"]
+         defname = func.name + "__lifted" if func.start_addr in self.overrides else func.name
+-        lines.append(f"void {weak}{defname}(ppu_context* ctx) {{")
++        # KZ3 patch 1116: a --longjmp function's body becomes <name>__ljbody; the wrapper below keeps its
++        # name (or <name>__lifted when the host overrides it, so the override's call keeps the host jump).
++        is_lj = func.start_addr in getattr(self, "longjmp_marks", ())
++        uses_sj = func.uses_setjmp or any("PPU_SJ_CALL(" in b for b in func.body_lines)
++        if uses_sj or is_lj:
++            lines.append('#include "ppu_setjmp.h"   /* KZ3 patch 1116: --setjmp/--longjmp */')
++        lj_wrapper = defname
++        if is_lj:
++            defname = func.name + "__ljbody"
++            weak_body, weak = weak, ""
++            lines.append(f"static void {defname}(ppu_context* ctx);")
++        lines.append(f"{'static ' if is_lj else ''}void {weak}{defname}(ppu_context* ctx) {{")
+         lines.append("    PPU_MM_SNAP")
+         for bline in _fuse_cr(func.body_lines):
+             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
+@@ -4336,6 +4361,16 @@ class PPULifter:
+ 
+         lines.append("}")
+         lines.append("")
++        if is_lj:
++            # The lifted longjmp restored the guest registers from the jmp_buf (r3 = the value, never 0);
++            # ppu_sj_longjmp lands at the matching PPU_SJ_CALL, or returns as before when there is none.
++            lines.append(f"/* --longjmp 0x{func.start_addr:08X}: body, then the host jump (KZ3 patch 1116) */")
++            lines.append(f"void {weak_body}{lj_wrapper}(ppu_context* ctx) {{")
++            lines.append("    const uint64_t _sj_jb = ctx->gpr[3];")
++            lines.append(f"    {defname}(ctx); DRAIN_TRAMPOLINE(ctx);")
++            lines.append("    ppu_sj_longjmp(ctx, _sj_jb);")
++            lines.append("}")
++            lines.append("")
+         return lines
+ 
+     def _table_lines(self) -> list[str]:
+@@ -5026,7 +5061,7 @@ _WORKER_STATE: dict = {}
+ 
+ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
+                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
+-                 toc_base=0, insn_patches=None):
++                 toc_base=0, insn_patches=None, setjmp_marks=None):
+     _WORKER_STATE["segs"] = segs
+     _WORKER_STATE["be"] = big_endian
+     _WORKER_STATE["names"] = name_map
+@@ -5042,6 +5077,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
+     _WORKER_STATE["code_hi"] = code_hi
+     _WORKER_STATE["jump_tables"] = jump_tables or {}
+     _WORKER_STATE["insn_patches"] = insn_patches or {}
++    _WORKER_STATE["setjmp_marks"] = setjmp_marks or {}   # KZ3 patch 1116: the bl sites need them
+ 
+ 
+ def _worker_lift(task):
+@@ -5058,6 +5094,7 @@ def _worker_lift(task):
+     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
+     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
+     lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
++    lifter.setjmp_marks = _WORKER_STATE.get("setjmp_marks", {})
+     results = []
+     for start, end in bounds:
+         blob = b""
+@@ -5093,7 +5130,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
+                              lifter.hle_stub_nids, lifter.function_entries,
+                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
+                              getattr(lifter, "toc_base", 0),
+-                             lifter.insn_patches))
++                             lifter.insn_patches,
++                             getattr(lifter, "setjmp_marks", {})))
+     try:
+         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
+             results_by_idx[idx0] = results
+@@ -5173,6 +5211,13 @@ def main() -> None:
+                         help="Emit lifted function definitions as weak symbols "
+                              "so a port's idiomatic overrides (strong symbols "
+                              "of the same name) shadow them at link time")
++    parser.add_argument("--setjmp", metavar="ADDR[:STATUS_OFF]", action="append", default=None,
++                        help="Guest setjmp entry (hex; repeatable; also `setjmp ADDR [status=OFF]` rows in --overrides): "
++                             "every bl to it takes a host frame a --longjmp lands on (runtime/ppu/ppu_setjmp.h). "
++                             "STATUS_OFF: offset from the jmp_buf argument of a 32-bit status the landing log prints")
++    parser.add_argument("--longjmp", metavar="ADDR", action="append", default=None,
++                        help="Guest longjmp entry (hex; repeatable; or `longjmp ADDR` rows in --overrides): after its "
++                             "lifted body it host-longjmps to the matching --setjmp call site")
+     parser.add_argument("--overrides", metavar="FILE", default=None,
+                         help="Text file of function entry addresses (hex, one per line, '#' comments) "
+                              "the host replaces: their lifted bodies are emitted as <name>__lifted")
+@@ -5642,13 +5687,36 @@ def main() -> None:
+         lifter.code_lo = min(s for s, _ in func_bounds)
+         lifter.code_hi = max(e for _, e in func_bounds)
+     lifter.hle_stub_nids = hle_stubs
++    def _mark_sj(kind, words):
++        a = int(words[0], 16)
++        if kind == "longjmp":
++            lifter.longjmp_marks.add(a)
++            return
++        off = -1
++        for w in words[1:]:
++            if w.startswith("status="):
++                off = int(w[7:], 0)
++        lifter.setjmp_marks[a] = off
++    for _v in (args.setjmp or []):
++        _p = _v.split(":")
++        _mark_sj("setjmp", [_p[0]] + ([f"status={_p[1]}"] if len(_p) > 1 else []))
++    for _v in (args.longjmp or []):
++        _mark_sj("longjmp", [_v])
+     if args.overrides:
+         with open(args.overrides) as _of:
+             for _ln in _of:
+                 _ln = _ln.split("#", 1)[0].strip()
+-                if _ln:
+-                    lifter.overrides.add(int(_ln, 16))
++                if not _ln:
++                    continue
++                _w = _ln.split()
++                if _w[0] in ("setjmp", "longjmp"):     # KZ3 patch 1116 rows: `setjmp ADDR [status=OFF]`, `longjmp ADDR`
++                    _mark_sj(_w[0], _w[1:])
++                    continue
++                lifter.overrides.add(int(_ln, 16))
+         print(f"  overrides: {len(lifter.overrides)} function(s) left to the host")
++    if lifter.setjmp_marks or lifter.longjmp_marks:
++        print(f"  setjmp/longjmp host frames: setjmp {', '.join(f'0x{a:08X}' for a in sorted(lifter.setjmp_marks))}"
++              f"; longjmp {', '.join(f'0x{a:08X}' for a in sorted(lifter.longjmp_marks))}")
+     lifter.function_entries = _func_entries
+     lifter.jump_tables = jt_dispatchers
+     if args.insn_patches:

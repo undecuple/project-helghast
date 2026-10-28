@@ -1,0 +1,634 @@
+KZ3 patch 2037: keyboard and mouse buttons from a binding file, alongside an XInput pad (RSX pass 36 hook C;
+configurable keybinds saved to a local config file). cellPad.c's one fixed keyboard table (patch 2034) is
+replaced by keybinds.ini in the player's data folder (the install folder when kz3-install.ini next to the exe or
+one level up says [install] portable = 1, else %APPDATA%\Project Helghast; KZ3_KEYBINDS=<path> overrides): one line
+per pad input (16 buttons + both sticks as four directions each, diagonals by holding two keys), primary and
+secondary key, mouse buttons Mouse1-5. Written with the defaults when missing, re-read when its time stamp changes
+(checked every 2 s). Unknown inputs, unknown keys, extra keys and broken lines are logged ("[keybinds] line N: ...")
+and ignored, never fatal. The keys are polled every time (not only when no XInput pad is on port 0) and merged into
+port 0: buttons OR'ed, a held stick direction overrides that stick, L2/R2 keys give full triggers. PAD_NO_KEYBOARD=1
+still turns the keyboard off. Parser, defaults and writer are platform-free in libs/input/pad_keybinds.h (host test
+tools/smoke/test_pad_keybinds.sh). Upstream candidate (the table and the coexistence with a pad; KZ3's default
+keys and data folder are port-specific).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index bc86d412..15b335f4 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -251,22 +251,17 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
+     return (u8)val;
+ }
+ 
+-/* Keyboard fallback for port 0.
++/* Keyboard (and mouse buttons) on port 0.
+  *
+  * The only backend here is XInput, so on a machine with no controller plugged
+  * in a title gets a pad that is reported present and never presses anything --
+  * it can be watched but not played. That is what The Simpsons Arcade Game hit:
+  * it reached its attract loop and no input existed to start a game.
+  *
+- * Only fills in for port 0, only when XInput found nothing there, so a real
+- * controller always wins and nothing changes for a port that has one. Keys are
+- * read only while a window of THIS process is in the foreground, so typing in
+- * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
+- * disable it entirely.
+- *
+- * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
+- * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
+- * so a title that reads the stick instead is playable too. */
++ * Keys are read only while a window of THIS process is in the foreground, so
++ * typing in another application does not drive the game. Set PAD_NO_KEYBOARD=1
++ * to disable it entirely. KZ3 patch 2037: the map is the player's keybinds.ini
++ * (pad_keybinds.h has the defaults) and it adds to a connected XInput pad. */
+ #ifdef _WIN32
+ static int pad_host_window_focused(void)
+ {
+@@ -277,54 +272,174 @@ static int pad_host_window_focused(void)
+     return pid == GetCurrentProcessId();
+ }
+ 
++/* KZ3 patch 2037 (hook C): the keys come from a binding file instead of one fixed table, and they work
++ * alongside an XInput pad on port 0 (buttons OR'ed, a key-held stick direction overrides that stick). The file is
++ * keybinds.ini in the player's data folder, the same folder tools/release/launch.py data_dir() picks: the install
++ * folder when kz3-install.ini (next to the exe or one level up, <root>/build/kz3.exe) says [install] portable = 1,
++ * else %APPDATA%\Project Helghast. KZ3_KEYBINDS=<path> names another file (tests). Missing = written with the
++ * defaults; re-read when its time stamp changes (checked every 2 s). Parser, defaults, writer: pad_keybinds.h. */
++#include "pad_keybinds.h"
++
++static PadKeybinds s_kb;
++static PadKbState  s_kb_state;          /* this poll's keys (zero when unfocused) */
++static int         s_kb_ready = 0;
++static wchar_t     s_kb_path[1024];
++static FILETIME    s_kb_stamp;
++static unsigned long long s_kb_checked_ms = 0;
++
++static void pad_kb_log(void* ctx, const char* msg)
++{
++    (void)ctx;
++    printf("[keybinds] %s\n", msg);
++}
++
++static int pad_kb_down_win(void* ctx, int vk) { (void)ctx; return (GetAsyncKeyState(vk) & 0x8000) != 0; }
++
++static char* pad_kb_read_w(const wchar_t* path)       /* malloc'd, NUL-terminated; NULL if unreadable */
++{
++    FILE* f = _wfopen(path, L"rb");
++    char* buf;
++    long n;
++    if (!f) return NULL;
++    if (fseek(f, 0, SEEK_END) != 0 || (n = ftell(f)) < 0 || n > (1 << 20) || fseek(f, 0, SEEK_SET) != 0) {
++        fclose(f); return NULL;
++    }
++    buf = (char*)malloc((size_t)n + 1);
++    if (buf) { buf[fread(buf, 1, (size_t)n, f)] = 0; }
++    fclose(f);
++    return buf;
++}
++
++/* <dir>\kz3-install.ini says portable? */
++static int pad_kb_dir_portable(const wchar_t* dir)
++{
++    wchar_t p[1024];
++    char* t;
++    int r;
++    if (_snwprintf(p, 1024, L"%ls\\kz3-install.ini", dir) < 0) return 0;
++    p[1023] = 0;
++    t = pad_kb_read_w(p);
++    r = t ? pad_kb_ini_portable(t) : 0;
++    free(t);
++    return r;
++}
++
++static void pad_kb_find_path(void)
++{
++    wchar_t exe[1024], appdata[1024];
++    const wchar_t* env = _wgetenv(L"KZ3_KEYBINDS");
++    DWORD n;
++    if (env && *env) { wcsncpy(s_kb_path, env, 1023); s_kb_path[1023] = 0; return; }
++    n = GetModuleFileNameW(NULL, exe, 1024);
++    if (n > 0 && n < 1024) {
++        wchar_t* sl = wcsrchr(exe, L'\\');
++        if (sl) {
++            *sl = 0;                                  /* exe dir */
++            if (pad_kb_dir_portable(exe)) { _snwprintf(s_kb_path, 1024, L"%ls\\keybinds.ini", exe); s_kb_path[1023] = 0; return; }
++            sl = wcsrchr(exe, L'\\');
++            if (sl) {
++                *sl = 0;                              /* install root */
++                if (pad_kb_dir_portable(exe)) { _snwprintf(s_kb_path, 1024, L"%ls\\keybinds.ini", exe); s_kb_path[1023] = 0; return; }
++            }
++        }
++    }
++    n = GetEnvironmentVariableW(L"APPDATA", appdata, 1024);
++    if (n > 0 && n < 1000) {
++        wchar_t dir[1024];
++        _snwprintf(dir, 1024, L"%ls\\Project Helghast", appdata); dir[1023] = 0;
++        CreateDirectoryW(dir, NULL);                  /* exists already = fine */
++        _snwprintf(s_kb_path, 1024, L"%ls\\keybinds.ini", dir); s_kb_path[1023] = 0;
++        return;
++    }
++    wcscpy(s_kb_path, L"keybinds.ini");               /* no APPDATA: the working folder */
++}
++
++static int pad_kb_stamp(FILETIME* out)
++{
++    WIN32_FILE_ATTRIBUTE_DATA a;
++    if (!GetFileAttributesExW(s_kb_path, GetFileExInfoStandard, &a)) return 0;
++    *out = a.ftLastWriteTime;
++    return 1;
++}
++
++static void pad_kb_load(int first)
++{
++    PadKeybinds kb;
++    char* text;
++    pad_kb_defaults(&kb);
++    text = pad_kb_read_w(s_kb_path);
++    if (!text) {
++        if (first) {
++            char buf[8192];
++            int len = pad_kb_format(&kb, buf, sizeof buf);
++            FILE* f = _wfopen(s_kb_path, L"wb");
++            int ok = f && len > 0 && len < (int)sizeof buf && fwrite(buf, 1, (size_t)len, f) == (size_t)len;
++            if (f) fclose(f);
++            printf("[keybinds] %ls: %s\n", s_kb_path, ok ? "not found, written with the defaults"
++                                                          : "not found and not writable, defaults used");
++        }
++    } else {
++        int bad = pad_kb_parse(&kb, text, pad_kb_log, NULL);
++        free(text);
++        printf("[keybinds] %ls: %s (%d problem line part(s) ignored)\n", s_kb_path, first ? "read" : "re-read", bad);
++    }
++    if (!pad_kb_stamp(&s_kb_stamp)) memset(&s_kb_stamp, 0, sizeof s_kb_stamp);
++    s_kb = kb;
++    fflush(stdout);
++}
++
+ static void pad_poll_keyboard(void)
+ {
+     static int off = -1;
+     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
++    s_kb_state.buttons = 0; s_kb_state.dirs = 0;
+     if (off) return;
+ 
++    if (!s_kb_ready) { pad_kb_find_path(); pad_kb_load(1); s_kb_ready = 1; s_kb_checked_ms = GetTickCount64(); }
++    else {
++        unsigned long long now = GetTickCount64();
++        if (now - s_kb_checked_ms >= 2000) {
++            FILETIME t;
++            s_kb_checked_ms = now;
++            if (pad_kb_stamp(&t) && CompareFileTime(&t, &s_kb_stamp) != 0) pad_kb_load(0);
++        }
++    }
++    /* Nothing while another program has the focus; releasing on focus loss keeps a key held while alt-tabbing
++     * from staying down forever. */
++    if (!pad_host_window_focused()) return;
++    s_kb_state = pad_kb_eval(&s_kb, pad_kb_down_win, NULL);
++}
++
++/* Port 0 = the XInput pad (if any) plus the keys. Without a pad, port 0 is the keys alone and is reported
++ * connected, as before (a title must see a pad to be playable on the keyboard). */
++static void pad_merge_keyboard(void)
++{
++    static int off = -1;
+     PadHostState* hs = &s_host_state[0];
+-    if (!pad_host_window_focused()) {
+-        /* Release everything on focus loss, or a key held while alt-tabbing
+-         * would stay down forever. */
+-        hs->buttons = 0;
+-        hs->analog_lx = hs->analog_ly = 128;
+-        hs->analog_rx = hs->analog_ry = 128;
++    const PadKbState* k = &s_kb_state;
++    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
++    int had_pad = hs->connected;
++    if (off) return;
++    if (!hs->connected) {
++        memset(hs, 0, sizeof *hs);
+         hs->connected = 1;
+-        return;
++        hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+     }
+-
+-    /* The one keyboard -> pad table (KZ3 patch 2034 adds Esc = START, so Esc opens the pause menu in game and
+-     * acts as the game's own back/resume in menus; Enter stays START too). A key-binding file replaces
+-     * this table later. */
+-    static const struct { int vk; u16 btn; } map[] = {
+-        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
+-        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
+-        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
+-        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
+-        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
+-        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
+-        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
+-        { VK_ESCAPE, CELL_PAD_CTRL_START },
+-    };
+-
+-    u16 btns = 0;
+-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+-
+-    hs->buttons   = btns;
+-    hs->connected = 1;
+-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
+-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+-    hs->analog_rx = hs->analog_ry = 128;
+-    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+-    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+-
+-    { static int said = 0;
+-      if (!said && btns) { said = 1;
+-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
++    if (!k->buttons && !k->dirs) return;
++    hs->buttons |= k->buttons;
++    if (k->dirs & ((1u << PKB_LS_LEFT) | (1u << PKB_LS_RIGHT)))
++        hs->analog_lx = pad_kb_axis(k->dirs, PKB_LS_LEFT, PKB_LS_RIGHT);
++    if (k->dirs & ((1u << PKB_LS_UP) | (1u << PKB_LS_DOWN)))
++        hs->analog_ly = pad_kb_axis(k->dirs, PKB_LS_UP, PKB_LS_DOWN);
++    if (k->dirs & ((1u << PKB_RS_LEFT) | (1u << PKB_RS_RIGHT)))
++        hs->analog_rx = pad_kb_axis(k->dirs, PKB_RS_LEFT, PKB_RS_RIGHT);
++    if (k->dirs & ((1u << PKB_RS_UP) | (1u << PKB_RS_DOWN)))
++        hs->analog_ry = pad_kb_axis(k->dirs, PKB_RS_UP, PKB_RS_DOWN);
++    if (k->buttons & PKB_L2) hs->trigger_l2 = 255;
++    if (k->buttons & PKB_R2) hs->trigger_r2 = 255;
++    { static int said = -1;
++      if (said != had_pad) { said = had_pad;
++          printf("[cellPad] keyboard input on port 0 (%s)\n", had_pad ? "with the XInput pad" : "no XInput pad");
+           fflush(stdout); } }
+ }
+ #endif
+@@ -715,7 +830,9 @@ static void pad_poll_backend(void)
+     pad_poll_sdl2();
+ #endif
+ #ifdef _WIN32
+-    if (!s_host_state[0].connected) pad_poll_keyboard();
++    /* KZ3 patch 2037: keys always polled (not only with no pad on port 0) and merged into port 0. */
++    pad_poll_keyboard();
++    pad_merge_keyboard();
+ #endif
+     pad_track_assign();
+     pad_unlock();
+diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+new file mode 100644
+index 00000000..dfe5cb9e
+--- /dev/null
++++ b/libs/input/pad_keybinds.h
+@@ -0,0 +1,356 @@
++/*
++ * KZ3 patch 2037: keyboard/mouse -> pad bindings read from a human-readable file (hook C).
++ *
++ * Pure C, no platform headers: the key codes are Windows virtual-key numbers written out, so the parser, the
++ * default table and the writer build and run anywhere (host test: tools/smoke/test_pad_keybinds.sh). cellPad.c
++ * includes this once, reads the file, polls the keys with GetAsyncKeyState and merges the result into port 0.
++ *
++ * File (keybinds.ini), one line per pad input:   <input> = <primary key>[, <secondary key>]
++ *   inputs: up down left right cross circle square triangle l1 r1 l2 r2 l3 r3 start select
++ *           ls_up ls_down ls_left ls_right rs_up rs_down rs_left rs_right  (sticks: any two keys of one stick
++ *           held together give the diagonal, so four keys cover the eight directions)
++ *   keys:   names from pad_kb_keys[] below (A-Z, 0-9, F1-F12, Space, Enter, Escape, ..., Mouse1-Mouse5), case
++ *           does not matter; "none" (or nothing) = unbound.
++ * '#' or ';' starts a comment; a "[keyboard]" header is optional, other sections are skipped (reserved for later
++ * pages: gamepad remap, mouse look). A line with an unknown input, an unknown key or more than two keys is logged
++ * and the bad part ignored; nothing in the file is ever fatal. An input missing from the file keeps its default.
++ */
++#ifndef PAD_KEYBINDS_H
++#define PAD_KEYBINDS_H
++
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++
++#define PKB_SLOTS 2
++
++/* pad bit values = CELL_PAD_CTRL_* as packed in PadHostState.buttons (cellPad.h) */
++enum {
++    PKB_SELECT = 0x0001, PKB_L3 = 0x0002, PKB_R3 = 0x0004, PKB_START = 0x0008,
++    PKB_UP = 0x0010, PKB_RIGHT = 0x0020, PKB_DOWN = 0x0040, PKB_LEFT = 0x0080,
++    PKB_L2 = 0x0100, PKB_R2 = 0x0200, PKB_L1 = 0x0400, PKB_R1 = 0x0800,
++    PKB_TRIANGLE = 0x1000, PKB_CIRCLE = 0x2000, PKB_CROSS = 0x4000, PKB_SQUARE = 0x8000
++};
++
++/* stick directions: bit index in PadKbState.dirs */
++enum { PKB_LS_UP, PKB_LS_DOWN, PKB_LS_LEFT, PKB_LS_RIGHT, PKB_RS_UP, PKB_RS_DOWN, PKB_RS_LEFT, PKB_RS_RIGHT };
++
++typedef struct { const char* name; unsigned short btn; signed char dir; const char* what; } PadKbInput;
++
++/* The order is the file's order. `what` is the Standard preset's main use (the RE notes 5.3). */
++static const PadKbInput pad_kb_inputs[] = {
++    { "up",       PKB_UP,       -1, "d-pad up (zoom mode)" },
++    { "down",     PKB_DOWN,     -1, "d-pad down" },
++    { "left",     PKB_LEFT,     -1, "d-pad left" },
++    { "right",    PKB_RIGHT,    -1, "d-pad right" },
++    { "cross",    PKB_CROSS,    -1, "jump, vault; menu accept" },
++    { "circle",   PKB_CIRCLE,   -1, "use; menu back" },
++    { "square",   PKB_SQUARE,   -1, "reload, pick up weapon" },
++    { "triangle", PKB_TRIANGLE, -1, "next weapon" },
++    { "l1",       PKB_L1,       -1, "close combat" },
++    { "r1",       PKB_R1,       -1, "fire" },
++    { "l2",       PKB_L2,       -1, "crouch, cover, slide" },
++    { "r2",       PKB_R2,       -1, "throw grenade" },
++    { "l3",       PKB_L3,       -1, "sprint" },
++    { "r3",       PKB_R3,       -1, "zoom, flashlight" },
++    { "start",    PKB_START,    -1, "pause menu" },
++    { "select",   PKB_SELECT,   -1, "select" },
++    { "ls_up",    0, PKB_LS_UP,    "move forward (left stick up)" },
++    { "ls_down",  0, PKB_LS_DOWN,  "move back" },
++    { "ls_left",  0, PKB_LS_LEFT,  "strafe left" },
++    { "ls_right", 0, PKB_LS_RIGHT, "strafe right" },
++    { "rs_up",    0, PKB_RS_UP,    "look up (right stick up)" },
++    { "rs_down",  0, PKB_RS_DOWN,  "look down" },
++    { "rs_left",  0, PKB_RS_LEFT,  "turn left" },
++    { "rs_right", 0, PKB_RS_RIGHT, "turn right" },
++};
++#define PKB_N_INPUTS ((int)(sizeof pad_kb_inputs / sizeof pad_kb_inputs[0]))
++
++typedef struct { const char* name; unsigned char vk; } PadKbKey;
++
++/* Windows virtual-key codes. Mouse1-5 = left, right, middle, X1, X2 (GetAsyncKeyState reads them too). */
++static const PadKbKey pad_kb_keys[] = {
++    { "Mouse1", 0x01 }, { "Mouse2", 0x02 }, { "Mouse3", 0x04 }, { "Mouse4", 0x05 }, { "Mouse5", 0x06 },
++    { "Backspace", 0x08 }, { "Tab", 0x09 }, { "Enter", 0x0D }, { "Pause", 0x13 }, { "CapsLock", 0x14 },
++    { "Escape", 0x1B }, { "Space", 0x20 }, { "PageUp", 0x21 }, { "PageDown", 0x22 }, { "End", 0x23 },
++    { "Home", 0x24 }, { "Left", 0x25 }, { "Up", 0x26 }, { "Right", 0x27 }, { "Down", 0x28 },
++    { "Insert", 0x2D }, { "Delete", 0x2E },
++    { "0", 0x30 }, { "1", 0x31 }, { "2", 0x32 }, { "3", 0x33 }, { "4", 0x34 },
++    { "5", 0x35 }, { "6", 0x36 }, { "7", 0x37 }, { "8", 0x38 }, { "9", 0x39 },
++    { "A", 0x41 }, { "B", 0x42 }, { "C", 0x43 }, { "D", 0x44 }, { "E", 0x45 }, { "F", 0x46 }, { "G", 0x47 },
++    { "H", 0x48 }, { "I", 0x49 }, { "J", 0x4A }, { "K", 0x4B }, { "L", 0x4C }, { "M", 0x4D }, { "N", 0x4E },
++    { "O", 0x4F }, { "P", 0x50 }, { "Q", 0x51 }, { "R", 0x52 }, { "S", 0x53 }, { "T", 0x54 }, { "U", 0x55 },
++    { "V", 0x56 }, { "W", 0x57 }, { "X", 0x58 }, { "Y", 0x59 }, { "Z", 0x5A },
++    { "Numpad0", 0x60 }, { "Numpad1", 0x61 }, { "Numpad2", 0x62 }, { "Numpad3", 0x63 }, { "Numpad4", 0x64 },
++    { "Numpad5", 0x65 }, { "Numpad6", 0x66 }, { "Numpad7", 0x67 }, { "Numpad8", 0x68 }, { "Numpad9", 0x69 },
++    { "NumpadMultiply", 0x6A }, { "NumpadAdd", 0x6B }, { "NumpadSubtract", 0x6D }, { "NumpadDecimal", 0x6E },
++    { "NumpadDivide", 0x6F },
++    { "F1", 0x70 }, { "F2", 0x71 }, { "F3", 0x72 }, { "F4", 0x73 }, { "F5", 0x74 }, { "F6", 0x75 },
++    { "F7", 0x76 }, { "F8", 0x77 }, { "F9", 0x78 }, { "F10", 0x79 }, { "F11", 0x7A }, { "F12", 0x7B },
++    { "LeftShift", 0xA0 }, { "RightShift", 0xA1 }, { "LeftCtrl", 0xA2 }, { "RightCtrl", 0xA3 },
++    { "LeftAlt", 0xA4 }, { "RightAlt", 0xA5 },
++    { "Semicolon", 0xBA }, { "Equals", 0xBB }, { "Comma", 0xBC }, { "Minus", 0xBD }, { "Period", 0xBE },
++    { "Slash", 0xBF }, { "Grave", 0xC0 }, { "LeftBracket", 0xDB }, { "Backslash", 0xDC },
++    { "RightBracket", 0xDD }, { "Apostrophe", 0xDE },
++};
++#define PKB_N_KEYS ((int)(sizeof pad_kb_keys / sizeof pad_kb_keys[0]))
++
++/* key[i][s] = virtual-key code of input i, slot s (0 = unbound). */
++typedef struct { unsigned char key[PKB_N_INPUTS][PKB_SLOTS]; } PadKeybinds;
++
++/* What the keys add to the pad this poll. */
++typedef struct { unsigned short buttons; unsigned char dirs; } PadKbState;
++
++typedef void (*PadKbLog)(void* ctx, const char* msg);
++
++static int pad_kb_ieq(const char* a, size_t na, const char* b)
++{
++    size_t i;
++    if (strlen(b) != na) return 0;
++    for (i = 0; i < na; i++) {
++        char x = a[i], y = b[i];
++        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
++        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
++        if (x != y) return 0;
++    }
++    return 1;
++}
++
++static int pad_kb_key_by_name(const char* s, size_t n)   /* -> vk, 0 = "none", -1 = unknown */
++{
++    int i;
++    if (pad_kb_ieq(s, n, "none")) return 0;
++    for (i = 0; i < PKB_N_KEYS; i++)
++        if (pad_kb_ieq(s, n, pad_kb_keys[i].name)) return pad_kb_keys[i].vk;
++    /* a few spellings people type */
++    if (pad_kb_ieq(s, n, "Return")) return 0x0D;
++    if (pad_kb_ieq(s, n, "Esc")) return 0x1B;
++    if (pad_kb_ieq(s, n, "LShift")) return 0xA0;
++    if (pad_kb_ieq(s, n, "RShift")) return 0xA1;
++    if (pad_kb_ieq(s, n, "LCtrl") || pad_kb_ieq(s, n, "LeftControl")) return 0xA2;
++    if (pad_kb_ieq(s, n, "RCtrl") || pad_kb_ieq(s, n, "RightControl")) return 0xA3;
++    if (pad_kb_ieq(s, n, "LAlt")) return 0xA4;
++    if (pad_kb_ieq(s, n, "RAlt")) return 0xA5;
++    if (pad_kb_ieq(s, n, "LeftMouse") || pad_kb_ieq(s, n, "MouseLeft")) return 0x01;
++    if (pad_kb_ieq(s, n, "RightMouse") || pad_kb_ieq(s, n, "MouseRight")) return 0x02;
++    if (pad_kb_ieq(s, n, "MiddleMouse") || pad_kb_ieq(s, n, "MouseMiddle")) return 0x04;
++    return -1;
++}
++
++static const char* pad_kb_key_name(int vk)
++{
++    int i;
++    for (i = 0; i < PKB_N_KEYS; i++)
++        if (pad_kb_keys[i].vk == vk) return pad_kb_keys[i].name;
++    return "none";
++}
++
++static int pad_kb_input_by_name(const char* s, size_t n)
++{
++    int i;
++    for (i = 0; i < PKB_N_INPUTS; i++)
++        if (pad_kb_ieq(s, n, pad_kb_inputs[i].name)) return i;
++    return -1;
++}
++
++/* Defaults (PC layout on top of the Standard preset; ENHANCEMENT). Mouse look is not wired yet, so the
++ * right stick is on I/J/K/L and the numpad. */
++static void pad_kb_defaults(PadKeybinds* kb)
++{
++    static const struct { const char* in; unsigned char a, b; } d[] = {
++        { "up", 0x26, 0 }, { "down", 0x28, 0 }, { "left", 0x25, 0 }, { "right", 0x27, 0 },
++        { "cross", 0x20, 0x0D },       /* Space, Enter */
++        { "circle", 0x45, 0x08 },      /* E, Backspace */
++        { "square", 0x52, 0 },         /* R */
++        { "triangle", 0x51, 0 },       /* Q */
++        { "l1", 0x46, 0 },             /* F */
++        { "r1", 0x01, 0x4F },          /* Mouse1, O */
++        { "l2", 0x43, 0xA2 },          /* C, LeftCtrl */
++        { "r2", 0x47, 0 },             /* G */
++        { "l3", 0xA0, 0 },             /* LeftShift */
++        { "r3", 0x02, 0x56 },          /* Mouse2, V */
++        { "start", 0x1B, 0x50 },       /* Escape, P */
++        { "select", 0x09, 0 },         /* Tab */
++        { "ls_up", 0x57, 0 }, { "ls_down", 0x53, 0 }, { "ls_left", 0x41, 0 }, { "ls_right", 0x44, 0 },
++        { "rs_up", 0x49, 0x68 }, { "rs_down", 0x4B, 0x62 }, { "rs_left", 0x4A, 0x64 }, { "rs_right", 0x4C, 0x66 },
++    };
++    unsigned i;
++    memset(kb, 0, sizeof *kb);
++    for (i = 0; i < sizeof d / sizeof d[0]; i++) {
++        int k = pad_kb_input_by_name(d[i].in, strlen(d[i].in));
++        if (k >= 0) { kb->key[k][0] = d[i].a; kb->key[k][1] = d[i].b; }
++    }
++}
++
++static void pad_kb_logf(PadKbLog log, void* ctx, int line, const char* what, const char* s, size_t n)
++{
++    char m[200];
++    if (!log) return;
++    if (n > 60) n = 60;
++    snprintf(m, sizeof m, "line %d: %s '%.*s' (ignored)", line, what, (int)n, s);
++    log(ctx, m);
++}
++
++static int pad_kb_space(char c) { return c == ' ' || c == '\t' || c == '\r'; }
++
++/* Parse `text` over the bindings already in *kb (start from pad_kb_defaults). Returns the number of problems
++ * logged (0 = clean file). Never fails. */
++static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* ctx)
++{
++    const char* p = text;
++    int line = 0, bad = 0, in_kb = 1;
++    if (!text) return 0;
++    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
++    while (*p) {
++        const char* e = p;
++        const char *a, *b, *eq, *c;
++        while (*e && *e != '\n') e++;
++        line++;
++        /* strip the comment and the blanks around the line */
++        for (c = p; c < e && *c != '#' && *c != ';'; c++) {}
++        a = p; b = c;
++        while (a < b && pad_kb_space(*a)) a++;
++        while (b > a && pad_kb_space(b[-1])) b--;
++        if (a < b) {
++            if (*a == '[') {
++                const char* r = memchr(a, ']', (size_t)(b - a));
++                if (!r) { pad_kb_logf(log, ctx, line, "broken section header", a, (size_t)(b - a)); bad++; in_kb = 0; }
++                else {
++                    in_kb = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "keyboard");
++                    if (!in_kb) { pad_kb_logf(log, ctx, line, "section not read by this version", a, (size_t)(r - a + 1)); }
++                }
++            } else if (in_kb) {
++                eq = memchr(a, '=', (size_t)(b - a));
++                if (!eq) { pad_kb_logf(log, ctx, line, "no '=' in", a, (size_t)(b - a)); bad++; }
++                else {
++                    const char* ne = eq;
++                    int in;
++                    while (ne > a && pad_kb_space(ne[-1])) ne--;
++                    in = pad_kb_input_by_name(a, (size_t)(ne - a));
++                    if (in < 0) { pad_kb_logf(log, ctx, line, "unknown pad input", a, (size_t)(ne - a)); bad++; }
++                    else {
++                        unsigned char got[PKB_SLOTS] = { 0 };
++                        int ng = 0, nbad = 0, nnone = 0;
++                        const char* t = eq + 1;
++                        while (t < b) {
++                            const char* te;
++                            const char* tb;
++                            int vk;
++                            while (t < b && (pad_kb_space(*t) || *t == ',')) t++;
++                            if (t >= b) break;
++                            tb = t;
++                            for (te = t; te < b && *te != ','; te++) {}
++                            t = te;
++                            while (te > tb && pad_kb_space(te[-1])) te--;
++                            vk = pad_kb_key_by_name(tb, (size_t)(te - tb));
++                            if (vk < 0) { pad_kb_logf(log, ctx, line, "unknown key", tb, (size_t)(te - tb)); bad++; nbad++; }
++                            else if (vk == 0) nnone++;
++                            else if (ng >= PKB_SLOTS) { pad_kb_logf(log, ctx, line, "more than two keys, extra key", tb, (size_t)(te - tb)); bad++; }
++                            else got[ng++] = (unsigned char)vk;
++                        }
++                        if (ng == 0 && nbad > 0 && nnone == 0) {
++                            pad_kb_logf(log, ctx, line, "no usable key, default kept for", a, (size_t)(ne - a));
++                        } else {
++                            kb->key[in][0] = got[0];
++                            kb->key[in][1] = got[1];
++                        }
++                    }
++                }
++            }
++        }
++        p = *e ? e + 1 : e;
++    }
++    return bad;
++}
++
++/* Is `vk` held? The poller supplies the host query (GetAsyncKeyState on Windows, a table in the test). */
++typedef int (*PadKbDown)(void* ctx, int vk);
++
++static PadKbState pad_kb_eval(const PadKeybinds* kb, PadKbDown down, void* ctx)
++{
++    PadKbState st = { 0, 0 };
++    int i, s;
++    for (i = 0; i < PKB_N_INPUTS; i++)
++        for (s = 0; s < PKB_SLOTS; s++)
++            if (kb->key[i][s] && down(ctx, kb->key[i][s])) {
++                if (pad_kb_inputs[i].dir >= 0) st.dirs |= (unsigned char)(1u << pad_kb_inputs[i].dir);
++                else st.buttons |= pad_kb_inputs[i].btn;
++                break;
++            }
++    return st;
++}
++
++/* Stick axis from two opposite directions: both or neither = centre (128), else 0 or 255 (full deflection, also
++ * on a diagonal; ASSUMPTION: the game's own dead zone and response curve want the raw range like a DS3 corner). */
++static unsigned char pad_kb_axis(unsigned char dirs, int neg, int pos)
++{
++    int n = (dirs >> neg) & 1, q = (dirs >> pos) & 1;
++    return (unsigned char)(n == q ? 128 : n ? 0 : 255);
++}
++
++/* Write the bindings as the file's text. Returns the length (like snprintf; > n-1 = truncated). */
++static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
++{
++    size_t o = 0;
++    int i;
++#define PKB_PUT(...) do { int w_ = snprintf(buf + (o < n ? o : n), o < n ? n - o : 0, __VA_ARGS__); \
++                          if (w_ > 0) o += (size_t)w_; } while (0)
++    PKB_PUT("# Project Helghast key bindings. Written with the defaults on the first start; edit and save, the game\n"
++            "# reads it again within two seconds. Delete this file to get the defaults back.\n"
++            "#\n"
++            "#   <pad input> = <primary key>, <secondary key>      (\"none\" or nothing = unbound)\n"
++            "#\n"
++            "# Keys: A-Z 0-9 F1-F12 Space Enter Escape Tab Backspace CapsLock LeftShift RightShift LeftCtrl\n"
++            "#   RightCtrl LeftAlt RightAlt Up Down Left Right Insert Delete Home End PageUp PageDown Pause\n"
++            "#   Numpad0-Numpad9 NumpadAdd NumpadSubtract NumpadMultiply NumpadDivide NumpadDecimal Semicolon\n"
++            "#   Equals Comma Minus Period Slash Grave LeftBracket RightBracket Backslash Apostrophe\n"
++            "#   Mouse1 (left) Mouse2 (right) Mouse3 (middle) Mouse4 Mouse5\n"
++            "# Sticks: hold two keys of one stick for a diagonal. A pad plugged in works at the same time.\n"
++            "# The uses listed are those of the Standard controller preset (Options > Controls).\n"
++            "\n[keyboard]\n");
++    for (i = 0; i < PKB_N_INPUTS; i++) {
++        char v[64];
++        if (!kb->key[i][0] && !kb->key[i][1]) snprintf(v, sizeof v, "none");
++        else if (!kb->key[i][1]) snprintf(v, sizeof v, "%s", pad_kb_key_name(kb->key[i][0]));
++        else if (!kb->key[i][0]) snprintf(v, sizeof v, "none, %s", pad_kb_key_name(kb->key[i][1]));
++        else snprintf(v, sizeof v, "%s, %s", pad_kb_key_name(kb->key[i][0]), pad_kb_key_name(kb->key[i][1]));
++        PKB_PUT("%-9s= %-22s# %s\n", pad_kb_inputs[i].name, v, pad_kb_inputs[i].what);
++    }
++#undef PKB_PUT
++    return (int)o;
++}
++
++/* kz3-install.ini (written by the installer / portable zip, read by tools/release/launch.py read_ini): is
++ * [install] portable = 1? Same rule as launch.py: portable only when the value is exactly "1". */
++static int pad_kb_ini_portable(const char* text)
++{
++    const char* p = text;
++    int in_install = 0;
++    if (!text) return 0;
++    while (*p) {
++        const char* e = p;
++        const char *a, *b;
++        while (*e && *e != '\n') e++;
++        a = p; b = e;
++        while (a < b && pad_kb_space(*a)) a++;
++        while (b > a && pad_kb_space(b[-1])) b--;
++        if (a < b && *a == '[') {
++            const char* r = memchr(a, ']', (size_t)(b - a));
++            in_install = r && r - a - 1 == 7 && memcmp(a + 1, "install", 7) == 0;   /* configparser: case-sensitive */
++        } else if (in_install && a < b && *a != '#' && *a != ';') {
++            const char* eq = a;
++            while (eq < b && *eq != '=' && *eq != ':') eq++;
++            if (eq < b) {
++                const char* ke = eq;
++                const char* v = eq + 1;
++                while (ke > a && pad_kb_space(ke[-1])) ke--;
++                while (v < b && pad_kb_space(*v)) v++;
++                if (pad_kb_ieq(a, (size_t)(ke - a), "portable")) return (b - v == 1 && *v == '1');
++            }
++        }
++        p = *e ? e + 1 : e;
++    }
++    return 0;
++}
++
++#endif /* PAD_KEYBINDS_H */

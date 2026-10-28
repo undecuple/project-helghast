@@ -1,0 +1,46 @@
+KZ3 patch 1105 (SPU pass 78): fa/fs/fm test only the result for exponent-255 lanes.
+
+Patch 1079 gave spu_fa/spu_fs/spu_fm one exponent-255 test over both operands and the result (spu__xr_mask3: three
+and+cmpeq pairs, two or, one movemask). In IEEE single arithmetic an infinity or NaN operand always gives an infinity
+or NaN result, whatever the rounding mode and FTZ/DAZ (inf * 0 and inf - inf are NaN; DAZ only replaces denormal
+operands by zero), so a lane with an exponent-255 operand always has an exponent-255 result: the mask of the result
+alone is the same mask, and the recompute (spu__xrq / spu__xr_fixv) sees the same lanes and operands. Six vector ops
+fewer per float op on the hot path (job 255's 0x5868 loop has 97 fa/fs/fm). Bit-identical by construction; host test
+tools/spu/test_spu_rmask.sh compares the new and old forms (mask and result) on random words and the edge words (zero,
+denormals, the smallest normal binade, Smax, infinity/NaN encodings, the K4 sentinel words) under every MXCSR rounding
+mode with FTZ/DAZ on and off. Compile-time switch: -DSPU_XR_RMASK=0 (C flags) = old. Upstream candidate.
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -596,8 +596,21 @@
+ #else
+ #  define SPU__F2(r, a, b, ps, sc) for (int i = 0; i < 4; i++) (r)._f32[i] = sc
+ #endif
+-SPU_HOT u128 spu_fa(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_add_ps, a._f32[i] + b._f32[i]); SPU_XR_RET_Q(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FA); }
+-SPU_HOT u128 spu_fs(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_sub_ps, a._f32[i] - b._f32[i]); SPU_XR_RET_Q(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FS); }
++/* KZ3 patch 1105 (SPU pass 78): the exponent-255 lanes of fa/fs/fm from the result alone. An infinity or NaN
++ * operand gives an infinity or NaN result in every MXCSR mode (rounding, FTZ, DAZ), so the result's mask equals
++ * spu__xr_mask3(a, b, r); same lanes, same recompute (tools/spu/test_spu_rmask.sh). -DSPU_XR_RMASK=0 = old. */
++#ifndef SPU_XR_RMASK
++#  define SPU_XR_RMASK 1
++#endif
++/* kz3-rmask begin */
++#if SPU_XR_RMASK
++#  define SPU__XRM_AR(a, b, r) spu__xr_mask(r)
++#else
++#  define SPU__XRM_AR(a, b, r) spu__xr_mask3(a, b, r)
++#endif
++/* kz3-rmask end */
++SPU_HOT u128 spu_fa(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_add_ps, a._f32[i] + b._f32[i]); SPU_XR_RET_Q(SPU__XRM_AR(a, b, r), r, a, b, SPU_XR_FA); }
++SPU_HOT u128 spu_fs(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_sub_ps, a._f32[i] - b._f32[i]); SPU_XR_RET_Q(SPU__XRM_AR(a, b, r), r, a, b, SPU_XR_FS); }
+
+ /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
+  * The canonical immediates 173 and 155 are identity conversions. */
+@@ -656,6 +669,6 @@
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f);
+     SPU_XR_RET(spu__xr_mask(r), r, a, a, SPU_XR_CUFLT, i8); }
+ #endif
+-SPU_HOT u128 spu_fm(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_mul_ps, a._f32[i] * b._f32[i]); SPU_XR_RET_Q(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FM); }   /* patch 1079 */
++SPU_HOT u128 spu_fm(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_mul_ps, a._f32[i] * b._f32[i]); SPU_XR_RET_Q(SPU__XRM_AR(a, b, r), r, a, b, SPU_XR_FM); }   /* patch 1079 */
+ /* KZ3 patch 1035: fused multiply-add without the libm call. Without -mfma, fmaf is MinGW's software
+  * routine (with frexp/ldexp inside; ~3 % of the level's SPURS samples in SPU pass 21). The product of two

@@ -1,0 +1,155 @@
+KZ3 patch 1048 (SPU pass 34, RE pass 70 section 5, 71): KZ3_SPURS_RUN_MS policy-module run budget (default 0 = off): past it the selectWorkload intercept answers 'another workload' so the module exits by its own path; past twice it a lane still at a GETLLAR or channel-read tick site is halted; the kernel joins the lanes, releases the claim and re-dispatches the lane at 0xA00 later; spu_pm_ctx_describe_resv for the stuck report.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 6c6f8032..08324f87 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -201,6 +201,22 @@ void spu_halt(spu_context* ctx)
+     if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
+ }
+ 
++/* KZ3 patch 1048: a policy-module lane more than twice KZ3_SPURS_RUN_MS into its run and still at a tick site
++ * (it never reached selectWorkload, or ignored the switch answer) is halted like an exitToKernel; the kernel
++ * thread's join then ends and the claim is released. Logged (first 16, then every 1024th). */
++static void kz3_pm_budget_halt(spu_context* ctx, const char* site)
++{
++    extern uint64_t kz3_pm_run_over_budget(int factor);
++    uint64_t over;
++    if (!ctx->policy_mode || !(over = kz3_pm_run_over_budget(2))) return;
++    { static volatile unsigned s_bh = 0;
++      if (++s_bh <= 16 || (s_bh & 0x3FF) == 0)
++          fprintf(stderr, "[spurs-budget] %s at pc=0x%05X img=%d ovl=%d %u ms over 2 x KZ3_SPURS_RUN_MS: halting the lane (#%u)\n",
++                  site, ctx->pc & SPU_LS_MASK, ctx->image_id, ctx->resident_ovl, (unsigned)over, s_bh); }
++    ctx->status = SPU_STATUS_STOPPED_BY_STOP;
++    spu_halt(ctx);
++}
++
+ /* Diagnostic: dump the taskset-policy scheduler's working tables (LS 0x2700..)
+  * at func_00000E60 entry, to reverse why it computes "no runnable task". Env
+  * YDKJ_E60. Called from the lifted taskset policy. */
+@@ -747,6 +763,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+       } }
+     switch (cmd) {
+     case MFC_GETLLAR_CMD:
++        kz3_pm_budget_halt(ctx, "GETLLAR");   /* KZ3 patch 1048 */
+         /* Lockstep tick: a guest GETLLAR..PUTLLC poll loop is intra-function
+          * (all gotos), so it never crosses the SPU_DRAIN tick site -- without a
+          * tick here a polling SPU would hold the run token forever while the
+@@ -1212,6 +1229,7 @@ static void spu_resv_lost_poll(spu_context* ctx)
+ 
+ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
+ {
++    kz3_pm_budget_halt(ctx, "rdch");   /* KZ3 patch 1048 */
+     if (channel == SPU_RdEventStat) spu_resv_lost_poll(ctx);
+     switch (channel) {
+     case SPU_RdInMbox:      return ctx->rcv_evt_n != 0 || ctx->ch_in_mbox.count != 0;
+@@ -2834,6 +2852,19 @@ void spu_indirect_branch(spu_context* ctx)
+             return;
+         }
+         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
++            /* KZ3 patch 1048: past the run budget answer "another workload" so the module exits by its own path. */
++            { extern uint64_t kz3_pm_run_over_budget(int factor);
++              uint64_t over = kz3_pm_run_over_budget(1);
++              if (over) {
++                  static volatile unsigned s_bp = 0;
++                  if (++s_bp <= 16 || (s_bp & 0x3FF) == 0)
++                      fprintf(stderr, "[spurs-budget] poll #%u %u ms over KZ3_SPURS_RUN_MS: answering switch (#%u)\n",
++                              g_spurs_pm_polls + 1, (unsigned)over, s_bp);
++                  g_spurs_pm_polls++;
++                  ctx->gpr[3] = spu_make_preferred_u32(1);
++                  ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++                  return;
++              } }
+             /* cellSpursModulePoll: report "no contention — keep running".
+              * (One virtual SPU per workload here, so nothing ever preempts.) */
+             unsigned n = ++g_spurs_pm_polls;
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index f94b15b0..a0647173 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -26,6 +26,11 @@
+ #include "spu_workload.h"
+ #include "spu_coherency.h"
+ #include <stdio.h>
++#ifdef _WIN32
++#include <windows.h>   /* KZ3 patch 1048: GetTickCount64 */
++#else
++#include <time.h>
++#endif
+ #include <stdlib.h>
+ #include <string.h>
+ #include "ps3emu/log_first.h"
+@@ -69,6 +74,61 @@ void spu_pm_ctx_describe(void* p, char* out, int n)
+                         c->mfc_tag_mask, c->srr0 & SPU_LS_MASK);
+ }
+ uint32_t spu_pm_ctx_pc(void* p) { return p ? (((spu_context*)p)->pc & SPU_LS_MASK) : 0; }  /* KZ3 patch 1013 */
++/* KZ3 patch 1047/1048: reservation, atomic and event state of a lane (the stuck-run report), the jm dispatcher's
++ * state words (RE pass 71: LS 0x1410 = EA of the list it waits on, 0x1440, 0x14E0-0x14FF) and the first 16 words
++ * of the 128-byte line at that EA (the dependency counters). */
++void spu_pm_ctx_describe_resv(void* p, char* out, int n)
++{
++    spu_context* c = (spu_context*)p;
++    if (!c) { out[0] = 0; return; }
++    int o = snprintf(out, n, "resv=%d@0x%08X atomic=%u ovl=%d evmask=0x%X evstat=0x%X", c->resv_valid, c->resv_ea, c->atomic_stat,
++                     c->resident_ovl, c->event_mask, c->event_status);
++    static const uint32_t at[3] = { 0x1410, 0x1440, 0x14E0 };
++    uint32_t w[3 + 8], ea;
++    for (int i = 0; i < 3; i++) { uint32_t t; memcpy(&t, (const uint8_t*)c->ls + at[i], 4); w[i] = __builtin_bswap32(t); }
++    for (int i = 0; i < 8; i++) { uint32_t t; memcpy(&t, (const uint8_t*)c->ls + 0x14E0 + 4 * i, 4); w[3 + i] = __builtin_bswap32(t); }
++    if (o < n) o += snprintf(out + o, n - o, " LS1410=%08X 1440=%08X 14E0=%08X.%08X.%08X.%08X.%08X.%08X.%08X.%08X", w[0], w[1],
++                             w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10]);
++    ea = w[0] & ~0x7Fu;
++    if (ea >= 0x10000u && ea < 0xF0000000u && o < n) {
++        extern uint8_t* vm_base;
++        o += snprintf(out + o, n - o, " line@%08X:", ea);
++        for (int i = 0; i < 16 && o < n; i++) { uint32_t t; memcpy(&t, vm_base + ea + 4 * i, 4); o += snprintf(out + o, n - o, " %08X", __builtin_bswap32(t)); }
++    }
++}
++/* KZ3 patch 1048 (SPU pass 34, RE pass 70 section 5): a policy-module run budget, KZ3_SPURS_RUN_MS (0 = off,
++ * the default). The HLE kernel never switches a running module out: selectWorkload always answers "continue"
++ * and a lane that waits for something only another run of the same workload produces spins forever on the
++ * host, holding the workload's claim (gp-t2: jm_hiprio from t = 411 s, every DeferredSchedule job behind it).
++ * Past the budget the selectWorkload intercept answers "another workload wants the SPU" (spu_channels.c) so the
++ * module leaves by its own exit path; past twice the budget a lane that never polls is halted at the GETLLAR
++ * and channel-read tick sites. The kernel thread then joins the lanes, releases the claim and re-enters the
++ * module on its next pass, as the real kernel does after a context switch. kz3-spurs-budget begin */
++SPU_THREAD_LOCAL uint64_t g_kz3_pm_run_t0;
++static int s_kz3_run_ms = -1;
++static uint64_t kz3_pm_now_ms(void)
++{
++#ifdef _WIN32
++    return (uint64_t)GetTickCount64();
++#else
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
++#endif
++}
++int kz3_pm_run_budget_ms(void)
++{
++    if (s_kz3_run_ms < 0) { const char* e = getenv("KZ3_SPURS_RUN_MS"); s_kz3_run_ms = e ? atoi(e) : 0; if (s_kz3_run_ms < 0) s_kz3_run_ms = 0; }
++    return s_kz3_run_ms;
++}
++/* 0 = within budget (or budget off / no run on this thread); else the ms over `factor` x budget. */
++uint64_t kz3_pm_run_over_budget(int factor)
++{
++    int b = kz3_pm_run_budget_ms();
++    if (!b || !g_kz3_pm_run_t0) return 0;
++    uint64_t el = kz3_pm_now_ms() - g_kz3_pm_run_t0, lim = (uint64_t)b * (uint64_t)factor;
++    return el > lim ? el - lim : 0;
++}
++/* kz3-spurs-budget end */
+ 
+ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+                           const uint8_t* pm_host, uint32_t pm_size,
+@@ -300,7 +360,9 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+     unsigned batch_before = g_wws_batch_gets;
+     unsigned claim_before = g_spu_putllc_sync_hit;
+ 
++    g_kz3_pm_run_t0 = kz3_pm_run_budget_ms() ? kz3_pm_now_ms() : 0;   /* patch 1048 */
+     const int pm_halted = spu_run_with_halt(entry, ctx);
++    g_kz3_pm_run_t0 = 0;
+     /* A lane's run should only end through exitToKernel. Anything else strands
+      * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
+     if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {

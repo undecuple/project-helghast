@@ -1,0 +1,145 @@
+KZ3 patch 2072 (RSX pass 68): frame-pacing metric, the RE notes "Pass 68".
+Every successful Present records the interval since the previous one (QueryPerformanceCounter) into a fixed
+0.25 ms histogram (to 250 ms + overflow) with a running sum and sum of squares (libs/video/rsx_pace.h, pure C, no
+allocation, no lock, no printing on the hot path). Every 10 s of wall time one line is printed and the window reset:
+  [pace] t=<ms since first present> n=<frames> p50=<ms> p99=<ms> max=<ms> sd=<ms> low1=<fps>
+RSX_PACE=0 turns it off (default on).
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -128,6 +128,7 @@
+ #include "rsx_pso_async.h"
+ /* patch 2048: asynchronous PSO build bookkeeping */
+ #include "rsx_pso_template.h"   /* patch 2071 */
++#include "rsx_pace.h"           /* patch 2072 */
+ #include <sys/stat.h>
+ 
+ #pragma comment(lib, "d3d12.lib")
+@@ -726,6 +727,21 @@
+ 
+ static void ld_present_measure_record(u32 guest_frame)
+ {
++    /* Patch 2072: per-present interval histogram, one [pace] line per 10 s; RSX_PACE=0 turns it off. */
++    {
++        static int s_pace_on = -1;
++        static rsx_pace s_pace;
++        if (s_pace_on < 0) {
++            const char* e = getenv("RSX_PACE");
++            s_pace_on = (e && *e == '0') ? 0 : 1;
++        }
++        if (s_pace_on) {
++            LARGE_INTEGER pc, pf;
++            QueryPerformanceCounter(&pc);
++            QueryPerformanceFrequency(&pf);
++            rsx_pace_frame(&s_pace, 1000.0 * (double)pc.QuadPart / (double)pf.QuadPart);
++        }
++    }
+ #if defined(YZ_PPU_SAMPLE)
+     if (!g_ld_present_thread_handle) {
+         HANDLE duplicate = NULL;
+--- /dev/null
++++ b/libs/video/rsx_pace.h
+@@ -0,0 +1,103 @@
++/* KZ3 patch 2072 (RSX pass 68): frame-pacing metric. Pure C, no OS calls, so tools/smoke/test_pace.sh builds it
++ * on the host. The caller passes a monotonic time in milliseconds (QueryPerformanceCounter in rsx_live_draw.c).
++ *
++ * Every successful Present records the interval since the previous one into a fixed histogram (0.25 ms buckets
++ * up to 250 ms, one overflow bucket) plus a running sum and sum of squares. Single writer (the present thread):
++ * no lock, no allocation, no printing on that path except the one line per window. Windows are slots of 10 s of
++ * wall time counted from the first present: the first window may be partial (it starts at the second present),
++ * every later one ends at the first present on or after k * 10000 ms and is reported then.
++ *
++ *   [pace] t=<ms since first present> n=<frames> p50=<ms> p99=<ms> max=<ms> sd=<ms> low1=<fps>
++ *
++ * p50/p99: the bucket midpoint of the smallest bucket whose cumulative count reaches ceil(q * n) (+-0.125 ms).
++ * max: exact. sd: population standard deviation of the intervals (sum, sum of squares). low1 = 1000 / mean of
++ * the slowest ceil(1 % of n) intervals (bucket midpoints; the overflow bucket uses its exact mean). */
++#ifndef RSX_PACE_H
++#define RSX_PACE_H
++#include <math.h>
++#include <stdio.h>
++
++#define RSX_PACE_BUCKET_MS   0.25
++#define RSX_PACE_BUCKETS     1000              /* 0 .. 250 ms; index RSX_PACE_BUCKETS = overflow */
++#define RSX_PACE_WINDOW_MS   10000.0
++
++typedef struct rsx_pace {
++    unsigned hist[RSX_PACE_BUCKETS + 1];
++    unsigned n;
++    double sum, sumsq, max, ovf_sum;
++    double prev_ms, start_ms, next_report_ms;
++    int started;
++} rsx_pace;
++
++static inline void rsx_pace_reset_window(rsx_pace* p)
++{
++    for (int i = 0; i <= RSX_PACE_BUCKETS; i++) p->hist[i] = 0;
++    p->n = 0; p->sum = p->sumsq = p->max = p->ovf_sum = 0.0;
++}
++
++static inline double rsx_pace_quantile(const rsx_pace* p, double q)
++{
++    unsigned want = (unsigned)ceil(q * (double)p->n);
++    if (want < 1) want = 1;
++    unsigned cum = 0;
++    for (int i = 0; i <= RSX_PACE_BUCKETS; i++) {
++        cum += p->hist[i];
++        if (cum >= want)
++            return i == RSX_PACE_BUCKETS ? p->ovf_sum / (double)p->hist[i]
++                                         : ((double)i + 0.5) * RSX_PACE_BUCKET_MS;
++    }
++    return p->max;
++}
++
++static inline double rsx_pace_low1(const rsx_pace* p)
++{
++    unsigned want = (unsigned)ceil(0.01 * (double)p->n);
++    if (want < 1) want = 1;
++    double tot = 0.0; unsigned left = want;
++    for (int i = RSX_PACE_BUCKETS; i >= 0 && left; i--) {
++        unsigned c = p->hist[i];
++        if (!c) continue;
++        const double rep = i == RSX_PACE_BUCKETS ? p->ovf_sum / (double)c : ((double)i + 0.5) * RSX_PACE_BUCKET_MS;
++        const unsigned take = c < left ? c : left;
++        tot += rep * (double)take; left -= take;
++    }
++    return tot > 0.0 ? 1000.0 / (tot / (double)want) : 0.0;
++}
++
++/* Formats the line for the current window (no newline) into buf; returns the length. */
++static inline int rsx_pace_format(const rsx_pace* p, double t_ms, char* buf, size_t cap)
++{
++    if (!p->n) return snprintf(buf, cap, "[pace] t=%.0f n=0", t_ms);
++    const double mean = p->sum / (double)p->n;
++    double var = p->sumsq / (double)p->n - mean * mean;
++    if (var < 0.0) var = 0.0;
++    return snprintf(buf, cap, "[pace] t=%.0f n=%u p50=%.2f p99=%.2f max=%.2f sd=%.2f low1=%.2f", t_ms, p->n,
++                    rsx_pace_quantile(p, 0.50), rsx_pace_quantile(p, 0.99), p->max, sqrt(var), rsx_pace_low1(p));
++}
++
++/* One call per successful Present. now_ms: monotonic milliseconds. Prints (stderr) at a window boundary. */
++static inline void rsx_pace_frame(rsx_pace* p, double now_ms)
++{
++    if (!p->started) {
++        p->started = 1; p->start_ms = p->prev_ms = now_ms;
++        p->next_report_ms = now_ms + RSX_PACE_WINDOW_MS;
++        return;
++    }
++    const double dt = now_ms - p->prev_ms;
++    p->prev_ms = now_ms;
++    int b = (int)(dt / RSX_PACE_BUCKET_MS);
++    if (b < 0) b = 0;
++    if (b >= RSX_PACE_BUCKETS) { b = RSX_PACE_BUCKETS; p->ovf_sum += dt; }
++    p->hist[b]++; p->n++;
++    p->sum += dt; p->sumsq += dt * dt;
++    if (dt > p->max) p->max = dt;
++    if (now_ms >= p->next_report_ms) {
++        char line[200];
++        rsx_pace_format(p, now_ms - p->start_ms, line, sizeof line);
++        fprintf(stderr, "%s%c", line, 10);
++        rsx_pace_reset_window(p);
++        p->next_report_ms = p->start_ms +
++            (floor((now_ms - p->start_ms) / RSX_PACE_WINDOW_MS) + 1.0) * RSX_PACE_WINDOW_MS;
++    }
++}
++#endif

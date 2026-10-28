@@ -1,0 +1,153 @@
+KZ3 patch 1094 (SPU pass 70): KZ3_AUDIO_VDEV=1, a virtual output device with Wine's WASAPI shared-mode timing for
+runs without an audio device. Proton test runs disable the audio drivers, so the cellAudio mix thread paces itself on
+QPC (one block per 5.33 ms) and never meets the device cadence a player's run has: Wine signals the stream event once
+per 10 ms period over a ~22 ms (1056-frame) buffer, the mix thread mixes ~2 blocks per period, the guest's read index
+moves in steps of 2 (the owner's live run: wid 9 and wid 5 kicks at 100/s, not 187.5/s), and a mix thread late by
+more than the buffer's fill makes the device play silence. The virtual device plays elapsed x 48 kHz on QPC, room =
+buffer - (submitted - played), waits to the next period boundary, counts each underrun ([audio-vdev] every 10 s with
+a wake-lateness histogram, the first 24 as [audio-underrun]) and writes the gap as zero frames into the
+KZ3_AUDIO_WAV capture so the capture is the device timeline. KZ3_AUDIO_VDEV=N > 1 = buffer frames,
+KZ3_AUDIO_VDEV_PERIOD_US = period. Diagnostic only, off by default; nothing is played.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ours + upstream's WASAPI underrun count (note: upstream 3bf0233d keeps 60 ms queued and runs the mixer ahead: KZ3 audio timing changes).
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 45c0a99b..9852bae3 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -414,6 +414,100 @@ static void audio_backend_wait(void)
+ }
+ 
+ 
++
++/* KZ3 patch 1094 (SPU pass 70): KZ3_AUDIO_VDEV=1, a virtual output device for runs without one (Proton tests
++ * disable the audio drivers, so audio_backend_room() is -1 and the mix thread paces on QPC, one block per 5.33 ms).
++ * A player's run has a WASAPI device, and Wine's shared-mode stream (winepulse/winealsa) signals the event once per
++ * 10 ms device period and holds a ~22 ms buffer (1056 frames): the mix thread then mixes in bursts of ~2 blocks per
++ * period, the guest sees its read index move 2 blocks at a time, and a mix thread late by more than the buffer's
++ * fill makes the device play silence (an underrun). This device has the same timing: frames played =
++ * elapsed x 48 kHz on QPC, room = buffer - (submitted - played), the wait ends at the next 10 ms period boundary,
++ * and when played passes submitted the shortfall was silence: it is counted ([audio-vdev] every 10 s, the first 24
++ * as [audio-underrun]) and written into the KZ3_AUDIO_WAV capture as zero frames at that point, so the capture is
++ * what the device played. KZ3_AUDIO_VDEV=N > 1 sets the buffer in frames (default 1056); KZ3_AUDIO_VDEV_PERIOD_US
++ * the period (default 10000). Diagnostic only: nothing is played. */
++static int s_kz3_vdev = -1;
++static unsigned s_kz3_vdev_buf = 1056, s_kz3_vdev_period_us = 10000;
++static LARGE_INTEGER s_kz3_vdev_q0, s_kz3_vdev_qf;
++static unsigned long long s_kz3_vdev_written, s_kz3_vdev_gap, s_kz3_vdev_pending_zero;
++static unsigned s_kz3_vdev_under, s_kz3_vdev_under_int, s_kz3_vdev_lines, s_kz3_vdev_maxgap;
++static unsigned long long s_kz3_vdev_gap_int, s_kz3_vdev_last_print, s_kz3_vdev_wakes, s_kz3_vdev_late_hist[5];
++static int kz3_vdev_on(void)
++{
++    if (s_kz3_vdev < 0) {
++        const char* e = getenv("KZ3_AUDIO_VDEV"); const char* pe = getenv("KZ3_AUDIO_VDEV_PERIOD_US");
++        s_kz3_vdev = (e && *e && *e != '0') ? 1 : 0;
++        if (s_kz3_vdev && atoi(e) > 1) s_kz3_vdev_buf = (unsigned)atoi(e);
++        if (pe && atoi(pe) > 0) s_kz3_vdev_period_us = (unsigned)atoi(pe);
++        if (s_kz3_vdev) fprintf(stderr, "[audio-vdev] virtual device: buffer %u frames, period %u us (KZ3_AUDIO_VDEV)\n",
++                                s_kz3_vdev_buf, s_kz3_vdev_period_us);
++    }
++    return s_kz3_vdev;
++}
++static unsigned long long kz3_vdev_played(void)   /* device frames since start, gaps included */
++{
++    LARGE_INTEGER n; QueryPerformanceCounter(&n);
++    const long long d = n.QuadPart - s_kz3_vdev_q0.QuadPart;
++    return (unsigned long long)(d / s_kz3_vdev_qf.QuadPart) * CELL_AUDIO_SAMPLE_RATE +
++           (unsigned long long)(d % s_kz3_vdev_qf.QuadPart) * CELL_AUDIO_SAMPLE_RATE / (unsigned long long)s_kz3_vdev_qf.QuadPart;
++}
++/* Room in frames; counts an underrun (the device ran dry) when the played position passed what was submitted. */
++static int kz3_vdev_room(void)
++{
++    if (!s_kz3_vdev_q0.QuadPart) { QueryPerformanceFrequency(&s_kz3_vdev_qf); QueryPerformanceCounter(&s_kz3_vdev_q0); }
++    const unsigned long long played = kz3_vdev_played();
++    const unsigned long long have = s_kz3_vdev_written + s_kz3_vdev_gap;   /* device frames covered so far */
++    if (played > have) {
++        /* ASSUMPTION (Wine's shared-mode streams): the device plays silence until data comes and then plays it
++         * in order, so the shortfall is a gap of silence in the device timeline. */
++        const unsigned long long gap = played - have;
++        s_kz3_vdev_gap += gap; s_kz3_vdev_gap_int += gap; s_kz3_vdev_pending_zero += gap;
++        if (s_kz3_vdev_written) {   /* not the start */
++            s_kz3_vdev_under++; s_kz3_vdev_under_int++;
++            const unsigned ms = (unsigned)(gap * 1000ull / CELL_AUDIO_SAMPLE_RATE);
++            if (ms > s_kz3_vdev_maxgap) s_kz3_vdev_maxgap = ms;
++            if (s_kz3_vdev_lines < 24) {
++                s_kz3_vdev_lines++;
++                fprintf(stderr, "[audio-underrun] t=%.3f gap=%.1f ms (device timeline; underrun %u)\n",
++                        (double)played / CELL_AUDIO_SAMPLE_RATE, gap * 1000.0 / CELL_AUDIO_SAMPLE_RATE, s_kz3_vdev_under);
++            }
++        }
++    }
++    const unsigned long long t10 = played / (10ull * CELL_AUDIO_SAMPLE_RATE);
++    if (t10 != s_kz3_vdev_last_print) {
++        s_kz3_vdev_last_print = t10;
++        fprintf(stderr, "[audio-vdev] t=%.1f underruns=%u/10s gap=%.1f ms/10s total=%u (%.1f ms) max_gap=%u ms "
++                "wake late after period (ms) <1=%llu 1-3=%llu 3-6=%llu 6-12=%llu >=12=%llu\n",
++                (double)played / CELL_AUDIO_SAMPLE_RATE, s_kz3_vdev_under_int, s_kz3_vdev_gap_int * 1000.0 / CELL_AUDIO_SAMPLE_RATE,
++                s_kz3_vdev_under, s_kz3_vdev_gap * 1000.0 / CELL_AUDIO_SAMPLE_RATE, s_kz3_vdev_maxgap,
++                s_kz3_vdev_late_hist[0], s_kz3_vdev_late_hist[1], s_kz3_vdev_late_hist[2], s_kz3_vdev_late_hist[3],
++                s_kz3_vdev_late_hist[4]);
++        s_kz3_vdev_under_int = 0; s_kz3_vdev_gap_int = 0;
++        memset(s_kz3_vdev_late_hist, 0, sizeof s_kz3_vdev_late_hist);
++    }
++    const long long fill = (long long)(s_kz3_vdev_written + s_kz3_vdev_gap) - (long long)kz3_vdev_played();
++    const long long room = (long long)s_kz3_vdev_buf - (fill > 0 ? fill : 0);
++    return room < 0 ? 0 : (int)room;
++}
++/* Wait to the next device period boundary (Wine's event), then record how late the wake was. */
++static void kz3_vdev_wait(void)
++{
++    const unsigned long long per = (unsigned long long)s_kz3_vdev_period_us;
++    LARGE_INTEGER n; QueryPerformanceCounter(&n);
++    unsigned long long us = (unsigned long long)(n.QuadPart - s_kz3_vdev_q0.QuadPart) * 1000000ull / (unsigned long long)s_kz3_vdev_qf.QuadPart;
++    const unsigned long long due = (us / per + 1) * per;
++    for (;;) {
++        const unsigned long long left = due > us ? due - us : 0;
++        if (!left) break;
++        if (left >= 1500) Sleep((DWORD)(left / 1000 - 1 > 0 ? left / 1000 - 1 : 1)); else Sleep(1);
++        QueryPerformanceCounter(&n);
++        us = (unsigned long long)(n.QuadPart - s_kz3_vdev_q0.QuadPart) * 1000000ull / (unsigned long long)s_kz3_vdev_qf.QuadPart;
++        if (us >= due) break;
++    }
++    const unsigned long long late = (us - due) / 1000ull;
++    s_kz3_vdev_late_hist[late < 1 ? 0 : late < 3 ? 1 : late < 6 ? 2 : late < 12 ? 3 : 4]++;
++    s_kz3_vdev_wakes++;
++}
+ #endif /* AUDIO_BACKEND_WASAPI */
+ 
+ /* ---------------------------------------------------------------------------
+@@ -705,8 +799,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
+     unsigned long long blocks = 0;
+     while (s_mix_thread_running) {
+-        const int room = audio_backend_room();
+-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
++        int room = audio_backend_room();
++        const int kz3_vd = room < 0 && kz3_vdev_on();   /* KZ3 patch 1094: the virtual device stands in */
++        if (kz3_vd) room = kz3_vdev_room();
++        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { if (kz3_vd) kz3_vdev_wait(); else audio_backend_wait(); continue; }
+ #if AUDIO_BACKEND_WASAPI
+         /* Device queue under half a block: it is about to play silence (an
+          * audible click/stutter). AUDIO_RATE reports how often. */
+@@ -773,6 +869,13 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+               } else if (e) fprintf(stderr, "[audio-wav] cannot open %s\n", e);
+           }
+           if (_kf) {
++              /* KZ3 patch 1094: with KZ3_AUDIO_VDEV the capture is the device timeline: the underrun gaps as zeros. */
++              while (kz3_vd && s_kz3_vdev_pending_zero) {
++                  static const float z[CELL_AUDIO_BLOCK_SAMPLES * 2];
++                  const unsigned long long nfr = s_kz3_vdev_pending_zero < CELL_AUDIO_BLOCK_SAMPLES ? s_kz3_vdev_pending_zero : CELL_AUDIO_BLOCK_SAMPLES;
++                  fwrite(z, sizeof(float) * 2, (size_t)nfr, _kf);
++                  s_kz3_vdev_pending_zero -= nfr;
++              }
+               fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _kf);
+               _kblocks++;
+               if (_kblocks % (10u * CELL_AUDIO_SAMPLE_RATE / CELL_AUDIO_BLOCK_SAMPLES) == 0) {
+@@ -794,6 +897,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+           } }
+         /* kz3-audio-wav end */
+         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
++        if (kz3_vd) { s_kz3_vdev_written += CELL_AUDIO_BLOCK_SAMPLES; s_kz3_vdev_pending_zero = 0; }   /* KZ3 patch 1094 */
+         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
+         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;

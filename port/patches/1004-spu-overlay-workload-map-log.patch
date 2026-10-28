@@ -1,0 +1,51 @@
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 00c7bc92..00d66c6e 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2129,6 +2129,36 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
+                 ea, size, os, on, ns, nn); }
+ }
+ 
++/* Which workload streams which overlay (KZ3, patch 1004). The streamed-overlay
++ * line above is capped at 32 for the whole run, so a title with many job
++ * modules cannot tell from it which ones ever ran. This prints each new
++ * (overlay image, workload id, LS base) once -- the workload id is the SPURS
++ * kernel context's wklCurrentId (LS 0x1DC) in a policy-module run, 255
++ * otherwise -- plus a running count per image at powers of two. Racy by
++ * design (several kernel threads): a duplicate line is harmless. */
++static void spu_overlay_map_note(spu_context* ctx, int image_id, uint32_t ea, uint32_t lsa)
++{
++    static uint32_t seen[512]; static unsigned nseen;
++    static unsigned count[1024];
++    uint32_t wid = 0xFF;
++    if (ctx->policy_mode)
++        wid = ((uint32_t)ctx->ls[0x1DC] << 24 | (uint32_t)ctx->ls[0x1DD] << 16 |
++               (uint32_t)ctx->ls[0x1DE] << 8 | ctx->ls[0x1DF]) & 0xFF;
++    uint32_t key = ((uint32_t)image_id & 0xFFFF) << 16 | wid << 8 | ((lsa >> 10) & 0xFF);
++    int known = 0;
++    for (unsigned i = 0; i < nseen && i < 512; i++) if (seen[i] == key) { known = 1; break; }
++    if (!known && nseen < 512) {
++        seen[nseen++] = key;
++        fprintf(stderr, "[spu-ovl-map] wid=%u overlay image %d src=0x%08X -> LS 0x%05X\n",
++                wid, image_id, ea, lsa);
++    }
++    if (image_id >= 0 && image_id < 1024) {
++        unsigned n = ++count[image_id];
++        if ((n & (n - 1)) == 0 && n >= 64)
++            fprintf(stderr, "[spu-ovl-map] overlay image %d streamed %u times\n", image_id, n);
++    }
++}
++
+ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
+ {
+     uint32_t lsa = (uint32_t)(ls - ctx->ls);
+@@ -2154,6 +2184,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
+                              : (o->src_ea == ea);
+         if (hit) {
++            spu_overlay_map_note(ctx, o->image_id, ea, lsa);
+             if (o->span) {
+                 if (lsa + o->span > SPU_LS_SIZE) return;
+                 /* Verified code was lifted for one load address. */

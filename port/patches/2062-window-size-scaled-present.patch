@@ -1,0 +1,241 @@
+KZ3 patch 2062 (RSX pass 62): window size apart from the guest's 1280x720 output.
+rsx_window_size.h (new, platform-free): KZ3_WINDOW_SIZE parsing (WxH, 720p/900p/1080p/1440p/2160p/4k), the largest
+aspect-correct client inside a size, the WM_SIZING correction, and (Win32) rsx_win_client_size + rsx_win_size_msg
+used by both window owners: rsx_null_backend.c (the window KZ3 runs in; the live-draw swap chain binds to it) and
+rsx_d3d12_backend.c. The window's client size comes from KZ3_WINDOW_SIZE (default: the guest size, as before), keeps the guest aspect (a 16:10 request becomes the
+largest 16:9 inside it) and shrinks it to the monitor's work area; WM_SIZING keeps the aspect while dragging,
+WM_GETMINMAXINFO makes maximize the largest aspect-correct client, centred, minimum 320x180. The swap chain stays at
+the guest size and DXGI_SCALING_STRETCH (its default) scales it to the client area at present, so nothing in the
+renderer changes. Log: [window]. Host test: tools/smoke/test_window_size.sh.
+
+diff -ruN a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c	2026-10-15 02:21:13.562280697 -0500
++++ b/libs/video/rsx_d3d12_backend.c	2026-10-15 02:25:43.426392036 -0500
+@@ -697,8 +697,12 @@
+  * Win32 window
+  * -----------------------------------------------------------------------*/
+ 
++#include "rsx_window_size.h"   /* KZ3 patch 2062: window size apart from the guest output */
++
+ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
++    LRESULT sized;
++    if (rsx_win_size_msg(hwnd, msg, wp, lp, &sized)) return sized;
+     switch (msg) {
+     case WM_CLOSE:
+         s_d3d.window_closed = 1;
+@@ -724,7 +728,9 @@
+     wc.lpszClassName = "ps3recomp_d3d12";
+     RegisterClassExA(&wc);
+ 
+-    RECT wr = {0, 0, (LONG)width, (LONG)height};
++    int cw, ch;
++    rsx_win_client_size(width, height, &cw, &ch);  /* patch 2062: KZ3_WINDOW_SIZE; the swap chain stays width x height */
++    RECT wr = {0, 0, (LONG)cw, (LONG)ch};
+     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+ 
+     /* Keep the display awake (see rsx_null_backend.c). */
+diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c	2026-10-15 02:25:43.410391673 -0500
++++ b/libs/video/rsx_null_backend.c	2026-10-15 02:25:43.427926318 -0500
+@@ -52,8 +52,12 @@
+ 
+ static int s_present_suppressed = 0;
+ 
++#include "rsx_window_size.h"   /* KZ3 patch 2062: window size apart from the guest output */
++
+ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
++    LRESULT sized;
++    if (rsx_win_size_msg(hwnd, msg, wp, lp, &sized)) return sized;
+     switch (msg) {
+     case WM_CLOSE:
+         s_state.window_closed = 1;
+@@ -244,8 +248,11 @@
+     wc.lpszClassName = "ps3recomp_null";
+     RegisterClassExA(&wc);
+ 
+-    /* Compute window size from client area */
+-    RECT wr = {0, 0, (LONG)width, (LONG)height};
++    /* Compute window size from client area (patch 2062: KZ3_WINDOW_SIZE; the live-draw swap chain stays
++     * width x height and is scaled to the client area at present) */
++    int cw, ch;
++    rsx_win_client_size(width, height, &cw, &ch);
++    RECT wr = {0, 0, (LONG)cw, (LONG)ch};
+     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+ 
+     s_state.hwnd = CreateWindowExA(
+@@ -275,7 +282,7 @@
+     /* Register as the active RSX backend */
+     rsx_set_backend(&s_null_backend);
+ 
+-    printf("[RSX null] Window created: %ux%u\n", width, height);
++    printf("[RSX null] Window created: %ux%u (client %dx%d)\n", width, height, cw, ch);
+     return 0;
+ }
+ 
+diff -ruN a/libs/video/rsx_window_size.h b/libs/video/rsx_window_size.h
+--- a/libs/video/rsx_window_size.h	1969-12-31 18:00:00.000000000 -0600
++++ b/libs/video/rsx_window_size.h	2026-10-15 02:25:43.424954846 -0500
+@@ -0,0 +1,161 @@
++/*
++ * KZ3 patch 2062 (RSX pass 62): the game window's size, apart from the guest's 1280x720 output.
++ *
++ * The swap chain stays at the guest size; its DXGI_SCALING_STRETCH (the default) scales it to the window's client
++ * area at present. This header keeps that client area at the guest's aspect ratio, so the scaling never distorts:
++ *   - KZ3_WINDOW_SIZE=<W>x<H> | 720p | 900p | 1080p | 1440p | 2160p sets the first client size (default: the guest
++ *     size, unchanged behaviour). A requested size that does not fit the monitor's work area is shrunk, keeping the
++ *     aspect, to the largest that does. (kz3.ini will name the same setting later; the env switch wins.)
++ *   - dragging an edge or corner (WM_SIZING) keeps the aspect; maximizing (WM_GETMINMAXINFO) gives the largest
++ *     aspect-correct client that fits, centred.
++ * The size math is platform-free (host test: tools/smoke/test_window_size.sh); the Win32 part below (_WIN32 only) is
++ * used by both window owners: rsx_null_backend.c (KZ3's window: the D3D12 live-draw swap chain binds to it) and
++ * rsx_d3d12_backend.c.
++ */
++#ifndef RSX_WINDOW_SIZE_H
++#define RSX_WINDOW_SIZE_H
++
++#include <stdlib.h>
++#include <string.h>
++
++/* "1920x1080", "1920X1080", "1080p" -> 1 and the size; anything else (or under 160x90 / over 16384) -> 0. */
++static int rsx_win_parse_size(const char* s, int* w, int* h)
++{
++    static const struct { const char* n; int w, h; } named[] = {
++        { "720p", 1280, 720 }, { "900p", 1600, 900 }, { "1080p", 1920, 1080 }, { "1440p", 2560, 1440 },
++        { "2160p", 3840, 2160 }, { "4k", 3840, 2160 },
++    };
++    unsigned i;
++    char* e;
++    long a, b;
++    if (!s || !*s) return 0;
++    for (i = 0; i < sizeof named / sizeof named[0]; i++) {
++        const char* p = s; const char* q = named[i].n;
++        while (*p && *q && ((*p | 32) == *q || *p == *q)) { p++; q++; }
++        if (!*p && !*q) { *w = named[i].w; *h = named[i].h; return 1; }
++    }
++    a = strtol(s, &e, 10);
++    if (e == s || (*e != 'x' && *e != 'X')) return 0;
++    s = e + 1;
++    b = strtol(s, &e, 10);
++    if (e == s || *e) return 0;
++    if (a < 160 || b < 90 || a > 16384 || b > 16384) return 0;
++    *w = (int)a; *h = (int)b;
++    return 1;
++}
++
++/* The largest client of aspect aw:ah inside (maxw, maxh), integer, never above (w, h) when w, h > 0. */
++static void rsx_win_fit(int aw, int ah, int maxw, int maxh, int* w, int* h)
++{
++    int cw = maxw, ch = (int)((long long)maxw * ah / aw);
++    if (ch > maxh) { ch = maxh; cw = (int)((long long)maxh * aw / ah); }
++    if (*w > 0 && *h > 0 && *w <= cw && *h <= ch) return;
++    *w = cw; *h = ch;
++}
++
++/* WM_SIZING edges (the WMSZ_* values). */
++enum { RSX_WMSZ_LEFT = 1, RSX_WMSZ_RIGHT, RSX_WMSZ_TOP, RSX_WMSZ_TOPLEFT, RSX_WMSZ_TOPRIGHT, RSX_WMSZ_BOTTOM,
++       RSX_WMSZ_BOTTOMLEFT, RSX_WMSZ_BOTTOMRIGHT };
++
++/* Correct a window rectangle being dragged (r = left, top, right, bottom) so its client area (rectangle minus the
++ * frame fw x fh) has the aspect aw:ah and is at least minw wide. A side edge drives the height, the top/bottom edge
++ * the width, a corner whichever moved the client further from the aspect (the larger of the two sizes). The edge
++ * being dragged moves; the opposite one stays. */
++static void rsx_win_sizing(int edge, int r[4], int fw, int fh, int aw, int ah, int minw)
++{
++    int cw = r[2] - r[0] - fw, ch = r[3] - r[1] - fh;
++    int by_w, by_h;
++    if (cw < minw) cw = minw;
++    if (ch < 1) ch = 1;
++    by_w = (int)(((long long)cw * ah + aw / 2) / aw);     /* height for this width */
++    by_h = (int)(((long long)ch * aw + ah / 2) / ah);     /* width for this height */
++    if (edge == RSX_WMSZ_TOP || edge == RSX_WMSZ_BOTTOM) { cw = by_h; }
++    else if (edge == RSX_WMSZ_LEFT || edge == RSX_WMSZ_RIGHT) { ch = by_w; }
++    else if (by_h > cw) { cw = by_h; }
++    else { ch = by_w; }
++    if (cw < minw) { cw = minw; ch = (int)(((long long)cw * ah + aw / 2) / aw); }
++    if (edge == RSX_WMSZ_LEFT || edge == RSX_WMSZ_TOPLEFT || edge == RSX_WMSZ_BOTTOMLEFT) r[0] = r[2] - cw - fw;
++    else r[2] = r[0] + cw + fw;
++    if (edge == RSX_WMSZ_TOP || edge == RSX_WMSZ_TOPLEFT || edge == RSX_WMSZ_TOPRIGHT) r[1] = r[3] - ch - fh;
++    else r[3] = r[1] + ch + fh;
++}
++
++#ifdef _WIN32
++#include <stdio.h>
++#include <windows.h>
++
++static int s_rsx_win_aw = 16, s_rsx_win_ah = 9;     /* the guest output's aspect (set by rsx_win_client_size) */
++
++static void rsx_win_frame_size(int* fw, int* fh)    /* frame + caption around the client area */
++{
++    RECT z = {0, 0, 0, 0};
++    AdjustWindowRect(&z, WS_OVERLAPPEDWINDOW, FALSE);
++    *fw = z.right - z.left; *fh = z.bottom - z.top;
++}
++
++/* The first client size for a guest output of width x height: KZ3_WINDOW_SIZE, else the guest size. */
++static void rsx_win_client_size(unsigned width, unsigned height, int* cw, int* ch)
++{
++    const char* e = getenv("KZ3_WINDOW_SIZE");
++    int rw = 0, rh = 0;
++    *cw = (int)width; *ch = (int)height;
++    if (width && height) {
++        unsigned a = width, b = height;
++        while (b) { unsigned t = a % b; a = b; b = t; }
++        s_rsx_win_aw = (int)(width / a); s_rsx_win_ah = (int)(height / a);
++    }
++    if (!e || !*e) return;
++    if (!rsx_win_parse_size(e, &rw, &rh)) {
++        printf("[window] KZ3_WINDOW_SIZE=%s not understood (WxH or 720p/900p/1080p/1440p/2160p), %ux%u kept\n", e, width, height);
++    } else {
++        RECT work;
++        int fw, fh, fitw = 0, fith = 0;
++        rsx_win_frame_size(&fw, &fh);
++        rsx_win_fit(s_rsx_win_aw, s_rsx_win_ah, rw, rh, &fitw, &fith);   /* 16:10 -> the largest 16:9 inside */
++        *cw = fitw; *ch = fith;
++        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
++            int mw = work.right - work.left - fw, mh = work.bottom - work.top - fh;
++            if (mw > 0 && mh > 0) rsx_win_fit(s_rsx_win_aw, s_rsx_win_ah, mw, mh, cw, ch);
++        }
++        printf("[window] KZ3_WINDOW_SIZE=%s: client %dx%d%s, guest output %ux%u scaled to it at present\n", e, *cw, *ch,
++               (*cw != rw || *ch != rh) ? " (aspect / work area)" : "", width, height);
++    }
++    fflush(stdout);
++}
++
++/* WM_SIZING / WM_GETMINMAXINFO for a game window; 1 = handled, *res = the window procedure's result. */
++static int rsx_win_size_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
++{
++    if (msg == WM_SIZING) {            /* dragging keeps the guest aspect, so the scaled present never distorts */
++        RECT* wr = (RECT*)lp;
++        int r[4] = { wr->left, wr->top, wr->right, wr->bottom }, fw, fh;
++        rsx_win_frame_size(&fw, &fh);
++        rsx_win_sizing((int)wp, r, fw, fh, s_rsx_win_aw, s_rsx_win_ah, 320);
++        wr->left = r[0]; wr->top = r[1]; wr->right = r[2]; wr->bottom = r[3];
++        *res = TRUE;
++        return 1;
++    }
++    if (msg == WM_GETMINMAXINFO) {     /* maximized = the largest aspect-correct client on the work area, centred */
++        MINMAXINFO* mm = (MINMAXINFO*)lp;
++        HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
++        MONITORINFO mi;
++        int fw, fh;
++        mi.cbSize = sizeof mi;
++        rsx_win_frame_size(&fw, &fh);
++        mm->ptMinTrackSize.x = 320 + fw; mm->ptMinTrackSize.y = 180 + fh;
++        if (mon && GetMonitorInfoA(mon, &mi)) {
++            int cw = 0, ch = 0;
++            int ww = mi.rcWork.right - mi.rcWork.left, wh = mi.rcWork.bottom - mi.rcWork.top;
++            rsx_win_fit(s_rsx_win_aw, s_rsx_win_ah, ww - fw, wh - fh, &cw, &ch);
++            mm->ptMaxSize.x = cw + fw; mm->ptMaxSize.y = ch + fh;
++            mm->ptMaxPosition.x = (mi.rcWork.left - mi.rcMonitor.left) + (ww - (cw + fw)) / 2;
++            mm->ptMaxPosition.y = (mi.rcWork.top - mi.rcMonitor.top) + (wh - (ch + fh)) / 2;
++        }
++        *res = 0;
++        return 1;
++    }
++    return 0;
++}
++#endif /* _WIN32 */
++
++#endif /* RSX_WINDOW_SIZE_H */

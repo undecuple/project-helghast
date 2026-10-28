@@ -1,0 +1,307 @@
+diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -157,6 +157,30 @@
+     return -1;
+ }
+ 
++/* KZ3 patch 2103: VSync (ENHANCEMENT, display.ini "vsync = on|off", Options > Display > VSync; default on). The host present
++ * interval only: the guest's vblank / flip pacing stays at its fixed 60 Hz. */
++enum { RSX_DM_VSYNC_OFF = 0, RSX_DM_VSYNC_ON = 1 };
++static inline const char* rsx_dm_vsync_name(int v) { return v ? "on" : "off"; }
++static inline int rsx_dm_parse_vsync(const char* s)
++{
++    size_t n;
++    if (!rsx_dm_trim(&s, &n)) return -1;
++    if (rsx_dm_ieq(s, n, "on") || rsx_dm_ieq(s, n, "true") || rsx_dm_ieq(s, n, "yes") || rsx_dm_ieq(s, n, "1")) return RSX_DM_VSYNC_ON;
++    if (rsx_dm_ieq(s, n, "off") || rsx_dm_ieq(s, n, "false") || rsx_dm_ieq(s, n, "no") || rsx_dm_ieq(s, n, "0")) return RSX_DM_VSYNC_OFF;
++    return -1;
++}
++/* The Present arguments. env_interval = LD_PRESENT_INTERVAL (0..4, -1 unset; wins, no tearing flag, as before patch 2103).
++ * vsync on = interval 1. Off = interval 0, plus the tearing flag when the swap chain has it and is not in exclusive
++ * fullscreen (DXGI refuses the flag there). *tearing = 1 when the flag is set. */
++static inline unsigned rsx_dm_present_args(int vsync, int tearing_ok, int exclusive_fs, int env_interval, unsigned* tearing)
++{
++    *tearing = 0;
++    if (env_interval >= 0) return (unsigned)env_interval;
++    if (vsync) return 1;
++    *tearing = (tearing_ok && !exclusive_fs) ? 1u : 0u;
++    return 0;
++}
++
+ /* The image rectangle for a scaling and filter choice. */
+ static inline rsx_dm_rect rsx_dm_rect_for(int sw, int sh, int dw, int dh, int scaling, int filter)
+ {
+@@ -234,14 +258,20 @@
+     return rsx_dm_ini_value(t, "filter", v, sizeof v) ? rsx_dm_parse_filter(v) : -1;
+ }
+ 
+-static inline int rsx_dm_ini_write(char* buf, size_t n, int mode, int scaling, int filter)
++static inline int rsx_dm_ini_vsync(const char* t)          /* the vsync setting, or -1 */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "vsync", v, sizeof v) ? rsx_dm_parse_vsync(v) : -1;
++}
++
++static inline int rsx_dm_ini_write(char* buf, size_t n, int mode, int scaling, int filter, int vsync)
+ {
+     return snprintf(buf, n,
+                     "# Project Helghast display settings (Options > Display; Alt+Enter toggles the mode).\n"
+-                    "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest.\n"
++                    "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest, vsync = on | off.\n"
+                     "# KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER override them for one run.\n"
+-                    "[display]\nmode = %s\nscaling = %s\nfilter = %s\n", rsx_dm_name(mode), rsx_dm_scaling_name(scaling),
+-                    rsx_dm_filter_name(filter));
++                    "[display]\nmode = %s\nscaling = %s\nfilter = %s\nvsync = %s\n", rsx_dm_name(mode), rsx_dm_scaling_name(scaling),
++                    rsx_dm_filter_name(filter), rsx_dm_vsync_name(vsync));
+ }
+ 
+ /* The Options row (Options > Display, common/displaysettings.gum): three <select>s (mode, scaling, filter) before the Brightness row, the same
+@@ -277,6 +307,11 @@
+         "\t\t\t\tdefault-value=\"bilinear\">\n"
+         "\t\t\t\t<selectitem value=\"bilinear\">Bilinear</selectitem>\n"
+         "\t\t\t\t<selectitem value=\"nearest\">Nearest</selectitem>\n"
++        "\t\t\t</select>\n\n\t\t\t"
++        "<select id=\"slc_kz3_vsync\" label=\"VSync\" onchange=\"script(settingscript,KZ3ChangeVSync)\"\n"
++        "\t\t\t\tdefault-value=\"on\">\n"
++        "\t\t\t\t<selectitem value=\"on\">On</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"off\">Off</selectitem>\n"
+         "\t\t\t</select>\n\n\t\t\t";
+ 
+     static const char rsx_dm_gum_lua[] =
+@@ -287,7 +322,8 @@
+         "\t\tfunction OnPageOn()\n"
+         "\t\t\tgRoot:GetTag(\"slc_kz3_display\"):SetValue(KZ3DisplayCmd(\"display\"))\n"
+         "\t\t\tgRoot:GetTag(\"slc_kz3_scaling\"):SetValue(KZ3DisplayCmd(\"scaling\"))\n"
+-        "\t\t\tgRoot:GetTag(\"slc_kz3_filter\"):SetValue(KZ3DisplayCmd(\"filter\"))\n\t\t\tgKz3Dm = 1\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_filter\"):SetValue(KZ3DisplayCmd(\"filter\"))\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_vsync\"):SetValue(KZ3DisplayCmd(\"vsync\"))\n\t\t\tgKz3Dm = 1\n"
+         "\t\tend\n\n"
+         "\t\tfunction KZ3ChangeDisplay(e)\n"
+         "\t\t\te:SetHandled(true)\n"
+@@ -300,6 +336,10 @@
+         "\t\tfunction KZ3ChangeFilter(e)\n"
+         "\t\t\te:SetHandled(true)\n"
+         "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"filter \"..e:GetSender():GetValue()) end\n"
++        "\t\tend\n\n"
++        "\t\tfunction KZ3ChangeVSync(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"vsync \"..e:GetSender():GetValue()) end\n"
+         "\t\tend\n";
+     const char* row = rsx_dm_find(in, n, 0, "<listitem id=\"lst_gamma_screen\"");
+     const char* scr = rsx_dm_find(in, n, 0, "<script id=\"settingscript\">");
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -76,6 +76,7 @@
+ int  rsx_live_draw_set_fullscreen(int on) { (void)on; return -1; }   /* patch 2095 */
+ int  rsx_live_draw_is_fullscreen(void) { return 0; }
+ void rsx_live_draw_set_scaling(int s, int f) { (void)s; (void)f; }
++void rsx_live_draw_set_vsync(int on) { (void)on; }   /* patch 2103 */
+ u32  rsx_live_draw_get_frames(void) { return 0; }
+ void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
+ u32  rsx_live_draw_get_last_draws(void) { return 0; }
+@@ -130,6 +131,7 @@
+ #include <d3d12.h>
+ #include <d3d12sdklayers.h>
+ #include <dxgi1_4.h>
++#include <dxgi1_5.h>   /* patch 2103: DXGI_FEATURE_PRESENT_ALLOW_TEARING */
+ #include <d3dcompiler.h>
+ #include "rsx_vertex_formats.h"
+ #include "rsx_keycaps.h"   /* patch 2039: keycap prompts */
+@@ -14977,6 +14979,33 @@
+ static int g_dm_fs;                           /* swap chain in exclusive fullscreen */
+ static u32 g_dm_resizes;
+ 
++/* patch 2103: VSync. The swap chain is created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING whenever the factory reports
++ * DXGI_FEATURE_PRESENT_ALLOW_TEARING (harmless with vsync on). ResizeBuffers must repeat the flag. */
++static int g_ld_vsync = 1;                    /* rsx_null_backend.c (window thread = present thread) */
++static int g_ld_tearing_ok;                   /* swap chain has the flag */
++static int g_ld_vsync_logged = -1;
++void rsx_live_draw_set_vsync(int on) { g_ld_vsync = on ? 1 : 0; }
++static UINT ld_swap_flags(void) { return g_ld_tearing_ok ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0; }
++/* Present with the interval and flags the setting asks for; logs "[rsx] vsync ..." once and on each change. */
++static HRESULT ld_present_swap(void)
++{
++    static int s_env = -2;
++    unsigned tearing = 0, interval;
++    if (s_env == -2) {
++        const char* e = getenv("LD_PRESENT_INTERVAL");   /* patch 2007, diagnostic: wins */
++        s_env = (e && *e >= '0' && *e <= '4') ? *e - '0' : -1;
++    }
++    interval = rsx_dm_present_args(g_ld_vsync, g_ld_tearing_ok, g_dm_fs, s_env, &tearing);
++    if (g_ld_vsync_logged != (g_ld_vsync | (int)(tearing << 1) | (s_env >= 0 ? 4 : 0))) {
++        g_ld_vsync_logged = g_ld_vsync | (int)(tearing << 1) | (s_env >= 0 ? 4 : 0);
++        fprintf(stderr, "[rsx] vsync %s (%s%s)\n", rsx_dm_vsync_name(g_ld_vsync),
++                g_ld_tearing_ok ? "tearing allowed" : "tearing not supported",
++                s_env >= 0 ? ", LD_PRESENT_INTERVAL set: interval from the environment" :
++                g_dm_fs && !g_ld_vsync ? ", exclusive fullscreen: interval 0 without the flag" : "");
++    }
++    return g.swap->lpVtbl->Present(g.swap, interval, tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
++}
++
+ static void ld_dm_client(u32* w, u32* h)
+ {
+     RECT rc;
+@@ -15005,7 +15034,7 @@
+     ld_wait_fence(g.fence_value);                   /* every submitted list that used a back buffer is done */
+     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++)
+         if (g.backbuf[i]) { g.backbuf[i]->lpVtbl->Release(g.backbuf[i]); g.backbuf[i] = NULL; }
+-    const HRESULT hr = g.swap->lpVtbl->ResizeBuffers(g.swap, LD_SWAP_BUFFERS, w, h, DXGI_FORMAT_UNKNOWN, 0);
++    const HRESULT hr = g.swap->lpVtbl->ResizeBuffers(g.swap, LD_SWAP_BUFFERS, w, h, DXGI_FORMAT_UNKNOWN, ld_swap_flags());
+     ld_dm_get_buffers();
+     if (FAILED(hr)) {
+         fprintf(stderr, "[display] ResizeBuffers %ux%u failed hr=0x%08lX: %ux%u kept\n", w, h, (unsigned long)hr,
+@@ -15383,6 +15412,16 @@
+     scd.Width = g_dm_bb_w; scd.Height = g_dm_bb_h; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+     scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+     scd.BufferCount = LD_SWAP_BUFFERS; scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++    {   /* patch 2103: tearing support (IDXGIFactory5) decides the swap-chain flag */
++        IDXGIFactory5* f5 = NULL;
++        BOOL allow = FALSE;
++        if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, &IID_IDXGIFactory5, (void**)&f5)) && f5) {
++            if (FAILED(f5->lpVtbl->CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof allow))) allow = FALSE;
++            f5->lpVtbl->Release(f5);
++        }
++        g_ld_tearing_ok = allow ? 1 : 0;
++        scd.Flags = ld_swap_flags();
++    }
+     IDXGISwapChain1* sc1 = NULL;
+     if (FAILED(factory->lpVtbl->CreateSwapChainForHwnd(factory, (IUnknown*)g.queue,
+             (HWND)hwnd, &scd, NULL, NULL, &sc1))) {
+@@ -16060,7 +16099,7 @@
+ 
+     ld_flush(LD_FLUSH_MOVIE_PRESENT);
+     {
+-        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
++        const HRESULT present_hr = ld_present_swap();
+         if (SUCCEEDED(present_hr))
+             ld_present_measure_record(g_ld_frames);
+         else {
+@@ -17358,14 +17397,8 @@
+ 
+     ld_flush(LD_FLUSH_PRESENT);
+     {
+-        /* LD_PRESENT_INTERVAL (patch 2007, diagnostic): swap-chain sync
+-         * interval, default 1 (vsync). 0 shows how much of the present
+-         * fence wait is pacing rather than GPU work. */
+-        static int s_interval = -1;
+-        if (s_interval < 0) {
+-            const char* e = getenv("LD_PRESENT_INTERVAL");
+-            s_interval = (e && *e >= '0' && *e <= '4') ? *e - '0' : 1;
+-        }
++        /* LD_PRESENT_INTERVAL (patch 2007, diagnostic) wins over the VSync setting (patch 2103, ld_present_swap):
++         * 0 shows how much of the present fence wait is pacing rather than GPU work. */
+         /* LD_NO_PRESENT=1 (patch 2008, diagnostic): skip the swap-chain
+          * Present, so RSX_PERF shows the renderer's own throughput without
+          * the display path (Xvfb costs ~12 ms per 1280x720 present). */
+@@ -17376,7 +17409,7 @@
+         }
+         const long long swap0 = rsx_perf_now();
+         const HRESULT present_hr = s_nopresent ? S_OK
+-            : g.swap->lpVtbl->Present(g.swap, (UINT)s_interval, 0);
++            : ld_present_swap();
+         rsx_perf_add(RSX_PERF_SWAP_T, rsx_perf_now() - swap0);
+         if (SUCCEEDED(present_hr))
+             ld_present_measure_record(g_ld_frames + 1u);
+diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -65,16 +65,19 @@
+ extern int rsx_live_draw_set_fullscreen(int on);   /* 1 taken, 0 refused, -1 no swap chain yet (rsx_live_draw.c) */
+ extern int rsx_live_draw_is_fullscreen(void);
+ extern void rsx_live_draw_set_scaling(int scaling, int filter);   /* Fit/Stretch, Bilinear/Nearest */
++extern void rsx_live_draw_set_vsync(int on);   /* patch 2103 */
+ 
+ #define RSX_DM_WM_SET (WM_APP + 0x95)
+ #define RSX_DM_WM_SCALE (WM_APP + 0x96)
++#define RSX_DM_WM_VSYNC (WM_APP + 0x9A)
+ static int s_dm_scaling = RSX_DM_SCALING_DEFAULT, s_dm_filter = RSX_DM_BILINEAR;
+-static int s_dm_cfg_scaling = -1, s_dm_cfg_filter = -1;
++static int s_dm_cfg_scaling = -1, s_dm_cfg_filter = -1, s_dm_cfg_vsync = -1;
++static int s_dm_vsync = RSX_DM_VSYNC_ON;
+ static rsx_dm_state s_dm;
+ static int s_dm_applied = RSX_DM_WINDOWED;        /* what the window is now */
+ static int s_dm_env = 0;                          /* KZ3_DISPLAY given: nothing is saved */
+ static int s_dm_cfg = -1;                         /* the saved mode (rsx_display_configure) */
+-static void (*s_dm_save)(int mode, int scaling, int filter);   /* writes display.ini (port/kz3/main.cpp) */
++static void (*s_dm_save)(int mode, int scaling, int filter, int vsync);   /* writes display.ini (port/kz3/main.cpp) */
+ static int s_dm_pending = -1;                     /* exclusive fullscreen waits for the swap chain */
+ static WINDOWPLACEMENT s_dm_wp;
+ static LONG_PTR s_dm_style, s_dm_exstyle;
+@@ -83,9 +86,10 @@
+ static const char* s_dm_script;                   /* KZ3_TEST_DISPLAY */
+ 
+ /* Called by the port before the window exists: what display.ini holds (-1 = none) and how to save the settings. */
+-void rsx_display_configure(int saved_mode, int saved_scaling, int saved_filter,
+-                           void (*save)(int mode, int scaling, int filter))
++void rsx_display_configure(int saved_mode, int saved_scaling, int saved_filter, int saved_vsync,
++                           void (*save)(int mode, int scaling, int filter, int vsync))
+ {
++    s_dm_cfg_vsync = saved_vsync;
+     s_dm_cfg = saved_mode;
+     s_dm_cfg_scaling = saved_scaling;
+     s_dm_cfg_filter = saved_filter;
+@@ -95,6 +99,7 @@
+ int rsx_display_get_mode(void) { return s_dm.mode; }
+ int rsx_display_get_scaling(void) { return s_dm_scaling; }
+ int rsx_display_get_filter(void) { return s_dm_filter; }
++int rsx_display_get_vsync(void) { return s_dm_vsync; }
+ /* patch 2096: KZ3_ASPECT (read once; the default is screen) */
+ int rsx_display_get_aspect(void)
+ {
+@@ -108,7 +113,7 @@
+     }
+     return v;
+ }
+-static void rsx_dm_save_now(void) { if (!s_dm_env && s_dm_save) s_dm_save(s_dm.mode, s_dm_scaling, s_dm_filter); }
++static void rsx_dm_save_now(void) { if (!s_dm_env && s_dm_save) s_dm_save(s_dm.mode, s_dm_scaling, s_dm_filter, s_dm_vsync); }
+ 
+ static void rsx_dm_log_client(const char* why)
+ {
+@@ -197,6 +202,13 @@
+     return PostMessageA(s_state.hwnd, RSX_DM_WM_SCALE, (WPARAM)(scaling + 1), (LPARAM)(filter + 1)) ? 1 : 0;
+ }
+ 
++/* patch 2103: the VSync row (posted from the Lua bridge thread, handled on the window's thread). */
++int rsx_display_set_vsync(int on)
++{
++    if (!s_state.hwnd) return 0;
++    return PostMessageA(s_state.hwnd, RSX_DM_WM_VSYNC, (WPARAM)(on ? 1 : 0), 0) ? 1 : 0;
++}
++
+ /* A client pixel -> the guest pixel under it, through the letterbox (1 inside the image, 0 on a bar). For the port's
+  * own mouse-driven UI; the game itself reads no cursor position. */
+ int rsx_display_client_to_guest(int cx, int cy, int* gx, int* gy)
+@@ -231,6 +243,13 @@
+         *res = 0;
+         return 1;
+     }
++    if (msg == RSX_DM_WM_VSYNC) {   /* patch 2103: applied at the next Present (the interval is per call) */
++        s_dm_vsync = wp ? RSX_DM_VSYNC_ON : RSX_DM_VSYNC_OFF;
++        rsx_live_draw_set_vsync(s_dm_vsync);
++        rsx_dm_save_now();
++        *res = 0;
++        return 1;
++    }
+     if (msg == WM_ACTIVATEAPP && wp && s_dm_applied == RSX_DM_FULLSCREEN && !rsx_live_draw_is_fullscreen()) {
+         if (rsx_live_draw_set_fullscreen(1) > 0) rsx_dm_log_client("exclusive fullscreen taken back on activation");
+         pad_mouse_refresh(hwnd);   /* patch 2097: the clip follows the re-taken output */
+@@ -296,11 +315,15 @@
+         s_dm_scaling = vs >= 0 ? vs : s_dm_cfg_scaling >= 0 ? s_dm_cfg_scaling : RSX_DM_SCALING_DEFAULT;
+         s_dm_filter = vf >= 0 ? vf : s_dm_cfg_filter >= 0 ? s_dm_cfg_filter : RSX_DM_BILINEAR;
+     }
++    {   /* vsync: display.ini, else on (no env switch: LD_PRESENT_INTERVAL, the diagnostic, wins in rsx_live_draw.c) */
++        s_dm_vsync = s_dm_cfg_vsync >= 0 ? s_dm_cfg_vsync : RSX_DM_VSYNC_ON;
++        rsx_live_draw_set_vsync(s_dm_vsync);
++    }
+     rsx_live_draw_set_scaling(s_dm_scaling, s_dm_filter);
+     s_dm_t0 = GetTickCount64();
+     s_dm_script = getenv("KZ3_TEST_DISPLAY");
+-    printf("[display] mode %s from %s (Alt+Enter toggles windowed / %s), scaling %s, filter %s%s\n", rsx_dm_name(m), src,
+-           rsx_dm_name(s_dm.last_fs), rsx_dm_scaling_name(s_dm_scaling), rsx_dm_filter_name(s_dm_filter),
++    printf("[display] mode %s from %s (Alt+Enter toggles windowed / %s), scaling %s, filter %s, vsync %s%s\n", rsx_dm_name(m), src,
++           rsx_dm_name(s_dm.last_fs), rsx_dm_scaling_name(s_dm_scaling), rsx_dm_filter_name(s_dm_filter), rsx_dm_vsync_name(s_dm_vsync),
+            s_dm_env ? " (KZ3_DISPLAY*: not saved)" : "");
+     if (m == RSX_DM_FULLSCREEN) {          /* the swap chain does not exist yet: borderless now, exclusive at the */
+         rsx_dm_apply(RSX_DM_BORDERLESS, "start");   /* first pump (live draw is up by then) */

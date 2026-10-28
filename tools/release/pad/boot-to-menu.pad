@@ -1,0 +1,14 @@
+# Boot to the main menu from a profile with no progress (coord-firstboot): follows the pages instead of the clock.
+# Prenarrative and intro end on CROSS; the title screen takes CROSS; then mainmenu.gum is up (Campaign highlighted).
+wait preintro.gum 90
+sleep 1
+key X
+wait intro.gum
+sleep 1
+key X
+wait titlescreen.gum
+sleep 1
+key X
+wait mainmenu.gum
+sleep 3
+mark main menu

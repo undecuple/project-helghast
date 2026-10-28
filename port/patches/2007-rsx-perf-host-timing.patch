@@ -1,0 +1,584 @@
+RSX_PERF=1: opt-in per-second host timing of the FIFO walker, D3D12 submit/present and the main thread's waits.
+
+Diagnostic for the performance probe, off by default (one getenv, cached). With RSX_PERF=1 a reporter thread,
+started by the first FIFO walk, prints once per second:
+- [perf]: guest flip requests, FIFO flips consumed by live-draw, presents, live-draw draws; FIFO walk count and
+  time (cellGcm_rsx_process_fifo, includes live-draw method work); D3D12 flushes by reason (present, guest
+  reference, other) with their total time and the GPU-fence wait inside them; whole present time and the
+  IDXGISwapChain::Present call alone; ref-register polls; real time in sys_timer_usleep of the thread that
+  called cellGcmInit (count, ms) and of all other threads.
+- [perf-wait]: the cellGcmInit thread's usleep time per guest call site (lr), top 4.
+- [perf-thr]: process CPU and the 10 busiest host threads (CPU ms in the last second), labelled rsx (walker/
+  present thread), gcm-init, ppu:<guest name>, or tid@+RVA of the thread start in the exe / tid@module+off.
+RSX_PERF_SAMPLE=1 adds an instruction-pointer sampler over the threads that used >= 300 ms CPU in the previous
+second (suspend, GetThreadContext, resume every 5 ms; nothing else while suspended) and prints the top 64
+256-byte RVA buckets per thread every 10 s ([perf-samp]); resolve them offline against the exe's symbols.
+LD_PRESENT_INTERVAL=0..4 sets the swap-chain sync interval of the live-draw present (default 1).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): drain: upstream's wprof_note_walker + g_gcm_drain_tid before 2007's perf split; sys_timer both.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 3f49aec6..d7133a18 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -18,6 +18,8 @@
+ #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+ #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
+ #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
++static unsigned long s_perf_rsx_tid, s_perf_gcm_tid;   /* RSX_PERF thread labels (patch 2007) */
++static uintptr_t s_ps_end;                            /* RSX_PERF_SAMPLE: exe image end */
+ 
+ /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
+  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
+@@ -505,6 +507,9 @@ static const int s_valid_pitch_count = sizeof(s_valid_pitches) / sizeof(s_valid_
+ /* NID: 0xB2E761D4 */
+ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+ {
++#ifdef _WIN32
++    if (rsx_perf_enabled()) s_perf_gcm_tid = GetCurrentThreadId();   /* RSX_PERF label */
++#endif
+     printf("[cellGcmSys] Init(cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%08X)\n",
+            cmdSize, ioSize, ioAddress);
+ 
+@@ -1935,6 +1940,7 @@ static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
+ 
+ void cellGcm_ref_on_poll(void)
+ {
++    rsx_perf_add(RSX_PERF_REFPOLL, 1);
+     /* Pace: leave each published value observable for >= ~200us of spins
+      * (equality-waiters at any poll rate see every value; still ~5000/s so
+      * loading's fence storms clear in seconds, not minutes). */
+@@ -1956,6 +1962,276 @@ void cellGcm_ref_on_poll(void)
+         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * RSX_PERF=1 (KZ3 patch 2007): per-second host timing, off by default.
++ * [perf]     flips, presents, draws; FIFO walk time (includes live-draw method
++ *            work and any submit it triggers); D3D12 flushes by reason with
++ *            their total and GPU-fence-wait time; present (flush + swap) and
++ *            the IDXGISwapChain::Present call alone; guest ref-register polls.
++ * [perf-thr] process CPU and the busiest host threads (ms of CPU in the last
++ *            second): rsx = FIFO walker/present thread, gcm-init = thread that
++ *            called cellGcmInit, ppu:<name> = guest PPU threads, others by
++ *            start address (+RVA in the exe; resolve with nm/addr2line).
++ * -----------------------------------------------------------------------*/
++static volatile long long g_rsx_perf[RSX_PERF_COUNT];
++_Static_assert(RSX_PERF_USLEEP_GCM_N == 13 && RSX_PERF_USLEEP_GCM_T == 14 && RSX_PERF_USLEEP_OTHER_T == 15,
++               "sys_timer.c mirrors the RSX_PERF_USLEEP_* indices");
++static unsigned long long s_rsx_perf_methods;      /* walker thread only */
++
++int rsx_perf_enabled(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_PERF"); on = (e && *e && *e != '0') ? 1 : 0; }
++    return on;
++}
++long long rsx_perf_now(void)
++{
++    LARGE_INTEGER t; QueryPerformanceCounter(&t); return (long long)t.QuadPart;
++}
++int rsx_perf_on_gcm_thread(void)
++{
++#ifdef _WIN32
++    return s_perf_gcm_tid && GetCurrentThreadId() == s_perf_gcm_tid;
++#else
++    return 0;
++#endif
++}
++/* Real usleep time of the cellGcmInit thread per guest call site (lr), for the
++ * [perf] line's top sites. Only that thread writes; the reporter reads and
++ * clears without a lock (diagnostic: a lost sample cannot change the ranking). */
++enum { RSX_PERF_SITES = 32 };
++static unsigned  s_perf_site_lr[RSX_PERF_SITES];
++static long long s_perf_site_t[RSX_PERF_SITES], s_perf_site_n[RSX_PERF_SITES];
++void rsx_perf_note_gcm_wait(unsigned lr, long long ticks)
++{
++    for (int i = 0; i < RSX_PERF_SITES; i++) {
++        if (s_perf_site_lr[i] == lr || s_perf_site_lr[i] == 0) {
++            s_perf_site_lr[i] = lr; s_perf_site_t[i] += ticks; s_perf_site_n[i]++; return;
++        }
++    }
++}
++void rsx_perf_add(int idx, long long v)
++{
++    if (rsx_perf_enabled() && idx >= 0 && idx < RSX_PERF_COUNT)
++        __atomic_fetch_add(&g_rsx_perf[idx], v, __ATOMIC_RELAXED);
++}
++
++#ifdef _WIN32
++#include <tlhelp32.h>
++extern const char* ppu_thread_name_for_os_tid(unsigned long os_tid);
++typedef LONG (WINAPI *rsx_perf_ntqit_fn)(HANDLE, int, PVOID, ULONG, PULONG);
++
++static void rsx_perf_label(HANDLE h, DWORD tid, char* out, size_t n)
++{
++    static rsx_perf_ntqit_fn ntq;
++    static uintptr_t base, end;
++    if (!base) {
++        base = (uintptr_t)GetModuleHandleA(NULL);
++        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
++        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
++        end = base + nt->OptionalHeader.SizeOfImage;
++        s_ps_end = end;
++        ntq = (rsx_perf_ntqit_fn)(void*)GetProcAddress(GetModuleHandleA("ntdll.dll"),
++                                                       "NtQueryInformationThread");
++    }
++    if (tid == s_perf_rsx_tid) { snprintf(out, n, "rsx"); return; }
++    if (tid == s_perf_gcm_tid) { snprintf(out, n, "gcm-init"); return; }
++    const char* pn = ppu_thread_name_for_os_tid(tid);
++    if (pn) { snprintf(out, n, "ppu:%.24s", pn); return; }
++    uintptr_t sa = 0;
++    if (ntq) ntq(h, 9 /* ThreadQuerySetWin32StartAddress */, &sa, sizeof sa, NULL);
++    if (sa >= base && sa < end) { snprintf(out, n, "%lu@+0x%llx", (unsigned long)tid,
++                                           (unsigned long long)(sa - base)); return; }
++    /* Outside the exe: name the module (wine/vkd3d/driver threads). */
++    HMODULE mod = NULL; char path[MAX_PATH] = "?";
++    if (sa && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)sa, &mod))
++        GetModuleFileNameA(mod, path, sizeof path);
++    const char* bn = path;
++    for (const char* q = path; *q; q++) if (*q == '\\' || *q == '/') bn = q + 1;
++    snprintf(out, n, "%lu@%.20s+0x%llx", (unsigned long)tid, bn,
++             (unsigned long long)(sa - (uintptr_t)mod));
++}
++
++/* RSX_PERF_SAMPLE=1: also sample the instruction pointer of the threads that
++ * used >= 300 ms CPU in the previous second (not the rsx thread), every 5 ms
++ * (suspend, read RIP, resume; nothing else while suspended). Every 10 s print
++ * the top 64 256-byte buckets per thread as exe RVAs ("[perf-samp]"); resolve
++ * them offline against the exe's symbols (lifted SPU/PPU functions are named). */
++enum { PS_HOT = 6, PS_SLOTS = 4096 };
++static DWORD     s_ps_tid[PS_HOT];
++static HANDLE    s_ps_h[PS_HOT];
++static char      s_ps_lab[PS_HOT][48];
++static uintptr_t s_ps_key[PS_HOT][PS_SLOTS];
++static unsigned  s_ps_cnt[PS_HOT][PS_SLOTS];
++static unsigned  s_ps_total[PS_HOT], s_ps_other[PS_HOT], s_ps_out[PS_HOT];
++static void rsx_perf_sample_once(void)
++{
++    const uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
++    for (int i = 0; i < PS_HOT; i++) {
++        if (!s_ps_h[i]) continue;
++        CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL;
++        if (SuspendThread(s_ps_h[i]) == (DWORD)-1) continue;
++        const BOOL ok = GetThreadContext(s_ps_h[i], &c);
++        ResumeThread(s_ps_h[i]);
++        if (!ok) continue;
++        s_ps_total[i]++;
++        if ((uintptr_t)c.Rip < base || (s_ps_end && (uintptr_t)c.Rip >= s_ps_end)) { s_ps_out[i]++; continue; }
++        const uintptr_t k = ((uintptr_t)c.Rip - base) >> 8;
++        unsigned h = (unsigned)(k * 2654435761u) & (PS_SLOTS - 1);
++        for (int n = 0; n < PS_SLOTS; n++, h = (h + 1) & (PS_SLOTS - 1)) {
++            if (s_ps_key[i][h] == k) { s_ps_cnt[i][h]++; break; }
++            if (s_ps_cnt[i][h] == 0) { s_ps_key[i][h] = k; s_ps_cnt[i][h] = 1; break; }
++            if (n == PS_SLOTS - 1) s_ps_other[i]++;
++        }
++    }
++}
++static void rsx_perf_sample_report(void)
++{
++    for (int i = 0; i < PS_HOT; i++) {
++        if (!s_ps_total[i]) continue;
++        char line[4096];
++        int off = snprintf(line, sizeof line, "[perf-samp] %s n=%u outside-exe=%u:", s_ps_lab[i],
++                           s_ps_total[i], s_ps_out[i]);
++        for (int t = 0; t < 64 && off < (int)sizeof line - 40; t++) {
++            int b = -1;
++            for (int j = 0; j < PS_SLOTS; j++)
++                if (s_ps_cnt[i][j] && (b < 0 || s_ps_cnt[i][j] > s_ps_cnt[i][b])) b = j;
++            if (b < 0) break;
++            off += snprintf(line + off, sizeof line - off, " %llx=%u",
++                            (unsigned long long)(s_ps_key[i][b] << 8), s_ps_cnt[i][b]);
++            s_ps_cnt[i][b] = 0;
++        }
++        fprintf(stderr, "%s\n", line);
++        memset(s_ps_cnt[i], 0, sizeof s_ps_cnt[i]); memset(s_ps_key[i], 0, sizeof s_ps_key[i]);
++        s_ps_total[i] = s_ps_other[i] = s_ps_out[i] = 0;
++    }
++}
++
++static DWORD WINAPI rsx_perf_thread(LPVOID unused)
++{
++    const char* pse = getenv("RSX_PERF_SAMPLE");
++    const int sampling = pse && *pse && *pse != '0';
++    unsigned secs = 0;
++    (void)unused;
++    enum { MAXT = 512, TOP = 10 };
++    static DWORD tids[MAXT]; static unsigned long long cpu_prev[MAXT]; static int ntids;
++    LARGE_INTEGER f, t0, last, now;
++    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); last = t0;
++    long long prev[RSX_PERF_COUNT] = {0};
++    unsigned long long prev_methods = 0, prev_draws = rsx_perf_draws(), prev_ff = rsx_perf_fifo_flips();
++    const double tk = 1000.0 / (double)f.QuadPart;   /* ticks -> ms */
++    for (;;) {
++        if (sampling) {
++            for (int k = 0; k < 200; k++) { Sleep(5); rsx_perf_sample_once(); }
++            if (++secs % 10 == 0) rsx_perf_sample_report();
++        } else {
++            Sleep(1000);
++        }
++        QueryPerformanceCounter(&now);
++        const double wall = (double)(now.QuadPart - last.QuadPart) * tk;
++        last = now;
++        long long d[RSX_PERF_COUNT];
++        for (int i = 0; i < RSX_PERF_COUNT; i++) {
++            const long long c = __atomic_load_n(&g_rsx_perf[i], __ATOMIC_RELAXED);
++            d[i] = c - prev[i]; prev[i] = c;
++        }
++        const unsigned long long m = s_rsx_perf_methods, dr = rsx_perf_draws();
++        fprintf(stderr,
++            "[perf] t=%.0fs wall=%.0fms flips=%lld fifo-flips=%llu presents=%lld draws=%llu | walk n=%lld %.1fms"
++            " methods=%llu | flush n=%lld (present %lld, ref %lld, other %lld) %.1fms gpuwait %.1fms"
++            " | present %.1fms swap %.1fms | refpoll=%lld | usleep gcm n=%lld %.1fms other %.1fms\n",
++            (double)(now.QuadPart - t0.QuadPart) * tk / 1000.0, wall,
++            d[RSX_PERF_FLIPS], rsx_perf_fifo_flips() - prev_ff, d[RSX_PERF_PRESENT_N], dr - prev_draws,
++            d[RSX_PERF_WALK_N], d[RSX_PERF_WALK_T] * tk, m - prev_methods,
++            d[RSX_PERF_FLUSH_N], d[RSX_PERF_FLUSH_PRESENT_N], d[RSX_PERF_FLUSH_REF_N],
++            d[RSX_PERF_FLUSH_OTHER_N], d[RSX_PERF_FLUSH_T] * tk, d[RSX_PERF_GPUWAIT_T] * tk,
++            d[RSX_PERF_PRESENT_T] * tk, d[RSX_PERF_SWAP_T] * tk, d[RSX_PERF_REFPOLL],
++            d[RSX_PERF_USLEEP_GCM_N], d[RSX_PERF_USLEEP_GCM_T] * tk, d[RSX_PERF_USLEEP_OTHER_T] * tk);
++        prev_methods = m; prev_draws = dr; prev_ff = rsx_perf_fifo_flips();
++        {   /* top 4 usleep sites of the cellGcmInit thread, real ms */
++            char sl[256]; int so = snprintf(sl, sizeof sl, "[perf-wait] gcm usleep by lr:");
++            for (int k = 0; k < 4; k++) {
++                int b = -1;
++                for (int i = 0; i < RSX_PERF_SITES; i++)
++                    if (s_perf_site_lr[i] && s_perf_site_t[i] > 0 && (b < 0 || s_perf_site_t[i] > s_perf_site_t[b])) b = i;
++                if (b < 0) break;
++                so += snprintf(sl + so, sizeof sl - so, " 0x%X=%.0fms/%lld", s_perf_site_lr[b],
++                               s_perf_site_t[b] * tk, s_perf_site_n[b]);
++                s_perf_site_t[b] = -s_perf_site_t[b];          /* mark printed */
++            }
++            for (int i = 0; i < RSX_PERF_SITES; i++) { s_perf_site_t[i] = 0; s_perf_site_n[i] = 0; }
++            fprintf(stderr, "%s\n", sl);
++        }
++
++        /* Host threads: CPU ms in the last period, top TOP. */
++        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++        if (snap == INVALID_HANDLE_VALUE) continue;
++        THREADENTRY32 te; te.dwSize = sizeof te;
++        const DWORD pid = GetCurrentProcessId();
++        double top_ms[TOP] = {0}; char top_lab[TOP][48]; DWORD top_tid[TOP] = {0}; int ntop = 0, nthr = 0;
++        double total = 0;
++        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
++            if (te.th32OwnerProcessID != pid) continue;
++            HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
++            if (!h) continue;
++            FILETIME c, e, k, u;
++            if (!GetThreadTimes(h, &c, &e, &k, &u)) { CloseHandle(h); continue; }
++            const unsigned long long cpu =
++                (((unsigned long long)k.dwHighDateTime << 32) | k.dwLowDateTime) +
++                (((unsigned long long)u.dwHighDateTime << 32) | u.dwLowDateTime);
++            int slot = -1;
++            for (int i = 0; i < ntids; i++) if (tids[i] == te.th32ThreadID) { slot = i; break; }
++            if (slot < 0 && ntids < MAXT) { slot = ntids++; tids[slot] = te.th32ThreadID; cpu_prev[slot] = 0; }
++            double ms = 0;
++            if (slot >= 0) { ms = (double)(cpu - cpu_prev[slot]) / 10000.0; cpu_prev[slot] = cpu; }
++            nthr++; total += ms;
++            int pos = ntop;
++            while (pos > 0 && top_ms[pos - 1] < ms) pos--;
++            if (pos < TOP) {
++                for (int i = (ntop < TOP ? ntop : TOP - 1); i > pos; i--) {
++                    top_ms[i] = top_ms[i - 1]; memcpy(top_lab[i], top_lab[i - 1], sizeof top_lab[i]);
++                    top_tid[i] = top_tid[i - 1];
++                }
++                top_ms[pos] = ms; top_tid[pos] = te.th32ThreadID;
++                rsx_perf_label(h, te.th32ThreadID, top_lab[pos], sizeof top_lab[pos]);
++                if (ntop < TOP) ntop++;
++            }
++            CloseHandle(h);
++        }
++        CloseHandle(snap);
++        if (sampling) {   /* next second's sample set: threads >= 300 ms, not rsx/self */
++            int hot[TOP], nh = 0;
++            for (int i = 0; i < ntop && nh < PS_HOT; i++)
++                if (top_ms[i] >= 300 && top_tid[i] != s_perf_rsx_tid && top_tid[i] != GetCurrentThreadId())
++                    hot[nh++] = i;
++            for (int j = 0; j < PS_HOT; j++) {   /* drop slots that went cold (keep their counts) */
++                int keep = 0;
++                for (int q = 0; q < nh; q++) if (top_tid[hot[q]] == s_ps_tid[j]) keep = 1;
++                if (!keep && s_ps_h[j]) { CloseHandle(s_ps_h[j]); s_ps_h[j] = NULL; s_ps_tid[j] = 0; }
++            }
++            for (int q = 0; q < nh; q++) {
++                int have = 0, freej = -1;
++                for (int j = 0; j < PS_HOT; j++) {
++                    if (s_ps_tid[j] == top_tid[hot[q]]) have = 1;
++                    if (!s_ps_tid[j] && !s_ps_total[j] && freej < 0) freej = j;
++                }
++                if (have || freej < 0) continue;
++                s_ps_tid[freej] = top_tid[hot[q]];
++                s_ps_h[freej] = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
++                                           THREAD_QUERY_INFORMATION, FALSE, top_tid[hot[q]]);
++                memcpy(s_ps_lab[freej], top_lab[hot[q]], sizeof s_ps_lab[freej]);
++            }
++        }
++        char line[1024]; int off = snprintf(line, sizeof line, "[perf-thr] cpu=%.0fms threads=%d:", total, nthr);
++        for (int i = 0; i < ntop && off < (int)sizeof line - 64; i++)
++            off += snprintf(line + off, sizeof line - off, " %s=%.0f", top_lab[i], top_ms[i]);
++        fprintf(stderr, "%s\n", line);
++    }
++    return 0;
++}
++#endif
++
+ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
+ 
+ /* RSX_WALKER_PROF=<file>: an in-process sampling profile of the FIFO walker
+@@ -2083,15 +2359,33 @@ void cellGcm_rsx_process_fifo(void)
+ {
+     wprof_note_walker();
+     g_gcm_drain_tid = GetCurrentThreadId();
+-    const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
++    if (!rsx_perf_enabled()) {
++        /* PS3_FTRACE drain spans: on this (default) path only; the RSX_PERF path keeps its own timing. */
++        const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
++        AcquireSRWLockExclusive(&s_gcm_fifo_lock);
++        gcm_rsx_process_fifo_unlocked();
++        ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
++        if (ft_t0) {
++            const uint64_t t1 = ps3_ft_now();
++            if (t1 - ft_t0 >= ps3_ft_min_ns())
++                ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
++        }
++        return;
++    }
++#ifdef _WIN32
++    if (!s_perf_rsx_tid) {
++        s_perf_rsx_tid = GetCurrentThreadId();
++        CloseHandle(CreateThread(NULL, 0, rsx_perf_thread, NULL, 0, NULL));
++        fprintf(stderr, "[perf] RSX_PERF=1: per-second host timing on (walker tid %lu)\n",
++                (unsigned long)s_perf_rsx_tid);
++    }
++#endif
++    const long long t0 = rsx_perf_now();
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+     gcm_rsx_process_fifo_unlocked();
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+-    if (ft_t0) {
+-        const uint64_t t1 = ps3_ft_now();
+-        if (t1 - ft_t0 >= ps3_ft_min_ns())
+-            ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
+-    }
++    rsx_perf_add(RSX_PERF_WALK_T, rsx_perf_now() - t0);
++    rsx_perf_add(RSX_PERF_WALK_N, 1);
+ }
+ 
+ /* The methods rsx_process_method acts on beyond its own rsx_state: the notify
+@@ -2857,7 +3151,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                  * canonicalises with & 0x1FFC itself. */
+                 if (wdiag) { static int live = -1;
+                   if (live < 0) live = rsx_live_draw_enabled();
+-                  if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
++                  if (live) { rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); s_rsx_perf_methods++; } }
+                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
+                  * (subchannel, method) pairs dispatched since the last report --
+                  * what a frame is actually made of when nothing draws. */
+@@ -3282,6 +3576,7 @@ u32 cellGcm_display_buffer_count(void)
+ 
+ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+ {
++    rsx_perf_add(RSX_PERF_FLIPS, 1);
+     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
+      * which answers "did it ever flip?" and not "is it still flipping, and how
+      * fast?" -- the question that matters when a title stops appearing on
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 31055c4b..0db55e6f 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -37,6 +37,8 @@ void rsx_live_draw_set_display_buffer(
+     u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
+ { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
+ void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
++unsigned long long rsx_perf_draws(void) { return 0; }
++unsigned long long rsx_perf_fifo_flips(void) { return 0; }
+ void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
+ void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
+ { (void)d; (void)o; (void)v; }
+@@ -2030,7 +2032,7 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
+ /* ---------------------------------------------------------------------------
+  * command list submit/wait (simple synchronous model, like the harness)
+  * -----------------------------------------------------------------------*/
+-static void ld_flush(ld_flush_reason reason)
++static void ld_flush_body(ld_flush_reason reason)
+ {
+ #if defined(YZ_PERF_PROFILE)
+     const LONGLONG flush_begin = ld_profile_qpc();
+@@ -2077,7 +2079,9 @@ static void ld_flush(ld_flush_reason reason)
+             g.ready = 0;
+             return;
+         }
+-        WaitForSingleObject(g.fence_event, INFINITE);
++        { const long long w0 = rsx_perf_now();
++          WaitForSingleObject(g.fence_event, INFINITE);
++          rsx_perf_add(RSX_PERF_GPUWAIT_T, rsx_perf_now() - w0); }
+ #if defined(YZ_PERF_PROFILE)
+         const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
+         g_ld_profile.total.fence_wait_qpc += wait_ticks;
+@@ -2102,6 +2106,19 @@ static void ld_flush(ld_flush_reason reason)
+ #endif
+ }
+ 
++/* RSX_PERF (patch 2007): time every submit, split by reason. */
++static void ld_flush(ld_flush_reason reason)
++{
++    if (!rsx_perf_enabled()) { ld_flush_body(reason); return; }
++    const long long t0 = rsx_perf_now();
++    ld_flush_body(reason);
++    rsx_perf_add(RSX_PERF_FLUSH_T, rsx_perf_now() - t0);
++    rsx_perf_add(RSX_PERF_FLUSH_N, 1);
++    rsx_perf_add(reason == LD_FLUSH_PRESENT ? RSX_PERF_FLUSH_PRESENT_N
++                 : reason == LD_FLUSH_GUEST_REFERENCE ? RSX_PERF_FLUSH_REF_N
++                 : RSX_PERF_FLUSH_OTHER_N, 1);
++}
++
+ /* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
+  * has finished all queued draws (mirrors RPCS3 nv406e::set_reference's sync(),
+  * RSXThread.cpp), so the game's REF poll advances only after the GPU has really
+@@ -9622,7 +9639,7 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
+     fflush(stderr);
+ }
+ 
+-void rsx_live_draw_present(u32 buffer_id)
++static void ld_present_body(u32 buffer_id)
+ {
+     if (!g.ready) return;
+ 
+@@ -9849,7 +9866,17 @@ void rsx_live_draw_present(u32 buffer_id)
+ 
+     ld_flush(LD_FLUSH_PRESENT);
+     {
+-        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
++        /* LD_PRESENT_INTERVAL (patch 2007, diagnostic): swap-chain sync
++         * interval, default 1 (vsync). 0 shows how much of the present
++         * fence wait is pacing rather than GPU work. */
++        static int s_interval = -1;
++        if (s_interval < 0) {
++            const char* e = getenv("LD_PRESENT_INTERVAL");
++            s_interval = (e && *e >= '0' && *e <= '4') ? *e - '0' : 1;
++        }
++        const long long swap0 = rsx_perf_now();
++        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, (UINT)s_interval, 0);
++        rsx_perf_add(RSX_PERF_SWAP_T, rsx_perf_now() - swap0);
+         if (SUCCEEDED(present_hr))
+             ld_present_measure_record(g_ld_frames + 1u);
+         else {
+@@ -10712,6 +10739,18 @@ void rsx_live_draw_present(u32 buffer_id)
+      * clear/demote a tracked zeta (sink_clear does that above). */
+ }
+ 
++/* RSX_PERF (patch 2007): whole present (flush + GPU wait + swap) per frame. */
++void rsx_live_draw_present(u32 buffer_id)
++{
++    if (!rsx_perf_enabled()) { ld_present_body(buffer_id); return; }
++    const long long t0 = rsx_perf_now();
++    ld_present_body(buffer_id);
++    rsx_perf_add(RSX_PERF_PRESENT_T, rsx_perf_now() - t0);
++    rsx_perf_add(RSX_PERF_PRESENT_N, 1);
++}
++unsigned long long rsx_perf_draws(void) { return g_ld_stats.groups_executed; }
++unsigned long long rsx_perf_fifo_flips(void) { return g_ld_flip_consumed; }
++
+ void rsx_live_draw_shutdown(void)
+ {
+     if (!g.ready) return;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 1c3fd72a..6837865d 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -156,6 +156,26 @@ int  rsx_live_draw_debug_dump_surface(u32 location, u32 offset,
+ /* Release all D3D12 resources. */
+ void rsx_live_draw_shutdown(void);
+ 
++/* RSX_PERF=1 (KZ3 patch 2007, diagnostic, off by default): host-side frame-time
++ * accounting. Counters are QPC ticks or counts, summed over all threads; a
++ * reporter thread (started by the first FIFO walk) prints one "[perf]" line
++ * per second with the FIFO walker, D3D12 flush / GPU-wait / present / swap
++ * times, and one "[perf-thr]" line with the busiest host threads' CPU use. */
++enum {
++    RSX_PERF_WALK_N = 0, RSX_PERF_WALK_T, RSX_PERF_FLIPS, RSX_PERF_REFPOLL,
++    RSX_PERF_FLUSH_N, RSX_PERF_FLUSH_T, RSX_PERF_GPUWAIT_T,
++    RSX_PERF_FLUSH_PRESENT_N, RSX_PERF_FLUSH_REF_N, RSX_PERF_FLUSH_OTHER_N,
++    RSX_PERF_PRESENT_N, RSX_PERF_PRESENT_T, RSX_PERF_SWAP_T,
++    RSX_PERF_USLEEP_GCM_N, RSX_PERF_USLEEP_GCM_T, RSX_PERF_USLEEP_OTHER_T,
++    RSX_PERF_COUNT
++};
++int       rsx_perf_enabled(void);
++long long rsx_perf_now(void);                  /* QPC ticks */
++void      rsx_perf_add(int idx, long long v);  /* no-op unless RSX_PERF=1 */
++int       rsx_perf_on_gcm_thread(void);        /* caller is the cellGcmInit thread */
++unsigned long long rsx_perf_draws(void);       /* live-draw groups executed so far */
++unsigned long long rsx_perf_fifo_flips(void);  /* flips consumed from the FIFO (sink_flip) */
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
+index 41d5721c..acbc2d5d 100644
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -403,6 +403,22 @@ int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
+     return 1;
+ }
+ 
++/* RSX_PERF (patch 2007): guest name of the PPU thread running on host thread
++ * `os_tid`, NULL if it is not a registered PPU thread. */
++const char* ppu_thread_name_for_os_tid(unsigned long os_tid)
++{
++#ifdef _WIN32
++    for (int i = 0; i < PPU_THREAD_MAX; i++) {
++        ppu_thread_info* t = &g_ppu_threads[i];
++        if (t->state == PPU_THREAD_STATE_FREE || !t->host_thread) continue;
++        if (GetThreadId(t->host_thread) == (DWORD)os_tid) return t->name;
++    }
++#else
++    (void)os_tid;
++#endif
++    return NULL;
++}
++
+ /* Called from the lv2/HLE dispatchers with the guest ctx (== &info->ctx). */
+ void ppu_prof_stamp(void* vctx, unsigned lr)
+ {
+diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
+index 889e8444..e042fa84 100644
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -134,10 +134,20 @@ static void write_be64(uint32_t addr, uint64_t val)
+  *
+  * r3 = microseconds
+  * -----------------------------------------------------------------------*/
++/* RSX_PERF (patch 2007): real time spent in usleep, split into the
++ * cellGcmInit (main render) thread and all others. Defined in cellGcmSys.c. */
++extern int       rsx_perf_enabled(void);
++extern long long rsx_perf_now(void);
++extern void      rsx_perf_add(int idx, long long v);
++extern int       rsx_perf_on_gcm_thread(void);
++extern void      rsx_perf_note_gcm_wait(unsigned lr, long long ticks);
++enum { SYS_TIMER_PERF_GCM_N = 13, SYS_TIMER_PERF_GCM_T = 14, SYS_TIMER_PERF_OTHER_T = 15 };  /* = RSX_PERF_USLEEP_* */
++
+ int64_t sys_timer_usleep(ppu_context* ctx)
+ {
+     uint64_t usec = LV2_ARG_U64(ctx, 0);
+     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
++    const long long perf_t0 = rsx_perf_enabled() ? rsx_perf_now() : 0;
+     { extern unsigned long long ps3_qpc_us(void);
+       static int n=0; if (PS3_LOG_FIRST(n, 60))
+         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
+@@ -284,6 +294,16 @@ int64_t sys_timer_usleep(ppu_context* ctx)
+     }
+ #endif
+ 
++    if (perf_t0) {
++        const long long dt = rsx_perf_now() - perf_t0;
++        if (rsx_perf_on_gcm_thread()) {
++            rsx_perf_add(SYS_TIMER_PERF_GCM_N, 1);
++            rsx_perf_add(SYS_TIMER_PERF_GCM_T, dt);
++            rsx_perf_note_gcm_wait((unsigned)ctx->lr, dt);
++        } else {
++            rsx_perf_add(SYS_TIMER_PERF_OTHER_T, dt);
++        }
++    }
+     return CELL_OK;
+ }
+ 

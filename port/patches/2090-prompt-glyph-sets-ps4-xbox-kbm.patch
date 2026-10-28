@@ -1,0 +1,438 @@
+KZ3 patch 2090 (stage 1, RSX pass 85): button prompt glyph sets for PS4/PS5, Xbox and keyboard/mouse.
+rsx_prompt_glyphs.h (new; nothing includes it yet, so the game is unchanged): draws the glyph sets into the
+pad-button cells of the game's two prompt atlases (2039's cell tables, HUD 1024x512 / menu 512x128 DXT5), in the
+style of the game's own PS3 cells and inside each cell's measured ink box: PS4/PS5 = OPTIONS on START and the
+touchpad (or SHARE, PG_OPT_PS4_SHARE) on SELECT; Xbox = A/B/X/Y coloured letters in the round body, LB/RB, LT/RT,
+LS/RS, View and Menu; keyboard/mouse = 2039's keycaps with the same shoulder body (PG_OPT_KBM_2039 = 2039's look).
+Shapes and letters only (text through 2039's text_mask source); no Sony or Microsoft artwork. API:
+rsx_pg_patch(src, w, h, bytes, kind, set, opts, &n) and rsx_pg_draw_cell(set, opts, input, menu, rgba, cw, ch).
+Host test tools/smoke/test_prompt_glyphs.sh; preview sheet tools/smoke/prompt_glyphs_preview.py.
+
+--- /dev/null
++++ b/libs/video/rsx_prompt_glyphs.h
+@@ -0,0 +1,425 @@
++/* KZ3 patch 2090 (RSX pass 85 stage 1): button prompt glyph sets for other pads.
++ *
++ * Patch 2039 (rsx_keycaps.h) redraws the pad-button cells of the game's two prompt atlases (HUD 1024x512 DXT5,
++ * ButtonIconCollection #416; menu 512x128 DXT5, ImageMap #104) as keycaps while the keyboard is in use. This header
++ * adds the other glyph sets of drawn the same way into the same cells, in the style of the game's own PS3 cells
++ * (round glossy face-button body, dark shoulder and trigger bodies with white letters, stick knob with a stem,
++ * icon-over-label SELECT/START cells):
++ *   PG_PS3   the original atlas (nothing changes),
++ *   PG_PS4   PS4/PS5: face, shoulder, trigger, stick and d-pad cells as PS3; START = OPTIONS; SELECT = the touchpad
++ *            (patch 4010 maps the touchpad click and Share/Create to SELECT; PG_OPT_PS4_SHARE draws SHARE instead),
++ *   PG_XBOX  A green / B red / X blue / Y yellow letters in the round body (positions: cross = A, circle = B,
++ *            square = X, triangle = Y), LB/RB in the shoulder body, LT/RT in the trigger body, LS/RS on the stick
++ *            press cells, View (SELECT) and Menu (START),
++ *   PG_KBM   keyboard/mouse keycaps (2039's key lookups, labels and pictures) drawn with the LB/RB shoulder body
++ *            in the game's ink box of each cell, so the four sets match; PG_OPT_KBM_2039 = 2039's own keycaps
++ *            (rsx_keycaps_patch: a brighter rim, the whole cell).
++ * Everything is drawn from shapes and letters (the text through the same text_mask source as 2039: the exe's
++ * Rajdhani Bold); no Sony or Microsoft artwork is copied. The d-pad and stick-move cells (L / R knobs) are left
++ * as the game draws them in every set.
++ *
++ * Stage 1 (pass 85): nothing includes this header yet, so the game is unchanged. Host test:
++ * tools/smoke/test_prompt_glyphs.sh; preview sheet of the real atlases: tools/smoke/prompt_glyphs_preview.py.
++ */
++#ifndef RSX_PROMPT_GLYPHS_H
++#define RSX_PROMPT_GLYPHS_H
++
++#include "rsx_keycaps.h"
++
++enum { PG_PS3 = 0, PG_PS4 = 1, PG_XBOX = 2, PG_KBM = 3, PG_N_SETS = 4 };
++#define PG_OPT_PS4_SHARE 1u   /* PS4/PS5 SELECT cell shows SHARE instead of the touchpad */
++#define PG_OPT_KBM_2039 2u    /* PG_KBM: 2039's keycaps as shipped (rsx_keycaps_patch) instead of the matched bodies */
++
++/* ---- where the game draws inside each cell ---------------------------------------------------------------------
++ * The game's buttons do not fill their cells (the space right and below holds a soft shadow or is empty). These
++ * boxes are the ink (alpha > 128) of each original cell, cell-relative, inclusive, measured on the 1.00 atlases in
++ * pass 85 (tools/smoke/prompt_glyphs_preview.py decodes them); the new glyphs are drawn into the same boxes. */
++typedef struct { const char* input; uint8_t l, t, r, b; } pg_box;
++static const pg_box pg_hud_boxes[] = {
++    { "square", 2, 1, 35, 34 }, { "cross", 2, 1, 35, 34 }, { "triangle", 2, 1, 35, 34 }, { "circle", 2, 1, 35, 34 },
++    { "l1", 3, 1, 45, 22 },     { "r1", 3, 1, 45, 22 },    { "l2", 4, 0, 46, 25 },       { "r2", 4, 0, 46, 25 },
++    { "l3", 6, 1, 34, 38 },     { "r3", 7, 1, 35, 38 },    { "up", 2, 1, 28, 35 },       { "down", 2, 1, 28, 35 },
++    { "left", 2, 2, 37, 28 },   { "right", 1, 2, 36, 28 }, { "select", 1, 0, 47, 28 },   { "start", 5, 0, 43, 28 },
++    { "ls", 8, 0, 33, 26 },     { "rs", 8, 0, 33, 26 },
++};
++static const pg_box pg_menu_boxes[] = {
++    { "cross", 2, 1, 25, 25 },  { "triangle", 2, 1, 25, 25 }, { "square", 2, 1, 25, 25 }, { "circle", 2, 1, 25, 25 },
++    { "left", 3, 5, 25, 22 },   { "right", 2, 5, 24, 22 },    { "up", 2, 2, 20, 25 },     { "down", 2, 2, 19, 25 },
++    { "l1", 2, 6, 30, 20 },     { "l2", 3, 5, 31, 22 },       { "l3", 3, 1, 23, 27 },     { "r1", 4, 6, 32, 20 },
++    { "r2", 4, 5, 32, 22 },     { "r3", 5, 1, 24, 27 },       { "ls", 1, 3, 31, 24 },     { "rs", 1, 3, 31, 24 },
++    { "select", 2, 2, 48, 23 }, { "start", 2, 1, 44, 23 },
++};
++/* The drawing box of a cell as pixel edges x0 y0 x1 y1 (x1/y1 exclusive); the whole cell when not in the table. */
++static void pg_cell_box(const char* in, int menu, int cw, int ch, float bx[4])
++{
++    const pg_box* t = menu ? pg_menu_boxes : pg_hud_boxes;
++    const unsigned n = menu ? sizeof pg_menu_boxes / sizeof pg_menu_boxes[0] : sizeof pg_hud_boxes / sizeof pg_hud_boxes[0];
++    bx[0] = 0.f; bx[1] = 0.f; bx[2] = (float)cw; bx[3] = (float)ch;
++    for (unsigned i = 0; i < n; i++)
++        if (!strcmp(t[i].input, in)) { bx[0] = t[i].l; bx[1] = t[i].t; bx[2] = t[i].r + 1.f; bx[3] = t[i].b + 1.f; return; }
++}
++
++/* ---- shading of the bodies (luminance values measured on the game's own cells, pass 85) ------------------- */
++
++static float pg_smooth(float e0, float e1, float x)
++{
++    float t = kc_clamp01((x - e0) / (e1 - e0));
++    return t * t * (3.f - 2.f * t);
++}
++
++/* Write an opaque grey body texel with coverage `cov` (0..1) over whatever the cell holds. */
++static void pg_put_grey(uint8_t* p, float lum, float cov)
++{
++    if (cov <= 0.f) return;
++    kc_over(p, lum, lum, lum, cov);
++}
++
++/* The round face-button body (PS3 Square/Cross/Triangle/Circle cells): a black rim, a glossy upper half (74 at the
++ * top -> 49 above the middle) and a dark lower half (16 -> 8), darker towards the sides. Centre (cx, cy), radius r. */
++static void pg_round_body(uint8_t* cell, int cw, int ch, float cx, float cy, float r)
++{
++    for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
++        const float px = x + 0.5f, py = y + 0.5f, dx = px - cx, dy = py - cy;
++        const float d = sqrtf(dx * dx + dy * dy) - r, cov = kc_clamp01(0.5f - d);
++        if (cov <= 0) continue;
++        const float u = dx / r, v = dy / r;
++        float lum = 16.f - 6.f * kc_clamp01(v) + 33.f * pg_smooth(0.22f, -0.18f, v) + 28.f * kc_clamp01(-v - 0.2f) / 0.8f;
++        lum *= 1.f - 0.45f * u * u;
++        const float rim = kc_clamp01(1.6f + d);              /* the outer 1.6 px go to black */
++        lum = lum * (1.f - rim) + 8.f * rim;
++        pg_put_grey(cell + ((size_t)y * cw + x) * 4, lum, cov);
++    }
++}
++
++/* The shoulder body (PS3 L1/R1 cells): a rounded box, a light 1 px rim (78 at the top, 70 at the bottom), the
++ * inside 16 at the sides rising to about 40 in the middle and a little darker towards the bottom. */
++static void pg_shoulder_body(uint8_t* cell, int cw, int ch, float cx, float cy, float hx, float hy, float rr)
++{
++    for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
++        const float px = x + 0.5f, py = y + 0.5f;
++        const float d = kc_rbox(px, py, cx, cy, hx, hy, rr), cov = kc_clamp01(0.5f - d);
++        if (cov <= 0) continue;
++        const float u = (px - cx) / hx, v = (py - cy) / hy;
++        float lum = 14.f + 26.f * (1.f - u * u) * (1.f - 0.4f * kc_clamp01(v));
++        const float rim = kc_clamp01(1.0f - fabsf(d + 1.0f));
++        lum = lum * (1.f - rim) + (78.f - 8.f * kc_clamp01(v * 0.5f + 0.5f)) * rim;
++        pg_put_grey(cell + ((size_t)y * cw + x) * 4, lum, cov);
++    }
++}
++
++/* Signed distance (approximate outside the axes) to an ellipse centred at (cx, cy), semi-axes a, b. */
++static float pg_ellipse(float x, float y, float cx, float cy, float a, float b)
++{
++    const float u = (x - cx) / a, v = (y - cy) / b, k = sqrtf(u * u + v * v);
++    return (k - 1.f) * (a < b ? a : b);
++}
++
++/* The trigger body (PS3 L2/R2 cells): straight top and sides, a bowl-shaped bottom. Measured on the HUD L2 cell
++ * (ink box 43 x 26): 4 px top corners, the bottom cut by an ellipse centred 0.135 of the box height below the top,
++ * semi-axes 0.63 of the box width and 0.92 of its height. Near black (12, lighter in the middle), a lighter rim. */
++static void pg_trigger_body(uint8_t* cell, int cw, int ch, const float bx[4])
++{
++    const float bw = bx[2] - bx[0], bh = bx[3] - bx[1], cx = (bx[0] + bx[2]) * 0.5f, hx = bw * 0.5f;
++    const float hy = bh * 0.5f + 2.f, cy = bx[1] + hy, rr = 4.f * bh / 26.f;
++    const float ea = 0.63f * bw, eb = 0.92f * bh, ecy = bx[1] + 0.135f * bh;
++    for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
++        const float px = x + 0.5f, py = y + 0.5f;
++        const float d1 = kc_rbox(px, py, cx, cy, hx, hy, rr), d2 = pg_ellipse(px, py, cx, ecy, ea, eb);
++        const float d = d1 > d2 ? d1 : d2, cov = kc_clamp01(0.5f - d);
++        if (cov <= 0) continue;
++        const float u = (px - cx) / hx;
++        float lum = 12.f + 18.f * (1.f - u * u) * (1.f - 0.5f * kc_clamp01((py - bx[1]) / bh));
++        const float rim = kc_clamp01(1.0f - fabsf(d + 1.0f));
++        lum = lum * (1.f - rim) + 52.f * rim;
++        pg_put_grey(cell + ((size_t)y * cw + x) * 4, lum, cov);
++    }
++}
++
++/* A small button body (the game's SELECT pill and START triangle: a bright top edge, 52 at the top falling to 8
++ * at the bottom). A rounded box centred at (cx, cy), half sizes hx, hy, corner radius rr. */
++static void pg_button_body(uint8_t* cell, int cw, int ch, float cx, float cy, float hx, float hy, float rr)
++{
++    for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
++        const float px = x + 0.5f, py = y + 0.5f;
++        const float d = kc_rbox(px, py, cx, cy, hx, hy, rr), cov = kc_clamp01(0.5f - d);
++        if (cov <= 0) continue;
++        const float t = kc_clamp01((py - (cy - hy)) / (2.f * hy));
++        float lum = 52.f - 44.f * t;
++        const float rim = kc_clamp01(1.1f - fabsf(d + 0.8f));
++        lum = lum * (1.f - rim) + (150.f - 90.f * t) * rim;
++        pg_put_grey(cell + ((size_t)y * cw + x) * 4, lum, cov);
++    }
++}
++
++/* ---- faces: letters and simple pictures ----------------------------------------------------------------------- */
++
++/* Composite an 8-bit mask (mw x mh) centred on its ink at (cx, cy) in colour c. outline > 0 first draws a dark
++ * ring of that many pixels around the ink (the HUD's SELECT / START labels have one). */
++static void pg_mask_at(uint8_t* cell, int cw, int ch, const unsigned char* mk, int mw, int mh, float cx, float cy,
++                       const float c[3], int outline)
++{
++    int x0 = mw, x1 = -1, y0 = mh, y1 = -1;
++    for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++)
++        if (mk[y * mw + x] > 24) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
++    if (x1 < x0) return;
++    const int ox = (int)floorf(cx - (x1 - x0 + 1) * 0.5f + 0.5f) - x0, oy = (int)floorf(cy - (y1 - y0 + 1) * 0.5f + 0.5f) - y0;
++    for (int pass = outline > 0 ? 0 : 1; pass < 2; pass++)
++        for (int ty = 0; ty < ch; ty++) for (int tx = 0; tx < cw; tx++) {
++            const int x = tx - ox, y = ty - oy;
++            float a = 0;
++            if (pass == 0) {
++                for (int dy = -outline; dy <= outline; dy++) for (int dx = -outline; dx <= outline; dx++) {
++                    const int sx = x + dx, sy = y + dy;
++                    if (sx >= 0 && sy >= 0 && sx < mw && sy < mh && mk[sy * mw + sx] / 255.f > a) a = mk[sy * mw + sx] / 255.f;
++                }
++                if (a > 0) kc_over(cell + ((size_t)ty * cw + tx) * 4, 10.f, 10.f, 10.f, a * 0.85f);
++            } else if (x >= 0 && y >= 0 && x < mw && y < mh && mk[y * mw + x]) {
++                kc_over(cell + ((size_t)ty * cw + tx) * 4, c[0], c[1], c[2], mk[y * mw + x] / 255.f);
++            }
++        }
++}
++
++/* Text through the source's rasteriser (2039: the exe's Rajdhani Bold), cap height at most cap_px, fitted into
++ * a box mw x mh, centred on its ink at (cx, cy). 0 when there is no rasteriser. */
++static int pg_text(uint8_t* cell, int cw, int ch, const char* t, int cap_px, int mw, int mh, float cx, float cy,
++                   const float c[3], int outline)
++{
++    if (!g_kc_have_src || !g_kc_src.text_mask || mw < 2 || mh < 2) return 0;
++    unsigned char* mk = (unsigned char*)calloc((size_t)mw * mh, 1);
++    if (!mk) return 0;
++    const int ok = g_kc_src.text_mask(t, cap_px, mk, mw, mh);
++    if (ok) pg_mask_at(cell, cw, ch, mk, mw, mh, cx, cy, c, outline);
++    free(mk);
++    return ok;
++}
++
++/* A shape's coverage at a pixel by 4x4 supersampling of an inside test. */
++typedef int (*pg_inside_fn)(float x, float y, const float* k);
++static void pg_fill(uint8_t* cell, int cw, int ch, pg_inside_fn in, const float* k, const float c[3])
++{
++    for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
++        int n = 0;
++        for (int sy = 0; sy < 4; sy++) for (int sx = 0; sx < 4; sx++) n += in(x + (sx + 0.5f) / 4, y + (sy + 0.5f) / 4, k);
++        if (n) kc_over(cell + ((size_t)y * cw + x) * 4, c[0], c[1], c[2], n / 16.f);
++    }
++}
++
++/* k = {cx, cy, half width, half height, stroke}: the outline of a box. */
++static int pg_in_box_outline(float x, float y, const float* k)
++{
++    const float ax = fabsf(x - k[0]), ay = fabsf(y - k[1]);
++    return ax <= k[2] && ay <= k[3] && (ax >= k[2] - k[4] || ay >= k[3] - k[4]);
++}
++/* k = {cx, cy, half width, half height}: a filled box. */
++static int pg_in_box(float x, float y, const float* k) { return fabsf(x - k[0]) <= k[2] && fabsf(y - k[1]) <= k[3]; }
++/* k = {cx, top y, half width, height}: a triangle pointing down (apex at the bottom). */
++static int pg_in_tri_down(float x, float y, const float* k)
++{
++    const float t = (y - k[1]) / k[3];
++    return t >= 0.f && t <= 1.f && fabsf(x - k[0]) <= k[2] * (1.f - t);
++}
++
++static const float pg_white[3] = { 255.f, 255.f, 255.f };
++static const float pg_face_white[3] = { 236.f, 236.f, 236.f };
++
++/* Xbox letter colours (ASSUMPTION: chosen at the saturation of the game's own PS3 symbols, which are pastel:
++ * cross 164,170,213 / circle 255,129,139 / triangle 16,178,156 / square 222,157,205). */
++static const float pg_xb_a[3] = { 110.f, 204.f, 84.f }, pg_xb_b[3] = { 246.f, 96.f, 90.f },
++                   pg_xb_x[3] = { 84.f, 152.f, 244.f }, pg_xb_y[3] = { 246.f, 206.f, 70.f };
++
++/* An icon-over-label cell (the PS3 SELECT / START style): the icon in the upper part of the box, the label below.
++ * Rows measured on the game's cells: HUD SELECT icon 0-15 / label 16-28 of a 29-row box; menu icon 2-12 / label
++ * 15-24 of rows 2-23. */
++typedef enum { PG_ICON_PILL, PG_ICON_TOUCHPAD, PG_ICON_VIEW, PG_ICON_MENU } pg_icon;
++
++static void pg_icon_label(uint8_t* cell, int cw, int ch, const float bx[4], pg_icon icon, const char* label, int menu)
++{
++    const float bh = bx[3] - bx[1], bw = bx[2] - bx[0], cx = (bx[0] + bx[2]) * 0.5f;
++    const float ih = bh * (menu ? 0.50f : 0.55f), iy = bx[1] + ih * 0.5f;
++    switch (icon) {
++    case PG_ICON_PILL:      /* OPTIONS / SHARE: a small upright capsule */
++        pg_button_body(cell, cw, ch, cx, iy, ih * 0.26f, ih * 0.46f, ih * 0.26f);
++        break;
++    case PG_ICON_TOUCHPAD:  /* the touchpad: a wide flat rounded box (the game's SELECT pill, wider) */
++        pg_button_body(cell, cw, ch, cx, iy, bw * 0.36f, ih * 0.44f, ih * 0.24f);
++        break;
++    case PG_ICON_VIEW: {    /* View: a round button with two overlapping box outlines */
++        const float r = ih * 0.5f - 0.3f, s = r * 0.40f, st = r > 7.f ? 1.2f : 1.0f;
++        pg_round_body(cell, cw, ch, cx, iy, r);
++        const float k1[5] = { cx - s * 0.40f, iy - s * 0.40f, s, s * 0.78f, st }, k2[5] = { cx + s * 0.40f, iy + s * 0.40f, s, s * 0.78f, st };
++        pg_fill(cell, cw, ch, pg_in_box_outline, k1, pg_face_white);
++        const float kb[4] = { k2[0], k2[1], s - st, s * 0.78f - st };     /* the front box hides the back one */
++        const float dark[3] = { 34.f, 34.f, 34.f };
++        pg_fill(cell, cw, ch, pg_in_box, kb, dark);
++        pg_fill(cell, cw, ch, pg_in_box_outline, k2, pg_face_white);
++        break; }
++    case PG_ICON_MENU: {    /* Menu: a round button with three lines */
++        const float r = ih * 0.5f - 0.3f, hw = r * 0.48f, st = r > 7.f ? 0.8f : 0.6f, gap = r * 0.32f;
++        pg_round_body(cell, cw, ch, cx, iy, r);
++        for (int i = -1; i <= 1; i++) {
++            const float k[4] = { cx, iy + i * gap, hw, st };
++            pg_fill(cell, cw, ch, pg_in_box, k, pg_face_white);
++        }
++        break; }
++    }
++    /* the label: grey with a dark outline on the HUD, lighter grey without on the menu (as the game's labels) */
++    const float g = menu ? 200.f : 156.f, lc[3] = { g, g, g };
++    const float ly0 = bx[1] + ih + (menu ? bh * 0.08f : 0.f), lh = bx[3] - ly0;
++    pg_text(cell, cw, ch, label, (int)(lh * (menu ? 0.80f : 0.72f)), (int)bw, (int)lh + 2, cx, ly0 + lh * 0.5f, lc, menu ? 0 : 1);
++}
++
++/* The stick-press cell (PS3 L3/R3): a stem with a down arrow above a round knob and a short stem below, the label
++ * in the knob. Measured on the HUD L3 cell (ink box 29 x 38): stems 0.38 of the box width, the upper one the top
++ * 0.26 of the box, the knob as wide as the box, centred 0.53 down. */
++static void pg_stick_press(uint8_t* cell, int cw, int ch, const float bx[4], const char* label)
++{
++    const float bw = bx[2] - bx[0], bh = bx[3] - bx[1], cx = (bx[0] + bx[2]) * 0.5f, sw = bw * 0.19f;
++    const float kr = bw * 0.5f < bh * 0.33f ? bw * 0.5f : bh * 0.33f, ky = bx[1] + bh * 0.53f;
++    pg_shoulder_body(cell, cw, ch, cx, bx[1] + bh * 0.13f, sw, bh * 0.13f, 1.5f);               /* stem above */
++    pg_shoulder_body(cell, cw, ch, cx, bx[1] + bh * 0.90f, sw * 0.9f, bh * 0.10f, 1.5f);        /* stem below */
++    pg_round_body(cell, cw, ch, cx, ky, kr);
++    const float k[4] = { cx, bx[1] + bh * 0.03f, sw * 0.85f, bh * 0.17f };
++    pg_fill(cell, cw, ch, pg_in_tri_down, k, pg_face_white);
++    pg_text(cell, cw, ch, label, (int)(kr * 0.72f), (int)(kr * 1.6f), (int)(kr * 1.4f), cx, ky + 0.5f, pg_white, 0);
++}
++
++/* ---- keyboard/mouse with the same bodies (option; 2039's own keycaps are the PG_OPT_KBM_2039 look) -------------- */
++
++/* A keycap in the cell's box: the shoulder body of LB/RB, the face from 2039 (kc_picture or the key's text). */
++static void pg_kbm_cap(uint8_t* cell, int cw, int ch, const float bx[4], const char* text, int vk)
++{
++    const float bw = bx[2] - bx[0], bh = bx[3] - bx[1], cx = (bx[0] + bx[2]) * 0.5f, cy = (bx[1] + bx[3]) * 0.5f;
++    const float hx = bw * 0.5f, hy = bh * 0.5f;
++    pg_shoulder_body(cell, cw, ch, cx, cy, hx, hy, (hx < hy ? hx : hy) * 0.40f);
++    const int iw = (int)bw - 4 > 4 ? (int)bw - 4 : 4, ih = (int)bh - 4 > 4 ? (int)bh - 4 : 4;
++    unsigned char* mk = (unsigned char*)calloc((size_t)iw * ih, 1);
++    if (!mk) return;
++    int ok = kc_picture(vk, mk, iw, ih);
++    if (!ok && text && text[0]) {
++        const size_t len = strlen(text);
++        const int cap = (int)(ih * (len <= 1 ? 0.62f : len <= 3 ? 0.52f : 0.50f) + 0.5f);
++        ok = g_kc_have_src && g_kc_src.text_mask && g_kc_src.text_mask(text, cap, mk, iw, ih);
++    }
++    if (ok) pg_mask_at(cell, cw, ch, mk, iw, ih, cx, cy, pg_white, 0);
++    free(mk);
++}
++
++/* ---- the sets ----------------------------------------------------------------------------------------------- */
++
++static int pg_is(const char* a, const char* b) { return !strcmp(a, b); }
++
++/* Draw the cell `input` (2039's cell names: "cross", "l1", "select", ...) of set `set` into the RGBA cell
++ * (cw x ch, cleared here). 1 = drawn, 0 = the set keeps the game's own cell. PG_KBM here = the matched keycaps
++ * (needs the 2039 key source); PG_OPT_KBM_2039 is handled by rsx_pg_patch. */
++static int rsx_pg_draw_cell(int set, unsigned opts, const char* in, int menu, uint8_t* cell, int cw, int ch)
++{
++    float bx[4];
++    pg_cell_box(in, menu, cw, ch, bx);
++    if (set == PG_KBM) {
++        if (!g_kc_have_src) return 0;
++        char lab[24]; int vk;
++        const int stick = pg_is(in, "ls") || pg_is(in, "rs");
++        if (stick) vk = kc_stick_label(in, lab, sizeof lab);
++        else { vk = kc_cell_key(in, menu); lab[0] = 0; if (vk) kc_label(vk, lab, sizeof lab); }
++        if (!vk) return 0;
++        memset(cell, 0, (size_t)cw * ch * 4);
++        pg_kbm_cap(cell, cw, ch, bx, lab, stick ? 0 : vk);
++        return 1;
++    }
++    if (set == PG_PS4) {
++        if (!pg_is(in, "select") && !pg_is(in, "start")) return 0;
++        memset(cell, 0, (size_t)cw * ch * 4);
++        if (pg_is(in, "start")) pg_icon_label(cell, cw, ch, bx, PG_ICON_PILL, "OPTIONS", menu);
++        else if (opts & PG_OPT_PS4_SHARE) pg_icon_label(cell, cw, ch, bx, PG_ICON_PILL, "SHARE", menu);
++        else pg_icon_label(cell, cw, ch, bx, PG_ICON_TOUCHPAD, "TOUCHPAD", menu);
++        return 1;
++    }
++    if (set != PG_XBOX) return 0;
++    const float bw = bx[2] - bx[0], bh = bx[3] - bx[1], cx = (bx[0] + bx[2]) * 0.5f, cy = (bx[1] + bx[3]) * 0.5f;
++    static const struct { const char* in; const char* t; const float* c; } face[] = {
++        { "cross", "A", pg_xb_a }, { "circle", "B", pg_xb_b }, { "square", "X", pg_xb_x }, { "triangle", "Y", pg_xb_y },
++    };
++    for (unsigned i = 0; i < sizeof face / sizeof face[0]; i++)
++        if (pg_is(in, face[i].in)) {
++            memset(cell, 0, (size_t)cw * ch * 4);
++            const float r = (bw < bh ? bw : bh) * 0.5f;
++            pg_round_body(cell, cw, ch, cx, cy, r);
++            pg_text(cell, cw, ch, face[i].t, (int)(r * 0.95f + 0.5f), (int)(r * 1.6f), (int)(r * 1.6f), cx, cy, face[i].c, 0);
++            return 1;
++        }
++    if (pg_is(in, "l1") || pg_is(in, "r1")) {
++        memset(cell, 0, (size_t)cw * ch * 4);
++        const float hx = bw * 0.5f, hy = bh * 0.5f;
++        pg_shoulder_body(cell, cw, ch, cx, cy, hx, hy, (hx < hy ? hx : hy) * 0.45f);
++        pg_text(cell, cw, ch, in[0] == 'l' ? "LB" : "RB", (int)(bh * 0.55f), (int)bw - 6, (int)bh - 2, cx, cy, pg_white, 0);
++        return 1;
++    }
++    if (pg_is(in, "l2") || pg_is(in, "r2")) {
++        memset(cell, 0, (size_t)cw * ch * 4);
++        pg_trigger_body(cell, cw, ch, bx);
++        pg_text(cell, cw, ch, in[0] == 'l' ? "LT" : "RT", (int)(bh * 0.50f), (int)bw - 10, (int)bh - 4, cx, bx[1] + bh * 0.46f, pg_white, 0);
++        return 1;
++    }
++    if (pg_is(in, "l3") || pg_is(in, "r3")) {
++        memset(cell, 0, (size_t)cw * ch * 4);
++        pg_stick_press(cell, cw, ch, bx, in[0] == 'l' ? "LS" : "RS");
++        return 1;
++    }
++    if (pg_is(in, "select") || pg_is(in, "start")) {
++        memset(cell, 0, (size_t)cw * ch * 4);
++        if (pg_is(in, "start")) pg_icon_label(cell, cw, ch, bx, PG_ICON_MENU, "MENU", menu);
++        else pg_icon_label(cell, cw, ch, bx, PG_ICON_VIEW, "VIEW", menu);
++        return 1;
++    }
++    return 0;
++}
++
++/* Write an RGBA cell into the BC3 atlas `out` (w wide): the blocks under the cell are decoded, the cell's texels
++ * replaced and the blocks re-encoded (2039's encoder), so texels outside the cell keep their colours up to BC3
++ * precision and blocks outside the cell are untouched. */
++static void pg_put_cell(uint8_t* out, uint32_t w, uint32_t h, const kc_cell* k, const uint8_t* cap)
++{
++    const int cw = k->r - k->l + 1;
++    const uint32_t bw = w / 4;
++    for (uint32_t by = k->t / 4; by <= (uint32_t)k->b / 4 && by < h / 4; by++)
++        for (uint32_t bx = k->l / 4; bx <= (uint32_t)k->r / 4 && bx < bw; bx++) {
++            uint8_t* blk = out + ((size_t)by * bw + bx) * 16;
++            uint8_t px[16][4];
++            kc_bc3_decode(blk, px);
++            for (int i = 0; i < 16; i++) {
++                const int x = (int)bx * 4 + (i & 3), y = (int)by * 4 + (i >> 2);
++                if (x < k->l || x > k->r || y < k->t || y > k->b) continue;
++                memcpy(px[i], cap + ((size_t)(y - k->t) * cw + (x - k->l)) * 4, 4);
++            }
++            kc_bc3_encode(px, blk);
++        }
++}
++
++/* A copy of the atlas (malloc'd, `bytes` long) with set `set` drawn into its cells, or NULL when the set keeps the
++ * original (PG_PS3, or no cell changed). PG_KBM with PG_OPT_KBM_2039 is 2039's rsx_keycaps_patch (NULL unless the
++ * source says the keyboard is active); without it the keycaps use the bodies of the other sets. */
++static uint8_t* rsx_pg_patch(const uint8_t* src, uint32_t w, uint32_t h, uint32_t bytes, int kind, int set, unsigned opts,
++                             int* n_cells)
++{
++    *n_cells = 0;
++    if (kind == KC_NONE || set <= PG_PS3 || set >= PG_N_SETS) return NULL;
++    if (set == PG_KBM && (opts & PG_OPT_KBM_2039)) return rsx_keycaps_patch(src, w, h, bytes, kind, n_cells);
++    if (bytes < w * h) return NULL;
++    const kc_cell* cells = kind == KC_HUD ? kc_hud_cells : kc_menu_cells;
++    const unsigned nc = kind == KC_HUD ? sizeof kc_hud_cells / sizeof kc_hud_cells[0] : sizeof kc_menu_cells / sizeof kc_menu_cells[0];
++    uint8_t* out = (uint8_t*)malloc(bytes);
++    if (!out) return NULL;
++    memcpy(out, src, bytes);
++    for (unsigned c = 0; c < nc; c++) {
++        const kc_cell* k = &cells[c];
++        const int cw = k->r - k->l + 1, ch = k->b - k->t + 1;
++        uint8_t* cap = (uint8_t*)malloc((size_t)cw * ch * 4);
++        if (!cap) continue;
++        if (rsx_pg_draw_cell(set, opts, k->input, kind == KC_MENU, cap, cw, ch)) { pg_put_cell(out, w, h, k, cap); (*n_cells)++; }
++        free(cap);
++    }
++    if (!*n_cells) { free(out); return NULL; }
++    return out;
++}
++
++#endif

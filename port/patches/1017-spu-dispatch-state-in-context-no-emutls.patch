@@ -1,0 +1,192 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): rebased onto PR290 per-context slot list, ctx mfc_cache fast path kept, cleared in spu_mfc_release.
+
+Rebased on ps3recomp v0.17.0 (SPU pass 95): #381's SPU_PCSAMPLE thread kept; its starter moved into mfc_for_slow so the cached fast path is unchanged.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream's drain refactor kept (`spu_task_launch_check_inline`, `spu_drain_hop_inline`, SPU_DIRECT init) with the history ring per context (no TLS); mfc_for = 1017's ctx cache in front of upstream's (opt-in TLS) lookup; stack-reset check = upstream's (same idea).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index bf047d47..73605eb7 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -453,7 +453,20 @@ static void spu_mfc_cache_invalidate(void)
+         atomic_store_explicit(&s_mfc_cache_generation, generation + 1, memory_order_release);
+ }
+ 
++/* KZ3 patch 1017: this runs on every MFC channel access, so the context caches its own engine in
++ * mfc_cache (no lock, no list walk; was thread-local, emulated TLS on MinGW). spu_mfc_release clears
++ * it before it frees the slot; a slot's ctx never changes while it is claimed. Upstream's opt-in
++ * SPU_MFC_LOOKUP_CACHE (thread-local) stays in the slow path. */
++static mfc_engine* mfc_for_slow(spu_context* ctx);
+ static mfc_engine* mfc_for(spu_context* ctx)
++{
++    if (ctx->mfc_cache) return (mfc_engine*)ctx->mfc_cache;
++    mfc_engine* e = mfc_for_slow(ctx);
++    ctx->mfc_cache = e;
++    return e;
++}
++
++static mfc_engine* mfc_for_slow(spu_context* ctx)
+ {
+     int cache_enabled = spu_mfc_cache_enabled();
+     if (cache_enabled) {
+@@ -508,6 +521,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
+ void spu_mfc_release(spu_context* ctx)
+ {
+     if (!ctx) return;
++    ctx->mfc_cache = NULL;   /* KZ3 patch 1013/1017 */
+     AcquireSRWLockExclusive(&s_mfc_claim_lock);
+     for (spu_mfc_slot** link = &s_mfc_slots; *link; link = &(*link)->next) {
+         if ((*link)->ctx != ctx) continue;
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index c5ccbec7..2db41f21 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -329,6 +329,18 @@ typedef struct spu_context {
+      * persistent workload-module image adopted at LS 0xA00, re-applied at
+      * dispatch after a call-bracket image restore. */
+     uint32_t host_depth;
++    /* KZ3 patch 1017: dispatch state that used to be thread-local. MinGW GCC has
++     * only emulated TLS (every access is a call to __emutls_get_address plus a
++     * table lookup), and these are touched several times per trampoline hop and
++     * per MFC channel access: 15-30 % of each SPU host thread's time in KZ3's
++     * movies. A context is pinned to one host thread, and a nested run on the same
++     * thread uses its own context, so per-context state means the same thing. */
++    void   (*tramp_fn)(struct spu_context*);  /* pending cross-function transfer */
++    uint32_t pch_ring[8];                     /* last trampoline-hop PCs */
++    unsigned pch_n;
++    uint32_t recent_pc[32];                   /* last drain steps ([pm-end]) */
++    unsigned recent_n;
++    void*    mfc_cache;                       /* this context's MFC engine */
+ 
+     /* Trampoline steps taken since this context started running. Only needed
+      * to tell a job's INITIAL entry at LS 0 from a later return to LS 0, which
+@@ -867,13 +879,15 @@ void spu_indirect_branch(spu_context* ctx);
+ 
+ /* Pending cross-function transfer target; NULL when none. Thread-local: each
+  * spu_context is pinned to one host thread for its lifetime. */
+-extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
++/* KZ3 patch 1017: a field of the context (was thread-local, see tramp_fn). Every
++ * user (runtime and lifted code) has its spu_context* in scope as `ctx`. */
++#define g_spu_trampoline_fn ((ctx)->tramp_fn)
+ 
+ /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
+  * report. The dispatcher records indirect branches; SPU_DRAIN records every
+  * trampoline hop, which is the one that actually precedes a bad branch. */
+-extern SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
+-extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
++#define g_spu_pch   ((ctx)->pch_ring)
++#define g_spu_pch_n ((ctx)->pch_n)
+ 
+ /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
+ void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 49bc2b94..7f07d49a 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -28,9 +28,7 @@ typedef struct spu_irq_frame {
+ } spu_irq_frame;
+ 
+ /* Pending cross-function transfer target for this host thread's SPU context. */
+-SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
+-SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
+-SPU_THREAD_LOCAL unsigned g_spu_pch_n;
++/* g_spu_trampoline_fn, g_spu_pch, g_spu_pch_n: context fields (KZ3 patch 1017). */
+ 
+ /* yz_lockstep_tick now has its real body in spu_lockstep.c (milestone 2). */
+ 
+@@ -58,16 +56,13 @@ void* volatile    g_pm_flow_ctx = 0;
+  * set the done bit on the pending records -- the faithful sync equivalent of
+  * the completion interrupt. Env SPU_JOBDRAIN (default off while validating). */
+ extern void spu_halt(spu_context*);
+-/* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
+- * ended where it should not have (spurs_policy.c, [pm-end]). */
+-/* One thread-local object: every Darwin TLV access is a call, and this runs
+- * on every drain transfer. */
+-typedef struct spu_recent_history { uint32_t pc[32]; uint32_t n; } spu_recent_history;
+-static _Thread_local spu_recent_history t_recent;
+-unsigned spu_recent_pcs(uint32_t* out, unsigned max)
++/* Last 32 drain steps of this SPU context (pc), for post-mortems of a run that
++ * ended where it should not have (spurs_policy.c, [pm-end]). KZ3 patch 1017: per
++ * context (was a thread-local ring, emulated TLS on MinGW). */
++unsigned spu_recent_pcs(const spu_context* ctx, uint32_t* out, unsigned max)
+ {
+-    unsigned n = t_recent.n < 32 ? t_recent.n : 32, k = n < max ? n : max;
+-    for (unsigned i = 0; i < k; i++) out[i] = t_recent.pc[(t_recent.n - k + i) & 31];
++    unsigned n = ctx->recent_n < 32 ? ctx->recent_n : 32, k = n < max ? n : max;
++    for (unsigned i = 0; i < k; i++) out[i] = ctx->recent_pc[(ctx->recent_n - k + i) & 31];
+     return k;
+ }
+ 
+@@ -93,10 +88,9 @@ static int spu_task_launch_diagnostics(void)
+ /* A drain may resolve the history TLS address once for its owning frame.
+  * Keep checkpoint order: stack reset can unwind before steps increment, and
+  * guest calls can change PM-flow, PC and steps before the next hop. */
+-SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
+-                                                  spu_recent_history* recent)
++SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn)
+ {
+-    recent->pc[recent->n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
++    ctx->recent_pc[ctx->recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;   /* KZ3 1017 */
+     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+     if (spu_stack_reset_needed(ctx))
+         spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+@@ -146,21 +140,21 @@ static void spu_job_ls0_note(const spu_context* ctx)
+ 
+ void spu_task_launch_check(spu_context* ctx, void* fn)
+ {
+-    spu_task_launch_check_inline(ctx, fn, &t_recent);
++    spu_task_launch_check_inline(ctx, fn);
+ }
+ 
+ SPU_DRAIN_INLINE void spu_drain_hop_inline(spu_context* ctx,
+-    void (*fn)(spu_context*), spu_recent_history* recent)
++    void (*fn)(spu_context*))
+ {
+     /* Read the live gate each hop. -1 still takes the original initialization
+      * path; a callee can enable lockstep before the next checkpoint. */
+     if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
+-    spu_task_launch_check_inline(ctx, (void*)fn, recent);
++    spu_task_launch_check_inline(ctx, (void*)fn);
+ }
+ 
+ void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*))
+ {
+-    spu_drain_hop_inline(ctx, fn, &t_recent);
++    spu_drain_hop_inline(ctx, fn);
+ }
+ 
+ static void spu_task_launch_slow(spu_context* ctx)
+@@ -555,7 +549,6 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+     f.prev = 0; f.depth = 0; f.image_id = 0;
+     /* Nested contexts/drains share this thread's cursor. Only its address is
+      * stable across guest calls and IRQ longjmps, never the stored contents. */
+-    spu_recent_history* const recent = &t_recent;
+     /* The pending-transfer slot is thread-local, and on Darwin every access
+      * to a thread-local is a call to the TLV resolver. The slot's address is
+      * fixed for the life of this host thread, and a drain never leaves its
+@@ -574,7 +567,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+             void (*fn)(spu_context*) = *tramp;
+             *tramp = 0;
+             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+-            spu_drain_hop_inline(ctx, fn, recent);
++            spu_drain_hop_inline(ctx, fn);
+             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
+                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 5fd0e88e..f94b15b0 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -304,8 +304,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+     /* A lane's run should only end through exitToKernel. Anything else strands
+      * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
+     if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
+-        extern unsigned spu_recent_pcs(uint32_t*, unsigned);
+-        uint32_t r[32]; unsigned n = spu_recent_pcs(r, 32);
++        extern unsigned spu_recent_pcs(const spu_context*, uint32_t*, unsigned);
++        uint32_t r[32]; unsigned n = spu_recent_pcs(ctx, r, 32);
+         static volatile long s_pe; if (__atomic_add_fetch(&s_pe, 1, __ATOMIC_RELAXED) <= 64) {
+             fprintf(stderr, "[pm-end] lane %u ctx=%p halted=%d status=0x%X pc=0x%05X lr=0x%05X r3=0x%08X depth=%u recent:",
+                     spu_num, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,

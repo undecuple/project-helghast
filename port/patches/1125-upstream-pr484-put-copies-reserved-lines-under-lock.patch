@@ -1,0 +1,81 @@
+KZ3 patch 1125 (SPU pass 106): upstream ps3recomp PR #484 by tekulvw (MIT, head 13a7676b), "spu: copy only the
+reserved lines of a PUT under the lock-line lock", ported onto KZ3's DMA patches 1026/1056/1065/1121.
+
+A plain PUT whose multi-line span touches a reserved line used to copy the whole span under the lock. Now the lines
+that are not reserved are copied first without the lock (as an unreserved span is), then the locked pass copies the
+reserved lines it skipped and notifies every reserved line; a line reserved after its unlocked copy is notified but
+not copied again (a peer may already have committed on top of it). Single-line spans and spans of 192+ lines keep the
+old whole-span locked copy. Adapted: KZ3's lock is patch 1056's stripe set (spu_ll_mask of the span, then
+spu_ll_lock_mask) instead of upstream's global spu_lockline_lock, so the locked pass holds the span's stripes only for
+the reserved lines' copies. No switch (no behaviour change for a PUT that touches no reserved line).
+Test: the PR's test_unaligned_wide_put_around_a_reserved_line in runtime/spu/tests/test_spu_lockline_peer.c
+(tools/spu/test_lockline.sh, t_lockline_peer).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (stripes); the test file upstream's (#484 merged).
+
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 3837abfa..d7f497da 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -709,15 +709,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+          * So a reserved line's copy and its notify run as ONE critical section
+          * under the lock-line lock -- the same contract the PPU store path and
+          * the PUTLLC commit keep, and the only way the copy cannot land inside
+-         * a peer's compare-and-commit window. Only the reserved lines need it:
+-         * in a multi-line span the others are copied first, without the lock,
+-         * exactly as an unreserved span is, and the locked pass then copies the
+-         * lines it skipped and notifies every reserved one. A line reserved
+-         * after its unlocked copy is notified there but NOT copied again: a
+-         * peer may already have reserved and committed it on top of our bytes,
+-         * and a second copy would write that commit back over. A wide PUT that
+-         * touches one queue line no longer holds every other SPU's atomics off
+-         * for the whole copy. Spans
++         * a peer's compare-and-commit window. Only the reserved lines need it
++         * (KZ3 patch 1125, upstream PR #484): in a multi-line span the others
++         * are copied first, without the lock, exactly as an unreserved span is,
++         * and the locked pass then copies the lines it skipped and notifies
++         * every reserved one. A line reserved after its unlocked copy is
++         * notified there but NOT copied again: a peer may already have reserved
++         * and committed it on top of our bytes, and a second copy would write
++         * that commit back over. A wide PUT that touches one queue line no
++         * longer holds the span's stripes for the whole copy. Spans
+          * that touch no reserved line keep the lock-free copy: bulk asset PUTs
+          * are large and hot, and the scan is a bitmap bit per 128 bytes against
+          * a global that stays zero until an SPU reserves its first line.
+@@ -744,7 +744,35 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                 if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+                 if (a == a1) break;
+             }
+-            if (span_reserved) {
++            /* Patch 1125: lines the unlocked pass left for the locked one; a
++             * 16 KiB transfer spans at most 129 lines. */
++            uint64_t locked_lines[3] = {0, 0, 0};
++            if (span_reserved && a0 != a1 && ((a1 - a0) >> 7) < 64u * 3u) {
++                const uint32_t ea32 = (uint32_t)ea;
++                uint32_t i = 0;
++                for (uint32_t a = a0; ; a += 128u, i++) {
++                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
++                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
++                    if (spu_coh_is_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
++                    else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
++                    if (a == a1) break;
++                }
++                const uint64_t llm = spu_ll_mask(ea32, size);   /* patch 1056: the span's stripes */
++                spu_ll_lock_mask(llm);
++                i = 0;
++                for (uint32_t a = a0; ; a += 128u, i++) {
++                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
++                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
++                    if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
++                        memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
++                        spu_coh_notify_write_except(a, spu);
++                    } else if (spu_coh_is_reserved(a)) {
++                        spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
++                    }
++                    if (a == a1) break;
++                }
++                spu_ll_unlock_mask(llm);
++            } else if (span_reserved) {
+                 const uint64_t llm = spu_ll_mask((uint32_t)ea, size);   /* patch 1056: the span's stripes */
+                 spu_ll_lock_mask(llm);
+                 memcpy(ea_ptr, ls_ptr, size);

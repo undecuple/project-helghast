@@ -1,0 +1,118 @@
+KZ3 patch 2051 (RSX pass 54): RSX_PERF_GPU=1 measures GPU busy time and vertex-fetch time per source type.
+
+Every submit notes its QPC time under its fence value; a 1 ms poller of the fence turns completions into
+busy intervals and logs `[perf-gpu] t=Ns lists N busy X ms of Y longest Z`. Default off, no cost when off
+(one cached getenv). Used to tell GPU-bound walker waits from latency.
+
+Also times rsx_vertex_fetch_many per NV4097 vertex type (`[perf-vtxtype]`, same switch).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): vertex-profile VP_BEGIN/VP_END hooks in 2040's fetch_many dropped with it (upstream's fetch_many has none; the [vtx-prof] type buckets for the batched path are gone).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 36918cce..25c03786 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2264,6 +2264,68 @@ static void ld_rb_drain(void);
+ /* Patch 2029: walker split timers (RSX_PERF=1 + RSX_PERF_PROF=A,B window). */
+ #define LDW_T0(name) const long long name = rsx_perf_walk_on() ? rsx_perf_now() : 0
+ #define LDW_ADD(idx, t0) do { if (t0) rsx_perf_add((idx), rsx_perf_now() - (t0)); } while (0)
++/* Patch 2051: RSX_PERF_GPU=1 measures how long the GPU is busy per second, from outside:
++ * every submit (chunk or frame list) notes its QPC time under its fence value; a 1 ms
++ * poller of the fence turns completions into busy intervals [max(previous completion,
++ * submit), completion] (resolution ~1 ms), and prints `[perf-gpu]` once per second:
++ * lists, busy ms, longest single list. Busy ms close to a second means the GPU, not the
++ * walker's CPU, is the limit; a low value with long walker waits means latency. */
++#define LD_GM_N 1024u
++static struct { u64 v; long long t; } g_gm[LD_GM_N];
++static int g_gm_on = -1;
++extern long long (*rsx_vtx_prof_clock)(void);
++extern unsigned long long rsx_vtx_prof[10][3];
++static DWORD WINAPI ld_gm_thread(LPVOID unused)
++{
++    (void)unused;
++    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
++    const double tk = 1000.0 / (double)fq.QuadPart;
++    u64 seen = g.fence_value; long long prev = rsx_perf_now(), win0 = prev;
++    double busy = 0.0, longest = 0.0; unsigned lists = 0, missed = 0; unsigned secs = 0;
++    for (;;) {
++        Sleep(1);
++        if (!g.ready || !g.fence) continue;
++        const u64 done = g.fence->lpVtbl->GetCompletedValue(g.fence);
++        const long long now = rsx_perf_now();
++        for (u64 v = seen + 1; v <= done; v++) {
++            if (g_gm[v & (LD_GM_N - 1)].v != v) { missed++; continue; }
++            long long st = g_gm[v & (LD_GM_N - 1)].t;
++            if (st < prev) st = prev;
++            const double d = now > st ? (double)(now - st) * tk : 0.0;
++            busy += d; if (d > longest) longest = d;
++            lists++; prev = now;
++        }
++        if (done > seen) seen = done;
++        if ((double)(now - win0) * tk >= 1000.0) {
++            fprintf(stderr, "[perf-gpu] t=%us lists %u busy %.1f ms of %.0f longest %.1f missed %u\n",
++                    ++secs, lists, busy, (double)(now - win0) * tk, longest, missed);
++            {   static const char* nm[10] = {"slow", "snorm16", "float", "half", "unorm8", "sint16", "cmp32", "uint8", "default", "unk"};
++                static unsigned long long last[10][3];
++                char vl[400]; int o = snprintf(vl, sizeof vl, "[perf-vtxtype] t=%us", secs);
++                for (int k = 0; k < 10; k++) {
++                    const unsigned long long t = rsx_vtx_prof[k][0] - last[k][0], vn = rsx_vtx_prof[k][1] - last[k][1], bl = rsx_vtx_prof[k][2] - last[k][2];
++                    memcpy(last[k], rsx_vtx_prof[k], sizeof last[k]);
++                    if (bl) o += snprintf(vl + o, sizeof vl - o, " %s %.1fms/%lluk-slot-verts/%llu", nm[k], (double)t * tk, vn / 1000, bl);
++                }
++                fprintf(stderr, "%s\n", vl);
++            }
++            win0 = now; busy = longest = 0.0; lists = missed = 0;
++        }
++    }
++    return 0;
++}
++static void ld_gm_note(u64 v)
++{
++    if (g_gm_on < 0) {
++        const char* e = getenv("RSX_PERF_GPU");
++        g_gm_on = e && *e && *e != '0';
++        if (g_gm_on) rsx_vtx_prof_clock = rsx_perf_now;
++        if (g_gm_on) CreateThread(NULL, 0, ld_gm_thread, NULL, 0, NULL);
++    }
++    if (!g_gm_on) return;
++    g_gm[v & (LD_GM_N - 1)].t = rsx_perf_now();
++    g_gm[v & (LD_GM_N - 1)].v = v;
++}
+ /* Patch 2029: draws recorded since the last submit (chunked submits). */
+ static u32 g_ld_unsubmitted;
+ static u64 g_ld_chunk_submits;
+@@ -2291,6 +2353,7 @@ static void ld_flush_body(ld_flush_reason reason)
+     ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+     const u64 v = ++g.fence_value;
++    ld_gm_note(v);   /* patch 2051 */
+     const HRESULT signal_hr =
+         g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+     if (FAILED(signal_hr)) {
+@@ -11059,6 +11122,7 @@ static void ld_submit_nowait(void)
+     ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+     const u64 v = ++g.fence_value;
++    ld_gm_note(v);   /* patch 2051 */
+     const HRESULT signal_hr = g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+     if (FAILED(signal_hr)) {
+         fprintf(stderr, "[d3d-fail] queue Signal (chunk) hr=0x%08lX frame=%u\n",
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index fe9bd25b..1b5c817b 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -6,6 +6,14 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++/* Patch 2051: RSX_PERF_GPU=1 also times rsx_vertex_fetch_many per source type
++ * (QPC ticks, vertices, slots); index = the NV4097 type, 0 = other slow path (unmapped/divided), 8 = default value, 9 = unknown, printed with the [perf-gpu] line. */
++long long (*rsx_vtx_prof_clock)(void);   /* set by RSX_PERF_GPU=1; NULL = off */
++unsigned long long rsx_vtx_prof[10][3];
++#define VP_BEGIN() long long vp_t = rsx_vtx_prof_clock ? rsx_vtx_prof_clock() : 0
++#define VP_END(k) do { if (vp_t) { rsx_vtx_prof[(k)][0] += (unsigned long long)(rsx_vtx_prof_clock() - vp_t); \
++                                   rsx_vtx_prof[(k)][1] += n; rsx_vtx_prof[(k)][2]++; } } while (0)
++
+ static float rsx_compact_be_f32(const u8* p)
+ {
+     u32 w;

@@ -1,0 +1,135 @@
+KZ3 patch 1090 (SPU pass 67): spu_overlay_note_get (every MFC GET) and spu_overlay_match_sig scanned every registered
+overlay source (a 16-byte memcmp per signature source for each GET >= 512 bytes; 0.8 % of the K4 SPU samples). The
+sources are chained in hash buckets (source EA; first signature word) in registration order, and a lookup keeps the
+lowest matching index: the entry the linear scan found first. spu_overlay_map_note's 512-entry seen-list scan is an
+open-addressed set. Same overlay for every GET (tools/spu/test_spu_ovl_index.sh compares with the old loop).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): index add + upstream's atomic count publish; spu_ovl_find skips a verified source at another load address, as upstream's loop `continue`s (part 3: first-hit-only missed a later source at the same EA, upstream 02bd95d5's prefilter test).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index c1ffe7cf..79067ca5 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2092,6 +2092,41 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
+ #define SPU_OVL_SRC_MAX 128
+ static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
+ static int s_ovl_src_count = 0;
++/* KZ3 patch 1090 (SPU pass 67): spu_overlay_note_get scanned every registered source on every MFC GET (a memcmp per
++ * content-signature source for each GET >= 512 bytes; 0.8 % of the K4 SPU samples). The sources are now chained by
++ * hash buckets, in registration order: source EA for the EA sources, the first signature word for the signature
++ * sources. A lookup walks the two chains and keeps the lowest index that matches, which is the entry the linear scan
++ * found first, so every GET resolves to the same overlay as before. Entries are added at registration (single-threaded
++ * at start-up, as the table itself). Values are entry index + 1, 0 ends a chain. */
++#define SPU_OVL_BUCKETS 64
++static uint8_t s_ovl_sig_head[SPU_OVL_BUCKETS], s_ovl_ea_head[SPU_OVL_BUCKETS], s_ovl_next[SPU_OVL_SRC_MAX];
++static inline unsigned spu_ovl_sig_bucket(const uint8_t* s) { uint32_t w; memcpy(&w, s, 4); return (w * 2654435761u) >> 26; }
++static inline unsigned spu_ovl_ea_bucket(uint32_t ea) { return (ea * 2654435761u) >> 26; }
++static void spu_ovl_index_add(int i)
++{
++    uint8_t* p = s_ovl_src[i].has_sig ? &s_ovl_sig_head[spu_ovl_sig_bucket(s_ovl_src[i].sig)]
++                                      : &s_ovl_ea_head[spu_ovl_ea_bucket(s_ovl_src[i].src_ea)];
++    while (*p) p = &s_ovl_next[*p - 1];
++    s_ovl_next[i] = 0;
++    *p = (uint8_t)(i + 1);
++}
++/* Lowest index whose source matches (EA, or the 16-byte signature when size >= 512), or -1. A verified source
++ * (code lifted for one load address) matches only a GET to that address: upstream's scan `continue`s past it, so a
++ * later source with the same EA or signature still matches (SPU pass 108: upstream 02bd95d5's prefilter test
++ * registers a plain source at the EA of an earlier verified region, and the old first-hit-only lookup missed it). */
++static inline int spu_ovl_lsa_ok(const spu_ovl_src* o, uint32_t lsa) { return !(o->span && o->code && lsa != o->load_lsa && lsa + o->span <= SPU_LS_SIZE); }
++static int spu_ovl_find(uint32_t ea, const uint8_t* ls, uint32_t size, uint32_t lsa)
++{
++    int best = -1;
++    for (unsigned k = s_ovl_ea_head[spu_ovl_ea_bucket(ea)]; k; k = s_ovl_next[k - 1])
++        if (s_ovl_src[k - 1].src_ea == ea && spu_ovl_lsa_ok(&s_ovl_src[k - 1], lsa)) { best = (int)k - 1; break; }
++    if (size >= 512)
++        for (unsigned k = s_ovl_sig_head[spu_ovl_sig_bucket(ls)]; k; k = s_ovl_next[k - 1]) {
++            if (best >= 0 && (int)k - 1 >= best) break;
++            if (memcmp(ls, s_ovl_src[k - 1].sig, 16) == 0 && spu_ovl_lsa_ok(&s_ovl_src[k - 1], lsa)) { best = (int)k - 1; break; }
++        }
++    return best;
++}
+ 
+ /* Every MFC GET is checked against the registered sources, and a job that
+  * streams its data in small pieces issues thousands of GETs a frame against
+@@ -2138,6 +2173,7 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
+         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
+         s_ovl_src[s_ovl_src_count].image_id = image_id;
+         s_ovl_src[s_ovl_src_count].has_sig = 0;
++        spu_ovl_index_add(s_ovl_src_count);   /* patch 1090 */
+         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
+     }
+ }
+@@ -2373,6 +2409,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
+         s_ovl_src[s_ovl_src_count].image_id = image_id;
+         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
+         s_ovl_src[s_ovl_src_count].has_sig = 1;
++        spu_ovl_index_add(s_ovl_src_count);   /* patch 1090 */
+         s_ovl_src_count++;
+     }
+ }
+@@ -2440,17 +2477,20 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
+  * design (several kernel threads): a duplicate line is harmless. */
+ static void spu_overlay_map_note(spu_context* ctx, int image_id, uint32_t ea, uint32_t lsa)
+ {
+-    static uint32_t seen[512]; static unsigned nseen;
++    static uint32_t seen[1024]; static unsigned nseen;   /* patch 1090: open-addressed set (was a 512-entry scan) */
+     static unsigned count[1024];
+     uint32_t wid = 0xFF;
+     if (ctx->policy_mode)
+         wid = ((uint32_t)ctx->ls[0x1DC] << 24 | (uint32_t)ctx->ls[0x1DD] << 16 |
+                (uint32_t)ctx->ls[0x1DE] << 8 | ctx->ls[0x1DF]) & 0xFF;
+     uint32_t key = ((uint32_t)image_id & 0xFFFF) << 16 | wid << 8 | ((lsa >> 10) & 0xFF);
+-    int known = 0;
+-    for (unsigned i = 0; i < nseen && i < 512; i++) if (seen[i] == key) { known = 1; break; }
+-    if (!known && nseen < 512) {
+-        seen[nseen++] = key;
++    int known = 0, slot = -1;
++    for (unsigned h = (key * 2654435761u) >> 22, n = 0; n < 1024; n++, h = (h + 1) & 1023) {
++        if (seen[h] == key) { known = 1; break; }
++        if (!seen[h]) { slot = (int)h; break; }
++    }
++    if (!known && slot >= 0 && nseen < 512) {   /* key != 0: image ids start at 1 */
++        seen[slot] = key; nseen++;
+         fprintf(stderr, "[spu-ovl-map] wid=%u overlay image %d src=0x%08X -> LS 0x%05X\n",
+                 wid, image_id, ea, lsa);
+     }
+@@ -2479,18 +2519,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+             }
+         }
+     }
+-    int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
+-    if (size < 512 && !spu_ovl_ea_known(ea)) return;
+-    for (int i = 0; i < nsrc; i++) {
+-        const spu_ovl_src* o = &s_ovl_src[i];
+-        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
+-                             : (o->src_ea == ea);
+-        if (hit) {
++    {   /* patch 1090: was a scan of every source, first hit wins; spu_ovl_find returns that entry */
++        const int i = spu_ovl_find(ea, ls, size, lsa);
++        const spu_ovl_src* o = i >= 0 ? &s_ovl_src[i] : NULL;
++        if (o) {
+             spu_overlay_map_note(ctx, o->image_id, ea, lsa);
+             if (o->span) {
+                 if (lsa + o->span > SPU_LS_SIZE) return;
+                 /* Verified code was lifted for one load address. */
+-                if (o->code && lsa != o->load_lsa) continue;
++                /* Verified sources at another load address were skipped by spu_ovl_find (patch 1090). */
+                 for (unsigned slot = 0; slot < 4; ++slot) {
+                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                         continue;
+@@ -2527,11 +2564,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+  * chunk), so resident_ovl is set at branch-in time by matching the buffer head. */
+ int spu_overlay_match_sig(const uint8_t hdr[16])
+ {
+-    for (int i = 0; i < s_ovl_src_count; i++) {
+-        const spu_ovl_src* o = &s_ovl_src[i];
+-        if (o->has_sig && memcmp(hdr, o->sig, 16) == 0)
+-            return o->image_id;
+-    }
++    for (unsigned k = s_ovl_sig_head[spu_ovl_sig_bucket(hdr)]; k; k = s_ovl_next[k - 1])   /* patch 1090 */
++        if (memcmp(hdr, s_ovl_src[k - 1].sig, 16) == 0)
++            return s_ovl_src[k - 1].image_id;
+     return 0;
+ }
+ 

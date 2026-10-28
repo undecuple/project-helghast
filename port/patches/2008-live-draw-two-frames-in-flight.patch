@@ -1,0 +1,220 @@
+Live-draw keeps two frames in flight: the present flush waits for frame N-1, not the frame it just submitted.
+
+Each frame slot has its own command allocator, upload/vertex/index/vertex-constant/pixel-constant rings,
+shader-visible SRV and sampler heaps, and retired-texture list. The present flush (LD_FLUSH_PRESENT) closes and
+queues frame N, waits for the other slot's fence (frame N-1), releases that slot's retired textures, switches the
+ring pointers to it and resets the ring cursors. Every other flush (rings full, guest reference, readback, movie,
+shutdown) stays synchronous and keeps the current slot. The movie path's offset-0 upload write waits for idle first.
+LD_FRAMES_IN_FLIGHT=1 restores the old model. LD_NO_PRESENT=1 (diagnostic) skips the swap-chain Present so
+RSX_PERF shows the renderer's own throughput without the display path.
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -287,6 +287,25 @@
+     ID3D12Fence*               fence;
+     HANDLE                     fence_event;
+     u64                        fence_value;
++    /* Two frames in flight (patch 2008): per-frame command allocator,
++     * upload/vertex/index/constant rings and shader-visible descriptor heaps.
++     * The present flush submits frame N and then waits only for frame N-1's
++     * fence; every other flush stays synchronous. LD_FRAMES_IN_FLIGHT=1
++     * restores the old wait-every-submit model. */
++    u32                        fif_n, fr_cur;
++    struct ld_frame_slot {
++        ID3D12CommandAllocator* alloc;
++        ID3D12Resource*         upload; u8* upload_mapped;
++        ID3D12Resource*         vb;     u8* vb_mapped;
++        ID3D12Resource*         ib;     u32* ib_mapped;
++        ID3D12Resource*         cb;     u8* cb_mapped;
++        ID3D12Resource*         ps_cb;  u8* ps_cb_mapped;
++        ID3D12DescriptorHeap*   srv_heap;
++        ID3D12DescriptorHeap*   smp_heap;
++        u64                     fence;
++        u32                     n_retired;
++        ID3D12Resource*         retired[4096];
++    }                          fr[2];
+ 
+     IDXGISwapChain3*           swap;
+     ID3D12Resource*            backbuf[LD_SWAP_BUFFERS];
+@@ -2019,6 +2038,62 @@
+ /* ---------------------------------------------------------------------------
+  * command list submit/wait (simple synchronous model, like the harness)
+  * -----------------------------------------------------------------------*/
++static void ld_fr_load(u32 i)
++{
++    struct ld_frame_slot* f = &g.fr[i];
++    g.alloc = f->alloc;
++    g.upload = f->upload; g.upload_mapped = f->upload_mapped;
++    g.vb = f->vb; g.vb_mapped = f->vb_mapped;
++    g.ib = f->ib; g.ib_mapped = f->ib_mapped;
++    g.cb = f->cb; g.cb_mapped = f->cb_mapped;
++    g.ps_cb = f->ps_cb; g.ps_cb_mapped = f->ps_cb_mapped;
++    g.srv_heap = f->srv_heap; g.smp_heap = f->smp_heap;
++    g.fr_cur = i;
++}
++static void ld_fr_store(u32 i)
++{
++    struct ld_frame_slot* f = &g.fr[i];
++    f->alloc = g.alloc;
++    f->upload = g.upload; f->upload_mapped = g.upload_mapped;
++    f->vb = g.vb; f->vb_mapped = g.vb_mapped;
++    f->ib = g.ib; f->ib_mapped = g.ib_mapped;
++    f->cb = g.cb; f->cb_mapped = g.cb_mapped;
++    f->ps_cb = g.ps_cb; f->ps_cb_mapped = g.ps_cb_mapped;
++    f->srv_heap = g.srv_heap; f->smp_heap = g.smp_heap;
++}
++/* Block until the queue fence reaches v. 0 on a D3D12 failure. */
++static int ld_wait_fence(u64 v)
++{
++    if (!v || g.fence->lpVtbl->GetCompletedValue(g.fence) >= v) return 1;
++    const HRESULT event_hr =
++        g.fence->lpVtbl->SetEventOnCompletion(g.fence, v, g.fence_event);
++    if (FAILED(event_hr)) {
++        fprintf(stderr,
++                "[d3d-fail] fence SetEventOnCompletion hr=0x%08lX frame=%u\n",
++                (unsigned long)event_hr, g_ld_frames);
++        ld_dump_dred("SetEventOnCompletion", event_hr);
++        g.ready = 0;
++        return 0;
++    }
++    const long long w0 = rsx_perf_now();
++    WaitForSingleObject(g.fence_event, INFINITE);
++    rsx_perf_add(RSX_PERF_GPUWAIT_T, rsx_perf_now() - w0);
++    return 1;
++}
++static void ld_fr_release_retired(u32 i)
++{
++    struct ld_frame_slot* f = &g.fr[i];
++    for (u32 k = 0; k < f->n_retired; k++)
++        f->retired[k]->lpVtbl->Release(f->retired[k]);
++    f->n_retired = 0;
++}
++/* CPU writes into a buffer outside the per-frame rings (movie upload at
++ * offset 0) must not race a frame still in flight. */
++static void ld_wait_idle(void)
++{
++    if (g.ready && g.fif_n > 1) ld_wait_fence(g.fence_value);
++}
++
+ static void ld_flush_body(ld_flush_reason reason)
+ {
+ #if defined(YZ_PERF_PROFILE)
+@@ -2050,6 +2125,28 @@
+         g.ready = 0;
+         return;
+     }
++    if (g.fif_n > 1 && reason == LD_FLUSH_PRESENT) {
++        /* Frame N is queued; recycle frame N-1's slot once its fence passes,
++         * so the walker records frame N+1 while the GPU and the swap chain
++         * finish frame N. */
++        const u32 cur = g.fr_cur, nxt = cur ^ 1u;
++        struct ld_frame_slot* f = &g.fr[cur];
++        g.fr[cur].fence = v;
++        memcpy(f->retired, g.retired_textures,
++               (size_t)g.n_retired_textures * sizeof(f->retired[0]));
++        f->n_retired = g.n_retired_textures;
++        g.n_retired_textures = 0;
++        if (!ld_wait_fence(g.fr[nxt].fence)) return;
++        ld_drain_info_queue("flush");
++        ld_fr_release_retired(nxt);
++        ld_fr_load(nxt);
++        g.alloc->lpVtbl->Reset(g.alloc);
++        g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
++        g.upload_used = 0;
++        g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
++        g.srv_ring_used = 0; g.smp_ring_used = 0;
++        return;
++    }
+     if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
+ #if defined(YZ_PERF_PROFILE)
+         const LONGLONG wait_begin = ld_profile_qpc();
+@@ -2083,6 +2180,8 @@
+     for (u32 i = 0; i < g.n_retired_textures; i++)
+         g.retired_textures[i]->lpVtbl->Release(g.retired_textures[i]);
+     g.n_retired_textures = 0;
++    ld_fr_release_retired(0);
++    ld_fr_release_retired(1);
+     g.alloc->lpVtbl->Reset(g.alloc);
+     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+     g.upload_used = 0;
+@@ -8342,6 +8441,53 @@
+                 (void*)g.smp_cpu_heap, (void*)g.smp_heap);
+         return -1;
+     }
++    /* Second frame slot (patch 2008): same sizes as the first. */
++    g.fif_n = 2;
++    { const char* e = getenv("LD_FRAMES_IN_FLIGHT");
++      if (e && *e == '1') g.fif_n = 1; }
++    ld_fr_store(0);
++    g.fr_cur = 0;
++    if (g.fif_n > 1) {
++        struct ld_frame_slot* f = &g.fr[1];
++        g.dev->lpVtbl->CreateCommandAllocator(g.dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
++            &IID_ID3D12CommandAllocator, (void**)&f->alloc);
++        bd.Width = UPLOAD_SIZE;
++        g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&f->upload);
++        bd.Width = VERT_BUFFER_SIZE;
++        g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&f->vb);
++        bd.Width = INDEX_BUFFER_SIZE;
++        g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&f->ib);
++        bd.Width = CB_RING_BYTES;
++        g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&f->cb);
++        bd.Width = PS_CB_RING_BYTES;
++        g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&f->ps_cb);
++        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++        hd.NumDescriptors = SRV_RING_TABLES * SRV_TABLE_SIZE;
++        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++        g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&f->srv_heap);
++        shd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
++        shd.NumDescriptors = SMP_RING_TABLES * SMP_TABLE_SIZE;
++        shd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++        g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &shd, &IID_ID3D12DescriptorHeap, (void**)&f->smp_heap);
++        if (f->upload) f->upload->lpVtbl->Map(f->upload, 0, &rr, (void**)&f->upload_mapped);
++        if (f->vb) f->vb->lpVtbl->Map(f->vb, 0, &rr, (void**)&f->vb_mapped);
++        if (f->ib) f->ib->lpVtbl->Map(f->ib, 0, &rr, (void**)&f->ib_mapped);
++        if (f->cb) f->cb->lpVtbl->Map(f->cb, 0, &rr, (void**)&f->cb_mapped);
++        if (f->ps_cb) f->ps_cb->lpVtbl->Map(f->ps_cb, 0, &rr, (void**)&f->ps_cb_mapped);
++        if (!f->alloc || !f->upload_mapped || !f->vb_mapped || !f->ib_mapped ||
++            !f->cb_mapped || !f->srv_heap || !f->smp_heap ||
++            (g.ps_cb && !f->ps_cb_mapped)) {
++            fprintf(stderr, "[live-draw] second frame slot failed; "
++                    "one frame in flight\n");
++            g.fif_n = 1;
++        }
++    }
++    fprintf(stderr, "[live-draw] frames in flight: %u\n", g.fif_n);
+     {
+         D3D12_SAMPLER_DESC def = {0};
+         def.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+@@ -8710,6 +8856,7 @@
+         return;
+     }
+ 
++    ld_wait_idle();   /* patch 2008: offset-0 write, outside the rings */
+     u8* host_upload = composite ? g.movie_upload_mapped : g.upload_mapped;
+     for (u32 y = 0; y < h; y++) {
+         u8* dstrow = host_upload + (size_t)y * pitch;
+@@ -9324,8 +9471,17 @@
+             const char* e = getenv("LD_PRESENT_INTERVAL");
+             s_interval = (e && *e >= '0' && *e <= '4') ? *e - '0' : 1;
+         }
++        /* LD_NO_PRESENT=1 (patch 2008, diagnostic): skip the swap-chain
++         * Present, so RSX_PERF shows the renderer's own throughput without
++         * the display path (Xvfb costs ~12 ms per 1280x720 present). */
++        static int s_nopresent = -1;
++        if (s_nopresent < 0) {
++            const char* e = getenv("LD_NO_PRESENT");
++            s_nopresent = (e && *e == '1') ? 1 : 0;
++        }
+         const long long swap0 = rsx_perf_now();
+-        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, (UINT)s_interval, 0);
++        const HRESULT present_hr = s_nopresent ? S_OK
++            : g.swap->lpVtbl->Present(g.swap, (UINT)s_interval, 0);
+         rsx_perf_add(RSX_PERF_SWAP_T, rsx_perf_now() - swap0);
+         if (SUCCEEDED(present_hr))
+             ld_present_measure_record(g_ld_frames + 1u);

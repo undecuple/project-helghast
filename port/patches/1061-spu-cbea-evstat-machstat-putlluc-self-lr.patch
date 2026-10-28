@@ -1,0 +1,106 @@
+KZ3 patch 1061 (SPU pass 47): three CBEA v1.01 SPU channel semantics (CBEA audit items 1, 2, 5): rdch SPU_RdEventStat returns pending AND event mask [CBEA s.9.11.1] (default on; KZ3_SPU_EVSTAT_UNMASKED=1 = old raw read); PUTLLUC/PUTQLLUC no longer raise Lr on the issuing SPU [CBEA s.9.11.1 bit 21] (default on; KZ3_SPU_PUTLLUC_SELF_LR=1 = old); rdch SPU_RdMachStat bit 31 = the interrupt-enable latch [CBEA s.9.8], upstream #289 by tekulvw, OPT-IN KZ3_SPU_MACHSTAT_IE=1 because KZ3's level load hangs with it (the port's job contexts read int_enable 0 where hardware has 1; KZ3_SPU_MACHSTAT_TRACE=1 locates the reads). Host test tools/spu/test_spu_cbea.sh (negative controls per piece); the upstream test_spu_lockline_peer.c case for the issuer-own PUTLLUC now expects no Lr.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): conflicts with PR289 (IE latch unconditional), its latch hangs the KZ3 level load (notes), ours keeps it opt-in.
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -454,6 +454,31 @@ static void kz3_curcont_check(spu_context* ctx, uint32_t ea, const uint8_t* mem,
+ }
+ 
+ /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
++
++/* KZ3 patch 1061 (SPU pass 47): three CBEA v1.01 channel semantics the runtime got wrong
++ * (CBEA audit items 1, 2, 5), each with an off switch that restores the old
++ * behaviour for A/B runs only:
++ *   KZ3_SPU_EVSTAT_UNMASKED=1  rdch SPU_RdEventStat returns the raw pending register. Spec: the
++ *       read returns pending AND the write event mask [CBEA s.9.11, s.9.11.1]; KZ3's readers ack
++ *       exactly what they read, so the raw value erased pending-but-masked SN/Tg bits.
++ *   KZ3_SPU_MACHSTAT_IE=1      rdch SPU_RdMachStat bit 31 = the interrupt-enable latch [CBEA s.9.8]
++ *       (upstream #289, tekulvw). OFF by default: KZ3's WWS AddJob saves it with `rdch RdMachStat;
++ *       andi 1` and re-enables interrupts on exit only when it was set, and in this port the job
++ *       sees int_enable == 0 there (SPU pass 47: the level load hangs, runs spu-47-a1/a2/x2/x3;
++ *       x1 with the old value loads), so the port's contexts lose IE somewhere hardware keeps it.
++ *       Default = the old "1 while running". KZ3_SPU_MACHSTAT_TRACE=1 prints the first reads
++ *       that see int_enable == 0 (image, pc) to find that spot.
++ *   KZ3_SPU_PUTLLUC_SELF_LR=1  PUTLLUC/PUTQLLUC raise Lr on the issuing SPU too. Spec: Lr is not
++ *       set for a reservation lost to a local action [CBEA s.9.11.1 bit 21]. */
++static inline int kz3_evstat_unmasked(void)
++{ static int s = -1; if (s < 0) { const char* e = getenv("KZ3_SPU_EVSTAT_UNMASKED"); s = (e && *e == '1') ? 1 : 0; } return s; }
++static inline int kz3_machstat_ie(void)
++{ static int s = -1; if (s < 0) { const char* e = getenv("KZ3_SPU_MACHSTAT_IE"); s = (e && *e == '1') ? 1 : 0; } return s; }
++static inline int kz3_machstat_trace(void)
++{ static int s = -1; if (s < 0) { const char* e = getenv("KZ3_SPU_MACHSTAT_TRACE"); s = (e && *e == '1') ? 1 : 0; } return s; }
++static inline int kz3_putlluc_self_lr(void)
++{ static int s = -1; if (s < 0) { const char* e = getenv("KZ3_SPU_PUTLLUC_SELF_LR"); s = (e && *e == '1') ? 1 : 0; } return s; }
++
+ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+ {
+     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
+@@ -838,6 +863,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+          * bookkeeping below rather than after it. A peer left holding a
+          * reservation here would commit a PUTLLC against a snapshot this store
+          * has already overwritten. */
++        /* KZ3 patch 1061: but not this SPU's own reservation: a local action never
++         * raises Lr on the issuer [CBEA s.9.11.1 bit 21]. Clear it under the stripe
++         * held above, so the registry walk's CAS skips this context. */
++        if (!kz3_putlluc_self_lr()) __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELEASE);
+         spu_coh_notify_write(ea);
+         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+         spu_ll_unlock_mask(llm);
+@@ -1191,10 +1220,21 @@ static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel)
+         break;
+     }
+     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
+-    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = spu_event_load(ctx); break;
+-    /* CBEA 9.8: numeric bit 0 is interrupt-enable, independent of run status.
+-     * This runtime models nonisolated SPUs, so the isolation bit stays clear. */
+-    case SPU_RdMachStat:    v = ctx->int_enable & 1u; break;
++    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = spu_event_load(ctx);
++                            /* KZ3 patch 1061: pending AND mask [CBEA s.9.11.1] */
++                            if (!kz3_evstat_unmasked()) v &= ctx->event_mask;
++                            break;
++    case SPU_RdMachStat:    /* KZ3 patch 1061: bit 31 = IE latch [CBEA s.9.8] (upstream #289), opt-in */
++                            v = kz3_machstat_ie() ? (ctx->int_enable ? 1u : 0u)
++                                                  : ((ctx->status == SPU_STATUS_RUNNING) ? 1 : 0);
++                            if (kz3_machstat_trace()) {
++                                static long n0, n1; static int shown;
++                                if (ctx->int_enable) n1++; else n0++;
++                                if (!ctx->int_enable && shown < 24) { shown++;
++                                    fprintf(stderr, "[machstat] img=%d pc=0x%05X ie=0 (reads ie0=%ld ie1=%ld)\n",
++                                            ctx->image_id, ctx->pc & SPU_LS_MASK, n0, n1); }
++                            }
++                            break;
+     case SPU_RdSRR0:        v = ctx->srr0;                              break;
+     default:
+         v = 0;
+diff --git a/runtime/spu/tests/test_spu_lockline_peer.c b/runtime/spu/tests/test_spu_lockline_peer.c
+--- a/runtime/spu/tests/test_spu_lockline_peer.c
++++ b/runtime/spu/tests/test_spu_lockline_peer.c
+@@ -249,18 +249,21 @@ static void test_putlluc_breaks_peer(void)
+     CHECK(mem_is(LINE_A, 0xB0, 128));
+ 
+     /* Unlike PUTLLC, a PUTLLUC is unconditional: it invalidates every
+-     * reservation on the line including the issuer's own, and the issuer is
+-     * told, because it never made the compare that would have said so. */
++     * reservation on the line including the issuer's own -- but the issuer is
++     * not told: the lost-reservation event "must not be set if the reservation
++     * is lost due to a local action" (CBEA v1.01 s.9.11.1, bit 21; KZ3 patch
++     * 1061). A phantom Lr here is one spurious wake per lock release. */
+     reset_pair();
+     raised = g_spu_lr_raise;
+     spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
+ 
+-    TEST("a PUTLLUC over the issuer's own reservation reports it lost");
++    TEST("a PUTLLUC over the issuer's own reservation drops it silently");
+     stage(&g_b, LSA_B, 0xB0, 128);
+     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
+-    CHECK_EQ_U32(g_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
++    CHECK_EQ_U32(g_b.event_status & SPU_EVENT_LR, 0);
+     CHECK(g_b.resv_valid == 0);
+-    CHECK(g_spu_lr_raise == raised + 1);
++    CHECK(g_spu_lr_raise == raised);
++    CHECK(mem_is(LINE_A, 0xB0, 128));
+ }
+ 
+ /* ===========================================================================

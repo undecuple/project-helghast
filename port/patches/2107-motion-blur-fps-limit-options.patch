@@ -1,0 +1,169 @@
+diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -264,6 +264,45 @@
+     return rsx_dm_ini_value(t, "vsync", v, sizeof v) ? rsx_dm_parse_vsync(v) : -1;
+ }
+ 
++/* KZ3 patch 2107: motion blur (on | off; the post chain's MotionBlur job, default on = the game's look) and the frame
++ * rate limit (30 | 60 | 120; default 30 = the game's own; ENHANCEMENT, gameplay timing: above 30 opt-in with a warning). */
++enum { RSX_DM_FPS_30 = 30, RSX_DM_FPS_60 = 60, RSX_DM_FPS_120 = 120 };
++static inline int rsx_dm_parse_fps(const char* s)
++{
++    size_t n;
++    if (!rsx_dm_trim(&s, &n)) return -1;
++    if (rsx_dm_ieq(s, n, "30")) return RSX_DM_FPS_30;
++    if (rsx_dm_ieq(s, n, "60")) return RSX_DM_FPS_60;
++    if (rsx_dm_ieq(s, n, "120")) return RSX_DM_FPS_120;
++    return -1;
++}
++static inline const char* rsx_dm_fps_name(int v) { return v == RSX_DM_FPS_120 ? "120" : v == RSX_DM_FPS_60 ? "60" : "30"; }
++static inline int rsx_dm_ini_motion_blur(const char* t)    /* 1 on, 0 off, -1 missing or unreadable */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "motion_blur", v, sizeof v) ? rsx_dm_parse_vsync(v) : -1;
++}
++static inline int rsx_dm_ini_fps(const char* t)            /* 30 | 60 | 120, -1 missing or unreadable */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "fps_limit", v, sizeof v) ? rsx_dm_parse_fps(v) : -1;
++}
++/* The guest vblank tick for a limit, in ms. KZ3 releases a frame on every 2nd vblank (its handler sets RSX label 72, the
++ * frame waits on it), so the vblank rate sets the cap: 16 ms (62.5 Hz, the port's tick before 2107) = 30, 8 = 60, 4 = 120. */
++static inline unsigned rsx_dm_fps_vblank_ms(int fps) { return fps == RSX_DM_FPS_120 ? 4u : fps == RSX_DM_FPS_60 ? 8u : 16u; }
++
++static inline int rsx_dm_ini_write_ext(char* buf, size_t n, int mode, int scaling, int filter, int vsync, int motion_blur, int fps)
++{
++    return snprintf(buf, n,
++                    "# Project Helghast display settings (Options > Display; Alt+Enter toggles the mode).\n"
++                    "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest, vsync = on | off.\n"
++                    "# motion_blur = on | off. fps_limit = 30 | 60 | 120: 30 is the game's own; above 30 can break gameplay timing.\n"
++                    "# KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER, KZ3_MOTION_BLUR, KZ3_FPS_LIMIT override them for one run.\n"
++                    "[display]\nmode = %s\nscaling = %s\nfilter = %s\nvsync = %s\nmotion_blur = %s\nfps_limit = %s\n",
++                    rsx_dm_name(mode), rsx_dm_scaling_name(scaling), rsx_dm_filter_name(filter), rsx_dm_vsync_name(vsync),
++                    rsx_dm_vsync_name(motion_blur != 0), rsx_dm_fps_name(fps));
++}
++
+ static inline int rsx_dm_ini_write(char* buf, size_t n, int mode, int scaling, int filter, int vsync)
+ {
+     return snprintf(buf, n,
+@@ -289,7 +328,8 @@
+ /* The page with the row and the functions added (malloc'd, NUL-terminated, *out_n bytes), or NULL when an anchor is
+  * missing (the Brightness listitem, the settingscript CDATA end), the script already has an OnPageOn, or the row is
+  * already there: the page is then served unchanged. */
+-static inline char* rsx_dm_patch_gum(const char* in, size_t n, size_t* out_n)
++#define RSX_DM_GUM_MBLUR 1   /* rsx_dm_patch_gum_opts: add the Motion blur row (patch 2107) */
++static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_n, unsigned opts)
+ {
+     static const char rsx_dm_gum_row[] =
+         "<select id=\"slc_kz3_display\" label=\"Display mode\" onchange=\"script(settingscript,KZ3ChangeDisplay)\"\n"
+@@ -312,7 +352,37 @@
+         "\t\t\t\tdefault-value=\"on\">\n"
+         "\t\t\t\t<selectitem value=\"on\">On</selectitem>\n"
+         "\t\t\t\t<selectitem value=\"off\">Off</selectitem>\n"
++        "\t\t\t</select>\n\n\t\t\t"
++        /* patch 2107 */
++        "<select id=\"slc_kz3_fps\" label=\"Frame rate limit\" onchange=\"script(settingscript,KZ3ChangeFps)\"\n"
++        "\t\t\t\tdefault-value=\"30\">\n"
++        "\t\t\t\t<selectitem value=\"30\">30 FPS</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"60\">60 FPS</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"120\">120 FPS</selectitem>\n"
+         "\t\t\t</select>\n\n\t\t\t";
++    static const char rsx_dm_gum_row_mb[] =   /* patch 2107: only when the MotionBlur hook is in the exe */
++        "<select id=\"slc_kz3_mblur\" label=\"Motion blur\" onchange=\"script(settingscript,KZ3ChangeMBlur)\"\n"
++        "\t\t\t\tdefault-value=\"on\">\n"
++        "\t\t\t\t<selectitem value=\"on\">On</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"off\">Off</selectitem>\n"
++        "\t\t\t</select>\n\n\t\t\t";
++    static const char rsx_dm_gum_lua_mb[] =   /* patch 2107: with the Motion blur row only */
++        "\t\tfunction KZ3MBlurOn()\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_mblur\"):SetValue(KZ3DisplayCmd(\"motionblur\"))\n"
++        "\t\tend\n\n"
++        "\t\tfunction KZ3ChangeMBlur(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"motionblur \"..e:GetSender():GetValue()) end\n"
++        "\t\tend\n";
++    /* patch 2107: the warning for a limit above 30, shaped like the game's own confirm dialogs (No focused, cancelable;
++     * Yes/No from the game's strings), placed beside the page's dialogconfirm include */
++    static const char rsx_dm_gum_dlg[] =
++        "<dialog id=\"dlg_kz3_fps\" label=\"Killzone 3 was made for 30 frames per second. A higher limit can break gameplay "
++        "timing: physics, animation and scripted events may run wrong. Use the higher limit?\" default-focus=\"dlg_kz3_fps_no\"\n"
++        "\t\tcancelable=\"true\">\n"
++        "\t\t<dialogoption id=\"dlg_kz3_fps_yes\" label=\"@key{menu_dialog_yes}\" value=\"yes\"/>\n"
++        "\t\t<dialogoption id=\"dlg_kz3_fps_no\" label=\"@key{menu_dialog_no}\" value=\"no\"/>\n"
++        "\t</dialog>\n\n\t";
+ 
+     static const char rsx_dm_gum_lua[] =
+         "\n\t\tgKz3Dm = 0\n\t\tfunction KZ3DisplayCmd(c)\n"
+@@ -323,7 +393,32 @@
+         "\t\t\tgRoot:GetTag(\"slc_kz3_display\"):SetValue(KZ3DisplayCmd(\"display\"))\n"
+         "\t\t\tgRoot:GetTag(\"slc_kz3_scaling\"):SetValue(KZ3DisplayCmd(\"scaling\"))\n"
+         "\t\t\tgRoot:GetTag(\"slc_kz3_filter\"):SetValue(KZ3DisplayCmd(\"filter\"))\n"
+-        "\t\t\tgRoot:GetTag(\"slc_kz3_vsync\"):SetValue(KZ3DisplayCmd(\"vsync\"))\n\t\t\tgKz3Dm = 1\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_vsync\"):SetValue(KZ3DisplayCmd(\"vsync\"))\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_fps\"):SetValue(KZ3DisplayCmd(\"fps\"))\n"
++        "\t\t\tif (KZ3MBlurOn) then KZ3MBlurOn() end\n"
++        "\t\t\tgKz3Dm = 1\n"
++        "\t\tend\n\n"
++        "\t\tgKz3FpsWant = \"30\"\n"
++        "\t\tfunction KZ3ChangeFps(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3Dm == 1) then\n"
++        "\t\t\t\tgKz3FpsWant = e:GetSender():GetValue()\n"
++        "\t\t\t\tif (gKz3FpsWant == \"30\") then\n"
++        "\t\t\t\t\tKZ3DisplayCmd(\"fps 30\")\n"
++        "\t\t\t\telse\n"
++        "\t\t\t\t\tgMenu:DoAction(\"dialog(dlg_kz3_fps, settingscript, OnKZ3FpsClose)\")\n"
++        "\t\t\t\tend\n"
++        "\t\t\tend\n"
++        "\t\tend\n\n"
++        "\t\tfunction OnKZ3FpsClose(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (e:GetSender():GetValue() == \"yes\") then\n"
++        "\t\t\t\tKZ3DisplayCmd(\"fps \"..gKz3FpsWant)\n"
++        "\t\t\telse\n"
++        "\t\t\t\tgKz3Dm = 0\n"
++        "\t\t\t\tgRoot:GetTag(\"slc_kz3_fps\"):SetValue(KZ3DisplayCmd(\"fps\"))\n"
++        "\t\t\t\tgKz3Dm = 1\n"
++        "\t\t\tend\n"
+         "\t\tend\n\n"
+         "\t\tfunction KZ3ChangeDisplay(e)\n"
+         "\t\t\te:SetHandled(true)\n"
+@@ -344,24 +439,34 @@
+     const char* row = rsx_dm_find(in, n, 0, "<listitem id=\"lst_gamma_screen\"");
+     const char* scr = rsx_dm_find(in, n, 0, "<script id=\"settingscript\">");
+     const char* cd = scr ? rsx_dm_find(in, n, (size_t)(scr - in), "]]>") : NULL;
+-    size_t at_row, at_lua, nr = sizeof rsx_dm_gum_row - 1, nl = sizeof rsx_dm_gum_lua - 1, o = 0;
++    size_t at_row, at_scr, at_lua, nr = sizeof rsx_dm_gum_row - 1, nl = sizeof rsx_dm_gum_lua - 1, o = 0;
++    size_t nm = (opts & RSX_DM_GUM_MBLUR) ? sizeof rsx_dm_gum_row_mb - 1 : 0, nd = sizeof rsx_dm_gum_dlg - 1;
+     char* out;
+     if (!row || !scr || !cd || row > scr || rsx_dm_find(in, n, 0, "function OnPageOn") ||
+         rsx_dm_find(in, n, 0, "slc_kz3_display")) return NULL;
+     at_row = (size_t)(row - in);
++    at_scr = (size_t)(scr - in);
+     at_lua = (size_t)(cd - in);
+-    out = (char*)malloc(n + nr + nl + 1);
++    size_t nlm = nm ? sizeof rsx_dm_gum_lua_mb - 1 : 0;
++    out = (char*)malloc(n + nr + nm + nd + nl + nlm + 1);
+     if (!out) return NULL;
+     memcpy(out + o, in, at_row); o += at_row;
+     memcpy(out + o, rsx_dm_gum_row, nr); o += nr;
+-    memcpy(out + o, in + at_row, at_lua - at_row); o += at_lua - at_row;
++    memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;
++    memcpy(out + o, in + at_row, at_scr - at_row); o += at_scr - at_row;
++    memcpy(out + o, rsx_dm_gum_dlg, nd); o += nd;                      /* patch 2107: before <script id="settingscript"> */
++    memcpy(out + o, in + at_scr, at_lua - at_scr); o += at_lua - at_scr;
+     memcpy(out + o, rsx_dm_gum_lua, nl); o += nl;
++    memcpy(out + o, rsx_dm_gum_lua_mb, nlm); o += nlm;
+     memcpy(out + o, in + at_lua, n - at_lua); o += n - at_lua;
+     out[o] = 0;
+     *out_n = o;
+     return out;
+ }
+ 
++/* The page as before patch 2107's options (the Motion blur row only when the exe has the hook). */
++static inline char* rsx_dm_patch_gum(const char* in, size_t n, size_t* out_n) { return rsx_dm_patch_gum_opts(in, n, out_n, 0); }
++
+ /* KZ3 patch 2096: view aspect (KZ3_ASPECT, ENHANCEMENT, default screen). Screen = the game's camera is set up for the
+  * window's (or the screen's) own aspect (port/kz3/main.cpp hooks GameViewGame::vf22 @0x007E5908: Hor+ above 16:9,
+  * Vert+ below) and every frame drawn with that camera is stretched to the whole client (the guest image stays

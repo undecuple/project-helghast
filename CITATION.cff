@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below and keep the MIT licence notice with any copied code."
+title: "Project Helghast"
+type: software
+version: 0.1.0
+authors:
+  - alias: undecuple
+repository-code: "https://github.com/undecuple/project-helghast"
+url: "https://github.com/undecuple/project-helghast"
+license: MIT
+abstract: >-
+  Killzone 3 // Unofficial PC Port (static recompilation). A native PC port of Killzone 3 (PS3) by static recompilation of its PPU and SPU code on ps3recomp, with the PS3
+  system software it calls reimplemented and graphics on Direct3D 12. Contains no game code or data.
+keywords:
+  - static recompilation
+  - PS3
+  - ps3recomp
+  - Killzone 3
+  - game preservation

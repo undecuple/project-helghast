@@ -1,0 +1,105 @@
+KZ3 patch 1081 (SPU pass 63, opt-in diagnostic): publish the live spu_context of every lifted job/task run and
+policy-module run (g_kz3_run_ctx_hook, defined next to spu_run_with_halt), the taskset/task id of the async task
+thread (g_kz3_cur_taskset/taskid), and one scan call per SPURS watcher pass (g_kz3_stall_scan). NULL hooks unless
+port/spu/kz3_stall_diag.c installs them (KZ3_STALL_DIAG=1); no behaviour change.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index d1055eef..ecc2a02f 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2234,6 +2234,8 @@ int kz3_spurs_runs_brief(char* buf, int n)
+     return o;
+ }
+ 
++/* KZ3 patch 1081: the stall diagnostic's scan (port/spu/kz3_stall_diag.c, KZ3_STALL_DIAG=1), once per watcher pass. */
++void (*g_kz3_stall_scan)(unsigned long long now_ms) = 0;
+ static DWORD WINAPI spurs_watch_thread(LPVOID p)
+ {
+     (void)p;
+@@ -2245,6 +2247,7 @@ static DWORD WINAPI spurs_watch_thread(LPVOID p)
+     static u64 cc_since[MAX_SPURS_INST][16], cc_rep[MAX_SPURS_INST][16];
+     for (;;) {
+         Sleep(50);
++        if (g_kz3_stall_scan) g_kz3_stall_scan(GetTickCount64());   /* KZ3 patch 1081 */
+         for (int j = 0; j < MAX_SPURS_INST; j++) {
+             u32 ea = s_inst[j].ea;
+             if (!ea) continue;
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 391589e1..f729d82c 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -323,6 +323,11 @@ static void spu_honour_stop_request(spu_context* ctx)
+ 
+ /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
+  * (via spu_halt), 0 if it returned normally. */
++/* KZ3 patch 1081 (opt-in diagnostic, KZ3_STALL_DIAG=1): called with on=1 before and on=0 after every lifted job/task
++ * run (kind 0, a = image id, b = args EA; spu_lifted_job.h) and every policy-module run (kind 1, a = wid, b = spu_num;
++ * spurs_policy.c), so a run that never returns can be described from another thread. NULL unless
++ * port/spu/kz3_stall_diag.c installs it. Defined here, next to spu_run_with_halt, so every user of the runners links it. */
++void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b) = 0;
+ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+ {
+     const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
+diff --git a/runtime/spu/spu_lifted_job.h b/runtime/spu/spu_lifted_job.h
+index 499f3a65..9a476b5b 100644
+--- a/runtime/spu/spu_lifted_job.h
++++ b/runtime/spu/spu_lifted_job.h
+@@ -300,8 +300,14 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+         fflush(stderr);
+     }
+     int _halted = 0;
++    /* KZ3 patch 1081 (opt-in diagnostic): publish the live context of a job/task run, so a run that never returns
++     * can be described from another thread (port/spu/kz3_stall_diag.c, KZ3_STALL_DIAG=1). */
++    { extern void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b);
++      if (g_kz3_run_ctx_hook) g_kz3_run_ctx_hook(&ctx, 1, 0, (uint32_t)image_id, args_ea); }
+     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+       _halted = spu_run_with_halt(entry, &ctx); }               /* run with halt pad   */
++    { extern void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b);
++      if (g_kz3_run_ctx_hook) g_kz3_run_ctx_hook(&ctx, 0, 0, 0, 0); }
+     /* Raw-worker run summary (env SPU_WORKER_TRACE). A worker that produces no
+      * outbound word leaves the PPU blocked in sys_event_queue_receive forever,
+      * and the difference between "parked at its idle poll" and "fell over after
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 7ead8e3b..8c5ffcd0 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -1000,8 +1000,12 @@ int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image,
+     return rc;
+ }
+ 
++/* KZ3 patch 1081: the taskset and task id of the task this host thread runs (0/0 outside a task), for the stall
++ * diagnostic (port/spu/kz3_stall_diag.c). */
++SPU_THREAD_LOCAL uint32_t g_kz3_cur_taskset, g_kz3_cur_taskid;
+ static void spu_async_run(spu_async_job* j)
+ {
++    g_kz3_cur_taskset = j->taskset_ea; g_kz3_cur_taskid = j->taskid;   /* KZ3 patch 1081 */
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     spu_taskset_bind_thread(j->taskset_ea);   /* KZ3 patch 1066 */
+     j2_start(j->taskset_ea, j->taskid, j->image_id);   /* KZ3 patch 1072 */
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 034495e6..6f564ac7 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -50,6 +50,10 @@ volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count
+ /* KZ3 patch 1011: the persistent PM contexts at file scope, so a stuck run can be
+  * described from another thread (cellSpurs.c [spurs-stuck]). */
+ static spu_context* g_pm_ctx_tab[16][6];
++/* KZ3 patch 1081 (opt-in diagnostic, KZ3_STALL_DIAG=1): called with on=1 before and on=0 after every policy-module
++ * run (kind 1, a = wid, b = spu_num) and every lifted job/task run (kind 0, a = image id, b = args EA,
++ * spu_lifted_job.h). NULL unless port/spu/kz3_stall_diag.c installs it. */
++extern void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b);   /* spu_channels.c */
+ void* spu_pm_ctx_peek(uint32_t wid, uint32_t spu_num)
+ {
+     return (wid < 16 && spu_num < 6) ? (void*)g_pm_ctx_tab[wid][spu_num] : NULL;
+@@ -459,7 +463,9 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+ 
+     g_kz3_pm_run_t0 = kz3_pm_run_budget_ms() ? kz3_pm_now_ms() : 0;   /* patch 1048 */
+     kz3_pm_select_run_begin();                                        /* patch 1058 */
++    if (g_kz3_run_ctx_hook) g_kz3_run_ctx_hook(ctx, 1, 1, wid, spu_num);   /* KZ3 patch 1081 */
+     const int pm_halted = spu_run_with_halt(entry, ctx);
++    if (g_kz3_run_ctx_hook) g_kz3_run_ctx_hook(ctx, 0, 1, wid, spu_num);   /* KZ3 patch 1081 */
+     g_kz3_pm_run_t0 = 0;
+     kz3_pm_select_run_end(ctx, wid);                                  /* patch 1058 */
+     /* A lane's run should only end through exitToKernel. Anything else strands

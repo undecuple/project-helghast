@@ -1,0 +1,194 @@
+KZ3 patch 1085 (SPU pass 66, diagnostic, opt-in): event trace hook for a per-frame timeline. kz3_wait_acct
+gains g_kz3_wtrace (NULL by default): every accounted bracket and note (HLE calls, syscalls, usleeps, label waits,
+kernel sleeps, policy-module runs, GCM parks), every job-module change, every flip and every WWS job call (the jm
+policy module, image 2, branching from its own code into the job code buffer at LS[0x1320])
+is passed to it with host times and the thread name; so are the GCM walker queueing a user command and a
+PPU pump delivering it (cellGcmSys.c). A job call ends when control is back at the PM link: in spu_indirect_branch
+when the job returned normally, else when the PM drain returns (spu_drain_call_full wraps its old body). Set by port/spu/kz3_frame_trace.c (KZ3_FRAME_TRACE=FROM,TO).
+Off: one predictable branch per indirect branch and per accounted bracket. kz3_wacct_base() exposes KZ3_PROF time zero.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): wrapper ours, body start upstream's (SPU_DIRECT init, `spu_depth_guard_check`, outer_ret_pc restore).
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index e5d6b0f9..97495254 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -882,6 +882,9 @@ void ppu_gcm_pump(void)
+     }
+     if (user) {
+         u32 cmd = (u32)user;
++        { extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);   /* KZ3 patch 1085 */
++          if (g_kz3_wtrace) { extern uint64_t kz3_wacct_now(void); extern void kz3_wacct_trace(int, uint32_t, uint64_t, uint64_t);
++                              const uint64_t n = kz3_wacct_now(); kz3_wacct_trace(35 /* KZ3_WT_UCMD_DELIVER */, cmd, n, n); } }
+         if (kz3_ft_on()) fprintf(stderr, "[ft] %llu deliver cmd=0x%08X opd=0x%08X\n", ps3_ms_now(), cmd, s_user_handler_opd);
+         if (s_user_handler_opd && g_ps3_guest_caller)
+             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+@@ -4491,6 +4494,9 @@ static void gcm_walker_user_command(u32 cmd)
+     { static unsigned long n = 0; if (n++ < 4 || (n % 1024) == 0)
+         fprintf(stderr, "[usercmd] HLE #%lu cmd=0x%08X\n", n, cmd); }
+     cellGcmQueueUserCommand(cmd);
++    { extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);   /* KZ3 patch 1085 */
++      if (g_kz3_wtrace) { extern uint64_t kz3_wacct_now(void); extern void kz3_wacct_trace(int, uint32_t, uint64_t, uint64_t);
++                          const uint64_t n = kz3_wacct_now(); kz3_wacct_trace(34 /* KZ3_WT_UCMD_QUEUE */, cmd, n, n); } }
+ }
+ 
+ void cellGcmQueueUserCommand(u32 cmd)
+diff --git a/runtime/diag/kz3_wait_acct.c b/runtime/diag/kz3_wait_acct.c
+index 0a890f72..be97e626 100644
+--- a/runtime/diag/kz3_wait_acct.c
++++ b/runtime/diag/kz3_wait_acct.c
+@@ -16,6 +16,7 @@
+ #endif
+ 
+ int g_kz3_wacct = -1;
++void (*g_kz3_wtrace)(const char* thr, int kind, uint32_t site, uint64_t t0, uint64_t t1) = 0;   /* patch 1085 */
+ 
+ enum { WA_SLOTS = 1024, WA_THREADS = 96 };
+ typedef struct { volatile uint64_t key; volatile uint64_t ns; volatile uint64_t n; } wa_slot;
+@@ -105,7 +106,8 @@ void kz3_wacct_end(int kind, uint32_t site, uint64_t t0)
+     if (!t0) return;
+     wa_thr* t = tls_get();
+     if (!t) return;
+-    uint64_t d = kz3_wacct_now() - t0;
++    const uint64_t t1 = kz3_wacct_now(), d = t1 - t0;
++    if (g_kz3_wtrace) g_kz3_wtrace(t->name, kind, site, t0, t1);   /* patch 1085 */
+     add(t, kind, site, d, 1);
+     if (--t->depth == 0) { t->top_ns[kind] += d; t->top_n[kind]++; }
+ }
+@@ -115,12 +117,23 @@ void kz3_wacct_note(int kind, uint32_t site, uint64_t ns)
+     if (!kz3_wacct_on()) return;
+     wa_thr* t = me();
+     if (t) add(t, kind, site, ns, 1);
++    if (t && g_kz3_wtrace) { const uint64_t n = kz3_wacct_now(); g_kz3_wtrace(t->name, kind, site, n - ns, n); }   /* 1085 */
+ }
+ 
++/* patch 1085: one event for the trace hook (no accounting) */
++void kz3_wacct_trace(int kind, uint32_t site, uint64_t t0, uint64_t t1)
++{
++    if (!g_kz3_wtrace) return;
++    wa_thr* t = me();
++    if (t) g_kz3_wtrace(t->name, kind, site, t0, t1);
++}
++uint64_t kz3_wacct_base(void) { return s_t0; }
++
+ void kz3_wacct_job(int image)
+ {
+     if (!kz3_wacct_on()) return;
+     wa_thr* t = me();
++    if (t && g_kz3_wtrace) { const uint64_t n = kz3_wacct_now(); g_kz3_wtrace(t->name, KZ3_WA_JOB, (uint32_t)image, n, n); }   /* 1085 */
+     if (!t || t->job_img == image) return;
+     uint64_t now = kz3_wacct_now();
+     if (t->job_img) add(t, KZ3_WA_JOB, (uint32_t)t->job_img, now - t->job_t0, 0);
+@@ -153,7 +166,11 @@ void kz3_wacct_name(const char* name)
+     __sync_lock_release(&lock);
+ }
+ 
+-void kz3_wacct_flip(void) { if (g_kz3_wacct > 0) __sync_fetch_and_add(&s_flips, 1); }
++void kz3_wacct_flip(void)
++{
++    if (g_kz3_wacct > 0) __sync_fetch_and_add(&s_flips, 1);
++    if (g_kz3_wtrace) { const uint64_t n = kz3_wacct_now(); kz3_wacct_trace(KZ3_WT_FLIP, 0, n, n); }   /* patch 1085 */
++}
+ 
+ /* ---- names ---------------------------------------------------------------------- */
+ /* Set by ppu_hle.cpp when it registers its first import: programs that link the runtime without the HLE
+diff --git a/runtime/diag/kz3_wait_acct.h b/runtime/diag/kz3_wait_acct.h
+index 777bbede..6d54a407 100644
+--- a/runtime/diag/kz3_wait_acct.h
++++ b/runtime/diag/kz3_wait_acct.h
+@@ -27,6 +27,19 @@ enum {
+     KZ3_WA_PARK,      /* GCM FIFO park, walker waited for the patch (site 0) */
+     KZ3_WA_NKIND
+ };
++/* KZ3 patch 1085 (diagnostic, opt-in): event trace. When g_kz3_wtrace is set (port/spu/kz3_frame_trace.c,
++ * KZ3_FRAME_TRACE) every accounted bracket and note, every job-module change, every flip and every WWS job call
++ * (PM -> job entry -> back) is also passed to it with its host times (ns, kz3_wacct_now) and the calling thread's
++ * wacct name. Kinds beyond KZ3_WA_NKIND: */
++enum {
++    KZ3_WT_FLIP = 32,
++    KZ3_WT_JOBCALL = 33,     /* site = image | runJobNum << 16 */
++    KZ3_WT_UCMD_QUEUE = 34,  /* GCM walker queued a user command (site = cmd) */
++    KZ3_WT_UCMD_DELIVER = 35 /* a PPU thread's pump runs its handler (site = cmd) */
++};
++extern void (*g_kz3_wtrace)(const char* thr, int kind, uint32_t site, uint64_t t0, uint64_t t1);
++void kz3_wacct_trace(int kind, uint32_t site, uint64_t t0, uint64_t t1);  /* patch 1085 */
++uint64_t kz3_wacct_base(void);                                            /* patch 1085: KZ3_PROF's time zero (ns) */
+ 
+ extern int g_kz3_wacct;                     /* -1 = not read yet, 0 = off, else window ms */
+ int      kz3_wacct_init(void);
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index f729d82c..c1ffe7cf 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2963,6 +2963,27 @@ static int spu_smc_microstep_body(spu_context* ctx)
+ /* KZ3 patch 1068: KZ3_PMEND_IB=1 also marks every indirect-branch entry in the [pm-end] ring (B:pc, then L:link
+  * register) and the SMC microstep (M:pc entry, F:pc when it gives up). Off by default (one global test). */
+ int g_kz3_pmend_ib = -1;
++/* KZ3 patch 1085: the open WWS job call of this host thread (KZ3_FRAME_TRACE) */
++extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
++extern uint64_t kz3_wacct_now(void);
++extern void kz3_wacct_trace(int, uint32_t, uint64_t, uint64_t);
++static SPU_THREAD_LOCAL struct { uint64_t t0; uint32_t lr, site; int depth; } t_kz3_jc;
++void kz3_jobcall_open(spu_context* ctx, uint32_t lr)
++{
++    const uint32_t jn = ((uint32_t)ctx->ls[0x12E2] << 8) | ctx->ls[0x12E3];
++    t_kz3_jc.t0 = kz3_wacct_now();
++    t_kz3_jc.lr = lr;
++    t_kz3_jc.depth = ctx->host_depth;
++    t_kz3_jc.site = jn << 16;   /* the image is known once the overlay matched: taken at the close */
++}
++void kz3_jobcall_close(spu_context* ctx, uint32_t pc)
++{
++    if (!t_kz3_jc.t0 || (pc & SPU_LS_MASK) != t_kz3_jc.lr || ctx->host_depth != t_kz3_jc.depth) return;
++    kz3_wacct_trace(33 /* KZ3_WT_JOBCALL */, t_kz3_jc.site | (uint32_t)(ctx->resident_ovl & 0xFFFF), t_kz3_jc.t0,
++                    kz3_wacct_now());
++    t_kz3_jc.t0 = 0;
++}
++
+ void spu_indirect_branch(spu_context* ctx)
+ {
+     if (__builtin_expect(g_kz3_pmend_ib != 0, 0)) {
+@@ -3476,6 +3497,20 @@ void spu_indirect_branch(spu_context* ctx)
+     }
+     if (fn) {
+         spu_check_stack_reset(ctx, fn);
++        /* KZ3 patch 1085: KZ3_FRAME_TRACE times each WWS job call: the jm policy module (image 2) branching from its
++         * own code into the job code buffer (LS[0x1320]) opens a record; it closes when control is back at the
++         * PM's link, here (the job returned normally) or in spu_drain_call_full (it ran on as trampolines). */
++        if (__builtin_expect(g_kz3_wtrace != 0, 0) && ctx->image_id == 2) {
++            const uint32_t cb = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16) |
++                                ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
++            const uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++            if (cb >= 0x4000 && ctx->pc >= cb && lr < cb) {
++                kz3_jobcall_open(ctx, lr);
++                fn(ctx);
++                if (!g_spu_trampoline_fn) kz3_jobcall_close(ctx, ctx->pc);
++                return;
++            }
++        }
+         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
+          * Bink decoder's per-command dispatch does) must not grow the host
+          * stack -- a plain call here leaked a resolver+callee frame per
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 79bd0818..b0015141 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -596,7 +596,18 @@ typedef void (*spu_drain_fn)(spu_context*);
+ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
+ 
+ 
++static void spu_drain_call_body(spu_context* ctx, uint32_t return_pc);
++/* KZ3 patch 1085: a WWS job call that ran on as trampolines ends when the PM's drain returns at its link */
+ void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
++{
++    spu_drain_call_body(ctx, return_pc);
++    extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
++    if (__builtin_expect(g_kz3_wtrace != 0, 0)) {
++        extern void kz3_jobcall_close(spu_context*, uint32_t);
++        kz3_jobcall_close(ctx, return_pc);
++    }
++}
++static void spu_drain_call_body(spu_context* ctx, uint32_t return_pc)
+ {
+     if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
+     spu_depth_guard_check(ctx);

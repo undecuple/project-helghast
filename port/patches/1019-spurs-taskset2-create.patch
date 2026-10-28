@@ -1,0 +1,105 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -896,6 +896,101 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
+     return spurs_create_taskset(spurs, taskset, 0, NULL, 0, size);
+ }
+ 
++/* KZ3 patch 1019: the CellSpursTaskset2 pair. KZ3 creates its level-load taskset with
++ *   _cellSpursTasksetAttribute2Initialize(attr, 0); attr->name/args/priority/max_contention = ...;
++ *   cellSpursCreateTaskset2(spurs, taskset (0x2900 bytes, 128-aligned), attr)       (caller 0x008E01B8)
++ * and both used to be unresolved (fake CELL_OK), so the taskset never existed. Guest layout of
++ * CellSpursTasksetAttribute2 (128 bytes), confirmed by the field writes at 0x008E0228..0x008E0240:
++ *   +0x00 u32 revision, +0x04 u32 name, +0x08 u64 args, +0x10 u8 priority[8], +0x18 u32 max_contention,
++ *   +0x1C u32 enable_clear_ls, +0x20 u32 task_name_buffer, rest reserved.
++ * ASSUMPTION (SDK defaults, not seen in the binary): priority 1 for all eight SPUs, max_contention 8.
++ * The taskset itself goes through cellSpursCreateTaskset (real BE layout, 1005 args), with the size field
++ * set to the Taskset2 size. */
++#define KZ3_SPURS_TASKSET2_SIZE 0x2900u
++s32 _cellSpursTasksetAttribute2Initialize(void* attr, u32 revision)
++{
++    u32 a = (u32)(uintptr_t)attr;
++    if (!a) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
++    if (a & 7) return CELL_SPURS_TASK_ERROR_ALIGN;
++    for (u32 o = 0; o < 128; o += 8) vm_write64(a + o, 0);
++    vm_write32(a + 0x00, revision);
++    for (u32 i = 0; i < 8; i++) vm_write8(a + 0x10 + i, 1);
++    vm_write32(a + 0x18, 8);
++    printf("[cellSpurs] _TasksetAttribute2Initialize(attr=0x%08X rev=%u)\n", a, revision);
++    return CELL_OK;
++}
++
++s32 cellSpursCreateTaskset2(CellSpurs* spurs, void* taskset, const void* attr)
++{
++    u32 ts = (u32)(uintptr_t)taskset, a = (u32)(uintptr_t)attr;
++    u64 args = 0; u32 prio_ea = 0, maxc = 8, name = 0;
++    if (!ts) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
++    if (ts & 0x7F) return CELL_SPURS_TASK_ERROR_ALIGN;
++    if (a) { name = vm_read32(a + 0x04); args = vm_read64(a + 0x08); prio_ea = a + 0x10; maxc = vm_read32(a + 0x18); }
++    for (u32 o = 0; o < KZ3_SPURS_TASKSET2_SIZE; o += 8) vm_write64(ts + o, 0);
++    s32 rc = cellSpursCreateTaskset(spurs, (CellSpursTaskset*)(uintptr_t)ts, args,
++                                    (const u8*)(uintptr_t)prio_ea, maxc);
++    if (rc == CELL_OK) vm_write32(ts + CSTS_SIZE_FIELD, KZ3_SPURS_TASKSET2_SIZE);
++    printf("[cellSpurs] CreateTaskset2 taskset=0x%08X attr=0x%08X name=0x%08X args=0x%016llX maxContention=%u -> 0x%08X\n",
++           ts, a, name, (unsigned long long)args, maxc, (unsigned)rc);
++    return rc;
++}
++
++/* KZ3 patch 1019: the Task2 calls Havok's hkPs3SpuUtil makes on a Taskset2 (RE pass 11).
++ * CreateTask2 is CreateTask without a context save area or LS pattern (a Task2 cannot yield).
++ * JoinTask2 waits until the task's enabled bit (+0x30, cleared by spu_taskset_task_exited) drops.
++ * ASSUMPTION: the exit code is reported as 0 (the runtime does not record task exit codes yet). */
++static int kz3_task2_enabled(u32 ts, u32 id)
++{
++    return (vm_read8(ts + 0x30 + id / 8) >> (7 - (id & 7))) & 1;
++}
++
++s32 cellSpursCreateTask2(void* taskset, u32* id, const void* elf, const void* argument, const char* name)
++{
++    u32 ts = (u32)(uintptr_t)taskset;
++    if (!ts || !id || !elf) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
++    s32 rc = cellSpursCreateTask((CellSpursTaskset*)taskset, (CellSpursTaskId*)id, (void*)elf, NULL, 0, 0,
++                                 (u32)(uintptr_t)argument);
++    static int n = 0;
++    if (n++ < 16)
++        printf("[cellSpurs] CreateTask2 taskset=0x%08X elf=0x%08X arg=0x%08X name=0x%08X -> 0x%08X id=%u\n",
++               ts, (u32)(uintptr_t)elf, (u32)(uintptr_t)argument, (u32)(uintptr_t)name, (unsigned)rc,
++               rc == CELL_OK ? vm_read32((u32)(uintptr_t)id) : 0xFFFFFFFFu);
++    return rc;
++}
++
++s32 cellSpursTryJoinTask2(void* taskset, u32 id, s32* exitCode)
++{
++    u32 ts = (u32)(uintptr_t)taskset;
++    if (!ts) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
++    if (id >= CELL_SPURS_MAX_TASK) return CELL_SPURS_TASK_ERROR_INVAL;
++    if (kz3_task2_enabled(ts, id)) return CELL_SPURS_TASK_ERROR_BUSY;
++    if (exitCode) vm_write32((u32)(uintptr_t)exitCode, 0);
++    return CELL_OK;
++}
++
++s32 cellSpursJoinTask2(void* taskset, u32 id, s32* exitCode)
++{
++    u32 ts = (u32)(uintptr_t)taskset;
++    if (!ts) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
++    if (id >= CELL_SPURS_MAX_TASK) return CELL_SPURS_TASK_ERROR_INVAL;
++    unsigned spins = 0;
++    while (kz3_task2_enabled(ts, id)) {
++        Sleep(spins < 64 ? 0 : 1);
++        if (++spins == 20000) printf("[cellSpurs] JoinTask2 taskset=0x%08X id=%u still running after ~20 s\n", ts, id);
++    }
++    if (exitCode) vm_write32((u32)(uintptr_t)exitCode, 0);
++    return CELL_OK;
++}
++
++s32 cellSpursDestroyTaskset2(void* taskset)
++{
++    u32 ts = (u32)(uintptr_t)taskset;
++    if (!ts) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
++    printf("[cellSpurs] DestroyTaskset2 taskset=0x%08X\n", ts);
++    return CELL_OK;
++}
++
+ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
+ {
+     taskset = GUEST_PTR(taskset, CellSpursTaskset*);

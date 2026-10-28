@@ -1,0 +1,265 @@
+KZ3 patch 2058 (RSX pass 57): no draw is skipped while its PSO builds; keycap uploads change only prompt-cell texels.
+Menu text corruption (main/campaign menu lists blank, capital C missing; stray glyphs
+in "For less"): patch 2048 skipped every draw whose PSO was still building. KZ3 renders its text once per glyph
+(stencil-then-cover) into the glyph cache at 0x3A00000 and samples it from there, so a glyph whose draws were
+skipped stayed blank, or kept the glyph that held the slot before. The keycap atlas (0x042A9180, the menu prompt
+atlas, not a font) was a coincidence: KZ3_KEYCAPS=0 runs on a cold PSO cache lose the same glyphs.
+rsx_live_draw.c: a pending PSO entry is waited for (ld_apso_await: the worker wakes the walker through the
+condition variable after each finished build); [pso-async] prints awaited= / await= / max= instead of
+skipped-draws=. LD_PSO_ASYNC=0 still builds on the walker thread.
+rsx_keycaps.h: the caps are drawn into a full-size overlay, then each touched BC3 block is encoded once: freely when
+all 16 texels are in cells, else keeping its endpoints and the indices of the texels outside every cell, so those
+decode exactly as before (2039 re-encoded shared blocks: 2,030 HUD and 73 menu texels outside the cells changed, up
+to 156 / 223 levels, measured on the real atlases). BC3 colour blocks decode in four-colour mode always (2039 used
+BC1's c0 <= c1 rule). Host test tools/smoke/test_keycaps.sh case 8 (flips).
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -7057,10 +7057,13 @@
+  * and the game's Gfx jobs stalled ~6 s on the RSX label. With LD_PSO_ASYNC=1 the walker still decompiles and looks
+  * the blobs up (memory, then the disk cache), then hands the HLSL, render state and layout to worker threads
+  * (LD_PSO_ASYNC_THREADS, default 3) that compile the missing blobs and create the PSO (through the 2031 pipeline
+- * library). Until the PSO is back the key's entry is pending (pso NULL): its draws are skipped (counted as
+- * drop{pso}), as RPCS3's asynchronous shader mode does; a visible pop-in of a frame or a few. The walker merges
+- * finished builds at its next PSO lookup: blobs into the memory and disk caches, the key into pso_keys.bin, the PSO
+- * into its entry. Statistics: [pso-async] every 256 frames while builds ran. */
++ * library). Until the PSO is back the key's entry is pending (pso NULL). Rounds 49-56 skipped its draws (as RPCS3's
++ * asynchronous shader mode); RSX pass 57 found that this loses draws for good on targets the game renders once and
++ * keeps (the glyph cache: blank menu lists, missing capitals), so the walker now waits for the build
++ * (ld_apso_await) and no draw is skipped; the miss costs the walker the build time again, as LD_PSO_ASYNC=0. The
++ * walker merges finished builds at its next PSO lookup: blobs into the memory and disk caches, the key into
++ * pso_keys.bin, the PSO into its entry. Statistics: [pso-async] every 256 frames while builds ran (awaited = draws
++ * that waited, await = their total wait). */
+ typedef struct ld_apso_job {
+     struct ld_apso_job* next;
+     u64 key, vs_hash, ps_hash;
+@@ -7085,7 +7088,8 @@
+     HANDLE sem;
+     ld_apso_job *q_head, *q_tail, *done;
+     volatile LONG done_flag, in_flight;
+-    u64 submitted, finished, failed, skipped_draws, compile_us, create_us, latency_us, max_latency_us, merged;
++    u64 submitted, finished, failed, compile_us, create_us, latency_us, max_latency_us, merged;
++    u64 awaits, await_us, max_await_us;   /* RSX pass 57: walker waits for a pending build (no draw is skipped) */
+     u32 max_in_flight;
+ } g_apso;
+ 
+@@ -7161,8 +7165,9 @@
+         j->create_us = (unsigned)((q2.QuadPart - q1.QuadPart) * 1000000 / f.QuadPart);
+         EnterCriticalSection(&g_apso.cs);
+         j->next = g_apso.done; g_apso.done = j;
+-        LeaveCriticalSection(&g_apso.cs);
+         InterlockedExchange(&g_apso.done_flag, 1);
++        LeaveCriticalSection(&g_apso.cs);
++        WakeAllConditionVariable(&g_apso.cv);   /* RSX pass 57: a walker may wait for this build (ld_apso_await) */
+     }
+     return 0;
+ }
+@@ -7268,15 +7273,37 @@
+     }
+ }
+ 
++/* RSX pass 57: the walker waits for the pending build of g.psos[idx] and returns its PSO (NULL only when the build
++ * failed). Draws are never skipped while a build is in flight: a skipped draw is lost for good when its target
++ * keeps its content across frames. KZ3's text is such a target: glyphs are rendered once (stencil-then-cover) into
++ * the glyph cache at 0x3A00000 and sampled from there afterwards, so a glyph whose draws were skipped stayed blank
++ * (whole menu lists, capital C/A) or kept the glyph that held its slot before (arrows in "For less"). */
++static ID3D12PipelineState* ld_apso_await(u32 idx)
++{
++    LARGE_INTEGER t0, t1, f; QueryPerformanceCounter(&t0);
++    ld_apso_drain();
++    if (!g.psos[idx].pending) return g.psos[idx].pso;
++    while (g.psos[idx].pending) {
++        EnterCriticalSection(&g_apso.cs);
++        while (!g_apso.done) SleepConditionVariableCS(&g_apso.cv, &g_apso.cs, INFINITE);
++        LeaveCriticalSection(&g_apso.cs);
++        ld_apso_drain();
++    }
++    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
++    const u64 us = (u64)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);
++    g_apso.awaits++; g_apso.await_us += us; if (us > g_apso.max_await_us) g_apso.max_await_us = us;
++    return g.psos[idx].pso;
++}
++
+ static void ld_apso_stat_print(void)
+ {
+     if (!g_apso.submitted) return;
+     fprintf(stderr, "[pso-async] frame=%u submitted=%llu finished=%llu failed=%llu in-flight=%ld max-in-flight=%u "
+-                    "skipped-draws=%llu worker compile=%.1f ms create=%.1f ms latency avg=%.1f max=%.1f ms"
++                    "awaited=%llu await=%.1f ms max=%.1f ms worker compile=%.1f ms create=%.1f ms latency avg=%.1f max=%.1f ms"
+                     " compiles-owned=%llu deduped=%llu waits=%llu in-flight-blobs=%u\n",
+             g_ld_frames, (unsigned long long)g_apso.submitted, (unsigned long long)g_apso.finished,
+             (unsigned long long)g_apso.failed, (long)g_apso.in_flight, g_apso.max_in_flight,
+-            (unsigned long long)g_apso.skipped_draws, g_apso.compile_us / 1e3, g_apso.create_us / 1e3,
++            (unsigned long long)g_apso.awaits, g_apso.await_us / 1e3, g_apso.max_await_us / 1e3, g_apso.compile_us / 1e3, g_apso.create_us / 1e3,
+             g_apso.finished ? g_apso.latency_us / 1e3 / (double)g_apso.finished : 0.0, g_apso.max_latency_us / 1e3,
+             (unsigned long long)g_apso.tab.owned, (unsigned long long)g_apso.tab.deduped,
+             (unsigned long long)g_apso.waits, g_apso.tab.count);
+@@ -7782,8 +7809,8 @@
+             g_ld_profile.total.pso_hits++;
+ #endif
+             if (g.psos[i].preloaded) { g.psos[i].preloaded = 0; g_ld_pl_used++; }
+-            if (g.psos[i].pending) g_apso.skipped_draws++;   /* patch 2048: build in flight, draw skipped */
+             LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
++            if (g.psos[i].pending) return ld_apso_await(i);   /* RSX pass 57: wait, never skip */
+             return g.psos[i].pso;
+         }
+     }
+@@ -7931,7 +7958,7 @@
+     int apso_pending = 0;   /* patch 2048 */
+     if (vi > 0 && fi > 0 && ld_apso_on() &&
+         ld_apso_submit(vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key)) {
+-        apso_pending = 1; g_apso.skipped_draws++;
++        apso_pending = 1;
+     } else if (vi > 0 && fi > 0) {
+         LDW_T0(bp_t0);
+         pso = build_pso(
+@@ -7966,6 +7993,7 @@
+     g.psos[g.n_psos].pso = pso;
+     g.psos[g.n_psos].pending = (u8)apso_pending;   /* patch 2048 */
+     g.n_psos++;
++    if (apso_pending) return ld_apso_await(g.n_psos - 1u);   /* RSX pass 57: the draw waits for its build */
+     return pso;
+ }
+ 
+--- a/libs/video/rsx_keycaps.h
++++ b/libs/video/rsx_keycaps.h
+@@ -176,10 +176,8 @@
+     uint64_t ab = 0; for (int i = 0; i < 6; i++) ab |= (uint64_t)b[2 + i] << (8 * i);
+     uint16_t c0 = (uint16_t)(b[8] | (b[9] << 8)), c1 = (uint16_t)(b[10] | (b[11] << 8));
+     int p[4][3]; kc_565(c0, p[0]); kc_565(c1, p[1]);
+-    for (int k = 0; k < 3; k++) {
+-        if (c0 > c1) { p[2][k] = (2 * p[0][k] + p[1][k]) / 3; p[3][k] = (p[0][k] + 2 * p[1][k]) / 3; }
+-        else { p[2][k] = (p[0][k] + p[1][k]) / 2; p[3][k] = 0; }
+-    }
++    (void)c0; (void)c1;   /* RSX pass 57: BC2/BC3 colour blocks are always four-colour (no c0 <= c1 mode as BC1) */
++    for (int k = 0; k < 3; k++) { p[2][k] = (2 * p[0][k] + p[1][k]) / 3; p[3][k] = (p[0][k] + 2 * p[1][k]) / 3; }
+     uint32_t cb = (uint32_t)b[12] | ((uint32_t)b[13] << 8) | ((uint32_t)b[14] << 16) | ((uint32_t)b[15] << 24);
+     for (int i = 0; i < 16; i++) {
+         const int ci = (cb >> (2 * i)) & 3;
+@@ -194,8 +192,8 @@
+ }
+ 
+ /* Plain range-fit encoder: alpha endpoints = min/max (8-level mode), colour endpoints = the brightest and darkest
+- * visible texel (4-colour mode). Good enough for grey keycaps; the game's own neighbours in a shared block lose a
+- * little precision (they were DXT5 already). */
++ * visible texel (4-colour mode). Good enough for grey keycaps. Only for blocks whose 16 texels are all inside prompt
++ * cells (RSX pass 57; blocks shared with other art go through kc_bc3_encode_keep). */
+ static void kc_bc3_encode(uint8_t px[16][4], uint8_t* b)
+ {
+     int amin = 255, amax = 0;
+@@ -241,6 +239,36 @@
+     b[12] = (uint8_t)cb; b[13] = (uint8_t)(cb >> 8); b[14] = (uint8_t)(cb >> 16); b[15] = (uint8_t)(cb >> 24);
+ }
+ 
++/* RSX pass 57: a block that also holds texels outside every prompt cell. The block keeps its endpoints (colour and
++ * alpha) and those texels' indices, so they decode exactly as before; only the texels inside a cell get new
++ * indices, the nearest of the block's own palette. in[i] = 1 for a texel inside a cell. */
++static void kc_bc3_encode_keep(const uint8_t px[16][4], const uint8_t in[16], uint8_t* b)
++{
++    int al[8]; al[0] = b[0]; al[1] = b[1];
++    if (al[0] > al[1]) for (int k = 0; k < 6; k++) al[2 + k] = ((6 - k) * al[0] + (k + 1) * al[1]) / 7;
++    else { for (int k = 0; k < 4; k++) al[2 + k] = ((4 - k) * al[0] + (k + 1) * al[1]) / 5; al[6] = 0; al[7] = 255; }
++    uint64_t ab = 0; for (int i = 0; i < 6; i++) ab |= (uint64_t)b[2 + i] << (8 * i);
++    int p[4][3];
++    kc_565((uint16_t)(b[8] | (b[9] << 8)), p[0]); kc_565((uint16_t)(b[10] | (b[11] << 8)), p[1]);
++    for (int k = 0; k < 3; k++) { p[2][k] = (2 * p[0][k] + p[1][k]) / 3; p[3][k] = (p[0][k] + 2 * p[1][k]) / 3; }
++    uint32_t cb = (uint32_t)b[12] | ((uint32_t)b[13] << 8) | ((uint32_t)b[14] << 16) | ((uint32_t)b[15] << 24);
++    for (int i = 0; i < 16; i++) {
++        if (!in[i]) continue;
++        int best = 0, bd = 1 << 30;
++        for (int k = 0; k < 8; k++) { int d = abs(al[k] - px[i][3]); if (d < bd) { bd = d; best = k; } }
++        ab = (ab & ~((uint64_t)7 << (3 * i))) | ((uint64_t)best << (3 * i));
++        best = 0; bd = 1 << 30;
++        for (int k = 0; k < 4; k++) {
++            int d0 = p[k][0] - px[i][0], d1 = p[k][1] - px[i][1], d2 = p[k][2] - px[i][2];
++            int d = d0 * d0 * 2 + d1 * d1 * 5 + d2 * d2;
++            if (d < bd) { bd = d; best = k; }
++        }
++        cb = (cb & ~(3u << (2 * i))) | ((uint32_t)best << (2 * i));
++    }
++    for (int i = 0; i < 6; i++) b[2 + i] = (uint8_t)(ab >> (8 * i));
++    b[12] = (uint8_t)cb; b[13] = (uint8_t)(cb >> 8); b[14] = (uint8_t)(cb >> 16); b[15] = (uint8_t)(cb >> 24);
++}
++
+ /* ---- drawing ------------------------------------------------------------------------------------------------- */
+ 
+ static float kc_clamp01(float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; }
+@@ -398,36 +426,51 @@
+     if (kind == KC_NONE || rsx_keycaps_sig() < 2) return NULL;
+     const kc_cell* cells = kind == KC_HUD ? kc_hud_cells : kc_menu_cells;
+     const unsigned nc = kind == KC_HUD ? sizeof kc_hud_cells / sizeof kc_hud_cells[0] : sizeof kc_menu_cells / sizeof kc_menu_cells[0];
++    /* RSX pass 57: the caps are drawn into a full-size overlay first (in = which texels belong to a drawn cell), then
++     * each touched block is re-encoded once: freely when all 16 texels are in cells, else with
++     * kc_bc3_encode_keep so the texels outside every cell keep their exact values. The guest bytes are never
++     * written; the pad pictures come back by uploading them unchanged (sig 1). */
+     uint8_t* out = (uint8_t*)malloc(bytes);
+-    if (!out) return NULL;
++    uint8_t* ov = (uint8_t*)malloc((size_t)w * h * 4);
++    uint8_t* in = (uint8_t*)calloc((size_t)w * h, 1);
++    if (!out || !ov || !in) { free(out); free(ov); free(in); return NULL; }
+     memcpy(out, src, bytes);
+-    const uint32_t bw = w / 4;
++    const uint32_t bw = w / 4, bh = h / 4;
+     for (unsigned c = 0; c < nc; c++) {
+         const kc_cell* k = &cells[c];
+         char lab[24]; int vk;
+         if (!strcmp(k->input, "ls") || !strcmp(k->input, "rs")) vk = kc_stick_label(k->input, lab, sizeof lab);
+         else { vk = kc_cell_key(k->input, kind == KC_MENU); lab[0] = 0; if (vk) kc_label(vk, lab, sizeof lab); }
+-        if (!vk) continue;
++        if (!vk || k->r >= w || k->b >= h) continue;
+         const int cw = k->r - k->l + 1, ch = k->b - k->t + 1;
+         uint8_t* cap = (uint8_t*)malloc((size_t)cw * ch * 4);
+         if (!cap) continue;
+         /* stick cells show text only (no arrow picture for a single arrow key) */
+         kc_draw_cap(cap, cw, ch, lab, (!strcmp(k->input, "ls") || !strcmp(k->input, "rs")) ? 0 : vk);
+-        for (uint32_t by = k->t / 4; by <= (uint32_t)k->b / 4 && by < h / 4; by++)
+-            for (uint32_t bx = k->l / 4; bx <= (uint32_t)k->r / 4 && bx < bw; bx++) {
+-                uint8_t* blk = out + ((size_t)by * bw + bx) * 16;
+-                uint8_t px[16][4];
+-                kc_bc3_decode(blk, px);
+-                for (int i = 0; i < 16; i++) {
+-                    const int x = (int)bx * 4 + (i & 3), y = (int)by * 4 + (i >> 2);
+-                    if (x < k->l || x > k->r || y < k->t || y > k->b) continue;
+-                    memcpy(px[i], cap + ((size_t)(y - k->t) * cw + (x - k->l)) * 4, 4);
+-                }
+-                kc_bc3_encode(px, blk);
+-            }
++        for (int y = 0; y < ch; y++) {
++            memcpy(ov + ((size_t)(k->t + y) * w + k->l) * 4, cap + (size_t)y * cw * 4, (size_t)cw * 4);
++            memset(in + (size_t)(k->t + y) * w + k->l, 1, (size_t)cw);
++        }
+         free(cap);
+         (*n_cells)++;
+     }
++    for (uint32_t by = 0; by < bh; by++)
++        for (uint32_t bx = 0; bx < bw; bx++) {
++            uint8_t bin[16]; int n_in = 0;
++            for (int i = 0; i < 16; i++) {
++                bin[i] = in[(size_t)(by * 4 + (i >> 2)) * w + bx * 4 + (i & 3)];
++                n_in += bin[i];
++            }
++            if (!n_in) continue;
++            uint8_t* blk = out + ((size_t)by * bw + bx) * 16;
++            uint8_t px[16][4];
++            kc_bc3_decode(blk, px);
++            for (int i = 0; i < 16; i++)
++                if (bin[i]) memcpy(px[i], ov + ((size_t)(by * 4 + (i >> 2)) * w + bx * 4 + (i & 3)) * 4, 4);
++            if (n_in == 16) kc_bc3_encode(px, blk);
++            else kc_bc3_encode_keep(px, bin, blk);
++        }
++    free(ov); free(in);
+     return out;
+ }
+ 
+--- a/libs/video/rsx_pso_async.h
++++ b/libs/video/rsx_pso_async.h
+@@ -2,8 +2,8 @@
+  * (LD_PSO_ASYNC), kept apart from the D3D12 code so a host test can check it with no GPU
+  * (tools/smoke/test_pso_async.c).
+  *
+- * 1. Pending entries. A PSO cache entry whose build is in flight has pso == NULL and pending = 1: a lookup returns
+- *    NULL, so the draw is skipped. When the build is back, RSX_APSO_MERGE finds the key's pending entry and stores
++ * 1. Pending entries. A PSO cache entry whose build is in flight has pso == NULL and pending = 1: a lookup waits for
++ *    the build (RSX pass 57, ld_apso_await; rounds 49-56 skipped the draw). When the build is back, RSX_APSO_MERGE finds the key's pending entry and stores
+  *    the PSO (or NULL for a failed build) and clears pending; with no pending entry for the key the caller releases
+  *    the PSO.
+  * 2. In-flight shader compiles (dedupe). Several jobs often need the same VS or PS blob before any of them is back.

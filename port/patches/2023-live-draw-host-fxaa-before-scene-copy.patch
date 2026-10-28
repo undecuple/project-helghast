@@ -1,0 +1,354 @@
+live-draw: host anti-aliasing pass (FXAA, ENHANCEMENT) on a frame-sized A8R8G8B8 colour surface right before an
+NV0039 copy of the whole surface writes it back to guest memory.
+
+Why (Killzone 3): the game anti-aliases with MLAA on the SPUs (post job 0x26, Transpose/MLAA/Transpose/MLAA queued by
+the PPU function 0x1FF008 in v1.00 / 0x20A958 in 1.14) in place on the NV0039 copy of the 1280x720 scene in main memory
+(local 0x1300000 -> main 0x1310400). MLAA bakes a 1280-pixel pitch (blocks a higher internal resolution) and is one of
+the two hottest SPU jobs. With the port skipping that call, live-draw anti-aliases the scene on the GPU where the
+copy picks it up, so the SPU Upsample and the composite downstream are unchanged.
+
+What: one compute pass (FXAA 3.11 quality-style: 4-neighbour luma early exit at max(0.0833, 0.166 * lumaMax),
+edge direction from the 3x3 luma, 8-step end search 1.5/2/2/2/2/4/8, subpixel term 0.75) from the surface's SRV into
+a UAV texture, copied back over the surface. Alpha is passed through; pixels under the contrast threshold are written
+back bit-exactly. Once per frame per surface; pipeline built lazily (a compile failure only disables the pass).
+Setting: KZ3_HOST_AA=fxaa|off (unset = fxaa). The pass runs when the mode is fxaa and either KZ3_HOST_AA is set
+explicitly or the port called rsx_live_draw_host_aa_arm(1) after skipping the game's own AA, so FXAA never stacks
+on SPU MLAA. Diagnostic: "[host-aa] fxaa on surface ..." (first 4), rsx_live_draw_debug_host_aa_passes().
+
+Verified: tools/smoke/test_host_aa.c under Proton (rotated 2-colour checker, 1280x720, three frames): flat pixels
+875,111 unchanged, alpha unchanged, 73.6 % of 46,489 edge pixels changed, PASS with KZ3_HOST_AA=fxaa and with --arm;
+KZ3_HOST_AA=off and unset without --arm FAIL (0 edge pixels changed).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 3aa33b26..c4c13fbe 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -44,6 +44,10 @@ void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
+ { (void)d; (void)o; (void)v; }
+ u32  rsx_live_draw_note_guest_write(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; return 0; }
+ u32  rsx_live_draw_writeback_range(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; return 0; }
++int  rsx_live_draw_host_aa_mode(void) { return 0; }
++void rsx_live_draw_host_aa_arm(int on) { (void)on; }
++int  rsx_live_draw_host_aa_active(void) { return 0; }
++u32  rsx_live_draw_debug_host_aa_passes(void) { return 0; }
+ void rsx_live_draw_note_guest_write_async(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ u32  rsx_live_draw_before_guest_sync(void) { return 0; }
+@@ -171,7 +175,9 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ /* Top-left windows of a surface for smaller textures that alias it (see surface_window). */
+ #define LD_SWIN_PER       2
+ #define SRV_SURF_WIN_BASE (SRV_FEEDBACK_BASE + MAX_SURFACES)
+-#define SRV_CPU_HEAP_SLOTS (SRV_SURF_WIN_BASE + MAX_SURFACES * LD_SWIN_PER)
++/* Patch 2023: UAV of the host AA pass's output texture (see ld_host_aa). */
++#define UAV_HOST_AA       (SRV_SURF_WIN_BASE + MAX_SURFACES * LD_SWIN_PER)
++#define SRV_CPU_HEAP_SLOTS (UAV_HOST_AA + 1)
+ #define SRV_TABLE_SIZE   16
+ #define SRV_RING_TABLES  4096
+ 
+@@ -10959,6 +10965,271 @@ void rsx_live_draw_debug_writeback_stats(double* us_total, u32* batches, u32* su
+     if (gpu_waits) *gpu_waits = g_ld_wb.waits;
+ }
+ 
++/* Patch 2023 (ENHANCEMENT): host anti-aliasing pass. Killzone 3 anti-aliases
++ * with MLAA on the SPUs (post job 0x26 with a hardcoded 1280-pixel pitch, run
++ * in place on the NV0039 copy of the scene in main memory). When the port
++ * skips that job (a PPU override of the MLAA call, see rsx_live_draw.h), the
++ * host runs FXAA (3.11 quality-style, one compute pass) on the scene surface
++ * right before the NV0039 copy writes it back, so the copy carries the
++ * anti-aliased scene into the post chain.
++ * Setting: KZ3_HOST_AA=fxaa|off. Unset = fxaa, but the pass only runs once
++ * the port armed it (rsx_live_draw_host_aa_arm, i.e. the game's own AA is
++ * off), so FXAA never stacks on SPU MLAA; an explicit KZ3_HOST_AA=fxaa runs
++ * it unconditionally (tests). Alpha is passed through untouched (the post
++ * chain may keep data there); pixels whose 4-neighbourhood luma contrast is
++ * under the edge threshold are written back bit-exactly. */
++static ID3D12RootSignature* g_aa_rootsig;
++static ID3D12PipelineState* g_aa_pso;
++static ID3D12Resource* g_aa_tex;
++static u32 g_aa_w, g_aa_h, g_aa_failed, g_aa_passes, g_aa_armed;
++static u32 g_aa_frame[MAX_SURFACES];
++static D3D12_RESOURCE_STATES g_aa_state;
++
++int rsx_live_draw_host_aa_mode(void)
++{
++    static int mode = -1;
++    if (mode < 0) {
++        const char* e = getenv("KZ3_HOST_AA");
++        mode = (e && (!_stricmp(e, "off") || !strcmp(e, "0"))) ? 0 : 1;
++    }
++    return mode;
++}
++void rsx_live_draw_host_aa_arm(int on) { g_aa_armed = on ? 1u : 0u; }
++int rsx_live_draw_host_aa_active(void)
++{
++    const char* e = getenv("KZ3_HOST_AA");
++    return rsx_live_draw_host_aa_mode() && (g_aa_armed || (e && *e));
++}
++u32 rsx_live_draw_debug_host_aa_passes(void) { return g_aa_passes; }
++
++static int ld_host_aa_pipeline(void)
++{
++    if (g_aa_pso) return 1;
++    if (g_aa_failed) return 0;
++    g_aa_failed = 1;
++    /* Sizes come as root constants (Wine's d3dcompiler rejects
++     * RWTexture2D::GetDimensions, see make_depth_snapshot_pipeline). No
++     * arrays, attributes or early loop exits, for vkd3d-shader's HLSL. */
++    static const char source[] =
++        "Texture2D<float4> src : register(t0);\n"
++        "RWTexture2D<float4> dst : register(u0);\n"
++        "SamplerState lin : register(s0);\n"
++        "cbuffer aa : register(b0) { uint W; uint H; float rw; float rh; };\n"
++        "float L(float4 c) { return dot(c.rgb, float3(0.299, 0.587, 0.114)); }\n"
++        "float Lat(int2 p) { return L(src.Load(int3(clamp(p, int2(0, 0), int2(W - 1, H - 1)), 0))); }\n"
++        "float Luv(float2 uv) { return L(src.SampleLevel(lin, uv, 0)); }\n"
++        "[numthreads(8, 8, 1)]\n"
++        "void main(uint3 id : SV_DispatchThreadID) {\n"
++        "  if (id.x >= W || id.y >= H) return;\n"
++        "  int2 p = int2(id.xy);\n"
++        "  float4 cM = src.Load(int3(p, 0));\n"
++        "  float lM = L(cM);\n"
++        "  float lN = Lat(p + int2(0, -1)), lS = Lat(p + int2(0, 1));\n"
++        "  float lW = Lat(p + int2(-1, 0)), lE = Lat(p + int2(1, 0));\n"
++        "  float lMax = max(max(max(lN, lS), max(lW, lE)), lM);\n"
++        "  float lMin = min(min(min(lN, lS), min(lW, lE)), lM);\n"
++        "  float range = lMax - lMin;\n"
++        "  if (range < max(0.0833, lMax * 0.166)) { dst[p] = cM; return; }\n"
++        "  float lNW = Lat(p + int2(-1, -1)), lNE = Lat(p + int2(1, -1));\n"
++        "  float lSW = Lat(p + int2(-1, 1)), lSE = Lat(p + int2(1, 1));\n"
++        "  float lNS = lN + lS, lWE = lW + lE;\n"
++        "  float lNWSW = lNW + lSW, lNESE = lNE + lSE, lNWNE = lNW + lNE, lSWSE = lSW + lSE;\n"
++        "  float eH = abs(-2.0 * lW + lNWSW) + abs(-2.0 * lM + lNS) * 2.0 + abs(-2.0 * lE + lNESE);\n"
++        "  float eV = abs(-2.0 * lS + lSWSE) + abs(-2.0 * lM + lWE) * 2.0 + abs(-2.0 * lN + lNWNE);\n"
++        "  bool horz = eH >= eV;\n"
++        "  float subA = (lNS + lWE) * 2.0 + lNWSW + lNESE;\n"
++        "  float subC = saturate(abs(subA / 12.0 - lM) / range);\n"
++        "  float subF = (-2.0 * subC + 3.0) * subC * subC;\n"
++        "  float subH = subF * subF * 0.75;\n"
++        "  float len = horz ? rh : rw;\n"
++        "  if (!horz) { lN = lW; lS = lE; }\n"
++        "  float gN = lN - lM, gS = lS - lM;\n"
++        "  bool pairN = abs(gN) >= abs(gS);\n"
++        "  float grad = max(abs(gN), abs(gS));\n"
++        "  if (pairN) len = -len;\n"
++        "  float lNN = pairN ? lN + lM : lS + lM;\n"
++        "  float2 posM = (float2(p) + 0.5) * float2(rw, rh);\n"
++        "  float2 posB = posM;\n"
++        "  if (horz) posB.y += len * 0.5; else posB.x += len * 0.5;\n"
++        "  float2 off = horz ? float2(rw, 0.0) : float2(0.0, rh);\n"
++        "  float2 posN = posB - off, posP = posB + off;\n"
++        "  float gs = grad * 0.25;\n"
++        "  bool mLTZ = (lM - lNN * 0.5) < 0.0;\n"
++        "  float eN = Luv(posN) - lNN * 0.5, eP = Luv(posP) - lNN * 0.5;\n"
++        "  bool dN = abs(eN) >= gs, dP = abs(eP) >= gs;\n"
++        "  for (int i = 0; i < 8; i++) {\n"
++        "    float st = i == 0 ? 1.5 : (i < 5 ? 2.0 : (i == 5 ? 4.0 : 8.0));\n"
++        "    if (!dN) posN -= off * st;\n"
++        "    if (!dP) posP += off * st;\n"
++        "    if (!dN) eN = Luv(posN) - lNN * 0.5;\n"
++        "    if (!dP) eP = Luv(posP) - lNN * 0.5;\n"
++        "    dN = dN || abs(eN) >= gs;\n"
++        "    dP = dP || abs(eP) >= gs;\n"
++        "  }\n"
++        "  float dstN = horz ? posM.x - posN.x : posM.y - posN.y;\n"
++        "  float dstP = horz ? posP.x - posM.x : posP.y - posM.y;\n"
++        "  bool goodN = (eN < 0.0) != mLTZ, goodP = (eP < 0.0) != mLTZ;\n"
++        "  bool dirN = dstN < dstP;\n"
++        "  float d = min(dstN, dstP);\n"
++        "  float off1 = (dirN ? goodN : goodP) ? 0.5 - d / (dstN + dstP) : 0.0;\n"
++        "  float o = max(off1, subH);\n"
++        "  if (horz) posM.y += o * len; else posM.x += o * len;\n"
++        "  dst[p] = float4(src.SampleLevel(lin, posM, 0).rgb, cM.a);\n"
++        "}\n";
++    ID3DBlob* cs = NULL; ID3DBlob* err = NULL;
++    HRESULT hr = D3DCompile(source, sizeof(source) - 1u, "host_aa_fxaa", NULL, NULL, "main", "cs_5_0",
++                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[host-aa] FXAA compile failed hr=0x%08lX: %s\n", (unsigned long)hr,
++                err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "<no diagnostics>");
++        if (err) err->lpVtbl->Release(err);
++        return 0;
++    }
++    if (err) err->lpVtbl->Release(err);
++    D3D12_DESCRIPTOR_RANGE rg[2] = {0};
++    rg[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[0].NumDescriptors = 1;
++    rg[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rg[1].NumDescriptors = 1;
++    D3D12_ROOT_PARAMETER rp[3] = {0};
++    for (u32 i = 0; i < 2; i++) {
++        rp[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++        rp[i].DescriptorTable.NumDescriptorRanges = 1;
++        rp[i].DescriptorTable.pDescriptorRanges = &rg[i];
++        rp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    }
++    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    rp[2].Constants.Num32BitValues = 4;
++    rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    D3D12_STATIC_SAMPLER_DESC ss = {0};
++    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    ss.MaxLOD = D3D12_FLOAT32_MAX;
++    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    D3D12_ROOT_SIGNATURE_DESC rd = {0};
++    rd.NumParameters = 3; rd.pParameters = rp;
++    rd.NumStaticSamplers = 1; rd.pStaticSamplers = &ss;
++    ID3DBlob* sig = NULL;
++    hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
++    if (err) err->lpVtbl->Release(err);
++    if (SUCCEEDED(hr)) {
++        hr = g.dev->lpVtbl->CreateRootSignature(g.dev, 0, sig->lpVtbl->GetBufferPointer(sig),
++                                                sig->lpVtbl->GetBufferSize(sig),
++                                                &IID_ID3D12RootSignature, (void**)&g_aa_rootsig);
++        sig->lpVtbl->Release(sig);
++    }
++    if (SUCCEEDED(hr)) {
++        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {0};
++        pd.pRootSignature = g_aa_rootsig;
++        pd.CS.pShaderBytecode = cs->lpVtbl->GetBufferPointer(cs);
++        pd.CS.BytecodeLength = cs->lpVtbl->GetBufferSize(cs);
++        hr = g.dev->lpVtbl->CreateComputePipelineState(g.dev, &pd, &IID_ID3D12PipelineState, (void**)&g_aa_pso);
++    }
++    cs->lpVtbl->Release(cs);
++    if (FAILED(hr) || !g_aa_pso) {
++        fprintf(stderr, "[host-aa] FXAA pipeline failed hr=0x%08lX\n", (unsigned long)hr);
++        return 0;
++    }
++    g_aa_failed = 0;
++    return 1;
++}
++
++/* Output texture (UAV) of the surface's size; it is copied over the surface. */
++static int ld_host_aa_target(u32 w, u32 h)
++{
++    if (g_aa_tex && g_aa_w == w && g_aa_h == h) return 1;
++    if (g_aa_tex) { retire_texture(g_aa_tex); g_aa_tex = NULL; }
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC rd = {0};
++    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
++    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
++    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
++            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&g_aa_tex)))
++        { g_aa_tex = NULL; return 0; }
++    g_aa_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    g_aa_w = w; g_aa_h = h;
++    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
++    ud.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++    g.dev->lpVtbl->CreateUnorderedAccessView(g.dev, g_aa_tex, NULL, &ud, srv_cpu(UAV_HOST_AA));
++    return 1;
++}
++
++/* Anti-alias colour surface i in place (recorded into the open list). Once
++ * per frame per surface; only A8R8G8B8 surfaces of at least 640x360. */
++static int ld_host_aa(u32 i)
++{
++    if (i >= MAX_SURFACES || !rsx_live_draw_host_aa_active()) return 0;
++    surface_t* sf = &g.surfaces[i];
++    if (!sf->tex || sf->fmt != DXGI_FORMAT_R8G8B8A8_UNORM || sf->w < 640u || sf->h < 360u) return 0;
++    if (g_aa_frame[i] == g_ld_frames + 1u) return 0;
++    if (!ld_host_aa_pipeline() || !ld_host_aa_target(sf->w, sf->h)) return 0;
++    if (g.srv_ring_used >= SRV_RING_TABLES) return 0;
++    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
++    g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
++    cpu.ptr += (size_t)base * g.srv_step;
++    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(SRV_SURFACE_BASE + i),
++                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    cpu.ptr += g.srv_step;
++    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(UAV_HOST_AA),
++                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
++    g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.srv_heap, &gpu);
++    gpu.ptr += (u64)base * g.srv_step;
++    D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu; gpu_uav.ptr += g.srv_step;
++
++    D3D12_RESOURCE_BARRIER b[2] = {0};
++    u32 nb = 0;
++    b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[nb].Transition.pResource = sf->tex;
++    b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    nb++;
++    if (g_aa_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
++        b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[nb].Transition.pResource = g_aa_tex;
++        b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[nb].Transition.StateBefore = g_aa_state;
++        b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++        nb++;
++    }
++    g.list->lpVtbl->ResourceBarrier(g.list, nb, b);
++    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
++    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
++    g.list->lpVtbl->SetPipelineState(g.list, g_aa_pso);
++    g.list->lpVtbl->SetComputeRootSignature(g.list, g_aa_rootsig);
++    g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 0, gpu);
++    g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 1, gpu_uav);
++    {
++        const float rw = 1.0f / (float)sf->w, rh = 1.0f / (float)sf->h;
++        UINT k[4] = { sf->w, sf->h, 0, 0 };
++        memcpy(&k[2], &rw, 4); memcpy(&k[3], &rh, 4);
++        g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 4, k, 0);
++    }
++    g.list->lpVtbl->Dispatch(g.list, (sf->w + 7u) / 8u, (sf->h + 7u) / 8u, 1);
++    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++    b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[1].Transition.pResource = g_aa_tex;
++    b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    g.list->lpVtbl->CopyResource(g.list, sf->tex, g_aa_tex);
++    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, b);
++    g_aa_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
++    g_aa_frame[i] = g_ld_frames + 1u;
++    if (g_aa_passes++ < 4)
++        fprintf(stderr, "[host-aa] fxaa on surface %u:0x%08X %ux%u (frame %u)\n",
++                sf->location, sf->offset, sf->w, sf->h, g_ld_frames);
++    return 1;
++}
++
+ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+ {
+     static int en = -1;
+@@ -10975,6 +11246,10 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+         const u64 s0 = sf->offset, s1 = s0 + (u64)gp * (sf->h - 1u) + (u64)sf->w * texel;
+         if (!(s0 < r1 && r0 < s1)) continue;
+         if (n < 64) idx[n++] = i;   /* patch 2018: batched */
++        /* Patch 2023: a copy of a whole frame-sized colour surface is the
++         * scene leaving for the SPU post chain (KZ3: local 0x1300000 -> main
++         * 0x1310400, where SPU MLAA ran); the host AA pass runs on it first. */
++        if (r0 <= s0 && r1 >= s1) ld_host_aa(i);
+     }
+     done = ld_writeback_batch(idx, n, offset, size);
+     return done;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index c057aed9..c8ae39fd 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -110,6 +110,19 @@ u32  rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size);
+  * LD_WRITEBACK_BATCH=0 = one wait per surface). Totals since start: wall time
+  * in microseconds, batches (calls), surfaces written, GPU waits. */
+ void rsx_live_draw_debug_writeback_stats(double* us_total, u32* batches, u32* surfaces, u32* gpu_waits);
++/* Patch 2023 (ENHANCEMENT): host anti-aliasing (FXAA, one compute pass) on a
++ * frame-sized A8R8G8B8 colour surface right before an NV0039 copy of the
++ * whole surface writes it back (Killzone 3: the scene leaving for the SPU post
++ * chain, where SPU MLAA ran). KZ3_HOST_AA=fxaa|off; mode() is 1 for fxaa (the
++ * default when unset), 0 for off. The pass runs when mode() is 1 and either
++ * KZ3_HOST_AA is set explicitly or the port armed it with arm(1) after
++ * skipping the game's own AA (Killzone 3: the PPU call of the MLAA submitter,
++ * bl 0x1FF008 at 0x1FF744 in v1.00, bl 0x20A958 at 0x20B094 in 1.14), so it
++ * never stacks on SPU MLAA. passes() counts surfaces anti-aliased. */
++int  rsx_live_draw_host_aa_mode(void);
++void rsx_live_draw_host_aa_arm(int on);
++int  rsx_live_draw_host_aa_active(void);
++u32  rsx_live_draw_debug_host_aa_passes(void);
+ /* 1:1 NV3089 blit whose source is a live GPU surface: copy it on the GPU.
+  * Addresses are location-relative byte offsets of the rect's top-left.
+  * Returns 1 when handled (the guest-memory copy still runs regardless). */

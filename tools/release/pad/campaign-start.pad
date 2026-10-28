@@ -1,0 +1,7 @@
+# Main menu -> Campaign (first item) -> difficulty page -> CROSS: the level load starts and the opening cinematic
+# (dialogue, subtitle cards) plays while mission_0 loads (~72 s). Pair with KZ3_VIDEO over that window.
+key X
+wait campaigndifficulty.gum
+sleep 2
+key X
+mark level load started

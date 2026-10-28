@@ -1,0 +1,562 @@
+KZ3 patch 2098 (RSX pass 93): mouse hover and click in the game's GUM menus (the RE notes "Pass 93").
+ENHANCEMENT. libs/input/pad_menu_mouse.h (new, pure; host test tools/smoke/test_menu_mouse.sh): kz3_menu_hit_test
+(RE pass 143's spec), PadMenuInject (a click or wheel notch = one delivered pad packet pressed, one released),
+PadMenuHover (hover only after a pointer move, never while the pad is used), pmm_event_bits. libs/input/pad_mouse.h/.c:
+g_mouse_guest {x, y, valid, seq} (the one pointer position, guest pixels via rsx_display_client_to_guest at
+WM_MOUSEMOVE), clicks/wheel queued while a menu is up, pad_cursor_decide's new `menu` input (no hide, no clip),
+KZ3_MENU_MOUSE_SCRIPT test events posted as window messages. libs/input/cellPad.c: port-0 hooks g_pad_menu_bits_hook
+(adds the presses; gets the pad's own menu buttons) and g_pad_menu_sent_hook (packet delivered), mouse-bound keys
+off while a menu is up, pad_kb_capture_busy. libs/video/rsx_null_backend.c: hands rsx_display_client_to_guest to
+pad_mouse.c. The guest side (GUM context capture, tag walk, SetFocus) is port/kz3/main.cpp kz3_menu_mouse_*.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): menu-mouse sent hook at upstream's emit (freshness now finalized earlier upstream, 6eb26c1e).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 6d86d461..7e5f1082 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -20,6 +20,11 @@
+ #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
+ #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+ #include "ps3emu/log_first.h"
++/* KZ3 patch 2098 (RSX pass 93): menu mouse hooks (port/kz3/main.cpp sets them; pad_menu_mouse.h has the rules). */
++#include "pad_menu_mouse.h"
++#include "pad_mouse.h"
++unsigned (*g_pad_menu_bits_hook)(unsigned pad_buttons, int pad_active) = NULL;
++void     (*g_pad_menu_sent_hook)(int delivered) = NULL;
+ 
+ /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
+  * wall-clock seconds. A loaded machine runs a title at a third of its usual
+@@ -382,6 +387,9 @@ static int pad_kb_down_win(void* ctx, int code)
+     int vk = code;
+     (void)ctx;
+     if (code > 0 && code < 256 && s_kb_layout_ok) vk = s_kb_layout.vk[code];
++    /* KZ3 patch 2098: in a GUM menu the mouse buttons are the menu's (click = CROSS/CIRCLE through the hover code),
++     * not their keybinds.ini pad buttons (Mouse1 = R1 by default) */
++    if ((vk == 0x01 || vk == 0x02 || vk == 0x04 || vk == 0x05 || vk == 0x06) && pad_mouse_menu_on()) return 0;
+     /* KZ3 patch 2095: Alt+Enter switches the display mode (rsx_null_backend.c); its Enter is not a pad press */
+     if (vk == 0x0D && (GetAsyncKeyState(0x12) & 0x8000)) return 0;
+     return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
+@@ -462,6 +470,17 @@ int pad_kb_sibling_path(const wchar_t* name, wchar_t* out, size_t n)
+     return 1;
+ }
+ 
++/* KZ3 patch 2098: 1 while the Keyboard page's key capture (2038, a port-drawn prompt, not a GUM item) owns the
++ * input: the menu mouse stays off then. */
++int pad_kb_capture_busy(void)
++{
++    int b;
++    AcquireSRWLockShared(&s_kb_lock);
++    b = pad_kb_ui_busy(&s_kb_ui);
++    ReleaseSRWLockShared(&s_kb_lock);
++    return b;
++}
++
+ static int pad_kb_stamp(FILETIME* out)
+ {
+     WIN32_FILE_ATTRIBUTE_DATA a;
+@@ -1406,6 +1425,19 @@ skip_inject: ;
+     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
+     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]  = hs->analog_ly;
+ 
++    /* KZ3 patch 2098 (RSX pass 93): menu mouse clicks and wheel notches (port/kz3/main.cpp kz3_menu_mouse_poll; no guest
++     * calls there). It gets the pad's own menu buttons (pads, keys) so the pad wins over hover, and returns presses to
++     * add to this packet (pad_menu_mouse.h). Added before the pressure words below, which give a set digital bit full
++     * pressure (run r93-mc3: a CROSS added after them, with pressure 0, opened nothing). */
++    if (port_no == 0 && g_pad_menu_bits_hook) {
++        const unsigned b = (unsigned)data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |
++                           ((unsigned)data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8);
++        const int sticks = abs((int)hs->analog_lx - 128) > 64 || abs((int)hs->analog_ly - 128) > 64;
++        const unsigned m = g_pad_menu_bits_hook(b, (b & PMM_PAD_MENU_MASK) != 0 || sticks);
++        data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(m & 0xFF);
++        data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((m >> 8) & 0xFF);
++    }
++
+     /* Pressure-sensitive buttons (only meaningful if PRESS_ON) */
+     if (setting & CELL_PAD_SETTING_PRESS_ON) {
+         data->button[CELL_PAD_BTN_OFFSET_PRESS_RIGHT]    = hs->press_right;
+@@ -1480,6 +1512,8 @@ emit:
+      *
+      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
+     {
++        /* KZ3 patch 2098: a menu mouse press lasts until it was in a delivered packet (pad_menu_mouse.h) */
++        if (port_no == 0 && g_pad_menu_sent_hook) g_pad_menu_sent_hook(data->len != 0);
+         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
+         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
+         for (int _i = 0; _i < CELL_PAD_MAX_CODES; _i++)                    /* button[] u16 */
+diff --git a/libs/input/pad_menu_mouse.h b/libs/input/pad_menu_mouse.h
+new file mode 100644
+index 00000000..2576d441
+--- /dev/null
++++ b/libs/input/pad_menu_mouse.h
+@@ -0,0 +1,157 @@
++/* KZ3 patch 2098 (RSX pass 93), ENHANCEMENT: mouse hover and click in the game's GUM menus, on top of pad focus.
++ *
++ * Design data: the RE notes "Menu cursor, pass 143" (RE pass 142/143); the KZ3 glue that walks
++ * the guest's GUM tags and calls the game's own focus setter is port/kz3/main.cpp (kz3_menu_mouse_*), the window
++ * side (pointer position, clicks, cursor rule) is pad_mouse.c, the pad injection is cellPad.c. This header holds the
++ * pure parts (host test tools/smoke/test_menu_mouse.c):
++ *   - kz3_menu_hit_test: which focusable item is under the pointer (re-data's spec, section 5);
++ *   - PadMenuInject: clicks and wheel notches become pad buttons for exactly one delivered pad packet each, with one
++ *     released packet after every press (so two clicks are two edges and no button stays down);
++ *   - PadMenuHover: hover acts only when the pointer moved since the last look, and never while the pad is in use.
++ * Pad bits are hs->buttons' (cellPad.c): DIGITAL1 in bits 0-7, DIGITAL2 in bits 8-15. */
++#ifndef PAD_MENU_MOUSE_H
++#define PAD_MENU_MOUSE_H
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define PMM_UP     0x0010u
++#define PMM_RIGHT  0x0020u
++#define PMM_DOWN   0x0040u
++#define PMM_LEFT   0x0080u
++#define PMM_CIRCLE 0x2000u
++#define PMM_CROSS  0x4000u
++/* Pad input that means "the player is using the pad/keys for the menu": the d-pad, the face buttons, START/SELECT,
++ * L1/R1 (tab rows). While any is down, hover does nothing (the pad wins). */
++#define PMM_PAD_MENU_MASK 0xFCF9u
++
++typedef struct { int l, t, r, b; } KZ3MenuRect;
++#define KZ3_MENU_CLIPS 8
++typedef struct {
++    int id;
++    int l, t, r, b;                   /* inner rect (widget +0xE0.., 1.14 +0xF0..), layout pixels, r/b exclusive */
++    int depth;                        /* tree depth, root = 0 */
++    int n_clips;
++    KZ3MenuRect clip[KZ3_MENU_CLIPS]; /* ancestor rects the point must also be inside */
++    int enabled, focusable;
++} KZ3MenuCand;
++
++/* The candidate id under (x, y), or -1. A candidate hits when focusable && enabled, l-pad <= x < r+pad,
++ * t-pad <= y < b+pad, and the point is inside every clip (clip rects without pad). Among hits the largest depth wins
++ * (innermost), ties go to the later index (drawn last). No hit or n == 0: -1 (the caller keeps the focus). */
++static inline int kz3_menu_hit_test(const KZ3MenuCand* c, int n, float x, float y, int pad_px)
++{
++    int best = -1, bd = -1, i, k;
++    for (i = 0; i < n; i++) {
++        const KZ3MenuCand* q = &c[i];
++        int in = 1;
++        if (!q->focusable || !q->enabled || q->r <= q->l || q->b <= q->t) continue;
++        if (!(x >= (float)(q->l - pad_px) && x < (float)(q->r + pad_px) &&
++              y >= (float)(q->t - pad_px) && y < (float)(q->b + pad_px))) continue;
++        for (k = 0; k < q->n_clips && k < KZ3_MENU_CLIPS && in; k++) {
++            const KZ3MenuRect* r = &q->clip[k];
++            in = x >= (float)r->l && x < (float)r->r && y >= (float)r->t && y < (float)r->b;
++        }
++        if (!in) continue;
++        if (q->depth >= bd) { bd = q->depth; best = i; }
++    }
++    return best < 0 ? -1 : c[best].id;
++}
++
++/* Clicks and wheel notches -> pad presses. A press lasts until it was in at least one delivered packet AND the menu
++ * thread has started two frames since it began (pmi_tick, the per-frame Gum hook), so the game's per-frame input
++ * copy sees it once whatever the pad thread's polling rate (run r93-mc1: the pad is polled on its own guest thread; a
++ * one-packet press was never seen by the menu). The release lasts the same. A focus change made by the click itself
++ * (pmi_defer) holds the next press back for one menu frame, so the page has the new focus before the button arrives
++ * (re-data hook plan step 5). */
++#define PMI_QUEUE 8
++typedef struct {
++    unsigned q[PMI_QUEUE];
++    int head, n;
++    int phase;       /* 0 idle, 1 pressing (cur), 2 releasing */
++    unsigned cur;
++    int defer;       /* menu frames to wait before the next press starts */
++    int sent;        /* the current phase was in a delivered packet */
++    int ticks;       /* menu frames since the current phase began */
++} PadMenuInject;
++
++static inline void pmi_init(PadMenuInject* s) { s->head = s->n = 0; s->phase = 0; s->cur = 0; s->defer = 0; s->sent = 0; s->ticks = 0; }
++static inline int pmi_push(PadMenuInject* s, unsigned bits)
++{
++    if (!bits || s->n >= PMI_QUEUE) return 0;
++    s->q[(s->head + s->n) % PMI_QUEUE] = bits;
++    s->n++;
++    return 1;
++}
++static inline void pmi_defer(PadMenuInject* s) { s->defer = 1; }
++/* Bits for the packet being built now (idempotent until pmi_delivered). */
++static inline unsigned pmi_bits(PadMenuInject* s)
++{
++    if (s->phase == 0 && s->n && !s->defer) {
++        s->cur = s->q[s->head];
++        s->head = (s->head + 1) % PMI_QUEUE;
++        s->n--;
++        s->phase = 1;
++        s->sent = 0;
++        s->ticks = 0;
++    }
++    return s->phase == 1 ? s->cur : 0u;
++}
++/* The packet was handed to the game (len > 0) or not. */
++static inline void pmi_delivered(PadMenuInject* s, int delivered)
++{
++    if (delivered && s->phase) s->sent = 1;
++}
++/* One menu frame began (the menu thread's per-frame hook). */
++static inline void pmi_tick(PadMenuInject* s)
++{
++    if (s->phase == 0) { if (s->defer) s->defer = 0; return; }
++    s->ticks++;
++    if (!s->sent || s->ticks < 2) return;
++    if (s->phase == 1) { s->phase = 2; s->sent = 0; s->ticks = 0; return; }
++    s->phase = 0; s->cur = 0; s->sent = 0; s->ticks = 0;
++}
++/* Menu left (or a port overlay took the input): queued presses are dropped; a press in flight still gets its release. */
++static inline void pmi_clear(PadMenuInject* s)
++{
++    s->head = s->n = 0;
++    s->defer = 0;
++    if (s->phase == 1) { s->phase = 2; s->sent = 0; s->ticks = 0; }
++}
++static inline int pmi_idle(const PadMenuInject* s) { return s->phase == 0 && s->n == 0; }
++
++/* Hover gate: 1 when the pointer moved since the last call (seq changed), is on the image (valid) and the pad is not
++ * in use this poll. The new seq is taken either way, so a move made while the pad is used, or before the menu came
++ * up (pmh_sync), never refocuses later with the pointer still. */
++typedef struct { unsigned seq; int have; } PadMenuHover;
++static inline void pmh_sync(PadMenuHover* h, unsigned seq) { h->seq = seq; h->have = 1; }
++static inline int pmh_should_hover(PadMenuHover* h, unsigned seq, int valid, int pad_active)
++{
++    const int moved = h->have && seq != h->seq;
++    h->seq = seq;
++    h->have = 1;
++    return moved && valid && !pad_active;
++}
++
++/* Mouse events (pad_mouse.c queues them on the window's thread while a menu is up). */
++enum { PMM_EV_LEFT = 1, PMM_EV_RIGHT = 2, PMM_EV_WHEEL = 3 };
++typedef struct { int kind; int wheel; float x, y; int valid; } PadMenuMouseEv;
++
++/* Buttons for one event. hit = the item under the pointer (-1 none), value_item = the focused item is a select or a
++ * slider (wheel changes its value: LEFT/RIGHT; elsewhere UP/DOWN). Left click only acts on an item (CROSS on empty
++ * space would activate whatever has the focus); right click is CIRCLE (back) anywhere; wheel up = UP / RIGHT. */
++static inline unsigned pmm_event_bits(int kind, int wheel, int hit, int value_item)
++{
++    if (kind == PMM_EV_LEFT) return hit >= 0 ? PMM_CROSS : 0u;
++    if (kind == PMM_EV_RIGHT) return PMM_CIRCLE;
++    if (kind == PMM_EV_WHEEL && wheel) {
++        if (value_item) return wheel > 0 ? PMM_RIGHT : PMM_LEFT;
++        return wheel > 0 ? PMM_UP : PMM_DOWN;
++    }
++    return 0u;
++}
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+index 450aadf6..9e721fef 100644
+--- a/libs/input/pad_mouse.c
++++ b/libs/input/pad_mouse.c
+@@ -62,6 +62,9 @@ static void pm_init(void)
+     s_on = on;
+ }
+ 
++/* Patch 2098: the pointer in guest pixels (pad_mouse.h). */
++volatile PadMouseGuest g_mouse_guest = { 0.0f, 0.0f, 0, 0u };
++
+ int pad_mouse_enabled(void) { pm_init(); return s_on; }
+ const PadMouseCfg* pad_mouse_cfg(void) { pm_init(); return &s_cfg; }
+ int pad_mouse_log_each(void) { pm_init(); return s_log_each; }
+@@ -99,7 +102,7 @@ int pad_mouse_take(double now, int* dx, int* dy)
+ static HWND           s_hwnd;        /* the game window (set with or without mouse look) */
+ static int            s_raw;         /* Raw Input registered */
+ static int            s_clipped;     /* our ClipCursor is in force */
+-static PadCursorState s_cs = { 0, 0, 0, 0, 0, 0, 1 };
++static PadCursorState s_cs = { 0, 0, 0, 0, 0, 0, 1, 0 };
+ static PadCursorDo    s_last = { -1, -1 };
+ 
+ static int pm_cursor_over_client(HWND hwnd)
+@@ -190,19 +193,33 @@ void pad_mouse_refresh(HWND hwnd)
+     if (s_hwnd && hwnd == s_hwnd) pm_apply(hwnd, "refresh");
+ }
+ 
++static int pm_menu_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res);   /* patch 2098, below */
+ int pad_mouse_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
+ {
+     if (msg == PAD_MOUSE_WM_ATTACH) { pm_attach_here(hwnd); *res = 0; return 1; }
+     if (!s_hwnd || hwnd != s_hwnd) return 0;
++    if (pm_menu_wndmsg(hwnd, msg, wp, lp, res)) return 1;
+     switch (msg) {
+     case WM_INPUT: {
+         RAWINPUT ri;
+         UINT size = sizeof(ri);
+         if (s_cs.look_on &&
+             GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+-            ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
+-            (ri.data.mouse.lLastX || ri.data.mouse.lLastY))
+-            pad_mouse_add((int)ri.data.mouse.lLastX, (int)ri.data.mouse.lLastY);
++            ri.header.dwType == RIM_TYPEMOUSE && (ri.data.mouse.lLastX || ri.data.mouse.lLastY)) {
++            /* RSX pass 93 (hand test: the view did not turn): say once what the first raw motion looked like, so a hand
++             * log shows whether counts arrive at all and whether they are relative */
++            static int s_said_rel = 0, s_said_abs = 0;
++            if (ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) {
++                if (!s_said_abs++)
++                    fprintf(stderr, "[mouse] raw input: ABSOLUTE motion (flags 0x%x, %ld,%ld) ignored: mouse look needs relative counts\n",
++                            (unsigned)ri.data.mouse.usFlags, (long)ri.data.mouse.lLastX, (long)ri.data.mouse.lLastY);
++            } else {
++                if (!s_said_rel++)
++                    fprintf(stderr, "[mouse] raw input: first relative motion %ld,%ld\n", (long)ri.data.mouse.lLastX,
++                            (long)ri.data.mouse.lLastY);
++                pad_mouse_add((int)ri.data.mouse.lLastX, (int)ri.data.mouse.lLastY);
++            }
++        }
+         return 0;   /* DefWindowProc cleans up */
+     }
+     case WM_SETCURSOR:
+@@ -261,4 +278,135 @@ int pad_mouse_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
+     }
+     return 0;
+ }
++
++/* ---- Patch 2098 (RSX pass 93): menu mouse, window side ---------------------------------------------------------
++ * While a GUM menu is up (pad_mouse_menu_set(1) from the pad poll, port/kz3/main.cpp), the cursor is shown and free
++ * (pad_cursor_decide), left/right clicks and wheel notches are queued for the poll, and mouse-bound keys stop
++ * acting as pad buttons (cellPad.c pad_kb_down_win). WM_MOUSEMOVE keeps g_mouse_guest current at all times. */
++#include "pad_menu_mouse.h"
++#define PAD_MOUSE_WM_MENU (WM_APP + 0x6A)
++#define PMQ_MAX 16
++static volatile LONG   s_menu;          /* menu up (pad poll's view) */
++static PadMenuMouseEv  s_mq[PMQ_MAX];   /* under s_lock */
++static int             s_mq_n;
++static int             s_wheel_rest;    /* window thread: wheel delta below one notch */
++int (*g_pad_mouse_to_guest)(int cx, int cy, int* gx, int* gy) = NULL;   /* rsx_null_backend.c: rsx_display_client_to_guest */
++
++static void pm_guest_at(int cx, int cy)
++{
++    int gx = cx, gy = cy, ok = 1;
++    if (g_pad_mouse_to_guest) ok = g_pad_mouse_to_guest(cx, cy, &gx, &gy);
++    else if (s_hwnd) {
++        RECT rc;
++        GetClientRect(s_hwnd, &rc);
++        ok = cx >= 0 && cy >= 0 && cx < rc.right && cy < rc.bottom;
++    }
++    g_mouse_guest.x = (float)gx;
++    g_mouse_guest.y = (float)gy;
++    g_mouse_guest.valid = ok ? 1 : 0;
++    g_mouse_guest.seq = g_mouse_guest.seq + 1u;
++}
++
++static void pm_menu_queue(int kind, int wheel)
++{
++    PadMenuMouseEv ev;
++    ev.kind = kind; ev.wheel = wheel;
++    ev.x = g_mouse_guest.x; ev.y = g_mouse_guest.y; ev.valid = g_mouse_guest.valid;
++    PM_LOCK();
++    if (s_mq_n < PMQ_MAX) s_mq[s_mq_n++] = ev;
++    PM_UNLOCK();
++}
++
++/* Called from pad_mouse_wndmsg for the mouse messages (1 = handled, *res set). */
++static int pm_menu_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
++{
++    (void)hwnd;
++    switch (msg) {
++    case WM_MOUSEMOVE:
++        pm_guest_at((short)LOWORD(lp), (short)HIWORD(lp));
++        return 0;
++    case WM_LBUTTONDOWN:
++    case WM_RBUTTONDOWN:
++        pm_guest_at((short)LOWORD(lp), (short)HIWORD(lp));
++        if (s_menu) pm_menu_queue(msg == WM_LBUTTONDOWN ? PMM_EV_LEFT : PMM_EV_RIGHT, 0);
++        return 0;
++    case WM_MOUSEWHEEL:
++        if (s_menu) {
++            int d = s_wheel_rest + GET_WHEEL_DELTA_WPARAM(wp), n = d / WHEEL_DELTA;
++            s_wheel_rest = d - n * WHEEL_DELTA;
++            if (n) pm_menu_queue(PMM_EV_WHEEL, n);
++            *res = 0;
++            return 1;
++        }
++        s_wheel_rest = 0;
++        return 0;
++    case PAD_MOUSE_WM_MENU:
++        s_cs.menu = (int)wp;
++        pm_apply(hwnd, wp ? "menu up" : "menu gone");
++        *res = 0;
++        return 1;
++    }
++    return 0;
++}
++
++void pad_mouse_menu_set(int on)
++{
++    on = on ? 1 : 0;
++    if (InterlockedExchange(&s_menu, on) == on) return;
++    if (!on) { PM_LOCK(); s_mq_n = 0; PM_UNLOCK(); }
++    if (s_hwnd) PostMessageA(s_hwnd, PAD_MOUSE_WM_MENU, (WPARAM)on, 0);
++}
++int pad_mouse_menu_on(void) { return (int)s_menu; }
++
++int pad_mouse_menu_take(void* evs, int max)
++{
++    int n;
++    PM_LOCK();
++    n = s_mq_n < max ? s_mq_n : max;
++    memcpy(evs, s_mq, (size_t)n * sizeof(PadMenuMouseEv));
++    s_mq_n = 0;
++    PM_UNLOCK();
++    return n;
++}
++
++void pad_mouse_menu_script_step(double now)
++{
++    static int init = 0, n = 0;
++    static PadMenuScriptEv ev[PAD_MENU_SCRIPT_MAX];
++    static double t0 = -1.0;
++    static int cx, cy;   /* the last scripted move (client pixels): where the clicks land */
++    int i;
++    if (!init) {
++        const char* e = getenv("KZ3_MENU_MOUSE_SCRIPT");
++        int bad = 0;
++        init = 1;
++        if (e && *e) {
++            n = pad_menu_script_parse(e, ev, PAD_MENU_SCRIPT_MAX, &bad);
++            fprintf(stderr, "[menu-mouse] KZ3_MENU_MOUSE_SCRIPT: %d event(s)%s\n", n, bad ? " (some tokens not read)" : "");
++        }
++    }
++    if (!n || !s_hwnd) return;
++    if (t0 < 0.0) t0 = now;
++    for (i = 0; i < n; i++) {
++        PadMenuScriptEv* x = &ev[i];
++        if (x->done || now - t0 < x->t) continue;
++        x->done = 1;
++        if (x->kind == PMS_MOVE) { cx = x->a; cy = x->b; PostMessageA(s_hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(cx, cy)); }
++        else if (x->kind == PMS_LEFT || x->kind == PMS_RIGHT) {
++            const LPARAM lp = MAKELPARAM(cx, cy);
++            PostMessageA(s_hwnd, x->kind == PMS_LEFT ? WM_LBUTTONDOWN : WM_RBUTTONDOWN, 0, lp);
++            PostMessageA(s_hwnd, x->kind == PMS_LEFT ? WM_LBUTTONUP : WM_RBUTTONUP, 0, lp);
++        } else if (x->kind == PMS_WHEEL)
++            PostMessageA(s_hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, (short)(x->a * WHEEL_DELTA)), 0);
++        fprintf(stderr, "[menu-mouse] script t=%.1f %s %d,%d\n", now - t0,
++                x->kind == PMS_MOVE ? "move" : x->kind == PMS_LEFT ? "left" : x->kind == PMS_RIGHT ? "right" : "wheel",
++                x->a, x->b);
++    }
++}
++#else
++void pad_mouse_menu_set(int on) { (void)on; }
++int  pad_mouse_menu_on(void) { return 0; }
++int  pad_mouse_menu_take(void* evs, int max) { (void)evs; (void)max; return 0; }
++void pad_mouse_menu_script_step(double now) { (void)now; }
+ #endif
++
+diff --git a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+index da8028d6..692f5f2c 100644
+--- a/libs/input/pad_mouse.h
++++ b/libs/input/pad_mouse.h
+@@ -71,6 +71,9 @@ static inline int pad_mouse_look_apply(const PadMouseCfg* c, int dx, int dy, flo
+  *         client). Display improvement: on even with mouse look off (KZ3_CURSOR_HIDE=0 keeps the arrow).
+  *   clip: the same conditions (minus the cursor position) and mouse look on. With mouse look off nothing reads the
+  *         mouse, so the pointer stays free to leave the window.
++ * Patch 2098 (RSX pass 93): menu = a GUM menu is up (pad_mouse_menu_set from the pad poll, port/kz3/main.cpp): no
++ *         hide and no clip, the pointer is shown (the system arrow; a drawn cursor may come later) and free; hidden and
++ *         locked again when the menu goes (gameplay, movies).
+  * Modes use rsx_display_mode.h's numbers (0 windowed, 1 borderless, 2 fullscreen). */
+ typedef struct {
+     int mode;        /* 0 windowed, 1 borderless, 2 exclusive fullscreen */
+@@ -80,6 +83,7 @@ typedef struct {
+     int closing;     /* WM_CLOSE / WM_DESTROY seen */
+     int look_on;     /* KZ3_MOUSE_LOOK */
+     int hide_opt;    /* KZ3_CURSOR_HIDE (1 default) */
++    int menu;        /* patch 2098: a GUM menu has the focus (pad_mouse_menu_set): the pointer is the menu's */
+ } PadCursorState;
+ 
+ typedef struct { int hide, clip; } PadCursorDo;
+@@ -89,8 +93,8 @@ static inline PadCursorDo pad_cursor_decide(const PadCursorState* s, int over_cl
+ {
+     PadCursorDo d = {0, 0};
+     const int live = s->focused && !s->minimized && !s->sizemove && !s->closing;
+-    d.hide = live && s->hide_opt && (s->mode != 0 || over_client);
+-    d.clip = live && s->look_on;
++    d.hide = live && s->hide_opt && !s->menu && (s->mode != 0 || over_client);
++    d.clip = live && s->look_on && !s->menu;
+     return d;
+ }
+ 
+@@ -138,6 +142,56 @@ static inline void pad_mouse_script_due(PadMouseEv* ev, int n, double now, int*
+         if (ev[i].left > 0 && now >= ev[i].t) { *dx += ev[i].dx; *dy += ev[i].dy; ev[i].left--; }
+ }
+ 
++/* Patch 2098 (RSX pass 93): the pointer in guest pixels, the ONE place it is kept (hover, and a later drawn cursor
++ * in the fps/watermark overlay path, read it). Written on the window's thread at WM_MOUSEMOVE through
++ * rsx_display_client_to_guest: valid = 0 over a letterbox bar or outside the client area; seq counts the moves. */
++typedef struct { float x, y; int valid; unsigned seq; } PadMouseGuest;
++extern volatile PadMouseGuest g_mouse_guest;
++
++/* KZ3_MENU_MOUSE_SCRIPT (tests, patch 2098): "T:m:X,Y" moves the pointer to client pixel X,Y, "T:l" left click,
++ * "T:r" right click, "T:w:N" N wheel notches (+ up); T = seconds since the first menu poll. The events are posted to
++ * the game window as WM_MOUSEMOVE / WM_LBUTTONDOWN+UP / WM_RBUTTONDOWN+UP / WM_MOUSEWHEEL, so they take the same
++ * path as a real mouse. */
++enum { PMS_MOVE = 1, PMS_LEFT = 2, PMS_RIGHT = 3, PMS_WHEEL = 4 };
++typedef struct { double t; int kind, a, b, done; } PadMenuScriptEv;
++#define PAD_MENU_SCRIPT_MAX 128
++static inline int pad_menu_script_parse(const char* s, PadMenuScriptEv* ev, int max, int* bad)
++{
++    int n = 0;
++    *bad = 0;
++    while (s && *s) {
++        char* e;
++        double t;
++        long a = 0, b = 0;
++        int kind = 0, ok;
++        while (*s == ' ' || *s == ';' || *s == '\t' || *s == '\n' || *s == '\r') s++;
++        if (!*s) break;
++        t = strtod(s, &e);
++        ok = e != s && *e == ':';
++        if (ok) {
++            s = e + 1;
++            if (*s == 'm' && s[1] == ':') {
++                kind = PMS_MOVE; s += 2; a = strtol(s, &e, 10); ok = e != s && *e == ',';
++                if (ok) { s = e + 1; b = strtol(s, &e, 10); ok = e != s; }
++            } else if ((*s == 'l' || *s == 'r') && (s[1] == 0 || s[1] == ' ' || s[1] == ';')) {
++                kind = *s == 'l' ? PMS_LEFT : PMS_RIGHT; e = (char*)s + 1;
++            } else if (*s == 'w' && s[1] == ':') {
++                kind = PMS_WHEEL; s += 2; a = strtol(s, &e, 10); ok = e != s && a != 0;
++            } else ok = 0;
++        }
++        if (ok && *e && *e != ' ' && *e != ';' && *e != '\t' && *e != '\n' && *e != '\r') ok = 0;
++        if (!ok) {
++            (*bad)++;
++            while (*s && *s != ' ' && *s != ';' && *s != '\t' && *s != '\n') s++;
++            continue;
++        }
++        if (n < max) { ev[n].t = t; ev[n].kind = kind; ev[n].a = (int)a; ev[n].b = (int)b; ev[n].done = 0; n++; }
++        else (*bad)++;
++        s = e;
++    }
++    return n;
++}
++
+ /* Runtime side (pad_mouse.c). */
+ int  pad_mouse_enabled(void);
+ const PadMouseCfg* pad_mouse_cfg(void);
+@@ -161,6 +215,13 @@ int  pad_mouse_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res);
+ void pad_mouse_set_mode(HWND hwnd, int mode);
+ void pad_mouse_refresh(HWND hwnd);
+ #endif
++/* Patch 2098: menu state from the pad poll (any thread; the cursor change runs on the window's thread), the mouse
++ * events queued while a menu is up (pad_mouse_menu_take empties the queue; returns the count), and the test script
++ * step (posts the due KZ3_MENU_MOUSE_SCRIPT events; now = seconds on the caller's clock). */
++void pad_mouse_menu_set(int on);
++int  pad_mouse_menu_on(void);
++int  pad_mouse_menu_take(void* evs /* PadMenuMouseEv[max] */, int max);
++void pad_mouse_menu_script_step(double now);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index ebe1cbbd..e7438824 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -521,6 +521,8 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+         wr.right - wr.left, wr.bottom - wr.top,
+         NULL, NULL, GetModuleHandle(NULL), NULL);
+ 
++    { extern int (*g_pad_mouse_to_guest)(int, int, int*, int*);   /* KZ3 patch 2098: pointer -> guest pixels */
++      g_pad_mouse_to_guest = rsx_display_client_to_guest; }
+     pad_mouse_attach(s_state.hwnd);   /* KZ3 patch 2069 */
+     if (!s_state.hwnd) {
+         printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());

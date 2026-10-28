@@ -1,0 +1,193 @@
+KZ3 patch 1109 (SPU pass 82): the lock-line coherency registry grows in chunks instead of holding 8 contexts.
+
+Patch 1056 kept the reservation-holder registry as one array of 8 atomic slots (SPU_COH_MAX_CTX) so its striped
+walkers could read it without the global lock. A 9th holder was not registered: one warning, then that context never
+got its lock-line (LR) events and a PUTLLC/GETLLAR wait on it relied on timeouts. 135 of 555 Proton logs under
+work/proton print "[spu-coh] more than 8 reserving SPU contexts" (newest spu-29a/b, 2026-10-10; none in the runs
+since, which postdate 1052/1084's unregister fixes). Upstream PR #290's test_spu_coherency.c registers 20 ("beyond
+eight") and failed on our stack.
+
+Now: a chain of 16-slot chunks, the first static, the others appended with a SEQ_CST CAS on the last chunk's next
+(new chunk already holding the context, so publishing it is the same instant as the old slot CAS) and never freed,
+so a walker holding a stripe still reads every slot lock-free. Holes left by unregister are reused before a chunk is
+added. Out of memory for a chunk aborts (a missed holder loses events, including ABA); never a silent drop.
+KZ3_LL_STATS=1 also prints "[spu-coh] registry grew to N slots" at each new chunk. spu_coh_capacity() for tests.
+Host tests: tools/spu/test_spu_event_race.sh (test_spu_coh_registry.c: 100 holders all killed, except-self past
+the first chunk, hole reuse, 8 threads registering 512 contexts while a notifier walks; also built with ASan/UBSan
+and TSan), tools/spu/test_lockline.sh (upstream test_spu_coherency.c beyond-eight case).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): chunked registry + watch wake.
+
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 9b0faefc..6740ec6a 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -249,10 +249,31 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+  * read unlocked, where a stale NULL costs at most one missed event on the very
+  * first reservation of the run. */
+ 
+-/* The SPU contexts that have reserved a line. Sized to match the MFC engine
+- * registry in spu_channels.c, which is the ceiling on live SPU contexts. */
+-#define SPU_COH_MAX_CTX 8
+-static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
++/* The SPU contexts that have reserved a line.
++ * KZ3 patch 1109: a chain of fixed chunks instead of one 8-slot array. Every
++ * live virtual context may hold a reservation (PR #290's test registers 20;
++ * KZ3 runs 5+1 SPUs, their kernels and stack-local job contexts), and a full
++ * array dropped the newcomer: it never got its lock-line events. Chunks are
++ * appended with a CAS and never freed, so 1056's walkers still read the slots
++ * lock-free under the stripe they hold; a slot is a plain atomic pointer as
++ * before. Out of memory for a new chunk is fatal (a missed holder loses
++ * events, including ABA), never a silent drop. */
++#define SPU_COH_CHUNK 16
++typedef struct spu_coh_chunk {
++    spu_context* slot[SPU_COH_CHUNK];
++    struct spu_coh_chunk* next;
++} spu_coh_chunk;
++static spu_coh_chunk s_coh_head;
++static unsigned s_coh_chunks = 1;
++#define SPU_COH_FOR_EACH(ch, i) \
++    for (spu_coh_chunk* ch = &s_coh_head; ch; ch = __atomic_load_n(&ch->next, __ATOMIC_ACQUIRE)) \
++        for (int i = 0; i < SPU_COH_CHUNK; i++)
++
++/* Registry capacity in slots (tests; grows by SPU_COH_CHUNK). */
++unsigned spu_coh_capacity(void)
++{
++    return __atomic_load_n(&s_coh_chunks, __ATOMIC_ACQUIRE) * SPU_COH_CHUNK;
++}
+ static spu_coh_watch* s_coh_watches;   /* upstream v0.18.0 line watches */
+ 
+ unsigned long g_spu_lr_raise = 0;
+@@ -275,8 +296,8 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+     if (!__atomic_load_n(&g_spu_coh_bits, __ATOMIC_RELAXED))
+         __atomic_store_n(&g_spu_coh_bits, (const unsigned char*)s_coh_bitmap, __ATOMIC_SEQ_CST);
+     if (!ctx) return;
+-    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+-        if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) return;
++    SPU_COH_FOR_EACH(ch, i)
++        if (__atomic_load_n(&ch->slot[i], __ATOMIC_ACQUIRE) == ctx) return;
+     spu_coh_reserve_add(ctx);
+ }
+ 
+@@ -289,21 +310,35 @@ static void spu_coh_reserve_add(spu_context* ctx)
+      * job context returned.
+      * KZ3 patch 1056: lock-free, a CAS into a free slot. Only ctx's own thread
+      * adds it (GETLLAR), so no duplicate can appear; walkers read the slots
+-     * atomically and unregister clears them under every stripe. */
+-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+-        spu_context* none = NULL;
+-        if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_RELAXED) == NULL &&
+-            __atomic_compare_exchange_n(&s_coh_ctxs[i], &none, ctx, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
++     * atomically and unregister clears them under every stripe.
++     * KZ3 patch 1109: every chunk is full: append one with ctx already in its
++     * first slot (published by the SEQ_CST CAS, as the slot CAS was). Losing
++     * the append race to another context's thread: free ours, try again. */
++    for (;;) {
++        spu_coh_chunk* last = &s_coh_head;
++        SPU_COH_FOR_EACH(ch, i) {
++            last = ch;
++            spu_context* none = NULL;
++            if (__atomic_load_n(&ch->slot[i], __ATOMIC_RELAXED) == NULL &&
++                __atomic_compare_exchange_n(&ch->slot[i], &none, ctx, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
++                return;
++        }
++        spu_coh_chunk* fresh = (spu_coh_chunk*)calloc(1, sizeof(*fresh));
++        if (!fresh) {
++            fprintf(stderr, "[spu-coh] out of memory registering reservation holder spu=0x%X\n", ctx->spu_id);
++            fflush(stderr);
++            abort();
++        }
++        fresh->slot[0] = ctx;
++        spu_coh_chunk* none = NULL;
++        if (__atomic_compare_exchange_n(&last->next, &none, fresh, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
++            unsigned n = __atomic_add_fetch(&s_coh_chunks, 1, __ATOMIC_ACQ_REL);
++            if (getenv("KZ3_LL_STATS"))
++                fprintf(stderr, "[spu-coh] registry grew to %u slots (spu=0x%X)\n", n * SPU_COH_CHUNK, ctx->spu_id);
+             return;
++        }
++        free(fresh);
+     }
+-    /* More live SPU contexts than the registry holds. The ones already in it
+-     * still get their events; this one would silently never wake, so say so. */
+-    { static int warned = 0;
+-      if (!warned) { warned = 1;
+-          fprintf(stderr, "[spu-coh] more than %d reserving SPU contexts -- "
+-                          "spu=0x%X will not receive lock-line events\n",
+-                  SPU_COH_MAX_CTX, ctx->spu_id);
+-          fflush(stderr); } }
+ }
+ 
+ void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
+@@ -353,7 +388,7 @@ void spu_coh_unregister(spu_context* ctx)
+      * not in the registry now cannot appear in it concurrently: skip the
+      * all-stripe lock (stack-local job contexts unregister after every job). */
+     { int present = 0;
+-      for (int i = 0; i < SPU_COH_MAX_CTX; i++) present |= __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx;
++      SPU_COH_FOR_EACH(ch, i) present |= __atomic_load_n(&ch->slot[i], __ATOMIC_ACQUIRE) == ctx;
+       if (!present) return; }
+     /* Under the lock-line lock, which every walker of s_coh_ctxs holds: a
+      * notifier that loaded this pointer just before the NULL store would
+@@ -361,8 +396,8 @@ void spu_coh_unregister(spu_context* ctx)
+      * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
+      * spu_coh_notify_write, reading a freed thread stack. */
+     spu_lockline_lock();
+-    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+-        if (s_coh_ctxs[i] == ctx) __atomic_store_n(&s_coh_ctxs[i], NULL, __ATOMIC_RELEASE);   /* patch 1052: every copy */
++    SPU_COH_FOR_EACH(ch, i)
++        if (ch->slot[i] == ctx) __atomic_store_n(&ch->slot[i], NULL, __ATOMIC_RELEASE);   /* patch 1052: every copy */
+     spu_lockline_unlock();
+ }
+ 
+@@ -375,14 +410,14 @@ void spu_coh_unregister(spu_context* ctx)
+ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
+ {
+     spu_lockline_lock();
+-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+-        uintptr_t c = (uintptr_t)s_coh_ctxs[i];
++    SPU_COH_FOR_EACH(ch, i) {
++        uintptr_t c = (uintptr_t)ch->slot[i];
+         if (c >= lo && c < hi) {
+             static int _n = 0;
+             if (PS3_LOG_FIRST(_n, 16))
+                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
+-                        (void*)c, s_coh_ctxs[i]->image_id);
+-            __atomic_store_n(&s_coh_ctxs[i], NULL, __ATOMIC_RELEASE);
++                        (void*)c, ch->slot[i]->image_id);
++            __atomic_store_n(&ch->slot[i], NULL, __ATOMIC_RELEASE);
+         }
+     }
+     spu_lockline_unlock();
+@@ -497,8 +532,8 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
+     uint32_t line = ea & ~127u;
+     ppu_resv_break_line(ea);   /* upstream #381: line-granule PPU reservations */
+     spu_coh_wake_watches(line);   /* upstream v0.18.0 */
+-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+-        spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
++    SPU_COH_FOR_EACH(ch, i) {
++        spu_context* c = __atomic_load_n(&ch->slot[i], __ATOMIC_ACQUIRE);
+         if (!c || (const void*)c == self) continue;
+         if (spu_resv_kill(c, line)) {           /* patch 1056: CAS under the line's stripe */
+             spu_event_raise(c, SPU_EVENT_LR);   /* patch 1052 */
+@@ -513,8 +548,8 @@ void spu_coh_notify_write(uint32_t ea)
+     uint32_t line = ea & ~127u;
+     ppu_resv_break_line(ea);   /* upstream #381: line-granule PPU reservations */
+     spu_coh_wake_watches(line);   /* upstream v0.18.0 */
+-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+-        spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
++    SPU_COH_FOR_EACH(ch, i) {
++        spu_context* c = __atomic_load_n(&ch->slot[i], __ATOMIC_ACQUIRE);
+         if (!c) continue;
+         if (spu_resv_kill(c, line)) {           /* patch 1056: CAS, reservation lost, PUTLLC must fail */
+             spu_event_raise(c, SPU_EVENT_LR);   /* patch 1052 */
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index 4e5373a5..5f838dcc 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -89,6 +89,7 @@ void spu_coh_notify_write(uint32_t ea);
+  * transient (stack-allocated) spu_context goes out of scope. */
+ void spu_coh_unregister(spu_context* ctx);
+ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
++unsigned spu_coh_capacity(void);  /* KZ3 patch 1109: registry slots now (chunks grow on demand) */
+ /* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
+  * write does not cost it its reservation on hardware. */
+ void spu_coh_notify_write_except(uint32_t ea, const void* self);

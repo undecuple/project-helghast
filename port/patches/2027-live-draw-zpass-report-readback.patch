@@ -1,0 +1,248 @@
+Live-draw: CPU-visible ZPASS report values from the occlusion queries (asynchronous readback).
+
+Symptom: a title that reads its occlusion reports back (Killzone 3's coronas: CoronaResource QueryOffset /
+FadeInTime / FadeOutTime) always saw "visible": the walker writes 0xFFFF into every type-1 GET_REPORT, so a
+light behind a wall kept its glow at full intensity. Patch 2025 used the queries only for GPU predication.
+
+Fix: at GET_REPORT, a report with exactly one query segment since its clear is also resolved into a READBACK
+buffer ring (4096 x u64, mapped for good). Entries get the queue fence value at the next submit; the end of
+every flush copies the counts whose fence has passed into the guest report (value at IO offset + 8,
+big-endian). No wait anywhere (the present flush already waits for frame N-1, so counts land a frame later).
+Walk-time value: 0 when no draw ran since the clear, else the report's last read-back count, else 0xFFFF.
+Off: LD_COND_RENDER=0 (all of 2025 + 2027) or LD_OQ_READBACK=0 (this part). Log every 256 flips:
+"[report-readback] flips= queued= written= zero= dropped= never= walk-last=".
+
+Verified with tools/smoke/test_cond_render.c (host test under Proton, main-memory report context).
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, the 2013 helper is gone (PR256), upstream main-memory test inlined.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): report readback moved into upstream's gcm_3d_method.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 2bfacd2f..30574067 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2577,9 +2577,12 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+     if (m == 0x1A8) s_report_dma = v;
+     if (m == 0x1800) {
+         const u32 off = v & 0xFFFFFFu, idx = off / 16u;
+-        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
++        u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+         const u64 ts = gcm_report_timestamp();
+         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
++        /* KZ3 patch 2027: ZPASS counts from the live engine's occlusion queries (0 / last count
++         * now, the real count a frame later); 0xFFFF stays when it has none. */
++        if (main_mem && (v >> 24) == 1u && rsx_live_draw_enabled()) val = rsx_live_draw_report_value(off, val);
+         { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+         if (main_mem) {
+             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
+@@ -3735,6 +3738,12 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+                              "resolves=%llu reports=%llu segments=%llu\n", nf, (unsigned long long)st[0],
+                              (unsigned long long)st[1], (unsigned long long)st[2], (unsigned long long)st[3],
+                              (unsigned long long)st[4], (unsigned long long)st[5]);
++          { /* KZ3 patch 2027: report readback counters. */
++            u64 rb[6]; rsx_live_draw_debug_report_readback_stats(rb);
++            if (rb[0] || rb[4]) fprintf(stderr, "[report-readback] flips=%llu queued=%llu written=%llu zero=%llu dropped=%llu "
++                                        "never=%llu walk-last=%llu\n", nf, (unsigned long long)rb[0], (unsigned long long)rb[1],
++                                        (unsigned long long)rb[2], (unsigned long long)rb[3], (unsigned long long)rb[4],
++                                        (unsigned long long)rb[5]); }
+           /* KZ3 patch 2026: game-frame markers (label 0x4A back-end releases) per flip. */
+           extern volatile u32 g_rsx_game_frame_marks;
+           static u32 last_marks = 0;
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index fa5bc8a4..3beacdfc 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -49,6 +49,8 @@ void rsx_live_draw_host_aa_arm(int on) { (void)on; }
+ int  rsx_live_draw_host_aa_active(void) { return 0; }
+ u32  rsx_live_draw_debug_host_aa_passes(void) { return 0; }
+ void rsx_live_draw_debug_cond_render_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] = 0; }
++u32  rsx_live_draw_report_value(u32 off, u32 dflt) { (void)off; return dflt; }
++void rsx_live_draw_debug_report_readback_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] = 0; }
+ void rsx_live_draw_note_guest_write_async(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ u32  rsx_live_draw_before_guest_sync(void) { return 0; }
+@@ -2154,6 +2156,8 @@ static void ld_wait_idle(void)
+ }
+ 
+ static void ld_oq_close(void);   /* patch 2025 */
++static void ld_rb_stamp(u64 v);   /* patch 2027 */
++static void ld_rb_drain(void);
+ static void ld_flush_body(ld_flush_reason reason)
+ {
+ #if defined(YZ_PERF_PROFILE)
+@@ -2186,6 +2190,7 @@ static void ld_flush_body(ld_flush_reason reason)
+         g.ready = 0;
+         return;
+     }
++    ld_rb_stamp(v);   /* patch 2027 */
+     if (g.fif_n > 1 && reason == LD_FLUSH_PRESENT) {
+         /* Frame N is queued; recycle frame N-1's slot once its fence passes,
+          * so the walker records frame N+1 while the GPU and the swap chain
+@@ -2206,6 +2211,7 @@ static void ld_flush_body(ld_flush_reason reason)
+         g.upload_used = 0;
+         g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
+         g.srv_ring_used = 0; g.smp_ring_used = 0;
++        ld_rb_drain();   /* patch 2027: frame N-1 is done */
+         return;
+     }
+     if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
+@@ -2246,6 +2252,7 @@ static void ld_flush_body(ld_flush_reason reason)
+     g.alloc->lpVtbl->Reset(g.alloc);
+     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+     g.upload_used = 0;
++    ld_rb_drain();   /* patch 2027 */
+ #if defined(YZ_PERF_PROFILE)
+     const u64 flush_ticks = (u64)(ld_profile_qpc() - flush_begin);
+     g_ld_profile.total.flush_qpc += flush_ticks;
+@@ -8753,10 +8760,112 @@ static struct {
+     u64 open_serial;
+     u32 segs;                     /* segments since CLEAR_REPORT_VALUE(ZPASS) */
+     u64 last_serial;              /* the newest closed segment */
+-    struct { u32 off; u8 used, state; u64 serial; } slot[LD_OQ_SLOTS];
++    struct { u32 off; u8 used, state, has_val; u32 val; u64 serial, rb; } slot[LD_OQ_SLOTS];   /* val/has_val/rb: patch 2027 */
+     u64 n_pred, n_skip, n_always, n_resolve, n_reports, n_segments;
+ } g_oq = { .on = -1 };
+ 
++/* KZ3 patch 2027: CPU-visible ZPASS report values.
++ *
++ * Patch 2025 used the occlusion queries only for GPU predication; the report value the title reads from
++ * guest memory stayed the walker's "visible" 0xFFFF. KZ3's coronas (CoronaResource: QueryOffset,
++ * FadeInTime, FadeOutTime) read their report back to fade the glow in and out, so every corona -- even one
++ * whose light sits behind a wall -- stayed at full intensity.
++ *
++ * Now each PENDING report (one query segment since its clear) is also resolved into a READBACK buffer
++ * ring at GET_REPORT time. Entries are stamped with the queue fence value at the next command-list
++ * submit, and the end of every flush copies the counts of entries whose fence has passed into the guest
++ * report (CellGcmReportData.value, big-endian, at IO offset + 8). Never a wait: the present flush already
++ * waits for frame N-1, so a frame's counts land one frame later -- what a PS3 title sees when it reads last
++ * frame's report. At walk time the walker writes the slot's last real count (0xFFFF before the first one;
++ * 0 for NEVER: no draw since the clear), so a read before the readback lands sees the previous frame.
++ * Off with LD_COND_RENDER=0 (whole path) or LD_OQ_READBACK=0 (this part only).
++ * ASSUMPTION: the surface is rendered at the guest resolution, so the D3D12 sample count is the RSX count. */
++#define LD_RB_N 4096u
++static struct {
++    int on;                       /* -1 = not decided yet */
++    ID3D12Resource* buf;          /* LD_RB_N x u64, READBACK heap, mapped for good */
++    const volatile u64* map;
++    u64 head, tail, unsubmitted;  /* ring indices, monotonic: [tail, unsubmitted) stamped, [unsubmitted, head) not */
++    struct { u64 fence; u32 off; u8 guest; } e[LD_RB_N];
++    u64 n_queued, n_written, n_zero, n_dropped, n_never, n_walk_last;
++} g_rb = { .on = -1 };
++
++static int ld_rb_enabled(void)
++{
++    if (g_rb.on >= 0) return g_rb.on;
++    const char* e = getenv("LD_OQ_READBACK");
++    g_rb.on = !(e && e[0] == '0');
++    if (!g_rb.on) { fprintf(stderr, "[report-readback] off (LD_OQ_READBACK=0)\n"); return 0; }
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)LD_RB_N * 8u;
++    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
++    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    void* m = NULL;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&g_rb.buf)) ||
++        FAILED(g_rb.buf->lpVtbl->Map(g_rb.buf, 0, NULL, &m)) || !m) {
++        fprintf(stderr, "[report-readback] readback buffer failed: off\n");
++        g_rb.on = 0; return 0;
++    }
++    g_rb.map = (const volatile u64*)m;
++    fprintf(stderr, "[report-readback] on: %u entries\n", LD_RB_N);
++    return 1;
++}
++
++/* After Signal(v): every entry queued since the last submit completes with fence v. */
++static void ld_rb_stamp(u64 v)
++{
++    for (; g_rb.unsubmitted < g_rb.head; g_rb.unsubmitted++) g_rb.e[g_rb.unsubmitted % LD_RB_N].fence = v;
++}
++
++static int ld_oq_slot(u32 off, int create);
++static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes);
++/* Copy finished counts into the guest reports. Never waits. */
++static void ld_rb_drain(void)
++{
++    if (g_rb.on != 1 || g_rb.tail == g_rb.unsubmitted) return;
++    const u64 done = g.fence->lpVtbl->GetCompletedValue(g.fence);
++    while (g_rb.tail < g_rb.unsubmitted) {
++        const u32 k = (u32)(g_rb.tail % LD_RB_N);
++        if (g_rb.e[k].fence > done) break;
++        const u64 c = g_rb.map[k];
++        const u32 v = c > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)c;
++        const int i = ld_oq_slot(g_rb.e[k].off, 0);
++        if (i >= 0) { g_oq.slot[i].val = v; g_oq.slot[i].has_val = 1; }
++        if (g_rb.e[k].guest) {
++            u8* p = (u8*)guest_ptr(1u, g_rb.e[k].off, 16u);   /* location 1: IO offset in main memory */
++            if (p) {
++                p[8] = (u8)(v >> 24); p[9] = (u8)(v >> 16); p[10] = (u8)(v >> 8); p[11] = (u8)v;
++                g_rb.n_written++; if (!v) g_rb.n_zero++;
++            }
++        }
++        g_rb.tail++;
++    }
++}
++
++/* Walker hook (cellGcmSys, type-1 report in main memory, called after sink_report for the same GET_REPORT):
++ * the value to write now. Marks the queued readback as one that goes to the guest. */
++u32 rsx_live_draw_report_value(u32 off, u32 dflt)
++{
++    if (!g.ready || g_oq.on != 1) return dflt;
++    const int i = ld_oq_slot(off & 0xFFFFFFu, 0);
++    if (i < 0) return dflt;
++    if (g_oq.slot[i].state == OQ_NEVER) { g_rb.n_never++; return 0u; }
++    if (g_oq.slot[i].state != OQ_PENDING) return dflt;
++    if (g_oq.slot[i].rb) { g_rb.e[(g_oq.slot[i].rb - 1u) % LD_RB_N].guest = 1; g_oq.slot[i].rb = 0; }
++    if (!g_oq.slot[i].has_val) return dflt;
++    g_rb.n_walk_last++;
++    return g_oq.slot[i].val;
++}
++
++void rsx_live_draw_debug_report_readback_stats(u64 out[6])
++{
++    out[0] = g_rb.n_queued; out[1] = g_rb.n_written; out[2] = g_rb.n_zero;
++    out[3] = g_rb.n_dropped; out[4] = g_rb.n_never; out[5] = g_rb.n_walk_last;
++}
++
+ static int ld_oq_enabled(void)
+ {
+     if (g_oq.on >= 0) return g_oq.on;
+@@ -8832,7 +8941,18 @@ static void sink_report(void* user, const rsx_dispatch* r, u32 method, u32 arg)
+     if (i < 0) return;
+     if ((arg >> 24) != 1u || g_oq.segs > 1) g_oq.slot[i].state = OQ_ALWAYS;
+     else if (g_oq.segs == 0) g_oq.slot[i].state = OQ_NEVER;
+-    else { g_oq.slot[i].state = OQ_PENDING; g_oq.slot[i].serial = g_oq.last_serial; }
++    else {
++        g_oq.slot[i].state = OQ_PENDING; g_oq.slot[i].serial = g_oq.last_serial; g_oq.slot[i].rb = 0;
++        if (ld_rb_enabled()) {   /* patch 2027: the count for the guest, a frame later */
++            if (g_rb.head - g_rb.tail >= LD_RB_N) { g_rb.n_dropped++; return; }
++            const u64 h = g_rb.head++;
++            g_rb.e[h % LD_RB_N].fence = 0; g_rb.e[h % LD_RB_N].off = arg & 0xFFFFFFu; g_rb.e[h % LD_RB_N].guest = 0;
++            g.list->lpVtbl->ResolveQueryData(g.list, g_oq.heap, D3D12_QUERY_TYPE_OCCLUSION,
++                (UINT)(g_oq.last_serial % LD_OQ_N), 1, g_rb.buf, (UINT64)(h % LD_RB_N) * 8u);
++            g_oq.slot[i].rb = h + 1u;
++            g_rb.n_queued++;
++        }
++    }
+ }
+ 
+ /* Before a draw: 0 = draw, 1 = draw under predication (clear it after), -1 = skip. */
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index a372f8f8..fb708b9b 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -126,6 +126,12 @@ u32  rsx_live_draw_debug_host_aa_passes(void);
+ /* patch 2025: conditional render counters: predicated draws, draws skipped on the CPU (count 0), mode-2 draws
+  * left unconditional (unknown report), query resolves, GET_REPORTs, query segments. */
+ void rsx_live_draw_debug_cond_render_stats(u64 out[6]);
++/* patch 2027: walker hook for a type-1 GET_REPORT into main memory: the value to write at walk time (0 when no
++ * draw ran since the clear, else the report's last read-back count, else dflt). The real count follows a frame
++ * later from the query readback. Stats: queued, written to the guest, written as 0, dropped (ring full),
++ * NEVER (0 at walk time), walk-time values taken from an earlier readback. */
++u32  rsx_live_draw_report_value(u32 off, u32 dflt);
++void rsx_live_draw_debug_report_readback_stats(u64 out[6]);
+ /* 1:1 NV3089 blit whose source is a live GPU surface: copy it on the GPU.
+  * Addresses are location-relative byte offsets of the rect's top-left.
+  * Returns 1 when handled (the guest-memory copy still runs regardless). */

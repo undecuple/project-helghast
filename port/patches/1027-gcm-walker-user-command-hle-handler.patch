@@ -1,0 +1,82 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR273 queues the command, the pending-slot handoff wait kept.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -21,6 +21,8 @@
+  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
+ static u32 s_gcm_context_ea = 0;
+ #include <stdio.h>
++#include <time.h>
++static void gcm_walker_user_command(u32 cmd);
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdint.h>
+@@ -259,6 +261,7 @@ static volatile LONG s_user_command = 0;
+ static volatile LONG64 s_user_pending = 0;
+ #define GCM_USER_PENDING_STORE(value) InterlockedExchange64(&s_user_pending, (LONG64)(value))
+ #define GCM_USER_PENDING_TAKE() ((u64)InterlockedExchange64(&s_user_pending, 0))
++#define GCM_USER_PENDING_PEEK() ((u64)InterlockedCompareExchange64(&s_user_pending, 0, 0))
+ #else
+ #include <stdatomic.h>
+ static atomic_uint s_user_command = 0;
+@@ -266,6 +269,7 @@ static atomic_uint s_user_command = 0;
+ static _Atomic(u64) s_user_pending = 0;
+ #define GCM_USER_PENDING_STORE(value) atomic_store(&s_user_pending, (value))
+ #define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
++#define GCM_USER_PENDING_PEEK() atomic_load(&s_user_pending)
+ #endif
+ 
+ /* Tile configuration (up to 15 tiles, 8 commonly used) */
+@@ -2030,12 +2034,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 if (subch == 7 && m == 0x0B00u) {
+                     extern void rsx_raise_user_cmd(u32 arg);
+                     rsx_raise_user_cmd(vm_read32(dea));
+-                    /* A title that registered its handler with the HLE
+-                     * cellGcmSetUserHandler has no lv2 interrupt thread
+-                     * reading that event; its handler runs from the pump.
+-                     * The `continue` skips the 0xEB00 case below, so queue
+-                     * it for the pump here. */
+-                    if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
++                    /* A title that registered its handler through the HLE
++                     * cellGcmSetUserHandler (Killzone 3: one per frame, the
++                     * argument is the frame's SPURS job item) has no lv2 ISR
++                     * queue, so rsx_raise_user_cmd drops it (qid 0, mask 0).
++                     * Deliver it the HLE way too; the two registrations are
++                     * exclusive, so nothing runs twice. Before this, the
++                     * `continue` skipped the 0xEB00 branch below for good. */
++                    if (s_user_handler_opd) gcm_walker_user_command(vm_read32(dea));
+                     continue;
+                 }
+                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
+@@ -3657,6 +3663,28 @@ void cellGcmSetUserCommand(u32 cmd)
+ /* Called when a FIFO consumer retires a user-interrupt method. Publishing
+  * the cause and pending marker is atomic; guest code runs later in the pump.
+  * Like the driver cause register, multiple pending commands coalesce. */
++/* The FIFO walker's user command: the pending slot holds one cause, and the
++ * walker can issue the next before a pump has delivered the previous one. Give
++ * the pump up to ~50 ms to take it (the RSX does not run ahead of an unserviced
++ * interrupt either), then report and overwrite. */
++static void gcm_walker_user_command(u32 cmd)
++{
++    for (int spin = 0; spin < 50; spin++) {
++        if (!GCM_USER_PENDING_PEEK()) break;
++#ifdef _WIN32
++        Sleep(1);
++#else
++        { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
++#endif
++    }
++    { u64 old = GCM_USER_PENDING_PEEK(); static int n = 0;
++      if (old && n++ < 8) fprintf(stderr, "[usercmd] pending 0x%08X not taken in 50 ms; replaced by 0x%08X\n",
++                                  (u32)old, cmd); }
++    { static unsigned long n = 0; if (n++ < 4 || (n % 1024) == 0)
++        fprintf(stderr, "[usercmd] HLE #%lu cmd=0x%08X\n", n, cmd); }
++    cellGcmQueueUserCommand(cmd);
++}
++
+ void cellGcmQueueUserCommand(u32 cmd)
+ {
+     GCM_USER_STORE(cmd);

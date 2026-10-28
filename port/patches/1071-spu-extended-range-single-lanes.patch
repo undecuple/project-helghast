@@ -1,0 +1,339 @@
+KZ3 patch 1071 (SPU pass 56): SPU extended-range single precision on the lanes the host gets wrong.
+The SPU has no single-precision Inf/NaN (exponent 255 is an ordinary binade, overflow saturates, SPU ISA v1.2 s.9.1);
+the helpers read such words as host Inf/NaN. fa/fs/fm, fma/fms/fnms (both paths), fceq/fcgt/fcmeq/fcmgt,
+cflts/cfltu, csflt/cuflt and fi now recompute a lane exactly when an operand or the host result has exponent 255
+(spu__xr_mask: one SSE compare per operand), using the exact lane code of sp00nznet/ps3recomp PR #287 by
+NoahBPeterson (spu__sf_pack/split/sum, fa/fm/fma lanes, key compares, cflts lanes, integer fi). All other lanes keep
+their current results and rounding. KZ3_SPU_XR=0 keeps the host results (A/B). Host test tools/spu/test_spu_xr.sh.
+
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -17,7 +17,8 @@
+ int g_kz3_spu_fastcg_level = 1 << 30;
+ int g_kz3_spu_fastdisp = 1;
+ int g_spu_launch_diag = 0;
+-int g_kz3_fma_stats = 0;   /* patch 1040: KZ3_SPU_FMASTATS=1 counts the fma fallback lanes by reason */
++int g_kz3_fma_stats = 0;
++int g_kz3_spu_xr = 1;   /* patch 1071: SPU extended-range lanes (KZ3_SPU_XR=0 = host results, for A/B) */   /* patch 1040: KZ3_SPU_FMASTATS=1 counts the fma fallback lanes by reason */
+ /* Lanes that left patch 1038's inline fma path, by reason: [0] NaN/inf sum, [1] float overflow, [2] float
+  * subnormal result (with FTZ: only the one edge value), [3] rounding midpoint; [4] fallback vectors. Shared by
+  * all SPU host threads (relaxed atomics, slow path only). */
+@@ -52,6 +53,7 @@
+     g_kz3_spu_slowcg = g_kz3_spu_fastcg_level < 1038;
+     g_kz3_spu_fastdisp = g_kz3_spu_fastcg_level >= 1039;
+     if (!g_kz3_spu_slowcg && g_kz3_spu_fastcg_level < 1040) g_kz3_spu_slowcg = 2;   /* 1038 paths without FTZ */
++    g_kz3_spu_xr = !(getenv("KZ3_SPU_XR") && *getenv("KZ3_SPU_XR") == '0');
+     g_kz3_fma_stats = getenv("KZ3_SPU_FMASTATS") && *getenv("KZ3_SPU_FMASTATS") == '1';
+     g_spu_launch_diag = !g_kz3_spu_fastdisp || getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
+                         getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -117,6 +117,116 @@
+ static inline u128 spu_mpya(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]+c._s32[i]; return r; }
+ /* sfx: extended subtract rb-ra-1+carry; carry-in = low bit of old rt (RT is 3rd src). */
+ static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
++/* ---- KZ3 patch 1071 (SPU pass 56): SPU extended-range singles on the lanes the host gets wrong ----
++ * The SPU single-precision unit is not IEEE (SPU ISA v1.2 section 9.1): biased exponent 255 is an ordinary binade
++ * (no Inf/NaN, Smax = 0x7FFFFFFF), exponent 0 is zero, results truncate and saturate at +-Smax. The host ops below
++ * read an exponent-255 word as Inf/NaN, so e.g. the normalise idiom x * fi(x, frsqest(x)) with x = 0 gives NaN here
++ * (frsqest(0) = exponent 255, fi keeps it, 0 * that = NaN) where the SPU gives 0. KZ3 met it twice: the TextureStreaming
++ * job's NaN scores (pass 55) and the animation job job_011c8080's bone matrices 0x7FF50000/0xFFF50000 (pass 56, the
++ * K2 Hammer camera). This patch keeps every existing fast path and its rounding, and only recomputes a lane exactly
++ * when an operand or the host result has exponent 255; the exact lane code is NoahBPeterson's from
++ * sp00nznet/ps3recomp PR #287 ("spu: hardware-exact float semantics", spu__sf_pack/split/sum, fa/fm/fma lanes, the key
++ * compares, cflts lanes and the integer fi), used here only on those lanes. g_kz3_spu_xr = 0 (KZ3_SPU_XR=0) keeps the
++ * host results (A/B); it is read only when such a lane occurs. */
++extern int g_kz3_spu_xr;
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
++static inline uint32_t spu__sf_pack(uint32_t sign, unsigned __int128 sig, int e2) {
++    const uint64_t hi = (uint64_t)(sig >> 64), lo = (uint64_t)sig;
++    const int top = hi ? 127 - __builtin_clzll(hi) : 63 - __builtin_clzll(lo);
++    const int biased = top + e2 + 127;
++    if (biased > 255) return sign | 0x7FFFFFFFu;
++    if (biased < 1)   return 0;
++    const uint32_t m24 = top >= 23 ? (uint32_t)(sig >> (top - 23)) : (uint32_t)(sig << (23 - top));
++    return sign | ((uint32_t)biased << 23) | (m24 & 0x7FFFFFu);
++}
++static inline int spu__sf_split(uint32_t x, uint32_t* sig, int* e2) {
++    const uint32_t be = (x >> 23) & 0xFFu;
++    if (!be) return 0;
++    *sig = (x & 0x7FFFFFu) | 0x800000u;
++    *e2 = (int)be - 150;
++    return 1;
++}
++static inline uint32_t spu__sf_sum(uint32_t s1, uint64_t m1, int e1, uint32_t s2, uint64_t m2, int e2) {
++    if (e1 < e2) { uint32_t ts = s1; s1 = s2; s2 = ts; uint64_t tm = m1; m1 = m2; m2 = tm; int te = e1; e1 = e2; e2 = te; }
++    const int d = e1 - e2;
++    if (d > 79) {
++        if (s1 == s2) return spu__sf_pack(s1, m1, e1);
++        return spu__sf_pack(s1, ((unsigned __int128)m1 << 1) - 1, e1 - 1);
++    }
++    const unsigned __int128 a = (unsigned __int128)m1 << d, b = m2;
++    if (s1 == s2) return spu__sf_pack(s1, a + b, e2);
++    if (a == b) return 0;
++    return a > b ? spu__sf_pack(s1, a - b, e2) : spu__sf_pack(s2, b - a, e2);
++}
++static inline uint32_t spu__fa_lane(uint32_t x, uint32_t y) {
++    uint32_t mx, my; int ex, ey;
++    const int nx = spu__sf_split(x, &mx, &ex), ny = spu__sf_split(y, &my, &ey);
++    if (!nx) return ny ? y : 0;
++    if (!ny) return x;
++    return spu__sf_sum(x & 0x80000000u, mx, ex, y & 0x80000000u, my, ey);
++}
++static inline uint32_t spu__fm_lane(uint32_t x, uint32_t y) {
++    uint32_t mx, my; int ex, ey;
++    if (!spu__sf_split(x, &mx, &ex) || !spu__sf_split(y, &my, &ey)) return 0;
++    return spu__sf_pack((x ^ y) & 0x80000000u, (uint64_t)mx * my, ex + ey);
++}
++static inline uint32_t spu__fma_lane(uint32_t x, uint32_t y, uint32_t z, uint32_t negp, uint32_t negc) {
++    uint32_t mx, my, mz; int ex, ey, ez;
++    const int np = spu__sf_split(x, &mx, &ex) & spu__sf_split(y, &my, &ey);
++    const int nz = spu__sf_split(z, &mz, &ez);
++    const uint32_t sp = ((x ^ y) & 0x80000000u) ^ negp, sz = (z & 0x80000000u) ^ negc;
++    if (!np) return nz ? (sz | (z & 0x7FFFFFFFu)) : 0;
++    const uint64_t p = (uint64_t)mx * my;
++    if (!nz) return spu__sf_pack(sp, p, ex + ey);
++    return spu__sf_sum(sp, p, ex + ey, sz, mz, ez);
++}
++static inline int64_t spu__sf_key(uint32_t x) {
++    if (!(x & 0x7F800000u)) return 0;
++    const int64_t m = x & 0x7FFFFFFFu;
++    return (x & 0x80000000u) ? -m : m;
++}
++static inline int64_t spu__sf_mag(uint32_t x) { return (x & 0x7F800000u) ? (int64_t)(x & 0x7FFFFFFFu) : 0; }
++static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
++    uint32_t m; int e;
++    if (!spu__sf_split(x, &m, &e)) return 0;
++    const int sh = e + scale, neg = (x >> 31) != 0;
++    if (is_unsigned) {
++        if (neg) return 0;
++        if (sh >= 9) return 0xFFFFFFFFu;
++        return sh >= 0 ? m << sh : (sh <= -24 ? 0 : m >> -sh);
++    }
++    if (sh >= 8) return neg ? 0x80000000u : 0x7FFFFFFFu;
++    const uint32_t v = sh >= 0 ? m << sh : (sh <= -24 ? 0 : m >> -sh);
++    return neg ? 0u - v : v;
++}
++/* PR #287's integer fi (ISA p. 219), used for an exponent-255 estimate. */
++static inline uint32_t spu__fi_lane(uint32_t ra, uint32_t est) {
++    const uint32_t sign = est & 0x80000000u;
++    int exp = (int)((est >> 23) & 0xFFu);
++    const uint64_t base = (est >> 10) & 0x1FFFu, step = est & 0x3FFu, y = ra & 0x7FFFFu;
++    if (exp == 0) return 0;
++    uint64_t m = ((((uint64_t)1 << 13) | base) << 19) - step * y;
++    if (m < ((uint64_t)1 << 32)) { m <<= 1; if (--exp == 0) return 0; }
++    return sign | ((uint32_t)exp << 23) | (uint32_t)((m >> 9) & 0x7FFFFFu);
++}
++/* Bit i set when word i has biased exponent 255. */
++static inline unsigned spu__xr_mask(u128 v) {
++#if defined(__SSE2__)
++    __m128i V; memcpy(&V, &v, 16);
++    const __m128i e = _mm_set1_epi32(0x7F800000);
++    return (unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(V, e), e)));
++#else
++    unsigned m = 0; for (int i = 0; i < 4; i++) m |= ((v._u32[i] & 0x7F800000u) == 0x7F800000u) << i; return m;
++#endif
++}
++#define SPU_XR_FIXM(mask, r, a, b, expr) do { const unsigned _m = (mask); \
++    if (__builtin_expect(_m != 0, 0) && g_kz3_spu_xr) for (int _i = 0; _i < 4; _i++) if (_m >> _i & 1) { \
++        const uint32_t x = (a)._u32[_i], y = (b)._u32[_i]; (void)x; (void)y; (r)._u32[_i] = (expr); } } while (0)
++/* float result: an exponent-255 operand or result lane is recomputed */
++#define SPU_XR_FIX2(r, a, b, expr) SPU_XR_FIXM(spu__xr_mask(a) | spu__xr_mask(b) | spu__xr_mask(r), r, a, b, expr)
++
+ /* FI decodes the base and step fields produced by the hardware estimate
+  * instructions; its second operand is not an ordinary reciprocal float. */
+ SPU_HOT u128 spu_fi(u128 a, u128 b) {
+@@ -125,6 +235,7 @@
+         uint32_t rb = b._u32[i];
+         uint32_t ra = a._u32[i];
+         uint32_t exp = (rb >> 23) & 0xFFu;
++        if (__builtin_expect(exp == 255u, 0) && g_kz3_spu_xr) { r._u32[i] = spu__fi_lane(ra, rb); continue; }   /* patch 1071 */
+         uint32_t base_bits = rb & 0xFFFFFC00u;
+         float base; memcpy(&base, &base_bits, sizeof base);
+         uint32_t step_frac = rb & 0x3FFu;
+@@ -186,11 +297,11 @@
+  *   sel & 0xC0 == 0xC0 -> 0xFF
+  *   sel & 0xC0 == 0x80 -> 0x00
+  *   otherwise           -> concat{a,b}[sel & 0x1F] */
+-#if defined(__SSE4_1__)
+-#include <smmintrin.h>
+-/* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
+- * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
+- * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
++#if defined(__SSE4_1__)
++#include <smmintrin.h>
++/* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
++ * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
++ * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+ /* KZ3 patch 1041 (SPU pass 28): shufb in host byte order, without the three word swaps. Result host byte h is
+  * SPU byte h ^ 3, so its control is host byte h of c as it stands; SPU source byte k (k = control & 0x1F) is
+  * host byte (k & 15) ^ 3 of a (k < 16) or b. t = (control & 0x1F) ^ 3 keeps bit 4 (the a/b choice):
+@@ -212,22 +323,45 @@
+     }
+ }
+ static inline u128 spu_shufb_1035(u128 a, u128 b, u128 c) {
+-    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+-    __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+-    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
+-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
+-    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
+-    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
+-    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
+-    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
+-    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
+-    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
+-    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
+-    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+-    u128 out; memcpy(&out, &r, 16); return out;
+-}
+-/* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
+-static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
++    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
++    __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
++    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
++    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
++    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
++    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
++    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
++    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
++    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
++    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
++    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
++    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
++    u128 out; memcpy(&out, &r, 16); return out;
++}
++/* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
++static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
++    /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
++     * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
++     * control, and the result) through SPU_W so a control supplied as an immediate
++     * (ila/il) or an LS-loaded constant -- already in true SPU byte order -- is
++     * interpreted correctly. The cbd/chd/cwd/cdd generators below produce true
++     * SPU-byte-order selectors to match. */
++    uint8_t cat[32];
++    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
++    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
++    u128 r;
++    for (int t=0;t<16;t++) {                              /* result SPU byte t */
++        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
++        uint8_t v;
++        if      ((s & 0xE0)==0xE0) v=0x80;
++        else if ((s & 0xC0)==0xC0) v=0xFF;
++        else if ((s & 0xC0)==0x80) v=0x00;
++        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
++        r._u8[SPU_W(t)] = v;
++    }
++    return r;
++}
++#else
++static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
+      * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
+      * control, and the result) through SPU_W so a control supplied as an immediate
+@@ -249,31 +383,8 @@
+     }
+     return r;
+ }
+-#else
+-static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+-    /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
+-     * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
+-     * control, and the result) through SPU_W so a control supplied as an immediate
+-     * (ila/il) or an LS-loaded constant -- already in true SPU byte order -- is
+-     * interpreted correctly. The cbd/chd/cwd/cdd generators below produce true
+-     * SPU-byte-order selectors to match. */
+-    uint8_t cat[32];
+-    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
+-    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
+-    u128 r;
+-    for (int t=0;t<16;t++) {                              /* result SPU byte t */
+-        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
+-        uint8_t v;
+-        if      ((s & 0xE0)==0xE0) v=0x80;
+-        else if ((s & 0xC0)==0xC0) v=0xFF;
+-        else if ((s & 0xC0)==0x80) v=0x00;
+-        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
+-        r._u8[SPU_W(t)] = v;
+-    }
+-    return r;
+-}
+-#define spu_shufb_ref spu_shufb
+-#endif
++#define spu_shufb_ref spu_shufb
++#endif
+ 
+ /* ---- shift / rotate immediate (word lanes) ---- */
+ static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
+@@ -327,20 +438,24 @@
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+ 
+ /* ---- single-precision float (4 lanes) ---- */
+-static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
+-static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
++static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; SPU_XR_FIX2(r, a, b, spu__fa_lane(x, y)); return r; }
++static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; SPU_XR_FIX2(r, a, b, spu__fa_lane(x, y ^ 0x80000000u)); return r; }
+ 
+ /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
+  * The canonical immediates 173 and 155 are identity conversions. */
+ static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
+-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
++    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } SPU_XR_FIXM(spu__xr_mask(a), r, a, a, spu__cfl_lane(x, 173 - (i8 & 0xFF), 0)); return r; }
+ static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
+-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
++    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } SPU_XR_FIXM(spu__xr_mask(a), r, a, a, spu__cfl_lane(x, 173 - (i8 & 0xFF), 1)); return r; }
+ static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+-    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
++    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f);
++    SPU_XR_FIXM(spu__xr_mask(r), r, a, a, (int32_t)x ? spu__sf_pack((int32_t)x < 0 ? 0x80000000u : 0, (int32_t)x < 0 ? 0u - x : x, -(155 - (i8 & 0xFF))) : 0);
++    return r; }
+ static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+-    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
+-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
++    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f);
++    SPU_XR_FIXM(spu__xr_mask(r), r, a, a, x ? spu__sf_pack(0, x, -(155 - (i8 & 0xFF))) : 0);
++    return r; }
++static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; SPU_XR_FIX2(r, a, b, spu__fm_lane(x, y)); return r; }
+ /* KZ3 patch 1035: fused multiply-add without the libm call. Without -mfma, fmaf is MinGW's software
+  * routine (with frexp/ldexp inside; ~3 % of the level's SPURS samples in SPU pass 21). The product of two
+  * floats is exact in double, so s = a*b + c has one double rounding; rounding s to float then equals the
+@@ -426,6 +541,9 @@
+     u128 r;
+     for (int i = 0; i < 4; i++)
+         r._f32[i] = spu__fmaf(a._f32[i], negb ? -b._f32[i] : b._f32[i], negc ? -c._f32[i] : c._f32[i]);
++    /* patch 1071: the fast path above never takes an exponent-255 operand (it reads as Inf/NaN in double) */
++    SPU_XR_FIXM(spu__xr_mask(a) | spu__xr_mask(b) | spu__xr_mask(c) | spu__xr_mask(r), r, a, b,
++                spu__fma_lane(x, y, c._u32[_i], negb ? 0x80000000u : 0u, negc ? 0x80000000u : 0u));
+     if (cgm == 0)
+         for (int i = 0; i < 4; i++)
+             if (r._f32[i] != 0.0f && __builtin_fabsf(r._f32[i]) < 0x1p-126f) r._u32[i] &= 0x80000000u;
+@@ -435,12 +553,12 @@
+ SPU_HOT u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__fma4(a, b, c, 0, 1); }
+ SPU_HOT u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__fma4(a, b, c, 1, 0); }
+ #else
+-SPU_HOT u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=spu__fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
+-SPU_HOT u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=spu__fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
+-SPU_HOT u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=spu__fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
++SPU_HOT u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=spu__fmaf(a._f32[i], b._f32[i], c._f32[i]); SPU_XR_FIXM(spu__xr_mask(a) | spu__xr_mask(b) | spu__xr_mask(c) | spu__xr_mask(r), r, a, b, spu__fma_lane(x, y, c._u32[_i], 0, 0)); return r; }
++SPU_HOT u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=spu__fmaf(a._f32[i], b._f32[i], -c._f32[i]); SPU_XR_FIXM(spu__xr_mask(a) | spu__xr_mask(b) | spu__xr_mask(c) | spu__xr_mask(r), r, a, b, spu__fma_lane(x, y, c._u32[_i], 0, 0x80000000u)); return r; }
++SPU_HOT u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=spu__fmaf(a._f32[i], -b._f32[i], c._f32[i]); SPU_XR_FIXM(spu__xr_mask(a) | spu__xr_mask(b) | spu__xr_mask(c) | spu__xr_mask(r), r, a, b, spu__fma_lane(x, y, c._u32[_i], 0x80000000u, 0)); return r; }
+ #endif
+-static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
+-static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
++static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; SPU_XR_FIXM(spu__xr_mask(a) | spu__xr_mask(b), r, a, b, spu__sf_key(x) == spu__sf_key(y) ? 0xFFFFFFFFu : 0u); return r; }
++static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; SPU_XR_FIXM(spu__xr_mask(a) | spu__xr_mask(b), r, a, b, spu__sf_key(x) > spu__sf_key(y) ? 0xFFFFFFFFu : 0u); return r; }
+ 
+ /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
+  * Reassemble via _u32 -- our u128 is host-LE, so a naive _f64[i] would SWAP the
+@@ -557,8 +675,8 @@
+ static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
+ static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
+ static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
+-static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
+-static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
++static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } SPU_XR_FIXM(spu__xr_mask(a) | spu__xr_mask(b), r, a, b, spu__sf_mag(x) == spu__sf_mag(y) ? 0xFFFFFFFFu : 0u); return r; }
++static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } SPU_XR_FIXM(spu__xr_mask(a) | spu__xr_mask(b), r, a, b, spu__sf_mag(x) > spu__sf_mag(y) ? 0xFFFFFFFFu : 0u); return r; }
+ static const uint32_t spu_frest_fraction_lut[32] = {
+     0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
+     0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,

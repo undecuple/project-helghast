@@ -1,0 +1,40 @@
+# Continue + pause/quit/Continue (network pass 14, tests T6 and T7 of the gameplay test plan).
+# Appended after tools/pad/menu-fast.pad by tools/level-run.sh, with KZ3_CROSS_EVERY=0, booting a profile whose
+# continue record is set (profile_edit.py show: can_continue=True), e.g. a T5 run:
+#   KZ3_CROSS_EVERY=0 tools/level-run.sh NAME 400 --pad tools/pad/continue.pad --load 46 --save-from <T5 run dir>
+# menu-fast's CROSSes open campaignlobby.gum (main menu Campaign; 35.1 s in net-r14-b/c); its default focus is Continue
+# (enabled by CanContinueGame 0x4CE6F0), so menu-fast's next CROSS already presses it (load 38.0 s). Every extra CROSS below only moves
+# forward on these pages (loading.gum does not wire CROSS), so the retries are safe.
+# Result (network pass 14, runs net-r14-b/c): Continue loads the saved level at 38 s, 2 of 2; the quit's Yes is taken
+# (UP alone does it, LEFT does nothing) but the port then stays black with no main menu, so the last CROSSes do nothing.
+# Detail and results: the RE notes.
+46:0x4000      # retry Continue (lobby opened late on a shared GPU)
+50:0x4000      #   retry
+# Loading movie skip (RE pass 105 recipe, maintainer lvlr-K*): START pauses, SQUARE skips once the loader is done.
+68:0x0008      # START: pause the loading movie
+73:0x8000      # SQUARE: skip
+78:0x8000
+83:0x8000
+88:0x8000
+93:0x8000
+98:0x8000
+103:0x8000
+108:0x8000
+113:0x8000
+118:0x8000
+# T7: pause, Quit (campaignoptions.gum lst_options: Resume, Restart, Restart section, Options, Quit = DOWN x4), confirm.
+150:0x0008     # START: pause menu (focus Resume)
+156:0x0040     # DOWN 1/4
+162:0x0040     # DOWN 2/4
+168:0x0040     # DOWN 3/4
+174:0x0040     # DOWN 4/4 -> Quit
+180:0x4000     # CROSS: dialogquit.gum (default focus No)
+186:0x0010     # UP: Yes if the options are stacked
+192:0x0080     # LEFT: Yes if they are side by side
+198:0x4000     # CROSS: Yes -> gGame:QuitGame() -> main menu
+# Back in the menus: cover/title -> main menu Campaign -> lobby Continue -> loading (CROSS ignored there).
+215:0x4000
+225:0x4000
+235:0x4000
+245:0x4000
+255:0x4000

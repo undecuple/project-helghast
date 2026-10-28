@@ -1,0 +1,370 @@
+KZ3 patch 4014 (stage 3b, ENHANCEMENT, opt-in): the editor behind the in-game "Edit custom layout" page.
+pad_remap_ui.h (new, pure): the page's rows (the game's actions, one per game button), bind / swap on conflict /
+clear / reset-to-preset on the custom table of 4013, the Start button can never be left unbound, and the text
+commands "kb:pm ..." (pmu_command, dispatched from pad_kb_ui_command next to padmap). cellPad.c: pad_map_edit_poll
+runs the capture of the next pad button on the raw host reports before the remap, keeps pad and keys from the game
+while it runs and until everything is released, saves keybinds.ini after a change (every change makes the layout
+Custom), KZ3_PM_TEST_BTN=<ps3 button> answers a waiting capture (Xvfb runs), the pad family comes from port 0.
+Host test: tools/net/test_pad_remap_ui.c. Page: port/net/kz3_padpage.h.
+
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -401,12 +401,15 @@
+     if (!s_kb_ready) { pad_kb_layout_update(); pad_kb_find_path(); pad_kb_load(1); s_kb_ready = 1; s_kb_checked_ms = GetTickCount64(); }
+ }
+ 
++static int pad_remap_family_port0(void);   /* 4014, defined with the remap below */
++
+ /* The Keyboard page's command entry (port/kz3/main.cpp calls it from the Lua bridge). See pad_kb_ui_command. */
+ int pad_kb_ui_cmd(const char* cmd, char* out, size_t n)
+ {
+     int changed;
+     AcquireSRWLockExclusive(&s_kb_lock);
+     pad_kb_ensure_loaded();
++    s_kb_ui.pm.family = pad_remap_family_port0();   /* 4014 */
+     changed = pad_kb_ui_command(&s_kb_ui, &s_kb, cmd, out, n, GetTickCount64());
+     if (changed) pad_kb_save();
+     ReleaseSRWLockExclusive(&s_kb_lock);
+@@ -1070,6 +1073,48 @@
+     }
+ }
+ 
++static int pad_remap_family_port0(void) { return pad_remap_family(s_port_dev[0]); }
++
++/* KZ3 patch 4014: the Custom layout page's capture of the next pad button (pad_remap_ui.h). Runs on the raw host
++ * reports, before the remap. While a capture runs, and until every pad button and key is up afterwards, the game
++ * gets neither pad nor keys (it would act on the very press that is meant for the page). KZ3_PM_TEST_BTN=<ps3 button
++ * name> answers a waiting capture after 0.7 s (Xvfb runs have no pad). */
++static void pad_map_edit_poll(void)
++{
++#ifdef _WIN32
++    static int tb = -2;
++    unsigned mask = 0;
++    int p, esc = 0, del = 0, changed;
++    unsigned long long now = GetTickCount64();
++    AcquireSRWLockExclusive(&s_kb_lock);
++    if (!s_kb_ready || !pmu_busy(&s_kb_ui.pm)) { ReleaseSRWLockExclusive(&s_kb_lock); return; }
++    if (tb == -2) {
++        const char* e = getenv("KZ3_PM_TEST_BTN");
++        tb = e && *e ? prm_button_by_name(e, strlen(e)) : -1;
++        if (e && *e) { printf("[pad] KZ3_PM_TEST_BTN=%s -> %s\n", e, tb >= 0 ? "used for the page's captures" : "unknown button"); fflush(stdout); }
++    }
++    for (p = 0; p < PAD_MAX_HOST_PORTS; p++) if (s_host_state[p].connected) mask |= s_host_state[p].buttons;
++    if (pad_host_window_focused()) {
++        esc = (GetAsyncKeyState(0x1B) & 0x8000) != 0;
++        del = (GetAsyncKeyState(0x2E) & 0x8000) != 0;
++    }
++    if (tb >= 0 && s_kb_ui.pm.phase == PMU_WAIT && now - s_kb_ui.pm.t_wait >= 700) mask = 1u << tb;
++    changed = pmu_step(&s_kb_ui.pm, &s_kb.padmap, s_kb.padc, mask, esc, del, now);
++    if (changed) pad_kb_save();
++    if (pmu_busy(&s_kb_ui.pm)) {
++        for (p = 0; p < PAD_MAX_HOST_PORTS; p++) {
++            PadHostState* hs = &s_host_state[p];
++            hs->buttons = 0; hs->press_up = hs->press_right = hs->press_down = hs->press_left = 0;
++            hs->trigger_l2 = hs->trigger_r2 = 0; hs->press_l1 = hs->press_r1 = 0;
++            hs->press_triangle = hs->press_circle = hs->press_cross = hs->press_square = 0;
++            hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
++        }
++        s_kb_state.buttons = 0; s_kb_state.dirs = 0;
++    }
++    ReleaseSRWLockExclusive(&s_kb_lock);
++#endif
++}
++
+ /* The table the Options row (keybinds.ini [pad]) selects; KZ3_PAD_PRESET=default|modern|custom (tests) before it. */
+ static void pad_remap_refresh(void)
+ {
+@@ -1162,6 +1207,7 @@
+     /* KZ3 patch 2037: keys always polled (not only with no pad on port 0) and merged into port 0. */
+     pad_poll_keyboard();
+ #endif
++    pad_map_edit_poll();     /* 4014: the Custom layout page's capture, on the raw reports */
+     pad_remap_apply_all();   /* 4013: the pad layout, on the pads only (not on the keys, merged below) */
+     pad_prompt_track();   /* 4011: before the keys are merged into port 0 */
+ #ifdef _WIN32
+diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -27,6 +27,7 @@
+ #define PAD_KEYBINDS_H
+ 
+ #include "pad_remap.h"   /* 4013 */
++#include "pad_remap_ui.h"   /* 4014 */
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -600,6 +601,7 @@
+     int suppress;               /* after a capture: keys stay away from the game until all are up */
+     int sel, sel_slot;          /* the page's selected cell + 1 ("sel R S", pass 38; 0 = page closed, so a zeroed
+                                  * PadKbUi has none): Delete clears it */
++    PadMapUi pm;                /* 4014: the Custom layout page's editor (pad_remap_ui.h) */
+ } PadKbUi;
+ 
+ static int pad_kb_row_input(int row)
+@@ -760,6 +762,11 @@
+     if (!n) return 0;
+     out[0] = 0;
+     if (sscanf(cmd, "%15s %d %d", verb, &r, &s) < 1) return 0;
++    if (!strcmp(verb, "pm")) {   /* 4014: the Custom layout page; see pad_remap_ui.h */
++        const unsigned char before = kb->padmap;
++        int ch = pmu_command(&u->pm, &kb->padmap, kb->padc, cmd + 2, out, n, now);
++        return ch || before != kb->padmap;
++    }
+     if (!strcmp(verb, "padmap")) {
+         /* 4013: "padmap" -> the Controller layout value's name; "padmap <name>" sets it (1 = changed, saved). */
+         const char* v = cmd + 6;
+diff -ruN a/libs/input/pad_remap_ui.h b/libs/input/pad_remap_ui.h
+--- a/libs/input/pad_remap_ui.h
++++ b/libs/input/pad_remap_ui.h
+@@ -0,0 +1,250 @@
++/*
++ * KZ3 patch 4014 (stage 3b, ENHANCEMENT, opt-in): the editor behind the in-game "Edit custom layout" page, pure
++ * (no host types; host test tools/net/test_pad_remap_ui.c). It edits the custom table of pad_remap.h
++ * (PadRemap.src[game button] = host button) and nothing else.
++ *
++ * The page (a GUM served by port/net/kz3_padpage.h) lists the game's actions, one per game button, and asks the host
++ * through text commands ("kb:pm ..." over the Keyboard page's Lua bridge, pmu_command). The capture of the next pad
++ * button runs in the pad poll (pmu_step, cellPad.c), on the raw host report (before the remap, so the button that is
++ * pressed is the button on the pad whatever the layout in use is).
++ *
++ * Rules: a host button that already drives another game button is swapped (the other button takes the old host
++ * button of the one being bound); the game's Start (menu / pause) can never be left without a host button: such a
++ * binding, a swap that would do it, and clearing it are refused. Every change makes the layout Custom.
++ *
++ * Commands (verb "pm", the rest of the line after it; out is always set):
++ *   rows                 -> the number of rows
++ *   src R                -> the row's EButton name (the page reads the game's own action text from it), "" = none
++ *   label R              -> the port's own fallback label (host tests; the page text for Start)
++ *   key R                -> the host button driving the row's game button, named for the pad (cross / A ...), "---"
++ *   dup R                -> "1" when another row's game button has the same host button
++ *   cap R                -> starts a capture for row R ("ok" or "bad")      cap -> the row being captured
++ *   clear R              -> unbinds ("ok" | "refused" | "bad")
++ *   reset default|modern -> copies that preset into Custom
++ *   cancel               -> ends a capture
++ *   state                -> "capture" | "bound" | "swapped" | "cleared" | "refused" | "cancel" | "timeout" | "idle"
++ *   other                -> the row that took the old button in a swap, else -1
++ *   preset               -> the layout in use (default|modern|custom)
++ *   poll                 -> "busy" | "changed" (once per change) | ""
++ */
++#ifndef PAD_REMAP_UI_H
++#define PAD_REMAP_UI_H
++
++#include "pad_remap.h"
++#include <stdio.h>
++#include <stdlib.h>
++
++typedef struct { int game; const char* button; const char* label; } PmuRow;
++/* Same order and fallback words as the Keyboard page's pad rows (pad_keybinds.h). Start has no string of its own. */
++static const PmuRow pmu_rows[] = {
++    { PRM_R1, "Shoulder_Right_1", "Fire" },   { PRM_R3, "Right_Analog", "Zoom" },
++    { PRM_SQUARE, "Square", "Reload" },       { PRM_TRIANGLE, "Triangle", "Next weapon" },
++    { PRM_CROSS, "Cross", "Jump" },           { PRM_CIRCLE, "Circle", "Use" },
++    { PRM_L2, "Shoulder_Left_2", "Crouch" },  { PRM_L3, "Left_Analog", "Sprint" },
++    { PRM_L1, "Shoulder_Left_1", "Melee" },   { PRM_R2, "Shoulder_Right_2", "Grenade" },
++    { PRM_UP, "Up", "Up" },                   { PRM_DOWN, "Down", "Down" },
++    { PRM_LEFT, "Left", "Left" },             { PRM_RIGHT, "Right", "Right" },
++    { PRM_START, 0, "Menu" },                 { PRM_SELECT, "Select", "Objectives" },
++};
++#define PMU_N_ROWS ((int)(sizeof pmu_rows / sizeof pmu_rows[0]))
++#define PMU_CAPTURE_MS 10000ull
++
++enum { PMU_IDLE, PMU_RELEASE, PMU_WAIT };
++enum { PMU_R_NONE, PMU_R_BOUND, PMU_R_SWAPPED, PMU_R_CLEARED, PMU_R_CANCEL, PMU_R_TIMEOUT, PMU_R_REFUSED };
++
++typedef struct {
++    int phase;                    /* PMU_*: RELEASE = until every pad button is up (the one that opened it) */
++    int row;                      /* the row being captured */
++    unsigned long long t0, t_wait;/* capture start; when RELEASE ended (ms) */
++    int result, other;            /* how the last capture/clear ended; row that took the old button (-1) */
++    unsigned gen, seen_gen;       /* change counter; "poll" reports one once */
++    int suppress;                 /* after a capture: pad and keys stay away from the game until all are up */
++    int family;                   /* PRM_FAM_*: which names the page shows, which Modern table "reset modern" copies */
++} PadMapUi;
++
++static int pmu_row_by_game(int g)
++{
++    int i;
++    for (i = 0; i < PMU_N_ROWS; i++) if (pmu_rows[i].game == g) return i;
++    return -1;
++}
++
++/* The name of a host button on the pad in use: PS3 names for a PlayStation pad, the Xbox ones otherwise. */
++static const char* pmu_button_name(int b, int family)
++{
++    static const char* const ps[PRM_N] = { "Select", "L3", "R3", "Start", "Up", "Right", "Down", "Left", "L2", "R2", "L1",
++                                           "R1", "Triangle", "Circle", "Cross", "Square" };
++    static const char* const xb[PRM_N] = { "Back", "LS", "RS", "Start", "Up", "Right", "Down", "Left", "LT", "RT", "LB",
++                                           "RB", "Y", "B", "A", "X" };
++    if (b < 0 || b >= PRM_N) return "---";
++    return family == PRM_FAM_XBOX ? xb[b] : ps[b];
++}
++
++/* Bind host button `host` to the row's game button. 1 = changed. *result gets PMU_R_*, *other the row that took the
++ * old host button in a swap (-1 none). */
++static int pmu_bind(unsigned char* padc, int row, int host, int* result, int* other)
++{
++    int g, h, old;
++    *other = -1;
++    if (row < 0 || row >= PMU_N_ROWS || host < 0 || host >= PRM_N) { *result = PMU_R_REFUSED; return 0; }
++    g = pmu_rows[row].game;
++    old = padc[g];
++    if (old == host) { *result = PMU_R_BOUND; return 0; }
++    for (h = 0; h < PRM_N; h++) if (h != g && padc[h] == host) break;
++    if (h < PRM_N) {
++        if (h == PRM_START && old >= PRM_N) { *result = PMU_R_REFUSED; return 0; }   /* Start would be left bare */
++        padc[h] = (unsigned char)old;
++        *other = pmu_row_by_game(h);
++        *result = PMU_R_SWAPPED;
++    } else *result = PMU_R_BOUND;
++    padc[g] = (unsigned char)host;
++    return 1;
++}
++
++static int pmu_clear(unsigned char* padc, int row, int* result)
++{
++    int g;
++    if (row < 0 || row >= PMU_N_ROWS) { *result = PMU_R_REFUSED; return 0; }
++    g = pmu_rows[row].game;
++    if (g == PRM_START) { *result = PMU_R_REFUSED; return 0; }   /* the menu must stay reachable */
++    *result = PMU_R_CLEARED;
++    if (padc[g] == PRM_NONE) return 0;
++    padc[g] = PRM_NONE;
++    return 1;
++}
++
++/* Copy a preset (PRM_DEFAULT / PRM_MODERN) into the custom table. 1 = it changed. */
++static int pmu_reset(unsigned char* padc, int preset, int family)
++{
++    PadRemap m;
++    int ch;
++    prm_fill(preset, family, NULL, &m);
++    ch = memcmp(padc, m.src, PRM_N) != 0;
++    memcpy(padc, m.src, PRM_N);
++    return ch;
++}
++
++static void pmu_begin(PadMapUi* u, int row, unsigned long long now)
++{
++    u->phase = PMU_RELEASE; u->row = row; u->t0 = now; u->result = PMU_R_NONE; u->other = -1;
++}
++
++static int pmu_busy(const PadMapUi* u) { return u->phase != PMU_IDLE || u->suppress; }
++
++/* Once per pad poll. mask = the raw host buttons (CELL_PAD_CTRL bits, all ports), esc/del = the keyboard keys that
++ * cancel / clear. 1 = the table changed (save, and the layout is Custom now: *padmap). The caller keeps pad and keys
++ * from the game while pmu_busy. */
++static int pmu_step(PadMapUi* u, unsigned char* padmap, unsigned char* padc, unsigned mask, int esc, int del,
++                    unsigned long long now)
++{
++    int ch = 0, b;
++    mask &= 0xFFFFu;
++    if (u->phase == PMU_IDLE) {
++        if (u->suppress && !mask && !esc && !del) u->suppress = 0;
++        return 0;
++    }
++    if (now - u->t0 > PMU_CAPTURE_MS) { u->phase = PMU_IDLE; u->suppress = 1; u->result = PMU_R_TIMEOUT; u->gen++; return 0; }
++    if (u->phase == PMU_RELEASE) {
++        if (!mask && !esc && !del) { u->phase = PMU_WAIT; u->t_wait = now; }
++        return 0;
++    }
++    if (esc) { u->phase = PMU_IDLE; u->suppress = 1; u->result = PMU_R_CANCEL; u->gen++; return 0; }
++    if (del) {
++        u->phase = PMU_IDLE; u->suppress = 1;
++        ch = pmu_clear(padc, u->row, &u->result);
++    } else if (mask) {
++        for (b = 0; b < PRM_N && !((mask >> b) & 1u); b++) {}
++        u->phase = PMU_IDLE; u->suppress = 1;
++        ch = pmu_bind(padc, u->row, b, &u->result, &u->other);
++    } else return 0;
++    if (ch) *padmap = PRM_CUSTOM;
++    u->gen++;   /* every end of a capture refreshes the page (status line) */
++    return ch;
++}
++
++static int pmu_num(const char* s, int lo, int hi)    /* -1 when not a number in range */
++{
++    char* e;
++    long v;
++    if (!s || !*s) return -1;
++    v = strtol(s, &e, 10);
++    return (e == s || v < lo || v > hi) ? -1 : (int)v;
++}
++
++/* The page's commands (the line after "pm "). 1 = the table or layout changed (save). */
++static int pmu_command(PadMapUi* u, unsigned char* padmap, unsigned char* padc, const char* cmd, char* out, size_t n,
++                       unsigned long long now)
++{
++    char verb[16] = { 0 };
++    const char* a;
++    int r, ch = 0, res;
++    if (!n) return 0;
++    out[0] = 0;
++    while (*cmd == ' ') cmd++;
++    if (sscanf(cmd, "%15s", verb) < 1) return 0;
++    a = cmd + strlen(verb);
++    while (*a == ' ') a++;
++    r = pmu_num(a, 0, PMU_N_ROWS - 1);
++    if (!strcmp(verb, "rows")) snprintf(out, n, "%d", PMU_N_ROWS);
++    else if (!strcmp(verb, "src")) { if (r >= 0 && pmu_rows[r].button) snprintf(out, n, "%s", pmu_rows[r].button); }
++    else if (!strcmp(verb, "label")) { if (r >= 0) snprintf(out, n, "%s", pmu_rows[r].label); }
++    else if (!strcmp(verb, "key")) snprintf(out, n, "%s", r < 0 ? "---" : pmu_button_name(padc[pmu_rows[r].game] < PRM_N ? padc[pmu_rows[r].game] : -1, u->family));
++    else if (!strcmp(verb, "dup")) {
++        int i;
++        if (r >= 0 && padc[pmu_rows[r].game] < PRM_N)
++            for (i = 0; i < PMU_N_ROWS; i++)
++                if (i != r && padc[pmu_rows[i].game] == padc[pmu_rows[r].game]) { snprintf(out, n, "1"); break; }
++    } else if (!strcmp(verb, "cap")) {
++        if (!*a) snprintf(out, n, "%d", u->phase != PMU_IDLE ? u->row : -1);
++        else if (r < 0) snprintf(out, n, "bad");
++        else { pmu_begin(u, r, now); snprintf(out, n, "ok"); }
++    } else if (!strcmp(verb, "clear")) {
++        if (r < 0) snprintf(out, n, "bad");
++        else {
++            ch = pmu_clear(padc, r, &res);
++            u->result = res; u->other = -1;
++            snprintf(out, n, res == PMU_R_REFUSED ? "refused" : "ok");
++            if (ch) { *padmap = PRM_CUSTOM; u->gen++; }
++        }
++    } else if (!strcmp(verb, "reset")) {
++        int p = !strcmp(a, "default") ? PRM_DEFAULT : !strcmp(a, "modern") ? PRM_MODERN : -1;
++        if (p < 0) snprintf(out, n, "bad");
++        else {
++            ch = pmu_reset(padc, p, u->family);
++            if (*padmap != PRM_CUSTOM) ch = 1;
++            *padmap = PRM_CUSTOM;
++            u->phase = PMU_IDLE; u->result = PMU_R_NONE; u->other = -1;
++            if (ch) u->gen++;
++            snprintf(out, n, "ok");
++        }
++    } else if (!strcmp(verb, "cancel")) {
++        if (u->phase != PMU_IDLE) { u->phase = PMU_IDLE; u->suppress = 1; u->result = PMU_R_CANCEL; u->gen++; }
++        snprintf(out, n, "ok");
++    } else if (!strcmp(verb, "state")) {
++        static const char* const nm[] = { "idle", "bound", "swapped", "cleared", "cancel", "timeout", "refused" };
++        snprintf(out, n, "%s", u->phase != PMU_IDLE ? "capture" : nm[u->result]);
++    } else if (!strcmp(verb, "other")) snprintf(out, n, "%d", u->other);
++    else if (!strcmp(verb, "at")) {
++        /* network pass 36, the controller picture under Custom: "at <EButton> <i>" = the i-th game button (EButton name,
++         * activeconfig key) whose actions the pad button <EButton> presses now; "-" when there is none */
++        char nm[24] = { 0 };
++        int k = -1, h = -1, i;
++        if (sscanf(a, "%23s %d", nm, &k) == 2 && k >= 0)
++            for (i = 0; i < PMU_N_ROWS; i++) if (pmu_rows[i].button && !strcmp(pmu_rows[i].button, nm)) h = pmu_rows[i].game;
++        snprintf(out, n, "-");
++        if (h >= 0)
++            for (i = 0; i < PMU_N_ROWS; i++)
++                if (pmu_rows[i].button && padc[pmu_rows[i].game] == h && k-- == 0) { snprintf(out, n, "%s", pmu_rows[i].button); break; }
++    }
++    else if (!strcmp(verb, "preset")) snprintf(out, n, "%s", prm_preset_names[*padmap < PRM_N_PRESETS ? *padmap : 0]);
++    else if (!strcmp(verb, "poll")) {
++        if (u->phase != PMU_IDLE) snprintf(out, n, "busy");
++        else if (u->gen != u->seen_gen) {
++            u->seen_gen = u->gen;
++            snprintf(out, n, "changed");
++        }
++    }
++    return ch;
++}
++
++#endif

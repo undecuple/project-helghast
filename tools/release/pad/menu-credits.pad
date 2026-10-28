@@ -1,0 +1,15 @@
+# Main menu -> Credits (5 DOWN) -> CROSS; the credits scroll by themselves.
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+mark credits row
+key X
+sleep 6
+mark credits opened

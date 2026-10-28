@@ -1,0 +1,700 @@
+KZ3 patch 4023 (stage 3c, ENHANCEMENT, opt-in; network pass 40): the Custom pad layout per ACTION instead of per
+game button. pad_action_custom.h (new, pure): 33 action groups (15 on foot, 18 vehicles / exo / guns) of the game's
+EDeviceFunction ids, each on the scheme's own button, unbound or an EButton; bind with a swap when a conflicting group
+holds the button (pairs the game's Standard / Alternate or Modern put together may share), clear, copy Default or
+Modern into Custom (Modern copied gives exactly pad_actions.h's Modern on Standard and Alternate), keybinds.ini
+[pad actions] (an older per-button Custom becomes groups), the page commands "kb:pa ..." and the controller
+picture's labels. pad_actions.h: pab_sync_block_user takes the per-action table (pab_sync_block unchanged for its
+callers). pad_keybinds.h: the section, the "pa" verb. cellPad.c: Custom writes the per-action table through 4022,
+the page's capture runs next to 4014's, `[pad] custom per action: ...` log line.
+Host test: tools/net/test_pad_action_custom.c. Pages: port/net/kz3_padpage.h. Notes: the RE notes s.34.
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -454,7 +454,7 @@
+ {
+     int b;
+     AcquireSRWLockShared(&s_kb_lock);
+-    b = pad_kb_ui_busy(&s_kb_ui) || pmu_busy(&s_kb_ui.pm);   /* KZ3 patch 4016: also 4014's Custom layout capture */
++    b = pad_kb_ui_busy(&s_kb_ui) || pmu_busy(&s_kb_ui.pm) || pac_busy(&s_kb_ui.pa);   /* 4016; 4023 per-action page */
+     ReleaseSRWLockShared(&s_kb_lock);
+     return b;
+ }
+@@ -538,6 +538,7 @@
+     AcquireSRWLockExclusive(&s_kb_lock);
+     pad_kb_ensure_loaded();
+     s_kb_ui.pm.family = pad_remap_family_port0();   /* 4014 */
++    s_kb_ui.pa.family = s_kb_ui.pm.family;          /* 4023 */
+     changed = pad_kb_ui_command(&s_kb_ui, &s_kb, cmd, out, n, GetTickCount64());
+     if (changed) pad_kb_save();
+     ReleaseSRWLockExclusive(&s_kb_lock);
+@@ -1287,7 +1288,7 @@
+     int p, esc = 0, del = 0, changed;
+     unsigned long long now = GetTickCount64();
+     AcquireSRWLockExclusive(&s_kb_lock);
+-    if (!s_kb_ready || !pmu_busy(&s_kb_ui.pm)) { ReleaseSRWLockExclusive(&s_kb_lock); return; }
++    if (!s_kb_ready || (!pmu_busy(&s_kb_ui.pm) && !pac_busy(&s_kb_ui.pa))) { ReleaseSRWLockExclusive(&s_kb_lock); return; }
+     if (tb == -2) {
+         const char* e = getenv("KZ3_PM_TEST_BTN");
+         tb = e && *e ? prm_button_by_name(e, strlen(e)) : -1;
+@@ -1299,9 +1300,11 @@
+         del = (GetAsyncKeyState(0x2E) & 0x8000) != 0;
+     }
+     if (tb >= 0 && s_kb_ui.pm.phase == PMU_WAIT && now - s_kb_ui.pm.t_wait >= 700) mask = 1u << tb;
++    if (tb >= 0 && s_kb_ui.pa.phase == PMU_WAIT && now - s_kb_ui.pa.t_wait >= 700) mask = 1u << tb;   /* 4023 */
+     changed = pmu_step(&s_kb_ui.pm, &s_kb.padmap, s_kb.padc, mask, esc, del, now);
++    changed |= pac_step(&s_kb_ui.pa, &s_kb.padmap, &s_kb.pac, pac_base_now(), mask, esc, del, now);   /* 4023 */
+     if (changed) pad_kb_save();
+-    if (pmu_busy(&s_kb_ui.pm)) {
++    if (pmu_busy(&s_kb_ui.pm) || pac_busy(&s_kb_ui.pa)) {
+         for (p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+             PadHostState* hs = &s_host_state[p];
+             hs->buttons = 0; hs->press_up = hs->press_right = hs->press_down = hs->press_left = 0;
+@@ -1401,6 +1404,7 @@
+     static int32_t last[2][PAB_N] = { { INT32_MIN }, { INT32_MIN } };
+     static int said[2][3];
+     unsigned char cust[16];
++    signed char user[PAB_N];   /* 4023: Custom per action */
+     uint32_t prof;
+     int p, kbd;
+     if (off < 0) { const char* e = getenv("KZ3_PAD_ACTIONS"); off = e && !strcmp(e, "0"); }
+@@ -1414,6 +1418,27 @@
+     prof = vm_read32(pab_versions[ver].profile_ptr);
+     if (!prof || prof >= 0x40000000u) return;
+     for (p = 0; p < 16; p++) cust[p] = s_remap[0].src[p];
++    AcquireSRWLockShared(&s_kb_lock);
++    pac_user(&s_kb.pac, user);
++    if (s_remap_preset == PRM_CUSTOM) {   /* 4023: log the per-action Custom once per change */
++        static signed char logged[PAC_NG];
++        static int have = 0;
++        if (!have || memcmp(logged, s_kb.pac.bind, sizeof logged)) {
++            char t[600];
++            size_t o = 0;
++            int g;
++            memcpy(logged, s_kb.pac.bind, sizeof logged);
++            have = 1;
++            for (g = 0; g < PAC_NG && o < sizeof t - 40; g++)
++                if (logged[g] != PAC_KEEP)
++                    o += (size_t)snprintf(t + o, sizeof t - o, " %s=%s", pac_groups[g].key,
++                                          logged[g] >= 0 ? prm_names[pab_eb_to_bit[(int)logged[g]]] : "none");
++            t[o] = 0;
++            printf("[pad] custom per action:%s\n", o ? t : " the scheme's own for every action");
++            fflush(stdout);
++        }
++    }
++    ReleaseSRWLockShared(&s_kb_lock);
+     kbd = pad_prompt_device() == PAD_DEV_KEYBOARD;
+     for (p = 0; p < 2; p++) {
+         int32_t id = 0;
+@@ -1432,8 +1457,9 @@
+                 said[p][0] = 1;
+             }
+         }
+-        r = pab_sync_block(blk, s_remap_preset, fam, kbd, s_remap_preset == PRM_CUSTOM ? cust : NULL, last[p], pab_rd32,
+-                           pab_rd8, pab_wr32, &id);
++        r = pab_sync_block_user(blk, s_remap_preset, fam, kbd, s_remap_preset == PRM_CUSTOM ? cust : NULL,
++                                s_remap_preset == PRM_CUSTOM ? user : NULL, last[p], pab_rd32, pab_rd8, pab_wr32, &id);
++        if (p == 0 && pab_base(id)) pac_scheme = (int)id;   /* 4023: the page shows this scheme's buttons */
+         if (r == PAB_WROTE || r == PAB_RESTORED) {
+             printf("[pad] player %d: %s (scheme %d, %s%s)\n", p + 1,
+                    r == PAB_RESTORED ? "the scheme's own action table back" : "action table set", (int)id,
+diff -ruN a/libs/input/pad_action_custom.h b/libs/input/pad_action_custom.h
+--- a/libs/input/pad_action_custom.h
++++ b/libs/input/pad_action_custom.h
+@@ -0,0 +1,393 @@
++/*
++ * KZ3 patch 4023 (stage 3c, ENHANCEMENT, opt-in; network pass 40, the RE notes s.34): the Custom pad layout per
++ * ACTION, pure (no host types; host test tools/net/test_pad_action_custom.c).
++ *
++ * Before (4013/4014): Custom was one table per game BUTTON (src[g] = the pad button that does what game button g did),
++ * so actions that share a button in the scheme moved together and Custom could not start from Modern (Modern is per
++ * action, pad_actions.h). Now Custom is a table per ACTION GROUP, written through the same 4022 path (the game's own
++ * action table in the PlayerProfile that ControlScheme::GetActionBinding reads for every action and every prompt).
++ *
++ * A group is a set of EDeviceFunction ids (the RE notes 5.3) that always move together (Fire = PrimaryFire,
++ * SecondaryFire, GrabRightHand; ...), in one context: on foot, vehicles, exo, mounted / AA guns. Each group holds
++ *   PAC_KEEP  = the active scheme's own button for each of its actions (Standard or Alternate; a fresh Custom),
++ *   -1        = unbound,
++ *   0..15     = an EButton (0 Triangle 1 Circle 2 Cross 3 Square 4 L2 5 R2 6 L1 7 R1 8 Start 9 Select 10 L3 11 R3
++ *               12 Up 13 Right 14 Down 15 Left), every action of the group on it.
++ * Start is never offered (the menu and pause must stay reachable; OptionScreen is the game's own Start action).
++ * Actions in no group (Suicide, StandUp, the d-pad quick selects, menus, Move / AGP, the second weapon sets and the
++ * analog vehicle pedals) always keep the scheme's own button.
++ *
++ * Conflicts: two groups of one context on one button are fine when the game's own Standard or Alternate scheme, or
++ * Modern, puts them together (Zoom + Flashlight on R3, Jump + Jetpack boost on Cross, Use + Crouch on Circle under
++ * Modern); any other pair is a conflict. Binding a group to a button a conflicting group holds swaps them (that group
++ * takes the old button), like the Keyboard page and 4014's editor; a conflict that comes from keybinds.ini is shown
++ * in the game's "used twice" style (the page's mystats cell, "dup").
++ *
++ * keybinds.ini: [pad actions] "<group key> = <pad button>|none" (PS3 button names of pad_remap.h, the same names for
++ * an Xbox pad: r2 = RT); a group not listed keeps the scheme's own. A file with no [pad actions] section but a
++ * per-button Custom table ([pad] "r1 = r2", 4013) gets the groups that table implies (pac_from_padc), so an old
++ * Custom keeps working.
++ *
++ * Page commands (verb "pa", sent as "kb:pa ..." over the Keyboard page's Lua bridge; out is always set):
++ *   rows                 -> number of groups               ctx G -> 0 on foot, 1 vehicles, 2 exo, 3 guns
++ *   label G              -> the group's label               id G -> its keybinds.ini key
++ *   key G                -> the pad button the group is on now, named for the pad in use (R2 / RT ...), "---" none
++ *   dup G                -> "1" when a conflicting group of its context has the same button
++ *   cap G | cap          -> starts a capture for group G ("ok" | "bad") | the group being captured (-1)
++ *   clear G              -> unbinds ("ok" | "bad")
++ *   reset default|modern -> copies that layout into Custom (and selects Custom)
++ *   cancel, state, other, poll, preset  as 4014's "pm" verbs (pad_remap_ui.h)
++ *   at <EButton name> I  -> the I-th on-foot group label on that pad button now ("-" none): the controller picture
++ */
++#ifndef PAD_ACTION_CUSTOM_H
++#define PAD_ACTION_CUSTOM_H
++
++#include "pad_remap.h"
++#include "pad_actions.h"
++#include "pad_remap_ui.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define PAC_KEEP (-2)
++enum { PAC_FOOT = 0, PAC_VEHICLE, PAC_EXO, PAC_GUN };
++
++typedef struct { const char* key; const char* label; int ctx; signed char act[4]; } PacGroup;   /* act: -1 ends */
++static const PacGroup pac_groups[] = {
++    /* on foot (the main page, in the order of the game's controller legend) */
++    { "fire",          "Fire",                    PAC_FOOT,    { 0, 1, 31, -1 } },   /* PrimaryFire, SecondaryFire, GrabRightHand */
++    { "aim",           "Aim / Zoom",              PAC_FOOT,    { 2, 30, -1 } },      /* ZoomSwitch, GrabLeftHand */
++    { "grenade",       "Grenade Quick Throw",     PAC_FOOT,    { 9, -1 } },          /* QuickThrow */
++    { "reload",        "Reload / Pickup",         PAC_FOOT,    { 10, 7, -1 } },      /* Reload, PickupWeapon */
++    { "use",           "Use",                     PAC_FOOT,    { 6, 18, -1 } },      /* Use, DoItNow */
++    { "crouch",        "Crouch / Cover",          PAC_FOOT,    { 12, 13, 14, -1 } }, /* Crouch, Slide, Cover */
++    { "melee",         "Melee",                   PAC_FOOT,    { 20, 21, -1 } },     /* CloseCombat, TriggerC4 */
++    { "jump",          "Jump / Vault",            PAC_FOOT,    { 5, 15, -1 } },      /* Jump, Vault */
++    { "sprint",        "Sprint",                  PAC_FOOT,    { 4, -1 } },          /* SprintToggle */
++    { "weapon_switch", "Weapon switch",           PAC_FOOT,    { 17, -1 } },         /* NextWeapon */
++    { "flashlight",    "Flashlight",              PAC_FOOT,    { 19, -1 } },         /* ToggleFlashlight */
++    { "direction",     "Direction / Sniper zoom", PAC_FOOT,    { 24, 3, -1 } },      /* PlanPath, ZoomModeSwitch */
++    { "jetpack_climb", "Jetpack climb",           PAC_FOOT,    { 69, -1 } },
++    { "jetpack_boost", "Jetpack boost",           PAC_FOOT,    { 70, -1 } },
++    { "objectives",    "Objectives",              PAC_FOOT,    { 75, -1 } },         /* IntelScreen */
++    /* vehicles, exo and guns (the sub-page) */
++    { "vehicle_fire",  "Vehicle fire",            PAC_VEHICLE, { 33, 50, -1 } },     /* LandVehicleFirePrimary, BuggyFirePrimary */
++    { "vehicle_fire2", "Vehicle secondary fire",  PAC_VEHICLE, { 34, 51, -1 } },
++    { "accelerate",    "Accelerate",              PAC_VEHICLE, { 37, -1 } },
++    { "boost",         "Vehicle boost",           PAC_VEHICLE, { 47, -1 } },
++    { "handbrake",     "Handbrake",               PAC_VEHICLE, { 39, 49, -1 } },     /* LandVehicleHandbreak, BuggyHandbrake */
++    { "exit_vehicle",  "Exit vehicle",            PAC_VEHICLE, { 42, -1 } },
++    { "vehicle_zoom",  "Vehicle zoom",            PAC_VEHICLE, { 43, -1 } },
++    { "rear_view",     "Rear view",               PAC_VEHICLE, { 44, -1 } },         /* LandVehicleReverseCamera */
++    { "reset_camera",  "Reset camera",            PAC_VEHICLE, { 48, -1 } },
++    { "exo_fire",      "Exo fire",                PAC_EXO,     { 56, -1 } },
++    { "exo_fire2",     "Exo secondary fire",      PAC_EXO,     { 57, -1 } },
++    { "exo_zoom",      "Exo zoom",                PAC_EXO,     { 58, -1 } },
++    { "exo_camera",    "Exo camera",              PAC_EXO,     { 59, -1 } },
++    { "gun_fire2",     "Mounted gun secondary fire", PAC_GUN,  { 62, -1 } },
++    { "gun_dismount",  "Dismount",                PAC_GUN,     { 63, -1 } },         /* MountedGunDismountAndTakeWeapon */
++    { "aa_fire",       "AA gun fire",             PAC_GUN,     { 66, -1 } },
++    { "aa_fire2",      "AA gun secondary fire",   PAC_GUN,     { 67, -1 } },
++    { "aa_zoom",       "AA gun zoom",             PAC_GUN,     { 68, -1 } },
++};
++#define PAC_NG ((int)(sizeof pac_groups / sizeof pac_groups[0]))
++#define PAC_N_FOOT 15
++
++/* The control scheme of player 1 the pad poll saw last (1 Standard, 2 Alternate): the page shows its buttons. */
++static int pac_scheme = 1;
++static const signed char* pac_base_now(void)
++{
++    const signed char* b = pab_base(pac_scheme);
++    return b ? b : pab_std;
++}
++
++typedef struct {
++    signed char bind[PAC_NG];   /* PAC_KEEP, -1 or an EButton */
++} PadActCustom;
++
++static void pac_defaults(PadActCustom* c)
++{
++    int g;
++    for (g = 0; g < PAC_NG; g++) c->bind[g] = PAC_KEEP;
++}
++
++/* The per-action override (PAC_KEEP = the scheme's own) the 4022 path writes. */
++static void pac_user(const PadActCustom* c, signed char user[PAB_N])
++{
++    int g, i;
++    for (i = 0; i < PAB_N; i++) user[i] = PAC_KEEP;
++    for (g = 0; g < PAC_NG; g++)
++        if (c->bind[g] != PAC_KEEP)
++            for (i = 0; i < 4 && pac_groups[g].act[i] >= 0; i++) user[(int)pac_groups[g].act[i]] = c->bind[g];
++}
++
++static void pac_apply(const signed char* base, const PadActCustom* c, int32_t out[PAB_N])
++{
++    signed char user[PAB_N];
++    int a;
++    pac_user(c, user);
++    for (a = 0; a < PAB_N; a++) out[a] = (user[a] == PAC_KEEP || pab_skip(a)) ? base[a] : user[a];
++}
++
++/* The button group g is on now (its first action), -1 none. */
++static int pac_eff(const PadActCustom* c, const signed char* base, int g)
++{
++    if (g < 0 || g >= PAC_NG) return -1;
++    return c->bind[g] != PAC_KEEP ? c->bind[g] : base[(int)pac_groups[g].act[0]];
++}
++
++/* Groups g and h may share a button: the same context and the same button for both in Standard, Alternate or Modern. */
++static int pac_share_ok(int g, int h)
++{
++    int32_t m[PAB_N];
++    int s;
++    if (pac_groups[g].ctx != pac_groups[h].ctx) return 1;
++    for (s = 0; s < 3; s++) {
++        const signed char* t = s == 1 ? pab_alt : pab_std;
++        int bg, bh;
++        if (s == 2) { pab_modern(pab_std, 0, m); bg = m[(int)pac_groups[g].act[0]]; bh = m[(int)pac_groups[h].act[0]]; }
++        else { bg = t[(int)pac_groups[g].act[0]]; bh = t[(int)pac_groups[h].act[0]]; }
++        if (bg >= 0 && bg == bh) return 1;
++    }
++    return 0;
++}
++
++static int pac_dup(const PadActCustom* c, const signed char* base, int g)
++{
++    int h, b = pac_eff(c, base, g);
++    if (b < 0) return 0;
++    for (h = 0; h < PAC_NG; h++)
++        if (h != g && pac_eff(c, base, h) == b && !pac_share_ok(g, h)) return 1;
++    return 0;
++}
++
++/* Bind group g to EButton b (0..15 but Start). Conflicting groups on b take g's old button. 1 = changed;
++ * *result PMU_R_BOUND / PMU_R_SWAPPED / PMU_R_REFUSED, *other = a group that took the old button (-1). */
++static int pac_bind(PadActCustom* c, const signed char* base, int g, int b, int* result, int* other)
++{
++    int h, old, ch = 0;
++    *other = -1;
++    if (g < 0 || g >= PAC_NG || b < 0 || b > PAB_LEFT || b == PAB_START) { *result = PMU_R_REFUSED; return 0; }
++    old = pac_eff(c, base, g);
++    *result = PMU_R_BOUND;
++    if (old == b) {
++        if (c->bind[g] == PAC_KEEP) return 0;   /* already there through the scheme */
++        return 0;
++    }
++    for (h = 0; h < PAC_NG; h++) {
++        if (h == g || pac_eff(c, base, h) != b || pac_share_ok(g, h)) continue;
++        c->bind[h] = (signed char)(old >= 0 ? old : -1);
++        if (*other < 0) *other = h;
++        *result = PMU_R_SWAPPED;
++    }
++    c->bind[g] = (signed char)b;
++    ch = 1;
++    return ch;
++}
++
++static int pac_clear(PadActCustom* c, const signed char* base, int g)
++{
++    if (g < 0 || g >= PAC_NG) return 0;
++    if (pac_eff(c, base, g) < 0 && c->bind[g] != PAC_KEEP) return 0;
++    c->bind[g] = -1;
++    return 1;
++}
++
++/* Copy Default (every group on the scheme's own) or Modern (pad_actions.h's per-action Modern) into Custom. For
++ * Modern each group Modern moves gets that button, the rest keep the scheme's own: pac_apply then gives exactly
++ * pab_modern on Standard and on Alternate (host test). 1 = changed. */
++static int pac_reset(PadActCustom* c, int preset)
++{
++    PadActCustom n;
++    int g;
++    pac_defaults(&n);
++    if (preset == PRM_MODERN) {
++        int32_t m[PAB_N];
++        pab_modern(pab_std, 0, m);
++        for (g = 0; g < PAC_NG; g++) {
++            const int a = pac_groups[g].act[0];
++            if (m[a] != pab_std[a]) n.bind[g] = (signed char)m[a];
++        }
++    }
++    if (!memcmp(n.bind, c->bind, sizeof n.bind)) return 0;
++    memcpy(c->bind, n.bind, sizeof n.bind);
++    return 1;
++}
++
++/* 4013's per-button Custom (padc[game button bit] = host button bit, PRM_NONE none) as groups, on Standard. */
++static void pac_from_padc(PadActCustom* c, const unsigned char padc[PRM_N])
++{
++    int g;
++    for (g = 0; g < PAC_NG; g++) {
++        const int b = pab_std[(int)pac_groups[g].act[0]];
++        unsigned s;
++        c->bind[g] = PAC_KEEP;
++        if (b < 0 || b > PAB_LEFT) continue;
++        s = padc[pab_eb_to_bit[b]];
++        if (s == (unsigned)pab_eb_to_bit[b]) continue;
++        c->bind[g] = s < PRM_N ? pab_bit_to_eb[s] : -1;
++    }
++}
++
++static int pac_group_by_key(const char* s, size_t n)
++{
++    int g;
++    for (g = 0; g < PAC_NG; g++) if (prm_ieq(s, n, pac_groups[g].key)) return g;
++    return -1;
++}
++
++/* One "[pad actions]" line's parts (key and value without blanks). 0 = ok, -1 unknown group, -2 unknown button. */
++static int pac_parse_line(PadActCustom* c, const char* k, size_t nk, const char* v, size_t nv)
++{
++    const int g = pac_group_by_key(k, nk);
++    int b;
++    if (g < 0) return -1;
++    if (prm_ieq(v, nv, "none")) { c->bind[g] = -1; return 0; }
++    if (prm_ieq(v, nv, "scheme")) { c->bind[g] = PAC_KEEP; return 0; }
++    b = prm_button_by_name(v, nv);
++    if (b < 0 || b == PRM_START) return -2;
++    c->bind[g] = pab_bit_to_eb[b];
++    return 0;
++}
++
++/* The section, written whole (a group not listed keeps the scheme's own button). Returns the length snprintf would. */
++static int pac_format(const PadActCustom* c, char* buf, size_t n)
++{
++    size_t o = 0;
++    int g;
++#define PAC_PUT(...) do { int w_ = snprintf(buf + (o < n ? o : n), o < n ? n - o : 0, __VA_ARGS__); \
++                          if (w_ > 0) o += (size_t)w_; } while (0)
++    PAC_PUT("\n[pad actions]\n"
++            "# Custom layout per action (Options > Controls > Advanced Settings > Layout and Prompts > Edit custom\n"
++            "# layout; used when preset = custom above). <action> = <pad button> | none; an action not listed keeps the\n"
++            "# game's own button. Pad buttons by their PS3 names (r2 = RT on an Xbox pad). Actions: fire aim grenade\n"
++            "# reload use crouch melee jump sprint weapon_switch flashlight direction jetpack_climb jetpack_boost\n"
++            "# objectives vehicle_fire vehicle_fire2 accelerate boost handbrake exit_vehicle vehicle_zoom rear_view\n"
++            "# reset_camera exo_fire exo_fire2 exo_zoom exo_camera gun_fire2 gun_dismount aa_fire aa_fire2 aa_zoom\n");
++    for (g = 0; g < PAC_NG; g++) {
++        const int b = c->bind[g];
++        if (b == PAC_KEEP) continue;
++        PAC_PUT("%-14s= %s\n", pac_groups[g].key, b >= 0 && b <= PAB_LEFT ? prm_names[pab_eb_to_bit[b]] : "none");
++    }
++#undef PAC_PUT
++    return (int)o;
++}
++
++/* ---- the page's editor (capture of the next pad button, like 4014's PadMapUi) */
++typedef struct {
++    int phase, row;
++    unsigned long long t0, t_wait;
++    int result, other;
++    unsigned gen, seen_gen;
++    int suppress, family;
++} PadActUi;
++
++static int pac_busy(const PadActUi* u) { return u->phase != PMU_IDLE || u->suppress; }
++
++/* The pad button's name for the pad in use (EButton in). */
++static const char* pac_button_name(int b, int family)
++{
++    return (b < 0 || b > PAB_LEFT) ? "---" : pmu_button_name(pab_eb_to_bit[b], family);
++}
++
++/* Once per pad poll while busy (see pmu_step). mask = raw host buttons (CELL_PAD_CTRL bits). 1 = changed (save;
++ * the layout is Custom now). base = the scheme's own table (pab_std when unknown). */
++static int pac_step(PadActUi* u, unsigned char* padmap, PadActCustom* c, const signed char* base, unsigned mask, int esc,
++                    int del, unsigned long long now)
++{
++    int ch = 0, b;
++    mask &= 0xFFFFu;
++    if (u->phase == PMU_IDLE) {
++        if (u->suppress && !mask && !esc && !del) u->suppress = 0;
++        return 0;
++    }
++    if (now - u->t0 > PMU_CAPTURE_MS) { u->phase = PMU_IDLE; u->suppress = 1; u->result = PMU_R_TIMEOUT; u->gen++; return 0; }
++    if (u->phase == PMU_RELEASE) {
++        if (!mask && !esc && !del) { u->phase = PMU_WAIT; u->t_wait = now; }
++        return 0;
++    }
++    if (esc) { u->phase = PMU_IDLE; u->suppress = 1; u->result = PMU_R_CANCEL; u->gen++; return 0; }
++    if (del) {
++        u->phase = PMU_IDLE; u->suppress = 1; u->other = -1;
++        u->result = PMU_R_CLEARED;
++        ch = pac_clear(c, base, u->row);
++    } else if (mask) {
++        for (b = 0; b < PRM_N && !((mask >> b) & 1u); b++) {}
++        u->phase = PMU_IDLE; u->suppress = 1;
++        ch = pac_bind(c, base, u->row, pab_bit_to_eb[b], &u->result, &u->other);
++    } else return 0;
++    if (ch) *padmap = PRM_CUSTOM;
++    u->gen++;
++    return ch;
++}
++
++static int pac_command(PadActUi* u, unsigned char* padmap, PadActCustom* c, const signed char* base, const char* cmd,
++                       char* out, size_t n, unsigned long long now)
++{
++    char verb[16] = { 0 };
++    const char* a;
++    int g, ch = 0;
++    if (!n) return 0;
++    out[0] = 0;
++    if (!base) base = pab_std;
++    while (*cmd == ' ') cmd++;
++    if (sscanf(cmd, "%15s", verb) < 1) return 0;
++    a = cmd + strlen(verb);
++    while (*a == ' ') a++;
++    g = pmu_num(a, 0, PAC_NG - 1);
++    if (!strcmp(verb, "rows")) snprintf(out, n, "%d", PAC_NG);
++    else if (!strcmp(verb, "ctx")) { if (g >= 0) snprintf(out, n, "%d", pac_groups[g].ctx); }
++    else if (!strcmp(verb, "label")) { if (g >= 0) snprintf(out, n, "%s", pac_groups[g].label); }
++    else if (!strcmp(verb, "id")) { if (g >= 0) snprintf(out, n, "%s", pac_groups[g].key); }
++    else if (!strcmp(verb, "key")) snprintf(out, n, "%s", g < 0 ? "---" : pac_button_name(pac_eff(c, base, g), u->family));
++    else if (!strcmp(verb, "dup")) { if (g >= 0 && pac_dup(c, base, g)) snprintf(out, n, "1"); }
++    else if (!strcmp(verb, "cap")) {
++        if (!*a) snprintf(out, n, "%d", u->phase != PMU_IDLE ? u->row : -1);
++        else if (g < 0) snprintf(out, n, "bad");
++        else { u->phase = PMU_RELEASE; u->row = g; u->t0 = now; u->result = PMU_R_NONE; u->other = -1; snprintf(out, n, "ok"); }
++    } else if (!strcmp(verb, "clear")) {
++        if (g < 0) snprintf(out, n, "bad");
++        else {
++            ch = pac_clear(c, base, g);
++            u->result = PMU_R_CLEARED; u->other = -1;
++            if (ch) { *padmap = PRM_CUSTOM; u->gen++; }
++            snprintf(out, n, "ok");
++        }
++    } else if (!strcmp(verb, "reset")) {
++        int p = !strcmp(a, "default") ? PRM_DEFAULT : !strcmp(a, "modern") ? PRM_MODERN : -1;
++        if (p < 0) snprintf(out, n, "bad");
++        else {
++            ch = pac_reset(c, p);
++            if (*padmap != PRM_CUSTOM) ch = 1;
++            *padmap = PRM_CUSTOM;
++            u->phase = PMU_IDLE; u->result = PMU_R_NONE; u->other = -1;
++            if (ch) u->gen++;
++            snprintf(out, n, "ok");
++        }
++    } else if (!strcmp(verb, "cancel")) {
++        if (u->phase != PMU_IDLE) { u->phase = PMU_IDLE; u->suppress = 1; u->result = PMU_R_CANCEL; u->gen++; }
++        snprintf(out, n, "ok");
++    } else if (!strcmp(verb, "state")) {
++        static const char* const nm[] = { "idle", "bound", "swapped", "cleared", "cancel", "timeout", "refused" };
++        snprintf(out, n, "%s", u->phase != PMU_IDLE ? "capture" : nm[u->result >= 0 && u->result <= PMU_R_REFUSED ? u->result : 0]);
++    } else if (!strcmp(verb, "other")) snprintf(out, n, "%d", u->other);
++    else if (!strcmp(verb, "preset")) snprintf(out, n, "%s", prm_preset_names[*padmap < PRM_N_PRESETS ? *padmap : 0]);
++    else if (!strcmp(verb, "poll")) {
++        if (u->phase != PMU_IDLE) snprintf(out, n, "busy");
++        else if (u->gen != u->seen_gen) { u->seen_gen = u->gen; snprintf(out, n, "changed"); }
++    } else if (!strcmp(verb, "at")) {
++        /* the controller picture under Custom: "at <EButton name> <i>" = the i-th on-foot group label on that button */
++        char nm[24] = { 0 };
++        int k = -1, h = -1, i;
++        snprintf(out, n, "-");
++        if (sscanf(a, "%23s %d", nm, &k) == 2 && k >= 0)
++            for (i = 0; i < PMU_N_ROWS; i++)
++                if (pmu_rows[i].button && !strcmp(pmu_rows[i].button, nm)) h = pab_bit_to_eb[pmu_rows[i].game];
++        if (h >= 0)
++            for (i = 0; i < PAC_N_FOOT; i++)
++                if (pac_eff(c, base, i) == h && k-- == 0) { snprintf(out, n, "%s", pac_groups[i].label); break; }
++    }
++    return ch;
++}
++
++#endif
+diff -ruN a/libs/input/pad_actions.h b/libs/input/pad_actions.h
+--- a/libs/input/pad_actions.h
++++ b/libs/input/pad_actions.h
+@@ -135,6 +135,14 @@
+     }
+ }
+ 
++/* KZ3 patch 4023: a per-action override table (user[a] = an EButton, -1 none, -2 = the scheme's own), Custom per
++ * action (pad_action_custom.h). Suicide / StandUp keep the scheme's own. */
++static void pab_user_apply(const signed char* base, const signed char* user, int32_t out[PAB_N])
++{
++    int a;
++    for (a = 0; a < PAB_N; a++) out[a] = (user[a] == -2 || pab_skip(a)) ? base[a] : user[a];
++}
++
+ static void pab_from_base(const signed char* base, int32_t out[PAB_N])
+ {
+     int a;
+@@ -192,18 +200,20 @@
+ /* What one block should hold. kbd = the keyboard is the device in use (keys name game buttons: they keep the game's
+  * table). Returns 0 when the block is left alone. */
+ static int pab_want(int preset, int family, int kbd, const signed char* base, const unsigned char custom_src[16],
+-                    int32_t out[PAB_N])
++                    const signed char* user, int32_t out[PAB_N])
+ {
+     if (!base) return 0;
+     if (kbd || preset == 0) pab_from_base(base, out);
+     else if (preset == 1) pab_modern(base, family, out);
++    else if (preset == 2 && user) pab_user_apply(base, user, out);   /* 4023: Custom per action */
+     else if (preset == 2 && custom_src) pab_custom(base, custom_src, out);
+     else pab_from_base(base, out);
+     return 1;
+ }
+ 
+ /* A table this file could have written for this scheme (so putting the scheme's own back is safe). */
+-static int pab_ours(const int32_t* cur, const signed char* base, const unsigned char custom_src[16], const int32_t* last)
++static int pab_ours(const int32_t* cur, const signed char* base, const unsigned char custom_src[16], const signed char* user,
++                    const int32_t* last)
+ {
+     int32_t t[PAB_N];
+     int f;
+@@ -211,6 +221,7 @@
+     if (pab_same(cur, t)) return 1;
+     for (f = 0; f < 2; f++) { pab_modern_r34(base, f, t); if (pab_same(cur, t)) return 1; }
+     if (custom_src) { pab_custom(base, custom_src, t); if (pab_same(cur, t)) return 1; }
++    if (user) { pab_user_apply(base, user, t); if (pab_same(cur, t)) return 1; }   /* 4023 */
+     return last && pab_same(cur, last);
+ }
+ 
+@@ -219,8 +230,10 @@
+ 
+ /* One block: read, decide, write. `last` (PAB_N, may hold anything; last[0] == INT32_MIN = none) is what this file
+  * wrote last into this block and is updated. */
+-static int pab_sync_block(uint32_t blk, int preset, int family, int kbd, const unsigned char custom_src[16],
+-                          int32_t* last, pab_rd32_fn rd32, pab_rd8_fn rd8, pab_wr32_fn wr32, int32_t* id_out)
++/* 4023: `user` (PAB_N, may be NULL) = the per-action Custom table; it wins over custom_src under preset 2. */
++static int pab_sync_block_user(uint32_t blk, int preset, int family, int kbd, const unsigned char custom_src[16],
++                               const signed char* user, int32_t* last, pab_rd32_fn rd32, pab_rd8_fn rd8, pab_wr32_fn wr32,
++                               int32_t* id_out)
+ {
+     int32_t cur[PAB_N], want[PAB_N];
+     const signed char* base;
+@@ -232,12 +245,12 @@
+     if (!base) return PAB_NONE;
+     for (a = 0; a < PAB_N; a++) cur[a] = (int32_t)rd32(blk + PAB_OFF_TABLE + 4u * (uint32_t)a);
+     if (!pab_plausible(cur)) return PAB_BAD;
+-    if (!pab_want(preset, family, kbd, base, custom_src, want)) return PAB_NONE;
++    if (!pab_want(preset, family, kbd, base, custom_src, user, want)) return PAB_NONE;
+     if (pab_same(cur, want)) return PAB_NONE;
+     {
+         int32_t b[PAB_N];
+         pab_from_base(base, b);
+-        if (pab_same(want, b) && !pab_ours(cur, base, custom_src, last[0] == INT32_MIN ? (const int32_t*)0 : last))
++        if (pab_same(want, b) && !pab_ours(cur, base, custom_src, user, last[0] == INT32_MIN ? (const int32_t*)0 : last))
+             return PAB_FOREIGN;   /* the game's own table (or one we do not know): leave it */
+         for (a = 0; a < PAB_N; a++)
+             if (!pab_skip(a) && cur[a] != want[a]) wr32(blk + PAB_OFF_TABLE + 4u * (uint32_t)a, (uint32_t)want[a]);
+@@ -246,4 +259,10 @@
+     }
+ }
+ 
++static int pab_sync_block(uint32_t blk, int preset, int family, int kbd, const unsigned char custom_src[16],
++                          int32_t* last, pab_rd32_fn rd32, pab_rd8_fn rd8, pab_wr32_fn wr32, int32_t* id_out)
++{
++    return pab_sync_block_user(blk, preset, family, kbd, custom_src, (const signed char*)0, last, rd32, rd8, wr32, id_out);
++}
++
+ #endif
+diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -28,6 +28,7 @@
+ 
+ #include "pad_remap.h"   /* 4013 */
+ #include "pad_remap_ui.h"   /* 4014 */
++#include "pad_action_custom.h"   /* 4023: Custom per action, [pad actions] */
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -115,7 +116,7 @@
+ /* KZ3 patch 4013 (stage 3): `padmap` = the pad layout preset (PRM_*, section [pad] preset), `padc` = the custom
+  * table (src of each game button, [pad] "r1 = r2"; identity unless the file says otherwise). */
+ typedef struct { unsigned char key[PKB_N_INPUTS][PKB_SLOTS]; unsigned char prompts; unsigned char padmap;
+-                 unsigned char padc[PRM_N]; } PadKeybinds;
++                 unsigned char padc[PRM_N]; PadActCustom pac; /* 4023 */ } PadKeybinds;
+ 
+ enum { PKB_PROMPTS_AUTO = 0, PKB_PROMPTS_PS3, PKB_PROMPTS_PS4, PKB_PROMPTS_XBOX, PKB_PROMPTS_KEYBOARD, PKB_N_PROMPTS };
+ static const char* const pkb_prompt_names[PKB_N_PROMPTS] = { "auto", "ps3", "ps4", "xbox", "keyboard" };
+@@ -333,6 +334,7 @@
+     memset(kb, 0, sizeof *kb);
+     for (i = 0; i < PRM_N; i++) kb->padc[i] = (unsigned char)i;   /* 4013 */
+     kb->padmap = PRM_DEFAULT_PRESET;
++    pac_defaults(&kb->pac);   /* 4023 */
+     for (i = 0; i < sizeof d / sizeof d[0]; i++) {
+         int k = pad_kb_input_by_name(d[i].in, strlen(d[i].in));
+         if (k >= 0) { kb->key[k][0] = d[i].a; kb->key[k][1] = d[i].b; }
+@@ -355,7 +357,7 @@
+ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* ctx)
+ {
+     const char* p = text;
+-    int line = 0, bad = 0, in_kb = 1, in_pr = 0, in_pd = 0;
++    int line = 0, bad = 0, in_kb = 1, in_pr = 0, in_pd = 0, in_pa = 0, saw_pa = 0;
+     if (!text) return 0;
+     if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
+     while (*p) {
+@@ -371,12 +373,27 @@
+         if (a < b) {
+             if (*a == '[') {
+                 const char* r = memchr(a, ']', (size_t)(b - a));
+-                if (!r) { pad_kb_logf(log, ctx, line, "broken section header", a, (size_t)(b - a)); bad++; in_kb = in_pr = in_pd = 0; }
++                if (!r) { pad_kb_logf(log, ctx, line, "broken section header", a, (size_t)(b - a)); bad++; in_kb = in_pr = in_pd = in_pa = 0; }
+                 else {
+                     in_kb = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "keyboard");
+                     in_pr = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "prompts");   /* 4011 */
+                     in_pd = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "pad");        /* 4013 */
+-                    if (!in_kb && !in_pr && !in_pd) { pad_kb_logf(log, ctx, line, "section not read by this version", a, (size_t)(r - a + 1)); }
++                    in_pa = pad_kb_ieq(a + 1, (size_t)(r - a - 1), "pad actions");   /* 4023 */
++                    if (in_pa) saw_pa = 1;
++                    if (!in_kb && !in_pr && !in_pd && !in_pa) { pad_kb_logf(log, ctx, line, "section not read by this version", a, (size_t)(r - a + 1)); }
++                }
++            } else if (in_pa) {
++                /* 4023: "<action group> = <pad button>|none|scheme" (pad_action_custom.h) */
++                const char* q = memchr(a, '=', (size_t)(b - a));
++                const char *ne = q, *v = q ? q + 1 : NULL;
++                int rc;
++                if (!q) { pad_kb_logf(log, ctx, line, "no '=' in", a, (size_t)(b - a)); bad++; }
++                else {
++                    while (ne > a && pad_kb_space(ne[-1])) ne--;
++                    while (v < b && pad_kb_space(*v)) v++;
++                    rc = pac_parse_line(&kb->pac, a, (size_t)(ne - a), v, (size_t)(b - v));
++                    if (rc == -1) { pad_kb_logf(log, ctx, line, "unknown pad action", a, (size_t)(ne - a)); bad++; }
++                    else if (rc == -2) { pad_kb_logf(log, ctx, line, "unknown or reserved pad button", v, (size_t)(b - v)); bad++; }
+                 }
+             } else if (in_pd) {
+                 /* 4013: "preset = default|modern|custom" and "<game button> = <host button>|none" (custom table) */
+@@ -453,6 +470,7 @@
+         }
+         p = *e ? e + 1 : e;
+     }
++    if (!saw_pa) pac_from_padc(&kb->pac, kb->padc);   /* 4023: an older file's per-button Custom, as groups */
+     return bad;
+ }
+ 
+@@ -560,6 +578,10 @@
+     for (i = 0; i < PRM_N; i++)
+         if (kb->padc[i] != i)
+             PKB_PUT("%-9s= %s\n", prm_names[i], kb->padc[i] < PRM_N ? prm_names[kb->padc[i]] : "none");
++    {   /* 4023 */
++        int w = pac_format(&kb->pac, buf + (o < n ? o : n), o < n ? n - o : 0);
++        if (w > 0) o += (size_t)w;
++    }
+ #undef PKB_PUT
+     return (int)o;
+ }
+@@ -640,6 +662,7 @@
+     int sel, sel_slot;          /* the page's selected cell + 1 ("sel R S", pass 38; 0 = page closed, so a zeroed
+                                  * PadKbUi has none): Delete clears it */
+     PadMapUi pm;                /* 4014: the Custom layout page's editor (pad_remap_ui.h) */
++    PadActUi pa;                /* 4023: the per-action Custom page's editor (pad_action_custom.h) */
+ } PadKbUi;
+ 
+ static int pad_kb_row_input(int row)
+@@ -819,6 +842,11 @@
+     if (!n) return 0;
+     out[0] = 0;
+     if (sscanf(cmd, "%15s %d %d", verb, &r, &s) < 1) return 0;
++    if (!strcmp(verb, "pa")) {   /* 4023: the per-action Custom pages; see pad_action_custom.h */
++        const unsigned char before = kb->padmap;
++        int ch = pac_command(&u->pa, &kb->padmap, &kb->pac, pac_base_now(), cmd + 2, out, n, now);
++        return ch || before != kb->padmap;
++    }
+     if (!strcmp(verb, "pm")) {   /* 4014: the Custom layout page; see pad_remap_ui.h */
+         const unsigned char before = kb->padmap;
+         int ch = pmu_command(&u->pm, &kb->padmap, kb->padc, cmd + 2, out, n, now);
+@@ -888,7 +916,7 @@
+     }
+     if (!strcmp(verb, "reset")) {
+         PadKeybinds keep = *kb;   /* 4011/4013: the Keyboard page's reset keeps the Button prompts and the pad layout */
+-        pad_kb_defaults(kb); kb->prompts = keep.prompts; kb->padmap = keep.padmap; memcpy(kb->padc, keep.padc, sizeof kb->padc); u->phase = PKB_UI_IDLE; u->gen++; u->result = PKB_R_NONE;
++        pad_kb_defaults(kb); kb->prompts = keep.prompts; kb->padmap = keep.padmap; memcpy(kb->padc, keep.padc, sizeof kb->padc); kb->pac = keep.pac; u->phase = PKB_UI_IDLE; u->gen++; u->result = PKB_R_NONE;
+         snprintf(out, n, "ok");
+         return 1;
+     }

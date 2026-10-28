@@ -1,0 +1,60 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR275 has the runtime-ring test, GCM_FLIP_WRAP switch and park-pool diagnostic kept.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -857,6 +857,16 @@ static void kz3_pt_ctx(const char* tag) {
+                 tag, kz3_pt_ms(), w, c, b, gcm_ea2io(b), en, cu, gcm_ea2io(cu), pp, gcm_ea2io(pp), r); }
+     fprintf(stderr, "[park-ctx] %s G+5B0=%08X G+5B8=%08X label480=%08X label490=%08X label4A0=%08X get=%08X\n", tag,
+             vm_read32(g + 0x5B0), vm_read32(g + 0x5B8), vm_read32(0x20000480u), vm_read32(0x20000490u), vm_read32(0x200004A0u), s_fifo_getoff);
++    /* KZ3 patch 1010 diagnostic: D's piece pool (D+0x10: count, size, stamps*, base, ?, ?, done*, issued)
++     * that the context-grow 0x5CA80 allocates from through 0x5B9F0, and D+0x80..+0x94. */
++    { u32 d = g + 0xF0u, pl = d + 0x10u; u32 w[8]; for (int i = 0; i < 8; i++) w[i] = vm_read32(pl + 4u * i);
++      fprintf(stderr, "[park-pool] %s pool=%08X n=%u sz=%08X stamps=%08X base=%08X +10=%08X +14=%08X done@%08X=%08X issued=%08X"
++              " D+80=%08X %08X %08X %08X %08X %08X\n", tag, pl, w[0], w[1], w[2], w[3], w[4], w[5], w[6],
++              w[6] ? vm_read32(w[6]) : 0, w[7], vm_read32(d + 0x80), vm_read32(d + 0x84), vm_read32(d + 0x88),
++              vm_read32(d + 0x8C), vm_read32(d + 0x90), vm_read32(d + 0x94));
++      if (w[2] && w[0] && w[0] <= 96) { char b[96 * 9 + 1]; int o = 0;
++        for (u32 i = 0; i < w[0]; i++) o += snprintf(b + o, sizeof b - o, " %08X", vm_read32(w[2] + 4u * i));
++        fprintf(stderr, "[park-pool] %s stamps:%s\n", tag, b); } }
+ }
+ static void kz3_pt_dump(void) {
+     if (!kz3_pt_on()) return;
+@@ -2508,6 +2518,24 @@ s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0);
+  * at ctx->current instead; the drain stops at it and fires the flip there,
+  * exactly as it does for the 0xFEAD words a statically-linked libgcm emits.
+  * Returns 0 when there is no room or ctx is not a mapped command buffer. */
++/* KZ3 patch 1010: the wrap below is only right for a ring the runtime owns (its
++ * buffer-full callback is ours). A title with its own callback manages its own
++ * buffers: Killzone 3 flips through its draw context D (0x404C96C0), a 0x30000-byte
++ * piece of its IO pool whose `end` moves down as it allocates data from the top, so
++ * `end - cur` is always below GCM_FLIP_WRAP_BYTES. Wrapping it rewound D.current to
++ * the piece's begin in mid-frame: the frame header was rewritten over itself and the
++ * frame ended at +0x2C8, orphaning the frame's draws -- with the Bink fence release in
++ * them, so the next frame waited for it forever in 0x640E0 (the ~16 s stop).
++ * GCM_FLIP_WRAP=0 never wraps, =1 always does (the old behaviour), unset: only ours. */
++static int gcm_flip_wrap_ok(u32 ctx)
++{
++    static int mode = -1;
++    if (mode < 0) { const char* e = getenv("GCM_FLIP_WRAP"); mode = e ? atoi(e) : 2; }
++    if (mode != 2) return mode;
++    const u32 opd = vm_read32(ctx + 0xC);
++    return opd && vm_read32(opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
++}
++
+ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+ {
+     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
+@@ -2533,9 +2561,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+      * Rewinding it to `begin` in mid-frame cut the frame short, dropping the
+      * fence release in its tail, and the title then waited for it forever. */
+     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
+-    const u32 cb_opd = vm_read32(ctx + 0xC);
+-    const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+-    if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
++    if (gcm_flip_wrap_ok(ctx) && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
+         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
+         vm_write32(ctx + 8, begin);

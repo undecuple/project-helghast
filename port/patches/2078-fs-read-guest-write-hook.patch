@@ -1,0 +1,105 @@
+KZ3 patch 2078 (RSX pass 74): host file reads report the guest bytes they write.
+the RE notes "Pass 74"; the RE notes "Pass 138".
+1. runtime/ppu/ppu_fs.cpp: cellFsRead and cellFsAioRead fread() straight into guest memory; no recompiled store or SPU
+   DMA put sees those bytes, so consumers that track guest writes (the live renderer's page bitmap behind the texture
+   and vertex caches) missed them. Both now call fs_note_guest_write(buf, n) after the copy with the bytes actually
+   read (nothing at EOF); the hook is set by fs_set_guest_write_hook and stays null in programs without one.
+2. libs/video/cellGcmSys.c: cellGcm_spu_guest_write_hook_install also installs cellGcm_note_guest_write_pages_ea as the
+   fs hook (a weak reference: host tests link without the fs layer), and the page note walks the range one 1 MB IO page
+   at a time (the IO map is per 1 MB page and not contiguous; a file read can be MBs or run into local memory).
+Host test: tools/smoke/test_fs_write_hook.sh (Linux); tools/smoke/test_guest_write.c case C4 (Proton).
+Upstream candidate: a generic guest-write hook in the fs layer (RE pass 138).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): hook after upstream's fs_set_dir fread.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 030ca301..3038d957 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -4516,13 +4516,24 @@ u32 cellGcmResolveOffset(u32 offset)
+ static void gcm_note_pages_ea(u32 ea, u32 size)
+ {
+     if (!size || !rsx_live_draw_enabled()) return;
+-    if (ea >= s_config.localAddress && ea - s_config.localAddress < s_config.localSize) {
+-        rsx_live_draw_note_guest_write_pages(0u, ea - s_config.localAddress, size);
+-        return;
++    /* patch 2078: one 1 MB IO page at a time. The IO map is per 1 MB page and need not be contiguous, and a host
++     * file read (MBs) can cross pages or run from unmapped memory into local memory; an SPU put (<= 16 KB) rarely
++     * did, so the old single lookup was enough for it. */
++    u64 a = ea;
++    const u64 end = (u64)ea + size;
++    while (a < end) {
++        const u64 next = (a | 0xFFFFFull) + 1u;
++        const u32 n = (u32)((next < end ? next : end) - a);
++        const u32 e = (u32)a;
++        if (e >= s_config.localAddress && e - s_config.localAddress < s_config.localSize) {
++            rsx_live_draw_note_guest_write_pages(0u, e - s_config.localAddress, n);
++        } else {
++            const u16 io_page = s_io_address_table[e >> 20];
++            if (io_page != 0xFFFF)
++                rsx_live_draw_note_guest_write_pages(1u, ((u32)io_page << 20) | (e & 0xFFFFFu), n);
++        }
++        a = next;
+     }
+-    const u16 io_page = s_io_address_table[ea >> 20];
+-    if (io_page != 0xFFFF)
+-        rsx_live_draw_note_guest_write_pages(1u, ((u32)io_page << 20) | (ea & 0xFFFFFu), size);
+ }
+ /* KZ3 patch 2033: SPU DMA puts (runtime/spu/spu_dma.h) report through a pointer owned by the SPU runtime
+  * (spu_coherency.c: spu_set_guest_write_hook). A weak function reference: programs without the SPU runtime
+@@ -4533,9 +4544,13 @@ extern void spu_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) _
+  * cache entries per put (r34a/b: texture binds 37-48 ms/frame against 21 in pass 30). The ring stays for
+  * explicit callers (cellGcm_note_guest_write_ea: host tests, PPU-side copies). */
+ void cellGcm_note_guest_write_pages_ea(u32 ea, u32 size) { gcm_note_pages_ea(ea, size); }
++/* KZ3 patch 2078: host file reads into guest memory (runtime/ppu/ppu_fs.cpp: cellFsRead, the AIO read) mark
++ * pages the same way; a weak reference for the same reason (host tests link without the fs layer). */
++extern void fs_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) __attribute__((weak));
+ void cellGcm_spu_guest_write_hook_install(void)
+ {
+     if (spu_set_guest_write_hook) spu_set_guest_write_hook(cellGcm_note_guest_write_pages_ea);
++    if (fs_set_guest_write_hook) fs_set_guest_write_hook(cellGcm_note_guest_write_pages_ea);   /* patch 2078 */
+ }
+ void cellGcm_note_guest_write_ea(u32 ea, u32 size)
+ {
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index f73907c2..9d0ced2d 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -451,6 +451,21 @@ static void cellFsClose(ppu_context* ctx)
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
++/* KZ3 patch 2078: host-side guest writes. The bytes fread() puts into guest memory never pass through a
++ * recompiled store or an SPU DMA put, so a consumer that tracks guest writes (the live renderer's page bitmap:
++ * texture and vertex caches) cannot see them. Every fs path that fills a guest buffer from the host reports the
++ * range here after the copy; the renderer installs the hook (fs_set_guest_write_hook, a weak reference on its
++ * side), and it stays null in programs without one. */
++extern "C" {
++void (*g_fs_guest_write_hook)(uint32_t ea, uint32_t size) = 0;
++void fs_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) { g_fs_guest_write_hook = hook; }
++}
++static inline void fs_note_guest_write(uint32_t buf, uint64_t n)
++{
++    void (*hook)(uint32_t, uint32_t) = g_fs_guest_write_hook;
++    if (hook && n) hook(buf, (uint32_t)(n > 0xFFFFFFFFull ? 0xFFFFFFFFull : n));
++}
++
+ /* Pre-fault a guest range so the kernel can write into it.
+  *
+  * The flat VM is MEM_RESERVEd and each page is committed on FIRST ACCESS by a
+@@ -487,6 +502,7 @@ static void cellFsRead(ppu_context* ctx)
+     fs_prefault(buf, nbytes);
+     fs_set_dir(fd, f, 1);
+     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
++    fs_note_guest_write(buf, n);   /* patch 2078 */
+     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
+      * The intro cinematic is 28 seconds and this port renders it at a few frames
+      * a second, so it cannot be watched to its end -- truncating the stream makes
+@@ -967,6 +983,7 @@ static void cellFsAioRead(ppu_context* ctx)
+             n = fread(vm_base + buf, 1, (size_t)size, f);
+         if (pos >= 0) HOST_FSEEK64(f, pos);
+         HOST_UNLOCKFILE(f);
++        fs_note_guest_write(buf, n);   /* patch 2078 */
+         err = CELL_OK;
+     }
+     if (getenv("PS3_FSLOG"))

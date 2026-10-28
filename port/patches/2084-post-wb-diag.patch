@@ -1,0 +1,208 @@
+KZ3 patch 2084: LD_POST_WB_DIAG, which SPU DMA reads of a live RSX surface saw the RSX's last write (pass 78).
+
+KZ3 runs its post chain (MLAA, bloom, DoF, motion blur, vignette, grain) on the SPUs over render targets the RSX
+drew in main memory; patch 2017 writes those back at guest sync points (semaphore release, flip). This diagnostic
+tells per surface record and report window whether each SPU GET that overlapped it read written-back bytes
+(fresh), bytes the GPU had overwritten since the last write-back (stale), bytes of a record never written back
+(never), or a record the GPU never drew to (nogpu). Local-memory surfaces are counted too (2017's sync write-back
+covers main memory only).
+
+- runtime/spu: g_spu_guest_read_hook + spu_set_guest_read_hook (spu_coherency.c), called on every DMA GET
+  (spu_dma.h) when non-null; null unless LD_POST_WB_DIAG > 0, so the default path only tests one pointer.
+- cellGcmSys.c: gcm_spu_read_ea (EA -> location/offset, per 1 MB IO page, as gcm_note_pages_ea) installed with
+  the write hook when LD_POST_WB_DIAG > 0.
+- rsx_live_draw.c: rsx_live_draw_note_spu_read; per-record GPU-write / write-back counters at
+  ld_gv_note_gpu_write and both write-back paths; ld_pwd_flip prints one `[post-wb]` line per record with SPU
+  GETs every N frames (LD_POST_WB_DIAG=N, 1 = 60; at most 4000 lines).
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -56,6 +56,7 @@
+ void rsx_live_draw_set_write_source(u32 s) { (void)s; }   /* patch 2081 */
+ void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+ u32  rsx_live_draw_before_guest_sync(void) { return 0; }
++void rsx_live_draw_note_spu_read(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }   /* patch 2084 */
+ void rsx_live_draw_debug_writeback_stats(double* t, u32* b, u32* s, u32* w)
+ { if (t) *t = 0; if (b) *b = 0; if (s) *s = 0; if (w) *w = 0; }
+ int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u32 h)
+@@ -589,6 +590,75 @@
+     LD_SURFACE_WRITE_OTHER = 7
+ };
+ 
++/* Patch 2084 diagnostic, LD_POST_WB_DIAG=N (frames per report, 1 = 60): which SPU DMA reads (GETs) of a
++ * live surface's guest bytes saw the RSX's last write. Per surface record and report window: GPU writes
++ * (draw/clear/copy/blit/resolve notes), write-backs to guest memory, and the SPU GETs that overlapped it,
++ * split at the moment of the GET into fresh (no GPU write since the last write-back), stale (the GPU wrote
++ * since the last write-back; an earlier one ran), never (the GPU wrote; no write-back ever ran on this
++ * record) and nogpu (the record was never drawn to). Local surfaces count too (the sync-point write-back
++ * of patch 2017 covers main memory only). Off: the SPU read hook is not even installed (cellGcmSys.c). */
++static int g_ld_pwd = -1;
++static volatile LONG g_ld_pwd_get[MAX_SURFACES][4];
++static u32 g_ld_pwd_gpu[MAX_SURFACES], g_ld_pwd_wb[MAX_SURFACES];
++static u32 g_ld_pwd_gpu_life[MAX_SURFACES], g_ld_pwd_wb_life[MAX_SURFACES], g_ld_pwd_key[MAX_SURFACES];
++static u32 g_ld_pwd_frames, g_ld_pwd_lines;
++static int ld_pwd_enabled(void)
++{
++    if (g_ld_pwd < 0) { const char* e = getenv("LD_POST_WB_DIAG"); g_ld_pwd = e ? atoi(e) : 0; if (g_ld_pwd == 1) g_ld_pwd = 60; }
++    return g_ld_pwd > 0;
++}
++static void ld_pwd_rekey(u32 i)   /* a reused record starts over */
++{
++    const u32 key = g.surfaces[i].offset ^ (g.surfaces[i].location << 31) ^ (g.surfaces[i].w << 16) ^ g.surfaces[i].h;
++    if (g_ld_pwd_key[i] == key) return;
++    g_ld_pwd_key[i] = key; g_ld_pwd_gpu_life[i] = g_ld_pwd_wb_life[i] = 0;
++}
++static void ld_pwd_note_gpu_write(u32 i)
++{
++    if (!ld_pwd_enabled()) return;
++    ld_pwd_rekey(i); g_ld_pwd_gpu[i]++; g_ld_pwd_gpu_life[i]++;
++}
++static void ld_pwd_note_writeback(u32 i)
++{
++    if (!ld_pwd_enabled()) return;
++    ld_pwd_rekey(i); g_ld_pwd_wb[i]++; g_ld_pwd_wb_life[i]++;
++}
++/* Any thread (SPU DMA): reads only; the counters are atomic. */
++void rsx_live_draw_note_spu_read(u32 location, u32 offset, u32 size)
++{
++    if (!ld_pwd_enabled() || !size) return;
++    const u64 r0 = offset, r1 = r0 + size;
++    const u32 n = g.n_surfaces < MAX_SURFACES ? g.n_surfaces : MAX_SURFACES;
++    for (u32 i = 0; i < n; i++) {
++        const surface_t* sf = &g.surfaces[i];
++        if (!sf->tex || sf->location != location || !sf->w || !sf->h) continue;
++        const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++        const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
++        const u64 s0 = sf->offset, s1 = s0 + (u64)gp * (sf->h - 1u) + (u64)sf->w * texel;
++        if (!(s0 < r1 && r0 < s1)) continue;
++        const int k = !g_ld_pwd_gpu_life[i] ? 3 : !sf->gv_gpu_dirty ? 0 : g_ld_pwd_wb_life[i] ? 1 : 2;
++        InterlockedIncrement(&g_ld_pwd_get[i][k]);
++    }
++}
++static void ld_pwd_flip(void)
++{
++    if (!ld_pwd_enabled() || ++g_ld_pwd_frames % (u32)g_ld_pwd) return;
++    for (u32 i = 0; i < MAX_SURFACES && i < g.n_surfaces; i++) {
++        LONG c[4];
++        for (int k = 0; k < 4; k++) c[k] = InterlockedExchange(&g_ld_pwd_get[i][k], 0);
++        const surface_t* sf = &g.surfaces[i];
++        if ((c[0] | c[1] | c[2] | c[3]) && g_ld_pwd_lines < 4000) {
++            g_ld_pwd_lines++;
++            fprintf(stderr, "[post-wb] f%u surf %u:0x%08X %ux%u fmt=%d pitch=%u gpu=%u wb=%u life gpu=%u wb=%u "
++                    "spu_get fresh=%ld stale=%ld never=%ld nogpu=%ld dirty_now=%u\n",
++                    g_ld_pwd_frames, sf->location, sf->offset, sf->w, sf->h, (int)sf->fmt, sf->pitch,
++                    g_ld_pwd_gpu[i], g_ld_pwd_wb[i], g_ld_pwd_gpu_life[i], g_ld_pwd_wb_life[i],
++                    (long)c[0], (long)c[1], (long)c[2], (long)c[3], (u32)sf->gv_gpu_dirty);
++        }
++        g_ld_pwd_gpu[i] = g_ld_pwd_wb[i] = 0;
++    }
++}
++
+ /* Patch 2017: every GPU write to a surface makes its guest-byte baseline stale
+  * and cancels an earlier explicit guest write (the GPU wrote over it). */
+ static inline void ld_gv_note_gpu_write(u32 target)
+@@ -597,6 +667,7 @@
+     g.surfaces[target].gv_pending = 1;
+     g.surfaces[target].gv_dirty = 0;
+     g.surfaces[target].gv_gpu_dirty = 1;
++    ld_pwd_note_gpu_write(target);   /* patch 2084 diagnostic */
+ }
+ 
+ static void ld_surface_note_write(u32 target, u32 kind)
+@@ -10848,6 +10919,7 @@
+     /* A guest flip still marks a new texture-generation boundary even though
+      * the guest surface is not sent to the swap chain. */
+     rsx_live_draw_before_guest_sync();   /* patch 2017 */
++    ld_pwd_flip();   /* patch 2084 diagnostic */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+     ld_vg_frame();  /* patch 2076 */
+@@ -14923,6 +14995,7 @@
+         }
+         ok = 1;
+         g.surfaces[i].gv_gpu_dirty = 0;
++        ld_pwd_note_writeback(i);   /* patch 2084 */
+         if (ld_gv_enabled()) ld_gv_baseline(&g.surfaces[i]);   /* guest bytes == host now */
+         static int logged;
+         if (logged++ < 8)
+@@ -15027,6 +15100,7 @@
+     D3D12_RANGE wr = {0, 0};
+     g_ld_rb[k]->lpVtbl->Unmap(g_ld_rb[k], 0, &wr);
+     g.surfaces[i].gv_gpu_dirty = 0;
++    ld_pwd_note_writeback(i);   /* patch 2084 */
+     if (ld_gv_enabled()) ld_gv_baseline(&g.surfaces[i]);   /* guest bytes == host now */
+     static int logged;
+     if (logged++ < 8)
+@@ -15984,6 +16058,7 @@
+       g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
+       packets_at_last_frame = g_ld_stats.packets_seen; }
+     rsx_live_draw_before_guest_sync();   /* patch 2017 */
++    ld_pwd_flip();   /* patch 2084 diagnostic */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+     ld_vg_frame();  /* patch 2076 */
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -106,6 +106,7 @@
+  * guest can observe a sync point (semaphore/label release, flip), so CPU/SPU
+  * readers of RSX output in main memory see it. Returns surfaces written. */
+ u32  rsx_live_draw_before_guest_sync(void);
++void rsx_live_draw_note_spu_read(u32 location, u32 offset, u32 size);   /* patch 2084: LD_POST_WB_DIAG */
+ /* Patch 2015: before the guest reads [offset, offset+size) of `location`
+  * (an NV0039 copy out of local memory), write every live colour surface that
+  * overlaps it back into guest memory in the RSX layout (A8R8G8B8 as A,R,G,B
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -3754,8 +3754,31 @@
+ {
+     rsx_live_draw_set_write_source(2u); gcm_note_pages_ea(ea, size); rsx_live_draw_set_write_source(0u);
+ }
++/* KZ3 patch 2084: LD_POST_WB_DIAG, SPU DMA GETs of RSX-visible memory -> rsx_live_draw_note_spu_read
++ * (same EA -> location/offset rule as gcm_note_pages_ea, one 1 MB IO page at a time). */
++extern void spu_set_guest_read_hook(void (*hook)(uint32_t ea, uint32_t size)) __attribute__((weak));
++static void gcm_spu_read_ea(uint32_t ea, uint32_t size)
++{
++    u64 a = ea;
++    const u64 end = (u64)ea + size;
++    while (a < end) {
++        const u64 next = (a | 0xFFFFFull) + 1u;
++        const u32 n = (u32)((next < end ? next : end) - a);
++        const u32 e = (u32)a;
++        if (e >= s_config.localAddress && e - s_config.localAddress < s_config.localSize) {
++            rsx_live_draw_note_spu_read(0u, e - s_config.localAddress, n);
++        } else {
++            const u16 io_page = s_io_address_table[e >> 20];
++            if (io_page != 0xFFFF)
++                rsx_live_draw_note_spu_read(1u, ((u32)io_page << 20) | (e & 0xFFFFFu), n);
++        }
++        a = next;
++    }
++}
+ void cellGcm_spu_guest_write_hook_install(void)
+ {
++    {   const char* e = getenv("LD_POST_WB_DIAG");   /* patch 2084 */
++        if (e && atoi(e) > 0 && spu_set_guest_read_hook) spu_set_guest_read_hook(gcm_spu_read_ea); }
+     if (spu_set_guest_write_hook) spu_set_guest_write_hook(gcm_spu_note_pages_ea);   /* 2033; tag 2081 */
+     if (fs_set_guest_write_hook) fs_set_guest_write_hook(gcm_fs_note_pages_ea);   /* patch 2078; tag 2081 */
+ }
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -424,4 +424,7 @@
+  * already links this file (spu_coh_is_reserved); the live renderer installs cellGcm_note_guest_write_ea
+  * through spu_set_guest_write_hook (a weak reference on its side). */
+ void (*g_spu_guest_write_hook)(uint32_t ea, uint32_t size) = 0;
++/* KZ3 patch 2084: the same for DMA GETs, installed only by the renderer's LD_POST_WB_DIAG diagnostic. */
++void (*g_spu_guest_read_hook)(uint32_t ea, uint32_t size) = 0;
++void spu_set_guest_read_hook(void (*hook)(uint32_t ea, uint32_t size)) { g_spu_guest_read_hook = hook; }
+ void spu_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) { g_spu_guest_write_hook = hook; }
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -586,6 +586,9 @@
+         }
+     }
+     if (mfc_is_get(cmd)) {
++        /* KZ3 patch 2084: LD_POST_WB_DIAG (libs/video) counts GETs of live RSX surfaces; null unless that is on. */
++        { extern void (*g_spu_guest_read_hook)(uint32_t ea, uint32_t size);   /* spu_coherency.c */
++          if (g_spu_guest_read_hook && size) g_spu_guest_read_hook((uint32_t)ea, size); }
+         /* LBP overlay-load diagnosis: a GET of the FMOD overlay descriptor
+          * (32B from ~0x94Fxxx) then a large GET from a NULL source = the
+          * overlay never loads. Dump the descriptor content to see where the

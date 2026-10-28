@@ -1,0 +1,138 @@
+KZ3 patch 1078 (SPU pass 61, level speed): a job module that another job loads at its own LS address can be lifted
+a second time at that address and dispatched there. KZ3's Amadeus mixer job (job_0127a180, wid 5 jm_amadeus, at LS
+0x4000) loads a DSP plugin module (job_0129bd80, header LS base 0) at LS 0x8000 and calls into it through pointers;
+the plugin's only lift was at 0x4000, so every call missed and ran in the SPU interpreter (patch 1069): in the K4
+level ~10-12 ms per mixer run, ~0.8 of the 5 SPUs (spu_step/spu_decode1/spu_lookup_ovl_exact are 95 % of the
+mixer's host samples, patch 1033 profiler). Now spu_overlay_register_located(code, lsa, span, image) registers the
+module's bytes, its load address, its size and the image id of its lift at that address; spu_lookup_located()
+serves a miss inside [lsa, lsa + span) from that image (exact, no wildcard) only while LS holds the module's
+16-byte header at lsa and its instruction word at pc (an SPU's LS outlives the job that loaded the module). Called
+after the image lookup in spu_indirect_branch, in the drain resume and in the interpreter's rejoin probe.
+KZ3_SPU_LOC=0 disables it (the interpreter path of 1069 again). The lift and the registration are KZ3's
+(tools/spu/lift_spu.py LOCATED, tools/spu/gen_spu_register.py kind "jobloc"); host test tools/spu/test_spu_located.sh.
+Upstream candidate (general: any title whose SPU jobs load other job modules at a fixed LS address of their own).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): the located lookup after upstream's `spu_lifted_lookup` (#420), outside resident spans; `spu_resident_code_owner` added here (was 1123).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 82f99dfd..391589e1 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1867,6 +1867,55 @@ spu_fn spu_lookup_ovl_exact(uint32_t addr, int image_id)
+     return NULL;
+ }
+ 
++/* KZ3 patch 1078: job modules lifted a second time at the LS base another job loads them to. KZ3's Amadeus mixer
++ * job (job_0127a180, run by the WWS policy module at LS 0x4000) loads a DSP plugin module (job_0129bd80, header
++ * base 0) at LS 0x8000 and calls into it through pointers. The plugin's own lift is at 0x4000 (the base a WWS
++ * job-list entry would give it), so every call into it missed and ran in the interpreter (patch 1069): ~10 ms of
++ * interpretation per mixer run, about one SPU of five in a level. The title registers the module's bytes (the
++ * lift's input; its first 16 bytes are the header), the LS address it is loaded at, its size and the image id of
++ * the lift at that address. A dispatch miss inside [lsa, lsa + span) dispatches the lifted function (exact image,
++ * no wildcard) only while LS still holds the module's header at lsa (the identification the WWS job-module match
++ * uses, spu_overlay_match_sig) AND the module's instruction word at pc: an SPU's LS outlives the job that loaded
++ * the module, so a later program could keep the header but hold other code at pc. KZ3_SPU_LOC=0 disables the
++ * lookup (the interpreter path again). */
++/* kz3-loc begin (tools/spu/test_spu_located.sh compiles this block) */
++#define SPU_LOC_MAX 8
++static struct { const uint8_t* code; uint32_t lsa, span; int image_id; unsigned hits; } s_loc[SPU_LOC_MAX];
++static int s_loc_n;
++void spu_overlay_register_located(const uint8_t* code, uint32_t lsa, uint32_t span, int image_id)
++{
++    if (s_loc_n >= SPU_LOC_MAX || !code || span < 16 || lsa >= SPU_LS_SIZE || span > SPU_LS_SIZE - lsa) return;
++    s_loc[s_loc_n].code = code;
++    s_loc[s_loc_n].lsa = lsa;
++    s_loc[s_loc_n].span = span;
++    s_loc[s_loc_n].image_id = image_id;
++    s_loc_n++;
++}
++int kz3_spu_loc_on(void)
++{
++    static int s = -1;
++    if (s < 0) { const char* e = getenv("KZ3_SPU_LOC"); s = (e && *e == '0') ? 0 : 1; }
++    return s;
++}
++spu_fn spu_lookup_located(const spu_context* ctx, uint32_t pc)
++{
++    if (!s_loc_n || !kz3_spu_loc_on()) return NULL;
++    pc &= SPU_LS_MASK;
++    for (int i = 0; i < s_loc_n; i++) {
++        const uint32_t off = pc - s_loc[i].lsa;
++        if (off >= s_loc[i].span || (pc & 3) || off + 4 > s_loc[i].span) continue;
++        if (memcmp(ctx->ls + s_loc[i].lsa, s_loc[i].code, 16) != 0) continue;
++        if (memcmp(ctx->ls + pc, s_loc[i].code + off, 4) != 0) continue;
++        spu_fn f = spu_lookup_ovl_exact(pc, s_loc[i].image_id);
++        if (f && s_loc[i].hits++ == 0)   /* racy count across lanes: only the first-hit log uses it */
++            fprintf(stderr, "[spu-loc] image %d at LS 0x%05X: first lifted dispatch pc=0x%05X (patch 1078)\n",
++                    s_loc[i].image_id, s_loc[i].lsa, pc);
++        if (f) return f;
++    }
++    return NULL;
++}
++/* kz3-loc end */
++
+ /* Which image registered a function at this LS address, or -1 if none did.
+  *
+  * Deliberately NOT spu_lookup(addr, 0): that call means "dispatch here in a
+@@ -1895,6 +1944,16 @@ int spu_have_function(uint32_t addr)
+  * through would execute stale code registered under another image. Task and
+  * unbounded overlay misses retain their existing primary-image fallback. */
+ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
++/* KZ3 patch 1078: the image owning a bounded resident code span at lsa, or 0 (the located-module lookup runs
++ * only outside such spans). */
++static inline int spu_resident_code_owner(const spu_context* ctx, uint32_t lsa)
++{
++    for (unsigned slot = 0; slot < 4; ++slot)
++        if (ctx->resident_code[slot].image_id && lsa >= ctx->resident_code[slot].lsa &&
++            lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
++            return ctx->resident_code[slot].image_id;
++    return 0;
++}
+ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
+ {
+     /* Every probe below goes through #436's per-thread memo rather than
+@@ -3118,8 +3177,11 @@ void spu_indirect_branch(spu_context* ctx)
+         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
+         if (ti) ctx->resident_task = ti;
+     }
+-    /* Use the same ownership order as the interpreter's rejoin probe. */
+-    spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
++    /* Use the same ownership order as the interpreter's rejoin probe (upstream #420): bounded
++     * resident code (authoritative, a miss there stays a miss), task, overlay, primary image. */
++    spu_fn fn = (spu_fn)spu_lifted_lookup(ctx, ctx->pc);
++    if (!fn && !spu_resident_code_owner(ctx, ctx->pc))
++        fn = spu_lookup_located(ctx, ctx->pc);   /* KZ3 patch 1078 */
+     /* The job returned through the link register we planted: it is finished.
+      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
+      * return landed on LS 0, which is the job's OWN entry, and it ran a second
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 5a0ac622..79bd0818 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -667,6 +667,10 @@ void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
+             uint32_t pc = ctx->pc & SPU_LS_MASK;
+             spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
+             if (!fn) fn = spu_lookup(pc, ctx->image_id);
++            if (!fn) {   /* KZ3 patch 1078: a module lifted at the LS base another job loaded it to */
++                extern spu_drain_fn spu_lookup_located(const spu_context*, uint32_t);
++                fn = spu_lookup_located(ctx, pc);
++            }
+             if (fn) {
+                 { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index fa80dd69..a34aee66 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -536,6 +536,11 @@ static spu_lifted_fn spu_interp_rejoin_lookup(const spu_context* ctx, uint32_t p
+         spu_lifted_fn f = spu_lookup_ovl_exact(pc, ctx->resident_ovl);
+         if (f) return f;
+     }
++    {   /* KZ3 patch 1078: rejoin a module lifted at the LS base another job loaded it to */
++        extern spu_lifted_fn spu_lookup_located(const spu_context*, uint32_t);
++        spu_lifted_fn f = spu_lookup_located(ctx, pc);
++        if (f) return f;
++    }
+     return spu_lifted_lookup(ctx, pc);
+ }
+ 

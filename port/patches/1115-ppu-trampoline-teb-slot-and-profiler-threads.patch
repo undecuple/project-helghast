@@ -1,0 +1,313 @@
+KZ3 patch 1115 (SPU pass 100): (1) on MinGW the lifted PPU code reaches g_trampoline_fn (read after every lifted
+call: 61k sites) through a pointer to its emulated-TLS storage cached in one TEB TLS slot, instead of a call to
+__emutls_get_address; default off since SPU pass 101: -DPPU_TRAMP_TEB=1 builds it (then KZ3_TRAMP_TEB=0 = no slot). (2) profiler: KZ3_PROF_ALL=1 samples
+every thread with a thread tag, KZ3_PROF_UNWIND=RVA,... records the caller of samples in those functions.
+Notes the RE notes Pass 100.
+
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -535,6 +535,38 @@
+  * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above. */
+ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
+ 
++/* KZ3 patch 1115 (SPU pass 100): on MinGW (emulated TLS: every g_trampoline_fn access was a call to
++ * __emutls_get_address, after every lifted call) the generated code reaches this thread's g_trampoline_fn
++ * through a pointer cached in one Windows TLS slot of the TEB (gs:[0x1480 + 8 * index]): two loads, no call.
++ * The storage stays the TLS variable itself, so runtime code that names it directly sees the same value
++ * (same per-thread semantics). A thread whose slot is still empty, or a process without the fast path
++ * (KZ3_TRAMP_TEB=0, no slot below 64, the self-check failed), takes ppu_tramp_ref_slow(), which returns
++ * &g_trampoline_fn and fills the slot. Default off (the old code); -DPPU_TRAMP_TEB=1 builds this path. */
++#ifndef PPU_TRAMP_TEB   /* SPU pass 101: default off (pass 100 A/B: no gain beyond noise); -DPPU_TRAMP_TEB=1 on */
++#  if defined(_WIN32) && defined(__GNUC__) && !defined(_MSC_VER) && defined(__x86_64__)
++#    define PPU_TRAMP_TEB 0
++#  else
++#    define PPU_TRAMP_TEB 0
++#  endif
++#endif
++#if PPU_TRAMP_TEB
++#ifndef PPU_TRAMP_GS_LOAD   /* the TEB read (a host test supplies an emulated TEB) */
++#  define PPU_TRAMP_GS_LOAD(o, p) __asm__("movq %%gs:(%1), %0" : "=r"(p) : "r"(o))
++#endif
++extern "C" unsigned g_ppu_tramp_slot;   /* TEB byte offset of the slot, 0 = no fast path */
++extern "C" void (**ppu_tramp_ref_slow(void))(void*);
++static inline __attribute__((always_inline)) void (**ppu_tramp_ref(void))(void*) {
++    const unsigned long long o = g_ppu_tramp_slot;
++    if (__builtin_expect(o != 0, 1)) {
++        void* p;
++        PPU_TRAMP_GS_LOAD(o, p);
++        if (__builtin_expect(p != 0, 1)) return (void (**)(void*))p;
++    }
++    return ppu_tramp_ref_slow();
++}
++#define g_trampoline_fn (*ppu_tramp_ref())
++#endif
++
+ /* Drain pending trampolines after any call that might set g_trampoline_fn.
+  * Converts cross-fragment fallthrough chains into iterative loops. */
+ #define DRAIN_TRAMPOLINE(ctx) do { \\
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2131,6 +2131,51 @@
+ /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
+ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
+ 
++/* KZ3 patch 1115 (SPU pass 100): the TEB-slot path to g_trampoline_fn the generated code takes on MinGW
++ * (PPU_TRAMP_TEB in the lifter's source preamble). The slot holds a pointer to this thread's g_trampoline_fn
++ * (its emulated-TLS storage), so both paths reach the same per-thread object. KZ3_TRAMP_TEB=0: no slot (every
++ * access comes here and returns &g_trampoline_fn, the old storage through one more call). */
++#if defined(_WIN32) && defined(__GNUC__) && !defined(_MSC_VER) && defined(__x86_64__)
++extern "C" unsigned g_ppu_tramp_slot = 0;
++static volatile long s_ppu_tramp_state = 0;   /* 0 undecided, 1 deciding, 2 decided */
++static DWORD s_ppu_tramp_idx = TLS_OUT_OF_INDEXES;
++extern "C" void (**ppu_tramp_ref_slow(void))(void*)
++{
++    void (**p)(void*) = &g_trampoline_fn;
++    if (s_ppu_tramp_state != 2) {
++        if (InterlockedCompareExchange(&s_ppu_tramp_state, 1, 0) == 0) {
++            const char* e = getenv("KZ3_TRAMP_TEB");
++            DWORD idx = (e && e[0] == '0') ? TLS_OUT_OF_INDEXES : TlsAlloc();
++            if (idx != TLS_OUT_OF_INDEXES && idx >= 64) { TlsFree(idx); idx = TLS_OUT_OF_INDEXES; }  /* expansion slots: no */
++            s_ppu_tramp_idx = idx;
++            fprintf(stderr, "[tramp] g_trampoline_fn via TEB slot: %s idx=%ld (KZ3 patch 1115)\n",
++                    idx == TLS_OUT_OF_INDEXES ? "off" : "on", idx == TLS_OUT_OF_INDEXES ? -1L : (long)idx);
++            InterlockedExchange(&s_ppu_tramp_state, 2);
++        } else {
++            while (s_ppu_tramp_state != 2) Sleep(0);
++        }
++    }
++    const DWORD idx = s_ppu_tramp_idx;
++    if (idx == TLS_OUT_OF_INDEXES) return p;
++    if (TlsGetValue(idx) != (void*)p) TlsSetValue(idx, (void*)p);
++    if (!g_ppu_tramp_slot) {
++        /* Self-check of the TEB layout (TlsSlots at 0x1480, also under Wine): the raw gs read must see what
++         * TlsSetValue stored, or the fast path stays off. */
++        const unsigned long long off = 0x1480ull + 8ull * idx;
++        void* q;
++        __asm__ __volatile__("movq %%gs:(%1), %0" : "=r"(q) : "r"(off));
++        if (q == (void*)p) g_ppu_tramp_slot = (unsigned)off;
++        else {
++            static volatile long warned = 0;
++            if (InterlockedExchange(&warned, 1) == 0)
++                fprintf(stderr, "[tramp] TEB self-check failed (gs:0x%llx = %p, want %p): fast path off\n", off, q, (void*)p);
++            s_ppu_tramp_idx = TLS_OUT_OF_INDEXES;
++        }
++    }
++    return p;
++}
++#endif
++
+ /* Per-thread active guest context, for the crash handler to report the guest PC
+  * (ctx->pc, updated by lifted code at block boundaries) of a host AV. */
+ extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx = nullptr;
+--- a/runtime/diag/kz3_wait_acct.c
++++ b/runtime/diag/kz3_wait_acct.c
+@@ -9,6 +9,7 @@
+ #include <string.h>
+ #ifdef _WIN32
+ #  include <windows.h>
++#  include <tlhelp32.h>   /* patch 1115: KZ3_PROF_ALL */
+ #else
+ #  include <pthread.h>
+ #  include <time.h>
+@@ -332,25 +333,111 @@
+  * the main PPU thread is "ppu-main")
+  * (default: the SPURS kernel threads "spurs-kern" and the lane workers "pm-worker"). */
+ #ifdef _WIN32
+-enum { PR_SLOTS = 1 << 16 };
+-typedef struct { uint64_t rip; int job; uint32_t n; } pr_ent;
++/* KZ3 patch 1115 (SPU pass 100): KZ3_PROF_ALL=1 samples every thread of the process, not only the named
++ * ones (a Toolhelp snapshot each second; tag "os<tid>", or the PPU thread name / thread description), and
++ * every entry carries its thread tag ("thr=K"; "[prof] thr K NAME" lines name them). KZ3_PROF_UNWIND=RVA[,RVA...]
++ * (function start RVAs, e.g. __emutls_get_address and the mcfgthread TLS helpers from nm): a sample whose RIP is
++ * in one of them is unwound (the exe's .pdata, RtlVirtualUnwind; no loader lock) through them to the first
++ * other frame, recorded as "caller=0xRVA". tools/spu/prof_resolve.py --threads / --callers read both. */
++enum { PR_SLOTS = 1 << 18, PR_XTHR = 160, PR_NUNW = 16 };
++typedef struct { uint64_t rip; uint64_t caller; int job; uint32_t thr; uint32_t n; } pr_ent;
++static int s_prof_all = 0;
++static uint32_t s_unw[PR_NUNW]; static int s_nunw = 0;
++static const RUNTIME_FUNCTION* s_pdata = 0; static uint32_t s_npdata = 0;
++typedef struct { unsigned long tid; HANDLE h; char name[48]; } pr_xthr;
++static pr_xthr s_xthr[PR_XTHR]; static int s_nxthr = 0;
+ static pr_ent* s_pr;
+ static volatile long s_pr_lock = 0;
+ static int s_prof_on = -1;
+ static double s_prof_from = 0, s_prof_to = 0;
+ static const char* s_prof_filter = 0;
+ 
+-static void pr_add(uint64_t rip, int job)
++static void pr_add(uint64_t rip, int job, uint32_t thr, uint64_t caller)
+ {
+-    uint64_t key = rip ^ ((uint64_t)(uint32_t)job << 40);
++    uint64_t key = rip ^ ((uint64_t)(uint32_t)job << 40) ^ ((uint64_t)thr << 52) ^ (caller * 0x100000001B3ull);
+     uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 40) & (PR_SLOTS - 1);
+     for (int p = 0; p < 64; p++) {
+         pr_ent* e = &s_pr[(h + p) & (PR_SLOTS - 1)];
+-        if (e->n && e->rip == rip && e->job == job) { e->n++; return; }
+-        if (!e->n) { e->rip = rip; e->job = job; e->n = 1; return; }
++        if (e->n && e->rip == rip && e->job == job && e->thr == thr && e->caller == caller) { e->n++; return; }
++        if (!e->n) { e->rip = rip; e->job = job; e->thr = thr; e->caller = caller; e->n = 1; return; }
+     }
+ }
+ 
++/* patch 1115: the exe's function table entry for RVA (binary search, no locks) */
++static const RUNTIME_FUNCTION* pr_func(uint32_t rva)
++{
++    uint32_t lo = 0, hi = s_npdata;
++    while (lo < hi) {
++        uint32_t m = (lo + hi) / 2;
++        if (rva < s_pdata[m].BeginAddress) hi = m;
++        else if (rva >= s_pdata[m].EndAddress) lo = m + 1;
++        else return &s_pdata[m];
++    }
++    return 0;
++}
++static int pr_in_unw(uint32_t begin)
++{
++    for (int i = 0; i < s_nunw; i++) if (s_unw[i] == begin) return 1;
++    return 0;
++}
++/* patch 1115: the first frame outside the KZ3_PROF_UNWIND functions, as an absolute address (0 = none) */
++static uint64_t pr_caller(const CONTEXT* c0, uint64_t base, uint64_t size)
++{
++    if (!s_nunw || c0->Rip < base || c0->Rip >= base + size) return 0;
++    const RUNTIME_FUNCTION* f = pr_func((uint32_t)(c0->Rip - base));
++    if (!f || !pr_in_unw(f->BeginAddress)) return 0;
++    CONTEXT c = *c0;
++    for (int d = 0; d < 8; d++) {
++        void* hd = 0; DWORD64 est = 0;
++        RtlVirtualUnwind(UNW_FLAG_NHANDLER, (DWORD64)base, c.Rip, (PRUNTIME_FUNCTION)f, &c, &hd, &est, NULL);
++        if (c.Rip < base || c.Rip >= base + size) return c.Rip;
++        f = pr_func((uint32_t)(c.Rip - 1 - base));
++        if (!f || !pr_in_unw(f->BeginAddress)) return c.Rip;
++    }
++    return 0;
++}
++
++/* patch 1115: KZ3_PROF_ALL: open every thread of the process not sampled yet (not the sampler itself) */
++static void pr_scan_threads(void)
++{
++    typedef HRESULT (WINAPI *gtd_t)(HANDLE, PWSTR*);
++    static gtd_t gtd = 0; static int gtd_done = 0;
++    if (!gtd_done) {
++        HMODULE k = GetModuleHandleA("kernelbase.dll"); if (!k) k = GetModuleHandleA("kernel32.dll");
++        if (k) gtd = (gtd_t)(void*)GetProcAddress(k, "GetThreadDescription");
++        gtd_done = 1;
++    }
++    HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++    if (sn == INVALID_HANDLE_VALUE) return;
++    THREADENTRY32 te; te.dwSize = sizeof te;
++    const DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
++    for (BOOL ok = Thread32First(sn, &te); ok && s_nxthr < PR_XTHR; ok = Thread32Next(sn, &te)) {
++        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
++        int known = 0;
++        long nt = s_nthr; if (nt > WA_THREADS) nt = WA_THREADS;
++        for (long i = 0; i < nt && !known; i++) if (s_thr[i] && s_thr[i]->hthr && s_thr[i]->ostid == te.th32ThreadID) known = 1;
++        for (int i = 0; i < s_nxthr && !known; i++) if (s_xthr[i].tid == te.th32ThreadID) known = 1;
++        if (known) continue;
++        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
++        if (!h) continue;
++        pr_xthr* x = &s_xthr[s_nxthr];
++        x->tid = te.th32ThreadID; x->h = h;
++        snprintf(x->name, sizeof x->name, "os%lu", x->tid);
++        const char* g = ppu_thread_name_for_os_tid(x->tid);
++        if (g && *g) snprintf(x->name, sizeof x->name, "os%lu ppu:%s", x->tid, g);
++        else if (gtd) {
++            PWSTR w = 0;
++            if (SUCCEEDED(gtd(h, &w)) && w) {
++                char a[32]; int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, a, sizeof a, NULL, NULL);
++                if (n > 1) snprintf(x->name, sizeof x->name, "os%lu %s", x->tid, a);
++                LocalFree(w);
++            }
++        }
++        s_nxthr++;
++    }
++    CloseHandle(sn);
++}
++
+ static DWORD WINAPI prof_thread(LPVOID p)
+ {
+     (void)p;
+@@ -358,11 +445,17 @@
+     const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(uintptr_t)(base + ((const IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
+     const uint64_t size = nt->OptionalHeader.SizeOfImage;
+     uint64_t samples = 0, miss = 0;
++    {   /* patch 1115: the exe's .pdata for KZ3_PROF_UNWIND */
++        const IMAGE_DATA_DIRECTORY* d = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
++        if (d->VirtualAddress && d->Size) { s_pdata = (const RUNTIME_FUNCTION*)(uintptr_t)(base + d->VirtualAddress); s_npdata = d->Size / sizeof(RUNTIME_FUNCTION); }
++    }
++    uint32_t tick = 0;
+     for (;;) {
+         Sleep(1);
+         double t = (double)(kz3_wacct_now() - s_t0) / 1e9;
+         if (t < s_prof_from) continue;
+         if (t >= s_prof_to) break;
++        if (s_prof_all && (tick++ % 1000) == 0) pr_scan_threads();
+         while (__sync_lock_test_and_set(&s_pr_lock, 1)) { }
+         long nt2 = s_nthr; if (nt2 > WA_THREADS) nt2 = WA_THREADS;
+         for (long i = 0; i < nt2; i++) {
+@@ -370,21 +463,38 @@
+             if (!w || !w->hthr) continue;
+             HANDLE h = (HANDLE)w->hthr;
+             if (SuspendThread(h) == (DWORD)-1) { miss++; continue; }
+-            CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL;
+-            if (GetThreadContext(h, &c)) { pr_add((uint64_t)c.Rip, w->job_img); samples++; } else miss++;
++            CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++            if (GetThreadContext(h, &c)) { pr_add((uint64_t)c.Rip, w->job_img, (uint32_t)i, pr_caller(&c, base, size)); samples++; } else miss++;
++            ResumeThread(h);
++        }
++        for (int i = 0; i < s_nxthr; i++) {   /* patch 1115: KZ3_PROF_ALL threads */
++            HANDLE h = s_xthr[i].h;
++            if (!h) continue;
++            if (SuspendThread(h) == (DWORD)-1) { CloseHandle(h); s_xthr[i].h = 0; continue; }   /* exited */
++            CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++            if (GetThreadContext(h, &c)) { pr_add((uint64_t)c.Rip, -2, (uint32_t)(WA_THREADS + i), pr_caller(&c, base, size)); samples++; } else miss++;
+             ResumeThread(h);
+         }
+         __sync_lock_release(&s_pr_lock);
+     }
+     fprintf(stderr, "[prof] done t=%.1f..%.1fs samples=%llu miss=%llu base=0x%llx size=0x%llx\n", s_prof_from, s_prof_to,
+             (unsigned long long)samples, (unsigned long long)miss, (unsigned long long)base, (unsigned long long)size);
++    {   /* patch 1115: thread tags */
++        long nt3 = s_nthr; if (nt3 > WA_THREADS) nt3 = WA_THREADS;
++        for (long i = 0; i < nt3; i++)
++            if (s_thr[i] && s_thr[i]->hthr) { char nm[64]; thr_name(s_thr[i], nm, sizeof nm); fprintf(stderr, "[prof] thr %ld %s\n", i, nm); }
++        for (int i = 0; i < s_nxthr; i++) fprintf(stderr, "[prof] thr %d %s\n", WA_THREADS + i, s_xthr[i].name);
++    }
+     for (int i = 0; i < PR_SLOTS; i++) {
+         const pr_ent* e = &s_pr[i];
+         if (!e->n) continue;
++        char cl[40] = "";
++        if (e->caller >= base && e->caller < base + size) snprintf(cl, sizeof cl, " caller=0x%llx", (unsigned long long)(e->caller - base));
++        else if (e->caller) snprintf(cl, sizeof cl, " caller=ext");
+         if (e->rip >= base && e->rip < base + size)
+-            fprintf(stderr, "[prof] rva=0x%llx job=%d n=%u\n", (unsigned long long)(e->rip - base), e->job, e->n);
++            fprintf(stderr, "[prof] rva=0x%llx job=%d n=%u thr=%u%s\n", (unsigned long long)(e->rip - base), e->job, e->n, e->thr, cl);
+         else
+-            fprintf(stderr, "[prof] ext=0x%llx job=%d n=%u\n", (unsigned long long)e->rip, e->job, e->n);
++            fprintf(stderr, "[prof] ext=0x%llx job=%d n=%u thr=%u%s\n", (unsigned long long)e->rip, e->job, e->n, e->thr, cl);
+     }
+     fflush(stderr);
+     return 0;
+@@ -396,11 +506,20 @@
+     s_prof_on = 0;
+     if (!e || sscanf(e, "%lf,%lf", &s_prof_from, &s_prof_to) != 2 || s_prof_to <= s_prof_from) return;
+     s_prof_filter = getenv("KZ3_PROF_FILTER");
++    { const char* a = getenv("KZ3_PROF_ALL"); s_prof_all = a && a[0] == '1'; }   /* patch 1115 */
++    {   const char* u = getenv("KZ3_PROF_UNWIND");
++        while (u && *u && s_nunw < PR_NUNW) {
++            char* end = 0; unsigned long v = strtoul(u, &end, 0);
++            if (end == u) break;
++            s_unw[s_nunw++] = (uint32_t)v;
++            u = (*end == ',') ? end + 1 : end;
++        }
++    }
+     s_pr = (pr_ent*)calloc(PR_SLOTS, sizeof *s_pr);
+     if (!s_pr) return;
+     s_prof_on = 1;
+-    fprintf(stderr, "[prof] on: %.0f..%.0f s, threads matching %s (KZ3 patch 1033)\n", s_prof_from, s_prof_to,
+-            s_prof_filter ? s_prof_filter : "spurs-kern|pm-worker");
++    fprintf(stderr, "[prof] on: %.0f..%.0f s, threads matching %s%s, %d unwind functions (KZ3 patches 1033, 1115)\n",
++            s_prof_from, s_prof_to, s_prof_filter ? s_prof_filter : "spurs-kern|pm-worker", s_prof_all ? " + all others" : "", s_nunw);
+     CreateThread(NULL, 1u << 18, prof_thread, NULL, 0, NULL);
+ }
+ 

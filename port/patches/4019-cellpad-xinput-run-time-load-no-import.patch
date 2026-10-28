@@ -1,0 +1,61 @@
+KZ3 patch 4019: cellPad loads XInput at run time instead of importing it, and the runtime no longer links xinput.
+MinGW's libxinput is xinput1_3.dll, which only the DirectX June 2010 redistributable installs: on a stock Windows 10
+22H2 (fresh VM, no redistributable) kz3.exe did not start at all, exit 0xC0000135 STATUS_DLL_NOT_FOUND (2026-10-22).
+Stock Windows 10/11 ship XInput1_4.dll and XInput9_1_0.dll. pad_xinput_load() (at cellPadInit when SDL does not serve
+the pads) tries XInput1_4.dll, XInput1_3.dll, XInput9_1_0.dll from System32 only, resolves XInputGetState and
+XInputSetState (the only two calls; 9_1_0 exports both), logs "[pad] XInput from <dll>" or "[pad] no XInput DLL ...",
+and without one every slot reads as unplugged (keyboard on port 0 still works). Guard: tools/net/test_pe_imports.py
+(KZ3 network pass 31, the RE notes s.27). Upstream candidate (general ps3recomp fix).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): shrunk: upstream #494 (our own PR) has the run-time XInput load; 4019 keeps the comments and the lazy load in 4010's pad_init_backend (only when SDL3 is not used).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index d5dd906b..9d680686 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -4,7 +4,8 @@
+  * Reads real gamepad input from the host and translates to PS3 pad format.
+  *
+  * Backend selection:
+- *   - Windows: SDL3 Gamepad when SDL3.dll loads (PS3RECOMP_PAD_SDL3, patch 4010), else XInput
++ *   - Windows: SDL3 Gamepad when SDL3.dll loads (PS3RECOMP_PAD_SDL3, patch 4010), else XInput, loaded at run
++ *     time from System32 (XInput1_4.dll, XInput1_3.dll, XInput9_1_0.dll; patch 4019), else no pad (keyboard only)
+  *   - Everywhere else: SDL3 Gamepad from libSDL3.so.0, loaded at run time
+  */
+ 
+@@ -65,6 +66,10 @@ static double pad_clock(unsigned long long t0_ms)
+   #include <dlfcn.h>
+ #endif
+ #if PAD_BACKEND_XINPUT
++  /* KZ3 patch 4019 (upstream candidate): types only. The exe must not import any XInput DLL: MinGW's libxinput
++   * is xinput1_3, which only the DirectX June 2010 redistributable installs, so on a stock Windows 10/11 the exe
++   * did not start at all (0xC0000135 STATUS_DLL_NOT_FOUND, fresh Windows 10 22H2, 2026-10-22). Stock Windows
++   * ships XInput1_4.dll and XInput9_1_0.dll; pad_xinput_load() picks the first of 1_4, 1_3, 9_1_0. */
+   #include <xinput.h>
+ #endif
+ #include "pad_host.h"
+@@ -765,7 +770,7 @@ static void pad_poll_xinput(void)
+     }
+ }
+ 
+-/* XInput needs no explicit init or shutdown. */
++/* XInput needs no explicit init or shutdown (4019: only the run-time load in pad_init_backend). */
+ 
+ #endif /* PAD_BACKEND_XINPUT */
+ 
+@@ -1109,12 +1114,12 @@ static void pad_sdl_shutdown(void)
+ 
+ static void pad_init_backend(void)
+ {
+-#if PAD_BACKEND_XINPUT
+-    pad_xinput_load();   /* upstream #494: XInput loaded at run time (the fallback when SDL3 is absent) */
+-#endif
+ #if PAD_BACKEND_SDL
+     s_use_sdl = pad_sdl_init();
+ #endif
++#if PAD_BACKEND_XINPUT
++    if (!s_use_sdl) pad_xinput_load();
++#endif
+ }
+ 
+ static void pad_shutdown_backend(void)

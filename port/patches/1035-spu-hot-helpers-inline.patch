@@ -1,0 +1,116 @@
+Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream edf994c0 (one LS diag gate per direction) replaces 1035's WWS range test; `SPU_HOT` kept on the accessors.
+
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 2db41f21..6665c059 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -620,6 +620,19 @@ static SPU_NOINLINE_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t
+     }
+ }
+ 
++/* KZ3 patch 1035: the hot LS accessors and SPU helpers are forced inline. Plain `static inline` was not
++ * enough: in the large lifted functions GCC's growth limits left out-of-line copies (SPU pass 21 profile:
++ * spu_ls_read128 1.2 %, spu_shufb 5.3 % of the level's SPURS thread samples). Since v0.18.0 the LS
++ * accessors' diagnostics sit behind one gate per direction upstream (edf994c0), which covers 1035's
++ * old WWS-probe range test. */
++#if defined(__GNUC__) || defined(__clang__)
++#  define SPU_HOT static inline __attribute__((always_inline))
++#elif defined(_MSC_VER)
++#  define SPU_HOT static __forceinline
++#else
++#  define SPU_HOT static inline
++#endif
++
+ /* The read diagnostics, then g_spu_ls_rdiag recomputed: it drops to 0 once
+  * none is armed (the first call also settles g_spu_ls_watch_n). */
+ static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t lsa)
+@@ -631,7 +644,7 @@ static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t
+     g_spu_ls_rdiag = g_spu_ls_probe || spu_ls_wws_probe_on() || g_spu_ls_watch_n != 0;
+ }
+ 
+-static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
++SPU_HOT u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+ {
+     u128 v;
+     if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
+@@ -731,7 +744,7 @@ static SPU_NOINLINE_COLD void spu_ls_write_diag(spu_context* ctx, uint32_t lsa,
+     g_spu_ls_wdiag = spu_ls_wws_probe_on() || g_spu_smc_watch || g_spu_ls_watch_n != 0;
+ }
+ 
+-static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
++SPU_HOT void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+ {
+     lsa &= SPU_LS_MASK & ~0xFu;
+     uint8_t* p = &ctx->ls[lsa];
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 0fca7f55..42880c1d 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -119,7 +119,7 @@ static inline u128 spu_mpya(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i+
+ static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
+ /* FI decodes the base and step fields produced by the hardware estimate
+  * instructions; its second operand is not an ordinary reciprocal float. */
+-static inline u128 spu_fi(u128 a, u128 b) {
++SPU_HOT u128 spu_fi(u128 a, u128 b) {
+     u128 r;
+     for (int i = 0; i < 4; i++) {
+         uint32_t rb = b._u32[i];
+@@ -128,9 +128,15 @@ static inline u128 spu_fi(u128 a, u128 b) {
+         uint32_t base_bits = rb & 0xFFFFFC00u;
+         float base; memcpy(&base, &base_bits, sizeof base);
+         uint32_t step_frac = rb & 0x3FFu;
+-        float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
++        /* KZ3 patch 1035: was ldexpf((float)step_frac, exp - 140) and ldexpf(ra & 0x7FFFF, -19), two
++         * libm calls per lane. step_frac (10 bits) times 2^(exp-140) is exact in double (exponent built
++         * from bits, exp 0..255 stays normal), so the one rounding to float is ldexpf's; the y scale is
++         * exact in float (19-bit integer times 2^-19). */
++        uint64_t sc_bits = (uint64_t)(1023 + (int)exp - 140) << 52;
++        double sc; memcpy(&sc, &sc_bits, sizeof sc);
++        float step = (float)((double)step_frac * sc);
+         if (base < 0.0f) step = -step;
+-        float y = ldexpf((float)(ra & 0x7FFFFu), -19);
++        float y = (float)(ra & 0x7FFFFu) * 0x1p-19f;
+         r._f32[i] = base - step * y;
+     }
+     return r;
+@@ -185,7 +191,7 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
+ /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
+  * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
+  * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+-static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
++SPU_HOT u128 spu_shufb(u128 a, u128 b, u128 c) {   /* patch 1035: forced inline */
+     const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+     A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
+@@ -288,9 +294,28 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-
+ static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
+ static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
+-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
+-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
+-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
++/* KZ3 patch 1035: fused multiply-add without the libm call. Without -mfma, fmaf is MinGW's software
++ * routine (with frexp/ldexp inside; ~3 % of the level's SPURS samples in SPU pass 21). The product of two
++ * floats is exact in double, so s = a*b + c has one double rounding; rounding s to float then equals the
++ * correctly rounded fused result unless s sits exactly on a float rounding midpoint (low 29 bits
++ * 0x10000000) or outside the normal float range (zero, subnormal, overflow, inf, NaN): those rare cases
++ * still call fmaf, so the result is bit-identical to the old fmaf path.
++ * ASSUMPTION: the host rounding mode is round-to-nearest without DAZ (nothing in the runtime changes MXCSR). */
++SPU_HOT float spu__fmaf(float a, float b, float c) {
++#if defined(__FMA__)
++    return __builtin_fmaf(a, b, c);
++#else
++    const double s = (double)a * (double)b + (double)c;
++    uint64_t u; memcpy(&u, &s, sizeof u);
++    const uint32_t e = (uint32_t)(u >> 52) & 0x7FFu;
++    if (__builtin_expect((u & 0x1FFFFFFFull) != 0x10000000ull && e - (1023u - 126u) < 254u, 1))
++        return (float)s;
++    return fmaf(a, b, c);
++#endif
++}
++SPU_HOT u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=spu__fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
++SPU_HOT u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=spu__fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
++SPU_HOT u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=spu__fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
+ static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
+ static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
+ 

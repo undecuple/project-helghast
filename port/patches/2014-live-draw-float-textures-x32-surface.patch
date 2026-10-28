@@ -1,0 +1,345 @@
+live-draw: FP16 textures keep their format, F_X32 colour surfaces render to R32_FLOAT.
+
+Symptom (Killzone 3 first level, RPCS3 capture of pass 11): Y16_X16_FLOAT (0x9F) textures, 172 binds per frame,
+were not decoded at all (the unit read SRV_WHITE); W16Z16Y16X16_FLOAT textures were decoded to RGBA8, clamped to
+[0,1] with negatives forced to 0, which loses the HDR range of the FP16 buffers the composite reads; the one
+F_X32 colour surface was rendered into RGBA8, clamping and quantising the float it stores.
+
+Fix:
+- decode_guest_texture_float: both FP16 formats (2D and cube, swizzled or pitch-linear, mips as the RGBA8 path)
+  upload as R16G16B16A16_FLOAT / R16G16_FLOAT; each big-endian half is byte-swapped, the first half in memory is
+  component R (X), then G (Y), B (Z), A (W). The 3D path keeps the old RGBA8 decode.
+- write_texture_srv: the RSX remap becomes the SRV Shader4ComponentMapping (ld_float_tex_mapping), so texels stay
+  bit-exact. Source channel (A,R,G,B) -> component: W16Z16Y16X16 W,X,Y,Z; Y16_X16 Y,X,Y,X (ASSUMPTION: the RSX's
+  two-channel fill; KZ3 uses remap 0x29E4 = (X, Y, 0, 1), which never selects B or A from the source).
+- ld_color_dxgi: F_X32 (0xD) surfaces are R32_FLOAT; render state carries rt_x32 into the PSO RTV format and key.
+- rsx_live_draw_debug_read_surface: raw texel readback of a host surface, for host tests.
+
+Verified with tools/smoke/test_tex_float.c (host test under Proton): 4x4 FP16 textures with values up to 1920.0
+and negatives, three remaps, FP16 and F_X32 surfaces, all texels compared bit-exactly.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index a298e1e3..846e4037 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -64,6 +64,8 @@ int  rsx_live_draw_a010_probe_active(void) { return 0; }
+ int  rsx_live_draw_a010_world_ready(void) { return 1; }
+ int  rsx_live_draw_debug_dump_surface(u32 l, u32 o, const char* p)
+ { (void)l; (void)o; (void)p; return -1; }
++int  rsx_live_draw_debug_read_surface(u32 l, u32 o, void* p, u32 n, u32* w, u32* h)
++{ (void)l; (void)o; (void)p; (void)n; (void)w; (void)h; return -1; }
+ void rsx_live_draw_set_a010_camera_matrix(const float* m) { (void)m; }
+ void rsx_live_draw_shutdown(void) {}
+ 
+@@ -203,6 +205,7 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ #define TEX_FMT_LINEAR     0x20
+ #define TEX_FMT_UNNORM     0x40
+ #define TEX_FMT_BASE_MASK  0x9F
++#define LD_SURFACE_FMT_F_X32 0xD   /* patch 2014: CELL_GCM_SURFACE_F_X32 */
+ 
+ typedef struct {
+     u32 location, offset;
+@@ -1408,6 +1411,7 @@ typedef struct {
+     /* TM: this title renders HDR into FP16 (SURFACE_FORMAT 0xB) targets;
+      * the RTV format is PSO state, so it belongs in the key. */
+     u32 rt_fp16;
++    u32 rt_x32;              /* patch 2014: F_X32 colour surface (R32_FLOAT) */
+     /* Colour targets the draw writes (SURFACE_COLOR_TARGET: A, AB, ABC,
+      * ABCD). GH3's venue pass writes A and B; the post pass then samples B.
+      * With only A bound, B stayed empty and that pass painted the scene
+@@ -1449,6 +1453,7 @@ static void decode_render_state(render_state_t* rs)
+     rsx_dsp_get_surface(&g.rsx, &alpha_surface);
+     rs->alpha_ref_format = alpha_surface.color_format;
+     rs->rt_fp16 = alpha_surface.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
++    rs->rt_x32 = alpha_surface.color_format == LD_SURFACE_FMT_F_X32;
+     rs->rt_count = ld_rt_count(alpha_surface.color_target);
+     rs->blend_enable = rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1;
+     const u32 sf = rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR);
+@@ -2490,6 +2495,7 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
+     case TEX_FMT_R5G6B5:
+     case TEX_FMT_G8B8: texel_size = 2; break;
+     case RSX_TEX_FMT_W16Z16Y16X16_FLOAT: texel_size = 8; break;
++    case RSX_TEX_FMT_Y16X16_FLOAT:   /* patch 2014 */
+     case TEX_FMT_A8R8G8B8:
+     case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
+     default: return 0;
+@@ -2710,6 +2716,99 @@ static ID3D12Resource* decode_guest_texture_3d(const rsx_dsp_texture* t, u32 rem
+     return tex;
+ }
+ 
++/* Patch 2014: FP16 textures keep their format. W16Z16Y16X16_FLOAT was decoded
++ * to RGBA8 (clamped to [0,1], negatives to 0), which threw away the HDR range
++ * of the FP16 buffers Killzone 3's composite reads; Y16_X16_FLOAT (0x9F, 172
++ * binds in the first level's frame, pass 11 capture) was not decoded at all
++ * and read SRV_WHITE. Both now upload as R16G16B16A16_FLOAT / R16G16_FLOAT:
++ * each big-endian half is byte-swapped in place, the first half in memory is
++ * D3D component R (X), then G (Y), B (Z), A (W). The RSX remap is not applied
++ * here; write_texture_srv turns it into the SRV component mapping
++ * (ld_float_tex_mapping), so the texels stay bit-exact. 2D and cube, swizzled
++ * or linear, with mips as for the RGBA8 path. */
++static int ld_is_float_tex(u32 base_fmt)
++{
++    return base_fmt == RSX_TEX_FMT_W16Z16Y16X16_FLOAT ||
++           base_fmt == RSX_TEX_FMT_Y16X16_FLOAT;
++}
++static ID3D12Resource* decode_guest_texture_float(const rsx_dsp_texture* t, u32 base_fmt,
++                                                  int linear, u32 n_mips)
++{
++    const u32 w = t->width, h = t->height;
++    const u32 texel = base_fmt == RSX_TEX_FMT_W16Z16Y16X16_FLOAT ? 8u : 4u;
++    const DXGI_FORMAT dxgi = texel == 8u ? DXGI_FORMAT_R16G16B16A16_FLOAT
++                                         : DXGI_FORMAT_R16G16_FLOAT;
++    if (!linear && ((w & (w - 1)) || (h & (h - 1)))) return NULL;
++    const u32 span = texture_source_span(t);
++    const u8* src = span ? guest_ptr(t->location, t->offset, span) : NULL;
++    if (!src) return NULL;
++    u32 available = 1;
++    for (u32 mw = w, mh = h; mw > 1 || mh > 1; available++) {
++        mw = mw > 1 ? mw >> 1 : 1;
++        mh = mh > 1 ? mh >> 1 : 1;
++    }
++    if (n_mips > available) n_mips = available;
++    const u32 faces = t->cubemap ? 6u : 1u;
++    const u32 face_span = span / faces;
++    u8* buf[6 * 14] = {0};
++    tex_level_t lv[6 * 14];
++    u32 n = 0;
++    int oom = 0;
++    for (u32 face = 0; face < faces && !oom; face++) {
++        u32 mw = w, mh = h, off = 0;
++        for (u32 m = 0; m < n_mips; m++) {
++            const u32 pitch = (m == 0 && linear && t->pitch) ? t->pitch : mw * texel;
++            buf[n] = (u8*)malloc((size_t)mw * mh * texel);
++            if (!buf[n]) { oom = 1; break; }
++            const u32 lw = log2_u32(mw), lh = log2_u32(mh);
++            const u8* level_src = src + (size_t)face * face_span + off;
++            for (u32 y = 0; y < mh; y++)
++                for (u32 x = 0; x < mw; x++) {
++                    const u8* px = linear
++                        ? level_src + (size_t)y * pitch + (size_t)x * texel
++                        : level_src + (size_t)morton_index(x, y, lw, lh) * texel;
++                    u8* d = buf[n] + ((size_t)y * mw + x) * texel;
++                    for (u32 k = 0; k < texel; k += 2) { d[k] = px[k + 1]; d[k + 1] = px[k]; }
++                }
++            lv[n].w = mw; lv[n].h = mh; lv[n].data = buf[n];
++            lv[n].row_bytes = mw * texel; lv[n].rows = mh;
++            n++;
++            off += pitch * mh;
++            mw = mw > 1 ? mw >> 1 : 1;
++            mh = mh > 1 ? mh >> 1 : 1;
++        }
++    }
++    ID3D12Resource* res = NULL;
++    if (!oom)
++        res = faces == 6 ? create_texture_cube(dxgi, lv, n_mips)
++                         : create_texture_mipped(dxgi, lv, n);
++    for (u32 i = 0; i < n; i++) free(buf[i]);
++    return res;
++}
++
++/* Patch 2014: SRV component mapping for the float formats from the RSX remap
++ * (ARGB order: comp 0 = A, 1 = R, 2 = G, 3 = B; op 0 = zero, 1 = one,
++ * 2 = source). Source channel sel (A,R,G,B) -> D3D component:
++ * W16Z16Y16X16 A=W(3) R=X(0) G=Y(1) B=Z(2); Y16_X16 has two halves and reads
++ * A=Y G=Y, R=X B=X (ASSUMPTION: the RSX's two-channel fill, as RPCS3 maps
++ * Y16_X16[_FLOAT]; KZ3's binds use remap 0x29E4 = (X, Y, 0, 1) and never
++ * select B or A from the source). */
++static u32 ld_float_tex_mapping(u32 base_fmt, u32 remap)
++{
++    static const u32 sel_rgba[4] = { 3, 0, 1, 2 };
++    static const u32 sel_rg[4]   = { 1, 0, 1, 0 };
++    static const u32 out2comp[4] = { 1, 2, 3, 0 };
++    const u32* sel2d3d = base_fmt == RSX_TEX_FMT_Y16X16_FLOAT ? sel_rg : sel_rgba;
++    u32 mapping = 1u << 12;
++    for (u32 out = 0; out < 4; out++) {
++        const u32 comp = out2comp[out];
++        const u32 op = (remap >> (8 + comp * 2)) & 3;
++        const u32 sel = (remap >> (comp * 2)) & 3;
++        mapping |= (op == 0 ? 4u : op == 1 ? 5u : sel2d3d[sel]) << (out * 3);
++    }
++    return mapping;
++}
++
+ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+ {
+     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+@@ -2789,6 +2888,9 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+         return create_texture_mipped(dxgi, levels, n);
+     }
+ 
++    if (ld_is_float_tex(base_fmt))   /* patch 2014 */
++        return decode_guest_texture_float(t, base_fmt, linear, n_mips);
++
+     u32 texel_size;
+     switch (base_fmt) {
+     case TEX_FMT_B8: texel_size = 1; break;
+@@ -2798,7 +2900,6 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+     case TEX_FMT_G8B8: texel_size = 2; break;
+     case TEX_FMT_A8R8G8B8:
+     case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
+-    case RSX_TEX_FMT_W16Z16Y16X16_FLOAT: texel_size = 8; break;
+     default: return NULL;
+     }
+     if (!linear && ((w & (w - 1)) || (h & (h - 1)))) return NULL;
+@@ -2990,6 +3091,21 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
+         desc.Texture3D.MipLevels = 1;
+         g.dev->lpVtbl->CreateShaderResourceView(
+             g.dev, entry->tex, &desc, srv_cpu(SRV_TEXTURE_BASE + index));
++    } else if (ld_is_float_tex(base_fmt)) {
++        /* Patch 2014: native FP16 resource, remap as component mapping. */
++        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
++        desc.Format = base_fmt == RSX_TEX_FMT_Y16X16_FLOAT ? DXGI_FORMAT_R16G16_FLOAT
++                                                           : DXGI_FORMAT_R16G16B16A16_FLOAT;
++        desc.Shader4ComponentMapping = ld_float_tex_mapping(base_fmt, entry->remap);
++        if (entry->cubemap) {
++            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
++            desc.TextureCube.MipLevels = (UINT)-1;
++        } else {
++            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++            desc.Texture2D.MipLevels = (UINT)-1;
++        }
++        g.dev->lpVtbl->CreateShaderResourceView(
++            g.dev, entry->tex, &desc, srv_cpu(SRV_TEXTURE_BASE + index));
+     } else if (entry->cubemap) {
+         static const u32 sel2d3d[4] = { 3, 0, 1, 2 };
+         static const u32 out2comp[4] = { 1, 2, 3, 0 };
+@@ -3459,6 +3575,16 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
+ /* fp constants are stored as raw bits; the shader reads them as floats. */
+ static float ld_c2f(u32 bits) { float f; memcpy(&f, &bits, sizeof f); return f; }
+ 
++/* Host format of an RSX colour surface. Patch 2014: F_X32 (one 320x180 draw
++ * in KZ3's first level) was rendered into RGBA8, which clamps and quantises the
++ * float it stores; it is R32_FLOAT now. Every other non-FP16 format stays RGBA8. */
++static DXGI_FORMAT ld_color_dxgi(u32 color_format)
++{
++    return color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16 ? DXGI_FORMAT_R16G16B16A16_FLOAT
++         : color_format == LD_SURFACE_FMT_F_X32         ? DXGI_FORMAT_R32_FLOAT
++                                                          : DXGI_FORMAT_R8G8B8A8_UNORM;
++}
++
+ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+                        DXGI_FORMAT want_fmt)
+ {
+@@ -4241,9 +4367,7 @@ static u32 current_surface(void)
+     rsx_dsp_get_surface(&g.rsx, &sf);
+     const u32 slot = surface_get(sf.color_location[0], sf.color_offset[0],
+                                  sf.clip_w, sf.clip_h,
+-                                 sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+-                                     ? DXGI_FORMAT_R16G16B16A16_FLOAT
+-                                     : DXGI_FORMAT_R8G8B8A8_UNORM);
++                                 ld_color_dxgi(sf.color_format));
+     if (slot != LD_INVALID_SURFACE) g.surfaces[slot].pitch = sf.color_pitch[0];
+     return slot;
+ }
+@@ -4775,6 +4899,7 @@ static u64 ld_hash_structural_render_state(
+     LD_HASH_RENDER_FIELD(front_face);
+     LD_HASH_RENDER_FIELD(color_mask);
+     LD_HASH_RENDER_FIELD(rt_fp16);
++    LD_HASH_RENDER_FIELD(rt_x32);
+     LD_HASH_RENDER_FIELD(rt_count);
+     LD_HASH_RENDER_FIELD(stencil_enable);
+     LD_HASH_RENDER_FIELD(stencil_two_sided);
+@@ -5207,6 +5332,7 @@ static ID3D12PipelineState* build_pso(
+     pd.NumRenderTargets = rs->rt_count ? rs->rt_count : 1;
+     for (u32 r = 0; r < pd.NumRenderTargets; r++)
+         pd.RTVFormats[r] = rs->rt_fp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT
++                         : rs->rt_x32  ? DXGI_FORMAT_R32_FLOAT
+                                        : DXGI_FORMAT_R8G8B8A8_UNORM;
+     pd.SampleDesc.Count = 1;
+     ID3D12PipelineState* pso = NULL;
+@@ -8080,9 +8206,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         for (u32 r = 1; r < want; r++) {
+             const u32 s = surface_get(msf.color_location[r], msf.color_offset[r],
+                                       msf.clip_w, msf.clip_h,
+-                                      msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+-                                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
+-                                          : DXGI_FORMAT_R8G8B8A8_UNORM);
++                                      ld_color_dxgi(msf.color_format));
+             if (s == LD_INVALID_SURFACE || s == target) break;
+             mrt[n_mrt++] = s;
+         }
+@@ -9945,6 +10069,68 @@ static void ld_parity_capture_surface(
+ }
+ #endif
+ 
++/* Patch 2014 (test hook): copy the raw texels of the host surface at
++ * (location, offset) into out (rows packed, w * texel bytes each). Returns the
++ * texel size (8 FP16, 4 RGBA8/R32F) or -1. Host tests compare float targets
++ * bit-exactly with it; the title never calls it. */
++int rsx_live_draw_debug_read_surface(u32 location, u32 offset, void* out,
++                                     u32 out_bytes, u32* out_w, u32* out_h)
++{
++    if (!g.ready || !out) return -1;
++    const surface_t* surface = NULL;
++    for (u32 i = 0; i < g.n_surfaces; i++)
++        if (g.surfaces[i].location == location && g.surfaces[i].offset == offset &&
++            g.surfaces[i].tex) { surface = &g.surfaces[i]; break; }
++    if (!surface) return -1;
++    const u32 width = surface->w, height = surface->h;
++    const u32 texel = surface->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++    const u32 pitch = (width * texel + 255) & ~255u;
++    if ((u64)width * height * texel > out_bytes) return -1;
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)pitch * height;
++    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
++    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    ID3D12Resource* rb = NULL;
++    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb)))
++        return -1;
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition.pResource = surface->tex;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
++    src.pResource = surface->tex; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    dst.PlacedFootprint.Footprint.Format = surface->fmt;
++    dst.PlacedFootprint.Footprint.Width = width;
++    dst.PlacedFootprint.Footprint.Height = height;
++    dst.PlacedFootprint.Footprint.Depth = 1;
++    dst.PlacedFootprint.Footprint.RowPitch = pitch;
++    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    ld_flush(LD_FLUSH_READBACK);
++    int ret = -1;
++    u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * height};
++    if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
++        for (u32 y = 0; y < height; y++)
++            memcpy((u8*)out + (size_t)y * width * texel, px + (size_t)y * pitch, (size_t)width * texel);
++        D3D12_RANGE wr = {0, 0};
++        rb->lpVtbl->Unmap(rb, 0, &wr);
++        if (out_w) *out_w = width;
++        if (out_h) *out_h = height;
++        ret = (int)texel;
++    }
++    rb->lpVtbl->Release(rb);
++    return ret;
++}
++
+ int rsx_live_draw_debug_dump_surface(
+     u32 location, u32 offset, const char* path)
+ {
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 6837865d..5f24f8dd 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -152,6 +152,9 @@ int  rsx_live_draw_a010_world_ready(void);
+  * independent replay renderer at the same guest surface boundary. */
+ int  rsx_live_draw_debug_dump_surface(u32 location, u32 offset,
+                                       const char* path);
++/* Patch 2014 (test hook): raw texels of a host surface; returns the texel size or -1. */
++int  rsx_live_draw_debug_read_surface(u32 location, u32 offset, void* out,
++                                      u32 out_bytes, u32* out_w, u32* out_h);
+ 
+ /* Release all D3D12 resources. */
+ void rsx_live_draw_shutdown(void);

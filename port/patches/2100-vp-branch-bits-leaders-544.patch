@@ -1,0 +1,87 @@
+KZ3 patch 2100 (RSX pass 95): VP BRB/CLB branch on the transform branch bits; block leaders up to slot 543.
+Based on sp00nznet/ps3recomp PR #485 by n0madic (head aa026464, MIT). the RE notes "Pass 95".
+1. rsx_vp_decompiler: RSX_VP_MAX_INSTR 512 -> 544 (the transform program memory, RSX_DSP_VP_INSTR), so a leader or
+   branch target past slot 511 opens its block (a long branching program otherwise lost its tail blocks; upstream saw
+   a 543-slot program fail to compile and its draws dropped). BRB/CLB test bit D3[23:27] of
+   SET_TRANSFORM_BRANCH_BITS (0x1FF8) against D3[28] (RPCS3's GetOptionalBranchCond) instead of falling through
+   ("TODO: not modelled"); the outcome is baked into the HLSL (rsx_vp_set_branch_bits), so
+   rsx_vp_uses_branch_bits() programs are keyed on the bits. Keys of programs without BRB/CLB are unchanged.
+2. rsx_live_draw (KZ3 port of the PR's get_pso hunk onto 2071's ld_xlate/ld_pso_key_tail): ld_xl_in.vp_bbits, set
+   from the dispatch register by the walker and 0 by the template prewarm (a template record of a BRB/CLB program
+   then fails the key recompute and the walker builds it); [vp-feat] lines count PSO misses whose VP has flow,
+   BRB/CLB, more than 512 instructions, or failed VP/FP translation (a failure stores a NULL pipeline and drops the
+   program's draws with no other log line).
+3. rsx_draw_engine and libs/video/tests/test_shader_msl.c as in the PR. KZ3 host test: tools/smoke/test_vp_branch_bits.sh.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): shrunk: upstream #544 has the decompiler side (branch bits, 544 slots, tests); 2100 keeps the live-draw port (key hashed only after 2077 saw flow and the VP tests bits, ld_xl_in.vp_branch_bits added in the 2071 rebase replaces vp_bbits) and [vp-feat].
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 4193edc5..6ce0f45c 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8317,12 +8317,14 @@ static u64 ld_pso_key_tail(u64 key, const ld_xl_in* xi, int packed_payload, u64*
+     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
+     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
+     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+-    /* v0.18.0: BRB/CLB outcomes are baked into the program (rsx_vp_set_branch_bits). The template records do not
+-     * store them: the prewarm passes 0, so only records made with 0 bits keep their key. */
+-    if (rsx_vp_uses_branch_bits(xi->vp_uc, xi->vp_instrs * 16))
+-        key = fnv1a(&xi->vp_branch_bits, sizeof(xi->vp_branch_bits), key);
+     /* patch 2077: a branching VP's HLSL depends on the slot it starts at (rsx_vp_set_branch_base in ld_xlate) */
++    const u64 key_pre_vbs = key;
+     key = rsx_vp_key_branch_base(key, xi->vp_uc, xi->vp_instrs * 16u, xi->vp_start);
++    /* patch 2100 (PR #485): BRB/CLB outcomes are baked into the HLSL, so the branch bits are identity only for a
++     * program that tests them; other keys are unchanged. This runs per draw: the BRB/CLB scan is made only for a
++     * program 2077 found flow in (it changed the key), so a branch-free program pays one compare. */
++    if (key != key_pre_vbs && rsx_vp_uses_branch_bits(xi->vp_uc, xi->vp_instrs * 16u))
++        key = fnv1a(&xi->vp_branch_bits, sizeof(xi->vp_branch_bits), key);
+     if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
+     if (srgb_out) key = fnv1a(&srgb_out, sizeof(srgb_out), key);   /* patch 2055 */
+     { static int s2a = -1;   /* patch 2057: the SRC2 abs switch changes shader text, so it changes the key */
+@@ -9699,7 +9701,7 @@ static ID3D12PipelineState* get_pso(
+     xi.vp_uc = vp_uc; xi.vp_instrs = vp_instrs; xi.vp_start = start; xi.layout = masked_layout; xi.vtex_mask = vtex_mask;
+     xi.fp_uc = fp_uc; xi.fp_size = fp_size; xi.fp_ctrl = fp_ctrl; xi.cube_mask = cube_mask; xi.rs = &rs;
+     xi.shadow_mask = shadow_mask; xi.shadow_zfunc = shadow_zfunc; xi.unnorm_mask = unnorm_mask; xi.unnorm_dim = unnorm_dim;
+-    xi.vp_branch_bits = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16) ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;   /* v0.18.0 */
++    xi.vp_branch_bits = rsx_dsp_reg(&g.rsx, 0x1FF8u);   /* patch 2100 (upstream #544 decompiler); hashed only for BRB/CLB programs */
+     xi.gamma_mask = gamma_mask; xi.argb_mask = argb_mask; xi.argb_remap = argb_remap; xi.srgb_out = srgb_out;
+     xi.fp_const_count = g.fp_constants.count; xi.fp_alpha_ref = g.fp_alpha_ref;
+     xi.vgpu = masked_layout && packed_payload == 2;   /* patch 2076 */
+@@ -9779,6 +9781,25 @@ static ID3D12PipelineState* get_pso(
+ #endif
+     int vi, fi;
+     ld_xlate(&xi, vs_hlsl, sizeof(vs_hlsl), ps_hlsl, sizeof(ps_hlsl), &vi, &fi);   /* patch 2071: shared with the prewarm */
++    /* patch 2100: [vp-feat] makes the VP flow cases PR #485 fixes measurable. A failed translation stores a NULL
++     * pipeline under its key, so every draw of that program is dropped without another word; one line per class
++     * (the first 8 of each, then every 256th) with running counts: flow = any BRA..CLB, bool = BRB/CLB (branch-bit
++     * tests), long = over 512 instructions (leaders past slot 511), vfail/ffail = VP/FP translation failed. */
++    { static LONG n_flow, n_bool, n_long, n_vfail, n_ffail;
++      const int fl = rsx_vp_has_flow(vp_uc, vp_instrs * 16u), bo = fl && rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16u);
++      const int lo = vp_instrs > 512u;
++      if (fl) InterlockedIncrement(&n_flow);
++      if (bo) InterlockedIncrement(&n_bool);
++      if (lo) InterlockedIncrement(&n_long);
++      if (vi <= 0) InterlockedIncrement(&n_vfail);
++      if (fi <= 0) InterlockedIncrement(&n_ffail);
++      const LONG k = bo ? n_bool : lo ? n_long : vi <= 0 ? n_vfail : fi <= 0 ? n_ffail : fl ? n_flow : 0;
++      if (k && (k <= 8 || !(k & 255)))
++          fprintf(stderr, "[vp-feat] %s key=%016llx start=%u instrs=%u bits=%08x vi=%d fi=%d | flow=%ld bool=%ld long=%ld"
++                          " vfail=%ld ffail=%ld\n",
++                  bo ? "bool" : lo ? "long" : vi <= 0 ? "vfail" : fi <= 0 ? "ffail" : "flow",
++                  (unsigned long long)key, start, vp_instrs, xi.vp_branch_bits, vi, fi,
++                  (long)n_flow, (long)n_bool, (long)n_long, (long)n_vfail, (long)n_ffail); }
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.decompile_qpc +=
+         (u64)(ld_profile_qpc() - decompile_begin);
+diff --git a/libs/video/rsx_vp_decompiler.h b/libs/video/rsx_vp_decompiler.h
+index 55af9ee3..8793d5d7 100644
+--- a/libs/video/rsx_vp_decompiler.h
++++ b/libs/video/rsx_vp_decompiler.h
+@@ -75,6 +75,7 @@ int rsx_vp_has_flow(const u8* ucode, u32 max_bytes);
+ u64 rsx_vp_key_branch_base(u64 key, const u8* ucode, u32 max_bytes,
+                            u32 start_slot);
+ 
++
+ /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
+  * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).
+  * Unmasked units retain the defined-zero fallback. */

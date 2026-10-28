@@ -1,0 +1,422 @@
+KZ3 patch 2048 (rsx rounds 49-50): asynchronous PSO builds for the live renderer, LD_PSO_ASYNC (default on since
+pass 50; LD_PSO_ASYNC=0 = the synchronous builds).
+On a walker PSO miss the walker decompiles and looks the VS/PS blobs up (memory, then the disk cache) as before, then
+queues the HLSL, render state and layout to worker threads (LD_PSO_ASYNC_THREADS, default 3) that compile the missing
+blobs (D3DCompile) and create the PSO (through patch 2031's pipeline library). Until the build is back the key's PSO
+entry is pending (pso NULL) and its draws are skipped (drop{pso}), as RPCS3's asynchronous shader mode does; the
+walker merges finished builds at its next PSO lookup (blobs into the memory and disk caches, the key into
+pso_keys.bin, the PSO into its entry). Pass 50: one in-flight compile per shader blob (the walker registers each
+missing blob in a table keyed by type, hash, length and source; the first job compiles it, later jobs wait for it).
+The bookkeeping is platform-neutral in libs/video/rsx_pso_async.h (host test tools/smoke/test_pso_async.c).
+Aim: the cold-cache level-start stall (K4: 245 misses = 16.4 s of walker time, RSX pass 48).
+Statistics: [pso-async] every 256 frames once builds ran.
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -125,6 +125,7 @@
+ #include <d3dcompiler.h>
+ #include "rsx_vertex_formats.h"
+ #include "rsx_keycaps.h"   /* patch 2039: keycap prompts */
++#include "rsx_pso_async.h"   /* patch 2048: asynchronous PSO build bookkeeping */
+ #include <sys/stat.h>
+ 
+ #pragma comment(lib, "d3d12.lib")
+@@ -310,7 +311,7 @@
+     u32 quiet, written, skip_frame;   /* patch 2033, as texcache_t */
+     u32 dyn;   /* patch 2046, as texcache_t (content change seen) */
+ } vtexcache_t;
+-typedef struct { u64 key; ID3D12PipelineState* pso; u8 preloaded; } psocache_t;   /* patch 2031: preloaded until first use */
++typedef struct { u64 key; ID3D12PipelineState* pso; u8 preloaded; u8 pending; } psocache_t;   /* patch 2031: preloaded until first use; patch 2048: pending = an asynchronous build in flight */
+ typedef struct {
+     u64 hash;
+     u32 source_length;
+@@ -2810,6 +2811,7 @@
+ static u32 g_ld_td_prev[2][LD_TD_WORDS];        /* pages written during the previous frame (walker) */
+ static u32 g_ld_pg_stamp[2][LD_TD_WORDS * 32u];  /* patch 2047: per 64 KB page, 1 + the last frame a tracked write hit it */
+ static void ld_vc_stat_print(void);              /* patch 2047 */
++static void ld_apso_stat_print(void);            /* patch 2048 */
+ static int g_ld_tex_hash_span = -1;
+ static struct { u64 hashes, skipped, changes, tracked, untracked, hashed_bytes, flip_flags, dyn_forced, wr_unchanged; } g_ld_th;
+ 
+@@ -2935,6 +2937,7 @@
+         }
+     }
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) ld_vc_stat_print();   /* patch 2047 */
++    if ((g_ld_frames % 256u) == 255u) ld_apso_stat_print();   /* patch 2048 (prints only once builds ran) */
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) {
+         fprintf(stderr, "[tex-hash] span=%d big=%u frame=%u hashes=%llu skipped=%llu bytes=%.1fMB changes=%llu tracked=%llu"
+                         " untracked=%llu flip-flags=%llu wr-unchanged=%llu dyn-forced=%llu inplace=%llu b8-direct=%llu"
+@@ -6669,6 +6672,238 @@
+     return SUCCEEDED(hr) ? pso : NULL;
+ }
+ 
++
++/* ===================== KZ3 patch 2048: asynchronous PSO builds (LD_PSO_ASYNC, default on since pass 50; 0 = synchronous) =====================
++ * A walker PSO miss normally decompiles, compiles the VS/PS (D3DCompile) and creates the PSO on the walker thread:
++ * at a cold level start (K4 frozen_shores, empty shader cache, RSX pass 48) 245 misses took 16.4 s of walker time
++ * and the game's Gfx jobs stalled ~6 s on the RSX label. With LD_PSO_ASYNC=1 the walker still decompiles and looks
++ * the blobs up (memory, then the disk cache), then hands the HLSL, render state and layout to worker threads
++ * (LD_PSO_ASYNC_THREADS, default 3) that compile the missing blobs and create the PSO (through the 2031 pipeline
++ * library). Until the PSO is back the key's entry is pending (pso NULL): its draws are skipped (counted as
++ * drop{pso}), as RPCS3's asynchronous shader mode does; a visible pop-in of a frame or a few. The walker merges
++ * finished builds at its next PSO lookup: blobs into the memory and disk caches, the key into pso_keys.bin, the PSO
++ * into its entry. Statistics: [pso-async] every 256 frames while builds ran. */
++typedef struct ld_apso_job {
++    struct ld_apso_job* next;
++    u64 key, vs_hash, ps_hash;
++    u32 vs_len, ps_len;
++    char* vs_src; char* ps_src;           /* NUL-terminated copies of the final HLSL */
++    ID3DBlob* vs; ID3DBlob* ps;           /* in: found by the walker (or NULL); out: compiled */
++    u8 vs_new, ps_new, masked, packed, depth;
++    rsx_apso_blob *vs_e, *ps_e;           /* in-flight compile entries this job owns (vs_own/ps_own) or waits for */
++    u8 vs_own, ps_own;
++    render_state_t rs;
++    rsx_vertex_layout_plan layout;
++    ID3D12PipelineState* pso;
++    unsigned compile_us, create_us;
++    LONGLONG t_submit;
++} ld_apso_job;
++static struct {
++    int on, started, n_threads;
++    CRITICAL_SECTION cs;
++    CONDITION_VARIABLE cv;                /* published in-flight compiles (rsx_pso_async.h) */
++    rsx_apso_blobtab tab;                 /* walker-owned in-flight compile table */
++    u64 waits;                            /* dependent workers that had to wait for the owner's compile */
++    HANDLE sem;
++    ld_apso_job *q_head, *q_tail, *done;
++    volatile LONG done_flag, in_flight;
++    u64 submitted, finished, failed, skipped_draws, compile_us, create_us, latency_us, max_latency_us, merged;
++    u32 max_in_flight;
++} g_apso;
++
++static int ld_apso_on(void)
++{
++    static int on = -1;
++    /* Default on since RSX pass 50 (K4 cold start: level-start stall gone, fps_window A-faster 3/3); LD_PSO_ASYNC=0
++     * restores the synchronous builds. */
++    if (on < 0) { const char* e = getenv("LD_PSO_ASYNC"); on = (e && *e) ? (atoi(e) != 0) : 1;
++                  fprintf(stderr, "[pso-async] %s (LD_PSO_ASYNC=%s)\n", on ? "on" : "off", e && *e ? e : "<unset>, default on"); }
++    return on;
++}
++
++/* Worker: compile one blob; when the job owns an in-flight entry, publish the result to it (the table keeps a
++ * reference of its own). 1 = compiled. */
++static int ld_apso_compile(const char* src, u32 len, const char* target, rsx_apso_blob* e, ID3DBlob** out)
++{
++    ID3DBlob* err = NULL;
++    *out = NULL;
++    if (FAILED(D3DCompile(src, len, target[0] == 'v' ? "xvs" : "xps", NULL, NULL, "main", target, 0, 0, out, &err)))
++        *out = NULL;
++    if (err) err->lpVtbl->Release(err);
++    if (e) {
++        if (*out) (*out)->lpVtbl->AddRef(*out);
++        EnterCriticalSection(&g_apso.cs);
++        rsx_apso_blob_publish(e, *out);
++        LeaveCriticalSection(&g_apso.cs);
++        WakeAllConditionVariable(&g_apso.cv);
++    }
++    return *out != NULL;
++}
++
++/* Worker: wait until the owner job published the entry, then take a reference to its blob (NULL = it failed). */
++static ID3DBlob* ld_apso_wait(rsx_apso_blob* e)
++{
++    EnterCriticalSection(&g_apso.cs);
++    if (!e->done) g_apso.waits++;
++    while (!e->done) SleepConditionVariableCS(&g_apso.cv, &g_apso.cs, INFINITE);
++    ID3DBlob* b = (ID3DBlob*)e->blob;
++    if (b) b->lpVtbl->AddRef(b);
++    LeaveCriticalSection(&g_apso.cs);
++    return b;
++}
++
++static DWORD WINAPI ld_apso_worker(LPVOID arg)
++{
++    (void)arg;
++    for (;;) {
++        WaitForSingleObject(g_apso.sem, INFINITE);
++        EnterCriticalSection(&g_apso.cs);
++        ld_apso_job* j = g_apso.q_head;
++        if (j) { g_apso.q_head = j->next; if (!g_apso.q_head) g_apso.q_tail = NULL; }
++        LeaveCriticalSection(&g_apso.cs);
++        if (!j) continue;
++        LARGE_INTEGER q0, q1, q2, f; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q0);
++        /* Owned blobs first (always compiled and published, even when the other stage failed: dependents wait on
++         * them), then the ones another job compiles (RSX pass 50: one in-flight compile per blob). */
++        if (!j->vs && (j->vs_own || !j->vs_e)) j->vs_new = (u8)ld_apso_compile(j->vs_src, j->vs_len, "vs_5_0", j->vs_e, &j->vs);
++        if (!j->ps && (j->ps_own || !j->ps_e)) j->ps_new = (u8)ld_apso_compile(j->ps_src, j->ps_len, "ps_5_0", j->ps_e, &j->ps);
++        if (!j->vs && j->vs_e && !j->vs_own) j->vs = ld_apso_wait(j->vs_e);
++        if (!j->ps && j->ps_e && !j->ps_own) j->ps = ld_apso_wait(j->ps_e);
++        QueryPerformanceCounter(&q1);
++        if (j->vs && j->ps) {
++            D3D12_INPUT_ELEMENT_DESC il[16];
++            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
++            ld_pso_desc_fill(&pd, il, j->vs, j->ps, &j->rs, j->masked ? j->layout.count : RSX_DSP_NUM_VERTEX_ATTR,
++                             j->masked ? j->layout.attrs : NULL, j->masked, j->packed, j->depth);
++            int lib_hit = 0;
++            if (FAILED(ld_pl_create(&pd, &j->rs, j->key, &j->pso, &lib_hit))) j->pso = NULL;
++        }
++        QueryPerformanceCounter(&q2);
++        j->compile_us = (unsigned)((q1.QuadPart - q0.QuadPart) * 1000000 / f.QuadPart);
++        j->create_us = (unsigned)((q2.QuadPart - q1.QuadPart) * 1000000 / f.QuadPart);
++        EnterCriticalSection(&g_apso.cs);
++        j->next = g_apso.done; g_apso.done = j;
++        LeaveCriticalSection(&g_apso.cs);
++        InterlockedExchange(&g_apso.done_flag, 1);
++    }
++    return 0;
++}
++
++/* Walker: queue the build of `key`. 0 = not queued (the caller builds synchronously). */
++static int ld_apso_submit(const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
++                          const rsx_vertex_layout_plan* masked_layout, int packed, u64 key)
++{
++    if (!g_apso.started) {
++        g_apso.started = 1;
++        InitializeCriticalSection(&g_apso.cs);
++        InitializeConditionVariable(&g_apso.cv);
++        g_apso.sem = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
++        const char* e = getenv("LD_PSO_ASYNC_THREADS");
++        int nt = e ? atoi(e) : 3; if (nt < 1) nt = 1; if (nt > 8) nt = 8;
++        for (int i = 0; i < nt && g_apso.sem; i++) {
++            HANDLE h = CreateThread(NULL, 0, ld_apso_worker, NULL, 0, NULL);
++            if (h) { CloseHandle(h); g_apso.n_threads++; }
++        }
++        fprintf(stderr, "[pso-async] %d worker threads\n", g_apso.n_threads);
++    }
++    if (!g_apso.n_threads) return 0;
++    ld_apso_job* j = (ld_apso_job*)calloc(1, sizeof *j);
++    if (!j) return 0;
++    j->vs_len = (u32)strlen(vs_hlsl); j->ps_len = (u32)strlen(ps_hlsl);
++    j->vs_src = (char*)malloc((size_t)j->vs_len + 1u); j->ps_src = (char*)malloc((size_t)j->ps_len + 1u);
++    if (!j->vs_src || !j->ps_src) { free(j->vs_src); free(j->ps_src); free(j); return 0; }
++    memcpy(j->vs_src, vs_hlsl, (size_t)j->vs_len + 1u); memcpy(j->ps_src, ps_hlsl, (size_t)j->ps_len + 1u);
++    j->vs_hash = fnv1a(vs_hlsl, j->vs_len, 1469598103934665603ull);
++    j->ps_hash = fnv1a(ps_hlsl, j->ps_len, 1469598103934665603ull);
++    int pb = 0, seen = 0;
++    j->vs = shader_blob_cache_find(&g.vs_blobs, vs_hlsl, j->vs_len, j->vs_hash, &pb, &seen);
++    if (!j->vs && (j->vs = ld_pstat_disk_load('V', vs_hlsl, j->vs_len, j->vs_hash)) != NULL)
++        shader_blob_cache_insert_accounted(&g.vs_blobs, vs_hlsl, j->vs_len, j->vs_hash, j->vs, 'V', seen);
++    seen = 0;
++    j->ps = shader_blob_cache_find(&g.ps_blobs, ps_hlsl, j->ps_len, j->ps_hash, &pb, &seen);
++    if (!j->ps && (j->ps = ld_pstat_disk_load('P', ps_hlsl, j->ps_len, j->ps_hash)) != NULL)
++        shader_blob_cache_insert_accounted(&g.ps_blobs, ps_hlsl, j->ps_len, j->ps_hash, j->ps, 'P', seen);
++    /* Blobs not in the caches: one in-flight compile each (RSX pass 50). Only the walker touches the table. */
++    if (!j->vs) { int own = 0; j->vs_e = rsx_apso_blob_acquire(&g_apso.tab, 'V', j->vs_src, j->vs_len, j->vs_hash, &own); j->vs_own = (u8)own; }
++    if (!j->ps) { int own = 0; j->ps_e = rsx_apso_blob_acquire(&g_apso.tab, 'P', j->ps_src, j->ps_len, j->ps_hash, &own); j->ps_own = (u8)own; }
++    j->key = key; j->rs = *rs;
++    j->masked = masked_layout != NULL; j->packed = (u8)(packed != 0); j->depth = g.depth != NULL;
++    if (masked_layout) j->layout = *masked_layout;
++    { LARGE_INTEGER q; QueryPerformanceCounter(&q); j->t_submit = q.QuadPart; }
++    EnterCriticalSection(&g_apso.cs);
++    if (g_apso.q_tail) g_apso.q_tail->next = j; else g_apso.q_head = j;
++    g_apso.q_tail = j;
++    LeaveCriticalSection(&g_apso.cs);
++    const LONG inf = InterlockedIncrement(&g_apso.in_flight);
++    if ((u32)inf > g_apso.max_in_flight) g_apso.max_in_flight = (u32)inf;
++    g_apso.submitted++;
++    ReleaseSemaphore(g_apso.sem, 1, NULL);
++    return 1;
++}
++
++/* Walker: merge the finished builds into the caches and their pending entries. */
++static void ld_apso_drain(void)
++{
++    if (!g_apso.done_flag) return;
++    EnterCriticalSection(&g_apso.cs);
++    InterlockedExchange(&g_apso.done_flag, 0);
++    ld_apso_job* j = g_apso.done; g_apso.done = NULL;
++    LeaveCriticalSection(&g_apso.cs);
++    LARGE_INTEGER now, f; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
++    while (j) {
++        ld_apso_job* nx = j->next;
++        int pb = 0, seen = 0;
++        if (j->vs_new) {
++            shader_disk_cache_store('V', j->vs_src, j->vs_len, j->vs_hash, j->vs);
++            ID3DBlob* o = shader_blob_cache_find(&g.vs_blobs, j->vs_src, j->vs_len, j->vs_hash, &pb, &seen);
++            if (o) o->lpVtbl->Release(o);
++            else shader_blob_cache_insert_accounted(&g.vs_blobs, j->vs_src, j->vs_len, j->vs_hash, j->vs, 'V', seen);
++        }
++        if (j->ps_new) {
++            seen = 0;
++            shader_disk_cache_store('P', j->ps_src, j->ps_len, j->ps_hash, j->ps);
++            ID3DBlob* o = shader_blob_cache_find(&g.ps_blobs, j->ps_src, j->ps_len, j->ps_hash, &pb, &seen);
++            if (o) o->lpVtbl->Release(o);
++            else shader_blob_cache_insert_accounted(&g.ps_blobs, j->ps_src, j->ps_len, j->ps_hash, j->ps, 'P', seen);
++        }
++        if (j->pso) {
++            g_ld_pl_last_vs_hash = j->vs_hash; g_ld_pl_last_vs_len = j->vs_len;
++            g_ld_pl_last_ps_hash = j->ps_hash; g_ld_pl_last_ps_len = j->ps_len;
++            ld_pl_record(j->key, &j->rs, j->masked ? &j->layout : NULL, j->packed, j->depth);
++        } else g_apso.failed++;
++        int merged = 0;
++        RSX_APSO_MERGE(g.psos, g.n_psos, j->key, j->pso, merged);
++        if (merged) g_apso.merged++;
++        else if (j->pso) j->pso->lpVtbl->Release(j->pso);
++        void* tb = NULL;   /* the in-flight entries' last job: the table's blob reference goes */
++        if (rsx_apso_blob_release(&g_apso.tab, j->vs_e, &tb) && tb) ((ID3DBlob*)tb)->lpVtbl->Release((ID3DBlob*)tb);
++        if (rsx_apso_blob_release(&g_apso.tab, j->ps_e, &tb) && tb) ((ID3DBlob*)tb)->lpVtbl->Release((ID3DBlob*)tb);
++        g_apso.finished++;
++        g_apso.compile_us += j->compile_us; g_apso.create_us += j->create_us;
++        const u64 lat = (u64)((now.QuadPart - j->t_submit) * 1000000 / f.QuadPart);
++        g_apso.latency_us += lat; if (lat > g_apso.max_latency_us) g_apso.max_latency_us = lat;
++        if (j->vs) j->vs->lpVtbl->Release(j->vs);
++        if (j->ps) j->ps->lpVtbl->Release(j->ps);
++        free(j->vs_src); free(j->ps_src); free(j);
++        InterlockedDecrement(&g_apso.in_flight);
++        j = nx;
++    }
++}
++
++static void ld_apso_stat_print(void)
++{
++    if (!g_apso.submitted) return;
++    fprintf(stderr, "[pso-async] frame=%u submitted=%llu finished=%llu failed=%llu in-flight=%ld max-in-flight=%u "
++                    "skipped-draws=%llu worker compile=%.1f ms create=%.1f ms latency avg=%.1f max=%.1f ms"
++                    " compiles-owned=%llu deduped=%llu waits=%llu in-flight-blobs=%u\n",
++            g_ld_frames, (unsigned long long)g_apso.submitted, (unsigned long long)g_apso.finished,
++            (unsigned long long)g_apso.failed, (long)g_apso.in_flight, g_apso.max_in_flight,
++            (unsigned long long)g_apso.skipped_draws, g_apso.compile_us / 1e3, g_apso.create_us / 1e3,
++            g_apso.finished ? g_apso.latency_us / 1e3 / (double)g_apso.finished : 0.0, g_apso.max_latency_us / 1e3,
++            (unsigned long long)g_apso.tab.owned, (unsigned long long)g_apso.tab.deduped,
++            (unsigned long long)g_apso.waits, g_apso.tab.count);
++}
++
+ static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
+ {
+     const u32 start = rsx_dsp_vp_start(&g.rsx);
+@@ -7083,6 +7318,7 @@
+     g_ld_profile.total.pso_lookups++;
+ #endif
+     ld_pl_drain();   /* patch 2031: take what the preload finished */
++    ld_apso_drain();   /* patch 2048: and the finished asynchronous builds */
+     for (u32 i = 0; i < g.n_psos; i++) {
+ #if defined(YZ_PERF_PROFILE)
+         g_ld_profile.total.pso_probes++;
+@@ -7092,6 +7328,7 @@
+             g_ld_profile.total.pso_hits++;
+ #endif
+             if (g.psos[i].preloaded) { g.psos[i].preloaded = 0; g_ld_pl_used++; }
++            if (g.psos[i].pending) g_apso.skipped_draws++;   /* patch 2048: build in flight, draw skipped */
+             LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
+             return g.psos[i].pso;
+         }
+@@ -7234,7 +7471,11 @@
+         snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)live_legacy_pso_key());
+         f = fopen(fn, "wb"); if (f) { fputs(fi > 0 ? ps_hlsl : "<fp fail>", f); fclose(f); }
+       } }
+-    if (vi > 0 && fi > 0) {
++    int apso_pending = 0;   /* patch 2048 */
++    if (vi > 0 && fi > 0 && ld_apso_on() &&
++        ld_apso_submit(vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key)) {
++        apso_pending = 1; g_apso.skipped_draws++;
++    } else if (vi > 0 && fi > 0) {
+         LDW_T0(bp_t0);
+         pso = build_pso(
+             vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key);
+@@ -7266,6 +7507,7 @@
+     }
+     g.psos[g.n_psos].key = key;
+     g.psos[g.n_psos].pso = pso;
++    g.psos[g.n_psos].pending = (u8)apso_pending;   /* patch 2048 */
+     g.n_psos++;
+     return pso;
+ }
+--- /dev/null
++++ b/libs/video/rsx_pso_async.h
+@@ -0,0 +1,96 @@
++/* KZ3 patch 2048 (rsx rounds 49-50): platform-neutral bookkeeping of the live renderer's asynchronous PSO builds
++ * (LD_PSO_ASYNC), kept apart from the D3D12 code so a host test can check it with no GPU
++ * (tools/smoke/test_pso_async.c).
++ *
++ * 1. Pending entries. A PSO cache entry whose build is in flight has pso == NULL and pending = 1: a lookup returns
++ *    NULL, so the draw is skipped. When the build is back, RSX_APSO_MERGE finds the key's pending entry and stores
++ *    the PSO (or NULL for a failed build) and clears pending; with no pending entry for the key the caller releases
++ *    the PSO.
++ * 2. In-flight shader compiles (dedupe). Several jobs often need the same VS or PS blob before any of them is back.
++ *    The walker thread registers each blob a job has to compile in a table keyed by type, hash, length and source:
++ *    the first job owns the compile, later jobs depend on the owner's entry (one reference each). A worker that owns
++ *    a blob compiles it and publishes it (done = 1, blob or NULL); a dependent worker waits for done and takes the
++ *    blob. Only the walker inserts and removes entries; an entry goes away when its last job was merged (its blob is
++ *    then in the walker's memory cache, so a later job finds it there). Workers read only entries they hold a
++ *    reference to, under the caller's lock. Deadlock-free with a FIFO queue: a job only depends on entries owned by
++ *    jobs queued before it, which a worker has already taken. */
++#ifndef RSX_PSO_ASYNC_H
++#define RSX_PSO_ASYNC_H
++
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* Index of the pending entry for key k in arr[0..n) (n when none). arr: any array of structs with .key and .pending. */
++#define RSX_APSO_FIND_PENDING(arr, n, k, out)                                                         \
++    do { uint32_t i_ = 0; while (i_ < (n) && !((arr)[i_].key == (k) && (arr)[i_].pending)) i_++;    \
++         (out) = i_; } while (0)
++
++/* Store a finished build into its pending entry. ok = 1 when merged, 0 when no pending entry had the key (the
++ * caller then releases the PSO). */
++#define RSX_APSO_MERGE(arr, n, k, pso_value, ok)                                                      \
++    do { uint32_t m_; RSX_APSO_FIND_PENDING(arr, n, k, m_);                                           \
++         if (m_ < (n)) { (arr)[m_].pso = (pso_value); (arr)[m_].pending = 0; (ok) = 1; }              \
++         else (ok) = 0; } while (0)
++
++typedef struct rsx_apso_blob {
++    struct rsx_apso_blob* next;
++    uint64_t hash;
++    uint32_t len;
++    uint32_t refs;      /* jobs that own or depend on this compile and were not merged yet */
++    char type;          /* 'V' or 'P' */
++    volatile uint8_t done;
++    char* src;          /* copy of the HLSL (exact match on hash collisions) */
++    void* blob;         /* published result (the table's own reference) or NULL when the compile failed */
++} rsx_apso_blob;
++
++typedef struct {
++    rsx_apso_blob* head;
++    uint32_t count;
++    uint64_t owned, deduped;
++} rsx_apso_blobtab;
++
++/* Walker: the in-flight entry for this source, created when absent. *owner = 1 when the caller's job must compile
++ * it, 0 when another job does. Takes one reference. NULL when out of memory (the job compiles on its own). */
++static inline rsx_apso_blob* rsx_apso_blob_acquire(rsx_apso_blobtab* t, char type, const char* src, uint32_t len,
++                                                   uint64_t hash, int* owner)
++{
++    for (rsx_apso_blob* e = t->head; e; e = e->next)
++        if (e->type == type && e->hash == hash && e->len == len && memcmp(e->src, src, len) == 0) {
++            e->refs++; t->deduped++; *owner = 0; return e;
++        }
++    rsx_apso_blob* e = (rsx_apso_blob*)calloc(1, sizeof *e);
++    if (!e) return NULL;
++    e->src = (char*)malloc((size_t)len + 1u);
++    if (!e->src) { free(e); return NULL; }
++    memcpy(e->src, src, len); e->src[len] = 0;
++    e->type = type; e->hash = hash; e->len = len; e->refs = 1;
++    e->next = t->head; t->head = e; t->count++; t->owned++;
++    *owner = 1;
++    return e;
++}
++
++/* Owner worker, under the caller's lock: publish the compile's result (the table keeps `blob` as its own reference:
++ * the caller adds one for it before). */
++static inline void rsx_apso_blob_publish(rsx_apso_blob* e, void* blob)
++{
++    e->blob = blob;
++    e->done = 1;
++}
++
++/* Walker, at a job's merge: drop the job's reference. When it was the last one the entry is removed and its blob
++ * (the table's reference, possibly NULL) is returned through *release for the caller to release; returns 1 then. */
++static inline int rsx_apso_blob_release(rsx_apso_blobtab* t, rsx_apso_blob* e, void** release)
++{
++    *release = NULL;
++    if (!e || !e->refs || --e->refs) return 0;
++    rsx_apso_blob** pp = &t->head;
++    while (*pp && *pp != e) pp = &(*pp)->next;
++    if (*pp) *pp = e->next;
++    t->count--;
++    *release = e->blob;
++    free(e->src); free(e);
++    return 1;
++}
++
++#endif /* RSX_PSO_ASYNC_H */

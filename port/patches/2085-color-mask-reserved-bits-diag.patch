@@ -1,0 +1,35 @@
+KZ3 patch 2085: SET_COLOR_MASK writes with reserved bits are counted, and can be ignored (RSX_COLOR_MASK_RESERVED=ignore); pass 82.
+
+From JonathanDC64/ps3recomp PR #47 (fork, MIT), narrowed to what KZ3 can verify. The PR drops a COLOR_MASK write that
+has any bit set outside the four 0/1 byte flags (0xFEFEFEFE) and keeps the old mask, which is what the fork says
+RPCS3 does. The live renderer reads the mask as "any nonzero byte = channel on" (rsx_live_draw.c, RenderTargetWriteMask),
+so a write such as 0x00020000 would turn red on here and be ignored there. Whether KZ3's own command streams (PPU
+libgcm inlines and the SPU jobs) ever write such a value is not known: nothing logged it. So the default behaviour
+is unchanged and the first eight such writes are logged ("[rsx-dispatch] COLOR_MASK 0x... has reserved bits");
+RSX_COLOR_MASK_RESERVED=ignore applies the PR's rule. Flip the default only when a level run shows the log line.
+
+Host test: tools/smoke/test_color_mask.sh (builds rsx_dispatch.c alone; default keeps the write, ignore keeps the old
+mask, clean values always apply).
+
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -320,6 +320,19 @@
+                     method, arg);
+         return;
+     }
++    /* Patch 2085 (PR #47 of JonathanDC64/ps3recomp): COLOR_MASK takes 0 or 1 in each byte. */
++    if (method == M_COLOR_MASK && (arg & 0xFEFEFEFEu)) {
++        static int n = 0, ignore = -1;
++        if (ignore < 0) {
++            const char* e = getenv("RSX_COLOR_MASK_RESERVED");
++            ignore = (e && !strcmp(e, "ignore")) ? 1 : 0;
++        }
++        if (n++ < 8)
++            fprintf(stderr, "[rsx-dispatch] COLOR_MASK 0x%08X has reserved bits%s\n", arg,
++                    ignore ? " -- ignored, old mask kept" : " (applied: nonzero byte = on)");
++        if (ignore)
++            return;
++    }
+     rsx->seen[idx]++;
+     rsx->regs[idx] = arg;
+     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||

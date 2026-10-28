@@ -1,0 +1,71 @@
+# Labels a new or edited issue: needs-triage always, plus one type label when the text matches one of the
+# issue forms. Security: the issue title and body are only ever read as data inside the script (never in a shell
+# line or an expression); no checkout; the token can only write issues; labels come from a fixed list, only
+# existing labels are added (none is created), and no label is ever removed.
+name: Issue labels
+on:
+  issues:
+    types: [opened, edited]
+permissions:
+  issues: write
+concurrency:
+  group: issue-labels-${{ github.event.issue.number }}
+  cancel-in-progress: true
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            // BEGIN rules (a host test runs exactly this block)
+            const ALLOWED = ['needs-triage', 'bug', 'enhancement', 'feedback', 'performance', 'pipeline-template'];
+            const TYPES = ['bug', 'enhancement', 'feedback', 'performance', 'pipeline-template'];
+            // Checked in order, first match wins. Headings are the first field of each issue form
+            // (.github/ISSUE_TEMPLATE), which GitHub renders as "### <label>" in the issue body.
+            const RULES = [
+              { label: 'pipeline-template', heading: 'Template file (zipped)', prefix: /^\s*\[?pipeline template\]?\s*[:\-]?/i },
+              { label: 'bug', heading: 'What happened, and what did you expect?', prefix: /^\s*\[?bug( report)?\]?\s*[:\-]?/i },
+              { label: 'enhancement', heading: 'What would you like, and why?', prefix: /^\s*\[?(feature request|feature|enhancement)\]?\s*[:\-]?/i },
+              { label: 'performance', heading: 'What you see', prefix: /^\s*\[?(performance( report)?|perf)\]?\s*[:\-]?/i },
+              { label: 'feedback', heading: 'Your feedback or question', prefix: /^\s*\[?(feedback|question)\]?\s*[:\-]?/i },
+            ];
+            function typeLabelFor(title, body) {
+              const t = typeof title === 'string' ? title : '';
+              const b = typeof body === 'string' ? body : '';
+              const headings = new Set(
+                b.split(/\r?\n/)
+                  .map((line) => line.match(/^###\s+(.+?)\s*$/))
+                  .filter(Boolean)
+                  .map((m) => m[1])
+              );
+              for (const r of RULES) {
+                if (headings.has(r.heading) || r.prefix.test(t)) return r.label;
+              }
+              return null;
+            }
+            // END rules
+
+            const issue = context.payload.issue;
+            if (!issue || issue.pull_request) return;
+            const have = new Set((issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name)));
+            const wanted = [];
+            if (!have.has('needs-triage')) wanted.push('needs-triage');
+            // One type label, and only when the issue has none yet (a maintainer's choice is not overridden).
+            if (!TYPES.some((t) => have.has(t))) {
+              const type = typeLabelFor(issue.title, issue.body);
+              if (type) wanted.push(type);
+            }
+            // Add only labels that already exist in the repository: addLabels would otherwise create them.
+            const existing = new Set(
+              (await github.paginate(github.rest.issues.listLabelsForRepo, {
+                owner: context.repo.owner, repo: context.repo.repo, per_page: 100,
+              })).map((l) => l.name)
+            );
+            const toAdd = wanted.filter((l) => ALLOWED.includes(l) && existing.has(l));
+            if (toAdd.length === 0) return;
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issue.number, labels: toAdd,
+            });

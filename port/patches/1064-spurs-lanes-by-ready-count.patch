@@ -1,0 +1,79 @@
+KZ3 patch 1064 (SPU pass 48): SPURS kernel lanes per dispatch follow the workload's ready count.
+The kernel ran maxContention lanes (capped at the instance's nSpus) for every kicked dispatch; the ready count byte
+only said "kicked". With the game's real HiPrio count of 5 (patch 1062, KZ3_SPURS_ATTR_SDK=1) that ran five
+job-manager lanes per list and the menu hung (spu-48n2: the main thread parks on a list at 0x89E04 from t~140 s,
+flips stop at 150 s). SPURS semantics: readyCount is the number of SPUs the workload asks for, up to maxContention.
+KZ3_SPURS_LANES_READY=1 caps a kicked dispatch at the ready count read before the pass consumed one unit; always on:
+a per-wid histogram of those ready counts and of the lanes run, in a [spurs-lanes] line every 10 s next to
+[spurs-ready]. Default behaviour unchanged (opt-in until the A/B says otherwise).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -532,6 +532,32 @@
+ }
+ /* kz3-pm-switch end */
+ 
++/* KZ3 patch 1064 (SPU pass 48): per wid, how many dispatches saw each ready count (0..7+) before the pass consumed
++ * one unit, and how many lanes each dispatch ran; KZ3_SPURS_LANES_READY=1 caps the lanes of a kicked dispatch at that
++ * ready count (SPURS semantics: readyCount = the number of SPUs the workload asks for, up to maxContention; the
++ * runtime ran maxContention lanes for every kick, which with the game's real HiPrio count of 5 (patch 1062) ran five
++ * job-manager lanes per list and hung the menu). Printed every 10 s next to the [spurs-ready] line. */
++static long s_kz3_lanes_rc[CELL_SPURS_MAX_WORKLOAD][8], s_kz3_lanes_n[CELL_SPURS_MAX_WORKLOAD][8];
++static int kz3_lanes_ready_on(void)
++{
++    static int s = -1;
++    if (s < 0) { const char* e = getenv("KZ3_SPURS_LANES_READY"); s = (e && *e == '1') ? 1 : 0; }
++    return s;
++}
++static void kz3_lanes_report(unsigned long long t_s)
++{
++    char line[480]; int o = 0;
++    for (u32 w = 0; w < CELL_SPURS_MAX_WORKLOAD; w++) {
++        long c = 0; for (int k = 0; k < 8; k++) c += s_kz3_lanes_rc[w][k];
++        if (!c || o >= (int)sizeof line - 80) continue;
++        o += snprintf(line + o, sizeof line - (size_t)o, " w%u:rc", w);
++        for (int k = 0; k < 8; k++) if (s_kz3_lanes_rc[w][k]) o += snprintf(line + o, sizeof line - (size_t)o, " %d=%ld", k, s_kz3_lanes_rc[w][k]);
++        o += snprintf(line + o, sizeof line - (size_t)o, " lanes");
++        for (int k = 0; k < 8; k++) if (s_kz3_lanes_n[w][k]) o += snprintf(line + o, sizeof line - (size_t)o, " %d=%ld", k, s_kz3_lanes_n[w][k]);
++    }
++    fprintf(stderr, "[spurs-lanes] t=%llus%s (dispatches by ready count before the pass / by lanes run)%s\n", t_s,
++            o ? line : " none", kz3_lanes_ready_on() ? " [KZ3_SPURS_LANES_READY]" : "");
++}
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+ /* KZ3 patch 1057 (SPU pass 39): called by the kernel thread when a workload's policy-module run starts (end 0,
+  * after the contention byte is set) and ends (end 1, after it is cleared, all lanes joined); NULL = off. The
+@@ -1974,6 +2000,7 @@
+                 fprintf(stderr, "[spurs-ready] t=%llus store=%ld/%ld swap=%ld/%ld cas=%ld/%ld (calls/byte changed) per wid:%s\n",
+                         (unsigned long long)((now - s_t_start) / 1000), tot[0], chg[0], tot[1], chg[1], tot[2], chg[2],
+                         o ? line : " none");
++                kz3_lanes_report((unsigned long long)((now - s_t_start) / 1000));   /* KZ3 patch 1064 */
+             }
+             for (u32 w = 0; w < 16; w++) {
+                 u8 cc = *(vm_base + ea + SPURS_WKL_CURCONT + w);
+@@ -2182,10 +2209,12 @@
+             /* KZ3 patch 1052: the PPU updates this guest byte atomically
+              * (cellSpursReadyCountStore/Swap/CompareAndSwap); a bare (*rdy)--
+              * could write back a stale count over a concurrent kick. */
+-            if (spu_race_old()) { if (*rdy) (*rdy)--; }
++            u8 rc0 = 0;   /* KZ3 patch 1064: the ready count before this pass consumed one unit */
++            if (spu_race_old()) { rc0 = *rdy; if (*rdy) (*rdy)--; }
+             else { u8 o = __atomic_load_n(rdy, __ATOMIC_ACQUIRE);
+               while (o && !__atomic_compare_exchange_n(rdy, &o, (u8)(o - 1), 0,
+-                                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {} }
++                                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
++              rc0 = o; }
+             if (sig & (0x8000u >> wid))
+                 vm_write32(ea + SPURS_WKL_SIGNAL1,
+                            (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
+@@ -2264,6 +2293,10 @@
+               if (s_fs == -2) { const char* e = getenv("SPURS_FORCE_SPUS");
+                 s_fs = e ? atoi(e) : -1; }
+               if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
++            /* KZ3 patch 1064: a kicked dispatch runs at most readyCount lanes when KZ3_SPURS_LANES_READY=1. */
++            if (kz3_lanes_ready_on() && rc0 > 0 && maxcont > rc0) maxcont = rc0;
++            s_kz3_lanes_rc[wid][rc0 > 7 ? 7 : rc0]++;
++            s_kz3_lanes_n[wid][maxcont > 7 ? 7 : maxcont]++;
+             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
+             if (g_kz3_pm_run_hook) g_kz3_pm_run_hook(ea, wid, 0);   /* KZ3 patch 1057 */
+             {

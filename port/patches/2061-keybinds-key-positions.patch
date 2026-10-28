@@ -1,0 +1,356 @@
+KZ3 patch 2061 (RSX pass 62, porting-status step 9q): keyboard binds by key position, not by layout.
+pad_keybinds.h: a binding code is the US-layout virtual key of a key POSITION; the 49 layout-dependent positions
+(letters, digits, punctuation, the ISO Oem102 key) carry their PC/AT scancode (pad_kb_pos_keys). PadKbLayout
+(pad_kb_layout_build, platform-free: the host passes scancode -> virtual key and scancode -> legend queries) maps
+positions to the active layout's virtual keys for polling and to its legends for the Keyboard page
+(pad_kb_key_short). Files written from now on carry "keys = positions"; a file without it is from before 2061 (its
+names were the active layout's keys) and pad_kb_migrate rebinds each slot to the position that layout gives the key,
+except inputs still on their old default pair, which take the default positions.
+cellPad.c: MapVirtualKeyExW(MAPVK_VSC_TO_VK) + GetKeyNameTextW build the layout; rebuilt when the foreground
+thread's HKL changes (read each focused poll: the switch WM_INPUTLANGCHANGE announces); GetAsyncKeyState polls the
+translated keys; the one-time migration rewrites the file; pad_kb_key_label gives the keycaps the legend in the ANSI
+code page (TextOutA). KZ3_KB_LAYOUT=<KLID> forces a layout (Windows checks). Log: [keybinds] layout ... positions
+W A S D are ... here; [keybinds] ... migrated to key positions. Host test: tools/smoke/test_pad_keybinds.sh
+(section 6, fake French AZERTY table).
+
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c	2026-10-15 02:15:42.563769817 -0500
++++ b/libs/input/cellPad.c	2026-10-15 02:17:10.417441955 -0500
+@@ -160,7 +160,93 @@
+     printf("[keybinds] %s\n", msg);
+ }
+ 
+-static int pad_kb_down_win(void* ctx, int vk) { (void)ctx; return (GetAsyncKeyState(vk) & 0x8000) != 0; }
++/* Patch 2061: binding codes are key positions (pad_keybinds.h); s_kb_layout turns them into the active layout's
++ * virtual keys. Rebuilt when the foreground thread's layout (HKL) changes: the poll reads it each time, which sees the
++ * same switch WM_INPUTLANGCHANGE announces without a hook in the window procedure. KZ3_KB_LAYOUT=<KLID> (eight hex
++ * digits, e.g. 0000040C French) loads and uses that layout instead (owners' checks on Windows; ASSUMPTION: Wine's
++ * MapVirtualKeyEx follows the X keymap and ignores the HKL, so under Proton the switch changes nothing). */
++static PadKbLayout s_kb_layout;
++static HKL         s_kb_hkl = NULL;
++static int         s_kb_layout_ok = 0;
++static char        s_kb_label_acp[256][PKB_LABEL];  /* the legends in the ANSI code page (keycaps: TextOutA) */
++
++static int pad_kb_sc_to_vk_win(void* ctx, int sc) { return (int)MapVirtualKeyExW((UINT)sc, 1 /* MAPVK_VSC_TO_VK */, (HKL)ctx); }
++static int pad_kb_sc_name_win(void* ctx, int sc, char* out, size_t n)
++{
++    wchar_t w[PKB_LABEL];
++    int len;
++    (void)ctx;      /* GetKeyNameTextW uses the calling thread's layout: activated around the build (pad_kb_layout_update) */
++    len = GetKeyNameTextW((LONG)((unsigned)sc << 16), w, PKB_LABEL);
++    if (len <= 0 || len >= 4) return 0;          /* a legend is one or two characters; longer = a word, keep ours */
++    w[len] = 0;
++    CharUpperW(w);
++    len = WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL);
++    return len > 1 ? len - 1 : 0;
++}
++
++static void pad_kb_layout_update(void)
++{
++    static int forced = -1;
++    static HKL fhkl = NULL;
++    HKL h;
++    if (forced < 0) {
++        const char* e = getenv("KZ3_KB_LAYOUT");
++        forced = 0;
++        if (e && *e) {
++            wchar_t w[16];
++            MultiByteToWideChar(CP_ACP, 0, e, -1, w, 16); w[15] = 0;
++            fhkl = LoadKeyboardLayoutW(w, KLF_NOTELLSHELL);
++            forced = fhkl != NULL;
++            printf("[keybinds] KZ3_KB_LAYOUT=%s -> %s\n", e, forced ? "loaded" : "not loadable, the active layout is used");
++        }
++    }
++    if (forced) h = fhkl;
++    else {
++        HWND fg = GetForegroundWindow();
++        h = GetKeyboardLayout(fg ? GetWindowThreadProcessId(fg, NULL) : 0);
++    }
++    if (s_kb_layout_ok && h == s_kb_hkl) return;
++    {
++        HKL old = GetKeyboardLayout(0);
++        int i, j, sw = h && h != old;
++        if (sw) ActivateKeyboardLayout(h, 0);           /* GetKeyNameTextW reads this thread's layout */
++        pad_kb_layout_build(&s_kb_layout, pad_kb_sc_to_vk_win, pad_kb_sc_name_win, (void*)h);
++        if (sw) ActivateKeyboardLayout(old, 0);
++        for (i = 0; i < 256; i++) {
++            wchar_t w[PKB_LABEL];
++            s_kb_label_acp[i][0] = 0;
++            if (!s_kb_layout.label[i][0]) continue;
++            if (MultiByteToWideChar(CP_UTF8, 0, s_kb_layout.label[i], -1, w, PKB_LABEL) > 0) {
++                BOOL lost = FALSE;
++                if (WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w, -1, s_kb_label_acp[i], PKB_LABEL, NULL, &lost) <= 0 || lost)
++                    s_kb_label_acp[i][0] = 0;              /* not in the code page: keycaps keep the port's name */
++            }
++        }
++        s_kb_hkl = h; s_kb_layout_ok = 1;
++        pad_kb_display_layout = &s_kb_layout;
++        {   /* one line per change: the layout and where the default WASD positions are on it */
++            static const unsigned char wasd[4] = { 0x57, 0x41, 0x53, 0x44 };
++            char t[64]; size_t o = 0;
++            for (j = 0; j < 4; j++) {
++                const char* l = s_kb_layout.label[wasd[j]];
++                o += (size_t)snprintf(t + o, sizeof t - o, "%s%s", j ? " " : "", *l ? l : "?");
++                if (o >= sizeof t) break;
++            }
++            printf("[keybinds] layout %08lx: positions W A S D are %s here (vk %02x %02x %02x %02x)\n",
++                   (unsigned long)(uintptr_t)h, t, s_kb_layout.vk[0x57], s_kb_layout.vk[0x41], s_kb_layout.vk[0x53],
++                   s_kb_layout.vk[0x44]);
++            fflush(stdout);
++        }
++    }
++}
++
++static int pad_kb_down_win(void* ctx, int code)
++{
++    int vk = code;
++    (void)ctx;
++    if (code > 0 && code < 256 && s_kb_layout_ok) vk = s_kb_layout.vk[code];
++    return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
++}
+ static int pad_kb_down_none(void* ctx, int vk) { (void)ctx; (void)vk; return 0; }
+ 
+ static char* pad_kb_read_w(const wchar_t* path)       /* malloc'd, NUL-terminated; NULL if unreadable */
+@@ -248,8 +334,25 @@
+         }
+     } else {
+         int bad = pad_kb_parse(&kb, text, pad_kb_log, NULL);
++        int positional = pad_kb_text_positional(text);
+         free(text);
+         printf("[keybinds] %ls: %s (%d problem line part(s) ignored)\n", s_kb_path, first ? "read" : "re-read", bad);
++        if (!positional) {
++            /* 2061: a file from before key positions. Its names were the keys of the layout active then; this
++             * start's layout is the best guess of that one. Migrated once: the rewrite adds "keys = positions". */
++            char buf[8192];
++            int n, len, ok;
++            FILE* f;
++            pad_kb_layout_update();
++            n = pad_kb_migrate(&kb, &s_kb_layout);
++            len = pad_kb_format(&kb, buf, sizeof buf);
++            f = _wfopen(s_kb_path, L"wb");
++            ok = f && len > 0 && len < (int)sizeof buf && fwrite(buf, 1, (size_t)len, f) == (size_t)len;
++            if (f) fclose(f);
++            printf("[keybinds] %ls: names were layout keys (before patch 2061), migrated to key positions with layout "
++                   "%08lx: %d slot(s) moved, inputs on the old defaults now use the default positions; %s\n", s_kb_path,
++                   (unsigned long)(uintptr_t)s_kb_hkl, n, ok ? "file rewritten" : "file NOT writable (migrated again next start)");
++        }
+     }
+     if (!pad_kb_stamp(&s_kb_stamp)) memset(&s_kb_stamp, 0, sizeof s_kb_stamp);
+     s_kb = kb;
+@@ -272,7 +375,7 @@
+ 
+ static void pad_kb_ensure_loaded(void)
+ {
+-    if (!s_kb_ready) { pad_kb_find_path(); pad_kb_load(1); s_kb_ready = 1; s_kb_checked_ms = GetTickCount64(); }
++    if (!s_kb_ready) { pad_kb_layout_update(); pad_kb_find_path(); pad_kb_load(1); s_kb_ready = 1; s_kb_checked_ms = GetTickCount64(); }
+ }
+ 
+ /* The Keyboard page's command entry (port/kz3/main.cpp calls it from the Lua bridge). See pad_kb_ui_command. */
+@@ -311,7 +414,13 @@
+     return vk;
+ }
+ 
+-const char* pad_kb_key_label(int vk) { return pad_kb_key_name(vk); }
++/* Keycap faces (rsx_keycaps.h kc_label): the layout's legend of a position key in the ANSI code page (the exe draws it
++ * with TextOutA), else the file name, which kc_label shortens. Patch 2061. */
++const char* pad_kb_key_label(int vk)
++{
++    if (vk > 0 && vk < 256 && s_kb_layout_ok && s_kb_label_acp[vk][0]) return s_kb_label_acp[vk];
++    return pad_kb_key_name(vk);
++}
+ 
+ /* patch 2039: the key in one slot of a keybinds.ini input ("cross", "ls_up", ...), 0 when unbound or before the
+  * file is read. For keycap prompts (rsx_keycaps.h through port/kz3/main.cpp). */
+@@ -346,6 +455,7 @@
+     if (off) return;
+ 
+     AcquireSRWLockExclusive(&s_kb_lock);
++    if (pad_host_window_focused() || !s_kb_layout_ok) pad_kb_layout_update();  /* 2061: layout switches */
+     if (!s_kb_ready) pad_kb_ensure_loaded();
+     else {
+         unsigned long long now = GetTickCount64();
+diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+--- a/libs/input/pad_keybinds.h	2026-10-15 02:15:42.563769817 -0500
++++ b/libs/input/pad_keybinds.h	2026-10-15 02:26:34.192063982 -0500
+@@ -14,6 +14,14 @@
+  * '#' or ';' starts a comment; a "[keyboard]" header is optional, other sections are skipped (reserved for later
+  * pages: gamepad remap, mouse look). A line with an unknown input, an unknown key or more than two keys is logged
+  * and the bad part ignored; nothing in the file is ever fatal. An input missing from the file keeps its default.
++ *
++ * KZ3 patch 2061: key names are key POSITIONS, named after the legend of a US keyboard ("W" = the key right of the
++ * Tab row's first letter, wherever the active layout puts its W). The codes stay byte-sized: a code is the US-layout
++ * virtual key of the position, and the 49 layout-dependent positions (letters, digits, punctuation) carry their
++ * PC/AT scancode (pad_kb_pos_keys). PadKbLayout maps them to the active layout's virtual keys for polling and to its
++ * legends for display; the other keys (F-keys, arrows, numpad, modifiers, mouse) are the same on every layout.
++ * A file without the "keys = positions" line is from before 2061 (its names were the active layout's keys): it is
++ * migrated once with the layout active at that start (pad_kb_migrate) and rewritten with the line.
+  */
+ #ifndef PAD_KEYBINDS_H
+ #define PAD_KEYBINDS_H
+@@ -91,7 +99,7 @@
+     { "LeftAlt", 0xA4 }, { "RightAlt", 0xA5 },
+     { "Semicolon", 0xBA }, { "Equals", 0xBB }, { "Comma", 0xBC }, { "Minus", 0xBD }, { "Period", 0xBE },
+     { "Slash", 0xBF }, { "Grave", 0xC0 }, { "LeftBracket", 0xDB }, { "Backslash", 0xDC },
+-    { "RightBracket", 0xDD }, { "Apostrophe", 0xDE },
++    { "RightBracket", 0xDD }, { "Apostrophe", 0xDE }, { "Oem102", 0xE2 },
+ };
+ #define PKB_N_KEYS ((int)(sizeof pad_kb_keys / sizeof pad_kb_keys[0]))
+ 
+@@ -153,6 +161,116 @@
+     return -1;
+ }
+ 
++/* ---- patch 2061: key positions ----
++ * The layout-dependent positions: code (US virtual key) and PC/AT set-1 scancode (all non-extended). Oem102 is the
++ * ISO key left of Z (102/105-key boards; no key on a US ANSI board). */
++typedef struct { unsigned char code, sc; } PadKbPosKey;
++static const PadKbPosKey pad_kb_pos_keys[] = {
++    { 0x31, 0x02 }, { 0x32, 0x03 }, { 0x33, 0x04 }, { 0x34, 0x05 }, { 0x35, 0x06 }, { 0x36, 0x07 }, { 0x37, 0x08 },
++    { 0x38, 0x09 }, { 0x39, 0x0A }, { 0x30, 0x0B }, { 0xBD, 0x0C }, { 0xBB, 0x0D },
++    { 0x51, 0x10 }, { 0x57, 0x11 }, { 0x45, 0x12 }, { 0x52, 0x13 }, { 0x54, 0x14 }, { 0x59, 0x15 }, { 0x55, 0x16 },
++    { 0x49, 0x17 }, { 0x4F, 0x18 }, { 0x50, 0x19 }, { 0xDB, 0x1A }, { 0xDD, 0x1B },
++    { 0x41, 0x1E }, { 0x53, 0x1F }, { 0x44, 0x20 }, { 0x46, 0x21 }, { 0x47, 0x22 }, { 0x48, 0x23 }, { 0x4A, 0x24 },
++    { 0x4B, 0x25 }, { 0x4C, 0x26 }, { 0xBA, 0x27 }, { 0xDE, 0x28 }, { 0xC0, 0x29 }, { 0xDC, 0x2B },
++    { 0x5A, 0x2C }, { 0x58, 0x2D }, { 0x43, 0x2E }, { 0x56, 0x2F }, { 0x42, 0x30 }, { 0x4E, 0x31 }, { 0x4D, 0x32 },
++    { 0xBC, 0x33 }, { 0xBE, 0x34 }, { 0xBF, 0x35 }, { 0xE2, 0x56 },
++};
++#define PKB_N_POS ((int)(sizeof pad_kb_pos_keys / sizeof pad_kb_pos_keys[0]))
++
++static int pad_kb_pos_sc(int code)          /* scancode of a layout-dependent position, 0 = layout-independent key */
++{
++    int i;
++    for (i = 0; i < PKB_N_POS; i++) if (pad_kb_pos_keys[i].code == code) return pad_kb_pos_keys[i].sc;
++    return 0;
++}
++
++/* The active keyboard layout as the bindings see it. vk: position code -> the layout's virtual key (0 = no key there);
++ * pos: virtual key -> position code (0 = no position produces it); label: the layout's legend of a position (UTF-8,
++ * "" = use the port's own name). Layout-independent codes map to themselves. */
++#define PKB_LABEL 16
++typedef struct {
++    unsigned char vk[256], pos[256];
++    char label[256][PKB_LABEL];
++} PadKbLayout;
++
++/* The host's layout queries: scancode -> virtual key, and scancode -> legend (UTF-8, upper case; 0 = none).
++ * Windows: MapVirtualKeyExW(MAPVK_VSC_TO_VK) and GetKeyNameTextW (cellPad.c); the host test: a fake table. */
++typedef int (*PadKbScToVk)(void* ctx, int sc);
++typedef int (*PadKbScName)(void* ctx, int sc, char* out, size_t n);
++
++static void pad_kb_layout_us(PadKbLayout* L)   /* identity: the US layout, and the state before any query */
++{
++    int i;
++    memset(L, 0, sizeof *L);
++    for (i = 0; i < 256; i++) { L->vk[i] = (unsigned char)i; L->pos[i] = (unsigned char)i; }
++}
++
++static void pad_kb_layout_build(PadKbLayout* L, PadKbScToVk to_vk, PadKbScName name, void* ctx)
++{
++    int i;
++    pad_kb_layout_us(L);
++    for (i = 0; i < PKB_N_POS; i++) {                    /* letters etc. move with the layout */
++        int c = pad_kb_pos_keys[i].code, v = to_vk ? to_vk(ctx, pad_kb_pos_keys[i].sc) : c;
++        if (v < 0 || v > 255) v = 0;
++        L->vk[c] = (unsigned char)v;
++        L->pos[c] = 0;
++    }
++    for (i = 0; i < PKB_N_POS; i++) L->pos[L->vk[pad_kb_pos_keys[i].code]] = 0;   /* also keys no US key has (OEM_8) */
++    for (i = 0; i < PKB_N_POS; i++) {
++        int c = pad_kb_pos_keys[i].code, v = L->vk[c];
++        if (v && !L->pos[v]) L->pos[v] = (unsigned char)c;
++        if (name && name(ctx, pad_kb_pos_keys[i].sc, L->label[c], PKB_LABEL) <= 0) L->label[c][0] = 0;
++        L->label[c][PKB_LABEL - 1] = 0;
++    }
++}
++
++/* The layout the display functions use (pad_kb_key_short); NULL = the port's own names. Set by the poller. */
++static const PadKbLayout* pad_kb_display_layout = NULL;
++
++/* Does this file text name key positions (written by 2061 or later)? A "keys = positions" line in [keyboard]. */
++static int pad_kb_text_positional(const char* text)
++{
++    const char* p = text;
++    if (!text) return 0;
++    while ((p = strstr(p, "keys")) != NULL) {
++        const char* a = p;
++        const char* q = p + 4;
++        while (a > text && (a[-1] == ' ' || a[-1] == '\t')) a--;
++        if (a == text || a[-1] == '\n') {
++            while (*q == ' ' || *q == '\t') q++;
++            if (*q == '=') {
++                q++;
++                while (*q == ' ' || *q == '\t') q++;
++                if (!strncmp(q, "positions", 9) || !strncmp(q, "Positions", 9)) return 1;
++            }
++        }
++        p += 4;
++    }
++    return 0;
++}
++
++static void pad_kb_defaults(PadKeybinds* kb);
++
++/* A pre-2061 file read into kb holds the virtual keys of the layout active then. Rebind each slot to the position
++ * that layout gives that key, so every key stays where the player put it. An input still on its old default pair is
++ * set to the default positions instead (the old default "W" sat at the US-Z position on AZERTY; nobody chose that).
++ * Returns the number of slots whose code changed. */
++static int pad_kb_migrate(PadKeybinds* kb, const PadKbLayout* L)
++{
++    PadKeybinds d;
++    int i, s, n = 0;
++    pad_kb_defaults(&d);
++    for (i = 0; i < PKB_N_INPUTS; i++) {
++        if (kb->key[i][0] == d.key[i][0] && kb->key[i][1] == d.key[i][1]) continue;
++        for (s = 0; s < PKB_SLOTS; s++) {
++            int v = kb->key[i][s], c = v;
++            if (v && pad_kb_pos_sc(v) && L->pos[v]) c = L->pos[v];  /* a layout key: where it is on this board */
++            if (c != v) { kb->key[i][s] = (unsigned char)c; n++; }
++        }
++    }
++    return n;
++}
++
+ /* Defaults (PC layout on top of the Standard preset; ENHANCEMENT). Mouse look is not wired yet, so the
+  * right stick is on I/J/K/L and the numpad. */
+ static void pad_kb_defaults(PadKeybinds* kb)
+@@ -227,7 +345,8 @@
+                     int in;
+                     while (ne > a && pad_kb_space(ne[-1])) ne--;
+                     in = pad_kb_input_by_name(a, (size_t)(ne - a));
+-                    if (in < 0) { pad_kb_logf(log, ctx, line, "unknown pad input", a, (size_t)(ne - a)); bad++; }
++                    if (in < 0 && pad_kb_ieq(a, (size_t)(ne - a), "keys")) { /* 2061 marker: pad_kb_text_positional */ }
++                    else if (in < 0) { pad_kb_logf(log, ctx, line, "unknown pad input", a, (size_t)(ne - a)); bad++; }
+                     else {
+                         unsigned char got[PKB_SLOTS] = { 0 };
+                         int ng = 0, nbad = 0, nnone = 0;
+@@ -300,14 +419,19 @@
+             "#\n"
+             "#   <pad input> = <primary key>, <secondary key>      (\"none\" or nothing = unbound)\n"
+             "#\n"
++            "# Key names are key POSITIONS, named after a US keyboard: W A S D mean the keys where a US board has\n"
++            "# W A S D, on any layout (Z Q S D on French AZERTY). The game's Keyboard page shows your layout's labels.\n"
++            "#\n"
+             "# Keys: A-Z 0-9 F1-F12 Space Enter Escape Tab Backspace CapsLock LeftShift RightShift LeftCtrl\n"
+             "#   RightCtrl LeftAlt RightAlt Up Down Left Right Insert Delete Home End PageUp PageDown Pause\n"
+             "#   Numpad0-Numpad9 NumpadAdd NumpadSubtract NumpadMultiply NumpadDivide NumpadDecimal Semicolon\n"
+-            "#   Equals Comma Minus Period Slash Grave LeftBracket RightBracket Backslash Apostrophe\n"
++            "#   Equals Comma Minus Period Slash Grave LeftBracket RightBracket Backslash Apostrophe Oem102 (the\n"
++            "#   extra key left of Z on 102/105-key boards)\n"
+             "#   Mouse1 (left) Mouse2 (right) Mouse3 (middle) Mouse4 Mouse5\n"
+             "# Sticks: hold two keys of one stick for a diagonal. A pad plugged in works at the same time.\n"
+             "# The uses listed are those of the Standard controller preset (Options > Controls).\n"
+-            "\n[keyboard]\n");
++            "\n[keyboard]\n"
++            "keys     = positions             # this file names key positions (patch 2061); keep this line\n");
+     for (i = 0; i < PKB_N_INPUTS; i++) {
+         char v[64];
+         if (!kb->key[i][0] && !kb->key[i][1]) snprintf(v, sizeof v, "none");
+@@ -475,6 +599,8 @@
+     };
+     unsigned i;
+     if (!vk) return "---";
++    if (pad_kb_display_layout && vk > 0 && vk < 256 && pad_kb_display_layout->label[vk][0])   /* 2061: the layout's legend */
++        return pad_kb_display_layout->label[vk];
+     for (i = 0; i < sizeof t / sizeof t[0]; i++) if (t[i].vk == vk) return t[i].s;
+     return pad_kb_key_name(vk);
+ }

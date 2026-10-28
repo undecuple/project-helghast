@@ -1,0 +1,7 @@
+# Python lint for tools/ and re/ (tools/lint.sh). Lint only, no reformatting: the default rules catch real bugs
+# (undefined names, unused imports/variables, syntax), which is the point; style stays as written.
+line-length = 120
+extend-exclude = ["third_party", "work", "build", "Game", "GameUpdate"]
+
+[lint]
+select = ["E9", "E722", "F", "B006", "B008"]

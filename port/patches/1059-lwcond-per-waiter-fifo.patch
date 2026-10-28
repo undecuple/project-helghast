@@ -1,0 +1,284 @@
+KZ3 patch 1059 (SPU pass 46, queue 9l; upstream candidate; design from Killzone 2's patch 6005): sys_lwcond waiters in a per-lwcond FIFO (runtime/ppu/kz3_lwcond_fifo.h, a node on the waiter's stack woken by name): signal wakes the oldest, signal_all every waiter queued at the time, signal_to the named thread. Patch 0003's one counting semaphore per lwcond let a thread woken by signal_all re-wait and take a count meant for another waiter, which then slept on (KZ2: FIOS media-thread startup hang). Host test tools/spu/test_lwcond_fifo.sh reproduces the lost wakeup on the old algorithm and passes on the FIFO.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): wait on 1059's per-waiter FIFO, mutex through `lwm_release`/`lwm_acquire`.
+
+diff --git a/runtime/ppu/kz3_lwcond_fifo.h b/runtime/ppu/kz3_lwcond_fifo.h
+new file mode 100644
+index 00000000..44ede30b
+--- /dev/null
++++ b/runtime/ppu/kz3_lwcond_fifo.h
+@@ -0,0 +1,166 @@
++/* KZ3 patch 1059 (upstream candidate; design from Killzone 2's patch 6005): per-waiter FIFO for sys_lwcond.
++ *
++ * A guest lwcond wait parks the calling host thread in a FIFO node that lives on the waiter's stack; a signal
++ * marks the oldest queued node (signal), every node queued at the time (signal_all) or the named thread's node
++ * (signal_to) as woken and pulses one condition variable. lv2 wakes the threads that were queued at the time of
++ * the signal and never one that queued later. The counting semaphore that patch 0003 used instead let a thread
++ * woken by signal_all go straight back to waiting and take the count meant for another waiter, which then slept
++ * on (Killzone 2's FIOS media-thread startup hang; the same code ran here). Platform-neutral so the host test
++ * tools/spu/test_lwcond_fifo.c can build it on Linux with pthreads; ppu_sysprx.cpp uses the Windows half. */
++#ifndef KZ3_LWCOND_FIFO_H
++#define KZ3_LWCOND_FIFO_H
++#include <stdint.h>
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <pthread.h>
++#include <time.h>
++#include <errno.h>
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct kz3_lwc_waiter { struct kz3_lwc_waiter* next; uint32_t tid; volatile int woken; };
++
++struct kz3_lwc_queue {
++#ifdef _WIN32
++    SRWLOCK lock; CONDITION_VARIABLE cv;    /* zero-initialised = SRWLOCK_INIT / CONDITION_VARIABLE_INIT */
++#else
++    pthread_mutex_t lock; pthread_cond_t cv;
++#endif
++    struct kz3_lwc_waiter* head; struct kz3_lwc_waiter* tail;
++    long waiters;                           /* queued nodes (diagnostics) */
++    int inited;
++};
++
++static inline void kz3_lwc_lock(struct kz3_lwc_queue* q)
++{
++#ifdef _WIN32
++    AcquireSRWLockExclusive(&q->lock);
++#else
++    pthread_mutex_lock(&q->lock);
++#endif
++}
++static inline void kz3_lwc_unlock(struct kz3_lwc_queue* q)
++{
++#ifdef _WIN32
++    ReleaseSRWLockExclusive(&q->lock);
++#else
++    pthread_mutex_unlock(&q->lock);
++#endif
++}
++
++/* Once per queue object (idempotent). The sync objects persist across guest create/destroy like the old
++ * semaphore did; kz3_lwc_reset empties the queue for a fresh guest lwcond in the same slot. */
++static inline void kz3_lwc_init(struct kz3_lwc_queue* q)
++{
++    if (q->inited) return;
++#ifdef _WIN32
++    InitializeSRWLock(&q->lock); InitializeConditionVariable(&q->cv);
++#else
++    pthread_condattr_t ca; pthread_condattr_init(&ca);
++    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
++    pthread_mutex_init(&q->lock, NULL); pthread_cond_init(&q->cv, &ca);
++    pthread_condattr_destroy(&ca);
++#endif
++    q->head = q->tail = 0; q->waiters = 0; q->inited = 1;
++}
++static inline void kz3_lwc_reset(struct kz3_lwc_queue* q)
++{
++    kz3_lwc_init(q);
++    kz3_lwc_lock(q); q->head = q->tail = 0; q->waiters = 0; kz3_lwc_unlock(q);
++}
++
++/* Queue the caller's node. Call BEFORE dropping the guest lwmutex, so a signal sent under that mutex finds it. */
++static inline void kz3_lwc_enqueue(struct kz3_lwc_queue* q, struct kz3_lwc_waiter* w, uint32_t tid)
++{
++    w->next = 0; w->tid = tid; w->woken = 0;
++    kz3_lwc_lock(q);
++    if (q->tail) q->tail->next = w; else q->head = w;
++    q->tail = w; q->waiters++;
++    kz3_lwc_unlock(q);
++}
++
++static inline void kz3_lwc_unlink_locked(struct kz3_lwc_queue* q, struct kz3_lwc_waiter* w)
++{
++    struct kz3_lwc_waiter** pp = &q->head; struct kz3_lwc_waiter* prev = 0;
++    while (*pp && *pp != w) { prev = *pp; pp = &(*pp)->next; }
++    if (!*pp) return;
++    *pp = w->next;
++    if (q->tail == w) q->tail = prev;
++    q->waiters--;
++}
++
++/* Block until the node is woken or timeout_ms (< 0 = forever) passes. Returns 1 woken, 0 timed out (the node
++ * is unlinked; a signal that lands first still counts as the wakeup). */
++static inline int kz3_lwc_wait(struct kz3_lwc_queue* q, struct kz3_lwc_waiter* w, int64_t timeout_ms)
++{
++#ifdef _WIN32
++    ULONGLONG deadline = timeout_ms >= 0 ? GetTickCount64() + (ULONGLONG)timeout_ms : 0;
++    AcquireSRWLockExclusive(&q->lock);
++    while (!w->woken) {
++        DWORD ms = INFINITE;
++        if (timeout_ms >= 0) {
++            ULONGLONG now = GetTickCount64();
++            if (now >= deadline) break;
++            ms = (DWORD)((deadline - now) > 0xFFFFFFFEull ? 0xFFFFFFFEu : (deadline - now));
++        }
++        SleepConditionVariableSRW(&q->cv, &q->lock, ms, 0);
++    }
++    int woken = w->woken;
++    if (!woken) kz3_lwc_unlink_locked(q, w);
++    ReleaseSRWLockExclusive(&q->lock);
++    return woken;
++#else
++    struct timespec dl;
++    if (timeout_ms >= 0) {
++        clock_gettime(CLOCK_MONOTONIC, &dl);
++        dl.tv_sec += timeout_ms / 1000; dl.tv_nsec += (timeout_ms % 1000) * 1000000L;
++        if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
++    }
++    pthread_mutex_lock(&q->lock);
++    while (!w->woken) {
++        if (timeout_ms >= 0) { if (pthread_cond_timedwait(&q->cv, &q->lock, &dl) == ETIMEDOUT) break; }
++        else pthread_cond_wait(&q->cv, &q->lock);
++    }
++    int woken = w->woken;
++    if (!woken) kz3_lwc_unlink_locked(q, w);
++    pthread_mutex_unlock(&q->lock);
++    return woken;
++#endif
++}
++
++/* signal (all = 0, to_tid = 0): the oldest queued waiter; signal_all: every waiter queued now; signal_to: the
++ * named thread if it is queued, else the oldest (the old code woke "one waiter, which one not modelled").
++ * Returns how many were woken (0: nobody waiting, lv2 drops the signal). */
++static inline int kz3_lwc_wake(struct kz3_lwc_queue* q, int all, uint32_t to_tid)
++{
++    int n = 0;
++    kz3_lwc_lock(q);
++    struct kz3_lwc_waiter* w = q->head;
++    if (to_tid)
++        for (struct kz3_lwc_waiter* x = q->head; x; x = x->next) if (x->tid == to_tid) { w = x; break; }
++    while (w) {
++        struct kz3_lwc_waiter* nx = w->next;
++        kz3_lwc_unlink_locked(q, w);
++        w->woken = 1; n++;
++        if (!all) break;
++        w = nx;
++    }
++    kz3_lwc_unlock(q);
++    if (n) {
++#ifdef _WIN32
++        WakeAllConditionVariable(&q->cv);
++#else
++        pthread_cond_broadcast(&q->cv);
++#endif
++    }
++    return n;
++}
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 6b4ef916..c447919c 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -408,12 +408,17 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
+  * between the unlock and the wait. r4 is the timeout in microseconds (0 =
+  * forever) and expiry returns ETIMEDOUT (0x8001000B), which callers test.
+  * A signal that races a timeout counts as the wakeup. */
++#ifdef _WIN32
++#include "kz3_lwcond_fifo.h"   /* KZ3 patch 1059 */
++#endif
+ #define LWC_MUTEX  0x00
+ #define LWC_QUEUE  0x04
+ #define LWC_ID_BASE 0x4C000000u
+ #ifdef _WIN32
+ #define LWC_SLOTS 8192u
+-static struct LwcSlot { HANDLE sem; volatile long waiters; } g_lwc[LWC_SLOTS];
++/* KZ3 patch 1059: each waiter is a FIFO node woken by name (runtime/ppu/kz3_lwcond_fifo.h); `sem` is only the
++ * "created" marker now and `waiters` lives in the queue. */
++static struct LwcSlot { HANDLE sem; struct kz3_lwc_queue q; } g_lwc[LWC_SLOTS];
+ static volatile long g_lwc_next = 0;
+ static struct LwcSlot* lwc_slot(uint32_t lwcond)
+ {
+@@ -430,7 +435,7 @@ static void sys_lwcond_create(ppu_context* ctx)
+     long n = _InterlockedIncrement(&g_lwc_next);
+     if ((uint32_t)n > LWC_SLOTS) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005u; return; } /* EAGAIN */
+     struct LwcSlot* sl = &g_lwc[n - 1];
+-    sl->waiters = 0;
++    kz3_lwc_reset(&sl->q);   /* KZ3 patch 1059 */
+     if (!sl->sem) sl->sem = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
+     uint32_t id = LWC_ID_BASE + (uint32_t)n;
+ #else
+@@ -442,32 +447,23 @@ static void sys_lwcond_create(ppu_context* ctx)
+     ctx->gpr[3] = 0;
+ }
+ static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+-static void lwcond_wake(uint32_t lwcond, int all)
++/* KZ3 patch 1059: signal = the oldest queued waiter, signal_all = every waiter queued now, signal_to = that
++ * thread (else the oldest); nobody waiting = lv2 drops it. The shared counting semaphore this replaces let a
++ * thread woken by signal_all re-wait and take a count meant for another waiter (see kz3_lwcond_fifo.h). */
++static void lwcond_wake(uint32_t lwcond, int all, uint32_t to_tid)
+ {
+ #ifdef _WIN32
+     struct LwcSlot* sl = lwc_slot(lwcond);
+     if (!sl || !sl->sem) return;
+-    if (all) {
+-        long n = _InterlockedExchange(&sl->waiters, 0);
+-        if (n > 0) ReleaseSemaphore(sl->sem, n, NULL);
+-        return;
+-    }
+-    for (;;) {
+-        long w = sl->waiters;
+-        if (w <= 0) return;                         /* nobody waiting: lv2 drops it */
+-        if (_InterlockedCompareExchange(&sl->waiters, w - 1, w) == w) {
+-            ReleaseSemaphore(sl->sem, 1, NULL);
+-            return;
+-        }
+-    }
++    kz3_lwc_wake(&sl->q, all, to_tid);
+ #else
+-    (void)lwcond; (void)all;
++    (void)lwcond; (void)all; (void)to_tid;
+ #endif
+ }
+-static void sys_lwcond_signal(ppu_context* ctx)     { lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_all(ppu_context* ctx) { lwcond_wake((uint32_t)ctx->gpr[3], 1); ctx->gpr[3] = 0; }
+-/* signal_to(lwcond, ppu_thread_id): wakes one waiter; which one is not modelled. */
+-static void sys_lwcond_signal_to(ppu_context* ctx)  { lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal(ppu_context* ctx)     { lwcond_wake((uint32_t)ctx->gpr[3], 0, 0); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_all(ppu_context* ctx) { lwcond_wake((uint32_t)ctx->gpr[3], 1, 0); ctx->gpr[3] = 0; }
++/* signal_to(lwcond, ppu_thread_id): wakes that thread if it is waiting, else the oldest waiter (patch 1059). */
++static void sys_lwcond_signal_to(ppu_context* ctx)  { lwcond_wake((uint32_t)ctx->gpr[3], 0, (uint32_t)ctx->gpr[4]); ctx->gpr[3] = 0; }
+ static void sys_lwcond_wait(ppu_context* ctx)
+ {
+     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+@@ -480,25 +476,17 @@ static void sys_lwcond_wait(ppu_context* ctx)
+     if (ms && sl && sl->sem) {
+         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+-        _InterlockedIncrement(&sl->waiters);
++        /* KZ3 patch 1059: queue this thread's node before the lwmutex drops (a signal under the mutex finds
++         * it), then block until a signal names this node or the timeout passes (ETIMEDOUT, node unlinked). */
++        struct kz3_lwc_waiter me;
++        kz3_lwc_enqueue(&sl->q, &me, (uint32_t)ctx->thread_id);
+         vm_write32(lwmutex + LWM_RECUR, 0);
+         vm_write32(lwmutex + LWM_OWNER, 0);
+         ppu_thread_note_block(ctx->thread_id);
+         lwm_release(ms);
+-        DWORD wms = INFINITE;
+-        if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; wms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
+-        if (WaitForSingleObject(sl->sem, wms) == WAIT_TIMEOUT) {
+-            /* Withdraw our registration. If a signaller already took it, its
+-             * count is on the way: consume it and report the wakeup. */
+-            int withdrawn = 0;
+-            for (;;) {
+-                long w = sl->waiters;
+-                if (w <= 0) break;
+-                if (_InterlockedCompareExchange(&sl->waiters, w - 1, w) == w) { withdrawn = 1; break; }
+-            }
+-            if (withdrawn) result = 0x8001000Bu;
+-            else WaitForSingleObject(sl->sem, INFINITE);
+-        }
++        int64_t wms = -1;
++        if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; wms = (int64_t)(m > 0xFFFFFFFEull ? 0xFFFFFFFEu : m); }
++        if (!kz3_lwc_wait(&sl->q, &me, wms)) result = 0x8001000Bu;
+         lwm_acquire(ms, 0);
+         vm_write32(lwmutex + LWM_OWNER, own);
+         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);

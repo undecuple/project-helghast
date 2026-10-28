@@ -1,0 +1,66 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1408,6 +1408,17 @@
+ extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;  /* fwd decl (defined below) */
+ /* Tracks the most recent vm_read32 {addr,value} on this thread, so PPU_WVAL can
+  * report the SOURCE a copied value came from (poison propagation vs true origin). */
++/* KZ3 patch 1020: the per-read diagnostics below used thread-locals, which MinGW GCC turns into
++ * emulated TLS (__emutls_get_address + mcfgthread lookups) -- two to four calls on EVERY guest read.
++ * The level load's byte-wise hashing (lookup2 at 0x000111F8) spent ~70 % of its samples there.
++ * The hot-read spin detectors now run only with PPU_READ_DIAG=1; the PT last-read capture only when
++ * PT is set. A plain cached static, read once. */
++static int s_ppu_read_diag = -1;
++static inline int ppu_read_diag(void)
++{
++    if (__builtin_expect(s_ppu_read_diag < 0, 0)) s_ppu_read_diag = getenv("PPU_READ_DIAG") ? 1 : 0;
++    return s_ppu_read_diag;
++}
+ static PPU_THREAD_LOCAL uint32_t g_last_rd_addr = 0;
+ static PPU_THREAD_LOCAL uint32_t g_last_rd_val  = 0;
+ /* PT=<hex>: persistent high-byte truncation detector. A write8 that turns the word
+@@ -1552,7 +1563,7 @@
+      * Every width shares one window so a byte-at-a-time strcmp is caught as
+      * readily as a word load. */
+     ppu_rwatch_hit((uint32_t)a, 1, __builtin_return_address(0));
+-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
++    if (ppu_read_diag()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+       if ((uint32_t)a==last) { if (++n==200000) {
+           fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%lu guest-fn=0x%08X\n",
+                   (uint32_t)a, vm_base[(uint32_t)a], GetCurrentThreadId(),
+@@ -1561,7 +1572,7 @@
+       else { last=(uint32_t)a; n=0; } }
+     return vm_base[(uint32_t)a]; }
+ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
++    if (ppu_read_diag()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
+     return __builtin_bswap16(v); }
+ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+@@ -1591,7 +1602,7 @@
+         if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
+         if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
+-    g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
++    if (g_pt_val >= 0) { g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v); }
+ #ifdef _WIN32
+     /* PT report: the hunted truncated value is being READ BACK from a slot we saw
+      * get truncated and never restored -> this read (about to free it) is the bug's
+@@ -1643,7 +1654,7 @@
+           for(uint32_t i=0;i<NB;i++) cnt[i]=0; } } }
+     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
+      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
+-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
++    if (ppu_read_diag()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+       if ((uint32_t)a==last) { if (++n==200000) { if (((uint32_t)a & ~0xFFFu) == (VM_HLE_INJECT_BASE + 0x2000u)) {
+               /* A spin on the GCM control block is a fence/FIFO wait. Print the
+                * WHOLE block: put vs get says whether the RSX side is behind or
+@@ -1682,7 +1693,7 @@
+ #ifdef VM_SAMPLE_READS
+     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
+ #endif
+-    { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
++    if (ppu_read_diag()) { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
+       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX) guest-fn=0x%08X\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v), ppu_prof_resolve_host(__builtin_return_address(0))); n=0;
+ #ifdef _WIN32
+         { static int64_t wa=-2; if(wa==-2){const char*e=getenv("PPU_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}

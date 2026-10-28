@@ -1,0 +1,25 @@
+KZ3 patch 2104 (SPU pass 108, v0.18.0 rebase; upstream candidate): the FIFO walker's main decode takes the new-style
+JUMP (offset | 1, RPCS3's NEW_JUMP_CMD) as a JUMP. v0.18.0's resync scan and park scans already counted it, but the
+main loop decoded the word as a method header (seen in another port, 2026-10-26: junk registers). A method header never
+has bit 0 set, and IO offsets fit in 29 bits, so the word is rewritten to the old form (0x20000000 | offset) before
+the decode. The flip word 0xFEADxxxx is excluded: buffer 1's (0xFEAD0101) has bit 0 set as well, and without the
+exclusion KZ3 froze at its first flip on buffer 1 (SPU pass 108 part 3, run spu-r108-k0: "FIFO resync (unmapped-JUMP)
+0x000A0550", label 0x4A stuck). KZ3 emits old-style jumps only.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index cecf8265..06aeb683 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2973,6 +2973,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             s_fifo_getoff = off;
+             continue;
+         }
++        /* KZ3 patch 2104 (upstream candidate): the new-style JUMP, offset | 1 (RPCS3's NEW_JUMP_CMD; a method header
++         * never has bit 0 set), goes the old JUMP's way. The resync scan and the park scans already took it; this
++         * loop decoded it as a method header and fed junk registers (seen in another port on v0.18.0). IO offsets fit in 29 bits.
++         * Not the 0xFEADxxxx flip word handled below: buffer 1's (0xFEAD0101) has bit 0 set too (SPU pass 108 part 3: KZ3
++         * froze at its first flip on buffer 1, a "JUMP" to unmapped 0x1EAD0100 and a resync). */
++        if ((w & 3u) == 1u && (w & 0xFFFF0000u) != 0xFEAD0000u) w = 0x20000000u | (w & 0x1FFFFFFCu);
+         u32 type = w >> 29;
+         /* The walker is reading something other than the park it waited on:
+          * it has left it, by the patched word (a JUMP elsewhere, or commands

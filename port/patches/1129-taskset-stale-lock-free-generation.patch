@@ -1,0 +1,67 @@
+KZ3 patch 1129 (SPU pass 108, v0.18.0 rebase): ts_stale reads the taskset generation lock-free.
+
+Lock order after the v0.18.0 rebase (runtime/spu/spu_workload.c):
+  - WAIT_SIGNAL (patch 1066/1067) holds s_sig_lock while it re-tests the SIGNALLED bit and ts_stale();
+  - spu_taskset_task_exited (1022/1030) takes ts_lock, then the lock line (spu_lockline_lock, every stripe: 1056);
+  - upstream 2913a317's coherent line watch runs spu_taskset_wake_written from a store to the watched SIGNALLED line
+    while that store holds its lock-line stripe, and the callback takes s_sig_lock.
+ts_stale() took ts_lock, so the three made the cycle s_sig_lock -> ts_lock -> lock line -> s_sig_lock: a parked task
+re-testing, a task exiting and a PPU/SPU store to the taskset's signalled line could deadlock (the Killzone 2 port's
+1023/#388 report is the same family). Now ts_stale takes no lock: a tracking slot's ea is published once with a release
+store (slots are never released) and gen only grows (cellSpursJoinTaskset bumps it under ts_lock with a release
+store), so acquire loads give a consistent answer; a bump just after the load is seen at the waiter's next check (a
+1 s timed wait), as it was under the lock. The order left: ts_lock -> lock line -> s_sig_lock, and nothing takes
+ts_lock or the lock line while holding s_sig_lock.
+
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index e6db40b5..fdcc54c1 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -518,7 +518,8 @@ static _Thread_local int s_ts_held;   /* this thread holds s_ts_lock */
+ static uint8_t* ts_running(uint32_t taskset_ea)
+ {
+     for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
+-    for (int i = 0; i < TS_TRACK; i++) if (!s_ts_run[i].ea) { s_ts_run[i].ea = taskset_ea; return s_ts_run[i].running; }
++    for (int i = 0; i < TS_TRACK; i++)
++        if (!s_ts_run[i].ea) { __atomic_store_n(&s_ts_run[i].ea, taskset_ea, __ATOMIC_RELEASE); return s_ts_run[i].running; }   /* 1129 */
+     return NULL;
+ }
+ static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
+@@ -547,17 +548,23 @@ static int ts_cutoff_exit(void) { static int v = -1; if (v < 0) { const char* e
+ static int ts_join_old(void) { static int v = -1; if (v < 0) { const char* e = getenv("KZ3_JOIN_TASKSET_OLD"); v = (e && *e == '1'); } return v; }
+ static int ts_find(uint32_t taskset_ea)
+ {
+-    for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return i;
++    for (int i = 0; i < TS_TRACK; i++) if (__atomic_load_n(&s_ts_run[i].ea, __ATOMIC_ACQUIRE) == taskset_ea) return i;   /* 1129 */
+     return -1;
+ }
+-/* 1 when the calling task thread belongs to an older generation of taskset_ea (call under ts_lock). */
+-static int ts_stale_locked(uint32_t taskset_ea)
++/* 1 when the calling task thread belongs to an older generation of taskset_ea.
++ * KZ3 patch 1129: lock-free. WAIT_SIGNAL calls it holding s_sig_lock; taking ts_lock there closed the cycle
++ * s_sig_lock -> ts_lock (here) -> lock line (spu_taskset_task_exited) -> s_sig_lock (upstream 2913a317: a store to a
++ * watched SIGNALLED line runs spu_taskset_wake_written under its lock-line stripe). A tracking slot's ea is written
++ * once (slots are never released) and gen only grows (cellSpursJoinTaskset, under ts_lock), so an acquire load of
++ * each is a consistent answer; a generation bumped just after the load is seen at the waiter's next check (the wait
++ * is a 1 s timed wait), as it was with the lock. */
++static int ts_stale(uint32_t taskset_ea)
+ {
+     if (ts_join_old() || !taskset_ea || t_task_ts != taskset_ea) return 0;
+     int i = ts_find(taskset_ea);
+-    return i >= 0 && s_ts_run[i].gen != t_task_gen;
++    return i >= 0 && __atomic_load_n(&s_ts_run[i].gen, __ATOMIC_ACQUIRE) != t_task_gen;
+ }
+-static int ts_stale(uint32_t taskset_ea) { ts_lock(); int r = ts_stale_locked(taskset_ea); ts_unlock(); return r; }
++static int ts_stale_locked(uint32_t taskset_ea) { return ts_stale(taskset_ea); }
+ static void ts_parked_add(uint32_t taskset_ea, int d)
+ {
+     if (ts_join_old()) return;
+@@ -596,7 +603,7 @@ int spu_taskset_join_wait(uint32_t taskset_ea)
+         }
+         if (busy <= 0) {
+             if (i >= 0) {                       /* new generation: older tasks are cut off */
+-                s_ts_run[i].gen++;
++                __atomic_store_n(&s_ts_run[i].gen, s_ts_run[i].gen + 1u, __ATOMIC_RELEASE);   /* 1129: ts_stale reads it lock-free */
+                 s_ts_run[i].parked = 0;
+                 memset(s_ts_run[i].running, 0, sizeof s_ts_run[i].running);
+             }

@@ -1,0 +1,466 @@
+KZ3 patch 2047 (RSX pass 47): draw payload cache for the live renderer's vertex fetch.
+LD_VTX_CACHE=0|1|verify (default LD_VTX_CACHE_DEFAULT): a draw whose vertex payload and topology indices come only
+from guest memory no tracked writer touched since they were fetched replays the bytes it uploaded then (ring memcpy)
+instead of reading the indices, remapping, fetching and rebuilding the topology. Key = the full fetch state of the
+draw (primitive, layout, per used attribute type/size/stride/frequency/offset/location and the current value of the
+disabled ones, base offset/index, divider mask, index array, restart, the draw's batches), compared word by word.
+Validity per source span (index range, each attribute's element range from the fetch plan): no tracked write this
+frame (page bitmap), none since the fill (per-page frame stamps set at the flip), and a sampled content hash (9 x 16
+bytes) unchanged, against untracked writers replacing a whole buffer. Local memory only unless LD_VTX_CACHE_MAIN=1;
+filled at the second sight of a key; an entry invalidated twice by tracked writes stays uncached; budget
+LD_VTX_CACHE_MB (256). verify = fetch every hit as before and compare byte for byte ([vtx-cache-bad]). Statistics:
+[vtx-cache] every 256 frames with RSX_PERF=1. Off under the diagnostic dumps that read the CPU-side payload.
+Pass 49: LD_VTX_CACHE_FULL=1 (default) validates a hit with a full compare of the source bytes against a copy kept at
+the fill (spans merged per location; the copy counts against the budget); 0 = the round-47 sampled hash.
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -48,6 +48,7 @@
+ int  rsx_live_draw_host_aa_active(void) { return 0; }
+ u32  rsx_live_draw_debug_host_aa_passes(void) { return 0; }
+ void rsx_live_draw_debug_cond_render_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] = 0; }
++void rsx_live_draw_debug_vc_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] = 0; }   /* patch 2047 */
+ u32  rsx_live_draw_report_value(u32 off, u32 dflt) { (void)off; return dflt; }
+ void rsx_live_draw_debug_report_readback_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] = 0; }
+ void rsx_live_draw_note_guest_write_async(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+@@ -2807,6 +2808,8 @@
+ #define LD_TD_WORDS 2048u   /* 64 KB pages over a 4 GB offset space, 32 pages per word, per location */
+ static volatile LONG g_ld_td[2][LD_TD_WORDS];   /* pages written since the last flip (any thread) */
+ static u32 g_ld_td_prev[2][LD_TD_WORDS];        /* pages written during the previous frame (walker) */
++static u32 g_ld_pg_stamp[2][LD_TD_WORDS * 32u];  /* patch 2047: per 64 KB page, 1 + the last frame a tracked write hit it */
++static void ld_vc_stat_print(void);              /* patch 2047 */
+ static int g_ld_tex_hash_span = -1;
+ static struct { u64 hashes, skipped, changes, tracked, untracked, hashed_bytes, flip_flags, dyn_forced, wr_unchanged; } g_ld_th;
+ 
+@@ -2916,6 +2919,8 @@
+             u32 w = 0;
+             if (g_ld_td[l][i]) { w = (u32)InterlockedExchange(&g_ld_td[l][i], 0); any = 1; }
+             g_ld_td_prev[l][i] = w;
++            for (u32 b = 0; w && b < 32u; b++)   /* patch 2047: last frame (+1) each page was written in */
++                if (w & (1u << b)) g_ld_pg_stamp[l][i * 32u + b] = g_ld_frames + 1u;
+         }
+     if (any) {
+         for (u32 i = 0; i < g.n_textures; i++) {
+@@ -2929,6 +2934,7 @@
+                 ld_td_test(g_ld_td_prev[e->location], e->offset, e->span)) { e->written = 1; g_ld_th.flip_flags++; }
+         }
+     }
++    if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) ld_vc_stat_print();   /* patch 2047 */
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) {
+         fprintf(stderr, "[tex-hash] span=%d big=%u frame=%u hashes=%llu skipped=%llu bytes=%.1fMB changes=%llu tracked=%llu"
+                         " untracked=%llu flip-flags=%llu wr-unchanged=%llu dyn-forced=%llu inplace=%llu b8-direct=%llu"
+@@ -7746,6 +7752,341 @@
+     }
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 2047: draw payload cache (LD_VTX_CACHE=0|1|verify, default LD_VTX_CACHE_DEFAULT).
++ * A draw whose vertex payload and topology indices come only from guest memory that no tracked writer touched
++ * since they were fetched replays the bytes it uploaded then instead of reading the indices, remapping, fetching
++ * and rebuilding the topology again. Key: the full fetch state of the draw (primitive, the vertex program's
++ * layout, per used attribute type/size/stride/frequency/offset/location and the current value of disabled ones,
++ * base offset/index, divider mask, index array, restart, the draw's array/index batches); compared word by word.
++ * Validity per source span (the index range and each attribute's element range, from the fetch plan): no tracked
++ * write this frame (g_ld_td), none since the frame the entry was filled (g_ld_pg_stamp), and a sampled content
++ * hash (16 bytes at 9 spread positions) unchanged, which catches an untracked writer replacing a whole buffer
++ * (the level streamer's PPU stores, pass 46: [tex-untracked]). Pass 49: with LD_VTX_CACHE_FULL=1 (default) the
++ * sampled hash is replaced by a full compare of the source bytes against a copy kept at the fill (spans merged per
++ * location), which also catches a PPU ring rewritten outside the samples. Local memory only unless LD_VTX_CACHE_MAIN=1.
++ * An entry is filled at the second sight of its key; one invalidated twice by tracked writes stays uncached
++ * (dynamic). verify: every hit is fetched as before and compared byte for byte ([vtx-cache-bad]).
++ * Budget LD_VTX_CACHE_MB (default 256). Off for the diagnostic dumps (RSX_DRAW_CSV, LD_DRAW_INPUTS,
++ * LD_DRAW_DUMP, RSX_A010_GEOM) that read the CPU-side payload of every draw.
++ * -----------------------------------------------------------------------*/
++#define LD_VTX_CACHE_DEFAULT 0
++#define LD_VC_SLOTS 16384u
++#define LD_VC_KEY_MAX 1200u
++#define LD_VC_SPANS 17u
++typedef struct { u32 loc, off, len; u64 sh; } ld_vc_span;
++typedef struct {
++    u64 h; u32* key; u32 key_n;
++    u8 state;          /* 0 empty, 1 seen (no data), 2 filled */
++    u8 dyn;            /* invalidated by tracked writes (2 = never filled again); 3 = a source span is in main
++                        * memory without LD_VTX_CACHE_MAIN (the key holds the locations): never again */
++    u8 n_spans, indexed;
++    u32 frame;         /* g_ld_frames when filled */
++    u32 n_verts, n_source_refs, n_tri, vb_bytes, ib_bytes;
++    u8* data;          /* vb_bytes of payload, then ib_bytes of u32 indices */
++    ld_vc_span spans[LD_VC_SPANS];
++    u8 n_cmp;          /* pass 49: the spans merged per location (overlaps and gaps < 256 bytes joined) */
++    ld_vc_span cmp[LD_VC_SPANS];
++    u8* src;           /* pass 49: a copy of the source bytes of every cmp span, compared in full on a hit */
++    u32 src_bytes;
++} ld_vc_entry;
++static ld_vc_entry* g_vc;
++static u32 g_vc_key[LD_VC_KEY_MAX];
++static u64 g_vc_bytes;
++static struct { u64 draws, hits, hit_verts, miss_verts, seen, filled, inval_tracked, inval_sample, inel_main,
++                inel_main_verts, inel_inline, inel_other, inel_other_verts, nostore, full, dyn_skip,
++                verify_ok, verify_bad, evict, cmp_bytes; } g_vc_st;
++
++static void write_topology_indices(u32 prim, u32* indices);
++static int ld_vc_full(void);   /* pass 49 */
++
++static int ld_vc_mode(void)   /* 0 off, 1 on, 2 verify */
++{
++    static int mode = -1;
++    if (mode < 0) {
++        const char* e = getenv("LD_VTX_CACHE");
++        mode = e ? (!strcmp(e, "verify") ? 2 : atoi(e) != 0) : LD_VTX_CACHE_DEFAULT;
++        if (getenv("RSX_DRAW_CSV") || getenv("LD_DRAW_INPUTS") || getenv("LD_DRAW_DUMP") || getenv("RSX_A010_GEOM"))
++            mode = 0;
++        fprintf(stderr, "[vtx-cache] mode=%d (LD_VTX_CACHE=%s) main=%d mb=%s full=%d\n", mode, e ? e : "unset",
++                getenv("LD_VTX_CACHE_MAIN") ? 1 : 0, getenv("LD_VTX_CACHE_MB") ? getenv("LD_VTX_CACHE_MB") : "256",
++                ld_vc_full());
++    }
++    return mode;
++}
++
++static u64 ld_vc_budget(void)
++{
++    static u64 b = 0;
++    if (!b) { const char* e = getenv("LD_VTX_CACHE_MB"); b = (u64)(e ? atoi(e) : 256) << 20; if (!b) b = 1; }
++    return b;
++}
++
++/* The draw's fetch key into g_vc_key; 0 = not cacheable (inline vertices, too many batches). */
++static u32 ld_vc_key(u32 prim, const rsx_vertex_layout_plan* layout)
++{
++    if (dc.inl || dc.inl_bytes) { g_vc_st.inel_inline++; return 0; }
++    if (2u * (dc.n_arr + dc.n_idx) + 16u * 10u + 32u > LD_VC_KEY_MAX) { g_vc_st.inel_other++; return 0; }
++    u32 n = 0;
++    u32* k = g_vc_key;
++    k[n++] = 0x2047u; k[n++] = prim; k[n++] = layout->mask; k[n++] = layout->stride; k[n++] = layout->count;
++    k[n++] = rsx_dsp_vertex_data_base_offset(&g.rsx);
++    k[n++] = rsx_dsp_vertex_data_base_index(&g.rsx);
++    k[n++] = rsx_dsp_reg(&g.rsx, 0x1FC0);
++    for (u32 slot = 0; slot < layout->count; slot++) {
++        const u32 attr = layout->attrs[slot];
++        rsx_dsp_vertex_attr d; rsx_dsp_get_vertex_attr(&g.rsx, attr, &d);
++        k[n++] = attr; k[n++] = d.type; k[n++] = d.size; k[n++] = d.stride; k[n++] = d.frequency;
++        k[n++] = d.offset; k[n++] = d.location;
++        if (!d.type || !d.size) {
++            float dv[4]; rsx_dsp_vertex_default(&g.rsx, attr, dv);
++            memcpy(k + n, dv, 16); n += 4;
++        }
++    }
++    k[n++] = dc.n_arr;
++    for (u32 i = 0; i < dc.n_arr; i++) { k[n++] = dc.arr[i].first; k[n++] = dc.arr[i].count; }
++    k[n++] = dc.n_idx;
++    if (dc.n_idx) {
++        rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
++        k[n++] = ia.location; k[n++] = ia.offset; k[n++] = (u32)ia.is_u32;
++        static int no_restart = -1;   /* pass 49: read once (a getenv per indexed draw cost the walker time) */
++        if (no_restart < 0) no_restart = getenv("RSX_NO_RESTART") != NULL;
++        const int ren = !no_restart && rsx_dsp_restart_index_enabled(&g.rsx, ia.is_u32);
++        k[n++] = (u32)ren; k[n++] = ren ? rsx_dsp_restart_index(&g.rsx) : 0u;
++        for (u32 i = 0; i < dc.n_idx; i++) { k[n++] = dc.idx[i].first; k[n++] = dc.idx[i].count; }
++    }
++    return n;
++}
++
++static u64 ld_vc_sample(u32 loc, u32 off, u32 len)
++{
++    const u8* p = guest_ptr(loc, off, len);
++    if (!p) return 0;
++    if (len <= 160u) return fnv1a(p, len, 1469598103934665603ull);
++    u64 h = 1469598103934665603ull ^ len;
++    for (u32 i = 0; i < 9u; i++) h = fnv1a(p + (u64)(len - 16u) * i / 8u, 16u, h);
++    return h;
++}
++
++/* Pass 49: LD_VTX_CACHE_FULL=1 (default) validates a hit with a full compare of its sources against the copy kept
++ * at the fill (a PPU ring rewritten outside the sampled bytes drew stale quads in level 2, pass 48); 0 = the
++ * sampled hash of pass 47. */
++static int ld_vc_full(void)
++{
++    static int f = -1;
++    if (f < 0) { const char* e = getenv("LD_VTX_CACHE_FULL"); f = e ? atoi(e) != 0 : 1; }
++    return f;
++}
++
++/* Pass 49: e->cmp = e->spans merged per location (sorted; overlapping or < 256 bytes apart joined): interleaved
++ * attributes of one buffer share one compare. */
++static void ld_vc_merge(ld_vc_entry* e)
++{
++    ld_vc_span t[LD_VC_SPANS];
++    u32 n = e->n_spans;
++    memcpy(t, e->spans, n * sizeof t[0]);
++    for (u32 i = 1; i < n; i++)
++        for (u32 j = i; j > 0 && (t[j].loc < t[j - 1].loc || (t[j].loc == t[j - 1].loc && t[j].off < t[j - 1].off)); j--) {
++            ld_vc_span x = t[j]; t[j] = t[j - 1]; t[j - 1] = x;
++        }
++    u32 m = 0;
++    for (u32 i = 0; i < n; i++) {
++        if (m && e->cmp[m - 1].loc == t[i].loc && (u64)t[i].off <= (u64)e->cmp[m - 1].off + e->cmp[m - 1].len + 256u) {
++            const u64 end = (u64)t[i].off + t[i].len, cend = (u64)e->cmp[m - 1].off + e->cmp[m - 1].len;
++            if (end > cend) e->cmp[m - 1].len = (u32)(end - e->cmp[m - 1].off);
++        } else e->cmp[m++] = t[i];
++    }
++    e->n_cmp = (u8)m;
++}
++
++static int ld_vc_span_written(const ld_vc_span* sp, u32 since_frame)
++{
++    if (ld_td_test((const u32*)g_ld_td[sp->loc], sp->off, sp->len)) return 1;
++    const u64 end = (u64)sp->off + sp->len - 1u;
++    const u32 p1 = (u32)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
++    for (u32 pg = sp->off >> 16; pg <= p1; pg++)
++        if (g_ld_pg_stamp[sp->loc][pg] > since_frame) return 1;   /* stamp = frame + 1 of the write */
++    return 0;
++}
++
++static void ld_vc_drop(ld_vc_entry* e)
++{
++    if (e->data) { g_vc_bytes -= (u64)e->vb_bytes + e->ib_bytes; free(e->data); e->data = NULL; }
++    if (e->src) { g_vc_bytes -= e->src_bytes; free(e->src); e->src = NULL; e->src_bytes = 0; }
++    if (e->state == 2) e->state = 1;
++}
++
++/* Walker, before the fetch. Returns the filled, still valid entry (a hit), else NULL; *slot = the entry to fill
++ * after the fetch (NULL = do not fill). */
++static ld_vc_entry* ld_vc_lookup(u32 prim, const rsx_vertex_layout_plan* layout, ld_vc_entry** slot)
++{
++    *slot = NULL;
++    g_vc_st.draws++;
++    const u32 n = ld_vc_key(prim, layout);
++    if (!n) return NULL;
++    if (!g_vc) { g_vc = (ld_vc_entry*)calloc(LD_VC_SLOTS, sizeof(ld_vc_entry)); if (!g_vc) return NULL; }
++    const u64 h = fnv1a(g_vc_key, n * 4u, 1469598103934665603ull);
++    ld_vc_entry* e = &g_vc[(h ^ (h >> 32)) & (LD_VC_SLOTS - 1u)];
++    if (e->state && (e->h != h || e->key_n != n || memcmp(e->key, g_vc_key, n * 4u))) {
++        ld_vc_drop(e); free(e->key); memset(e, 0, sizeof(*e)); g_vc_st.evict++;
++    }
++    if (!e->state) {
++        e->key = (u32*)malloc(n * 4u);
++        if (!e->key) return NULL;
++        memcpy(e->key, g_vc_key, n * 4u); e->key_n = n; e->h = h; e->state = 1; g_vc_st.seen++;
++        return NULL;   /* filled at the second sight */
++    }
++    if (e->state == 2) {
++        int bad = 0;
++        for (u32 i = 0; i < e->n_spans && !bad; i++)
++            if (ld_vc_span_written(&e->spans[i], e->frame)) bad = 1;
++        if (bad) { g_vc_st.inval_tracked++; if (e->dyn < 2) e->dyn++; ld_vc_drop(e); }
++        else if (ld_vc_full()) {   /* pass 49: the whole source, byte for byte */
++            const u8* c = e->src;
++            for (u32 i = 0; i < e->n_cmp && !bad; i++) {
++                const u8* p = guest_ptr(e->cmp[i].loc, e->cmp[i].off, e->cmp[i].len);
++                if (!p || memcmp(p, c, e->cmp[i].len)) bad = 1;
++                c += e->cmp[i].len; g_vc_st.cmp_bytes += e->cmp[i].len;
++            }
++            if (bad) { g_vc_st.inval_sample++; ld_vc_drop(e); }
++        } else {
++            for (u32 i = 0; i < e->n_spans && !bad; i++)
++                if (ld_vc_sample(e->spans[i].loc, e->spans[i].off, e->spans[i].len) != e->spans[i].sh) bad = 1;
++            if (bad) { g_vc_st.inval_sample++; ld_vc_drop(e); }
++        }
++        if (!bad) { g_vc_st.hits++; g_vc_st.hit_verts += e->n_verts; return e; }
++    }
++    if (e->dyn == 3) { g_vc_st.inel_main++; return NULL; }
++    if (e->dyn >= 2) { g_vc_st.dyn_skip++; return NULL; }
++    *slot = e;
++    return NULL;
++}
++
++/* Walker, after a fetch whose key went to `e`: the source spans, or 0 when one is not cacheable. */
++static int ld_vc_spans(ld_vc_entry* e)
++{
++    static int main_ok = -1;   /* pass 49: read once */
++    if (main_ok < 0) main_ok = getenv("LD_VTX_CACHE_MAIN") != NULL;
++    u32 ns = 0;
++    if (dc.n_idx) {
++        rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
++        const u32 esz = ia.is_u32 ? 4u : 2u;
++        u64 lo = ~0ull, hi = 0;
++        for (u32 i = 0; i < dc.n_idx; i++) {
++            if (!dc.idx[i].count) continue;
++            const u64 a = (u64)ia.offset + (u64)dc.idx[i].first * esz, b = a + (u64)dc.idx[i].count * esz;
++            if (a < lo) lo = a;
++            if (b > hi) hi = b;
++        }
++        if (hi > lo) {
++            if (hi > 0x100000000ull || ia.location > 1u) return 0;
++            e->spans[ns].loc = ia.location; e->spans[ns].off = (u32)lo; e->spans[ns].len = (u32)(hi - lo); ns++;
++        }
++    }
++    for (u32 slot = 0; slot < dc.layout.count; slot++) {
++        const rsx_vertex_fetch_attr* f = &dc.fetch_plan.attr[dc.layout.attrs[slot]];
++        if (!f->desc.type || !f->desc.size) continue;
++        if (!f->stable_base || f->desc.location > 1u || ns >= LD_VC_SPANS) return 0;
++        const u64 a = (u64)dc.fetch_plan.base_offset + f->desc.offset + (u64)f->stable_first * f->stride;
++        const u64 b = (u64)dc.fetch_plan.base_offset + f->desc.offset + (u64)f->stable_last * f->stride + f->elem_size;
++        if (b > 0x100000000ull || b <= a) return 0;
++        e->spans[ns].loc = f->desc.location; e->spans[ns].off = (u32)a; e->spans[ns].len = (u32)(b - a); ns++;
++    }
++    for (u32 i = 0; i < ns; i++)
++        if (e->spans[i].loc == 1u && !main_ok) return -1;
++    for (u32 i = 0; i < ns; i++) {
++        if (ld_td_test((const u32*)g_ld_td[e->spans[i].loc], e->spans[i].off, e->spans[i].len)) return 0;
++        e->spans[i].sh = ld_vc_sample(e->spans[i].loc, e->spans[i].off, e->spans[i].len);
++    }
++    e->n_spans = (u8)ns;
++    return 1;
++}
++
++/* Walker, after the fetch and topology of a draw whose key went to `e` (fill) or that hit `e` in verify mode
++ * (compare). vb = the fetched payload; the indices are written here (into `ib_out`, the ring). */
++static void ld_vc_after_fetch(ld_vc_entry* e, int verify, u32 prim, const void* vb, u32 vb_bytes, u32 ib_bytes,
++                              u32 n_tri, int indexed, u32* ib_out)
++{
++    if (!verify) {   /* classify first: a draw that cannot be cached costs no copy */
++        const int sp = ld_vc_spans(e);
++        if (sp <= 0) {
++            if (sp < 0) { g_vc_st.inel_main_verts += dc.n_verts; e->dyn = 3; }
++            else { g_vc_st.nostore++; g_vc_st.inel_other_verts += dc.n_verts; }
++            if (indexed) write_topology_indices(prim, ib_out);
++            return;
++        }
++    }
++    u8* buf = (u8*)malloc((size_t)vb_bytes + ib_bytes + 1u);
++    if (!buf) { if (indexed) write_topology_indices(prim, ib_out); return; }
++    memcpy(buf, vb, vb_bytes);
++    if (indexed) { write_topology_indices(prim, (u32*)(buf + vb_bytes)); memcpy(ib_out, buf + vb_bytes, ib_bytes); }
++    if (verify) {
++        const int same = e->vb_bytes == vb_bytes && e->ib_bytes == ib_bytes && e->n_tri == n_tri &&
++                         e->indexed == (u8)indexed && !memcmp(e->data, buf, (size_t)vb_bytes + ib_bytes);
++        if (same) { g_vc_st.verify_ok++; free(buf); return; }
++        static u32 nbad = 0;
++        g_vc_st.verify_bad++;
++        if (++nbad <= 32u || (nbad & 1023u) == 0)
++            fprintf(stderr, "[vtx-cache-bad] n=%u frame=%u filled=%u prim=%u verts=%u/%u tri=%u/%u vb=%u/%u ib=%u/%u"
++                            " span0=%u:0x%08X+%u spans=%u\n", nbad, g_ld_frames, e->frame, prim, e->n_verts,
++                    dc.n_verts, e->n_tri, n_tri, e->vb_bytes, vb_bytes, e->ib_bytes, ib_bytes, e->spans[0].loc,
++                    e->spans[0].off, e->spans[0].len, e->n_spans);
++        ld_vc_drop(e);
++    }
++    if (verify) {
++        const int sp = ld_vc_spans(e);
++        if (sp <= 0) {
++            if (sp < 0) { g_vc_st.inel_main_verts += dc.n_verts; e->dyn = 3; }
++            else { g_vc_st.nostore++; g_vc_st.inel_other_verts += dc.n_verts; }
++            free(buf); return;
++        }
++    }
++    u32 src_bytes = 0;
++    if (ld_vc_full()) { ld_vc_merge(e); for (u32 i = 0; i < e->n_cmp; i++) src_bytes += e->cmp[i].len; }
++    if (g_vc_bytes + vb_bytes + ib_bytes + src_bytes > ld_vc_budget()) { g_vc_st.full++; free(buf); return; }
++    ld_vc_drop(e);
++    if (ld_vc_full()) {   /* pass 49: the source copy for the full compare */
++        u8* src = (u8*)malloc((size_t)src_bytes + 1u);
++        if (!src) { free(buf); return; }
++        u8* c = src;
++        for (u32 i = 0; i < e->n_cmp; i++) {
++            const u8* p = guest_ptr(e->cmp[i].loc, e->cmp[i].off, e->cmp[i].len);
++            if (!p) { free(src); free(buf); return; }
++            memcpy(c, p, e->cmp[i].len); c += e->cmp[i].len;
++        }
++        e->src = src; e->src_bytes = src_bytes; g_vc_bytes += src_bytes;
++    }
++    e->data = buf; e->vb_bytes = vb_bytes; e->ib_bytes = ib_bytes; e->n_tri = n_tri; e->indexed = (u8)indexed;
++    e->n_verts = dc.n_verts; e->n_source_refs = dc.n_source_refs; e->frame = g_ld_frames; e->state = 2;
++    g_vc_bytes += (u64)vb_bytes + ib_bytes;
++    g_vc_st.filled++;
++}
++
++/* Host tests (patch 2047): hits, filled, inval-tracked, inval-sample, verify-ok, verify-bad. */
++void rsx_live_draw_debug_vc_stats(u64 out[6])
++{
++    out[0] = g_vc_st.hits; out[1] = g_vc_st.filled; out[2] = g_vc_st.inval_tracked; out[3] = g_vc_st.inval_sample;
++    out[4] = g_vc_st.verify_ok; out[5] = g_vc_st.verify_bad;
++}
++
++static void ld_vc_stat_print(void)
++{
++    if (!ld_vc_mode() && !g_vc_st.draws) return;
++    fprintf(stderr, "[vtx-cache] frame=%u mode=%d draws=%llu hits=%llu hit-verts=%llu miss-verts=%llu seen=%llu "
++                    "filled=%llu inval-tracked=%llu inval-sample=%llu main=%llu/%llu inline=%llu other=%llu nostore=%llu/%llu "
++                    "full=%llu dyn-skip=%llu evict=%llu verify=%llu/%llu bytes=%.1fMB full-cmp=%d cmp=%.1fMB\n",
++            g_ld_frames, ld_vc_mode(), (unsigned long long)g_vc_st.draws, (unsigned long long)g_vc_st.hits,
++            (unsigned long long)g_vc_st.hit_verts, (unsigned long long)g_vc_st.miss_verts,
++            (unsigned long long)g_vc_st.seen, (unsigned long long)g_vc_st.filled,
++            (unsigned long long)g_vc_st.inval_tracked, (unsigned long long)g_vc_st.inval_sample,
++            (unsigned long long)g_vc_st.inel_main, (unsigned long long)g_vc_st.inel_main_verts,
++            (unsigned long long)g_vc_st.inel_inline, (unsigned long long)g_vc_st.inel_other,
++            (unsigned long long)g_vc_st.nostore, (unsigned long long)g_vc_st.inel_other_verts,
++            (unsigned long long)g_vc_st.full, (unsigned long long)g_vc_st.dyn_skip, (unsigned long long)g_vc_st.evict,
++            (unsigned long long)g_vc_st.verify_ok, (unsigned long long)g_vc_st.verify_bad,
++            (double)g_vc_bytes / 1048576.0, ld_vc_full(), (double)g_vc_st.cmp_bytes / 1048576.0);
++}
++
+ static const float* dc_vertex_attr(
+     u32 vertex, u32 attr, float fallback[4])
+ {
+@@ -10124,8 +10465,17 @@
+ #endif
+     LDW_ADD(RSX_PERF_W_D_PRE_T, pre_t0);
+     LDW_T0(vtx_t0);
+-    if (ld_vertex_compact_payload()) {
++    ld_vc_entry* vc_hit = NULL; ld_vc_entry* vc_fill = NULL; int vc_verify = 0;   /* patch 2047 */
++    if (ld_vertex_compact_payload() && ld_vc_mode()) {
++        vc_hit = ld_vc_lookup(prim, &used_layout, &vc_fill);
++        if (vc_hit && ld_vc_mode() == 2) { vc_fill = vc_hit; vc_hit = NULL; vc_verify = 1; }
++    }
++    if (vc_hit) {   /* patch 2047: replay the bytes uploaded when the entry was filled */
++        dc.n_verts = vc_hit->n_verts; dc.n_source_refs = vc_hit->n_source_refs;
++        dc.layout = used_layout; dc.fetch_ok = 1;
++    } else if (ld_vertex_compact_payload()) {
+         fetch_batches_hoisted(&used_layout, 1);
++        if (vc_fill && !vc_verify && dc.fetch_ok) g_vc_st.miss_verts += dc.n_verts;
+     } else if (ld_vertex_hoist_fetch()) {
+         rsx_vertex_layout_plan legacy_layout;
+         ld_layout_plan_get(0xFFFFu, &legacy_layout);
+@@ -10145,11 +10495,12 @@
+     /* Preserve validated occurrence order while allowing repeated compact
+      * vertex references to share one fetched and uploaded payload. */
+     int indexed = 0;
+-    if (!rsx_vertex_topology_plan(prim, dc.refs_remapped, &indexed)) {
++    if (vc_hit) indexed = vc_hit->indexed;   /* patch 2047 */
++    else if (!rsx_vertex_topology_plan(prim, dc.refs_remapped, &indexed)) {
+         g_ld_stats.group_drop_primitive++;
+         return;
+     }
+-    u32 n_tri = indexed
++    u32 n_tri = vc_hit ? vc_hit->n_tri : indexed
+         ? topology_index_count(prim)
+         : dc.n_source_refs - dc.n_source_refs % 3;
+ 
+@@ -10158,12 +10509,12 @@
+         return;
+     }
+ 
+-    live_a010_geom_trace(prim, n_tri);
++    if (!vc_hit) live_a010_geom_trace(prim, n_tri);   /* patch 2047: a hit has no CPU-side payload */
+ 
+     const u32 vertex_stride =
+         ld_vertex_compact_payload() ? used_layout.stride : VERT_STRIDE;
+     const u32 uploaded_vertices = indexed ? dc.n_verts : n_tri;
+-    const void* vertex_data = ld_vertex_compact_payload()
++    const void* vertex_data = vc_hit ? (const void*)vc_hit->data : ld_vertex_compact_payload()
+         ? (const void*)dc.compact_verts : (const void*)dc.verts;
+     const u64 draw_vb_bytes = (u64)uploaded_vertices * vertex_stride;
+     const u64 draw_ib_bytes = indexed ? (u64)n_tri * sizeof(u32) : 0;
+@@ -10195,7 +10546,13 @@
+         memcpy(
+             g.vb_mapped + g.vb_used, vertex_data,
+             (size_t)draw_vb_bytes);
+-    if (indexed)
++    if (vc_hit) {   /* patch 2047 */
++        if (indexed && draw_ib_bytes)
++            memcpy((u8*)g.ib_mapped + g.ib_used, vc_hit->data + vc_hit->vb_bytes, (size_t)draw_ib_bytes);
++    } else if (vc_fill && dc.fetch_ok)
++        ld_vc_after_fetch(vc_fill, vc_verify, prim, vertex_data, (u32)draw_vb_bytes, (u32)draw_ib_bytes, n_tri,
++                          indexed, (u32*)((u8*)g.ib_mapped + g.ib_used));
++    else if (indexed)
+         write_topology_indices(
+             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
+     LDW_ADD(RSX_PERF_W_VTX_T, vcopy_t0);
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -129,6 +129,7 @@
+ /* patch 2025: conditional render counters: predicated draws, draws skipped on the CPU (count 0), mode-2 draws
+  * left unconditional (unknown report), query resolves, GET_REPORTs, query segments. */
+ void rsx_live_draw_debug_cond_render_stats(u64 out[6]);
++void rsx_live_draw_debug_vc_stats(u64 out[6]);   /* KZ3 patch 2047: vertex payload cache counters (host tests) */
+ /* patch 2027: walker hook for a type-1 GET_REPORT into main memory: the value to write at walk time (0 when no
+  * draw ran since the clear, else the report's last read-back count, else dflt). The real count follows a frame
+  * later from the query readback. Stats: queued, written to the guest, written as 0, dropped (ring full),

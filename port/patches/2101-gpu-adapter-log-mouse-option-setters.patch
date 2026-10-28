@@ -1,0 +1,218 @@
+KZ3 patch 2101 (RSX pass 96): the GPU adapter on one log line, and runtime setters for the mouse options.
+
+libs/video/rsx_d3d12_device.h: rsx_adapter_line (pure; host test tools/smoke/test_d3d12_warp.sh) formats
+"[rsx] D3D12 adapter: <DXGI description> (vendor 0x10DE NVIDIA device 0x....), <dedicated MB> MB, hardware|software
+(WARP)" and rsx_d3d12_log_device prints it once per process next to the existing "[d3d12] device" line, so the release
+support package's facts.txt (tools/release/support.py GPU_RX: adapter ... vendor name) finds the GPU.
+
+libs/input/pad_mouse.{h,c}: pad_mouse_opts_set/get change the user sensitivity, the zoom factor and invert Y at run
+time (the next look update uses them); pure clamp/step/format helpers (0.5..10 in steps of 0.5) and
+pad_mouse_ini_upsert (set one key under [input] in kz3.ini text, other lines byte for byte) for the Options > Mouse
+page in port/kz3/main.cpp. Host test tools/smoke/test_mouse_opts.sh.
+
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+--- a/libs/input/pad_mouse.c
++++ b/libs/input/pad_mouse.c
+@@ -13,6 +13,7 @@
+ static int         s_on = -1;
+ static int         s_log_each;
+ static PadMouseCfg s_cfg = { PAD_MOUSE_SENS_DEFAULT, 1.0f, 0 };
++static float       s_user = PAD_MOUSE_USER_SENS_DEF, s_deg = PAD_MOUSE_DEG_PER_COUNT;   /* patch 2101 */
+ static PadMouseEv  s_ev[PAD_MOUSE_SCRIPT_MAX];
+ static int         s_nev;
+ static double      s_t0 = -1.0;
+@@ -49,6 +50,8 @@
+     const float deg = pm_envf("KZ3_MOUSE_YAW", PAD_MOUSE_DEG_PER_COUNT);
+     int bad = 0;
+     s_cfg.sens = pad_mouse_rad_per_count(user, deg, &bad);
++    s_user = bad ? PAD_MOUSE_USER_SENS_DEF : user;
++    s_deg = bad ? PAD_MOUSE_DEG_PER_COUNT : deg;
+     if (bad) fprintf(stderr, "[mouse] WARNING: KZ3_MOUSE_SENS/KZ3_MOUSE_YAW must be positive numbers: defaults used\n");
+     s_cfg.zoom_sens = pm_envf("KZ3_MOUSE_ZOOM_SENS", 1.0f);
+     if (!(s_cfg.zoom_sens > 0.0f)) {
+@@ -83,6 +86,24 @@
+ const PadMouseCfg* pad_mouse_cfg(void) { pm_init(); return &s_cfg; }
+ int pad_mouse_log_each(void) { pm_init(); return s_log_each; }
+ 
++/* Patch 2101: Options > Mouse. The look thread reads s_cfg once per update; a torn read of a float is not possible on
++ * the platforms we build for, and a stale one is one update old. */
++void pad_mouse_opts_set(float user, float zoom, int invert)
++{
++    pm_init();
++    s_user = pad_mouse_opt_clamp(user, PAD_MOUSE_USER_SENS_DEF);
++    s_cfg.zoom_sens = pad_mouse_opt_clamp(zoom, 1.0f);
++    s_cfg.invert = invert ? 1 : 0;
++    s_cfg.sens = pad_mouse_rad_per_count(s_user, s_deg, NULL);
++}
++void pad_mouse_opts_get(float* user, float* zoom, int* invert)
++{
++    pm_init();
++    if (user) *user = s_user;
++    if (zoom) *zoom = s_cfg.zoom_sens;
++    if (invert) *invert = s_cfg.invert;
++}
++
+ /* Patch 2099: the accumulator's frame clock = the guest's flip requests (cellGcmSys.c; cellPad.c uses it too). */
+ extern unsigned cellGcm_flip_request_count(void);
+ static unsigned pm_flip_clock(void) { return cellGcm_flip_request_count(); }
+diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+--- a/libs/input/pad_mouse.h
++++ b/libs/input/pad_mouse.h
+@@ -44,6 +44,7 @@
+ #define PAD_MOUSE_H
+ 
+ #include <math.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -86,6 +87,90 @@
+     return user * deg_per_count * 0.017453292519943295f;
+ }
+ 
++/* Options > Mouse rows (patch 2101, RSX pass 96): sensitivity and the zoom factor are steppers from 0.5 to 10 in steps
++ * of 0.5 (the page's selectitems are the same 20 numbers); kz3.ini [input] keeps them. Pure helpers (host test
++ * tools/smoke/test_mouse_opts.c). */
++#define PAD_MOUSE_OPT_MIN   0.5f
++#define PAD_MOUSE_OPT_MAX   10.0f
++#define PAD_MOUSE_OPT_STEP  0.5f
++
++/* v clamped to [0.5, 10] and snapped to the nearest 0.5; not a finite number -> def (also snapped). */
++static inline float pad_mouse_opt_clamp(float v, float def)
++{
++    if (!isfinite(v)) v = def;
++    if (v < PAD_MOUSE_OPT_MIN) v = PAD_MOUSE_OPT_MIN;
++    if (v > PAD_MOUSE_OPT_MAX) v = PAD_MOUSE_OPT_MAX;
++    return floorf(v / PAD_MOUSE_OPT_STEP + 0.5f) * PAD_MOUSE_OPT_STEP;
++}
++/* One step up (dir > 0) or down (dir < 0), stopping at the ends. */
++static inline float pad_mouse_opt_step(float v, int dir)
++{
++    v = pad_mouse_opt_clamp(v, PAD_MOUSE_USER_SENS_DEF);
++    return pad_mouse_opt_clamp(v + (dir > 0 ? PAD_MOUSE_OPT_STEP : dir < 0 ? -PAD_MOUSE_OPT_STEP : 0.0f), v);
++}
++/* "2.5", "10": no trailing zero, no ".0" (what the row shows and what kz3.ini keeps). */
++static inline int pad_mouse_opt_fmt(char* out, size_t n, float v)
++{
++    v = pad_mouse_opt_clamp(v, PAD_MOUSE_USER_SENS_DEF);
++    return (v == floorf(v)) ? snprintf(out, n, "%d", (int)v) : snprintf(out, n, "%.1f", v);
++}
++
++/* kz3.ini text with `key = value` set in the [input] section: the key's own line when it exists (any section, as
++ * kz3_ini_get reads), else a new line right under [input], else a new [input] section at the end. Everything else
++ * stays byte for byte. -> bytes written (excluding the NUL), or -1 when `cap` is too small. */
++static inline int pad_mouse_ini_upsert(const char* in, char* out, size_t cap, const char* key, const char* val)
++{
++    const size_t kl = strlen(key);
++    const char* p = in;
++    const char* line_s = NULL; const char* line_e = NULL;   /* the key's line: value span */
++    const char* sec_e = NULL;                               /* end of the [input] header line (incl. newline) */
++    while (*p) {
++        const char* eol = p;
++        while (*eol && *eol != '\n' && *eol != '\r') eol++;
++        const char* nx = eol;
++        while (*nx == '\n' || *nx == '\r') nx++;
++        const char* s = p;
++        while (s < eol && (*s == ' ' || *s == '\t')) s++;
++        if (s < eol && *s == '[') {
++            if ((size_t)(eol - s) >= 7 && !strncmp(s, "[input]", 7)) sec_e = nx;
++        } else if (s < eol && *s != ';' && *s != '#') {
++            const char* eq = s;
++            while (eq < eol && *eq != '=') eq++;
++            const char* ke = eq;
++            while (ke > s && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
++            if (eq < eol && (size_t)(ke - s) == kl) {
++                size_t i = 0;
++                while (i < kl && (s[i] | 0x20) == (key[i] | 0x20)) i++;
++                if (i == kl && !line_s) { line_s = eq + 1; line_e = eol; }
++            }
++        }
++        p = nx;
++    }
++    const size_t il = strlen(in), vl = strlen(val);
++    size_t o = 0;
++#define PM_PUT(ptr, len) do { if (o + (len) + 1 > cap) return -1; memcpy(out + o, (ptr), (len)); o += (len); } while (0)
++    if (line_s) {   /* replace the value, keep the key text and the comment-free rest of the line */
++        PM_PUT(in, (size_t)(line_s - in));
++        PM_PUT(" ", 1);
++        PM_PUT(val, vl);
++        PM_PUT(line_e, il - (size_t)(line_e - in));
++    } else if (sec_e) {
++        PM_PUT(in, (size_t)(sec_e - in));
++        if (sec_e > in && sec_e[-1] != '\n' && sec_e[-1] != '\r') PM_PUT("\n", 1);
++        PM_PUT(key, kl); PM_PUT(" = ", 3); PM_PUT(val, vl); PM_PUT("\n", 1);
++        PM_PUT(sec_e, il - (size_t)(sec_e - in));
++    } else {
++        PM_PUT(in, il);
++        if (il && in[il - 1] != '\n') PM_PUT("\n", 1);
++        if (il) PM_PUT("\n", 1);
++        PM_PUT("[input]\n", 8);
++        PM_PUT(key, kl); PM_PUT(" = ", 3); PM_PUT(val, vl); PM_PUT("\n", 1);
++    }
++#undef PM_PUT
++    out[o] = 0;
++    return (int)o;
++}
++
+ /* The look accumulator (pure; pad_mouse.c holds one under its lock). frame = the guest frame counter now. */
+ typedef struct {
+     long long dx, dy;      /* counts kept for the next take */
+@@ -280,6 +365,10 @@
+ int  pad_mouse_enabled(void);
+ const PadMouseCfg* pad_mouse_cfg(void);
+ int  pad_mouse_log_each(void);
++/* Patch 2101: the Options > Mouse rows. Set: user sensitivity (a factor on KZ3_MOUSE_YAW), zoom factor, invert Y;
++ * each is clamped as above and applies to the next look update. Get: the values now (user = the 2.5-style number). */
++void pad_mouse_opts_set(float user, float zoom, int invert);
++void pad_mouse_opts_get(float* user, float* zoom, int* invert);
+ void pad_mouse_add(int dx, int dy);
+ /* Takes (and clears) the counts since the last call, plus the script's due events; `now` = seconds on the caller's
+  * clock (the script's clock starts at the first call). Returns 1 when either count is non-zero. */
+diff -ruN a/libs/video/rsx_d3d12_device.h b/libs/video/rsx_d3d12_device.h
+--- a/libs/video/rsx_d3d12_device.h
++++ b/libs/video/rsx_d3d12_device.h
+@@ -35,6 +35,28 @@
+ static inline int rsx_warp_try_hw(int mode) { return mode != RSX_WARP_FORCE; }
+ static inline int rsx_warp_try_warp(int mode, int hw_ok) { return mode == RSX_WARP_FORCE || (mode == RSX_WARP_AUTO && !hw_ok); }
+ 
++/* Patch 2101: the one-line adapter summary the support package looks for (tools/release/support.py GPU_RX: "adapter"
++ * ... a vendor name). `software`: 1 = DXGI_ADAPTER_FLAG_SOFTWARE (WARP), 0 = hardware, -1 = unknown. The vendor
++ * word comes from the PCI vendor id, so a driver description without it still names one. */
++static inline const char* rsx_vendor_name(unsigned id)
++{
++    switch (id) {
++    case 0x10DE: return "NVIDIA";
++    case 0x1002: case 0x1022: return "AMD";
++    case 0x8086: return "Intel";
++    case 0x1414: return "Microsoft";
++    default: return "";
++    }
++}
++static inline int rsx_adapter_line(char* out, size_t n, const char* name, unsigned vendor, unsigned device,
++                                   unsigned long long vram_mb, int software)
++{
++    const char* vn = rsx_vendor_name(vendor);
++    return snprintf(out, n, "[rsx] D3D12 adapter: %s (vendor 0x%04X%s%s device 0x%04X), %llu MB, %s", name, vendor,
++                    *vn ? " " : "", vn, device, vram_mb,
++                    software == 1 ? "software (WARP)" : software == 0 ? "hardware" : "hardware or software unknown");
++}
++
+ #ifdef _WIN32
+ #include <stdlib.h>
+ 
+@@ -72,6 +94,15 @@
+     sm.HighestShaderModel = (D3D_SHADER_MODEL)0x60;   /* 6_0; the answer is the highest one up to the request */
+     if (FAILED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm)))
+         sm.HighestShaderModel = (D3D_SHADER_MODEL)0x51;   /* runtimes that predate SM 6 know 5_1 */
++    {   /* patch 2101: the compact line, once per process (the live renderer and any later device share the adapter) */
++        static int once;
++        if (!once) {
++            char line[400];
++            once = 1;
++            rsx_adapter_line(line, sizeof line, name, vendor, device, vram >> 20, software);
++            fprintf(stderr, "%s\n", line);
++        }
++    }
+     fprintf(stderr, "[d3d12] device (%s, %s): adapter \"%s\" vendor=0x%04X device=0x%04X software=%d vram=%llu MB "
+                     "max-fl=0x%X binding-tier=%d typed-uav-load-x=%d highest-sm=0x%X (needs: fl 11_0, sm 5.0)\n",
+             who, how, name, vendor, device, software, vram >> 20, have_fl ? (unsigned)fl.MaxSupportedFeatureLevel : 0u,

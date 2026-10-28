@@ -1,0 +1,79 @@
+KZ3 patch 2073 (RSX pass 69): CMP32 attributes take rsx_vertex_fetch_many's block loop, the RE notes "Pass 69".
+Patch 2040's attribute-major fetch sent every CMP32 (11/11/10 packed normal) slot through the per-vertex path
+(rsx_vertex_fetch_attr_one: element index, mapping test, type switch per vertex). On K4 that path was the largest
+vertex-fetch cost: 54.6 of ~110 timed ms per second, 8.15 M slot-vertices at 6.7 ns (coord-fullclk-k4,
+`[perf-vtxtype]`). CMP32 now has its own block loop over the attribute's contiguous mapping: one big-endian load,
+the fields sign-extended by shifts (the same integers as rsx_vertex_decode_element), the same divisions. Vertices
+outside the mapping still take the per-vertex path. Output bytes identical (tools/smoke/test_vtx_batch.sh).
+LD_VTX_CMP32=0 = the old path (default on).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): CMP32 loop moved into upstream's fetch_many switch (LD_VTX_CMP32=1, RSX_FETCH_LOOP; default per-vertex as before).
+
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index 1b5c817b..968725ed 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -46,6 +46,17 @@ static float rsx_compact_be_f16(const u8* p)
+     return f;
+ }
+ 
++int rsx_vtx_cmp32_batch = -1;   /* KZ3 patch 2073 */
++
++static int rsx_vtx_switch(int* v, const char* name)
++{
++    if (*v < 0) {
++        const char* e = getenv(name);
++        *v = !(e && e[0] == '0' && !e[1]);
++    }
++    return *v;
++}
++
+ /* KZ3 patch 2033: the decoder with the type switch hoisted out of the component
+  * loop (the walker runs it once per attribute per vertex, ~10^5 times a frame).
+  * Same results as before, component by component: the per-component bodies and
+@@ -407,6 +418,7 @@ int rsx_vertex_fetch_many(
+     if (!plan || (!refs && count) || (!out && plan->layout.stride && count))
+         return 0;
+     const u32 stride = plan->layout.stride;
++    const int cmp32_batch = rsx_vtx_switch(&rsx_vtx_cmp32_batch, "LD_VTX_CMP32");   /* patch 2073 */
+     for (u32 slot = 0; slot < plan->layout.count; slot++) {
+         const u32 attr = plan->layout.attrs[slot];
+         const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+@@ -445,6 +457,20 @@ int rsx_vertex_fetch_many(
+         case RSX_VTX_TYPE_SINT16:
+             RSX_FETCH_LOOP(v[c] = (float)(s16)((src[c * 2] << 8) | src[c * 2 + 1]))
+             break;
++        case RSX_VTX_TYPE_CMP32:   /* KZ3 patch 2073: one packed word, LD_VTX_CMP32=1 decodes it in the loop */
++            if (cmp32_batch) {
++                /* the 11/11/10-bit fields sign-extended by shifts: the same integers as
++                 * rsx_vertex_decode_element's "if (x & 0x400) x -= 0x800" */
++                RSX_FETCH_LOOP(if (c == 0) {
++                    const u32 word = ((u32)src[0] << 24) | ((u32)src[1] << 16) |
++                                     ((u32)src[2] << 8) | (u32)src[3];
++                    v[0] = (float)((s32)(word << 21) >> 21) / 1023.0f;
++                    v[1] = (float)((s32)(word << 10) >> 21) / 1023.0f;
++                    v[2] = (float)((s32)word >> 22) / 511.0f;
++                })
++                break;
++            }
++            /* fall through */
+         default:   /* RSX_VTX_TYPE_CMP32: one packed word, whatever the size */
+             for (u32 i = 0; i < count; i++)
+                 if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
+diff --git a/libs/video/rsx_vertex_compact.h b/libs/video/rsx_vertex_compact.h
+index 6a12f6f0..6134d628 100644
+--- a/libs/video/rsx_vertex_compact.h
++++ b/libs/video/rsx_vertex_compact.h
+@@ -124,6 +124,12 @@ int rsx_vertex_fetch_many(
+     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+     u8* out);
+ 
++/* KZ3 patch 2073: rsx_vertex_fetch_many's CMP32 block loop. -1 = read
++ * LD_VTX_CMP32 once (unset or not "0" = on); 0/1 set directly (host tests).
++ * Off = patch 2040's per-vertex path for CMP32. */
++#define RSX_VTX_PATCH_2073 1
++extern int rsx_vtx_cmp32_batch;
++
+ /* Collapse repeated (vertex_id, base_index) references in first-use order.
+  * refs is rewritten in place with the unique prefix.  The occurrence map
+  * remains valid until the next call using the same remap object. */

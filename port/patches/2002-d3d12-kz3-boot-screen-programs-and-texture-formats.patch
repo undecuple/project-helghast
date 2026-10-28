@@ -1,0 +1,254 @@
+D3D12 backend: draw KZ3's boot screen through its own fragment programs.
+
+Found on KZ3's boot/loading screen (the full-screen "blue quad", checkpoint kz3-first-ui-draws):
+1. rsx_fp_decompiler.c declared r[48]/h[48], but FP source/destination register fields are 6 bits; KZ3's
+   99-instruction boot-screen program uses h50, failed to compile (E5019) and the draw fell back to the
+   built-in colour PS (vertex colour: the solid blue / gradient). Now r[64]/h[64].
+2. vp_get_fp_pso passed RSX_FP_CTRL_AUTO, so the decompiler guessed the export file from which of r0/h0 was
+   written. KZ3 writes coordinates to r0 and its colour to h0..h8 (half exports); the guess exported r0..r4.
+   The draw's SET_SHADER_CONTROL 32-bit-exports bit (already captured as fp_exp32 and in the PSO key) is now
+   passed through. FP_CTRL_AUTO=1 restores the guess.
+3. Guest textures were uploaded only for B8, A8R8G8B8, G8B8 and DXT1/3/5; every other format bound a null
+   SRV (KZ3 samples six 64x1 W16Z16Y16X16_FLOAT tables). Now every format rsx_texture_layout() classifies
+   (packed 16-bit colours, HILO, depth, X16, Y16X16, F16/F32) is uploaded, with one DXGI mapping
+   (tex_decoded_dxgi) shared by the resource and its SRV.
+4. SCREEN_AS_TEX (swap any display-sized texture for the last presented frame) is now opt-in: it turned
+   KZ3's own 1280x720 scene target into a feedback loop that saturated the screen to white.
+Diagnostics: DRAWLOG=<N> (per replayed draw: pipeline or FALLBACK, target, viewport, blend, textures and
+sampler slots), FP_DUMP_MATCH=<text> (dump programs whose HLSL contains text, to fp_match.hlsl), and a
+guest-FP PSO failure now prints its key and the debug-layer messages (D3D12_DBG=1; FP_FAIL_DUMP=1 keeps
+the HLSL). KZ3 port RSX, 2026-10-07; tested with tools/smoke/host_kz3.c and KZ3 under Proton.
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream buffer size macro taken.
+
+Rebased on ps3recomp v0.17.0 (SPU pass 95): partly absorbed: the FP export-width bit is #396 (switch now RSX_FP_CTRL_AUTO).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): DRAWLOG block after upstream's OMSetStencilRef; its /s<idx> sampler field dropped (2001's samp index gone).
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 65027cfe..fb75b6c4 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2476,6 +2476,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+             fprintf(f, " */\n%s\n", hlsl); fclose(f);
+         } } }
+ 
++    /* FP_DUMP_MATCH=<text>: append every program whose HLSL contains <text> to fp_match.hlsl (program
++     * addresses move between runs when a title streams its FPs through a ring; content does not). */
++    { const char* fm = getenv("FP_DUMP_MATCH");
++      static int fm_n = 0;
++      if (fm && *fm && fm_n < 16 && strstr(hlsl, fm)) {
++          FILE* f = fopen("fp_match.hlsl", "a");
++          if (f) { fm_n++; fprintf(f, "/* fp_addr=0x%08X, %d instrs */\n%s\n", fp_addr, n, hlsl); fclose(f); }
++      } }
+     /* FP_PICK=<hex fp_addr>: write just that program, whatever order it compiles
+      * in. fp_dump.hlsl keeps only the first four, same trap as vp2_dump.hlsl. */
+     { static const char* fpk = (const char*)1; static u32 wantf = 0; static int done = 0;
+@@ -2765,7 +2773,31 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+         s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+     pb->lpVtbl->Release(pb);
+     if (FAILED(hr)) {
+-        static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
++        static int _e3=0; if (_e3++<16) {
++            printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX) nrt=%d rtfmt=%u blend=0x%08X cmask=0x%X cull=0x%X"
++                   " cube=0x%X\n", fp_addr, hr, nrt, (unsigned)rtfmt, blend, cmask, cull, cube_mask);
++            /* The exact reason, when the debug layer is on (D3D12_DBG=1). */
++            ID3D12InfoQueue* iq = NULL;
++            if (SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(
++                    s_d3d.device, &IID_ID3D12InfoQueue, (void**)&iq)) && iq) {
++                UINT64 n = iq->lpVtbl->GetNumStoredMessages(iq);
++                for (UINT64 mi = 0; mi < n; mi++) {
++                    SIZE_T len = 0;
++                    iq->lpVtbl->GetMessage(iq, mi, NULL, &len);
++                    D3D12_MESSAGE* m = (D3D12_MESSAGE*)malloc(len);
++                    if (m && SUCCEEDED(iq->lpVtbl->GetMessage(iq, mi, m, &len)))
++                        printf("[FP][DBG] %s\n", m->pDescription);
++                    free(m);
++                }
++                iq->lpVtbl->ClearStoredMessages(iq);
++                iq->lpVtbl->Release(iq);
++            }
++            /* FP_FAIL_DUMP=1: keep the HLSL of programs whose pipeline fails. */
++            if (getenv("FP_FAIL_DUMP")) {
++                FILE* f = fopen("fp_fail.hlsl", "a");
++                if (f) { fprintf(f, "/* fp_addr=0x%08X PSO FAIL */\n%s\n", fp_addr, hlsl); fclose(f); }
++            }
++        }
+         return NULL;
+     }
+     { static int _ok=0; if (PS3_LOG_FIRST(_ok, 32)) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
+@@ -2854,6 +2886,46 @@ static u32 tex_csum(const u8* base, u32 nbytes)
+     return h;
+ }
+ 
++/* Texture formats the guest-texture upload handles: every base format
++ * rsx_texture_layout() classifies (rsx_texture_layout.c), i.e. B8, the packed
++ * 16-bit colours, A8R8G8B8/D8R8G8B8, G8B8/HILO, DXT1/3/5, DEPTH24_D8, DEPTH16,
++ * X16, Y16X16, and the float formats. Was B8, A8R8G8B8, G8B8 and DXT only, so
++ * every other format bound a null SRV (KZ3's boot screen samples six 64x1
++ * W16Z16Y16X16_FLOAT tables and drew black). */
++static int tex_fmt_uploadable(u32 basef)
++{
++    switch (basef) {
++    case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
++    case 0x88: case 0x8B: case 0x8C: case 0x8D: case 0x90: case 0x92: case 0x94:
++    case 0x95: case 0x97: case 0x9A: case 0x9B: case 0x9C: case 0x9D: case 0x9E:
++    case 0x9F:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++/* DXGI format of the DECODED image (the resource vp_upload_tex_slot creates
++ * and the SRV that views it), which is not always the guest's: the packed
++ * 16-bit colours arrive unpacked to RGBA8 and DEPTH24_D8 as a float. */
++static DXGI_FORMAT tex_decoded_dxgi(u32 fmt, u32 w, u32 h)
++{
++    rsx_tex_layout tl;
++    rsx_texture_layout(fmt, w, h, &tl);
++    return (tl.fmt == RSX_TEXFMT_R8G8B8A8) ? DXGI_FORMAT_R8G8B8A8_UNORM
++         : (tl.fmt == RSX_TEXFMT_R8G8)     ? DXGI_FORMAT_R8G8_UNORM
++         : (tl.fmt == RSX_TEXFMT_BC1)      ? DXGI_FORMAT_BC1_UNORM
++         : (tl.fmt == RSX_TEXFMT_BC2)      ? DXGI_FORMAT_BC2_UNORM
++         : (tl.fmt == RSX_TEXFMT_BC3)      ? DXGI_FORMAT_BC3_UNORM
++         : (tl.fmt == RSX_TEXFMT_R16)      ? DXGI_FORMAT_R16_UNORM
++         : (tl.fmt == RSX_TEXFMT_R16G16)   ? DXGI_FORMAT_R16G16_UNORM
++         : (tl.fmt == RSX_TEXFMT_R16G16F)  ? DXGI_FORMAT_R16G16_FLOAT
++         : (tl.fmt == RSX_TEXFMT_R16G16B16A16F) ? DXGI_FORMAT_R16G16B16A16_FLOAT
++         : (tl.fmt == RSX_TEXFMT_R32F)     ? DXGI_FORMAT_R32_FLOAT
++         : (tl.fmt == RSX_TEXFMT_R32G32B32A32F) ? DXGI_FORMAT_R32G32B32A32_FLOAT
++         : DXGI_FORMAT_R8_UNORM;
++}
++
+ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
+ {
+     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
+@@ -2887,18 +2959,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+     /* The DECODED image's format, which is not always the guest's: the packed
+      * 16-bit colour formats arrive here unpacked to RGBA8, and DEPTH24_D8 as a
+      * float. rsx_texture_layout.h says which class each format byte lands in. */
+-    DXGI_FORMAT dxfmt = (tl.fmt == RSX_TEXFMT_R8G8B8A8) ? DXGI_FORMAT_R8G8B8A8_UNORM
+-                      : (tl.fmt == RSX_TEXFMT_R8G8)     ? DXGI_FORMAT_R8G8_UNORM
+-                      : (tl.fmt == RSX_TEXFMT_BC1)      ? DXGI_FORMAT_BC1_UNORM
+-                      : (tl.fmt == RSX_TEXFMT_BC2)      ? DXGI_FORMAT_BC2_UNORM
+-                      : (tl.fmt == RSX_TEXFMT_BC3)      ? DXGI_FORMAT_BC3_UNORM
+-                      : (tl.fmt == RSX_TEXFMT_R16)      ? DXGI_FORMAT_R16_UNORM
+-                      : (tl.fmt == RSX_TEXFMT_R16G16)   ? DXGI_FORMAT_R16G16_UNORM
+-                      : (tl.fmt == RSX_TEXFMT_R16G16F)  ? DXGI_FORMAT_R16G16_FLOAT
+-                      : (tl.fmt == RSX_TEXFMT_R16G16B16A16F) ? DXGI_FORMAT_R16G16B16A16_FLOAT
+-                      : (tl.fmt == RSX_TEXFMT_R32F)     ? DXGI_FORMAT_R32_FLOAT
+-                      : (tl.fmt == RSX_TEXFMT_R32G32B32A32F) ? DXGI_FORMAT_R32G32B32A32_FLOAT
+-                      : DXGI_FORMAT_R8_UNORM;
++    DXGI_FORMAT dxfmt = tex_decoded_dxgi(fmt, w, h);
+     /* DXT data is stored as linear 4x4 block rows (compressed formats are
+      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
+     u32 blkrow  = dxt ? tl.row_bytes : 0;
+@@ -4185,7 +4246,7 @@ static u32 draw_filter_tex(const char* e)
+ static void screen_copy_capture(u32 fi)
+ {
+     static int en = -1;
+-    if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
++    if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 0; }   /* same switch as the substitution below */
+     if (!en || !s_d3d.device) return;
+             if (!s_screen_copy) {
+                 D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+@@ -4834,7 +4895,13 @@ static void render_frame(void)
+             if (dr->tex[_u].set && s_screen_copy &&
+                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
+                 static int en = -1;
+-                if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
++                /* Off by default (SCREEN_AS_TEX=1 restores it): it swaps ANY
++                 * display-sized texture for a copy of the last presented frame,
++                 * which was right for the title it was written for but turns
++                 * KZ3's own 1280x720 scene target (0x1300000) into a feedback
++                 * loop through its additive composite passes -- the boot screen
++                 * saturated to white. Offscreen RTs are matched by offset below. */
++                if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 0; }
+                 if (en) {
+                     { static int _n = 0; if (PS3_LOG_FIRST(_n, 3))
+                         fprintf(stderr, "[SCREENTEX] bound frame copy at unit %d for"
+@@ -4876,9 +4943,7 @@ static void render_frame(void)
+                     continue;
+                 }
+                 u32 _bf = dr->tex[_u].fmt & 0x9F;
+-                if (dr->tex[_u].off &&
+-                    (_bf == 0x81 || _bf == 0x85 || _bf == 0x8B ||
+-                     (_bf >= 0x86 && _bf <= 0x88))) {
++                if (dr->tex[_u].off && tex_fmt_uploadable(_bf)) {
+                     double _tt = perf_on() ? perf_now() : 0.0;
+                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
+                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
+@@ -4891,13 +4956,8 @@ static void render_frame(void)
+                     if (s_duck_off && dr->tex[_u].off == s_duck_off)
+                         s_duck_raw = dr->tex[_u].raw;
+                     if (ts >= 0) {
+-                        DXGI_FORMAT sf =
+-                            (_bf == 0x85) ? DXGI_FORMAT_R8G8B8A8_UNORM :
+-                            (_bf == 0x8B) ? DXGI_FORMAT_R8G8_UNORM :
+-                            (_bf == 0x86) ? DXGI_FORMAT_BC1_UNORM :
+-                            (_bf == 0x87) ? DXGI_FORMAT_BC2_UNORM :
+-                            (_bf == 0x88) ? DXGI_FORMAT_BC3_UNORM :
+-                                            DXGI_FORMAT_R8_UNORM;
++                        DXGI_FORMAT sf = tex_decoded_dxgi(dr->tex[_u].fmt, dr->tex[_u].w,
++                                                          dr->tex[_u].h);
+                         srv_write_ex(wslot, s_d3d.vp_tex[ts].res, sf,
+                                   (_bf == 0x81) ? 0x1000
+                                                 : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
+@@ -5313,6 +5373,22 @@ static void render_frame(void)
+                                                          dpso ? dpso : vpso);
+                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
+                 if (cur_z >= 0 && (dr->zs_key & (2u | (1u << 5)))) s_d3d.off_ds[cur_z].gen++;
++                /* DRAWLOG=<N>: one line per replayed draw (first N): which pipeline it got (a guest FP that
++                 * failed to build falls back to the built-in PS, which draws vertex colour), its target,
++                 * viewport, blend key and the textures it samples. */
++                { static int dl_cap = -1, dl_n = 0;
++                  if (dl_cap < 0) { const char* e = getenv("DRAWLOG"); dl_cap = e ? atoi(e) : 0; }
++                  if (dl_cap && dl_n < dl_cap) { dl_n++;
++                      char tb[512]; int tp = 0; tb[0] = 0;
++                      for (int _u = 0; _u < RSX_D3D_TEX_UNITS && tp < 440; _u++)
++                          if (dr->tex[_u].set)
++                              tp += snprintf(tb + tp, sizeof tb - tp, " t%d=0x%X/fmt0x%02X/%ux%u%s", _u,
++                                             dr->tex[_u].raw, dr->tex[_u].fmt, dr->tex[_u].w, dr->tex[_u].h,
++                                             dr->tex_rt[_u] >= 0 ? "/RT" : "");
++                      printf("[DRAWLOG] d=%u fp=0x%08X %s verts=%u topo=%u rt=0x%X(%ux%u fmt%u) vp=%u,%u %ux%u"
++                             " blend=0x%X cmask=0x%X%s\n", d, dr->fp_addr, dpso ? "guestFP" : "FALLBACK",
++                             dr->vertex_count, dr->topology, dr->rt_off, dr->rt_w, dr->rt_h, dr->rt_fmt,
++                             dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h, dr->blend_key, dr->cmask, tb); } }
+                 /* Per-draw viewport: the guest rect when sane, else the
+                  * full target. Scissor tracks the same rect. */
+                 {
+@@ -7477,11 +7553,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
+     /* VP path: record the latest bound texture (any supported format) so draws
+      * can carry it per-draw. Location bits (format[1:0]): 1 = LOCAL, 2 = MAIN. */
+     extern u32 cellGcmResolveLocated(int local, u32 offset);
+-    if (unit < RSX_D3D_TEX_UNITS &&
+-        (base_fmt == 0x81 /* B8 */ || base_fmt == 0x85 /* A8R8G8B8 */ ||
+-         base_fmt == 0x8B /* G8B8: LBP's font atlas */ ||
+-         (base_fmt >= 0x86 && base_fmt <= 0x88) /* DXT1/23/45 */ ||
+-         base_fmt == 0x9A /* W16Z16Y16X16 half-float: RTT intermediates */)) {
++    if (unit < RSX_D3D_TEX_UNITS && tex_fmt_uploadable(base_fmt)) {
+         /* TEX_RESOLVE_AUTO=1: resolve through the page tables (local-page map
+          * then IO table) instead of trusting the format's location bits. A
+          * texture the guest built in main memory but tagged local resolves to
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index cfb9685b..87cf639c 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -668,11 +668,14 @@ static int rsx_fp_decompile_internal(
+     out[0] = '\0';
+     int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
+     out_puts(&o,
+-        "    float4 r[48]; float4 h[48];\n"
++        /* 64 each: the source and destination register fields are 6 bits
++         * (FP_SRC_REG_MASK / FP_OUT_REG_MASK). 48 rejected every program
++         * touching r48..r63 / h48..h63 with E5019 (KZ3 uses h50). */
++        "    float4 r[64]; float4 h[64];\n"
+         /* Fully initialise both register files: RSX programs routinely read a
+          * register lane before writing it (the hardware reads undefined), but
+          * HLSL rejects use-before-init (error X4000). Zero everything. */
+-        "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
++        "    [unroll] for (int _i = 0; _i < 64; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
+         /* Condition-code registers for exec_if predication / set_cond. Reset
+          * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
+         "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");

@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest an improvement or a PC feature
+labels: [enhancement, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: Check [ROADMAP.md](../blob/main/docs/ROADMAP.md) first; it may already be planned.
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like, and why?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [Display/graphics, Controls/input, Audio, Multiplayer, Linux, Mods, Tools/build, Other]
+  - type: checkboxes
+    id: gameplay
+    attributes:
+      label: Gameplay
+      options:
+        - label: This would change gameplay (it would then be an opt-in setting)
+  - type: input
+    id: version
+    attributes:
+      label: Port build and game version (if it matters)
+      description: "Release number or commit, and 1.00 or 1.14."

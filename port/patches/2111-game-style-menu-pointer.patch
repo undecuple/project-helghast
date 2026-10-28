@@ -1,0 +1,148 @@
+diff -ruN a/libs/input/pad_cursor_art.h b/libs/input/pad_cursor_art.h
+--- a/libs/input/pad_cursor_art.h
++++ b/libs/input/pad_cursor_art.h
+@@ -0,0 +1,69 @@
++/* Patch 2111 (KZ3 RSX pass 104; ENHANCEMENT): the menu mouse pointer in the game's menu colours instead of the
++ * system arrow. Pure pixels, no Win32, so the host test can check it: an arrow (the usual 7-point outline) filled
++ * with the menu text cream, a game-red rim and a thin dark outer edge for contrast on the red backdrop; 4x4
++ * supersampled coverage as alpha. Colours from docs/guides/ui-style.md (amber #F6DE96, game red #D61C14).
++ * Output: size*size premultiplied BGRA words (0xAARRGGBB), row 0 at the top; the hotspot is (1,1), the arrow tip. */
++#ifndef PAD_CURSOR_ART_H
++#define PAD_CURSOR_ART_H
++#include <stdint.h>
++#include <math.h>
++
++#define PAD_CURSOR_FILL 0xF6DE96u
++#define PAD_CURSOR_RIM  0xD61C14u
++#define PAD_CURSOR_EDGE 0x140000u
++
++/* distance from (x,y) to the segment a-b */
++static inline float pad_cursor_seg_dist(float x, float y, float ax, float ay, float bx, float by)
++{
++    const float dx = bx - ax, dy = by - ay, l = dx * dx + dy * dy;
++    float t = l > 0 ? ((x - ax) * dx + (y - ay) * dy) / l : 0;
++    t = t < 0 ? 0 : t > 1 ? 1 : t;
++    const float px = ax + t * dx - x, py = ay + t * dy - y;
++    return sqrtf(px * px + py * py);
++}
++
++/* 0 outside, 1 rim/fill region inside the arrow; *d = distance to the outline */
++static inline int pad_cursor_inside(float x, float y, const float* p, int n, float* d)
++{
++    int in = 0;
++    float m = 1e9f;
++    for (int i = 0, j = n - 1; i < n; j = i++) {
++        const float xi = p[2 * i], yi = p[2 * i + 1], xj = p[2 * j], yj = p[2 * j + 1];
++        if (((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) in = !in;
++        const float s = pad_cursor_seg_dist(x, y, xi, yi, xj, yj);
++        if (s < m) m = s;
++    }
++    *d = m;
++    return in;
++}
++
++/* size: the cursor bitmap's side in pixels (32 at 96 dpi, 48 at 144 dpi) */
++static inline void pad_cursor_render(uint32_t* px, int size)
++{
++    /* the arrow in units of the bitmap side: tip, down the left edge, the notch, the tail, back to the right wing */
++    static const float shape[14] = { 0.00f, 0.00f, 0.00f, 0.72f, 0.18f, 0.56f, 0.30f, 0.84f,
++                                     0.41f, 0.79f, 0.29f, 0.52f, 0.52f, 0.52f };
++    float p[14];
++    const float s = (float)size * 0.95f, rim = size / 24.0f, edge = size / 32.0f;
++    for (int i = 0; i < 7; i++) { p[2 * i] = 1.0f + shape[2 * i] * s; p[2 * i + 1] = 1.0f + shape[2 * i + 1] * s; }
++    for (int y = 0; y < size; y++)
++        for (int x = 0; x < size; x++) {
++            float r = 0, g = 0, b = 0, a = 0;
++            for (int sy = 0; sy < 4; sy++)
++                for (int sx = 0; sx < 4; sx++) {
++                    float d;
++                    const float fx = x + (sx + 0.5f) / 4, fy = y + (sy + 0.5f) / 4;
++                    const int in = pad_cursor_inside(fx, fy, p, 7, &d);
++                    uint32_t c;
++                    float al = 1;
++                    if (in) c = d < rim ? PAD_CURSOR_RIM : PAD_CURSOR_FILL;
++                    else if (d < edge) { c = PAD_CURSOR_EDGE; al = 0.8f; }
++                    else continue;
++                    r += al * ((c >> 16) & 0xFF); g += al * ((c >> 8) & 0xFF); b += al * (c & 0xFF); a += al;
++                }
++            const uint32_t A = (uint32_t)(a / 16 * 255 + 0.5f), R = (uint32_t)(r / 16 + 0.5f),
++                           G = (uint32_t)(g / 16 + 0.5f), B = (uint32_t)(b / 16 + 0.5f);
++            px[y * size + x] = A << 24 | R << 16 | G << 8 | B;   /* premultiplied: colour sums already carry alpha */
++        }
++}
++#endif
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+--- a/libs/input/pad_mouse.c
++++ b/libs/input/pad_mouse.c
+@@ -3,6 +3,7 @@
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -230,6 +231,43 @@
+     return PtInRect(&rc, pt);
+ }
+ 
++/* Patch 2111 (RSX pass 104; ENHANCEMENT): the shown cursor over the client area is the menu pointer in the game's
++ * colours (pad_cursor_art.h), made once at the window's DPI; KZ3_GAME_CURSOR=0 keeps the system arrow. */
++#include "pad_cursor_art.h"
++static HCURSOR pm_cursor(HWND hwnd)
++{
++    static HCURSOR c;
++    static int tried;
++    if (tried) return c ? c : LoadCursor(NULL, IDC_ARROW);
++    tried = 1;
++    const char* e = getenv("KZ3_GAME_CURSOR");
++    if (e && *e == '0') return LoadCursor(NULL, IDC_ARROW);
++    UINT dpi = 96;
++    HMODULE u = GetModuleHandleA("user32.dll");
++    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
++    GetDpiForWindowFn gd = u ? (GetDpiForWindowFn)(void*)GetProcAddress(u, "GetDpiForWindow") : NULL;
++    if (gd && hwnd) { const UINT v = gd(hwnd); if (v >= 96) dpi = v; }
++    const int size = MulDiv(32, (int)dpi, 96);
++    BITMAPV5HEADER bh;
++    memset(&bh, 0, sizeof bh);
++    bh.bV5Size = sizeof bh; bh.bV5Width = size; bh.bV5Height = -size; bh.bV5Planes = 1; bh.bV5BitCount = 32;
++    bh.bV5Compression = BI_BITFIELDS; bh.bV5RedMask = 0x00FF0000; bh.bV5GreenMask = 0x0000FF00;
++    bh.bV5BlueMask = 0x000000FF; bh.bV5AlphaMask = 0xFF000000;
++    void* bits = NULL;
++    HDC dc = GetDC(NULL);
++    HBITMAP col = CreateDIBSection(dc, (BITMAPINFO*)&bh, DIB_RGB_COLORS, &bits, NULL, 0);
++    ReleaseDC(NULL, dc);
++    HBITMAP mask = CreateBitmap(size, size, 1, 1, NULL);
++    if (col && bits && mask) {
++        pad_cursor_render((uint32_t*)bits, size);
++        ICONINFO ii = { FALSE, 1, 1, mask, col };
++        c = (HCURSOR)CreateIconIndirect(&ii);
++    }
++    if (col) DeleteObject(col);
++    if (mask) DeleteObject(mask);
++    fprintf(stderr, "[mouse] menu pointer: %s (%d px, %u dpi)\n", c ? "game style" : "system arrow (create failed)", size, dpi);
++    return c ? c : LoadCursor(NULL, IDC_ARROW);
++}
+ static void pm_apply(HWND hwnd, const char* why)
+ {
+     const int over = pm_cursor_over_client(hwnd);
+@@ -250,7 +288,7 @@
+         s_clipped = 0;
+     }
+     /* WM_SETCURSOR only comes when the mouse moves: set the cursor now when it is over the client area. */
+-    if (over) SetCursor(d.hide ? NULL : LoadCursor(NULL, IDC_ARROW));
++    if (over) SetCursor(d.hide ? NULL : pm_cursor(hwnd));   /* 2111 */
+     if (d.hide != s_last.hide || d.clip != s_last.clip) {
+         fprintf(stderr, "[mouse] cursor %s, %s (%s: mode %d focus %d min %d sizemove %d closing %d look %d)\n",
+                 d.hide ? "hidden" : "shown", d.clip ? "locked to the client area" : "free", why, s_cs.mode,
+@@ -341,8 +379,9 @@
+         if ((HWND)wp == hwnd) {
+             const PadCursorDo d = pad_cursor_decide(&s_cs, LOWORD(lp) == HTCLIENT);
+             if (d.hide) { SetCursor(NULL); *res = TRUE; return 1; }
++            if (LOWORD(lp) == HTCLIENT) { SetCursor(pm_cursor(hwnd)); *res = TRUE; return 1; }   /* 2111 */
+         }
+-        return 0;   /* DefWindowProc: the class arrow, the frame's resize arrows */
++        return 0;   /* DefWindowProc: the frame's resize arrows */
+     case WM_ACTIVATE:
+         s_cs.focused = LOWORD(wp) != WA_INACTIVE;
+         s_cs.minimized = HIWORD(wp) != 0;

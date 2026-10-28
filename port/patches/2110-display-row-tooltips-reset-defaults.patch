@@ -1,0 +1,133 @@
+diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -370,6 +370,15 @@
+ /* The page with the row and the functions added (malloc'd, NUL-terminated, *out_n bytes), or NULL when an anchor is
+  * missing (the Brightness listitem, the settingscript CDATA end), the script already has an OnPageOn, or the row is
+  * already there: the page is then served unchanged. */
++/* patch 2110: the port's display defaults as the page's values (Reset to defaults); the same as main.cpp's initial
++ * s_dm_saved / s_mb_saved / s_fps_saved / s_fov_saved (test_display_mode checks they parse to those). */
++#define RSX_DM_DEF_MODE    "windowed"
++#define RSX_DM_DEF_SCALING "stretch"
++#define RSX_DM_DEF_FILTER  "bilinear"
++#define RSX_DM_DEF_VSYNC   "on"
++#define RSX_DM_DEF_FPS     "30"
++#define RSX_DM_DEF_MBLUR   "on"
++#define RSX_DM_DEF_FOV     "default"
+ #define RSX_DM_GUM_MBLUR 1   /* rsx_dm_patch_gum_opts: add the Motion blur row (patch 2107) */
+ #define RSX_DM_GUM_FOV   2   /* rsx_dm_patch_gum_opts: add the Field of view row (patch 2109) */
+ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_n, unsigned opts)
+@@ -442,13 +451,51 @@
+     /* patch 2107: the warning for a limit above 30, shaped like the game's own confirm dialogs (No focused, cancelable;
+      * Yes/No from the game's strings), placed beside the page's dialogconfirm include */
+     static const char rsx_dm_gum_dlg[] =
+-        "<dialog id=\"dlg_kz3_fps\" label=\"Killzone 3 was made for 30 frames per second. A higher limit can break gameplay "
+-        "timing: physics, animation and scripted events may run wrong. Use the higher limit?\" default-focus=\"dlg_kz3_fps_no\"\n"
++        "<dialog id=\"dlg_kz3_fps\" label=\"A frame rate limit above 30 can make the game run wrong. Are you sure?\" "
++        "default-focus=\"dlg_kz3_fps_no\"\n"
+         "\t\tcancelable=\"true\">\n"
+         "\t\t<dialogoption id=\"dlg_kz3_fps_yes\" label=\"@key{menu_dialog_yes}\" value=\"yes\"/>\n"
+         "\t\t<dialogoption id=\"dlg_kz3_fps_no\" label=\"@key{menu_dialog_no}\" value=\"no\"/>\n"
+         "\t</dialog>\n\n\t";
+ 
++    /* patch 2110: the row descriptions, in the game's own tooltip panel (common/advancedcontroller.gum: a list onchange
++     * fills <panel class="tooltip" y="440"><text id="tooltip_txt"> for its Zoom row); shown for the port's rows only,
++     * since the game's Display rows have none. */
++    static const char rsx_dm_gum_tip[] =
++        "\n\t\t<panel id=\"pnl_kz3_tooltip\" class=\"tooltip\" y=\"440\">\n"
++        "\t\t\t<text id=\"txt_kz3_tooltip\"></text>\n"
++        "\t\t</panel>\n";
++    static const char rsx_dm_gum_lua_tip[] =
++        "\n\t\tgKz3Tip = {\n"
++        "\t\t\tslc_kz3_display = \"Windowed, borderless window or exclusive fullscreen.\",\n"
++        "\t\t\tslc_kz3_scaling = \"Fit keeps the picture's shape with black bars. Stretch fills the whole window.\",\n"
++        "\t\t\tslc_kz3_filter = \"Bilinear smooths the scaled picture. Nearest keeps hard pixel edges.\",\n"
++        "\t\t\tslc_kz3_vsync = \"Waits for the display's refresh to stop tearing. Off can lower input delay.\",\n"
++        "\t\t\tslc_kz3_fps = \"Killzone 3 was made for 30 frames per second. Higher limits can make physics, animation and "
++        "scripted events run wrong.\",\n"
++        "\t\t\tslc_kz3_mblur = \"Blurs the picture during fast camera movement.\",\n"
++        "\t\t\tslc_kz3_fov = \"Horizontal field of view in the campaign. Default is the game's own 80.\"\n"
++        "\t\t}\n\n"
++        "\t\tfunction KZ3Tooltip(e)\n"
++        "\t\t\tlocal item = gRoot:GetTag(\"lst_options\"):GetSelectedItem()\n"
++        "\t\t\tlocal t = nil\n"
++        "\t\t\tif (item ~= nil) then t = gKz3Tip[item:GetID()] end\n"
++        "\t\t\tif (t == nil) then t = \"\" end\n"
++        "\t\t\tgRoot:GetTag(\"txt_kz3_tooltip\"):SetValue(t)\n"
++        "\t\tend\n\n"
++        /* Reset to defaults: the game's OnDialogClose calls this after SetDefaultDisplay (inserted there). The values
++         * are the port's defaults (main.cpp s_dm_saved, s_mb_saved, s_fps_saved, s_fov_saved). */
++        "\t\tfunction KZ3ResetDisplay()\n"
++        "\t\t\tgKz3Dm = 0\n"
++        "\t\t\tKZ3DisplayCmd(\"display " RSX_DM_DEF_MODE "\")\n"
++        "\t\t\tKZ3DisplayCmd(\"scaling " RSX_DM_DEF_SCALING "\")\n"
++        "\t\t\tKZ3DisplayCmd(\"filter " RSX_DM_DEF_FILTER "\")\n"
++        "\t\t\tKZ3DisplayCmd(\"vsync " RSX_DM_DEF_VSYNC "\")\n"
++        "\t\t\tKZ3DisplayCmd(\"fps " RSX_DM_DEF_FPS "\")\n"
++        "\t\t\tif (KZ3MBlurOn) then KZ3DisplayCmd(\"motionblur " RSX_DM_DEF_MBLUR "\") end\n"
++        "\t\t\tif (KZ3FovOn) then KZ3DisplayCmd(\"fov " RSX_DM_DEF_FOV "\") end\n"
++        "\t\t\tOnPageOn()\n"
++        "\t\tend\n";
+     static const char rsx_dm_gum_lua[] =
+         "\n\t\tgKz3Dm = 0\n\t\tfunction KZ3DisplayCmd(c)\n"
+         "\t\t\tgPlayerProfile:SetTimeZone(\"kb:\"..c)\n"
+@@ -515,17 +562,28 @@
+     at_lua = (size_t)(cd - in);
+     size_t nlm = nm ? sizeof rsx_dm_gum_lua_mb - 1 : 0;
+     const size_t nf = (opts & RSX_DM_GUM_FOV) ? sizeof rsx_dm_gum_row_fov - 1 : 0, nlf = nf ? sizeof rsx_dm_gum_lua_fov - 1 : 0;
+-    out = (char*)malloc(n + nr + nm + nf + nd + nl + nlm + nlf + 16 + 1);
++    /* patch 2110: the tooltip after the list, its Lua, the list's onchange and the reset call */
++    static const char rsx_dm_list_on[] = " onchange=\"script(settingscript,KZ3Tooltip)\"";
++    static const char rsx_dm_reset_at[] = "gPlayerProfile:SetDefaultDisplay()";
++    static const char rsx_dm_reset_call[] = "\n\t\t\t\tKZ3ResetDisplay()";
++    const char* le = rsx_dm_find(in, n, (size_t)(row - in), "</list>");
++    const char* rs = rsx_dm_find(in, n, (size_t)(scr - in), rsx_dm_reset_at);
++    const size_t nt = sizeof rsx_dm_gum_tip - 1, nlt = sizeof rsx_dm_gum_lua_tip - 1;
++    if (!le || le > scr || (rs && rs > cd)) return NULL;
++    out = (char*)malloc(n + nr + nm + nf + nd + nl + nlm + nlf + nt + nlt + 128 + 1);
+     if (!out) return NULL;
+     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend (run r103-dpage3):
+-     * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead. */
++     * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead.
++     * Patch 2110: always (1.14 has 11 rows without Motion blur and Field of view): 400 = the game's longest options
++     * list, common/advancedcontroller.gum, 10 rows ending above its tooltip and legend (run r104-advc2). */
+     static const char rsx_dm_list_tag[] = "<list id=\"lst_options\" class=\"PEDS\"";
+     static const char rsx_dm_list_h[] = " height=\"400\"";
+-    const char* lt = nf ? rsx_dm_find(in, n, 0, rsx_dm_list_tag) : NULL;
++    const char* lt = rsx_dm_find(in, n, 0, rsx_dm_list_tag);
+     if (lt && lt < row) {
+         const size_t at_lt = (size_t)(lt - in) + sizeof rsx_dm_list_tag - 1;
+         memcpy(out + o, in, at_lt); o += at_lt;
+         memcpy(out + o, rsx_dm_list_h, sizeof rsx_dm_list_h - 1); o += sizeof rsx_dm_list_h - 1;
++        memcpy(out + o, rsx_dm_list_on, sizeof rsx_dm_list_on - 1); o += sizeof rsx_dm_list_on - 1;   /* 2110 */
+         memcpy(out + o, in + at_lt, at_row - at_lt); o += at_row - at_lt;
+     } else {
+         memcpy(out + o, in, at_row); o += at_row;
+@@ -533,12 +591,25 @@
+     memcpy(out + o, rsx_dm_gum_row, nr); o += nr;
+     memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;
+     memcpy(out + o, rsx_dm_gum_row_fov, nf); o += nf;                  /* patch 2109 */
+-    memcpy(out + o, in + at_row, at_scr - at_row); o += at_scr - at_row;
++    {   /* patch 2110: the tooltip panel right after the list */
++        const size_t at_le = (size_t)(le - in) + 7;
++        memcpy(out + o, in + at_row, at_le - at_row); o += at_le - at_row;
++        memcpy(out + o, rsx_dm_gum_tip, nt); o += nt;
++        memcpy(out + o, in + at_le, at_scr - at_le); o += at_scr - at_le;
++    }
+     memcpy(out + o, rsx_dm_gum_dlg, nd); o += nd;                      /* patch 2107: before <script id="settingscript"> */
+-    memcpy(out + o, in + at_scr, at_lua - at_scr); o += at_lua - at_scr;
++    if (rs) {   /* patch 2110: Reset to defaults also resets the port's rows */
++        const size_t at_rs = (size_t)(rs - in) + sizeof rsx_dm_reset_at - 1;
++        memcpy(out + o, in + at_scr, at_rs - at_scr); o += at_rs - at_scr;
++        memcpy(out + o, rsx_dm_reset_call, sizeof rsx_dm_reset_call - 1); o += sizeof rsx_dm_reset_call - 1;
++        memcpy(out + o, in + at_rs, at_lua - at_rs); o += at_lua - at_rs;
++    } else {
++        memcpy(out + o, in + at_scr, at_lua - at_scr); o += at_lua - at_scr;
++    }
+     memcpy(out + o, rsx_dm_gum_lua, nl); o += nl;
+     memcpy(out + o, rsx_dm_gum_lua_mb, nlm); o += nlm;
+     memcpy(out + o, rsx_dm_gum_lua_fov, nlf); o += nlf;
++    memcpy(out + o, rsx_dm_gum_lua_tip, nlt); o += nlt;               /* patch 2110 */
+     memcpy(out + o, in + at_lua, n - at_lua); o += n - at_lua;
+     out[o] = 0;
+     *out_n = o;

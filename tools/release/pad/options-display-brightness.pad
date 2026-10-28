@@ -1,0 +1,48 @@
+# Options list with Audio highlighted -> Display (1 DOWN, CROSS): rows Crosshair, HUD, Subtitles, Hints, Brightness.
+# Toggle Subtitles (row 3) with RIGHT, then Brightness (4 DOWN from the top) opens the gamma page: LEFT x4, RIGHT x8.
+key DOWN
+sleep 2
+key X
+sleep 4
+mark display page default
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+key RIGHT
+sleep 2
+mark display subtitles toggled
+key DOWN
+sleep 1.5
+key DOWN
+sleep 1.5
+mark display row Brightness
+key X
+sleep 4
+mark brightness page default
+key LEFT
+sleep 1.5
+key LEFT
+sleep 1.5
+key LEFT
+sleep 1.5
+key LEFT
+sleep 2
+mark brightness lowered
+key RIGHT
+sleep 1.5
+key RIGHT
+sleep 1.5
+key RIGHT
+sleep 1.5
+key RIGHT
+sleep 1.5
+key RIGHT
+sleep 1.5
+key RIGHT
+sleep 1.5
+key RIGHT
+sleep 1.5
+key RIGHT
+sleep 2
+mark brightness raised

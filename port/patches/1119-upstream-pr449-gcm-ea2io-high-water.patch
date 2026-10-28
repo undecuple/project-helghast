@@ -1,0 +1,64 @@
+KZ3 patch 1119 (SPU pass 103): upstream ps3recomp PR #449 on top of our patch 1101 (MIT; author: tekulvw, https://github.com/sp00nznet/ps3recomp/pull/449). s_io_mapping_hw, one past the highest IO mapping slot handed out since
+the table was last cleared (raised in find_free_mapping and for cellGcmInit's slot 0, reset with the table), bounds
+gcm_ea2io_range's slot scan behind the SPU PUT hook. Merged with 1101 at the root: 1101's O(1) offset-table reject
+stays first (an EA in no IO page never scans), the bounded scan handles the EAs that are in an IO page;
+KZ3_GCM_PUT_FAST=0 keeps the old full 512-slot scan (both changes off). Every slot writer in the fully patched tree
+(2xxx included) takes its slot from find_free_mapping or is cellGcmInit's slot 0. PR tests: tests/test_gcm_ea2io_range.c
+via tools/test_gcm_ea2io_range.py (its full-scan reference applies 1101's offset-table reject, and the one assert on
+overlapping EA ranges after an unmap expects 1101's answer) (tools/spu/test_r103_pr_tests.sh), tools/test_gcm_io_mappings.py (run by
+tools/upstream/test_upstream_suite.sh with its 2082/2083 stub header). tools/spu/test_gcm_put_fast.sh keeps the
+high-water mark in its stub list writer.
+Notes the RE notes Pass 103.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): 1101's offset-table miss + upstream's high-water bound (#449 upstream); 1119 keeps the KZ3_GCM_PUT_FAST=0 full scan and the test's 1101 case.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 62915833..3f49aec6 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1615,10 +1615,10 @@ static u32 gcm_ea2io_range(u32 ea, u32* room)
+         s_ea2io_fast = !(e && e[0] == '0');
+     }
+     if (s_ea2io_fast && s_io_address_table[ea >> 20] == 0xFFFF) return 0xFFFFFFFFu;
+-    /* Called for every SPU PUT. The table has CELL_GCM_MAX_IO_MAPPINGS slots
+-     * and a title uses a handful, all below the high-water mark; the first
+-     * match in slot order is the one a full scan returns. */
+-    const int n = __atomic_load_n(&s_io_mapping_hw, __ATOMIC_RELAXED);
++    /* Upstream PR #449 (KZ3 patch 1119): the scan stops at the high-water mark. The table has
++     * CELL_GCM_MAX_IO_MAPPINGS slots and a title uses a handful, all below the high-water mark; the first
++     * match in slot order is the one a full scan returns. KZ3_GCM_PUT_FAST=0 keeps the old full scan too. */
++    const int n = s_ea2io_fast ? __atomic_load_n(&s_io_mapping_hw, __ATOMIC_RELAXED) : CELL_GCM_MAX_IO_MAPPINGS;
+     for (int i = 0; i < n; i++) {
+         IoMapping* m = &s_io_mappings[i];
+         if (!m->active || !m->size) continue;
+diff --git a/tests/test_gcm_ea2io_range.c b/tests/test_gcm_ea2io_range.c
+index 151e8568..30d3ede2 100644
+--- a/tests/test_gcm_ea2io_range.c
++++ b/tests/test_gcm_ea2io_range.c
+@@ -17,9 +17,13 @@ void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
+ void spu_lockline_lock(void) { abort(); }
+ void spu_lockline_unlock(void) { abort(); }
+ 
+-/* The lookup over every slot: what gcm_ea2io_range returned before the bound. */
++/* The lookup over every slot: what gcm_ea2io_range returned before the bound.
++ * KZ3 patch 1119: before the bound, KZ3 patch 1101 answered "no mapping" at once
++ * for an EA whose 1 MB offset-table page is unmapped, so the reference does too
++ * (it differs from the list only for overlapping EA ranges after an unmap). */
+ static u32 full_scan(u32 ea, u32* room)
+ {
++    if (s_ea2io_fast && s_io_address_table[ea >> 20] == 0xFFFF) return 0xFFFFFFFFu;
+     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+         const IoMapping* m = &s_io_mappings[i];
+         if (!m->active || !m->size) continue;
+@@ -82,7 +86,10 @@ int main(void)
+     cellGcm_syscall_iomap(EA0 + 0x100000u, 0x00800000u, 0x200000u); /* slot 1 */
+     assert(gcm_ea2io_range(EA0 + 0x180000u, NULL) == 0x00280000u);
+     assert(cellGcmUnmapEaIoAddress(EA0) == CELL_OK);
+-    assert(gcm_ea2io_range(EA0 + 0x180000u, NULL) == 0x00880000u);
++    /* KZ3 patch 1101: the unmap cleared the offset table under slot 1's first
++     * page too (overlapping EA ranges), so that page now reads unmapped. */
++    assert(gcm_ea2io_range(EA0 + 0x180000u, NULL) ==
++           (s_ea2io_fast ? 0xFFFFFFFFu : 0x00880000u));
+     cellGcm_syscall_iomap(EA0 + 0x100000u, 0x00C00000u, 0x100000u); /* slot 0 again */
+     assert(s_io_mappings[0].active && s_io_mappings[0].io == 0x00C00000u);
+     assert(gcm_ea2io_range(EA0 + 0x180000u, NULL) == 0x00C80000u);

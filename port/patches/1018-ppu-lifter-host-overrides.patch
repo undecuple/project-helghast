@@ -1,0 +1,68 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): merged with upstream weak-symbol emit and CR fusion, overrides kept.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): defname (`__lifted`) + upstream's `--insn-patches` guards and `PPU_MM_SNAP`.
+
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index a657ba61..b7e5b220 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -1036,6 +1036,13 @@ class PPULifter:
+         # `.lib.stub` trampoline (which derefs an import pointer table the recomp
+         # never populates -> bctrl to garbage). Populated from --hle-stubs.
+         self.hle_stub_nids: dict[int, int] = {}
++        # --overrides: entry addresses whose lifted body is emitted as
++        # <name>__lifted. The host defines <name> itself (and may call the
++        # lifted body); every direct call, trampoline and the function table
++        # then reach the host version. The header announces each one with
++        # PPU_OVERRIDE_<addr> so the host can compile its replacement only
++        # against a lift that made room for it.
++        self.overrides: set[int] = set()
+         # Module primary TOC (r2). Set by main() only when the ELF yields exactly
+         # one TOC candidate; enables the `ld r2, N(r1)` restore lowering below.
+         self.toc_base: int = 0
+@@ -3996,6 +4003,9 @@ class PPULifter:
+         # Forward declarations
+         for func in self.functions:
+             lines.append(f"void {func.name}(ppu_context* ctx);")
++            if func.start_addr in self.overrides:
++                lines.append(f"void {func.name}__lifted(ppu_context* ctx); /* --overrides: host defines {func.name} */")
++                lines.append(f"#define PPU_OVERRIDE_{func.start_addr:08X} 1")
+         # Also declare any call targets that aren't defined
+         defined = {f.start_addr for f in self.functions}
+         for target in sorted((self.call_targets | self.branch_targets) - defined):
+@@ -4176,7 +4186,8 @@ class PPULifter:
+         for g in guards:
+             lines += ["#ifdef __cplusplus", f'extern "C" int {g};', "#else",
+                       f"extern int {g};", "#endif"]
+-        lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
++        defname = func.name + "__lifted" if func.start_addr in self.overrides else func.name
++        lines.append(f"void {weak}{defname}(ppu_context* ctx) {{")
+         lines.append("    PPU_MM_SNAP")
+         for bline in _fuse_cr(func.body_lines):
+             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
+@@ -5052,6 +5063,9 @@ def main() -> None:
+                         help="Emit lifted function definitions as weak symbols "
+                              "so a port's idiomatic overrides (strong symbols "
+                              "of the same name) shadow them at link time")
++    parser.add_argument("--overrides", metavar="FILE", default=None,
++                        help="Text file of function entry addresses (hex, one per line, '#' comments) "
++                             "the host replaces: their lifted bodies are emitted as <name>__lifted")
+     parser.add_argument("--hle-stubs", metavar="FILE", default=None,
+                         help="EBOOT.imports.json ([{library,nid,stub}]). Each "
+                              "import stub address is lifted as ps3_hle_call(nid) "
+@@ -5518,6 +5532,13 @@ def main() -> None:
+         lifter.code_lo = min(s for s, _ in func_bounds)
+         lifter.code_hi = max(e for _, e in func_bounds)
+     lifter.hle_stub_nids = hle_stubs
++    if args.overrides:
++        with open(args.overrides) as _of:
++            for _ln in _of:
++                _ln = _ln.split("#", 1)[0].strip()
++                if _ln:
++                    lifter.overrides.add(int(_ln, 16))
++        print(f"  overrides: {len(lifter.overrides)} function(s) left to the host")
+     lifter.function_entries = _func_entries
+     lifter.jump_tables = jt_dispatchers
+     if args.insn_patches:

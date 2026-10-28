@@ -1,0 +1,44 @@
+KZ3 patch 1101 (SPU pass 74): the SPU PUT hook's EA -> IO lookup answers "not RSX-visible" from the offset table.
+
+gcm_note_spu_put (patch 1087's park wake and the walker's SPU block record) runs on every SPU PUT and called
+gcm_ea2io_range, a scan of the IO mapping list. Since patch 2019 the list has 512 slots, and a PUT to memory no
+mapping covers (most of them: the audio mixer's voice state and output) walked all 512: gcm_note_spu_put was
+2.7 % of the K2 audio synth job (job 259, SPU pass 74 profile of run spu-73-hH2). Every list writer fills the 1 MB
+offset table (s_io_address_table) for the same range and the resets clear both, so when the table has the PUT's
+first page unmapped no mapping holds it and the lookup returns at once. Hits still scan the list (same answer as
+before). The one divergence is sys_rsx iounmap, which clears only the table: such a range is no longer RSX-visible,
+so the table's answer is the right one. KZ3_GCM_PUT_FAST=0 = the old scan (same exe, A/B). Upstream candidate
+(together with patch 2019's slot count).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): 1101's offset-table miss + upstream's high-water bound (#449 upstream); 1119 keeps the KZ3_GCM_PUT_FAST=0 full scan and the test's 1101 case.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 40038c29..62915833 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1597,9 +1597,24 @@ static void gcm_ref_push_at(u32 v, u32 getoff);
+ static struct { u32 io_start, io_end; } s_spu_blk[GCM_SPU_BLK_N];
+ static int s_spu_blk_w = 0;
+ 
+-/* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
++/* EA -> IO through the mapping list (range lookup; the by-ea helper is exact).
++ *
++ * KZ3 patch 1101 (SPU pass 74): every SPU PUT asks this (gcm_note_spu_put), and most PUTs (the audio mixer's
++ * voice state and output, job data) go to memory no IO mapping covers: each of those walked all 512 slots of the
++ * list (patch 2019's size; ~2.7 % of the K2 audio synth job). Every list writer (cellGcmInit's IO region,
++ * cellGcmMapEaIoAddress(WithFlags), cellGcmMapMainMemory, the auto-map, the sys_rsx iomap) fills the 1 MB offset
++ * table for the same range, and both resets clear the two together, so a PUT whose first 1 MB page the offset
++ * table has unmapped (0xFFFF) is in no mapping: answer at once. The one case where the list still holds a range
++ * the table cleared is sys_rsx iounmap (it clears only the table): that range is no longer RSX-visible, so the
++ * table's answer is the right one. KZ3_GCM_PUT_FAST=0 = the old full scan. */
++static int s_ea2io_fast = -1;
+ static u32 gcm_ea2io_range(u32 ea, u32* room)
+ {
++    if (__builtin_expect(s_ea2io_fast < 0, 0)) {
++        const char* e = getenv("KZ3_GCM_PUT_FAST");
++        s_ea2io_fast = !(e && e[0] == '0');
++    }
++    if (s_ea2io_fast && s_io_address_table[ea >> 20] == 0xFFFF) return 0xFFFFFFFFu;
+     /* Called for every SPU PUT. The table has CELL_GCM_MAX_IO_MAPPINGS slots
+      * and a title uses a handful, all below the high-water mark; the first
+      * match in slot order is the one a full scan returns. */

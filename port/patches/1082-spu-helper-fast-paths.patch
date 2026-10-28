@@ -1,0 +1,209 @@
+KZ3 patch 1082 (SPU pass 65): SPU helper fast paths, every result bit-identical.
+1. Float ops: the exponent-255 recompute (spu__xr_fix) and the fma cold paths take __m128 arguments, so the
+   inlined op keeps its result in a register (a u128 argument made the compiler store the result and reload it
+   into two general registers on the main path; fma loaded its three operands as GPR pairs + pinsrq).
+2. LS accessors: lifted functions that touch LS open with SPU_LS_LOCALS (LS base + one snapshot of the debug
+   gates); the lifted source maps spu_ls_read128/write128 to the _l forms, so -fno-strict-aliasing stores no
+   longer force reloads of g_spu_ls_probe, ctx->ls, g_spu_ls_watch_n, g_spu_smc_watch. Any armed (or not yet
+   read, -1) gate sends the access through the unchanged full accessor.
+3. shufb with ra == rb: spu_shufb1(a, c), one pshufb (7 vector ops instead of 11), emitted by the lifter.
+Tests: tools/spu/test_spu_xr.sh, test_spu_fastcg.sh (shufb1 vs reference), test_spu_lift.py, test_job_diff.py.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 81ae1a25..53a95786 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -801,6 +801,54 @@ SPU_HOT void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+         spu_ls_write_diag(ctx, lsa, val);
+ }
+ 
++/* KZ3 patch 1082 (SPU pass 65): LS accessors with the context's LS base and the debug gates taken once per lifted
++ * function. The lifted code is built with -fno-strict-aliasing, so every store (each ctx->gpr[] write, each LS
++ * store) forces the next spu_ls_read128/write128 to reload g_spu_ls_probe, ctx->ls and g_spu_ls_watch_n (and the
++ * write's g_spu_smc_watch): ~5 instructions of every LS access in a hot loop (the RE notes Pass 64 s.4). The
++ * lifter (spu_lifter.py, emit_source) now opens every function that touches LS with SPU_LS_LOCALS, and the lifted
++ * source maps spu_ls_read128/write128 onto the _l forms below.
++ * Exactness: ctx->ls is set when the context is created (spu_context_init, spu_raw) and never changes while a lifted
++ * function runs. The gates only go from -1 (env not read yet) to their env value, inside the probes themselves; a
++ * snapshot taken while any gate is non-zero (including -1) sends every access of that function through the full
++ * accessor, which reads the live gates, so the env is still read on first use and every armed probe still fires.
++ * With all gates 0 they stay 0, and the full accessor's gated branches are all not-taken: the _l fast path below
++ * is that accessor with those branches removed. The WWS range probes (no gate: image 2 in policy mode, raw lsa
++ * 0xDF0..0xEAF on reads, 0x1320 on writes) stay on the fast path unchanged. */
++static inline int spu_ls_dbg_armed(void)
++{
++    return (g_spu_ls_probe | g_spu_ls_watch_n | g_spu_smc_watch) != 0;
++}
++#define SPU_LS_LOCALS                                                                                  \
++    uint8_t* const spu__ls = ctx->ls;                                                                  \
++    const int spu__lsdbg = spu_ls_dbg_armed();                                                         \
++    (void)spu__ls; (void)spu__lsdbg;
++SPU_HOT u128 spu_ls_read128_l(const spu_context* ctx, const uint8_t* ls, int dbg, uint32_t lsa)
++{
++    if (__builtin_expect(dbg, 0)) return spu_ls_read128(ctx, lsa);
++    if (__builtin_expect((uint32_t)(lsa - 0xDF0u) < 0xC0u && ctx->image_id == 2 && ctx->policy_mode, 0))
++        spu_ls_read_probe(ctx, lsa);
++    const uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~0xFu));
++    u128 v;
++    uint32_t w0, w1, w2, w3;
++    memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
++    memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
++    v._u32[0] = SPU_BSWAP32(w0); v._u32[1] = SPU_BSWAP32(w1);
++    v._u32[2] = SPU_BSWAP32(w2); v._u32[3] = SPU_BSWAP32(w3);
++    return v;
++}
++SPU_HOT void spu_ls_write128_l(spu_context* ctx, uint8_t* ls, int dbg, uint32_t lsa, u128 val)
++{
++    if (__builtin_expect(dbg, 0)) { spu_ls_write128(ctx, lsa, val); return; }
++    lsa &= SPU_LS_MASK & ~0xFu;
++    if (__builtin_expect(lsa == 0x1320, 0) && ctx->image_id == 2 && ctx->policy_mode)
++        spu_ls_write_probe_pre(ctx, lsa, val);
++    uint8_t* p = ls + lsa;
++    uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
++    uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
++    memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
++    memcpy(p + 8,  &w2, 4); memcpy(p + 12, &w3, 4);
++}
++
+ /* ---------------------------------------------------------------------------
+  * Preferred slot extraction
+  *
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 250367e1..020b8cf4 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -281,8 +281,26 @@ SPU_XR_COLD u128 spu__xr_fix(u128 r, u128 a, u128 b, unsigned m, int op, int imm
+     }
+     return r;
+ }
+-#define SPU_XR_RET(m, r, a, b, op, imm) do { const unsigned _xm = (m); \
++/* KZ3 patch 1082 (SPU pass 65): the recompute is called with vector arguments. A u128 argument (a union of integer and
++ * float arrays) is passed in two general registers on SysV x86-64 and by a stack copy on Windows x64; the compiler
++ * built that argument on the inlined op's main path (result stored to the stack and reloaded into rdi/rsi before the
++ * branch: 4 instructions and a store-forward per float op, the RE notes Pass 64 s.4). __m128 arguments are already
++ * in xmm registers, so the main path keeps the result in a register; the conversion to u128 happens inside the cold
++ * function. Same lanes, same expressions (spu__xr_fix): bit-identical. */
++#if defined(__SSE2__)
++SPU_XR_COLD __m128 spu__xr_fixv(__m128 r, __m128 a, __m128 b, unsigned m, int op, int imm) {
++    u128 R, A, B; memcpy(&R, &r, 16); memcpy(&A, &a, 16); memcpy(&B, &b, 16);
++    R = spu__xr_fix(R, A, B, m, op, imm);
++    memcpy(&r, &R, 16); return r;
++}
++#  define SPU_XR_RET(m, r, a, b, op, imm) do { const unsigned _xm = (m); \
++    if (__builtin_expect(_xm != 0, 0)) { __m128 _xr, _xa, _xb; memcpy(&_xr, &(r), 16); memcpy(&_xa, &(a), 16); \
++        memcpy(&_xb, &(b), 16); _xr = spu__xr_fixv(_xr, _xa, _xb, _xm, op, imm); memcpy(&(r), &_xr, 16); } \
++    return r; } while (0)
++#else
++#  define SPU_XR_RET(m, r, a, b, op, imm) do { const unsigned _xm = (m); \
+     if (__builtin_expect(_xm != 0, 0)) return spu__xr_fix(r, a, b, _xm, op, imm); return r; } while (0)
++#endif
+ 
+ /* FI decodes the base and step fields produced by the hardware estimate
+  * instructions; its second operand is not an ordinary reciprocal float. */
+@@ -442,6 +460,23 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+ }
+ #define spu_shufb_ref spu_shufb
+ #endif
++/* KZ3 patch 1082 (SPU pass 65): shufb with ra == rb (63 of the 66 shufb of ovl255's 0x5868 loop, 28 % of all lifted
++ * shufb), emitted by spu_lifter.py for that case. Both halves of the 32-byte concat are a, so SPU source byte k is
++ * host byte (k & 15) ^ 3 of a: one pshufb on (control & 0x0F) ^ 3 (bit 7 clear, so pshufb never zeroes) instead of
++ * two pshufb and the a/b merge; the special selectors as in spu_shufb. 7 vector ops instead of 11; bit-identical to
++ * spu_shufb(a, a, c) (tools/spu/test_spu_fastcg.c part 4). */
++#if defined(__SSE4_1__)
++SPU_HOT u128 spu_shufb1(u128 a, u128 c) {
++    __m128i A, C; memcpy(&A, &a, 16); memcpy(&C, &c, 16);
++    __m128i r = _mm_shuffle_epi8(A, _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x0F)), _mm_set1_epi8(3)));
++    const __m128i lut = _mm_setr_epi8(0,0,0,0, 0,0,0,0, 0,0,0,0, (char)0xFF,(char)0xFF,(char)0x80,(char)0x80);
++    const __m128i sp = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 4), _mm_set1_epi8(0x0F)));
++    r = _mm_blendv_epi8(r, sp, C);
++    u128 out; memcpy(&out, &r, 16); return out;
++}
++#else
++static inline u128 spu_shufb1(u128 a, u128 c) { return spu_shufb(a, a, c); }
++#endif
+ 
+ /* ---- shift / rotate immediate (word lanes) ---- */
+ static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
+@@ -577,8 +612,17 @@ SPU_XR_COLD u128 spu__fma4_ref(u128 a, u128 b, u128 c, int negb, int negc, int c
+             if (r._f32[i] != 0.0f && __builtin_fabsf(r._f32[i]) < 0x1p-126f) r._u32[i] &= 0x80000000u;
+     return r;
+ }
+-SPU_XR_COLD u128 spu__fma4_slow(u128 a, u128 b, u128 c, int negb, int negc, int cgm, __m128d sl, __m128d sh, __m128d al, __m128d ah,
++/* patch 1082: the cold paths take the operands as __m128 (see SPU_XR_RET): with u128 arguments the inline fast path
++ * loaded each operand as two general registers and rebuilt it with pinsrq (9 instructions for 3 loads). */
++SPU_XR_COLD u128 spu__fma4_refv(__m128 av, __m128 bv, __m128 cv, int negb, int negc, int cgm) {
++    u128 a, b, c; memcpy(&a, &av, 16); memcpy(&b, &bv, 16); memcpy(&c, &cv, 16);
++    return spu__fma4_ref(a, b, c, negb, negc, cgm);
++}
++SPU_XR_COLD u128 spu__fma4_slow(__m128 av, __m128 bv, __m128 cv, int negb, int negc, int cgm, __m128d sl, __m128d sh,
+                                 __m128d okl, __m128d okh) {
++    /* patch 1082: |sl|, |sh| recomputed here (seven vector arguments fit the xmm argument registers) */
++    const __m128d absm = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
++    const __m128d al = _mm_and_pd(sl, absm), ah = _mm_and_pd(sh, absm);
+     const __m128d lo = _mm_set1_pd(0x1p-126);
+     const int ftz = cgm == 0;
+     if (ftz) {   /* off the common path: tiny sums are fine too, their result is flushed */
+@@ -597,12 +641,13 @@ SPU_XR_COLD u128 spu__fma4_slow(u128 a, u128 b, u128 c, int negb, int negc, int
+         double sv[4]; _mm_storeu_pd(sv, sl); _mm_storeu_pd(sv + 2, sh);
+         kz3_spu_fma_note(sv, ftz);
+     }
+-    return spu__fma4_ref(a, b, c, negb, negc, cgm);
++    return spu__fma4_refv(av, bv, cv, negb, negc, cgm);
+ }
+ SPU_HOT u128 spu__fma4(u128 a, u128 b, u128 c, int negb, int negc) {
+     const int cgm = g_kz3_spu_slowcg;
++    __m128 A0, B0, C0; memcpy(&A0, &a, 16); memcpy(&B0, &b, 16); memcpy(&C0, &c, 16);
+     if (__builtin_expect(cgm != 1, 1)) {
+-        __m128 A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
++        __m128 A = A0, B = B0, C = C0;
+         const __m128 sgn = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));
+         if (negb) B = _mm_xor_ps(B, sgn);
+         if (negc) C = _mm_xor_ps(C, sgn);
+@@ -621,9 +666,9 @@ SPU_HOT u128 spu__fma4(u128 a, u128 b, u128 c, int negb, int negc) {
+             const __m128 r4 = _mm_movelh_ps(_mm_cvtpd_ps(sl), _mm_cvtpd_ps(sh));
+             u128 r; memcpy(&r, &r4, 16); return r;
+         }
+-        return spu__fma4_slow(a, b, c, negb, negc, cgm, sl, sh, al, ah, okl, okh);
++        return spu__fma4_slow(A0, B0, C0, negb, negc, cgm, sl, sh, okl, okh);
+     }
+-    return spu__fma4_ref(a, b, c, negb, negc, cgm);
++    return spu__fma4_refv(A0, B0, C0, negb, negc, cgm);
+ }
+ SPU_HOT u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__fma4(a, b, c, 0, 0); }
+ SPU_HOT u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__fma4(a, b, c, 0, 1); }
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index d98d0a78..d34d5604 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -141,6 +141,10 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt);
+ SOURCE_PREAMBLE = """/* Auto-generated by spu_lifter.py -- do not edit by hand. */
+ #include "{header_name}"
+ #include "../../runtime/spu/spu_helpers.h"
++/* KZ3 patch 1082: LS accesses use the LS base and debug gates each function snapshots in SPU_LS_LOCALS
++ * (runtime/spu/spu_context.h, spu_ls_read128_l). */
++#define spu_ls_read128(c, a) spu_ls_read128_l((c), spu__ls, spu__lsdbg, (a))
++#define spu_ls_write128(c, a, v) spu_ls_write128_l((c), spu__ls, spu__lsdbg, (a), (v))
+ """
+ 
+ # ---------------------------------------------------------------------------
+@@ -785,6 +789,8 @@ class SPULifter:
+             return f"{g(rt())} = spu_selb({g(ra())}, {g(rb())}, {g(rc)});"
+         if mn == "shufb":
+             rc = _reg(ops[3])
++            if ra() == rb():   # KZ3 patch 1082: one-source form (runtime/spu/spu_helpers.h spu_shufb1)
++                return f"{g(rt())} = spu_shufb1({g(ra())}, {g(rc)});"
+             return f"{g(rt())} = spu_shufb({g(ra())}, {g(rb())}, {g(rc)});"
+         if mn in ("fma", "fms", "fnms", "mpya"):
+             rc = _reg(ops[3])
+@@ -1025,6 +1031,9 @@ class SPULifter:
+         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
+         for f in self.functions:
+             lines.append(f"void {f.name}(spu_context* ctx) {{")
++            # KZ3 patch 1082: one LS base / debug-gate snapshot per function that touches LS (see SOURCE_PREAMBLE).
++            if any("spu_ls_read128(" in b or "spu_ls_write128(" in b for b in f.body_lines):
++                lines.append("    SPU_LS_LOCALS")
+             for b in f.body_lines:
+                 lines.append(b if b.endswith(":") else f"    {b}")
+             lines.append("}")

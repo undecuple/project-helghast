@@ -1,0 +1,166 @@
+KZ3 patch 1050 (SPU pass 35): KZ3_AUDIO_DIAG=1 mix diagnostics (holes per port with ring occupancy and the SPURS kernel threads' runs, port vs mix clipping, port-lock wait, backlog drops = the drift) and KZ3_AUDIO_PRIO=1 (mix thread TIME_CRITICAL, opt-in).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 546f0004..8773e11d 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -434,15 +434,44 @@ static inline float ld_be_f32(const float* p)
+     return f;
+ }
+ 
++/* KZ3 patch 1050 (SPU pass 35): KZ3_AUDIO_DIAG=1 mix diagnostics for the in-level dropouts (pass 34: whole
++ * 256-frame holes, clipping, the mixer drifting behind real time). Per running port, a block that is all zero at
++ * read_index while the port runs is a hole (the producer did not fill it in time); the first 24 and then every
++ * 64th print [audio-hole] with the ring occupancy, how many filled blocks sit AHEAD of the cursor (a phase error if
++ * nonzero) and what the SPURS kernel threads were running (kz3_spurs_runs_brief, patch 1049). Clipping is counted
++ * on each port's own samples (genuine: the game's mix already past +-1) and on the sum (mix_clip: the ports add up
++ * past +-1 = gain stage). The wait for s_audio_mutex and the mix thread's >50 ms backlog drops (the drift) are
++ * timed. [audio-diag] every 10 s. KZ3_AUDIO_PRIO=1 raises the mix thread to TIME_CRITICAL (fix candidate for the
++ * drift, A/B pending). */
++extern int kz3_spurs_runs_brief(char* buf, int n);
++static int s_kz3_adiag = -1;
++static unsigned s_kz3_blocks, s_kz3_holes_tot, s_kz3_holes_port[CELL_AUDIO_PORT_MAX], s_kz3_holes_int,
++                s_kz3_pclip_int, s_kz3_mclip_int, s_kz3_hole_lines, s_kz3_lock_max_us, s_kz3_late_drops,
++                s_kz3_last_nz[CELL_AUDIO_PORT_MAX], s_kz3_hole_at[CELL_AUDIO_PORT_MAX], s_kz3_fill_hist[6],
++                s_kz3_fill_max;
++static int s_kz3_hole_blk[CELL_AUDIO_PORT_MAX] = {-1, -1, -1, -1, -1, -1, -1, -1};
++static long long s_kz3_late_ms;
++static int s_kz3_adiag_on(void) { if (s_kz3_adiag < 0) s_kz3_adiag = getenv("KZ3_AUDIO_DIAG") ? 1 : 0; return s_kz3_adiag; }
++
+ /* Mix one block from all active ports into s_mix_buffer (stereo float) */
+ static void audio_mix_one_block(void)
+ {
++    const int kz3_diag = s_kz3_adiag_on();   /* KZ3 patch 1050 */
++    LARGE_INTEGER kz3_l0, kz3_l1, kz3_lf;
++    if (kz3_diag) { QueryPerformanceFrequency(&kz3_lf); QueryPerformanceCounter(&kz3_l0); }
+     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
+ 
+     mutex_lock(&s_audio_mutex);
++    if (kz3_diag) {   /* KZ3 patch 1050: how long the mixer waited for the port lock */
++        QueryPerformanceCounter(&kz3_l1);
++        unsigned us = (unsigned)((kz3_l1.QuadPart - kz3_l0.QuadPart) * 1000000 / kz3_lf.QuadPart);
++        if (us > s_kz3_lock_max_us) s_kz3_lock_max_us = us;
++        s_kz3_blocks++;
++    }
+ 
+     for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
+         AudioPortSlot* port = &s_ports[p];
++        int kz3_nz = 0; unsigned kz3_pclip = 0;   /* KZ3 patch 1050 */
+         /* Diagnostic: a port that HOLDS PCM but was never started is inaudible
+          * by design -- flag it once so "no PortStart" vs "no data" is decidable
+          * from the log (LBP's Bink movie audio port sat exactly there). */
+@@ -473,6 +502,19 @@ static void audio_mix_one_block(void)
+         u32 block_idx = (u32)(port->read_index % nblock);
+         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
+         float* src = port->buffer + block_offset;
++        if (kz3_diag && s_kz3_hole_blk[p] >= 0) {
++            /* late fill: when does the producer write the block the mixer found empty? (blocks after the hole) */
++            u32 hb = (u32)s_kz3_hole_blk[p];
++            const float* bp = port->buffer + hb * CELL_AUDIO_BLOCK_SAMPLES * nch;
++            int nz2 = 0;
++            for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 16) if (bp[s2] != 0.0f) { nz2 = 1; break; }
++            if (nz2) {
++                unsigned late = s_kz3_blocks - s_kz3_hole_at[p];
++                s_kz3_fill_hist[late <= 1 ? 0 : late == 2 ? 1 : late <= 4 ? 2 : late <= 8 ? 3 : 4]++;
++                if (late > s_kz3_fill_max) s_kz3_fill_max = late;
++                s_kz3_hole_blk[p] = -1;
++            } else if ((u32)(port->read_index % nblock) == hb) { s_kz3_fill_hist[5]++; s_kz3_hole_blk[p] = -1; }
++        }
+ 
+         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
+          * vs which block the read cursor is on -- distinguishes "writer never
+@@ -515,9 +557,42 @@ static void audio_mix_one_block(void)
+                 right += center + lfe + rr + sr;
+             }
+ 
++            if (kz3_diag) {   /* KZ3 patch 1050 */
++                if (left != 0.0f || right != 0.0f) kz3_nz = 1;
++                if (left >= 0.999f || left <= -0.999f || right >= 0.999f || right <= -0.999f) kz3_pclip++;
++            }
+             s_mix_buffer[s * 2 + 0] += left;
+             s_mix_buffer[s * 2 + 1] += right;
+         }
++        if (kz3_diag) {   /* KZ3 patch 1050: an empty block on a running port = a hole */
++            s_kz3_pclip_int += kz3_pclip;
++            if (kz3_nz) s_kz3_last_nz[p] = s_kz3_blocks;
++            /* a hole only inside non-silent audio: the port produced data within the last two ring lengths */
++            else if (s_kz3_last_nz[p] && s_kz3_blocks - s_kz3_last_nz[p] <= 2 * nblock) {
++                s_kz3_holes_tot++; s_kz3_holes_int++; s_kz3_holes_port[p]++;
++                if (s_kz3_hole_blk[p] < 0) { s_kz3_hole_blk[p] = (int)block_idx; s_kz3_hole_at[p] = s_kz3_blocks; }
++                if (s_kz3_hole_lines < 24 || (s_kz3_holes_tot % 64) == 0) {
++                    char map[36], runs[200]; int ahead = 0, contiguous = 1; u32 b;
++                    s_kz3_hole_lines++;
++                    for (b = 0; b < nblock && b < 32; b++) {
++                        const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
++                        int nz2 = 0;
++                        for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 16)
++                            if (bp[s2] != 0.0f) { nz2 = 1; break; }
++                        map[b] = nz2 ? '#' : '.';
++                    }
++                    map[b] = 0;
++                    for (b = 1; b < nblock; b++) {
++                        if (map[(block_idx + b) % nblock] == '#') { if (contiguous) ahead++; }
++                        else contiguous = 0;
++                    }
++                    runs[0] = 0; kz3_spurs_runs_brief(runs, sizeof runs);
++                    fprintf(stderr, "[audio-hole] t=%.3f port=%d ridx=%llu blk=%u nblk=%u nch=%u ahead=%d ring=[%s] spurs: %s\n",
++                            (double)s_kz3_blocks * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE, p,
++                            (unsigned long long)port->read_index, block_idx, nblock, nch, ahead, map, runs);
++                }
++            }
++        }
+ 
+         /* Firmware clears a ring-buffer block after consuming it. Besides
+          * preventing stale PCM from replaying when a producer stalls, the
+@@ -536,8 +611,20 @@ static void audio_mix_one_block(void)
+ 
+     /* Clip to [-1.0, 1.0] */
+     for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+-        if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
+-        if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
++        if (s_mix_buffer[i] > 1.0f) { s_mix_buffer[i] = 1.0f; s_kz3_mclip_int += kz3_diag; }
++        if (s_mix_buffer[i] < -1.0f) { s_mix_buffer[i] = -1.0f; s_kz3_mclip_int += kz3_diag; }
++    }
++    if (kz3_diag && (s_kz3_blocks % (10u * CELL_AUDIO_SAMPLE_RATE / CELL_AUDIO_BLOCK_SAMPLES)) == 0) {
++        char per[160]; int o = 0;   /* KZ3 patch 1050: the 10 s summary */
++        for (int p = 0; p < CELL_AUDIO_PORT_MAX && o < (int)sizeof per - 16; p++)
++            if (s_kz3_holes_port[p]) o += snprintf(per + o, sizeof per - (size_t)o, " p%d=%u", p, s_kz3_holes_port[p]);
++        fprintf(stderr, "[audio-diag] t=%.1f blocks=%u holes=%u/10s total=%u (%s) port_clip=%u mix_clip=%u lock_max_us=%u late_drops=%u (%lld ms) "
++                "late-fill blocks: 1=%u 2=%u 3-4=%u 5-8=%u >8=%u never=%u max=%u\n",
++                (double)s_kz3_blocks * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE, s_kz3_blocks, s_kz3_holes_int,
++                s_kz3_holes_tot, o ? per + 1 : "none", s_kz3_pclip_int, s_kz3_mclip_int, s_kz3_lock_max_us,
++                s_kz3_late_drops, s_kz3_late_ms, s_kz3_fill_hist[0], s_kz3_fill_hist[1], s_kz3_fill_hist[2],
++                s_kz3_fill_hist[3], s_kz3_fill_hist[4], s_kz3_fill_hist[5], s_kz3_fill_max);
++        s_kz3_holes_int = s_kz3_pclip_int = s_kz3_mclip_int = s_kz3_lock_max_us = 0;
+     }
+ }
+ 
+@@ -567,6 +654,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+     (void)arg;
+     ps3_thread_name("audio mix");
+     printf("[cellAudio] Mixing thread started\n");
++    /* KZ3 patch 1050: KZ3_AUDIO_PRIO=1 (opt-in): the mixer above the SPURS kernel and lane threads. */
++    { const char* e = getenv("KZ3_AUDIO_PRIO");
++      if (e && atoi(e) > 0) { int ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++          fprintf(stderr, "[cellAudio] mix thread priority TIME_CRITICAL: %s (KZ3_AUDIO_PRIO)\n", ok ? "set" : "FAILED"); } }
+ 
+     /* The device deadline is every few ms and the guest threads keep every
+      * core busy: run this one ahead of them (MMCSS "Pro Audio" when the
+@@ -604,6 +695,15 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+             if (now.QuadPart < due) { Sleep(1); continue; }
+             /* More than 50 ms behind (device just went away, a debugger
+              * stop): drop the backlog instead of mixing it in a burst. */
++            if (now.QuadPart - due > qf.QuadPart / 20) {
++                if (s_kz3_adiag_on()) {   /* KZ3 patch 1050: each drop is lost real time (the WAV drift) */
++                    long long ms = (now.QuadPart - due) * 1000 / qf.QuadPart;
++                    s_kz3_late_drops++; s_kz3_late_ms += ms;
++                    if (s_kz3_late_drops <= 24)
++                        fprintf(stderr, "[audio-late] t=%.3f backlog %lld ms dropped (mix thread stalled)\n",
++                                (double)blocks * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE, ms);
++                }
++            }
+             if (now.QuadPart - due > qf.QuadPart / 20)
+                 q0.QuadPart = now.QuadPart -
+                     (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);

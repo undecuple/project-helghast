@@ -1,0 +1,183 @@
+
+
+Rebased on ps3recomp v0.15.0 (SPU pass 81): upstream PR283 added a different spu_taskset_line_committed (wakes waiters), ours renamed spu_taskset_line_scan, both called.
+
+Rebased on ps3recomp v0.17.0 (SPU pass 95): #381's Taskset2 helpers (spu_taskset2_register/set_exit; nothing registers a taskset in v0.17.0) kept next to spu_task2_exit_code_set; task_exited keeps #388's lock-line externs and s_ts_held.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 908fdeb6..119d03f8 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -934,6 +934,20 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, void* taskset, const void* attr)
+     s32 rc = cellSpursCreateTaskset(spurs, (CellSpursTaskset*)(uintptr_t)ts, args,
+                                     (const u8*)(uintptr_t)prio_ea, maxc);
+     if (rc == CELL_OK) vm_write32(ts + CSTS_SIZE_FIELD, KZ3_SPURS_TASKSET2_SIZE);
++    /* +0x1898 / +0x189C: two lv2 event flags (KZ3 patch 1022). The SPU-side cellSpursCreateTask2 in KZ3's
++     * Havok task (elf_00f6b900 LS 0x1C7F8-0x1C820) reads the line at +0x1880 and fails when the size is
++     * below 0x2900 or both ids are 0; its caller (LS 0x1A134) then reaps ids 0..127 with TryJoinTask2 and
++     * retries forever. ASSUMPTION: plain flags with pattern 0, as the real CreateTaskset2 makes. */
++    if (rc == CELL_OK) {
++        extern int64_t sys_event_flag_create(ppu_context* ctx);
++        for (u32 k = 0; k < 2; k++) {
++            ppu_context c; memset(&c, 0, sizeof c);
++            c.gpr[3] = ts + 0x1898 + 4 * k; c.gpr[4] = 0; c.gpr[5] = 0;
++            int64_t frc = sys_event_flag_create(&c);
++            printf("[cellSpurs] CreateTaskset2 taskset=0x%08X event flag %u -> id %u (rc 0x%X)\n", ts, k + 1,
++                   vm_read32(ts + 0x1898 + 4 * k), (unsigned)frc);
++        }
++    }
+     printf("[cellSpurs] CreateTaskset2 taskset=0x%08X attr=0x%08X name=0x%08X args=0x%016llX maxContention=%u -> 0x%08X\n",
+            ts, a, name, (unsigned long long)args, maxc, (unsigned)rc);
+     return rc;
+@@ -948,12 +962,27 @@ static int kz3_task2_enabled(u32 ts, u32 id)
+     return (vm_read8(ts + 0x30 + id / 8) >> (7 - (id & 7))) & 1;
+ }
+ 
++/* The exit code recorded in task_exit_code[id] (+0x1980 + 16*id, +8) when the entry says exited (state 2);
++ * marks it joined (4), as the SPU-side join does. 0 otherwise (KZ3 patch 1022). */
++static s32 kz3_task2_take_exit_code(u32 ts, u32 id)
++{
++    if (vm_read32(ts + 0x1890) != 0x2900u) return 0;
++    u32 e = ts + 0x1980 + 16 * id;
++    if ((vm_read8(e + 15) & 0x0F) != 2) return 0;
++    s32 code = (s32)vm_read32(e + 8);
++    vm_write8(e + 15, 4);
++    return code;
++}
++
+ s32 cellSpursCreateTask2(void* taskset, u32* id, const void* elf, const void* argument, const char* name)
+ {
+     u32 ts = (u32)(uintptr_t)taskset;
+     if (!ts || !id || !elf) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+     s32 rc = cellSpursCreateTask((CellSpursTaskset*)taskset, (CellSpursTaskId*)id, (void*)elf, NULL, 0, 0,
+                                  (u32)(uintptr_t)argument);
++    /* task_exit_code[id] := running, joinable (KZ3 patch 1022, see spu_task2_exit_code_set). */
++    { extern void spu_task2_exit_code_set(uint32_t, uint32_t, int32_t, int);
++      if (rc == CELL_OK) spu_task2_exit_code_set(ts, vm_read32((u32)(uintptr_t)id), 0, 1); }
+     static int n = 0;
+     if (n++ < 16)
+         printf("[cellSpurs] CreateTask2 taskset=0x%08X elf=0x%08X arg=0x%08X name=0x%08X -> 0x%08X id=%u\n",
+@@ -968,7 +997,8 @@ s32 cellSpursTryJoinTask2(void* taskset, u32 id, s32* exitCode)
+     if (!ts) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+     if (id >= CELL_SPURS_MAX_TASK) return CELL_SPURS_TASK_ERROR_INVAL;
+     if (kz3_task2_enabled(ts, id)) return CELL_SPURS_TASK_ERROR_BUSY;
+-    if (exitCode) vm_write32((u32)(uintptr_t)exitCode, 0);
++    if (exitCode) vm_write32((u32)(uintptr_t)exitCode, kz3_task2_take_exit_code(ts, id));
++    else kz3_task2_take_exit_code(ts, id);
+     return CELL_OK;
+ }
+ 
+@@ -982,7 +1012,8 @@ s32 cellSpursJoinTask2(void* taskset, u32 id, s32* exitCode)
+         Sleep(spins < 64 ? 0 : 1);
+         if (++spins == 20000) printf("[cellSpurs] JoinTask2 taskset=0x%08X id=%u still running after ~20 s\n", ts, id);
+     }
+-    if (exitCode) vm_write32((u32)(uintptr_t)exitCode, 0);
++    if (exitCode) vm_write32((u32)(uintptr_t)exitCode, kz3_task2_take_exit_code(ts, id));
++    else kz3_task2_take_exit_code(ts, id);
+     return CELL_OK;
+ }
+ 
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 6da2d24e..d6aeace1 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -818,6 +818,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+             spu_taskset_line_committed(ea & ~127u);
+             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+         }
++        /* SPU-side task creation in a taskset: start what it made ready (KZ3 patch 1022). */
++        { extern void spu_taskset_line_scan(uint32_t line);
++          if (ctx->atomic_stat == 0) spu_taskset_line_scan(ea & ~127u); }
+         return 1;
+ 
+     case MFC_PUTLLUC_CMD:
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 20089610..e21e1c5d 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -436,12 +436,51 @@ void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint3
+     spu_lockline_unlock();
+ }
+ 
+-static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
++/* CellSpursTaskset2 (size 0x2900 at +0x1890): task_exit_code[128] at +0x1980, 16 bytes per task. Read
++ * from the SPU-side join in KZ3's Havok task (elf_00f6b900 LS 0x1D08C-0x1D1BC, GETLLAR/PUTLLC on the
++ * entry): u32 exit code at +8; byte 14 must be 0; byte 15 low nibble = state. 1 = running (with 0x10 set:
++ * joinable, the join answers AGAIN 0x80410901 and retries), 2 = exited (join copies +8 and sets byte 15 to
++ * 4 = joined), 3 = shut down (SHUTDOWN 0x80410920), anything else = STAT 0x8041090F. Nothing wrote the
++ * array, so every SPU join saw 0 (STAT) and the Havok workers spun on it. The task exit writes state 2
++ * here, cellSpursCreateTask2 writes 0x11 (KZ3 patch 1022). Shared with the PPU join in cellSpurs.c. */
++void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_code, int create)
++{
++    extern uint8_t* vm_base;
++    if (!vm_base || !taskset_ea || task >= 128) return;
++    uint8_t* ts = vm_base + taskset_ea;
++    uint32_t size = ((uint32_t)ts[0x1890] << 24) | ((uint32_t)ts[0x1891] << 16) |
++                    ((uint32_t)ts[0x1892] << 8) | ts[0x1893];
++    if (size != 0x2900u) return;
++    uint32_t ea = taskset_ea + 0x1980u + 16u * task;
++    uint8_t* e = vm_base + ea;
++    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
++    extern void spu_coh_notify_write(uint32_t ea);
++    spu_lockline_lock();
++    uint8_t st = e[15] & 0x0Fu;
++    if (create) {
++        if (st != 2 && st != 3) {          /* the task may already have exited: keep that */
++            e[8] = e[9] = e[10] = e[11] = 0; e[14] = 0; e[15] = 0x11;
++        }
++    } else {
++        e[8] = (uint8_t)((uint32_t)exit_code >> 24); e[9] = (uint8_t)((uint32_t)exit_code >> 16);
++        e[10] = (uint8_t)((uint32_t)exit_code >> 8); e[11] = (uint8_t)exit_code;
++        e[14] = 0; e[15] = (uint8_t)((e[15] & 0xF0u) | 2u);
++    }
++    spu_lockline_unlock();
++    spu_coh_notify_write(ea);
++    static int n;
++    if (n++ < 16)
++        fprintf(stderr, "[task2] taskset 0x%08X task %u %s exit_code[%u] state 0x%02X code %d\n", taskset_ea,
++                task, create ? "created:" : "exited:", task, e[15], exit_code);
++}
++
++static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task, int32_t exit_code)
+ {
+     extern uint8_t* vm_base;
+     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+     extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+     extern void spu_coh_notify_write(uint32_t);
++    spu_task2_exit_code_set(taskset_ea, done_task, exit_code, 0);   /* KZ3 patch 1022 */
+     ts_lock(); s_ts_held = 1;
+     uint8_t* ts = vm_base + taskset_ea;
+     uint8_t* run = ts_running(taskset_ea);
+@@ -500,7 +539,22 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+  * last exit (Havok's master recreates its workers) was never noticed. */
+ void spu_taskset_start_pending(uint32_t taskset_ea)
+ {
+-    if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu);
++    if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu, 0);
++}
++
++/* A PUTLLC landed in the first 0x1900 bytes of a taskset the runtime tracks (bitsets, task_info): SPU code
++ * may have created a task or made one ready (KZ3's Havok task calls the SPU-side cellSpursCreateTask2,
++ * elf_00f6b900 LS 0x1C710, then joins it). The real taskset policy module would schedule it; scan the
++ * taskset now, as a task exit does, instead of only when some task of it exits (KZ3 patch 1022; named
++ * _scan since upstream's spu_taskset_line_committed below wakes WAIT_SIGNAL waiters on the same commits). */
++void spu_taskset_line_scan(uint32_t line)
++{
++    uint32_t hit = 0;
++    for (int i = 0; i < TS_TRACK; i++) {
++        uint32_t ts = s_ts_run[i].ea;
++        if (ts && line >= ts && line < ts + 0x1900u) { hit = ts; break; }
++    }
++    if (hit) spu_taskset_task_exited(hit, 128u, 0);
+ }
+ 
+ static void spu_async_run(spu_async_job* j)
+@@ -845,7 +899,7 @@ static void spu_async_run(spu_async_job* j)
+             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                     "(job ran to completion, did not loop)\n", j->image_id, rc);
+             spu_serial_release();
+-            if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
++            if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid, rc);
+         }
+         /* Persistent LS is retained in its taskset slot for the next task; a
+          * per-dispatch LS is freed. */

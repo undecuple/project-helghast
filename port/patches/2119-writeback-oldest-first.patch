@@ -1,0 +1,49 @@
+KZ3 patch 2119 (RSX pass 112): surface write-backs in write order (oldest first), so overlapping live surfaces leave the
+most recent GPU write in guest memory. Fixes the Botzone corner minimap box (an older 256x256 radar surface at the
+scene target address written over the NV0039 scene copy). LD_WB_ORDER=0 keeps the old table order.
+
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -16609,11 +16609,40 @@
+ 
+ /* Write back surfaces idx[0..n): all copies, one submit + wait, all stores.
+  * Falls back to the per-surface path when LD_WRITEBACK_BATCH=0. */
+-static u32 ld_writeback_batch(const u32* idx, u32 n, u32 for_off, u32 for_size)
++static u32 ld_writeback_batch(const u32* idx_in, u32 n, u32 for_off, u32 for_size)
+ {
+     LARGE_INTEGER t0, t1;
+     QueryPerformanceCounter(&t0);
+     u32 done = 0;
++    /* KZ3 patch 2119 (RSX pass 112): write the surfaces back oldest write first, so where two live surfaces
++     * share guest bytes the most recent GPU write lands last, as it does in RSX memory. The table order put
++     * an older surface over a newer one: Killzone 3's Botzone radar (256x256 at local 0x1300000, pitch 5120,
++     * drawn after the frame's NV0039 scene copy) sits inside the 1280x720 scene target at the same address,
++     * and the next frame's copy wrote last frame's radar over the scene's top-left 256x256 corner, which the
++     * compose then showed as a black box holding a second minimap. LD_WB_ORDER=0 keeps the table order. */
++    u32 idx[64];
++    if (n > 64u) n = 64u;   /* both callers collect at most 64 (patch 2018's batch arrays) */
++    memcpy(idx, idx_in, (size_t)n * sizeof idx[0]);
++    { static int en = -1;
++      if (en < 0) { const char* e = getenv("LD_WB_ORDER"); en = e ? atoi(e) : 1; }
++      int moved = 0;
++      if (en)
++          for (u32 j = 1; j < n; j++) {   /* insertion sort, stable: n is a handful */
++              const u32 v = idx[j], g0 = g.surfaces[v].last_write_generation;
++              u32 k = j;
++              while (k > 0 && g.surfaces[idx[k - 1u]].last_write_generation > g0) { idx[k] = idx[k - 1u]; k--; moved = 1; }
++              idx[k] = v;
++          }
++      static u32 nlog;
++      if (moved && nlog++ < 4) {
++          fprintf(stderr, "[wb-order] f=%u write-back for 0x%08X+0x%X reordered (oldest write first):", g_ld_frames, for_off, for_size);
++          for (u32 j = 0; j < n; j++) {
++              const surface_t* sf = &g.surfaces[idx[j]];
++              fprintf(stderr, " [%u]%u:0x%08X %ux%u pitch=%u gen=%u", idx[j], sf->location, sf->offset, sf->w, sf->h,
++                      sf->pitch, sf->last_write_generation);
++          }
++          fprintf(stderr, "\n");
++      } }
+     if (!ld_wb_batch_enabled()) {
+         for (u32 j = 0; j < n; j++) { done += (u32)ld_writeback_surface(idx[j], for_off ? for_off : g.surfaces[idx[j]].offset, for_size); g_ld_wb.waits++; }
+     } else {

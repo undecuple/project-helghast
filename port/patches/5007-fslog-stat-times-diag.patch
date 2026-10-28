@@ -1,0 +1,36 @@
+--- a/runtime/ppu/ppu_fs.cpp	2026-10-27 02:00:18.469166763 -0500
++++ b/runtime/ppu/ppu_fs.cpp	2026-10-27 02:00:40.161899284 -0500
+@@ -338,7 +338,8 @@
+           { const char* want = getenv("FS_STACK");
+             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
+           } }
+-      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
++      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd);
++      if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs]   host='%s'\n", hpath); }
+     if (g_ps3_fs_open_hook) g_ps3_fs_open_hook(gpath);
+     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
+         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
+@@ -714,7 +715,7 @@
+         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+     }
+-    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
++    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld mtime=%lld ctime=%lld host='%s')\n", gpath, (long long)st.st_size, (long long)st.st_mtime, (long long)st.st_ctime, hpath);
+     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
+                                            : (CELL_FS_S_IFREG | 0x1B6);
+     if (sb) write_stat(sb, mode, (uint64_t)st.st_size, (int64_t)st.st_atime, (int64_t)st.st_mtime, (int64_t)st.st_ctime);
+@@ -758,7 +759,13 @@
+         write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz,
+                    (int64_t)hst.st_atime, (int64_t)hst.st_mtime, (int64_t)hst.st_ctime);
+     }
+-    if (getenv("PS3_FSLOG")) { static int _n=0; if(PS3_LOG_FIRST(_n, 12)) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
++    if (getenv("PS3_FSLOG")) { fs_stat64_t lst; memset(&lst, 0, sizeof lst);
++#ifdef _WIN32
++        _fstat64(_fileno(f), &lst);
++#else
++        fstat(fileno(f), &lst);
++#endif
++        fprintf(stderr,"[fs] fstat fd=%d '%s' -> size=%lld mtime=%lld ctime=%lld\n",fd,g_fd_path[fd],(long long)sz,(long long)lst.st_mtime,(long long)lst.st_ctime); }
+     ctx->gpr[3] = CELL_OK;
+ }
+ 

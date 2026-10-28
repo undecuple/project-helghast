@@ -1,0 +1,464 @@
+KZ3 4001: one online switch, a host-name map and an egress allowlist for the network layer (libs/network/net_policy.c).
+ps3_net_online() reads KZ3_ONLINE once (upstream form: PS3_NET_ONLINE) and every path that can open a real socket asks
+it: ppu_sysprx (host sockets registered only when online), cellNetCtl (state), np_psnr (--psnr forces it on). Strict
+mode (off unless a port enables it): gethostbyname resolves only mapped names (others HOST_NOT_FOUND, never the host
+resolver), connect/sendto reach only allowlisted ip:port/protocol, port 53 always refused, each refused destination
+logged once; denied name suffixes (telemetry) refused in any mode. Guest host names are length-bounded (256) before
+use. Upstream tests that compile sysNet.c/np_psnr.c directly include net_policy.c. Test: tools/net/test_net.sh.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/network/cellNetCtl.c b/libs/network/cellNetCtl.c
+index 8b002ffe..da86e84a 100644
+--- a/libs/network/cellNetCtl.c
++++ b/libs/network/cellNetCtl.c
+@@ -10,6 +10,7 @@
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
+ #include "ps3emu/endian.h" /* ps3_bswap32 -- CellNetCtlInfo/NatInfo integer fields are guest big-endian */
+ #include "np_psnr.h"      /* np_psnr_identity -- the player name the MAC derives from */
++#include "net_policy.h"   /* ps3_net_online (KZ3 4001) */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -40,13 +41,11 @@ static int s_netctl_initialized = 0;
+  * and hang waiting on PSN jobs that can never complete if we claim a live
+  * connection. A real console with no link reports Disconnected and games take
+  * their offline path (verified against LBP's working RPCS3 boot, where
+- * GetState never reported a connection). PS3_NET_ONLINE=1 restores the old
++ * GetState never reported a connection). The online switch (net_policy.h) restores the old
+  * fake-connected behaviour for online experiments. */
+ static int netctl_online(void)
+ {
+-    static int v = -1;
+-    if (v < 0) v = getenv("PS3_NET_ONLINE") ? 1 : 0;
+-    return v;
++    return ps3_net_online();   /* KZ3 4001: the one online switch */
+ }
+ 
+ /* For the libraries that answer the same question (cellSysutilNpEula.c). */
+diff --git a/libs/network/net_policy.c b/libs/network/net_policy.c
+new file mode 100644
+index 00000000..067d3401
+--- /dev/null
++++ b/libs/network/net_policy.c
+@@ -0,0 +1,170 @@
++/*
++ * ps3recomp - network policy (see net_policy.h). KZ3 patch 4001.
++ */
++#include "net_policy.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++
++static int s_online = -1;          /* -1: not read yet */
++static int s_np_signed_in = 0;
++static int s_strict = 0;
++
++static struct { char name[PS3_NET_POLICY_NAME_MAX + 1]; uint8_t ip[4]; } s_map[PS3_NET_POLICY_MAX_NAMES];
++static int s_nmap;
++static char s_deny[PS3_NET_POLICY_MAX_NAMES][PS3_NET_POLICY_NAME_MAX + 1];
++static int s_ndeny;
++static struct { uint8_t ip[4]; uint16_t lo, hi; int protos; } s_allow[PS3_NET_POLICY_MAX_ALLOW];
++static int s_nallow;
++
++/* Refusals already logged: (proto, ip, port). Guarded by a spin flag (connect/sendto run on many threads). */
++#define LOGGED_MAX 64
++static struct { int proto; uint8_t ip[4]; uint16_t port; } s_logged[LOGGED_MAX];
++static unsigned s_nlogged;
++static int s_logged_full_said;
++static volatile char s_log_lock;
++
++static void log_lock(void)   { while (__atomic_test_and_set(&s_log_lock, __ATOMIC_ACQUIRE)) { } }
++static void log_unlock(void) { __atomic_clear(&s_log_lock, __ATOMIC_RELEASE); }
++
++int ps3_net_online(void)
++{
++    int v = __atomic_load_n(&s_online, __ATOMIC_ACQUIRE);
++    if (v < 0) {
++        const char* e = getenv("KZ3_ONLINE");
++        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
++        __atomic_store_n(&s_online, v, __ATOMIC_RELEASE);
++        printf("[net] %s\n", v ? "online (KZ3_ONLINE)" : "offline (KZ3_ONLINE unset): no real sockets");
++    }
++    return v;
++}
++
++void ps3_net_set_online(int on) { __atomic_store_n(&s_online, on ? 1 : 0, __ATOMIC_RELEASE); }
++
++int  ps3_net_np_signed_in(void) { return s_np_signed_in && ps3_net_online(); }
++void ps3_net_set_np_signed_in(int on) { s_np_signed_in = on ? 1 : 0; }
++
++void ps3_net_policy_reset(void)
++{
++    s_strict = 0;
++    s_nmap = s_ndeny = s_nallow = 0;
++    log_lock();
++    s_nlogged = 0;
++    s_logged_full_said = 0;
++    log_unlock();
++}
++
++void ps3_net_policy_set_strict(int on) { s_strict = on ? 1 : 0; }
++int  ps3_net_policy_strict(void) { return s_strict; }
++
++/* A host name as the policy compares it: 1-255 chars of letters, digits, '-', '.', '_'; lowered. */
++static int norm_name(const char* in, char out[PS3_NET_POLICY_NAME_MAX + 1])
++{
++    size_t n = 0;
++    if (!in) return 0;
++    for (; in[n]; n++) {
++        unsigned char c = (unsigned char)in[n];
++        if (n >= PS3_NET_POLICY_NAME_MAX) return 0;
++        if (!(isalnum(c) || c == '-' || c == '.' || c == '_')) return 0;
++        out[n] = (char)tolower(c);
++    }
++    out[n] = 0;
++    while (n > 0 && out[n - 1] == '.') out[--n] = 0;    /* "host." == "host" */
++    return n > 0;
++}
++
++int ps3_net_policy_map_host(const char* name, const uint8_t ip[4])
++{
++    if (s_nmap >= PS3_NET_POLICY_MAX_NAMES || !ip || !norm_name(name, s_map[s_nmap].name)) return -1;
++    memcpy(s_map[s_nmap].ip, ip, 4);
++    s_nmap++;
++    return 0;
++}
++
++int ps3_net_policy_deny_host(const char* suffix)
++{
++    if (s_ndeny >= PS3_NET_POLICY_MAX_NAMES || !norm_name(suffix, s_deny[s_ndeny])) return -1;
++    s_ndeny++;
++    return 0;
++}
++
++int ps3_net_policy_allow(const uint8_t ip[4], uint16_t lo, uint16_t hi, int protos)
++{
++    if (s_nallow >= PS3_NET_POLICY_MAX_ALLOW || !ip || lo > hi || !(protos & 3)) return -1;
++    memcpy(s_allow[s_nallow].ip, ip, 4);
++    s_allow[s_nallow].lo = lo;
++    s_allow[s_nallow].hi = hi;
++    s_allow[s_nallow].protos = protos;
++    s_nallow++;
++    return 0;
++}
++
++static int denied(const char* n)
++{
++    size_t ln = strlen(n);
++    for (int i = 0; i < s_ndeny; i++) {
++        size_t ls = strlen(s_deny[i]);
++        if (ln == ls && !strcmp(n, s_deny[i])) return 1;
++        if (ln > ls && n[ln - ls - 1] == '.' && !strcmp(n + ln - ls, s_deny[i])) return 1;
++    }
++    return 0;
++}
++
++int ps3_net_policy_resolve(const char* name, uint8_t ip[4])
++{
++    char n[PS3_NET_POLICY_NAME_MAX + 1];
++    if (!norm_name(name, n)) return s_strict ? 0 : -1;   /* odd names: the host resolver judges them */
++    if (denied(n)) return 0;
++    for (int i = 0; i < s_nmap; i++)
++        if (!strcmp(n, s_map[i].name)) { memcpy(ip, s_map[i].ip, 4); return 1; }
++    return s_strict ? 0 : -1;
++}
++
++static void log_refusal(int proto, const uint8_t ip[4], uint16_t port)
++{
++    int say = 1;
++    log_lock();
++    for (unsigned i = 0; i < s_nlogged; i++)
++        if (s_logged[i].proto == proto && s_logged[i].port == port && !memcmp(s_logged[i].ip, ip, 4)) { say = 0; break; }
++    if (say) {
++        if (s_nlogged < LOGGED_MAX) {
++            s_logged[s_nlogged].proto = proto;
++            memcpy(s_logged[s_nlogged].ip, ip, 4);
++            s_logged[s_nlogged].port = port;
++            s_nlogged++;
++        } else if (s_logged_full_said) {
++            say = 0;
++        } else {
++            s_logged_full_said = 1;
++        }
++    }
++    unsigned n = s_nlogged;
++    log_unlock();
++    if (say)
++        printf("[net] refused %s %u.%u.%u.%u:%u (not the configured server)%s\n",
++               proto == PS3_NET_PROTO_TCP ? "TCP" : "UDP", ip[0], ip[1], ip[2], ip[3], port,
++               n >= LOGGED_MAX ? "; further refusals not logged" : "");
++}
++
++int ps3_net_policy_check(int proto, const uint8_t ip[4], uint16_t port)
++{
++    if (!s_strict) return 1;
++    if (port != 53) {
++        for (int i = 0; i < s_nallow; i++)
++            if ((s_allow[i].protos & proto) && !memcmp(s_allow[i].ip, ip, 4) &&
++                port >= s_allow[i].lo && port <= s_allow[i].hi)
++                return 1;
++    }
++    log_refusal(proto, ip, port);
++    return 0;
++}
++
++unsigned ps3_net_policy_refusals_logged(void)
++{
++    log_lock();
++    unsigned n = s_nlogged;
++    log_unlock();
++    return n;
++}
+diff --git a/libs/network/net_policy.h b/libs/network/net_policy.h
+new file mode 100644
+index 00000000..4c54e329
+--- /dev/null
++++ b/libs/network/net_policy.h
+@@ -0,0 +1,71 @@
++/*
++ * ps3recomp - network policy: the online switch, a host-name map and an egress allowlist.
++ *
++ * One place decides whether a title may touch the real network at all, and if so, where it may go:
++ *
++ *   ps3_net_online()       the single online switch, read once from the environment (off by default).
++ *                          Every path that can open a real socket (sys_net, cellHttp, NetCtl's state, psnr)
++ *                          asks it; off means the offline model everywhere.
++ *   strict mode            off until a port turns it on. When on, gethostbyname/cellHttp resolve only names
++ *                          in the map (everything else is HOST_NOT_FOUND, nothing reaches the host resolver),
++ *                          and connect/sendto reach only allowlisted (address, port, protocol) destinations.
++ *                          Port 53 (DNS) is always refused in strict mode, whatever the allowlist says, so a
++ *                          title's own resolver cannot leak names to the internet. Each refused destination
++ *                          is logged once.
++ *   denied names           refused even outside strict mode (telemetry hosts).
++ *
++ * A port fills the map and the allowlist at start-up (single-threaded), before the title runs; afterwards the
++ * tables are only read. KZ3 patch 4001.
++ */
++#ifndef PS3_NET_POLICY_H
++#define PS3_NET_POLICY_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define PS3_NET_PROTO_TCP 1
++#define PS3_NET_PROTO_UDP 2
++
++#define PS3_NET_POLICY_MAX_NAMES 16
++#define PS3_NET_POLICY_MAX_ALLOW 16
++#define PS3_NET_POLICY_NAME_MAX  255   /* longest host name the policy compares (DNS limit) */
++
++/* The online switch. KZ3: the environment variable KZ3_ONLINE (any non-empty value except "0"); the upstream
++ * form of this patch reads PS3_NET_ONLINE. Read once, then cached. */
++int  ps3_net_online(void);
++void ps3_net_set_online(int on);          /* psnr's --psnr, tests: overrides the environment */
++
++/* NP sign-in without psnr: a port that has its own server (KZ3: a Medius server) reports the NP manager
++ * ONLINE through this flag. Never set while offline. */
++int  ps3_net_np_signed_in(void);
++void ps3_net_set_np_signed_in(int on);
++
++void ps3_net_policy_reset(void);          /* tests: empty tables, strict off */
++void ps3_net_policy_set_strict(int on);
++int  ps3_net_policy_strict(void);
++
++/* name -> IPv4 (network order). Case-insensitive, exact. 0 on success, -1 if invalid or the table is full. */
++int  ps3_net_policy_map_host(const char* name, const uint8_t ip[4]);
++/* Refuse `suffix` and every sub-domain of it ("scee.com" covers "a.scee.com"). 0 / -1 as above. */
++int  ps3_net_policy_deny_host(const char* suffix);
++/* Allow ip:[lo,hi] for `protos` (PS3_NET_PROTO_* bits). 0 / -1 as above. */
++int  ps3_net_policy_allow(const uint8_t ip[4], uint16_t lo, uint16_t hi, int protos);
++
++/* Resolve `name` by the policy. 1: mapped, ip filled. 0: refused (denied, or unmapped in strict mode).
++ * -1: no decision (not strict, not denied): the caller may use the host resolver. */
++int  ps3_net_policy_resolve(const char* name, uint8_t ip[4]);
++/* May a socket of `proto` reach ip:port (network-order ip, host-order port)? 1 yes, 0 no.
++ * Outside strict mode always 1. */
++int  ps3_net_policy_check(int proto, const uint8_t ip[4], uint16_t port);
++
++/* Refusals logged so far (tests). */
++unsigned ps3_net_policy_refusals_logged(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS3_NET_POLICY_H */
+diff --git a/libs/network/np_psnr.c b/libs/network/np_psnr.c
+index 8adba0ba..0d326559 100644
+--- a/libs/network/np_psnr.c
++++ b/libs/network/np_psnr.c
+@@ -2,6 +2,7 @@
+  * ps3recomp - the connection to a psnr server. See np_psnr.h.
+  */
+ #include "np_psnr.h"
++#include "net_policy.h"   /* ps3_net_online (KZ3 4001) */
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -62,7 +63,7 @@ void np_psnr_setup(const char* username, const char* server)
+     /* Before anything reads them: the runtime's getenv cache keeps the first
+      * answer it sees. */
+     if (server && *server) {
+-        set_env("PS3_NET_ONLINE", "1");
++        ps3_net_set_online(1);   /* KZ3 4001: --psnr is the online choice */
+         set_env("PSNR_SERVER", server);
+     }
+     /* The first valid one of: --username, PS3_NP_ONLINE_ID, and -- online
+@@ -97,7 +98,7 @@ const char* np_psnr_identity(void)
+ 
+ int np_psnr_enabled(void)
+ {
+-    return getenv("PS3_NET_ONLINE") && getenv("PSNR_SERVER");
++    return ps3_net_online() && getenv("PSNR_SERVER");
+ }
+ 
+ const char* np_psnr_online_id(void)
+diff --git a/libs/network/sysNet.c b/libs/network/sysNet.c
+index 87595f37..ee5b6e3c 100644
+--- a/libs/network/sysNet.c
++++ b/libs/network/sysNet.c
+@@ -52,6 +52,7 @@
+ #include "../../runtime/ppu/ppu_memory.h"
+ #include "../../include/ps3emu/nid.h"
+ #include "np_psnr.h"   /* np_psnr_p2p_port, NAT traversal on the P2P socket */
++#include "net_policy.h" /* KZ3 4001: host-name map and egress allowlist */
+ 
+ #include <stdio.h>
+ #include <string.h>
+@@ -523,6 +524,9 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
+ 
+     char ip[16];
+     printf("[sys_net] connect(%d, %s:%u)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port));
++    if (!ps3_net_policy_check(s_sockets[s].stream ? PS3_NET_PROTO_TCP : PS3_NET_PROTO_UDP,
++                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
++        return fail(SYS_NET_ECONNREFUSED);   /* KZ3 4001: not an allowed destination */
+     if (s_sockets[s].p2p && s_sockets[s].stream) {
+         /* A peer that can't take a direct connection (behind its router):
+          * the stream goes through psnr's relay, and its socket replaces
+@@ -619,6 +623,9 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
+     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+     if (!to) return sys_net_bnet_send(s, buf, len, flags);   /* connected socket */
+     if (read_sockaddr(EA(to), &a)) return fail(SYS_NET_EINVAL);
++    if (!ps3_net_policy_check(s_sockets[s].stream ? PS3_NET_PROTO_TCP : PS3_NET_PROTO_UDP,
++                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
++        return fail(SYS_NET_EHOSTUNREACH);   /* KZ3 4001: e.g. a title's own DNS query to port 53 */
+     if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
+                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
+         return (int32_t)len;   /* went through psnr's relay */
+@@ -988,16 +995,37 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
+     const char* host = GUEST_PTR(EA(name), const char*);
+     uint32_t h = scratch(&s_hostent_ea, HOSTENT_SCRATCH);
+     struct addrinfo hints, *res = NULL;
++    struct sockaddr_in mapped;
++    const struct sockaddr_in* sa;
++    uint8_t mip[4];
+     if (!host || !h) return 0;
++    if (strnlen(host, 256) >= 256) {   /* guest string: bounded before anything reads it */
++        if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
++        return 0;
++    }
+ 
+-    memset(&hints, 0, sizeof(hints));
+-    hints.ai_family = AF_INET;
+-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+-        printf("[sys_net] gethostbyname('%s') failed\n", host);
++    /* KZ3 4001: the policy's name map first; a refused name never reaches the host resolver. */
++    int pr = ps3_net_policy_resolve(host, mip);
++    if (pr == 0) {
++        printf("[sys_net] gethostbyname('%s') refused by the network policy\n", host);
+         if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
+         return 0;
+     }
+-    const struct sockaddr_in* sa = (const struct sockaddr_in*)res->ai_addr;
++    if (pr == 1) {
++        memset(&mapped, 0, sizeof(mapped));
++        mapped.sin_family = AF_INET;
++        memcpy(&mapped.sin_addr, mip, 4);
++        sa = &mapped;
++    } else {
++        memset(&hints, 0, sizeof(hints));
++        hints.ai_family = AF_INET;
++        if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
++            printf("[sys_net] gethostbyname('%s') failed\n", host);
++            if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
++            return 0;
++        }
++        sa = (const struct sockaddr_in*)res->ai_addr;
++    }
+ 
+     memset(vm_ptr8(h), 0, HOSTENT_SCRATCH);
+     vm_write32(h + 0,  h + 64);           /* h_name */
+@@ -1010,8 +1038,8 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
+     strncpy((char*)vm_ptr8(h + 64), host, HOSTENT_SCRATCH - 65);
+ 
+     char ip[16];
+-    printf("[sys_net] gethostbyname('%s') -> %s\n", host, ip_str(&sa->sin_addr, ip));
+-    freeaddrinfo(res);
++    printf("[sys_net] gethostbyname('%s') -> %s%s\n", host, ip_str(&sa->sin_addr, ip), pr == 1 ? " (mapped)" : "");
++    if (res) freeaddrinfo(res);
+     return h;
+ }
+ 
+diff --git a/libs/network/tests/test_np_identity.c b/libs/network/tests/test_np_identity.c
+index 5242fb29..012f49fa 100644
+--- a/libs/network/tests/test_np_identity.c
++++ b/libs/network/tests/test_np_identity.c
+@@ -6,6 +6,7 @@
+  */
+ #include "../psnr/psnr.c"
+ #include "../np_psnr.c"
++#include "../net_policy.c"   /* KZ3 4001 */
+ 
+ #include <assert.h>
+ 
+diff --git a/libs/network/tests/test_np_nat.c b/libs/network/tests/test_np_nat.c
+index 903f2e2b..43059de5 100644
+--- a/libs/network/tests/test_np_nat.c
++++ b/libs/network/tests/test_np_nat.c
+@@ -9,6 +9,7 @@
+  */
+ #include "../psnr/psnr.c"
+ #include "../np_psnr.c"
++#include "../net_policy.c"   /* KZ3 4001 */
+ 
+ #include <assert.h>
+ #ifdef _WIN32
+diff --git a/libs/network/tests/test_sys_net.c b/libs/network/tests/test_sys_net.c
+index e9f78886..747fa2f1 100644
+--- a/libs/network/tests/test_sys_net.c
++++ b/libs/network/tests/test_sys_net.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include "../sysNet.c"
++#include "../net_policy.c"   /* KZ3 4001 */
+ 
+ #include <assert.h>
+ 
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 737438f0..db57a794 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -604,6 +604,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
+  * _sys_net_errno_loc returns a POINTER the game dereferences. */
+ #define SYS_NET_EWOULDBLOCK_V 35
+ extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
++extern "C" int ps3_net_online(void);   /* libs/network/net_policy.c (KZ3 4001) */
+ extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
+ extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
+ extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
+@@ -933,7 +934,7 @@ extern "C" void ppu_sysprx_register(void)
+     /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
+      * first because the first registration of a NID wins, so these shadow the
+      * offline model below; without the variable nothing changes. */
+-    if (getenv("PS3_NET_ONLINE")) ps3_net_host_register(gcm_guest_alloc);
++    if (ps3_net_online()) ps3_net_host_register(gcm_guest_alloc);   /* KZ3 4001: the one online switch */
+     /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
+      * come off the stack, so they need the full context. */
+     np_score_register_ctx();

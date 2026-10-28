@@ -1,0 +1,261 @@
+Import stubs for the 1.14 EBOOT: the 24 imports KZ3 1.14 adds that had no handler in the patched tree (12
+sceNpCommerce2, cellHttpCookie{Import,Export}WithClientId, cellSslCertGet{IssuerName,NameEntryCount,NameEntryInfo},
+sceNpDrm{VerifyUpgradeLicense,ExecuteGamePurchase}, sceNpBasic{SetPresenceDetails2,GetFriendPresenceByIndex2},
+sceNpManagerGetNetworkTime, sys_net_if_ctl, sys_crash_dump_set_user_log_area = sys_crashdump 0xB20F87B3). All are plain
+C definitions that gen_hle_nids.py --all registers under ps3_compute_nid(name); every NID was checked against the 1.14
+import table. Offline behaviour: store/request/result calls fail, the disc's upgrade license is reported present,
+presence/network time answer offline, cookies form an empty jar, crash-dump areas are accepted and ignored. Also fixes
+sceNpCommerce2CreateCtx's argument order (the context id is the 5th argument; the old form wrote it over the title's
+handler descriptor). Each choice names its source (SDK behaviour or the 1.14 call site read with rizin) in a comment.
+Tests: tools/assets/test_imports114.py (NID coverage), tools/assets/test_imports114.sh (return codes, host harness).
+Upstream candidate (CreateCtx argument order; the stubs are general firmware coverage).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/libs/network/cellHttp.c b/libs/network/cellHttp.c
+index 5250a8eb..80eef5c2 100644
+--- a/libs/network/cellHttp.c
++++ b/libs/network/cellHttp.c
+@@ -1160,3 +1160,20 @@ s32 cellHttpAbortTransaction(CellHttpTransId transId)
+     printf("[cellHttp] AbortTransaction(trans=%u)\n", transId);
+     return CELL_OK;
+ }
++
++/* ---- KZ3 patch 5003: the per-client cookie jar calls KZ3 1.14 imports (NIDs = ps3_compute_nid(name)). Cookies are
++ * not kept: the jar is always empty. KZ3 1.14 (0x84b5c) first asks Export for the size with a null buffer, sizes its
++ * buffer to the answer, exports, and later re-imports the bytes it kept; an empty jar (size 0, CELL_OK) and an
++ * accepted import are a consistent round trip. */
++s32 cellHttpCookieExportWithClientId(u32 buffer, u32 size, u32 exportSize, u32 clientId)
++{
++    (void)buffer; (void)size; (void)clientId;
++    if (exportSize) vm_write32(exportSize, 0);
++    return CELL_OK;
++}
++
++s32 cellHttpCookieImportWithClientId(u32 buffer, u32 size, u32 clientId)
++{
++    (void)buffer; (void)size; (void)clientId;
++    return CELL_OK;
++}
+diff --git a/libs/network/cellSsl.c b/libs/network/cellSsl.c
+index 7ed91daf..bf8e75b2 100644
+--- a/libs/network/cellSsl.c
++++ b/libs/network/cellSsl.c
+@@ -136,3 +136,24 @@ s32 cellSslGetRandomNumber(u8* buf, u32 size)
+ 
+     return CELL_OK;
+ }
++
++/* ---- KZ3 patch 5003: certificate name queries KZ3 1.14 imports (NIDs = ps3_compute_nid(name)). They are only
++ * meaningful inside a TLS verify callback, which cannot run offline; fail without writing. KZ3 1.14 (0x85750) returns
++ * its own error 4 on a negative IssuerName and skips the entry loop on a negative count. */
++s32 cellSslCertGetIssuerName(u32 certId, u32 certName)
++{
++    (void)certId; (void)certName;
++    return (s32)CELL_SSL_ERROR_INVALID_ARG;
++}
++
++s32 cellSslCertGetNameEntryCount(u32 certName, u32 entryCount)
++{
++    (void)certName; (void)entryCount;
++    return (s32)CELL_SSL_ERROR_INVALID_ARG;
++}
++
++s32 cellSslCertGetNameEntryInfo(u32 certName, u32 entryNum, u32 oidName, u32 value, u32 valueLength, s32 flag)
++{
++    (void)certName; (void)entryNum; (void)oidName; (void)value; (void)valueLength; (void)flag;
++    return (s32)CELL_SSL_ERROR_INVALID_ARG;
++}
+diff --git a/libs/network/sceNp.c b/libs/network/sceNp.c
+index 6ff22b65..18757b0d 100644
+--- a/libs/network/sceNp.c
++++ b/libs/network/sceNp.c
+@@ -428,3 +428,25 @@ s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path)
+ {
+     return np_drm_is_available(k_licensee, drm_path);
+ }
++
++/* ---- KZ3 patch 5003: three sceNp imports KZ3 1.14 adds (NIDs = ps3_compute_nid(name)) ------------------------ */
++
++/* (const char* content_id). KZ3 1.14 at 0x528d88 maps the result: 0 -> 0, LICENSE_NOT_FOUND (0x80029521) or a
++ * positive value -> 1, any other negative -> 2 (rizin pdg). Its EBOOT carries the disc content id
++ * UP9000-BCUS98234_00 next to the digital NPUA70167 one; the disc is the full game, so report the upgrade license as
++ * present (CELL_OK). ASSUMPTION: 0 is "licensed" (RPCS3 returns CELL_OK when the license is found and
++ * SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND otherwise; the game's own folding of 0x80029521 with "not 0" fits that). */
++s32 sceNpDrmVerifyUpgradeLicense(u32 content_id)
++{
++    if (!content_id) return SCE_NP_ERROR_INVALID_ARGUMENT;
++    return CELL_OK;
++}
++
++/* (void): opens the store's purchase flow for a trial. Not available offline. KZ3 1.14 discards the result
++ * (0x528e14). ASSUMPTION: SCE_NP_ERROR_OFFLINE is the fitting code; no SDK header here lists this function's errors. */
++s32 sceNpDrmExecuteGamePurchase(void)
++{
++    return SCE_NP_ERROR_OFFLINE;
++}
++
++/* sceNpManagerGetNetworkTime: upstream v0.18.0 has the same function (above); 5003's copy dropped (SPU pass 108). */
+diff --git a/libs/network/sceNpBasic.c b/libs/network/sceNpBasic.c
+index b24d39ef..95222c20 100644
+--- a/libs/network/sceNpBasic.c
++++ b/libs/network/sceNpBasic.c
+@@ -270,3 +270,24 @@ s32 sceNpBasicRegisterContextSensitiveHandler(const void* context, void* handler
+     (void)context; (void)handler; (void)arg;
+     return CELL_OK;
+ }
++
++/* ---- KZ3 patch 5003: the two presence "2" variants KZ3 1.14 imports (NIDs = ps3_compute_nid(name)). They follow
++ * their version-1 siblings above: no friends offline, own presence accepted. KZ3 1.14 breaks out of its friend loop
++ * on a negative GetFriendPresenceByIndex2 (0x1748fc, rizin pdg). */
++s32 sceNpBasicGetFriendPresenceByIndex2(u32 index, u32 user, u32 presence, u32 options)
++{
++    (void)index; (void)user; (void)presence; (void)options;
++    if (!s_initialized)
++        return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
++    return (s32)SCE_NP_BASIC_ERROR_DATA_NOT_FOUND;
++}
++
++s32 sceNpBasicSetPresenceDetails2(u32 pres, u32 options)
++{
++    (void)options;
++    if (!s_initialized)
++        return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
++    if (!pres)
++        return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
++    return CELL_OK;   /* accepted, not published: there is no presence server */
++}
+diff --git a/libs/network/sceNpCommerce2.c b/libs/network/sceNpCommerce2.c
+index df9844ad..aede176b 100644
+--- a/libs/network/sceNpCommerce2.c
++++ b/libs/network/sceNpCommerce2.c
+@@ -138,3 +138,90 @@ s32 sceNpCommerce2DoCheckoutFinishAsync(SceNpCommerce2Context ctx)
+     (void)ctx;
+     return SCE_NP_COMMERCE2_ERROR_SERVER_ERROR;
+ }
++
++/* ---- KZ3 patch 5003: the twelve sceNpCommerce2 imports KZ3 1.14 adds that had no definition here --------------
++ * NIDs equal ps3_compute_nid(name) (checked: tools/assets/test_imports114.py). Offline there is no store: requests
++ * fail the way CreateSessionStart above already does. KZ3 1.14's store code (0x179600-0x17ae60) tests only the sign
++ * of every result here and parks its store state machine in its error state (state 4, code kept) on a negative one,
++ * so the store UI stays hidden; the exact code value does not matter to it (rizin pdg of 0x17ad30, 0x1795c8,
++ * 0x17a3cc). ASSUMPTION: the 0x800244xx values in sceNpCommerce2.h are this tree's, not checked against an SDK
++ * header (RPCS3 keeps sceNpCommerce2 errors at 0x800230xx). */
++static int s_bgdl_available = 0;   /* SDK: a local per-title setting, no network involved */
++
++/* (bool* bgdlAvailability): KZ3 ignores the return value at 0x17ade8 and reads the bool, so it must be written. */
++s32 sceNpCommerce2GetBGDLAvailability(u32 bgdlAvailability)
++{
++    if (!bgdlAvailability) return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
++    vm_write8(bgdlAvailability, (u8)s_bgdl_available);
++    return CELL_OK;
++}
++
++/* (bool bgdlAvailability) */
++s32 sceNpCommerce2SetBGDLAvailability(u32 bgdlAvailability)
++{
++    s_bgdl_available = (bgdlAvailability & 0xFF) != 0;
++    return CELL_OK;
++}
++
++/* Request creation: no request is made offline, so no request id is handed out (*req_id untouched). */
++s32 sceNpCommerce2GetCategoryContentsCreateReq(SceNpCommerce2Context ctx, u32 req_id)
++{
++    (void)ctx; (void)req_id;
++    return SCE_NP_COMMERCE2_ERROR_SERVER_ERROR;
++}
++
++s32 sceNpCommerce2GetProductInfoCreateReq(SceNpCommerce2Context ctx, u32 req_id)
++{
++    (void)ctx; (void)req_id;
++    return SCE_NP_COMMERCE2_ERROR_SERVER_ERROR;
++}
++
++/* Download list (same behaviour as DoCheckout{Start,Finish}Async above). */
++s32 sceNpCommerce2DoDlListStartAsync(SceNpCommerce2Context ctx, u32 serviceId, u32 skuIds, u32 skuNum, u32 container)
++{
++    (void)ctx; (void)serviceId; (void)skuIds; (void)skuNum; (void)container;
++    return SCE_NP_COMMERCE2_ERROR_SERVER_ERROR;
++}
++
++s32 sceNpCommerce2DoDlListFinishAsync(SceNpCommerce2Context ctx)
++{
++    (void)ctx;
++    return SCE_NP_COMMERCE2_ERROR_SERVER_ERROR;
++}
++
++/* Result parsing: no request ever produced data, so every result buffer is invalid. Out-params untouched. */
++s32 sceNpCommerce2InitGetCategoryContentsResult(u32 result, u32 data, u32 dataSize)
++{
++    (void)result; (void)data; (void)dataSize;
++    return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
++}
++
++s32 sceNpCommerce2InitGetProductInfoResult(u32 result, u32 data, u32 dataSize)
++{
++    (void)result; (void)data; (void)dataSize;
++    return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
++}
++
++s32 sceNpCommerce2GetContentInfo(u32 result, u32 index, u32 contentInfo)
++{
++    (void)result; (void)index; (void)contentInfo;
++    return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
++}
++
++s32 sceNpCommerce2GetGameProductInfo(u32 result, u32 gameProductInfo)
++{
++    (void)result; (void)gameProductInfo;
++    return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
++}
++
++s32 sceNpCommerce2GetGameProductInfoFromContentInfo(u32 contentInfo, u32 gameProductInfo)
++{
++    (void)contentInfo; (void)gameProductInfo;
++    return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
++}
++
++s32 sceNpCommerce2GetGameSkuInfoFromGameProductInfo(u32 gameProductInfo, u32 index, u32 gameSkuInfo)
++{
++    (void)gameProductInfo; (void)index; (void)gameSkuInfo;
++    return SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT;
++}
+diff --git a/libs/network/sysNet.c b/libs/network/sysNet.c
+index f456d5bf..275aedeb 100644
+--- a/libs/network/sysNet.c
++++ b/libs/network/sysNet.c
+@@ -1169,3 +1169,13 @@ void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int size, unsign
+     printf("[sys_net] PS3_NET_ONLINE: host sockets registered (%u exports)\n",
+            (unsigned)(sizeof(tab) / sizeof(tab[0])));
+ }
++
++/* KZ3 patch 5003: sys_net_if_ctl (NID 0x27FB339D = ps3_compute_nid("sys_net_if_ctl")), (s32 prefix, s32 cmd,
++ * void* arg, s32 len), the interface query KZ3 1.14 calls four times at 0x4d51bc..0x4d5258 into a table it has
++ * already filled with defaults, discarding each result. Not modelled: fail like every other call here with errno
++ * ENETDOWN (BSD 50), so nothing is written into the caller's buffer. */
++int32_t sys_net_if_ctl(int32_t prefix, int32_t cmd, uint32_t arg, int32_t len)
++{
++    (void)prefix; (void)cmd; (void)arg; (void)len;
++    return fail(50);
++}
+diff --git a/libs/system/sys_crashdump.c b/libs/system/sys_crashdump.c
+new file mode 100644
+index 00000000..f590870d
+--- /dev/null
++++ b/libs/system/sys_crashdump.c
+@@ -0,0 +1,15 @@
++/*
++ * KZ3 patch 5003: sys_crashdump, the one-function library KZ3 1.14 imports.
++ *
++ * NID 0xB20F87B3 = ps3_compute_nid("sys_crash_dump_set_user_log_area") (found by hashing candidate names; checked by
++ * tools/assets/test_imports114.py). KZ3 1.14 calls it at 0x8d094 as (u8 index, entry*) with entry holding a guest
++ * address and size, and treats 0 as success. A crash dump is never written here, so the area is accepted and
++ * ignored.
++ */
++#include <stdint.h>
++
++int32_t sys_crash_dump_set_user_log_area(uint32_t index, uint32_t new_entry)
++{
++    (void)index; (void)new_entry;
++    return 0;   /* CELL_OK */
++}

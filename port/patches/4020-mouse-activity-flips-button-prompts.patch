@@ -1,0 +1,133 @@
+KZ3 patch 4020 (RSX pass 98): raw mouse input counts as keyboard+mouse activity for the button prompts.
+Hand play 2026-10-22: with only the mouse in use the prompts stayed on the pad glyphs, because cellPad.c's s_keys_active
+(patch 4011, pad_prompt_track) came only from the keyboard state. libs/input/pad_mouse.{h,c}: PadMouseAct (pure) =
+a mouse button down or wheel step is activity at once; motion counts when |dx|+|dy| reaches PAD_MOUSE_ACT_COUNTS (8)
+inside one PAD_MOUSE_ACT_WINDOW_MS (100 ms) window, so a bumped desk leaves the prompts alone. pad_mouse.c's WM_INPUT
+feeds every raw mouse report in (buttons from usButtonFlags, motion for relative reports only) and
+pad_mouse_activity_take() hands it to cellPad.c once per poll. The pad and keyboard rules are unchanged (a pad with
+input in the same poll still wins). Needs the raw input registration of mouse look (KZ3_MOUSE_LOOK=0: no activity).
+Host test tools/smoke/test_mouse_act.sh.
+Also a bounded diagnostic for the Wine Wayland question (RSX pass 98): "[mouse] raw stats: N relative report(s) in S s:
+C counts, max M in one report, A counts/report" per motion burst (first 30 lines), so a hand log shows what the driver
+delivers per report (compare PROTON_ENABLE_WAYLAND=1 with the default driver over the same physical mouse move).
+
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c	2026-10-22 15:38:54.121312211 -0500
++++ b/libs/input/cellPad.c	2026-10-22 15:39:09.894669031 -0500
+@@ -599,7 +599,8 @@
+     }
+     s_kb_state = pad_kb_eval(&s_kb, pad_kb_down_win, NULL);
+     ReleaseSRWLockExclusive(&s_kb_lock);
+-    s_keys_active = (s_kb_state.buttons || s_kb_state.dirs) ? 1 : 0;   /* 4011: pad_prompt_track */
++    /* 4011: pad_prompt_track; 4020: raw mouse buttons / enough motion count as keyboard+mouse too */
++    s_keys_active = (s_kb_state.buttons || s_kb_state.dirs || pad_mouse_activity_take()) ? 1 : 0;
+ }
+
+ /* Port 0 = the XInput pad (if any) plus the keys. Without a pad, port 0 is the keys alone and is reported
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+--- a/libs/input/pad_mouse.c	2026-10-22 15:38:54.121312211 -0500
++++ b/libs/input/pad_mouse.c	2026-10-22 15:39:08.627640368 -0500
+@@ -17,6 +17,7 @@
+ static PadMouseEv  s_ev[PAD_MOUSE_SCRIPT_MAX];
+ static int         s_nev;
+ static double      s_t0 = -1.0;
++static PadMouseAct s_act;        /* patch 4020: activity for the button prompts (under s_lock) */
+ static PadLookAcc  s_acc;        /* counts kept for the next take (under s_lock; patch 2099) */
+ static unsigned    pm_flip_clock(void);
+ static unsigned  (*s_frame_clock)(void) = pm_flip_clock;
+@@ -109,4 +110,13 @@
+ static unsigned pm_flip_clock(void) { return cellGcm_flip_request_count(); }
+ void pad_mouse_set_frame_clock(unsigned (*fn)(void)) { s_frame_clock = fn ? fn : pm_flip_clock; }
+
++/* patch 4020: the prompts' mouse activity (rule: PadMouseAct in pad_mouse.h) */
++int pad_mouse_activity_take(void)
++{
++    PM_LOCK();
++    const int r = pad_mouse_act_take(&s_act);
++    PM_UNLOCK();
++    return r;
++}
++
+ void pad_mouse_add(int dx, int dy)
+@@ -249,9 +259,33 @@
+     case WM_INPUT: {
+         RAWINPUT ri;
+         UINT size = sizeof(ri);
+-        if (s_cs.look_on &&
++        const int got = s_cs.look_on &&
+             GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+-            ri.header.dwType == RIM_TYPEMOUSE && (ri.data.mouse.lLastX || ri.data.mouse.lLastY)) {
++            ri.header.dwType == RIM_TYPEMOUSE;
++        if (got) {   /* patch 4020: any raw mouse report is activity for the button prompts (absolute reports: buttons only) */
++            const int rel = !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE);
++            PM_LOCK();
++            if (ri.data.mouse.usButtonFlags & PAD_MOUSE_ACT_BUTTON_MASK) pad_mouse_act_button(&s_act);
++            if (rel) pad_mouse_act_motion(&s_act, (int)ri.data.mouse.lLastX, (int)ri.data.mouse.lLastY, GetTickCount64());
++            PM_UNLOCK();
++            if (rel) {   /* what the Wine driver delivers (X11 vs Wayland drivers differ): bounded diagnostics, first 30 lines */
++                static unsigned long long s_t0, s_last;
++                static unsigned s_n, s_lines;
++                static long long s_sum, s_max;
++                const unsigned long long t = GetTickCount64();
++                const long long m = (ri.data.mouse.lLastX < 0 ? -(long long)ri.data.mouse.lLastX : ri.data.mouse.lLastX) +
++                                    (ri.data.mouse.lLastY < 0 ? -(long long)ri.data.mouse.lLastY : ri.data.mouse.lLastY);
++                if (s_n && (t - s_last > 500 || t - s_t0 >= 2000)) {
++                    if (s_lines++ < 30)
++                        fprintf(stderr, "[mouse] raw stats: %u relative report(s) in %.1f s: %lld counts, max %lld in one report, "
++                                        "%.1f counts/report\n", s_n, (double)(s_last - s_t0) / 1000.0, s_sum, s_max,
++                                (double)s_sum / s_n);
++                    s_n = 0; s_sum = s_max = 0;
++                }
++                if (m) { if (!s_n) s_t0 = t; s_n++; s_sum += m; if (m > s_max) s_max = m; s_last = t; }
++            }
++        }
++        if (got && (ri.data.mouse.lLastX || ri.data.mouse.lLastY)) {
+             /* RSX pass 93 (hand test: the view did not turn): say once what the first raw motion looked like, so a hand
+              * log shows whether counts arrive at all and whether they are relative */
+             static int s_said_rel = 0, s_said_abs = 0;
+diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+--- a/libs/input/pad_mouse.h	2026-10-22 15:38:54.121312211 -0500
++++ b/libs/input/pad_mouse.h	2026-10-22 15:39:15.036785354 -0500
+@@ -171,6 +171,29 @@
+     return (int)o;
+ }
+
++/* Patch 4020: the mouse-activity rule (pure; pad_mouse.c holds one under its lock). A button (or the wheel) is activity
++ * at once; motion counts only when |dx|+|dy| summed over one PAD_MOUSE_ACT_WINDOW_MS window reaches
++ * PAD_MOUSE_ACT_COUNTS, so a bumped desk (a few counts) leaves the prompts alone. ASSUMPTION: 8 counts in 100 ms is a
++ * pick (a deliberate hand move is dozens of counts at 800 dpi; not measured). */
++#define PAD_MOUSE_ACT_COUNTS     8
++#define PAD_MOUSE_ACT_WINDOW_MS  100
++/* RAWMOUSE usButtonFlags: RI_MOUSE_BUTTON_1..5_DOWN (0x1 0x4 0x10 0x40 0x100), RI_MOUSE_WHEEL, RI_MOUSE_HWHEEL */
++#define PAD_MOUSE_ACT_BUTTON_MASK 0xD55
++typedef struct {
++    unsigned long long start_ms;   /* start of the current motion window */
++    long               sum;        /* |dx|+|dy| in it */
++    int                active;     /* activity since the last take */
++} PadMouseAct;
++static inline void pad_mouse_act_button(PadMouseAct* a) { a->active = 1; }
++static inline void pad_mouse_act_motion(PadMouseAct* a, int dx, int dy, unsigned long long now_ms)
++{
++    if (!dx && !dy) return;
++    if (!a->sum || now_ms - a->start_ms > PAD_MOUSE_ACT_WINDOW_MS) { a->start_ms = now_ms; a->sum = 0; }
++    a->sum += (dx < 0 ? -(long)dx : dx) + (dy < 0 ? -(long)dy : dy);
++    if (a->sum >= PAD_MOUSE_ACT_COUNTS) { a->active = 1; a->sum = 0; }
++}
++static inline int pad_mouse_act_take(PadMouseAct* a) { const int r = a->active; a->active = 0; return r; }
++
+ /* The look accumulator (pure; pad_mouse.c holds one under its lock). frame = the guest frame counter now. */
+ typedef struct {
+     long long dx, dy;      /* counts kept for the next take */
+@@ -399,6 +422,12 @@
+ int  pad_mouse_menu_take(void* evs /* PadMenuMouseEv[max] */, int max);
+ void pad_mouse_menu_script_step(double now);
+
++/* Patch 4020 (RSX pass 98): raw mouse input as keyboard+mouse activity for the button prompts (cellPad.c
++ * pad_prompt_track). pad_mouse.c's WM_INPUT feeds every raw mouse report in; pad_mouse_activity_take returns 1 once
++ * when a button or enough motion arrived since the last call (the prompts then follow the keyboard+mouse). Needs the
++ * raw input registration that mouse look makes (KZ3_MOUSE_LOOK=0: no raw input, no mouse activity). */
++int pad_mouse_activity_take(void);
++
+ #ifdef __cplusplus
+ }
+ #endif

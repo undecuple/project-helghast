@@ -1,0 +1,109 @@
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1577,24 +1577,42 @@
+  * in the walker-bound K4 scene, and one of its two runs stalled at 172 s in a main-thread flag wait, cause open; see
+  * the RE notes Pass 62). On POSIX (ppu_vm_size != 0, a real range check) the gate stays off. */
+ static int s_vm_rd_fast = -1, s_vm_wr_fast = -1;
++/* KZ3 patch 1091: the lifted code's inline loads (ppu_lifter.py preamble) test one byte per 64 KiB guest page
++ * (layout after soyjxck/ps3recomp's ppu_vm_page.h: RD 1, WR 2, COH 4, ST 8; only RD is used so far). All zero, so
++ * every load calls vm_read*, until vm_fast_init sets RD under KZ3_VM_INLINE=1 and the same read conditions as 1080's
++ * gate (no read diagnostic armed, ppu_vm_size == 0), on every page but the null page, the raw SPU window and above,
++ * and the GCM ref word's page. */
++extern "C" unsigned char g_ppu_vm_page[65536] = {0};
++static void vm_inline_open(void)
++{
++    const uint32_t ref_page = (VM_HLE_INJECT_BASE + 0x2008u) >> 16;
++    for (uint32_t pg = 1; pg < (SPU_RAW_BASE >> 16); pg++)
++        if (pg != ref_page) __atomic_or_fetch(&g_ppu_vm_page[pg], 1u, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++}
+ static void vm_fast_init(void)
+ {
+     const char* en = getenv("KZ3_VM_FAST");
+-    int on = en && *en && *en != '0' && ppu_vm_size == 0;
++    const char* ei = getenv("KZ3_VM_INLINE");
++    int rq = ppu_vm_size == 0;
+ #ifdef VM_SAMPLE_READS
+-    on = 0;
++    rq = 0;
+ #endif
+     static const char* const rd[] = {"PPU_RWATCH", "PPU_FORCE_READ_ADDR", "YDKJ_RWATCH", "PPU_RVAL", "PPU_RVAL64",
+                                      "PPU_HOTMAP", "PPU_READ_DIAG", "PT"};
+-    int rdf = on;
+-    for (unsigned i = 0; i < sizeof rd / sizeof rd[0]; i++) if (getenv(rd[i])) rdf = 0;
++    for (unsigned i = 0; i < sizeof rd / sizeof rd[0]; i++) if (getenv(rd[i])) rq = 0;
++    const int on = en && *en && *en != '0' && ppu_vm_size == 0;
++    const int rdf = on && rq;
++    const int inl = ei && *ei && *ei != '0' && rq;
+     const int wrf = on && !getenv("PPU_WVAL") && !getenv("PPU_WWATCH");
+     s_vm_wr_fast = wrf;
++    if (inl) vm_inline_open();
+     __atomic_store_n(&s_vm_rd_fast, rdf, __ATOMIC_RELEASE);
+     static volatile long once = 0;   /* several threads may get here first; the values are the same, print once */
+     if (__sync_lock_test_and_set(&once, 1) == 0)
+-        fprintf(stderr, "[vm-fast] guest accessor fast path: reads %s, writes %s (KZ3 patch 1080)\n",
+-                rdf ? "on" : "off", wrf ? "on" : "off");
++        fprintf(stderr, "[vm-fast] guest accessor fast path: reads %s, writes %s (KZ3 patch 1080); "
++                "lifted-code inline loads %s (KZ3 patch 1091)\n",
++                rdf ? "on" : "off", wrf ? "on" : "off", inl ? "on" : "off");
+ }
+ static inline int vm_rd_plain(uint32_t a)
+ {
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -326,6 +326,55 @@
+ /* VM base pointer (defined by game project) */
+ extern "C" uint8_t* vm_base;
+ 
++/* ---- KZ3 patch 1091 begin: inline guest loads (opt-in, KZ3_VM_INLINE=1) ----
++ * Every guest load of the lifted code was a call into vm_read8/16/32/64. Here a load from a page whose byte in
++ * g_ppu_vm_page (one byte per 64 KiB guest page) has the RD bit is a relaxed atomic load from vm_base + ea and a
++ * byte swap: relaxed atomic, so the compiler can neither hoist a poll loop's load out of the loop nor tear it, and on
++ * x86-64 it is one mov. The page-byte gate follows soyjxck/ps3recomp (the Drakengard 3 fork, MIT: ppu_vm_page.h,
++ * ppu_vm_fast.h); RD only here, stores stay out of line. The runtime sets RD (ppu_loader.cpp, vm_fast_init) only
++ * when KZ3_VM_INLINE=1 is set and no read diagnostic is armed (patch 1080's read conditions), and never on the null
++ * page (page 0), the raw SPU window and above (0xE000-0xFFFF: problem-state registers whose loads have side effects)
++ * or the page of the GCM ref word (ppu_hle_inject_base + 0x2008: its reads publish fences, GCM_REFPOLL); those and
++ * every page until then call vm_read* as before. Like 1080's gate, only the first byte's page is tested. */
++#if defined(__GNUC__) && !defined(PPU_VMI_DISABLE)
++extern "C" unsigned char g_ppu_vm_page[65536];
++#define PPU_VM_PAGE_RD 1u
++typedef uint16_t __attribute__((may_alias)) ppu_vmi_u16;
++typedef uint32_t __attribute__((may_alias)) ppu_vmi_u32;
++typedef uint64_t __attribute__((may_alias)) ppu_vmi_u64;
++static inline __attribute__((always_inline)) int ppu_vmi_ok(uint32_t ea) {
++    return __atomic_load_n(&g_ppu_vm_page[ea >> 16], __ATOMIC_RELAXED) & PPU_VM_PAGE_RD;
++}
++static inline __attribute__((always_inline)) uint8_t ppu_vmi_read8(uint64_t a) {
++    const uint32_t ea = (uint32_t)a;
++    if (__builtin_expect(ppu_vmi_ok(ea), 1)) return __atomic_load_n(vm_base + ea, __ATOMIC_RELAXED);
++    return vm_read8(a);
++}
++static inline __attribute__((always_inline)) uint16_t ppu_vmi_read16(uint64_t a) {
++    const uint32_t ea = (uint32_t)a;
++    if (__builtin_expect(ppu_vmi_ok(ea), 1))
++        return __builtin_bswap16(__atomic_load_n((const ppu_vmi_u16*)(vm_base + ea), __ATOMIC_RELAXED));
++    return vm_read16(a);
++}
++static inline __attribute__((always_inline)) uint32_t ppu_vmi_read32(uint64_t a) {
++    const uint32_t ea = (uint32_t)a;
++    if (__builtin_expect(ppu_vmi_ok(ea), 1))
++        return __builtin_bswap32(__atomic_load_n((const ppu_vmi_u32*)(vm_base + ea), __ATOMIC_RELAXED));
++    return vm_read32(a);
++}
++static inline __attribute__((always_inline)) uint64_t ppu_vmi_read64(uint64_t a) {
++    const uint32_t ea = (uint32_t)a;
++    if (__builtin_expect(ppu_vmi_ok(ea), 1))
++        return __builtin_bswap64(__atomic_load_n((const ppu_vmi_u64*)(vm_base + ea), __ATOMIC_RELAXED));
++    return vm_read64(a);
++}
++#define vm_read8(a)  ppu_vmi_read8(a)
++#define vm_read16(a) ppu_vmi_read16(a)
++#define vm_read32(a) ppu_vmi_read32(a)
++#define vm_read64(a) ppu_vmi_read64(a)
++#endif
++/* ---- KZ3 patch 1091 end ---- */
++
+ /* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
+  * Looks up the guest address in CTR via a hash table and calls the
+  * corresponding host function. Handles OPD resolution. */

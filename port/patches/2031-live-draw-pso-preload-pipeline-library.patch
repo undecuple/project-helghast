@@ -1,0 +1,612 @@
+KZ3 PSO preload (RSX pass 32): record the PSO keys a run uses and pre-create them at the next start.
+
+- Every PSO the walker builds is appended once to <shader cache dir>\pso_keys.bin (key, VS/PS HLSL hash+length =
+  the disk cache file names, render state, masked vertex layout, depth bound or not).
+- rsx_live_draw_init starts LD_PSO_PRELOAD_THREADS (3) worker threads after the root signature: they read the keys,
+  take the bytecode from the shader disk cache files (source + blob, no compile needed) and create the PSOs through
+  an ID3D12PipelineLibrary (<dir>\pso_library.bin, serialized on a helper thread when the preload ends, every 60 s
+  when it grew and at shutdown; plain creation when ID3D12Device1 or the library is unavailable). Finished PSOs are
+  staged and merged into g.psos by the walker before its next lookup and on every present: neither the boot nor the
+  walker waits for them.
+- The walker's own builds also go through the library (LoadGraphicsPipeline first, StorePipeline after a create).
+- apply_render_state takes the depth-bound flag as a parameter (the record keeps it; the key never had it).
+- LD_PSO_PRELOAD=0: no workers, no library, recording stays on. LD_PSO_PRELOAD_NOLIB=1: plain creates only.
+- [pso-stat] also closes its minute line on every present, and reports "preload used=N".
+- Log lines: [pso-preload] start / done (records, library hits, creates, failures, missing blobs, wall ms) /
+  library saved / used.
+- ppu_crash_report (patch 2030's hunk): the crash file path is logged before the minidump attempt, the result after
+  it (the single line after MiniDumpWriteDump never appeared in the round-31 test).
+
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3806,6 +3806,11 @@
+             snprintf(dmp, sizeof dmp, "%s", crash);
+             char* dot = strrchr(dmp, '.');
+             if (dot && (size_t)(dot - dmp) + 5 < sizeof dmp) strcpy(dot, ".dmp");
++            /* KZ3 patch 2031: name the crash file before the minidump; the line after it never appeared in the
++             * round-31 test (the process ended with the exception code and a 14 kB dump: ASSUMPTION the dump
++             * call faults inside the handler), so the path must be on record before the attempt. */
++            fprintf(stderr, "[CRASH] crash file %s, writing minidump %s\n", crash, dmp);
++            fflush(stderr);
+             HANDLE f = CreateFileA(dmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+             if (f != INVALID_HANDLE_VALUE) {
+                 typedef BOOL (WINAPI *mdw_fn)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+@@ -3816,7 +3821,7 @@
+                 BOOL ok = mdw ? mdw(GetCurrentProcess(), GetCurrentProcessId(), f, 0, &mei, NULL, NULL) : FALSE;
+                 CloseHandle(f);
+                 if (!ok) DeleteFileA(dmp);
+-                fprintf(stderr, "[CRASH] crash file %s, minidump %s\n", crash, ok ? dmp : "(not written)");
++                fprintf(stderr, "[CRASH] minidump %s\n", ok ? "written" : "NOT written");
+             }
+         }
+         kz3_crash_notify(crash ? crash : "");
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -290,7 +290,7 @@
+     u32 last_hash_frame;
+     u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
+ } vtexcache_t;
+-typedef struct { u64 key; ID3D12PipelineState* pso; } psocache_t;
++typedef struct { u64 key; ID3D12PipelineState* pso; u8 preloaded; } psocache_t;   /* patch 2031: preloaded until first use */
+ typedef struct {
+     u64 hash;
+     u32 source_length;
+@@ -1575,7 +1575,7 @@
+ }
+ 
+ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+-                               const render_state_t* rs)
++                               const render_state_t* rs, int has_depth)   /* patch 2031: g.depth passed in */
+ {
+     D3D12_RENDER_TARGET_BLEND_DESC* b = &pd->BlendState.RenderTarget[0];
+     /* nv40_3d COLOR_MASK byte layout (Mesa/nouveau nv40_3d.xml.h, MIT/X11):
+@@ -1644,7 +1644,7 @@
+     /* Y-negating viewport epilogue mirrors winding; take the front sense
+      * straight from the guest value (validated in B1). */
+     pd->RasterizerState.FrontCounterClockwise = (rs->front_face == 0x0901);
+-    if (g.depth) {
++    if (has_depth) {
+         pd->DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+         pd->DepthStencilState.DepthEnable = rs->depth_test ? TRUE : FALSE;
+         pd->DepthStencilState.DepthWriteMask =
+@@ -5310,6 +5310,7 @@
+  * with any PSO built (minute = ms since process start / 60000). For the shader preload decision (RSX pass 31):
+  * miss = the whole PSO cache-miss path (decompile + compile or disk load + CreateGraphicsPipelineState).
+  * LD_PSO_STAT=0 turns it off. */
++static unsigned g_ld_pl_used;   /* patch 2031: preloaded PSOs the walker used (read by the [pso-stat] line) */
+ typedef struct { unsigned n, max_us; unsigned long long us; } ld_pstat_acc;
+ static struct {
+     int on; long long qpf, qpc0, ms0; long long bucket;
+@@ -5352,14 +5353,14 @@
+     if (g_ld_pstat.bucket >= 0 && g_ld_pstat.miss.n)
+         fprintf(stderr, "[pso-stat] min %lld: pso-miss n=%u tot=%.1f ms max=%.1f ms (>4ms %u >16ms %u >50ms %u)"
+                 " | vs-compile n=%u tot=%.1f max=%.1f | ps-compile n=%u tot=%.1f max=%.1f | disk-hit vs=%u ps=%u"
+-                " | create n=%u tot=%.1f max=%.1f | run total miss=%llu compiles=%llu %.1f ms\n",
++                " | create n=%u tot=%.1f max=%.1f | run total miss=%llu compiles=%llu %.1f ms | preload used=%u\n",
+                 g_ld_pstat.bucket, g_ld_pstat.miss.n, g_ld_pstat.miss.us / 1e3, g_ld_pstat.miss.max_us / 1e3,
+                 g_ld_pstat.over4, g_ld_pstat.over16, g_ld_pstat.over50,
+                 g_ld_pstat.vsc.n, g_ld_pstat.vsc.us / 1e3, g_ld_pstat.vsc.max_us / 1e3,
+                 g_ld_pstat.psc.n, g_ld_pstat.psc.us / 1e3, g_ld_pstat.psc.max_us / 1e3,
+                 g_ld_pstat.disk_v, g_ld_pstat.disk_p,
+                 g_ld_pstat.create.n, g_ld_pstat.create.us / 1e3, g_ld_pstat.create.max_us / 1e3,
+-                g_ld_pstat.tot_miss, g_ld_pstat.tot_compile, g_ld_pstat.tot_miss_us / 1e3);
++                g_ld_pstat.tot_miss, g_ld_pstat.tot_compile, g_ld_pstat.tot_miss_us / 1e3, g_ld_pl_used);
+     memset(&g_ld_pstat.miss, 0, sizeof g_ld_pstat.miss); memset(&g_ld_pstat.vsc, 0, sizeof g_ld_pstat.vsc);
+     memset(&g_ld_pstat.psc, 0, sizeof g_ld_pstat.psc); memset(&g_ld_pstat.create, 0, sizeof g_ld_pstat.create);
+     g_ld_pstat.disk_v = g_ld_pstat.disk_p = g_ld_pstat.over4 = g_ld_pstat.over16 = g_ld_pstat.over50 = 0;
+@@ -5384,9 +5385,414 @@
+     return b;
+ }
+ 
++/* ===================== KZ3 patch 2031: PSO preload =====================
++ * Every PSO the walker builds is appended once (by key) to <shader cache dir>\pso_keys.bin: the PSO key, the FNV
++ * hashes and lengths of the final VS/PS HLSL (the shader disk cache's file names), the render state, the masked
++ * vertex layout and whether a depth surface was bound. At init, worker threads (LD_PSO_PRELOAD_THREADS, default 3)
++ * read the recorded keys, take the shader bytecode from the disk cache files (which hold source + blob, so no
++ * compile is needed; a record whose blob is missing is skipped) and create the PSOs through an
++ * ID3D12PipelineLibrary (<dir>\pso_library.bin, serialized on a helper thread every 60 s when it grew, and at
++ * shutdown) or, without one, through plain creation. Finished PSOs wait in a staged list that the walker merges into
++ * g.psos before its next lookup and on every present, so the walker never blocks on the preload. LD_PSO_PRELOAD=0
++ * turns the preload and the library off (recording stays on, so an A/B run still produces the key file).
++ * Recording is first-build-wins like the in-memory cache: the DSV format of a PSO follows the depth surface bound
++ * at its first build (apply_render_state's g.depth test), which the key does not include, so the record keeps it. */
++#define LD_PL_MAGIC   0x4C505350u   /* "PSPL" */
++#define LD_PL_VERSION 1u
++#define LD_PL_FLAG_LAYOUT 1u
++#define LD_PL_FLAG_PACKED 2u
++#define LD_PL_FLAG_DEPTH  4u
++typedef struct { u32 magic, version, rec_size, rs_size, cache_version, reserved; } ld_pl_hdr;
++typedef struct {
++    u64 key, vs_hash, ps_hash;
++    u32 vs_len, ps_len, flags, layout_mask, layout_stride, layout_count;
++    u8  attrs[RSX_DSP_NUM_VERTEX_ATTR];
++    render_state_t rs;
++} ld_pl_rec;
++typedef struct { u64 key; ID3D12PipelineState* pso; } ld_pl_staged;
++static struct {
++    int on, opened, started;
++    char path[MAX_PATH], lib_path[MAX_PATH];
++    ld_pl_rec* recs; u32 n_recs, cap_recs;
++    u64* keyset; u32 keyset_cap, keyset_n;     /* keys already in the file (walker thread only) */
++    CRITICAL_SECTION cs;                        /* staged[], stats below */
++    ld_pl_staged* staged; u32 n_staged, cap_staged; volatile LONG staged_flag;
++    volatile LONG next; volatile LONG workers_left; HANDLE threads[8]; u32 n_threads;
++    ID3D12Device1* dev1; ID3D12PipelineLibrary* lib; void* lib_blob; size_t lib_blob_size;
++    volatile LONG lib_dirty, lib_saving; HANDLE save_thread; LONGLONG last_save_qpc;
++    LONGLONG t0, qpf;
++    unsigned n_lib_hit, n_created, n_failed, n_missing, n_dup, n_lib_stored, n_lib_hit_walker;
++    unsigned long long create_us, lib_us, blob_us;
++} g_ld_pl;
++static u32 g_ld_pl_last_vs_len, g_ld_pl_last_ps_len;
++static u64 g_ld_pl_last_vs_hash, g_ld_pl_last_ps_hash;
++
++static int ld_pl_enabled(void)
++{
++    if (!g_ld_pl.opened) { const char* e = getenv("LD_PSO_PRELOAD"); g_ld_pl.on = e ? atoi(e) != 0 : 1; }
++    return g_ld_pl.on;
++}
++static LONGLONG ld_pl_qpc(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart; }
++static unsigned ld_pl_us(LONGLONG t0) { return (unsigned)((ld_pl_qpc() - t0) * 1000000 / (g_ld_pl.qpf ? g_ld_pl.qpf : 1)); }
++
++/* Open-addressing set of the recorded keys; returns 1 when the key was new. */
++static int ld_pl_keyset_add(u64 key)
++{
++    if (!g_ld_pl.keyset) {
++        g_ld_pl.keyset_cap = 4u * MAX_PSOS;   /* power of two, at most 25 % full */
++        g_ld_pl.keyset = (u64*)calloc(g_ld_pl.keyset_cap, sizeof(u64));
++        if (!g_ld_pl.keyset) return 0;
++    }
++    if (g_ld_pl.keyset_n >= g_ld_pl.keyset_cap / 2) return 0;
++    u32 i = (u32)(key ^ (key >> 29)) & (g_ld_pl.keyset_cap - 1);
++    for (;; i = (i + 1) & (g_ld_pl.keyset_cap - 1)) {
++        if (g_ld_pl.keyset[i] == key) return 0;
++        if (!g_ld_pl.keyset[i]) { g_ld_pl.keyset[i] = key; g_ld_pl.keyset_n++; return 1; }
++    }
++}
++
++/* Read the key file (init thread, before the walker runs); a header mismatch starts a fresh file. */
++static void ld_pl_open(void)
++{
++    if (g_ld_pl.opened) return;
++    ld_pl_enabled();
++    g_ld_pl.opened = 1;
++    { LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_ld_pl.qpf = f.QuadPart; }
++    InitializeCriticalSection(&g_ld_pl.cs);
++    if (!shader_disk_cache_prepare()) { fprintf(stderr, "[pso-preload] off: no shader disk cache\n"); return; }
++    snprintf(g_ld_pl.path, sizeof g_ld_pl.path, "%s\\pso_keys.bin", g_ld_shader_disk_dir);
++    snprintf(g_ld_pl.lib_path, sizeof g_ld_pl.lib_path, "%s\\pso_library.bin", g_ld_shader_disk_dir);
++    FILE* f = fopen(g_ld_pl.path, "rb");
++    if (!f) return;
++    ld_pl_hdr h; memset(&h, 0, sizeof h);
++    int ok = fread(&h, sizeof h, 1, f) == 1 && h.magic == LD_PL_MAGIC && h.version == LD_PL_VERSION &&
++             h.rec_size == sizeof(ld_pl_rec) && h.rs_size == sizeof(render_state_t) &&
++             h.cache_version == SHADER_DISK_CACHE_VERSION;
++    if (ok) {
++        g_ld_pl.cap_recs = 1024;
++        g_ld_pl.recs = (ld_pl_rec*)malloc(g_ld_pl.cap_recs * sizeof(ld_pl_rec));
++        ld_pl_rec r;
++        while (g_ld_pl.recs && fread(&r, sizeof h, 1, f) == 1 && g_ld_pl.n_recs < MAX_PSOS) {
++            if (!memcmp(&r, &h, sizeof h)) continue;   /* a repeated header (files from the first r32 build): skip it */
++            if (fread((char*)&r + sizeof h, sizeof r - sizeof h, 1, f) != 1) break;
++            if (!ld_pl_keyset_add(r.key)) continue;   /* duplicate line (two sessions appended): keep the first */
++            if (g_ld_pl.n_recs == g_ld_pl.cap_recs) {
++                ld_pl_rec* n = (ld_pl_rec*)realloc(g_ld_pl.recs, 2u * g_ld_pl.cap_recs * sizeof(ld_pl_rec));
++                if (!n) break;
++                g_ld_pl.recs = n; g_ld_pl.cap_recs *= 2;
++            }
++            g_ld_pl.recs[g_ld_pl.n_recs++] = r;
++        }
++    }
++    fclose(f);
++    if (!ok) {
++        fprintf(stderr, "[pso-preload] key file '%s' has another layout, starting over\n", g_ld_pl.path);
++        DeleteFileA(g_ld_pl.path);
++    }
++}
++
++/* Walker thread, after a successful build: append the record when the key is new. */
++static void ld_pl_record(u64 key, const render_state_t* rs, const rsx_vertex_layout_plan* layout, int packed, int depth)
++{
++    if (!g_ld_pl.opened || !g_ld_pl.path[0] || !ld_pl_keyset_add(key)) return;
++    ld_pl_rec r; memset(&r, 0, sizeof r);
++    r.key = key; r.vs_hash = g_ld_pl_last_vs_hash; r.ps_hash = g_ld_pl_last_ps_hash;
++    r.vs_len = g_ld_pl_last_vs_len; r.ps_len = g_ld_pl_last_ps_len;
++    r.flags = (layout ? LD_PL_FLAG_LAYOUT : 0u) | (layout && packed ? LD_PL_FLAG_PACKED : 0u) | (depth ? LD_PL_FLAG_DEPTH : 0u);
++    if (layout) {
++        r.layout_mask = layout->mask; r.layout_stride = layout->stride; r.layout_count = layout->count;
++        memcpy(r.attrs, layout->attrs, sizeof r.attrs);
++    }
++    r.rs = *rs;
++    FILE* f = fopen(g_ld_pl.path, "ab");
++    if (!f) return;
++    fseek(f, 0, SEEK_END);   /* MSVCRT: an "a" stream reports position 0 until its first write */
++    if (ftell(f) == 0) {
++        ld_pl_hdr h = { LD_PL_MAGIC, LD_PL_VERSION, (u32)sizeof(ld_pl_rec), (u32)sizeof(render_state_t), SHADER_DISK_CACHE_VERSION, 0 };
++        fwrite(&h, sizeof h, 1, f);
++    }
++    fwrite(&r, sizeof r, 1, f);
++    fclose(f);
++}
++
++/* Worker threads: a disk cache file by name, verified by its header and the hash of the stored source. */
++static ID3DBlob* ld_pl_load_blob(u32 stage, u64 hash, u32 len)
++{
++    char path[MAX_PATH];
++    if (!shader_disk_cache_path(path, stage, hash, len)) return NULL;
++    FILE* f = fopen(path, "rb");
++    if (!f) return NULL;
++    shader_disk_cache_header h; memset(&h, 0, sizeof h);
++    int ok = fread(&h, sizeof h, 1, f) == 1 && h.magic == SHADER_DISK_CACHE_MAGIC && h.version == SHADER_DISK_CACHE_VERSION &&
++             h.stage == stage && h.source_hash == hash && h.source_length == len && len && len <= 256u * 1024u &&
++             h.blob_length > 0 && h.blob_length <= SHADER_DISK_CACHE_MAX_BLOB;
++    ID3DBlob* blob = NULL;
++    char* src = ok ? (char*)malloc(len) : NULL;
++    if (src) ok = fread(src, 1, len, f) == len && fnv1a(src, len, 1469598103934665603ull) == hash;
++    else ok = 0;
++    free(src);
++    if (ok) ok = SUCCEEDED(D3DCreateBlob(h.blob_length, &blob)) && blob &&
++                 fread(blob->lpVtbl->GetBufferPointer(blob), 1, h.blob_length, f) == h.blob_length;
++    fclose(f);
++    if (!ok && blob) { blob->lpVtbl->Release(blob); blob = NULL; }
++    return ok ? blob : NULL;
++}
++
++/* The PSO description build_pso used before the preload, shared with the workers. */
++static void ld_pso_desc_fill(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEMENT_DESC il[16],
++                             ID3DBlob* vs, ID3DBlob* ps, const render_state_t* rs,
++                             u32 input_count, const u8* attrs, int masked, int packed_offsets, int has_depth)
++{
++    for (u32 slot = 0; slot < input_count; slot++) {
++        const u32 attr = masked ? attrs[slot] : slot;
++        D3D12_INPUT_ELEMENT_DESC e = {
++            "ATTR", attr, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
++            masked && !packed_offsets ? attr * 16u : slot * 16u,
++            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0
++        };
++        il[slot] = e;
++    }
++    memset(pd, 0, sizeof *pd);
++    pd->pRootSignature = g.rootsig_x;
++    pd->VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs);
++    pd->VS.BytecodeLength = vs->lpVtbl->GetBufferSize(vs);
++    pd->PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
++    pd->PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
++    pd->InputLayout.pInputElementDescs = input_count ? il : NULL;
++    pd->InputLayout.NumElements = input_count;
++    apply_render_state(pd, rs, has_depth);
++    pd->SampleMask = 0xFFFFFFFFu;
++    pd->PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    pd->NumRenderTargets = rs->rt_count ? rs->rt_count : 1;
++    for (u32 r = 0; r < pd->NumRenderTargets; r++)
++        pd->RTVFormats[r] = rs->rt_fp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT
++                          : rs->rt_x32  ? DXGI_FORMAT_R32_FLOAT
++                                        : DXGI_FORMAT_R8G8B8A8_UNORM;
++    pd->SampleDesc.Count = 1;
++}
++
++static int ld_pso_needs_stream(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const render_state_t* rs)
++{
++    return (rs->depth_bounds || rs->stencil_per_face) && g_ld_caps.dev2 && pd->DSVFormat;
++}
++
++/* Create through the pipeline library when there is one (named by the PSO key); stream PSOs stay on ld_create_pso. */
++static HRESULT ld_pl_create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const render_state_t* rs, u64 key,
++                            ID3D12PipelineState** out, int* lib_hit)
++{
++    *lib_hit = 0;
++    if (g_ld_pl.lib && !ld_pso_needs_stream(pd, rs)) {
++        WCHAR name[24];
++        for (int i = 0; i < 16; i++) name[i] = L"0123456789ABCDEF"[(key >> (60 - 4 * i)) & 15];
++        name[16] = 0;
++        HRESULT hr = g_ld_pl.lib->lpVtbl->LoadGraphicsPipeline(g_ld_pl.lib, name, pd, &IID_ID3D12PipelineState, (void**)out);
++        if (SUCCEEDED(hr) && *out) { *lib_hit = 1; return hr; }
++        *out = NULL;
++        hr = ld_create_pso(pd, rs, out);
++        if (SUCCEEDED(hr) && *out) {
++            if (SUCCEEDED(g_ld_pl.lib->lpVtbl->StorePipeline(g_ld_pl.lib, name, *out))) {
++                InterlockedExchange(&g_ld_pl.lib_dirty, 1);
++                InterlockedIncrement((volatile LONG*)&g_ld_pl.n_lib_stored);
++            }
++        }
++        return hr;
++    }
++    return ld_create_pso(pd, rs, out);
++}
++
++static DWORD WINAPI ld_pl_save_thread(LPVOID arg)
++{
++    (void)arg;
++    const LONGLONG t0 = ld_pl_qpc();
++    const SIZE_T n = g_ld_pl.lib->lpVtbl->GetSerializedSize(g_ld_pl.lib);
++    void* buf = n ? malloc(n) : NULL;
++    int ok = 0;
++    if (buf && SUCCEEDED(g_ld_pl.lib->lpVtbl->Serialize(g_ld_pl.lib, buf, n))) {
++        char tmp[MAX_PATH + 8];
++        snprintf(tmp, sizeof tmp, "%s.tmp", g_ld_pl.lib_path);
++        FILE* f = fopen(tmp, "wb");
++        if (f) {
++            ok = fwrite(buf, 1, n, f) == n;
++            fclose(f);
++            if (ok) ok = MoveFileExA(tmp, g_ld_pl.lib_path, MOVEFILE_REPLACE_EXISTING) != 0;
++        }
++    }
++    free(buf);
++    fprintf(stderr, "[pso-preload] library %s: %u bytes, %u entries stored this run, %.1f ms\n",
++            ok ? "saved" : "NOT saved", (unsigned)n, g_ld_pl.n_lib_stored, ld_pl_us(t0) / 1e3);
++    InterlockedExchange(&g_ld_pl.lib_saving, 0);
++    return 0;
++}
++/* Walker or worker: serialize the library on a helper thread when it grew (no-op while a save is running). */
++static void ld_pl_save_library(int wait)
++{
++    if (!g_ld_pl.lib || !InterlockedExchange(&g_ld_pl.lib_dirty, 0)) return;
++    if (InterlockedCompareExchange(&g_ld_pl.lib_saving, 1, 0)) { InterlockedExchange(&g_ld_pl.lib_dirty, 1); return; }
++    if (g_ld_pl.save_thread) { CloseHandle(g_ld_pl.save_thread); g_ld_pl.save_thread = NULL; }
++    g_ld_pl.last_save_qpc = ld_pl_qpc();
++    if (wait) { ld_pl_save_thread(NULL); return; }
++    g_ld_pl.save_thread = CreateThread(NULL, 0, ld_pl_save_thread, NULL, 0, NULL);
++    if (!g_ld_pl.save_thread) ld_pl_save_thread(NULL);
++}
++
++static void ld_pl_stage(u64 key, ID3D12PipelineState* pso)
++{
++    EnterCriticalSection(&g_ld_pl.cs);
++    if (g_ld_pl.n_staged == g_ld_pl.cap_staged) {
++        const u32 cap = g_ld_pl.cap_staged ? 2u * g_ld_pl.cap_staged : 256u;
++        ld_pl_staged* n = (ld_pl_staged*)realloc(g_ld_pl.staged, cap * sizeof(ld_pl_staged));
++        if (!n) { LeaveCriticalSection(&g_ld_pl.cs); pso->lpVtbl->Release(pso); return; }
++        g_ld_pl.staged = n; g_ld_pl.cap_staged = cap;
++    }
++    g_ld_pl.staged[g_ld_pl.n_staged].key = key;
++    g_ld_pl.staged[g_ld_pl.n_staged].pso = pso;
++    g_ld_pl.n_staged++;
++    InterlockedExchange(&g_ld_pl.staged_flag, 1);
++    LeaveCriticalSection(&g_ld_pl.cs);
++}
++
++static DWORD WINAPI ld_pl_worker(LPVOID arg)
++{
++    (void)arg;
++    for (;;) {
++        const LONG i = InterlockedIncrement(&g_ld_pl.next) - 1;
++        if (i < 0 || (u32)i >= g_ld_pl.n_recs) break;
++        const ld_pl_rec* r = &g_ld_pl.recs[i];
++        const LONGLONG tb = ld_pl_qpc();
++        ID3DBlob* vs = ld_pl_load_blob('V', r->vs_hash, r->vs_len);
++        ID3DBlob* ps = vs ? ld_pl_load_blob('P', r->ps_hash, r->ps_len) : NULL;
++        const unsigned bus = ld_pl_us(tb);
++        if (!vs || !ps) {
++            if (vs) vs->lpVtbl->Release(vs);
++            EnterCriticalSection(&g_ld_pl.cs); g_ld_pl.n_missing++; g_ld_pl.blob_us += bus; LeaveCriticalSection(&g_ld_pl.cs);
++            continue;
++        }
++        D3D12_INPUT_ELEMENT_DESC il[16];
++        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
++        const int masked = (r->flags & LD_PL_FLAG_LAYOUT) != 0;
++        ld_pso_desc_fill(&pd, il, vs, ps, &r->rs, masked ? r->layout_count : RSX_DSP_NUM_VERTEX_ATTR, r->attrs,
++                         masked, (r->flags & LD_PL_FLAG_PACKED) != 0, (r->flags & LD_PL_FLAG_DEPTH) != 0);
++        ID3D12PipelineState* pso = NULL;
++        int lib_hit = 0;
++        const LONGLONG tc = ld_pl_qpc();
++        const HRESULT hr = ld_pl_create(&pd, &r->rs, r->key, &pso, &lib_hit);
++        const unsigned cus = ld_pl_us(tc);
++        vs->lpVtbl->Release(vs); ps->lpVtbl->Release(ps);
++        EnterCriticalSection(&g_ld_pl.cs);
++        g_ld_pl.blob_us += bus;
++        if (lib_hit) { g_ld_pl.n_lib_hit++; g_ld_pl.lib_us += cus; }
++        else if (SUCCEEDED(hr) && pso) { g_ld_pl.n_created++; g_ld_pl.create_us += cus; }
++        else g_ld_pl.n_failed++;
++        LeaveCriticalSection(&g_ld_pl.cs);
++        if (SUCCEEDED(hr) && pso) ld_pl_stage(r->key, pso);
++    }
++    if (InterlockedDecrement(&g_ld_pl.workers_left) == 0) {
++        fprintf(stderr, "[pso-preload] done: %u records, %u from library (%.1f ms), %u created (%.1f ms), %u failed, "
++                        "%u without blobs (blob reads %.1f ms), %u threads, %.1f ms wall\n",
++                g_ld_pl.n_recs, g_ld_pl.n_lib_hit, g_ld_pl.lib_us / 1e3, g_ld_pl.n_created, g_ld_pl.create_us / 1e3,
++                g_ld_pl.n_failed, g_ld_pl.n_missing, g_ld_pl.blob_us / 1e3, g_ld_pl.n_threads, ld_pl_us(g_ld_pl.t0) / 1e3);
++        ld_pl_save_library(0);
++    }
++    return 0;
++}
++
++/* Init thread, after the root signature exists: library, then the workers. */
++static void ld_pl_start(void)
++{
++    ld_pl_open();
++    if (g_ld_pl.started) return;
++    g_ld_pl.started = 1;
++    if (!ld_pl_enabled()) { fprintf(stderr, "[pso-preload] off (LD_PSO_PRELOAD=0): recording only, %u keys on file\n", g_ld_pl.n_recs); return; }
++    if (!g_ld_pl.path[0]) return;
++    g_ld_pl.t0 = ld_pl_qpc();
++    if (!getenv("LD_PSO_PRELOAD_NOLIB") &&
++        SUCCEEDED(g.dev->lpVtbl->QueryInterface(g.dev, &IID_ID3D12Device1, (void**)&g_ld_pl.dev1)) && g_ld_pl.dev1) {
++        FILE* f = fopen(g_ld_pl.lib_path, "rb");
++        HRESULT hr = E_FAIL;
++        if (f) {
++            fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
++            if (n > 0 && (g_ld_pl.lib_blob = malloc((size_t)n)) != NULL && fread(g_ld_pl.lib_blob, 1, (size_t)n, f) == (size_t)n) {
++                g_ld_pl.lib_blob_size = (size_t)n;
++                hr = g_ld_pl.dev1->lpVtbl->CreatePipelineLibrary(g_ld_pl.dev1, g_ld_pl.lib_blob, g_ld_pl.lib_blob_size,
++                                                                &IID_ID3D12PipelineLibrary, (void**)&g_ld_pl.lib);
++                if (FAILED(hr)) fprintf(stderr, "[pso-preload] library file rejected hr=0x%08lX (%ld bytes), starting empty\n",
++                                        (unsigned long)hr, n);
++            }
++            fclose(f);
++        }
++        if (FAILED(hr)) {
++            free(g_ld_pl.lib_blob); g_ld_pl.lib_blob = NULL; g_ld_pl.lib_blob_size = 0; g_ld_pl.lib = NULL;
++            hr = g_ld_pl.dev1->lpVtbl->CreatePipelineLibrary(g_ld_pl.dev1, NULL, 0, &IID_ID3D12PipelineLibrary, (void**)&g_ld_pl.lib);
++            if (FAILED(hr)) { g_ld_pl.lib = NULL; fprintf(stderr, "[pso-preload] no pipeline library (hr=0x%08lX), plain creates\n", (unsigned long)hr); }
++        }
++    } else {
++        fprintf(stderr, "[pso-preload] no ID3D12Device1, plain creates\n");
++    }
++    const char* e = getenv("LD_PSO_PRELOAD_THREADS");
++    int nt = e ? atoi(e) : 3;
++    if (nt < 1) nt = 1;
++    if (nt > 8) nt = 8;
++    g_ld_pl.n_threads = (u32)nt;
++    g_ld_pl.workers_left = nt;
++    fprintf(stderr, "[pso-preload] start: %u keys on file, library %s (%u bytes on disk), %d threads\n",
++            g_ld_pl.n_recs, g_ld_pl.lib ? "yes" : "no", (unsigned)g_ld_pl.lib_blob_size, nt);
++    if (!g_ld_pl.n_recs) { g_ld_pl.workers_left = 0; return; }
++    for (int i = 0; i < nt; i++) {
++        g_ld_pl.threads[i] = CreateThread(NULL, 0, ld_pl_worker, NULL, 0, NULL);
++        if (!g_ld_pl.threads[i]) InterlockedDecrement(&g_ld_pl.workers_left);
++    }
++}
++
++/* Walker: merge the finished PSOs (a key the walker built itself in the meantime keeps the walker's). */
++static void ld_pl_drain(void)
++{
++    if (!g_ld_pl.staged_flag) return;
++    EnterCriticalSection(&g_ld_pl.cs);
++    InterlockedExchange(&g_ld_pl.staged_flag, 0);
++    for (u32 s = 0; s < g_ld_pl.n_staged; s++) {
++        const u64 key = g_ld_pl.staged[s].key;
++        ID3D12PipelineState* pso = g_ld_pl.staged[s].pso;
++        u32 i = 0;
++        while (i < g.n_psos && g.psos[i].key != key) i++;
++        if (i < g.n_psos || g.n_psos >= MAX_PSOS) { pso->lpVtbl->Release(pso); g_ld_pl.n_dup++; continue; }
++        g.psos[g.n_psos].key = key;
++        g.psos[g.n_psos].pso = pso;
++        g.psos[g.n_psos].preloaded = 1;
++        g.n_psos++;
++    }
++    g_ld_pl.n_staged = 0;
++    LeaveCriticalSection(&g_ld_pl.cs);
++}
++
++/* Present: drain, periodic library save. */
++static void ld_pl_tick(void)
++{
++    if (!g_ld_pl.started) return;
++    ld_pl_drain();
++    if (g_ld_pl.lib && g_ld_pl.lib_dirty && !g_ld_pl.workers_left &&
++        (ld_pl_qpc() - g_ld_pl.last_save_qpc) > 60 * g_ld_pl.qpf)
++        ld_pl_save_library(0);
++}
++
++static void ld_pl_shutdown(void)
++{
++    if (!g_ld_pl.started) return;
++    for (u32 i = 0; i < g_ld_pl.n_threads; i++)
++        if (g_ld_pl.threads[i]) { WaitForSingleObject(g_ld_pl.threads[i], 10000); CloseHandle(g_ld_pl.threads[i]); g_ld_pl.threads[i] = NULL; }
++    if (g_ld_pl.save_thread) { WaitForSingleObject(g_ld_pl.save_thread, 30000); CloseHandle(g_ld_pl.save_thread); g_ld_pl.save_thread = NULL; }
++    ld_pl_save_library(1);
++    ld_pl_drain();
++    fprintf(stderr, "[pso-preload] used %u of the preloaded PSOs, %u duplicates of walker builds, walker library hits %u\n",
++            g_ld_pl_used, g_ld_pl.n_dup, g_ld_pl.n_lib_hit_walker);
++    if (g_ld_pl.lib) { g_ld_pl.lib->lpVtbl->Release(g_ld_pl.lib); g_ld_pl.lib = NULL; }
++    if (g_ld_pl.dev1) { g_ld_pl.dev1->lpVtbl->Release(g_ld_pl.dev1); g_ld_pl.dev1 = NULL; }
++    free(g_ld_pl.lib_blob); g_ld_pl.lib_blob = NULL;
++}
++/* ===================== end of patch 2031 block ===================== */
++
+ static ID3D12PipelineState* build_pso(
+     const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
+-    const rsx_vertex_layout_plan* masked_layout, int packed_offsets)
++    const rsx_vertex_layout_plan* masked_layout, int packed_offsets, u64 key)
+ {
+     ID3DBlob *vs = NULL, *ps = NULL, *err = NULL;
+     static u32 compile_fail_logs = 0;
+@@ -5531,40 +5937,20 @@
+     D3D12_INPUT_ELEMENT_DESC il[16];
+     const u32 input_count =
+         masked_layout ? masked_layout->count : RSX_DSP_NUM_VERTEX_ATTR;
+-    for (u32 slot = 0; slot < input_count; slot++) {
+-        const u32 attr =
+-            masked_layout ? masked_layout->attrs[slot] : slot;
+-        D3D12_INPUT_ELEMENT_DESC e = {
+-            "ATTR", attr, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
+-            masked_layout && !packed_offsets ? attr * 16u : slot * 16u,
+-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0
+-        };
+-        il[slot] = e;
+-    }
+-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+-    pd.pRootSignature = g.rootsig_x;
+-    pd.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs);
+-    pd.VS.BytecodeLength = vs->lpVtbl->GetBufferSize(vs);
+-    pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
+-    pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
+-    pd.InputLayout.pInputElementDescs = input_count ? il : NULL;
+-    pd.InputLayout.NumElements = input_count;
+-    apply_render_state(&pd, rs);
+-    pd.SampleMask = 0xFFFFFFFFu;
+-    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+-    pd.NumRenderTargets = rs->rt_count ? rs->rt_count : 1;
+-    for (u32 r = 0; r < pd.NumRenderTargets; r++)
+-        pd.RTVFormats[r] = rs->rt_fp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT
+-                         : rs->rt_x32  ? DXGI_FORMAT_R32_FLOAT
+-                                       : DXGI_FORMAT_R8G8B8A8_UNORM;
+-    pd.SampleDesc.Count = 1;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;   /* patch 2031: shared with the preload workers */
++    ld_pso_desc_fill(&pd, il, vs, ps, rs, input_count, masked_layout ? masked_layout->attrs : NULL,
++                     masked_layout != NULL, packed_offsets, g.depth != NULL);
++    g_ld_pl_last_vs_hash = vs_hash; g_ld_pl_last_vs_len = vs_length;
++    g_ld_pl_last_ps_hash = ps_hash; g_ld_pl_last_ps_len = ps_length;
+     ID3D12PipelineState* pso = NULL;
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.create_pso_calls++;
+     const LONGLONG create_begin = ld_profile_qpc();
+ #endif
+     const LONGLONG pst_c0 = ld_pstat_qpc();
+-    HRESULT hr = ld_create_pso(&pd, rs, &pso);
++    int lib_hit = 0;
++    HRESULT hr = ld_pl_create(&pd, rs, key, &pso, &lib_hit);   /* patch 2031: pipeline library first */
++    if (lib_hit) g_ld_pl.n_lib_hit_walker++;
+     if (g_ld_pstat.on > 0) ld_pstat_acc_add(&g_ld_pstat.create, ld_pstat_us(pst_c0));
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.create_pso_qpc +=
+@@ -5969,6 +6355,7 @@
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.pso_lookups++;
+ #endif
++    ld_pl_drain();   /* patch 2031: take what the preload finished */
+     for (u32 i = 0; i < g.n_psos; i++) {
+ #if defined(YZ_PERF_PROFILE)
+         g_ld_profile.total.pso_probes++;
+@@ -5977,6 +6364,7 @@
+ #if defined(YZ_PERF_PROFILE)
+             g_ld_profile.total.pso_hits++;
+ #endif
++            if (g.psos[i].preloaded) { g.psos[i].preloaded = 0; g_ld_pl_used++; }
+             LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
+             return g.psos[i].pso;
+         }
+@@ -6122,7 +6510,8 @@
+     if (vi > 0 && fi > 0) {
+         LDW_T0(bp_t0);
+         pso = build_pso(
+-            vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload);
++            vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key);
++        if (pso) ld_pl_record(key, &rs, masked_layout, packed_payload, g.depth != NULL);   /* patch 2031 */
+         if (bp_t0) { LDW_ADD(RSX_PERF_W_PSO_NEW_T, bp_t0); rsx_perf_add(RSX_PERF_W_PSO_NEW_N, 1); }
+     }
+ 
+@@ -10421,6 +10810,7 @@
+     if (make_root_signature() != 0 ||
+         make_depth_snapshot_pipeline() != 0)
+         return -1;
++    ld_pl_start();   /* patch 2031: PSO preload workers (LD_PSO_PRELOAD=0 records only) */
+ 
+     static const u8 white[4] = {255, 255, 255, 255};
+     g.white_tex = create_texture_rgba(white, 1, 1);
+@@ -12940,6 +13330,8 @@
+ /* RSX_PERF (patch 2007): whole present (flush + GPU wait + swap) per frame. */
+ void rsx_live_draw_present(u32 buffer_id)
+ {
++    ld_pl_tick();                                   /* patch 2031 */
++    if (ld_pstat_on()) ld_pstat_flush_if_new_minute();   /* patch 2031: close the minute line on flips too */
+     if (!rsx_perf_enabled()) { ld_present_body(buffer_id); return; }
+     const long long t0 = rsx_perf_now();
+     ld_present_body(buffer_id);
+@@ -13158,6 +13550,7 @@
+                 (unsigned long long)g_ld_shader_disk_writes[1],
+                 (unsigned long long)g_ld_shader_disk_rejects);
+     }
++    ld_pl_shutdown();   /* patch 2031 */
+     for (u32 i = 0; i < g.n_psos; i++) if (g.psos[i].pso) g.psos[i].pso->lpVtbl->Release(g.psos[i].pso);
+     shader_blob_cache_release(&g.vs_blobs);
+     shader_blob_cache_release(&g.ps_blobs);

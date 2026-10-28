@@ -1,0 +1,224 @@
+KZ3 patch 1058 (SPU pass 40, RE pass 86): the selectWorkload intercept answers the current workload id (wklCurrentId, LS 0x1DC) instead of 0, so the WWS job-manager policy module (every KZ3 job manager) runs jobs back to back instead of one job per kernel run; another id only when the port's kernel wants the SPU elsewhere (over KZ3_SPURS_RUN_MS, another kicked workload waits unclaimed, or every kernel thread is busy and the run is past KZ3_PM_QUANTUM_US, default 8000). off by default (KZ3_PM_SELECT=1 = on, KZ3_PM_SELECT=2 = the bare upstream form: always answer the current id, no budget/kick/quantum switch (SPU pass 75), KZ3_PM_SELECT_OLD=1 = force old), KZ3_PM_SELECT_TRACE=1 = [pm-sel] lines. Upstream candidate.
+
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -128,6 +128,103 @@
+ }
+ /* kz3-spurs-budget end */
+ 
++/* KZ3 patch 1058 (SPU pass 40, RE pass 86): the selectWorkload answer (spurs_select.h). kz3-pm-select begin */
++#include "spurs_select.h"
++/* Set by cellSpurs.c (constructor): 1 = another kicked workload of this instance waits unclaimed (or, every kernel
++ * thread busy, this run is past KZ3_PM_QUANTUM_US). NULL = never switch. */
++int (*g_kz3_spurs_switch_wanted)(uint32_t spurs_ea, uint32_t cur_wid, uint64_t run_us) = 0;
++static SPU_THREAD_LOCAL uint64_t s_kz3_sel_t0_us;      /* this thread's PM run start */
++static SPU_THREAD_LOCAL unsigned s_kz3_sel_sw;         /* "switch" answers in this run */
++static int s_kz3_sel_old = -1, s_kz3_sel_trace = -1, s_kz3_sel_bare = 0;
++static volatile long s_kz3_sel_runs[16], s_kz3_sel_polls[16], s_kz3_sel_swc[16], s_kz3_sel_stop[16], s_kz3_sel_trc[16];
++static volatile uint64_t s_kz3_sel_last_print;
++static uint64_t kz3_pm_now_us(void)
++{
++#ifdef _WIN32
++    static LARGE_INTEGER f; LARGE_INTEGER c;
++    if (!f.QuadPart) QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (uint64_t)(c.QuadPart / f.QuadPart) * 1000000u + (uint64_t)(c.QuadPart % f.QuadPart) * 1000000u / (uint64_t)f.QuadPart;
++#else
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
++#endif
++}
++static uint32_t kz3_ls_be32(const uint8_t* ls, uint32_t a)
++{
++    return (uint32_t)ls[a] << 24 | (uint32_t)ls[a + 1] << 16 | (uint32_t)ls[a + 2] << 8 | ls[a + 3];
++}
++int kz3_pm_select_old(void)
++{
++    /* Off by default (SPU pass 40: about -0.7 fps and one menu park freeze in 6 runs with it on):
++     * KZ3_PM_SELECT=1 turns the current-id answer on; KZ3_PM_SELECT_OLD=1 forces the old answers either way.
++     * KZ3_PM_SELECT=2 = the bare upstream form (SPU pass 75, evidence for ps3recomp #213): the answer is always
++     * wklCurrentId, no run budget, no kicked-workload / quantum switch (docs/upstream/submission/1058-*.diff). */
++    if (s_kz3_sel_old < 0) {
++        const char* on = getenv("KZ3_PM_SELECT"); const char* e = getenv("KZ3_PM_SELECT_OLD");
++        s_kz3_sel_old = ((on && *on && *on != '0') && !(e && *e && *e != '0')) ? 0 : 1;
++        s_kz3_sel_bare = (!s_kz3_sel_old && on[0] == '2') ? 1 : 0;
++    }
++    return s_kz3_sel_old;
++}
++static int kz3_pm_select_trace(void)
++{
++    if (s_kz3_sel_trace < 0) { const char* e = getenv("KZ3_PM_SELECT_TRACE"); s_kz3_sel_trace = (e && *e && *e != '0') ? 1 : 0; }
++    return s_kz3_sel_trace;
++}
++/* Called by the selectWorkload intercept: the workload id to put in r3. `ls` = the PM's local store, `lr` = the
++ * return address (0x369C for the WWS PM wrapper 0x3678), `arg` = r3 on entry (1 from the WWS PM). */
++uint32_t kz3_pm_select(const uint8_t* ls, uint32_t lr, uint32_t arg, int over_budget)
++{
++    const uint32_t cur = kz3_ls_be32(ls, 0x1DC), ea = kz3_ls_be32(ls, 0x1C4);
++    int want = 0;
++    const int old = kz3_pm_select_old();
++    uint64_t run_us = 0;
++    if (!old && !over_budget && g_kz3_spurs_switch_wanted) {
++        run_us = s_kz3_sel_t0_us ? kz3_pm_now_us() - s_kz3_sel_t0_us : 0;
++        want = g_kz3_spurs_switch_wanted(ea, cur, run_us);
++    }
++    kz3_pm_select_old();
++    const uint32_t ans = s_kz3_sel_bare ? cur : spurs_pm_select_answer(cur, old, over_budget, want);
++    if (ans != cur) s_kz3_sel_sw++;
++    if (kz3_pm_select_trace() && cur < 16) {
++        __atomic_add_fetch(&s_kz3_sel_polls[cur], 1, __ATOMIC_RELAXED);
++        if (ans != cur) __atomic_add_fetch(&s_kz3_sel_swc[cur], 1, __ATOMIC_RELAXED);
++        if (__atomic_add_fetch(&s_kz3_sel_trc[cur], 1, __ATOMIC_RELAXED) <= 6)
++            fprintf(stderr, "[pm-sel] wid=%u select: cur(0x1DC)=%u answer=%u lr=0x%04X r3=0x%X run=%llu us over=%d want=%d old=%d\n",
++                    cur, cur, ans, lr & 0x3FFFF, arg, (unsigned long long)run_us, over_budget, want, old);
++    }
++    return ans;
++}
++static void kz3_pm_select_run_begin(void) { s_kz3_sel_t0_us = kz3_pm_now_us(); s_kz3_sel_sw = 0; }
++static void kz3_pm_select_run_end(const spu_context* ctx, uint32_t wid)
++{
++    const uint64_t now = kz3_pm_now_us(), us = s_kz3_sel_t0_us ? now - s_kz3_sel_t0_us : 0;
++    s_kz3_sel_t0_us = 0;
++    if (!kz3_pm_select_trace() || wid >= 16) return;
++    /* LS 0x12C0 = the WWS PM's nextLoadJobNum: negative = prefetch stopped (0x1A20, a "switch" poll answer). */
++    const int32_t nl = (int32_t)kz3_ls_be32(ctx->ls, 0x12C0);
++    const long r = __atomic_add_fetch(&s_kz3_sel_runs[wid], 1, __ATOMIC_RELAXED);
++    if (nl < 0) __atomic_add_fetch(&s_kz3_sel_stop[wid], 1, __ATOMIC_RELAXED);
++    if (r <= 4)
++        fprintf(stderr, "[pm-sel] wid=%u run#%ld end: polls=%u switch-answers=%u 0x12C0=0x%08X %llu us\n",
++                wid, r, g_spurs_pm_polls, s_kz3_sel_sw, (uint32_t)nl, (unsigned long long)us);
++    uint64_t last = s_kz3_sel_last_print;
++    if (now - last >= 10000000u && __atomic_compare_exchange_n(&s_kz3_sel_last_print, &last, now, 0,
++                                                               __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++        char b[1024]; int o = 0;
++        for (int w = 0; w < 16 && o < (int)sizeof b - 64; w++) {
++            long rn = __atomic_exchange_n(&s_kz3_sel_runs[w], 0, __ATOMIC_RELAXED);
++            long pl = __atomic_exchange_n(&s_kz3_sel_polls[w], 0, __ATOMIC_RELAXED);
++            long sw = __atomic_exchange_n(&s_kz3_sel_swc[w], 0, __ATOMIC_RELAXED);
++            long st = __atomic_exchange_n(&s_kz3_sel_stop[w], 0, __ATOMIC_RELAXED);
++            if (rn || pl) o += snprintf(b + o, sizeof b - (size_t)o, " w%d:%ld/%ld/%ld/%ld", w, rn, pl, sw, st);
++        }
++        if (last) fprintf(stderr, "[pm-sel] 10s runs/polls/switch/stopped:%s\n", b);
++    }
++}
++/* kz3-pm-select end */
++
+ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+                           const uint8_t* pm_host, uint32_t pm_size,
+                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
+@@ -358,8 +455,10 @@
+     unsigned claim_before = g_spu_putllc_sync_hit;
+ 
+     g_kz3_pm_run_t0 = kz3_pm_run_budget_ms() ? kz3_pm_now_ms() : 0;   /* patch 1048 */
++    kz3_pm_select_run_begin();                                        /* patch 1058 */
+     const int pm_halted = spu_run_with_halt(entry, ctx);
+     g_kz3_pm_run_t0 = 0;
++    kz3_pm_select_run_end(ctx, wid);                                  /* patch 1058 */
+     /* A lane's run should only end through exitToKernel. Anything else strands
+      * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
+     if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2337,7 +2337,24 @@
+                       fprintf(stderr, "[spurs-budget] poll #%u %u ms over KZ3_SPURS_RUN_MS: answering switch (#%u)\n",
+                               g_spurs_pm_polls + 1, (unsigned)over, s_bp);
+                   g_spurs_pm_polls++;
+-                  ctx->gpr[3] = spu_make_preferred_u32(1);
++                  /* KZ3 patch 1058: "another workload" = any id but wklCurrentId (it was 1, which is the current
++                   * id of wid 1); the old 1 is kept unless KZ3_PM_SELECT=1. */
++                  { extern uint32_t kz3_pm_select(const uint8_t*, uint32_t, uint32_t, int);
++                    ctx->gpr[3] = spu_make_preferred_u32(kz3_pm_select(ctx->ls, ctx->gpr[0]._u32[0], ctx->gpr[3]._u32[0], 1)); }
++                  ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++                  return;
++              } }
++            /* KZ3 patch 1058 (RE pass 86): the WWS job-manager PM compares this answer with wklCurrentId (LS 0x1DC)
++             * and stops after the job in flight when they differ; the old constant 0 below differed for every
++             * wid != 0, so each job manager ran one job per kernel run. Answer the current id unless the port's
++             * kernel wants the SPU elsewhere (spurs_policy.c kz3_pm_select; only with KZ3_PM_SELECT=1); otherwise falls through
++             * to the old 0 (the call still counts the poll for KZ3_PM_SELECT_TRACE). */
++            { extern uint32_t kz3_pm_select(const uint8_t*, uint32_t, uint32_t, int);
++              extern int kz3_pm_select_old(void);
++              const uint32_t ans = kz3_pm_select(ctx->ls, ctx->gpr[0]._u32[0], ctx->gpr[3]._u32[0], 0);
++              if (!kz3_pm_select_old()) {
++                  ++g_spurs_pm_polls;
++                  ctx->gpr[3] = spu_make_preferred_u32(ans);
+                   ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                   return;
+               } }
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -492,6 +492,45 @@
+     return NULL;
+ }
+ 
++/* KZ3 patch 1058 (SPU pass 40): the port kernel's side of the selectWorkload answer (spurs_policy.c
++ * kz3_pm_select). A running policy module keeps its SPU (the answer is its own wklCurrentId) unless another
++ * workload of the instance is enabled, state 2, not claimed by a kernel thread, and
++ *  - kicked (ready count or signal): it waits for an SPU, as the real kernel's readyCount > contention rule, or
++ *  - every kernel thread of the instance is in a run and this run is past KZ3_PM_QUANTUM_US (default 8000; 0 =
++ *    none): the round-robin passes would otherwise stall behind long runs.
++ * A free kernel thread is not enough to keep running past a kick: an idle thread sleeps between passes, so a
++ * kicked workload (wid 10 LibMP3 next to wid 9) waited up to that sleep (pass 40 probe spu-40n, first variant). 
++ * ASSUMPTION: the real kernel weighs per-SPU priorities (wklInfo) too; the port's kernel threads are
++ * round-robin with no priorities, so any waiting kicked workload counts. kz3-pm-switch begin */
++static int s_kz3_quantum_us = -1;
++static int kz3_spurs_switch_wanted(u32 ea, u32 cur, u64 run_us)
++{
++    struct SpursInst* si = NULL;
++    for (int i = 0; i < MAX_SPURS_INST; i++) if (s_inst[i].ea == ea) { si = &s_inst[i]; break; }
++    if (!si) return 0;
++    const int j = (int)(si - s_inst);
++    int n = si->nthreads < 1 ? 1 : si->nthreads;
++    if (n > KZ3_KT_MAX) n = KZ3_KT_MAX;
++    if (s_kz3_quantum_us < 0) { const char* e = getenv("KZ3_PM_QUANTUM_US"); int q = e ? atoi(e) : 8000; s_kz3_quantum_us = q < 0 ? 0 : q; }
++    int over_q = s_kz3_quantum_us && run_us > (u64)s_kz3_quantum_us;
++    for (int kt = 0; kt < n && over_q; kt++) if (!s_run_t0[j][kt]) over_q = 0;
++    const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
++    const u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;
++    for (u32 w = 0; w < 16; w++) {
++        if (w == cur || !(enabled & (0x80000000u >> w))) continue;
++        if (*(vm_base + ea + SPURS_WKL_STATE1 + w) != 2) continue;
++        if (!s_workloads[w].in_use || s_workloads[w].spurs_ea != ea || s_wkl_busy[w]) continue;
++        if (over_q || *(vm_base + ea + SPURS_WKL_READY1 + w) || (sig & (0x8000u >> w))) return 1;
++    }
++    return 0;
++}
++__attribute__((constructor)) static void kz3_pm_switch_init(void)
++{
++    extern int (*g_kz3_spurs_switch_wanted)(uint32_t, uint32_t, uint64_t);
++    g_kz3_spurs_switch_wanted = kz3_spurs_switch_wanted;
++}
++/* kz3-pm-switch end */
++
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+ /* KZ3 patch 1057 (SPU pass 39): called by the kernel thread when a workload's policy-module run starts (end 0,
+  * after the contention byte is set) and ends (end 1, after it is cleared, all lanes joined); NULL = off. The
+--- /dev/null
++++ b/runtime/spu/spurs_select.h
+@@ -0,0 +1,26 @@
++/* KZ3 patch 1058 (SPU pass 40, RE pass 86 "why the BrB job manager runs one job per PM run"):
++ * the answer of the HLE kernel's selectWorkload intercept (LS 0x9D0, spu_channels.c).
++ *
++ * A policy module asks the kernel "which workload should this SPU run now?" and compares the answer with
++ * wklCurrentId (kernel context LS 0x1DC). The WWS job-manager PM (every KZ3 job manager: BrB audio wid 9,
++ * jm_gfx, physics, post ...) does it in its rate-limited poll 0x2D40 -> wrapper 0x3678 (`ceq r5, cur` at
++ * 0x36C8): a different id means "another workload was selected": the PM stops prefetching (LS 0x12C0 |= 0xFFF0
++ * at 0x1A20) and exits to the kernel once the job in flight is done. The HLE used to answer 0, which differs
++ * from every wid != 0, so every such PM ran exactly one job per kernel run (SPU pass 39 P3).
++ *
++ * The answer now: the current id (keep running) unless the kernel genuinely wants the SPU elsewhere (the run is
++ * over KZ3_SPURS_RUN_MS, patch 1048, or the port's kernel has another kicked workload waiting unclaimed,
++ * or every kernel thread is busy and the run is past KZ3_PM_QUANTUM_US; cellSpurs.c kz3_spurs_switch_wanted), then cur + 1 (mod 16), which is never cur. Off by default: KZ3_PM_SELECT=1 turns it on, KZ3_PM_SELECT_OLD=1 forces
++ * the old answers (0 within budget, 1 over budget) for A/B. Pure, so the host test checks it alone. */
++#ifndef SPURS_SELECT_H
++#define SPURS_SELECT_H
++#include <stdint.h>
++
++static inline uint32_t spurs_pm_select_answer(uint32_t cur_wid, int old_mode, int over_budget, int switch_wanted)
++{
++    if (old_mode) return over_budget ? 1u : 0u;          /* pre-1058: 0 = "continue", 1 = budget switch */
++    if (over_budget || switch_wanted) return (cur_wid + 1u) & 0xFu;
++    return cur_wid;
++}
++
++#endif

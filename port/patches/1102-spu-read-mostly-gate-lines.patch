@@ -1,0 +1,231 @@
+KZ3 patch 1102 (SPU pass 74): the read-mostly SPU dispatch gates in cache lines of their own (PE builds).
+
+Every direct hop, computed-hop guess and lifted function entry reads ~25 runtime flags (spu_hop_ok,
+spu_ib_guess_ok, spu_ls_dbg_armed, the fa/fs/fm and drain fast-path switches). They are written once at start or
+by opt-in diagnostics, but the linker placed them next to counters other SPU threads write all the time: in K2's
+kz3.exe g_spu_stack_reset_n and g_kz3_trace_ctx shared a 64-byte line with g_spu_putllc_count (++ on every PUTLLC
+of every SPU) and g_spu_putllc_sync_hit, g_pm_flow_ctx and g_spu_ib_guess one with g_sn_defer/g_sn_defer_ctx,
+g_spu_launch_diag one with g_kz3_fma_fb[4] (an atomic add per fma fallback vector). The gate helpers were ~11 % of
+the audio synth job's samples (spu_hop_ok 3.8, spu_ib_guess_ok 4.0, spu_ls_dbg_armed 3.0, SPU pass 74 profile),
+with the hottest samples on the loads of those lines, and -mcmodel=small (direct loads instead of .refptr) did not
+change that.
+- spu_context.h: SPU_READ_MOSTLY = section(".data$kz3rm") on PE GCC builds; applied to the header's weak gates
+  (g_spu_ls_probe, g_spu_smc_watch, g_wws_code_probe, g_wws_read_probe) and to the definitions in spu_drain.c,
+  spu_lockstep.c, spu_channels.c and diag/kz3_wait_acct.c (g_kz3_wtrace).
+- spu_channels.c: 64-byte aligned 64-byte fences in .data$kz3rl and .data$kz3rn; ld's PE script sorts .data$* by
+  name, so they bound the group and no other variable shares its lines.
+Same variables and values; layout only. -DSPU_NO_READ_MOSTLY (all runtime TUs) = the old layout for an A/B.
+Upstream candidate (layout of hot read-mostly globals vs. hot counters in the SPU runtime).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): READ_MOSTLY on `g_spu_stack_reset_n` and `g_spu_depth_max`.
+
+diff --git a/runtime/diag/kz3_wait_acct.c b/runtime/diag/kz3_wait_acct.c
+index be97e626..a3eb5ddb 100644
+--- a/runtime/diag/kz3_wait_acct.c
++++ b/runtime/diag/kz3_wait_acct.c
+@@ -16,6 +16,10 @@
+ #endif
+ 
+ int g_kz3_wacct = -1;
++/* KZ3 patch 1102: read by every computed-hop guess (spu_context.h SPU_READ_MOSTLY; this TU does not include it) */
++#if defined(_WIN32) && defined(__GNUC__) && !defined(SPU_NO_READ_MOSTLY)
++__attribute__((section(".data$kz3rm")))
++#endif
+ void (*g_kz3_wtrace)(const char* thr, int kind, uint32_t site, uint64_t t0, uint64_t t1) = 0;   /* patch 1085 */
+ 
+ enum { WA_SLOTS = 1024, WA_THREADS = 96 };
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index f06843d2..312b070d 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -100,7 +100,7 @@ void spu_taskset_line_committed(uint32_t line);
+ /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
+  * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
+ #define SPU_WATCH_MAX 4
+-int g_spu_ls_watch_n = -1;
++int g_spu_ls_watch_n SPU_READ_MOSTLY = -1;   /* KZ3 patch 1102 */
+ /* DMA watch windows set at run time (spu_dma.h, mfc_do_transfer). */
+ volatile uint32_t g_spu_dma_watch_lo[SPU_DMA_WATCH_SLOTS], g_spu_dma_watch_hi[SPU_DMA_WATCH_SLOTS];
+ volatile long g_spu_dma_watch_hits[SPU_DMA_WATCH_SLOTS];
+@@ -1108,7 +1108,7 @@ static int channel_is_mfc(uint32_t ch)
+  * ===========================================================================*/
+ /* KZ3 patch 1013 (diagnostic): a short event trace of one SPU context, armed by the
+  * [spurs-stuck] watcher (cellSpurs.c): indirect branches and channel reads/writes. */
+-void* volatile g_kz3_trace_ctx = 0;
++void* volatile g_kz3_trace_ctx SPU_READ_MOSTLY = 0;   /* KZ3 patch 1102 */
+ volatile long g_kz3_trace_n = 0;
+ static void kz3_trace(spu_context* ctx, const char* what, uint32_t ch, uint32_t v)
+ {
+@@ -2301,11 +2301,18 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+  * writer and are immutable after publication. */
+ static struct { uint32_t entry; int image_id; } s_stack_reset[16];
+ unsigned g_spu_stack_reset_count;
+-volatile unsigned g_spu_stack_reset_n = 0;   /* KZ3 patch 1039: the inline launch check skips the call when 0 */
++volatile unsigned g_spu_stack_reset_n SPU_READ_MOSTLY = 0;   /* KZ3 patch 1039: the inline launch check skips the call when 0 */
+ /* Nonzero at (entry >> 2) & 1023 of every registered entry, so SPU_DIRECT
+  * (spu_context.h) can tell with one load that a transfer needs the drain's
+  * stack-reset check. Collisions only cost a trampoline step. */
+ uint8_t g_spu_stack_reset_hint[1024];
++/* KZ3 patch 1102: the fences around the read-mostly group (.data$kz3rm, spu_context.h SPU_READ_MOSTLY): the PE
++ * linker sorts .data$* by name, so .data$kz3rl comes right before the group and .data$kz3rn right after it; both
++ * are 64-byte aligned and 64 bytes long, so the group's first and last cache lines hold nothing else. */
++#if defined(_WIN32) && defined(__GNUC__) && !defined(SPU_NO_READ_MOSTLY)
++__attribute__((section(".data$kz3rl"), aligned(64), used)) volatile uint8_t g_spu_rm_fence_lo[64] = {1};
++__attribute__((section(".data$kz3rn"), aligned(64), used)) volatile uint8_t g_spu_rm_fence_hi[64] = {1};
++#endif
+ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
+ {
+     /* Registrations have one writer; publish a complete new slot before a
+@@ -2364,10 +2371,10 @@ static int s_task_entry_count = 0;
+ /* KZ3 patch 1097: filters for spu_ib_direct (direct hops): a bit per registered task entry (hashed LS address) and
+  * per taskset policy image id, so a job overlay's computed hop skips the LS read and the table scans. A clear bit
+  * means no match; a set bit runs the scan as before. */
+-uint64_t g_spu_task_entry_bits[16];   /* KZ3 patch 1098: not static (spu_ib_guess_ok, spu_context.h) */
++uint64_t g_spu_task_entry_bits[16] SPU_READ_MOSTLY;   /* KZ3 patch 1098: not static (spu_ib_guess_ok, spu_context.h) */
+ #define SPU_TASK_POL_BITS 1024u
+-uint64_t g_spu_task_pol_bits[SPU_TASK_POL_BITS / 64];
+-int g_spu_task_pol_big;   /* a policy image id >= SPU_TASK_POL_BITS was registered: no filter */
++uint64_t g_spu_task_pol_bits[SPU_TASK_POL_BITS / 64] SPU_READ_MOSTLY;
++int g_spu_task_pol_big SPU_READ_MOSTLY;   /* a policy image id >= SPU_TASK_POL_BITS was registered: no filter */
+ void spu_taskset_register_task_entry(uint32_t entry, int image_id)
+ {
+     if (s_task_entry_count < SPU_TASK_ENTRY_MAX) {
+@@ -2426,8 +2433,8 @@ _Static_assert(SPU_TASKSET_TASK_LO == SPU_IBG_TASKSET_TASK_LO && SPU_TASK_POL_BI
+  * fast path when nothing is marked. kz3-ovl-skip begin */
+ #define KZ3_OVL_SKIP_MAX 512u   /* image ids: ELFs 1..43, policy modules, job modules 200..290 */
+ _Static_assert(KZ3_OVL_SKIP_MAX == 512u, "KZ3 patch 1098: g_spu_ovl_skip's size in spu_context.h");
+-int g_spu_ovl_skip_any = 0;
+-uint8_t g_spu_ovl_skip[KZ3_OVL_SKIP_MAX];   /* KZ3 patch 1098: not static (spu_ib_guess_ok) */
++int g_spu_ovl_skip_any SPU_READ_MOSTLY = 0;
++uint8_t g_spu_ovl_skip[KZ3_OVL_SKIP_MAX] SPU_READ_MOSTLY;   /* KZ3 patch 1098: not static (spu_ib_guess_ok) */
+ #define s_ovl_skip g_spu_ovl_skip   /* 0 off, 1 return at entry, 2 ask the entry hook (patch 1044) */
+ /* KZ3 patch 1044 (SPU pass 31): an entry hook in place of the plain skip. It runs at the same point (the job
+  * manager's call of the module entry; ctx->gpr[3] = the job context, LS[ctx+0x20] = the job's parameters) and
+@@ -3073,7 +3080,7 @@ static int spu_smc_microstep_body(spu_context* ctx)
+ 
+ /* KZ3 patch 1068: KZ3_PMEND_IB=1 also marks every indirect-branch entry in the [pm-end] ring (B:pc, then L:link
+  * register) and the SMC microstep (M:pc entry, F:pc when it gives up). Off by default (one global test). */
+-int g_kz3_pmend_ib = -1;
++int g_kz3_pmend_ib SPU_READ_MOSTLY = -1;   /* KZ3 patch 1102 */
+ /* KZ3 patch 1085: the open WWS job call of this host thread (KZ3_FRAME_TRACE) */
+ extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
+ extern uint64_t kz3_wacct_now(void);
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 51e0e439..a0727fca 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -669,10 +669,25 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
+ #else
+ #  define SPU_GATE __attribute__((weak))
+ #endif
+-SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      */
+-SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
+-SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
+-SPU_GATE int g_wws_read_probe = 0;
++/* KZ3 patch 1102 (SPU pass 74): read-mostly gates in cache lines of their own (PE builds).
++ * Every direct hop, computed-hop guess and lifted function entry reads ~20 runtime flags (spu_hop_ok,
++ * spu_ib_guess_ok, spu_ls_dbg_armed, the drain and fa/fs/fm fast-path switches). They are written once at start or
++ * by opt-in diagnostics, but the linker had placed them next to counters other SPU threads write all the time
++ * (g_spu_stack_reset_n and g_kz3_trace_ctx shared a 64-byte line with g_spu_putllc_count, ++ on every PUTLLC of
++ * every SPU; g_pm_flow_ctx and g_spu_ib_guess with g_sn_defer; g_spu_launch_diag with g_kz3_fma_fb[4]), so the
++ * audio SPU's gate loads missed on lines bouncing between cores. SPU_READ_MOSTLY puts each definition in the PE
++ * section .data$kz3rm; the linker sorts .data$* by name, and spu_channels.c's 64-byte aligned fences in .data$kz3rl
++ * and .data$kz3rn bound the group, so no other variable shares its lines. -DSPU_NO_READ_MOSTLY = the old layout
++ * (A/B; set it for every runtime TU). Not a semantic change: same variables, same values. */
++#if defined(_WIN32) && defined(__GNUC__) && !defined(SPU_NO_READ_MOSTLY)
++#  define SPU_READ_MOSTLY __attribute__((section(".data$kz3rm")))
++#else
++#  define SPU_READ_MOSTLY
++#endif
++SPU_GATE SPU_READ_MOSTLY int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      */
++SPU_GATE SPU_READ_MOSTLY int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
++SPU_GATE SPU_READ_MOSTLY int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
++SPU_GATE SPU_READ_MOSTLY int g_wws_read_probe = 0;
+ #define SPU_WWS_READ_CAP 48   /* KZ3 patch 1100: the WWS probes' print caps (their only effect), see spu_ls_dbg_armed */
+ #define SPU_WWS_CODE_CAP 6
+ SPU_GATE int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 57b13186..7f85440b 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -26,11 +26,11 @@
+ 
+ /* KZ3 patch 1038: A/B switch for the pshufb quadword byte shifts/rotates in spu_helpers.h.
+  * KZ3_SPU_FASTCG=0 keeps the old byte loops (default: the pshufb path). Read once before main. */
+-int g_kz3_spu_slowcg = 0;
++int g_kz3_spu_slowcg SPU_READ_MOSTLY = 0;
+ 
+ /* KZ3 patch 1095 (SPU pass 70): SPU denormal rule on SPU host threads; see spu_fpmode.h. Opt-in: KZ3_SPU_FTZ=1. */
+ #include "spu_fpmode.h"
+-int g_kz3_spu_ftz = -1;
++int g_kz3_spu_ftz SPU_READ_MOSTLY = -1;
+ void spu_host_fp_init(void)
+ {
+     if (g_kz3_spu_ftz < 0) g_kz3_spu_ftz = spu_fpmode_env_on(getenv("KZ3_SPU_FTZ"));
+@@ -38,11 +38,11 @@ void spu_host_fp_init(void)
+ }
+ /* KZ3 patch 1039: KZ3_SPU_FASTCG=N turns on the fast paths of patches <= N (unset: all; 0: none; 1038: only
+  * patch 1038's; any other value starting with a digit is the patch number). */
+-int g_kz3_spu_fastcg_level = 1 << 30;
+-int g_kz3_spu_fastdisp = 1;
+-int g_spu_launch_diag = 0;
++int g_kz3_spu_fastcg_level SPU_READ_MOSTLY = 1 << 30;
++int g_kz3_spu_fastdisp SPU_READ_MOSTLY = 1;
++int g_spu_launch_diag SPU_READ_MOSTLY = 0;
+ int g_kz3_fma_stats = 0;
+-int g_kz3_spu_xr = 1;   /* patch 1071: SPU extended-range lanes (KZ3_SPU_XR=0 = host results, for A/B) */   /* patch 1040: KZ3_SPU_FMASTATS=1 counts the fma fallback lanes by reason */
++int g_kz3_spu_xr SPU_READ_MOSTLY = 1;   /* patch 1071: SPU extended-range lanes (KZ3_SPU_XR=0 = host results, for A/B) */   /* patch 1040: KZ3_SPU_FMASTATS=1 counts the fma fallback lanes by reason */
+ /* Lanes that left patch 1038's inline fma path, by reason: [0] NaN/inf sum, [1] float overflow, [2] float
+  * subnormal result (with FTZ: only the one edge value), [3] rounding midpoint; [4] fallback vectors. Shared by
+  * all SPU host threads (relaxed atomics, slow path only). */
+@@ -74,7 +74,7 @@ void kz3_spu_fma_note(const double s[4], int ftz)
+  * the host call site (return address of the cold function = the lifted function's code) and every exponent-255
+  * operand word. Shared tables, relaxed atomics (opt-in, perturbs the run). A summary every 2^20 lanes. */
+ int g_kz3_xr_stats = 0;
+-int g_kz3_spu_xrq = 1;   /* patch 1089: exponent-255 zero/far/saturated lanes of fa/fs/fm inline (KZ3_SPU_XRQ=0 = all per lane) */
++int g_kz3_spu_xrq SPU_READ_MOSTLY = 1;   /* patch 1089: exponent-255 zero/far/saturated lanes of fa/fs/fm inline (KZ3_SPU_XRQ=0 = all per lane) */
+ #define XRS_SITES 1024
+ #define XRS_WORDS 512
+ static unsigned long long s_xrs_key[32 * 216], s_xrs_lanes, s_xrs_vec;
+@@ -199,7 +199,7 @@ typedef struct spu_irq_frame {
+  * armed/dumped by spu_run_policy_module. */
+ uint32_t          g_pm_flow_buf[8192];
+ volatile unsigned g_pm_flow_n = 0;
+-void* volatile    g_pm_flow_ctx = 0;
++void* volatile    g_pm_flow_ctx SPU_READ_MOSTLY = 0;   /* KZ3 patch 1102 */
+ 
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -632,7 +632,7 @@ void (SPU_ABI *spu_take_interrupt(spu_context* ctx,
+ 
+ /* See the declaration in spu_context.h. */
+ uint32_t g_spu_depth_guard_limit;
+-uint32_t g_spu_depth_max = 0;
++uint32_t g_spu_depth_max SPU_READ_MOSTLY = 0;   /* KZ3 patch 1102 */
+ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
+ {
+     if (!g_spu_depth_guard_limit) {
+@@ -670,8 +670,8 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
+ /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
+ /* KZ3 patch 1096: direct hops (spu_context.h). Decided once: KZ3_SPU_HOP=0 turns them off, and so does every
+  * switch that makes the drain loop or spu_indirect_branch do more than dispatch (their diagnostics need every hop). */
+-int g_spu_hop_on = -1;
+-int g_spu_ib_guess = 0;   /* KZ3 patch 1098 */
++int g_spu_hop_on SPU_READ_MOSTLY = -1;
++int g_spu_ib_guess SPU_READ_MOSTLY = 0;   /* KZ3 patch 1098 */
+ void spu_hop_init(void)
+ {
+     static const char* const diag[] = {"SPU_TAILRET", "SPU_JOBTRACE", "SPU_JOBEXEC", "SPU_POLLTRACE", "SPU_IBCOV",
+diff --git a/runtime/spu/spu_lockstep.c b/runtime/spu/spu_lockstep.c
+index 22f2e29d..cd6d2a46 100644
+--- a/runtime/spu/spu_lockstep.c
++++ b/runtime/spu/spu_lockstep.c
+@@ -59,7 +59,7 @@ static uint64_t ls_now_ns(void)
+ }
+ #endif
+ 
+-volatile int g_yz_lockstep_on = -1;
++volatile int g_yz_lockstep_on SPU_READ_MOSTLY = -1;   /* KZ3 patch 1102 */
+ 
+ #define YZ_LOCKSTEP_MAX_SPUS         32
+ #define YZ_LOCKSTEP_DEFAULT_QUANTUM  65536ull

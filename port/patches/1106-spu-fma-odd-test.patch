@@ -1,0 +1,36 @@
+KZ3 patch 1106 (SPU pass 78): the -mfma fast path of spu__fma4 tests its result in 4 vector ops instead of 7.
+
+Patch 1097's fused path returns the vfmadd result unless a lane is "odd": |r| non-zero below 2^-125 (exponent 0 or
+1) or exponent 255. It built that as and, cmpeq, cmplt, andnot, cmpgt, or, ptest. The same predicate in fewer ops:
+t = |r| + 0x7F000000 (mod 2^32) maps the normal range [0x01000000, 0x7F7FFFFF] to the signed range
+[INT_MIN, -0x01800001] and every non-normal magnitude above it, so cmpgt(t, -0x01800001) marks the non-normal lanes;
+ptest of that mask against |r| itself clears the zero lanes (a zero r is its own result). and, add, cmpgt, ptest.
+Same lanes take the double path, so the results are the same bits: host test tools/spu/test_spu_fmaodd.sh compares
+the new and old spu_fma/spu_fms/spu_fnms (two translation units, -DSPU_FMA_ODD4=0/1) on every 32-bit result word
+(r = a * 1 + 0, all 2^32 words) and on random and edge operands under the MXCSR rounding modes with FTZ/DAZ on and
+off. Compile-time switch: -DSPU_FMA_ODD4=0 (C flags) = old. Upstream candidate (with 1097).
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -803,11 +803,21 @@
+         if (negb) B = _mm_xor_ps(B, sgn);
+         if (negc) C = _mm_xor_ps(C, sgn);
+         const __m128 r4 = _mm_fmadd_ps(A, B, C);
+         const __m128i ab = _mm_and_si128(_mm_castps_si128(r4), _mm_set1_epi32(0x7FFFFFFF));
++#ifndef SPU_FMA_ODD4
++#  define SPU_FMA_ODD4 1
++#endif
++#if SPU_FMA_ODD4   /* KZ3 patch 1106: |r| + 0x7F000000 > -0x01800001 (signed) = not normal; ptest with |r| drops zeros */
++        /* kz3-fmaodd begin */
++        const __m128i nn = _mm_cmpgt_epi32(_mm_add_epi32(ab, _mm_set1_epi32(0x7F000000)), _mm_set1_epi32(-0x01800001));
++        if (__builtin_expect(_mm_testz_si128(nn, ab), 1)) { u128 r; memcpy(&r, &r4, 16); return r; }
++        /* kz3-fmaodd end */
++#else
+         const __m128i odd = _mm_or_si128(
+             _mm_andnot_si128(_mm_cmpeq_epi32(ab, _mm_setzero_si128()), _mm_cmplt_epi32(ab, _mm_set1_epi32(0x01000000))),
+             _mm_cmpgt_epi32(ab, _mm_set1_epi32(0x7F7FFFFF)));
+         if (__builtin_expect(_mm_testz_si128(odd, odd), 1)) { u128 r; memcpy(&r, &r4, 16); return r; }
++#endif
+     }
+ #endif
+     __m128 A0, B0, C0; memcpy(&A0, &a, 16); memcpy(&B0, &b, 16); memcpy(&C0, &c, 16);

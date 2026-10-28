@@ -1,0 +1,48 @@
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1682,13 +1682,33 @@
+  * fast path when nothing is marked. kz3-ovl-skip begin */
+ #define KZ3_OVL_SKIP_MAX 512u   /* image ids: ELFs 1..43, policy modules, job modules 200..290 */
+ int g_spu_ovl_skip_any = 0;
+-static uint8_t s_ovl_skip[KZ3_OVL_SKIP_MAX];
++static uint8_t s_ovl_skip[KZ3_OVL_SKIP_MAX];   /* 0 off, 1 return at entry, 2 ask the entry hook (patch 1044) */
++/* KZ3 patch 1044 (SPU pass 31): an entry hook in place of the plain skip. It runs at the same point (the job
++ * manager's call of the module entry; ctx->gpr[3] = the job context, LS[ctx+0x20] = the job's parameters) and
++ * may edit the local store before the module runs; it returns 1 to skip the module after all, 0 to let it run
++ * (e.g. with a zeroed work count the module takes its own "nothing to do" path and still signals completion,
++ * which a plain skip never does). kz3-ovl-hook */
++typedef int (*spu_overlay_entry_fn)(spu_context* ctx, int image_id, void* user);
++static spu_overlay_entry_fn s_ovl_hook[KZ3_OVL_SKIP_MAX];
++static void* s_ovl_hook_user[KZ3_OVL_SKIP_MAX];
++static void spu_overlay_skip_recount(void)
++{
++    g_spu_ovl_skip_any = 0;
++    for (unsigned i = 0; i < KZ3_OVL_SKIP_MAX; i++) if (s_ovl_skip[i]) g_spu_ovl_skip_any = 1;
++}
+ void spu_overlay_set_skip(int image_id, int on)
+ {
+     if (image_id <= 0 || image_id >= (int)KZ3_OVL_SKIP_MAX) return;
+     s_ovl_skip[image_id] = (uint8_t)(on != 0);
+-    g_spu_ovl_skip_any = 0;
+-    for (unsigned i = 0; i < KZ3_OVL_SKIP_MAX; i++) if (s_ovl_skip[i]) g_spu_ovl_skip_any = 1;
++    spu_overlay_skip_recount();
++}
++void spu_overlay_set_entry_hook(int image_id, spu_overlay_entry_fn fn, void* user)
++{
++    if (image_id <= 0 || image_id >= (int)KZ3_OVL_SKIP_MAX) return;
++    s_ovl_hook[image_id] = fn;
++    s_ovl_hook_user[image_id] = user;
++    s_ovl_skip[image_id] = (uint8_t)(fn ? 2 : 0);
++    spu_overlay_skip_recount();
+ }
+ /* Returns 1 after redirecting ctx->pc to the link register (masked). Call only when g_spu_ovl_skip_any. */
+ int spu_overlay_skip_entry(spu_context* ctx, int img)
+@@ -1698,6 +1718,8 @@
+     if (ctx->image_id != 2 || pc < 0x4000 || pc >= 0x3E000) return 0;
+     uint32_t link = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+     if (link >= 0x4000) return 0;                 /* a call inside the module: not its entry */
++    if (s_ovl_skip[img] == 2 && (!s_ovl_hook[img] || !s_ovl_hook[img](ctx, img, s_ovl_hook_user[img])))
++        return 0;                                 /* patch 1044: the hook edited LS and lets the module run */
+     static unsigned s_n[KZ3_OVL_SKIP_MAX];
+     if (s_n[img]++ < 2)
+         fprintf(stderr, "[spu-ovl-skip] image %d entry pc=0x%05X skipped, returning to link 0x%05X (%u so far)\n",

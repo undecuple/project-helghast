@@ -1,0 +1,106 @@
+KZ3 patch 1114 (SPU pass 98): KZ3_SPU_JOBCOST=IMG:F[,IMG:F...], a measurement probe (default off) that makes every WWS job
+call of job-module image IMG cost F times its own time (the SPU thread spins (F - 1) x the call's duration after it
+returns), on the job bracket of patch 1085 without the frame trace. F 1 = bracket only (the A/B control side).
+Question it answers: how much frame time a job's speed buys, before a rewrite. Notes the RE notes Pass 98.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 2b4c281d..5cd19e48 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -3096,11 +3096,33 @@ int g_kz3_pmend_ib SPU_READ_MOSTLY = -1;   /* KZ3 patch 1102 */
+ extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
+ extern uint64_t kz3_wacct_now(void);
+ extern void kz3_wacct_trace(int, uint32_t, uint64_t, uint64_t);
+-static SPU_THREAD_LOCAL struct { uint64_t t0; uint32_t lr, site; int depth; } t_kz3_jc;
++static SPU_THREAD_LOCAL struct { uint64_t t0, h0; uint32_t lr, site; int depth; } t_kz3_jc;
++/* KZ3 patch 1114 (SPU pass 98): KZ3_SPU_JOBCOST=IMG:F[,IMG:F...] (measurement probe, default off) makes every WWS
++ * job call of job-module image IMG cost F times its own time: after the job returns, its SPU thread spins for
++ * (F - 1) x the call's duration (F 1 = bracket only, the control side of an A/B). Answers "how much frame time does
++ * this job's speed buy" before a rewrite (a slower job moves the frame by about what a faster one would gain back).
++ * Uses the KZ3_FRAME_TRACE job bracket (patch 1085) without the trace; the hops into job code go through the
++ * resolver while it is on (spu_ib_direct), the same on both sides of an A/B. */
++int g_kz3_jobcost SPU_READ_MOSTLY = 0;
++static float s_kz3_jobcost_f[512];
++void kz3_jobcost_init_once(void)
++{
++    const char* e = getenv("KZ3_SPU_JOBCOST");
++    if (!e || !*e) return;
++    for (const char* q = e; *q;) {
++        char* end; const long img = strtol(q, &end, 10);
++        if (end == q || *end != ':') break;
++        const double f = strtod(end + 1, &end);
++        if (img > 0 && img < 512 && f >= 1.0 && f <= 64.0) { s_kz3_jobcost_f[img] = (float)f; g_kz3_jobcost = 1;
++            fprintf(stderr, "[jobcost] image %ld job calls cost x%.2f (KZ3_SPU_JOBCOST, KZ3 patch 1114)\n", img, f); }
++        q = end; if (*q == ',') q++; else break;
++    }
++}
+ void kz3_jobcall_open(spu_context* ctx, uint32_t lr)
+ {
+     const uint32_t jn = ((uint32_t)ctx->ls[0x12E2] << 8) | ctx->ls[0x12E3];
+-    t_kz3_jc.t0 = kz3_wacct_now();
++    t_kz3_jc.t0 = g_kz3_wtrace ? kz3_wacct_now() : 1;
++    t_kz3_jc.h0 = g_kz3_jobcost ? spu_host_ns() : 0;
+     t_kz3_jc.lr = lr;
+     t_kz3_jc.depth = ctx->host_depth;
+     t_kz3_jc.site = jn << 16;   /* the image is known once the overlay matched: taken at the close */
+@@ -3108,8 +3130,14 @@ void kz3_jobcall_open(spu_context* ctx, uint32_t lr)
+ void kz3_jobcall_close(spu_context* ctx, uint32_t pc)
+ {
+     if (!t_kz3_jc.t0 || (pc & SPU_LS_MASK) != t_kz3_jc.lr || ctx->host_depth != t_kz3_jc.depth) return;
+-    kz3_wacct_trace(33 /* KZ3_WT_JOBCALL */, t_kz3_jc.site | (uint32_t)(ctx->resident_ovl & 0xFFFF), t_kz3_jc.t0,
+-                    kz3_wacct_now());
++    const int img = ctx->resident_ovl & 0xFFFF;
++    if (g_kz3_wtrace)
++        kz3_wacct_trace(33 /* KZ3_WT_JOBCALL */, t_kz3_jc.site | (uint32_t)img, t_kz3_jc.t0, kz3_wacct_now());
++    if (g_kz3_jobcost && t_kz3_jc.h0 && img > 0 && img < 512 && s_kz3_jobcost_f[img] > 1.0f) {   /* patch 1114 */
++        const uint64_t h1 = spu_host_ns();
++        const uint64_t until = h1 + (uint64_t)((double)(h1 - t_kz3_jc.h0) * (double)(s_kz3_jobcost_f[img] - 1.0f));
++        while (spu_host_ns() < until) { }
++    }
+     t_kz3_jc.t0 = 0;
+ }
+ 
+@@ -3162,6 +3190,10 @@ spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
+         SPU_HS(13);
+         return NULL;
+     }
++    if (g_kz3_jobcost && ctx->image_id == 2 && t >= 0x4000) {   /* patch 1114: the PM's hop into job code opens a bracket */
++        SPU_HS(13);
++        return NULL;
++    }
+     /* patch 1043/1044 skip or entry hook: acts only on the job manager's call of a marked module's entry
+      * (the same test as spu_overlay_skip_entry before it reads the hook) */
+     if (g_spu_ovl_skip_any && ctx->resident_ovl > 0 && ctx->resident_ovl < (int)KZ3_OVL_SKIP_MAX &&
+@@ -3729,7 +3761,7 @@ SPU_ABI void spu_indirect_branch(spu_context* ctx)
+         /* KZ3 patch 1085: KZ3_FRAME_TRACE times each WWS job call: the jm policy module (image 2) branching from its
+          * own code into the job code buffer (LS[0x1320]) opens a record; it closes when control is back at the
+          * PM's link, here (the job returned normally) or in spu_drain_call_full (it ran on as trampolines). */
+-        if (__builtin_expect(g_kz3_wtrace != 0, 0) && ctx->image_id == 2) {
++        if (__builtin_expect(g_kz3_wtrace != 0 || g_kz3_jobcost, 0) && ctx->image_id == 2) {   /* jobcost: patch 1114 */
+             const uint32_t cb = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16) |
+                                 ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
+             const uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 7f85440b..8ebd86a4 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -686,6 +686,7 @@ void spu_hop_init(void)
+       const int gon = on && !(g && g[0] == '0');
+       if (g_spu_hop_on < 0) fprintf(stderr, "[spu] computed-hop guesses %s (KZ3 patch 1098)\n", gon ? "on" : "off");
+       g_spu_ib_guess = gon ? ((st && st[0] == '1') ? 2 : 1) : 0; }
++    if (g_spu_hop_on < 0) { extern void kz3_jobcost_init_once(void); kz3_jobcost_init_once(); }   /* KZ3 patch 1114 */
+     g_spu_hop_on = on;
+ }
+ 
+@@ -726,7 +727,8 @@ void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
+     spu_drain_call_body(ctx, return_pc);
+     ctx->hop_ret_pc = hop_ret_saved;
+     extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
+-    if (__builtin_expect(g_kz3_wtrace != 0, 0)) {
++    extern int g_kz3_jobcost;   /* KZ3 patch 1114 */
++    if (__builtin_expect(g_kz3_wtrace != 0 || g_kz3_jobcost, 0)) {
+         extern void kz3_jobcall_close(spu_context*, uint32_t);
+         kz3_jobcall_close(ctx, return_pc);
+     }

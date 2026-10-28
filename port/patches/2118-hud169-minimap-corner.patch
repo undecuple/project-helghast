@@ -1,0 +1,143 @@
+KZ3 patch 2118 (rsx rounds 111-112): Botzone corner minimap diagnostics, all env-gated: KZ3_HUD_169_LOG=2 KZ3_HUD_169_LOGF=<frame>|g (g = the LD_SURF_DUMP capture frame) logs every draw of 3 frames (any target, blend state), [h169t] alpha/channel statistics of small A8R8G8B8 textures in that frame (KZ3_H169_TDIR=<dir> dumps their guest bytes), KZ3_HUD_169_DDIR, KZ3_H169_SKIP256.
+
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -6033,6 +6033,14 @@
+                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h)
+ {
+     const int r = ld_blit_gpu(src_loc, src_abs, src_pitch, dst_loc, dst_abs, dst_pitch, w, h);
++    {   /* patch 2118 diagnostics: KZ3_HUD_169_LOG=2 KZ3_HUD_169_LOGF=<frame>: the blits of 3 frames */
++        static int dl = -2; static u32 df = 0;
++        if (dl == -2) { const char* e = getenv("KZ3_HUD_169_LOG"); const char* f = getenv("KZ3_HUD_169_LOGF");
++                        dl = (e && e[0] == '2' && f) ? 1 : 0; df = f ? (u32)atoi(f) : 0; }
++        if (dl > 0 && g_ld_frames >= df && g_ld_frames < df + 3)
++            fprintf(stderr, "[h169b] f=%u src=%u:0x%X/%u dst=%u:0x%X/%u %ux%u -> %d\n", g_ld_frames, src_loc, src_abs,
++                    src_pitch, dst_loc, dst_abs, dst_pitch, w, h, r);
++    }
+     if (s_csv_file && s_csv_gate_open) {
+         fprintf(s_csv_file, "#blit,%u,%u:0x%X/%u,%u:0x%X/%u,%ux%u,gpu=%d\n", g_ld_frames,
+                 src_loc, src_abs, src_pitch, dst_loc, dst_abs, dst_pitch, w, h, r);
+@@ -12899,6 +12907,16 @@
+  * within a frame, so the state at the present is not the one the lights read). */
+ static const char* g_zd_dir;
+ static u32 g_zd_seq;
++/* patch 2118 (RSX pass 112): the diagnostics frame. KZ3_HUD_169_LOGF=<n> a frame number; =g the first frame drawn
++ * with the LD_SURF_DUMP capture on (LD_SURF_DUMP_GATE=<file> fires it when the file appears, so a run can pick the
++ * frame by time instead of by a frame count that varies between runs). */
++static u32 ld_h169_df(void)
++{
++    const char* f = getenv("KZ3_HUD_169_LOGF");
++    if (!f) return 0xFFFFFFF0u;
++    if (f[0] == 'g') { static u32 gf = 0xFFFFFFF0u; if (gf == 0xFFFFFFF0u && g_zd_dir) gf = g_ld_frames; return gf; }
++    return (u32)atoi(f);
++}
+ static void ld_zd_after_draw(void)
+ {
+     if (g_zd_dir) {
+@@ -13350,6 +13368,9 @@
+ static int ld_h169_factors(float* kx, float* ky);   /* after ld_dm_scaling_now */
+ static u32 g_h169_frame = 0xFFFFFFFFu;
+ static int g_h169_depth_seen, g_h169_disp_seen, g_h169_rt_sampled;
++static u32 g_h169_rt_off;
++static char g_h169_tx[256]; static int g_h169_txn;
++static int g_h169_rt256;   /* patch 2118 diagnostics: the draw samples a 256x256 surface */
+ static int ld_h169_is_display(u32 target)
+ {
+     const surface_t* s = &g.surfaces[target];
+@@ -13739,6 +13760,7 @@
+     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
+     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
+     g_h169_rt_sampled = 0;   /* patch 2113 */
++    g_h169_rt256 = 0; g_h169_tx[0] = 0; g_h169_txn = 0;
+     u32 zdepth_used[SRV_TABLE_SIZE], n_zdepth_used = 0;
+     u32 texture_mask = 0;
+     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) slots[u] = SRV_WHITE;
+@@ -13982,6 +14004,31 @@
+                         "zslot=%u self=%d\n", g_ld_frames, rsx_dsp_reg(&g.rsx, 0x1D60), g.surfaces[target].location,
+                         g.surfaces[target].offset, u, t.offset, sampled, zeta_pref, current_zslot, self_zeta_read);
+         }
++        if (((g_ld_fp_units_cur >> u) & 1u) && (t.format & 0x9Fu) == 0x85u && t.width * t.height * 4u <= 0x40000u &&
++            getenv("KZ3_HUD_169_LOG") && getenv("KZ3_HUD_169_LOG")[0] == '2') {   /* A8R8G8B8 alpha byte statistics (big-endian: byte 0) */
++            const u8* gp = (const u8*)guest_ptr(t.location, t.offset, t.width * t.height * 4u);
++            if (gp) {
++                u32 z = 0, f = 0, n = t.width * t.height;
++                for (u32 q = 0; q < n; q++) { if (gp[q * 4u] == 0) z++; else if (gp[q * 4u] == 255) f++; }
++                /* pass 112: in the KZ3_HUD_169_LOGF frame only (the counter used to run out before it), plus channel
++                 * means, the remap, and KZ3_H169_TDIR=<dir>: the raw guest bytes as tex_<offset>_<w>x<h>_f<fmt>.bin */
++                const char* lf = getenv("KZ3_HUD_169_LOGF");
++                static u32 nl; if (lf && g_ld_frames == ld_h169_df() && nl++ < 400) {
++                    double m[4] = {0, 0, 0, 0};
++                    for (u32 q = 0; q < n; q++) for (u32 c = 0; c < 4u; c++) m[c] += gp[q * 4u + c];
++                    fprintf(stderr, "[h169t] f=%u L%u 0x%X %ux%u fmt=%02X remap=%08X ctl0=%08X alpha0=%u alpha255=%u of %u "
++                            "mean b0..b3=%.1f,%.1f,%.1f,%.1f\n", g_ld_frames, t.location, t.offset, t.width, t.height,
++                            t.format, t.remap, t.control0, z, f, n, m[0] / n, m[1] / n, m[2] / n, m[3] / n);
++                    const char* td = getenv("KZ3_H169_TDIR");
++                    if (td) { char path[MAX_PATH * 2];
++                              snprintf(path, sizeof(path), "%s\\tex_%08X_%ux%u_f%02X.bin", td, t.offset, t.width, t.height, t.format);
++                              FILE* tf = fopen(path, "wb"); if (tf) { fwrite(gp, 1, (size_t)n * 4u, tf); fclose(tf); } }
++                }
++            }
++        }
++        if (((g_ld_fp_units_cur >> u) & 1u) && g_h169_txn < 200)   /* patch 2118 diagnostics */
++            g_h169_txn += snprintf(g_h169_tx + g_h169_txn, sizeof g_h169_tx - (size_t)g_h169_txn, " u%u:0x%X/%ux%u f%02X r%04X->%d", u,
++                                   t.offset, t.width, t.height, t.format, t.remap & 0xFFFFu, sampled);
+         if (sampled < 0 && !zeta_pref && g.surfaces[target].location == t.location &&
+             g.surfaces[target].offset == t.offset) {
+             /* Reads its own render target: sample a copy of it. */
+@@ -14008,11 +14055,12 @@
+                             g.surfaces[sampled].offset,
+                             g.surfaces[sampled].w, g.surfaces[sampled].h);
+             }
++            if (((g_ld_fp_units_cur >> u) & 1u) && g.surfaces[sampled].w == 256u && g.surfaces[sampled].h == 256u) g_h169_rt256 = 1;
+             /* patch 2113: a sampled render target of >= 90 % of the draw target's size in both axes */
+             if (((g_ld_fp_units_cur >> u) & 1u) && target < g.n_surfaces &&
+                 g.surfaces[sampled].w * 10u >= g.surfaces[target].w * 9u &&
+                 g.surfaces[sampled].h * 10u >= g.surfaces[target].h * 9u)
+-                g_h169_rt_sampled = 1;
++                { g_h169_rt_sampled = 1; g_h169_rt_off = g.surfaces[sampled].offset; }
+             {   /* a smaller texture reads the surface's top-left samples, texel for sample */
+                 const int sw = surface_window((u32)sampled, &t, alias_dbg);
+                 if (sw >= 0) { slots[u] = (u32)sw; g_ld_bind_surf++; continue; }
+@@ -14271,6 +14319,29 @@
+                 }
+             }
+         }
++        {   /* patch 2118 diagnostics: KZ3_HUD_169_LOG=2 KZ3_HUD_169_LOGF=<frame>: every draw of 3 frames, any target */
++            static int dl = -2; static u32 df = 0;
++            if (dl == -2) { const char* e = getenv("KZ3_HUD_169_LOG"); const char* f = getenv("KZ3_HUD_169_LOGF");
++                            dl = (e && e[0] == '2' && f) ? 1 : 0; df = f ? (u32)atoi(f) : 0; }
++            if (dl > 0 && g_ld_frames == ld_h169_df() && target < g.n_surfaces && ld_h169_is_display(target) && getenv("KZ3_HUD_169_DDIR")) {
++                static u32 di; char path[MAX_PATH * 2];   /* the display target before this draw (read back) */
++                snprintf(path, sizeof(path), "%s\\dd_%03u.ppm", getenv("KZ3_HUD_169_DDIR"), di);
++                fprintf(stderr, "[h169d] dd_%03u prim=%u v=%u sc=%08X/%08X\n", di, prim, n_tri * 3u,
++                        rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL));
++                di++;
++                ld_dump_surface_ppm(path, &g.surfaces[target]);
++            }
++            if (dl > 0 && g_ld_frames >= ld_h169_df() && g_ld_frames < ld_h169_df() + 3 && target < g.n_surfaces)
++                fprintf(stderr, "[h169d] f=%u surf=0x%X %ux%u disp=%d vp=%.0f,%.0f/%.0f,%.0f prim=%u v=%u depth=%u blend=%u "
++                        "rt=%d(0x%X) sc=%08X/%08X bf=%08X/%08X eq=%08X cm=%08X at=%u key=%016llX tx:%s -> %s\n", g_ld_frames, g.surfaces[target].offset, g.surfaces[target].w, g.surfaces[target].h,
++                        ld_h169_is_display(target), vp.scale[0], vp.scale[1], vp.translate[0], vp.translate[1], prim,
++                        n_tri * 3u, rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u, rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u,
++                        g_h169_rt_sampled, g_h169_rt_off, rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL),
++                        rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL), rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR), rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR),
++                        rsx_dsp_reg(&g.rsx, M_BLEND_EQUATION), rsx_dsp_reg(&g.rsx, M_COLOR_MASK), rsx_dsp_reg(&g.rsx, M_ALPHA_TEST_ENABLE) & 1u,
++                        (unsigned long long)live_legacy_pso_key(), g_h169_tx,
++                        h169 ? "squeeze" : "keep");
++        }
+         if (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) g_h169_depth_seen = 1;
+         if (h169) rsx_h169_xf(xf, h_kx, h_ky);
+     }
+@@ -14335,6 +14406,11 @@
+         }
+     }
+     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
++    {   /* patch 2118 diagnostics: KZ3_H169_SKIP256=1 empties the scissor of every draw sampling a 256x256 surface */
++        static int sk = -1;
++        if (sk < 0) { const char* e = getenv("KZ3_H169_SKIP256"); sk = (e && e[0] == '1') ? 1 : 0; }
++        if (sk && g_h169_rt256) { sc.right = sc.left; sc.bottom = sc.top; }
++    }
+     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+     /* Dynamic stencil reference (kept out of the PSO key on purpose); back reference for two-sided. */
+     ld_set_stencil_refs();

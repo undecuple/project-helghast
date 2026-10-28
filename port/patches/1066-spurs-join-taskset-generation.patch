@@ -1,0 +1,183 @@
+KZ3 patch 1066 (SPU pass 49): cellSpursJoinTaskset returned at once, so a taskset re-created at the same address
+right after Shutdown + Join (KZ3's Bink: two tasksets at fixed EAs, re-created at every movie switch) had its old
+task (same taskset EA, same task id) still alive on its host thread next to the new one. Both park in WAIT_SIGNAL on
+the same SIGNALLED bit; the old one could consume the new task's first signal, the new task waited forever and the
+PPU's Bink wait loop (0xCB8424, usleep(400) at lr 0xCB8594) never ended (the intermittent menu-movie stall). The old
+task's exit also cleared the new task's ready/pending/enabled bits and its running mark. Now each task thread
+remembers the taskset generation it started in; Join waits (bounded, KZ3_JOIN_TASKSET_MS, default 1000) for the
+taskset's running, not parked, tasks to finish, then bumps the generation; a parked task of an older generation never
+consumes a signal again and its exit leaves the new tasks' state alone. KZ3_JOIN_TASKSET_OLD=1 = the old behaviour.
+One "[ts-join]" line per join (first 32, then every 64th, and every timeout). Upstream candidate (general).
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream's coherent signal watch + 1066's parked count; 1067's `!cut` on upstream's moved signalled update.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 689fbacc..c084f3d6 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1151,12 +1151,15 @@ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
+ 
+ s32 cellSpursJoinTaskset(CellSpursTaskset* taskset)
+ {
++    const uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
+     if (!taskset)
+         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+ 
+     printf("[cellSpurs] JoinTaskset()\n");
+-    /* In a full implementation, wait for all tasks to complete */
++    /* KZ3 patch 1066: wait (bounded) for the taskset's running tasks, then cut off the parked ones, so a taskset
++     * re-created at the same address does not share task ids with the old tasks (spu_taskset_join_wait). */
++    { extern int spu_taskset_join_wait(uint32_t); spu_taskset_join_wait(taskset_ea); }
+     return CELL_OK;
+ }
+ 
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index aae58d54..72e461e7 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -509,7 +509,9 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
+  * +0x30 enabled (task 0 = MSB of byte 0); task_info[t] at +0x80 + 0x30*t with
+  * the ELF EA at +0x14 and the context save EA at +0x1C. */
+ #define TS_TRACK 8
+-static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
++/* KZ3 patch 1066: gen = the taskset's generation (bumped by cellSpursJoinTaskset), parked = tasks of the current
++ * generation parked in WAIT_SIGNAL. */
++static struct { uint32_t ea; uint8_t running[16]; uint32_t gen; int parked; } s_ts_run[TS_TRACK];
+ static volatile LONG s_ts_lock;
+ static _Thread_local int s_ts_held;   /* this thread holds s_ts_lock */
+ static uint8_t* ts_running(uint32_t taskset_ea)
+@@ -521,6 +523,83 @@ static uint8_t* ts_running(uint32_t taskset_ea)
+ static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
+ static void ts_unlock(void) { InterlockedExchange(&s_ts_lock, 0); }
+ 
++/* KZ3 patch 1066: cellSpursJoinTaskset returned at once, so a game that shuts a taskset down, joins it and creates a
++ * new one at the same address (KZ3's Bink: two tasksets at fixed EAs, re-created at every movie switch) had the old
++ * task (same taskset EA, same task id) still alive on its host thread next to the new one. Both wait in WAIT_SIGNAL
++ * on the same SIGNALLED bit, so the old one could consume the new task's first signal (or a quit signal and the new
++ * movie's signal merged into one latched bit), the new task waited forever and the PPU's Bink wait loop (0xCB8424,
++ * usleep(400) at lr 0xCB8594) never ended: the intermittent menu-movie stall. The old task's exit also cleared the new
++ * task's ready/enabled bits and running mark. Now each task thread remembers the taskset generation it was started
++ * in; Join waits (bounded) for the taskset's running, not parked, tasks to finish, then bumps the generation. A
++ * parked task of an older generation never consumes a signal again (it stays parked: on real SPURS a shut-down
++ * taskset's waiting tasks are never resumed) and its exit, if any, leaves the new tasks' state alone.
++ * KZ3_JOIN_TASKSET_OLD=1 = the old behaviour; KZ3_JOIN_TASKSET_MS = the wait bound (default 1000). */
++static _Thread_local uint32_t t_task_ts, t_task_gen;
++static int ts_join_old(void) { static int v = -1; if (v < 0) { const char* e = getenv("KZ3_JOIN_TASKSET_OLD"); v = (e && *e == '1'); } return v; }
++static int ts_find(uint32_t taskset_ea)
++{
++    for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return i;
++    return -1;
++}
++/* 1 when the calling task thread belongs to an older generation of taskset_ea (call under ts_lock). */
++static int ts_stale_locked(uint32_t taskset_ea)
++{
++    if (ts_join_old() || !taskset_ea || t_task_ts != taskset_ea) return 0;
++    int i = ts_find(taskset_ea);
++    return i >= 0 && s_ts_run[i].gen != t_task_gen;
++}
++static int ts_stale(uint32_t taskset_ea) { ts_lock(); int r = ts_stale_locked(taskset_ea); ts_unlock(); return r; }
++static void ts_parked_add(uint32_t taskset_ea, int d)
++{
++    if (ts_join_old()) return;
++    ts_lock();
++    int i = ts_find(taskset_ea);
++    if (i >= 0 && !ts_stale_locked(taskset_ea)) s_ts_run[i].parked += d;
++    ts_unlock();
++}
++/* The calling host thread runs a task of taskset_ea's current generation (spu_async_run; host tests). */
++void spu_taskset_bind_thread(uint32_t taskset_ea)
++{
++    if (!taskset_ea) return;
++    ts_lock(); int i = ts_find(taskset_ea);
++    t_task_ts = taskset_ea; t_task_gen = i >= 0 ? s_ts_run[i].gen : 0;
++    ts_unlock();
++}
++int spu_taskset_join_wait(uint32_t taskset_ea)
++{
++    if (ts_join_old() || !taskset_ea) return -1;
++    static unsigned max_ms = 0;
++    if (!max_ms) { const char* e = getenv("KZ3_JOIN_TASKSET_MS"); max_ms = e && atoi(e) > 0 ? (unsigned)atoi(e) : 1000u; }
++    unsigned waited = 0; int busy = 0, parked = 0, marks = 0;
++    for (;;) {
++        ts_lock();
++        int i = ts_find(taskset_ea);
++        marks = 0; parked = 0;
++        if (i >= 0) {
++            for (int b = 0; b < 16; b++) marks += __builtin_popcount(s_ts_run[i].running[b]);
++            parked = s_ts_run[i].parked;
++        }
++        busy = marks - parked;
++        if (busy <= 0 || waited >= max_ms) {
++            if (i >= 0) {                       /* new generation: older tasks are cut off */
++                s_ts_run[i].gen++;
++                s_ts_run[i].parked = 0;
++                memset(s_ts_run[i].running, 0, sizeof s_ts_run[i].running);
++            }
++            ts_unlock();
++            break;
++        }
++        ts_unlock();
++        Sleep(1); waited++;
++    }
++    static volatile LONG n;
++    LONG k = InterlockedIncrement(&n);
++    if (k <= 32 || (k % 64) == 0 || busy > 0)
++        fprintf(stderr, "[ts-join] #%ld taskset 0x%08X: waited %u ms, %d running, %d parked task(s) cut off%s\n",
++                (long)k, taskset_ea, waited, busy > 0 ? busy : 0, parked, busy > 0 ? " (TIMEOUT)" : "");
++    return busy > 0 ? busy : 0;
++}
++
+ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
+ {
+     if (!taskset_ea || t >= 128 || s_ts_held) return;   /* held: caller set it */
+@@ -620,6 +699,12 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task, int
+     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+     extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+     extern void spu_coh_notify_write(uint32_t);
++    if (done_task < 128 && ts_stale(taskset_ea)) {   /* KZ3 patch 1066: a cut-off task's exit is not the new task's */
++        static int n; if (n++ < 16)
++            fprintf(stderr, "[ts-join] cut-off task %u of taskset 0x%08X exited (rc %d): bits left alone\n",
++                    done_task, taskset_ea, exit_code);
++        return;
++    }
+     spu_task2_exit_code_set(taskset_ea, done_task, exit_code, 0);   /* KZ3 patch 1022 */
+     ts_lock(); s_ts_held = 1;
+     uint8_t* ts = vm_base + taskset_ea;
+@@ -777,6 +862,7 @@ int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image,
+ static void spu_async_run(spu_async_job* j)
+ {
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
++    spu_taskset_bind_thread(j->taskset_ea);   /* KZ3 patch 1066 */
+     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
+      * back to a fresh per-dispatch LS when disabled / no taskset. */
+     spu_ts_ls_slot* ts_slot = NULL;
+@@ -1576,9 +1662,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     spu_lockline_lock();
+     spu_coh_watch_add(&watch, taskset_ea + CSTS_SIGNALLED, spu_taskset_wake_written, NULL);
+     spu_lockline_unlock();
++    ts_parked_add(taskset_ea, 1);   /* KZ3 patch 1066: JoinTaskset does not wait for parked tasks */
+ #ifdef _WIN32
+     AcquireSRWLockExclusive(&s_sig_lock);
+-    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
++    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId) || ts_stale(taskset_ea)) {   /* 1066 */
+         if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+             static int _n = 0;
+             if (++secs && _n < 16) { _n++;
+@@ -1590,7 +1677,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     ReleaseSRWLockExclusive(&s_sig_lock);
+ #else
+     pthread_mutex_lock(&s_sig_lock);
+-    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
++    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId) || ts_stale(taskset_ea)) {   /* 1066 */
+         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
+         if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+             static int _n = 0;
+@@ -1607,6 +1694,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     spu_lockline_unlock();
+     /* Signals coalesce in the bit, so consuming it outside s_sig_lock loses none. */
+     if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
++    ts_parked_add(taskset_ea, -1);
+     if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
+         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
+                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }

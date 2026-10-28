@@ -1,0 +1,167 @@
+KZ3 patch 2117 (RSX pass 110; ENHANCEMENT, display, with 2094): the controls page picture without the L1 leader
+line while the pad layout gives L1 no on-foot action (Modern = the Shadow Fall layout): the game's own picture with
+the line erased (PS3 set), no L1 line on the drawn PS4/PS5 and Xbox pictures; the state is part of the prompt atlas
+signature so a layout switch re-uploads the picture. main.cpp supplies layout_l1_unused. Notes
+the RE notes Pass 110.
+
+diff -ruN a/libs/video/rsx_keycaps.h b/libs/video/rsx_keycaps.h
+--- a/libs/video/rsx_keycaps.h
++++ b/libs/video/rsx_keycaps.h
+@@ -39,6 +39,9 @@
+      * shows the touchpad); NULL / 0 = DualShock 4. Both appended: older initialisers leave them NULL. */
+     int (*text_mask_thin)(const char* text, int max_px, unsigned char* mask, int w, int h);
+     int (*pad_variant)(void);
++    /* Patch 2117 (RSX pass 110): 1 = the pad layout in use gives L1 no on-foot action (Modern, the Shadow Fall
++     * layout): the controls page's picture leaves out L1's leader line. NULL / 0 = the game's picture. Appended. */
++    int (*layout_l1_unused)(void);
+ } rsx_keycap_source;
+ 
+ static rsx_keycap_source g_kc_src;
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -3217,6 +3217,18 @@
+  * the copy), later draws the new ones, the same as a new resource gave. LD_TEX_INPLACE=0 restores the old path.
+  * Cube, 3D and vertex textures keep the old path. Counted in [tex-hash] as inplace=N. */
+ static ID3D12Resource* g_ld_tex_reuse;
++/* patch 2117 (RSX pass 110): the layout's "L1 unused" state (Modern) is part of every prompt atlas's signature, so
++ * switching the layout on the controls page re-uploads its picture (rsx_pg_patch reads the same callback). Once per
++ * frame. */
++static u32 g_ld_l1_frame = 0xFFFFFFFFu, g_ld_l1_now;
++static u32 ld_kc_l1_sig(u32 frame)
++{
++    if (g_ld_l1_frame != frame) {
++        g_ld_l1_frame = frame;
++        g_ld_l1_now = g_kc_have_src && g_kc_src.layout_l1_unused && g_kc_src.layout_l1_unused() ? 0x2117A5C3u : 0u;
++    }
++    return g_ld_l1_now;
++}
+ /* patch 2039: what the last decode_guest_texture found (prompt atlas kind, signature it drew for) */
+ static int g_ld_kc_kind;
+ static u32 g_ld_kc_sig;
+@@ -5243,14 +5255,15 @@
+ 
+     for (u32 i = ld_tex_index_find(t, remap); i != UINT32_MAX; i = UINT32_MAX) {   /* patch 2033: indexed */
+         texcache_t* entry = &g.textures[i];
+-        if (entry->kc_kind && entry->tex && ld_keycaps_sig_frame(g_ld_frames) != entry->kc_sig) {   /* patch 2039 */
+-            const u32 want = g_ld_kc_sig_now;
++        if (entry->kc_kind && entry->tex &&
++            (ld_keycaps_sig_frame(g_ld_frames) ^ ld_kc_l1_sig(g_ld_frames)) != entry->kc_sig) {   /* patch 2039, 2117 */
++            const u32 want = g_ld_kc_sig_now ^ g_ld_l1_now;
+             g_ld_tex_reuse = ld_tex_inplace_on() ? entry->tex : NULL;
+             g_ld_kc_kind = 0;
+             ID3D12Resource* r = decode_guest_texture_profiled(t, remap);
+             g_ld_tex_reuse = NULL;
+             entry->kc_sig = want;   /* also on failure: no retry storm; the next change retries */
+-            if (r && g_ld_kc_kind) entry->kc_sig = g_ld_kc_sig;
++            if (r && g_ld_kc_kind) entry->kc_sig = g_ld_kc_sig ^ ld_kc_l1_sig(g_ld_frames);
+             if (!g_ld_kc_kind) entry->kc_kind = 0;   /* the bytes there are no longer the atlas */
+             if (r && r != entry->tex) {
+                 ID3D12Resource* old = entry->tex;
+@@ -5327,7 +5340,7 @@
+                     decode_guest_texture_profiled(t, remap);
+                 g_ld_tex_reuse = NULL;
+                 ld_redecode_note(0, t, entry->span, rd_t0 ? rsx_perf_now() - rd_t0 : 0);   /* patch 2045 diagnostic */
+-                if (replacement) { entry->kc_kind = g_ld_kc_kind; entry->kc_sig = g_ld_kc_sig; }   /* patch 2039 */
++                if (replacement) { entry->kc_kind = g_ld_kc_kind; entry->kc_sig = g_ld_kc_sig ^ ld_kc_l1_sig(g_ld_frames); }   /* 2039, 2117 */
+                 if (replacement) entry->raw_argb = g_ld_tex_raw;   /* patch 2046 (constant per format in practice) */
+                 if (replacement && replacement == entry->tex) {
+                     entry->content_hash = hash;   /* same resource, same SRV: nothing to rewrite or retire */
+@@ -5427,7 +5440,7 @@
+     g_ld_tex_reuse = NULL;
+     ld_redecode_note(2, t, replacement.span, nw_t0 ? rsx_perf_now() - nw_t0 : 0);   /* patch 2045 diagnostic: new entries */
+     replacement.kc_kind = g_ld_kc_kind;   /* patch 2039 */
+-    replacement.kc_sig = g_ld_kc_sig;
++    replacement.kc_sig = g_ld_kc_sig ^ ld_kc_l1_sig(g_ld_frames);   /* patch 2117 */
+     replacement.raw_argb = g_ld_tex_raw;   /* patch 2046 */
+     if (replacement.tex) {
+         texcache_t* entry = &g.textures[index];
+diff -ruN a/libs/video/rsx_prompt_glyphs.h b/libs/video/rsx_prompt_glyphs.h
+--- a/libs/video/rsx_prompt_glyphs.h
++++ b/libs/video/rsx_prompt_glyphs.h
+@@ -29,6 +29,7 @@
+ enum { PG_PS3 = 0, PG_PS4 = 1, PG_XBOX = 2, PG_KBM = 3, PG_N_SETS = 4 };
+ #define PG_OPT_PS4_SHARE 1u   /* PS4/PS5 SELECT cell shows SHARE instead of the touchpad */
+ #define PG_OPT_PS5 4u         /* PG_PS4: a DualSense: SELECT = CREATE (a pill with a label) where the DualShock 4 shows the touchpad (patch 2094) */
++#define PG_OPT_NO_L1 8u       /* KC_CTL (patch 2117): L1 has no action under the layout in use: no L1 leader line */
+ #define PG_OPT_KBM_2039 2u    /* PG_KBM: 2039's keycaps as shipped (rsx_keycaps_patch) instead of the matched bodies */
+ 
+ /* ---- where the game draws inside each cell ---------------------------------------------------------------------
+@@ -581,7 +582,58 @@
+     }
+     pc_lead lead[PCL_N];
+     pc_leads(&L, sel_x, sel_y, lead);
+-    for (int i = 0; i < PCL_N; i++) pc_line(img, w, h, lead[i].p, lead[i].n, W);
++    for (int i = 0; i < PCL_N; i++)
++        if (!(i == PCL_L1 && (opts & PG_OPT_NO_L1))) pc_line(img, w, h, lead[i].p, lead[i].n, W);   /* patch 2117 */
++}
++
++/* Patch 2117 (RSX pass 110, ENHANCEMENT, display): the game's own picture (KC_CTL, PS3 set) without L1's leader line,
++ * for a layout that gives L1 no on-foot action (Modern; network pass 39: the line pointed at an empty label). The picture
++ * is white line art in the alpha channel (body ~70, buttons and lines ~200-240). The line runs from (103.5, 23.1) to
++ * (133.0, 33.3) (measured on the game's texture, numbers only); every texel within 1.6 px of it, left of the L1 button's
++ * outline (x <= 132), gets the alpha interpolated down its column between the texels just above and below the line,
++ * which is 0 in the empty ground and continues the body's outline where the line crossed it (x 125-131). Only the
++ * blocks holding such texels are decoded and re-encoded (2039's encoder); the rest of the picture is untouched. */
++static int pg_l1_unused(void)
++{
++    return g_kc_have_src && g_kc_src.layout_l1_unused && g_kc_src.layout_l1_unused();
++}
++static void rsx_pg_ctl_erase_l1(uint8_t* bc3, uint32_t w, uint32_t h)
++{
++    enum { X0 = 100, X1 = 132, Y0 = 16, Y1 = 40 };
++    if (w != KC_CTL_W || h != KC_CTL_H) return;
++    /* the alpha of blocks x 100..135, y 16..43 */
++    uint8_t a[Y1 - Y0 + 4][X1 - X0 + 4], b[Y1 - Y0 + 4][X1 - X0 + 4];
++    int changed[(Y1 + 3) / 4 + 1][X1 / 4 + 1];
++    const uint32_t bw = w / 4, bx0 = X0 / 4, bx1 = X1 / 4, by0 = Y0 / 4, by1 = (Y1 + 3) / 4;
++    uint8_t px[16][4];
++    for (uint32_t by = by0; by <= by1; by++)
++        for (uint32_t bx = bx0; bx <= bx1; bx++) {
++            kc_bc3_decode(bc3 + ((size_t)by * bw + bx) * 16, px);
++            for (int i = 0; i < 16; i++) a[by * 4 + (i >> 2) - Y0][bx * 4 + (i & 3) - X0] = px[i][3];
++        }
++    memcpy(b, a, sizeof b);
++    memset(changed, 0, sizeof changed);
++    for (int x = X0; x <= X1; x++) {
++        int t = -1, u = -1;
++        for (int y = Y0 + 1; y < Y1; y++)
++            if (pc_d_seg((float)x, (float)y, 103.5f, 23.1f, 133.0f, 33.3f) <= 1.6f) { if (t < 0) t = y; u = y; }
++        if (t < 0) continue;
++        const int ya = t - 1, yb = u + 1;
++        for (int y = t; y <= u; y++) {
++            const float f = (float)(y - ya) / (float)(yb - ya);
++            const float v = (float)a[ya - Y0][x - X0] * (1.f - f) + (float)a[yb - Y0][x - X0] * f;
++            b[y - Y0][x - X0] = (uint8_t)(v + 0.5f);
++            changed[y / 4][x / 4] = 1;
++        }
++    }
++    for (uint32_t by = by0; by <= by1; by++)
++        for (uint32_t bx = bx0; bx <= bx1; bx++) {
++            if (!changed[by][bx]) continue;
++            uint8_t* blk = bc3 + ((size_t)by * bw + bx) * 16;
++            kc_bc3_decode(blk, px);
++            for (int i = 0; i < 16; i++) px[i][3] = b[by * 4 + (i >> 2) - Y0][bx * 4 + (i & 3) - X0];
++            kc_bc3_encode(px, blk);
++        }
+ }
+ 
+ /* Write an RGBA cell into the BC3 atlas `out` (w wide): the blocks under the cell are decoded, the cell's texels
+@@ -612,6 +664,17 @@
+                              int* n_cells)
+ {
+     *n_cells = 0;
++    /* patch 2117: under a layout without L1 (Modern) the controls picture leaves out L1's line; the keyboard set keeps
++     * the game's picture (keys are bound to game buttons, L1 included) */
++    if (kind == KC_CTL && set != PG_KBM && pg_l1_unused()) opts |= PG_OPT_NO_L1;
++    if (kind == KC_CTL && set == PG_PS3 && (opts & PG_OPT_NO_L1) && bytes >= w * h) {
++        uint8_t* o = (uint8_t*)malloc(bytes);
++        if (!o) return NULL;
++        memcpy(o, src, bytes);
++        rsx_pg_ctl_erase_l1(o, w, h);
++        *n_cells = 1;
++        return o;
++    }
+     if (kind == KC_NONE || set <= PG_PS3 || set >= PG_N_SETS) return NULL;
+     if (set == PG_PS4 && g_kc_have_src && g_kc_src.pad_variant && g_kc_src.pad_variant() == 1) opts |= PG_OPT_PS5;
+     if (kind == KC_CTL) {   /* the controls page's pad picture: PS4/PS5 and Xbox draw their own, keyboard keeps the game's */

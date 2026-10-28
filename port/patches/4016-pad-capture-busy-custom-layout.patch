@@ -1,0 +1,15 @@
+KZ3 patch 4016 (RSX pass 93): pad_kb_capture_busy (patch 2098, menu mouse off while a port capture owns the input)
+also covers patch 4014's Custom pad layout capture. Applies after 4014 (2098 sits before it in the patch order).
+
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c	2026-10-21 14:00:10.877401108 -0500
++++ b/libs/input/cellPad.c	2026-10-21 14:00:10.888729378 -0500
+@@ -364,7 +364,7 @@
+ {
+     int b;
+     AcquireSRWLockShared(&s_kb_lock);
+-    b = pad_kb_ui_busy(&s_kb_ui);
++    b = pad_kb_ui_busy(&s_kb_ui) || pmu_busy(&s_kb_ui.pm);   /* KZ3 patch 4016: also 4014's Custom layout capture */
+     ReleaseSRWLockShared(&s_kb_lock);
+     return b;
+ }

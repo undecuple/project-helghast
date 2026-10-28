@@ -1,0 +1,126 @@
+KZ3 patch 2077 (RSX pass 73): the VP start slot in the pipeline key; the shipped pipeline template loads by default.
+the RE notes "Pass 73".
+1. The walker keys a pipeline by the VP words, but ld_xlate decompiles with rsx_vp_set_branch_base(vp_start): a
+   branching program's absolute targets become relative to its start slot, so the same words uploaded at two slots
+   give two shaders under one key (the 8-chapter template merge saw 881 such clashes). rsx_vp_key_branch_base folds the
+   start slot into the key for programs with a flow instruction (rsx_vp_has_flow, the decompiler's own leader scan);
+   branch-free keys are unchanged, so pso_keys.bin and template records of branch-free programs stay valid. Stale
+   records of branching programs fail the prewarm's key recompute ("key mismatch") and are never used.
+2. LD_PSO_TEMPLATE unset: <exe dir>\pso-template.bin, else <exe dir>\..\pso-template.bin (the release keeps kz3.exe
+   in build\ and the template in the install root) is prewarmed when it exists. LD_PSO_TEMPLATE=0 turns it off.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): both (branch-bits key from the rebase, then 2077's branch-base key).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 9dcb3e34..6e22555d 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -7809,6 +7809,8 @@ static u64 ld_pso_key_tail(u64 key, const ld_xl_in* xi, int packed_payload, u64*
+      * store them: the prewarm passes 0, so only records made with 0 bits keep their key. */
+     if (rsx_vp_uses_branch_bits(xi->vp_uc, xi->vp_instrs * 16))
+         key = fnv1a(&xi->vp_branch_bits, sizeof(xi->vp_branch_bits), key);
++    /* patch 2077: a branching VP's HLSL depends on the slot it starts at (rsx_vp_set_branch_base in ld_xlate) */
++    key = rsx_vp_key_branch_base(key, xi->vp_uc, xi->vp_instrs * 16u, xi->vp_start);
+     if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
+     if (srgb_out) key = fnv1a(&srgb_out, sizeof(srgb_out), key);   /* patch 2055 */
+     { static int s2a = -1;   /* patch 2057: the SRC2 abs switch changes shader text, so it changes the key */
+@@ -8176,6 +8178,27 @@ static DWORD WINAPI ld_pt_scout(LPVOID arg)
+     return 0;
+ }
+ 
++/* Patch 2077: the template a release ships (installer/pso-template.bin -> pso-template.bin), used when LD_PSO_TEMPLATE
++ * is unset: next to the exe, else one folder up (the release keeps the exe in build\ and the template in the install
++ * root, tools/release/assemble_payload.py TEMPLATE_DEST). NULL when neither file exists. */
++static const char* ld_pt_default_path(char* buf, size_t n)
++{
++    char dir[1024];
++    const DWORD len = GetModuleFileNameA(NULL, dir, (DWORD)sizeof dir);
++    if (len == 0 || len >= sizeof dir) return NULL;
++    char* slash = NULL;
++    for (char* p = dir; *p; p++) if (*p == '\\' || *p == '/') slash = p;
++    if (!slash) return NULL;
++    *slash = 0;
++    static const char* const rel[2] = { "\\pso-template.bin", "\\..\\pso-template.bin" };
++    for (int k = 0; k < 2; k++) {
++        if (snprintf(buf, n, "%s%s", dir, rel[k]) >= (int)n) return NULL;
++        const DWORD a = GetFileAttributesA(buf);
++        if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) return buf;
++    }
++    return NULL;
++}
++
+ /* Init thread, after ld_pl_start (the pipeline library exists by then). */
+ static void ld_pt_start(void)
+ {
+@@ -8188,7 +8211,13 @@ static void ld_pt_start(void)
+         fprintf(stderr, "[pso-template] export on: '%s'\n", g_pt.out_path);
+     }
+     const char* i = getenv("LD_PSO_TEMPLATE");
+-    if (!i || !*i) return;
++    char def[1024];
++    if (i && i[0] == '0' && !i[1]) { fprintf(stderr, "[pso-template] off (LD_PSO_TEMPLATE=0)\n"); return; }
++    if (!i || !*i) {   /* patch 2077: the shipped template is on by default */
++        i = ld_pt_default_path(def, sizeof def);
++        if (!i) return;
++        fprintf(stderr, "[pso-template] default template '%s'\n", i);
++    }
+     if (snprintf(g_pt.in_path, sizeof g_pt.in_path, "%s", i) >= (int)sizeof g_pt.in_path) return;
+     if (!ld_fp_constants_buffered()) { fprintf(stderr, "[pso-template] off: literal fragment constants\n"); return; }
+     if (!g_ld_pl.opened || !g_ld_pl.on) { fprintf(stderr, "[pso-template] off: the PSO preload is off (LD_PSO_PRELOAD=0)\n"); return; }
+diff --git a/libs/video/rsx_vp_decompiler.c b/libs/video/rsx_vp_decompiler.c
+index 5881f518..d3b826d0 100644
+--- a/libs/video/rsx_vp_decompiler.c
++++ b/libs/video/rsx_vp_decompiler.c
+@@ -169,6 +169,29 @@ static u32 vp_branch_target(u32 d0, u32 d2, u32 d3)
+     return t >= s_vp_branch_base ? t - s_vp_branch_base : t;
+ }
+ 
++/* KZ3 patch 2077: the leader scan's walk (vp_decompile_impl), flow only. */
++int rsx_vp_has_flow(const u8* ucode, u32 max_bytes)
++{
++    u32 o = 0; int k = 0;
++    while (o + 16 <= max_bytes && k < RSX_VP_MAX_INSTR) {
++        const u32 e1 = rd_le(ucode + o + 4), e3 = rd_le(ucode + o + 12);
++        if (vp_is_flow((e1 >> 27) & 0x1F)) return 1;
++        k++; o += 16;
++        if (e3 & 1u) break;
++    }
++    return 0;
++}
++
++u64 rsx_vp_key_branch_base(u64 key, const u8* ucode, u32 max_bytes,
++                           u32 start_slot)
++{
++    if (!rsx_vp_has_flow(ucode, max_bytes)) return key;
++    const u32 w[2] = { 0x31534256u /* "VBS1" */, start_slot };
++    const u8* p = (const u8*)w;
++    for (u32 i = 0; i < (u32)sizeof w; i++) { key ^= p[i]; key *= 1099511628211ull; }
++    return key;
++}
++
+ /* Condition-code state for one instruction (D0). The NV40 VP has two CC
+  * registers; a write under cond-test lands only in the components whose
+  * CC component (through the D0 CC swizzle) compares true against zero.
+diff --git a/libs/video/rsx_vp_decompiler.h b/libs/video/rsx_vp_decompiler.h
+index fd014466..55af9ee3 100644
+--- a/libs/video/rsx_vp_decompiler.h
++++ b/libs/video/rsx_vp_decompiler.h
+@@ -62,6 +62,18 @@ void rsx_vp_set_branch_base(u32 start_slot);
+  * program that rsx_vp_uses_branch_bits() must be keyed on them too. */
+ void rsx_vp_set_branch_bits(u32 bits);
+ int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes);
++/* KZ3 patch 2077: 1 when the program (up to its end bit, the same scan the
++ * decompiler makes) holds a flow instruction (BRA BRI CAL CLI RET BRB CLB).
++ * Only such a program's HLSL depends on the branch base. */
++int rsx_vp_has_flow(const u8* ucode, u32 max_bytes);
++
++/* KZ3 patch 2077: folds the start slot into a pipeline key (FNV-1a) when,
++ * and only when, it reaches the HLSL (rsx_vp_has_flow); returns key
++ * unchanged for branch-free programs. Two uploads of the same branching
++ * program at different slots decompile to different block targets, so
++ * they must never share a pipeline. */
++u64 rsx_vp_key_branch_base(u64 key, const u8* ucode, u32 max_bytes,
++                           u32 start_slot);
+ 
+ /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
+  * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).

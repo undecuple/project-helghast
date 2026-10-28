@@ -1,0 +1,232 @@
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+--- a/libs/input/pad_mouse.c
++++ b/libs/input/pad_mouse.c
+@@ -29,6 +29,8 @@
+ #define PM_LOCK()   pthread_mutex_lock(&s_lock)
+ #define PM_UNLOCK() pthread_mutex_unlock(&s_lock)
+ #endif
++static unsigned long long (*s_time_clock)(void);   /* patch 2108: pad_mouse_set_time_clock */
++static int pm_take(double now, int until, unsigned long long cut, int* dx, int* dy);
+ 
+ static float pm_envf(const char* name, float def)
+ {
+@@ -112,18 +114,30 @@
+ void pad_mouse_add(int dx, int dy)
+ {
+     const unsigned f = s_frame_clock();
++    unsigned long long (*clk)(void) = s_time_clock;
++    const unsigned long long tb = clk ? clk() : 0;   /* patch 2108: arrival time */
+     PM_LOCK();
+-    pad_look_acc_add(&s_acc, dx, dy, f);
++    if (clk) pad_look_acc_add_at(&s_acc, dx, dy, f, tb);
++    else pad_look_acc_add(&s_acc, dx, dy, f);
+     PM_UNLOCK();
+ }
+ 
+-int pad_mouse_take(double now, int* dx, int* dy)
++/* Patch 2108: the arrival clock, and the test feed (KZ3_MOUSE_FEED, started by the first take). */
++void pad_mouse_set_time_clock(unsigned long long (*fn)(void)) { s_time_clock = fn; }
++static void pm_feed_start(void);
++
++int pad_mouse_take(double now, int* dx, int* dy) { return pm_take(now, 0, 0, dx, dy); }
++int pad_mouse_take_until(double now, unsigned long long cut, int* dx, int* dy) { return pm_take(now, 1, cut, dx, dy); }
++
++static int pm_take(double now, int until, unsigned long long cut, int* dx, int* dy)
+ {
+     pm_init();
++    pm_feed_start();
+     const unsigned f = s_frame_clock();
+     long long dropped = 0;
+     PM_LOCK();
+-    pad_look_acc_take(&s_acc, f, dx, dy, &dropped);
++    if (until) pad_look_acc_take_until(&s_acc, f, cut, dx, dy, &dropped);
++    else pad_look_acc_take(&s_acc, f, dx, dy, &dropped);
+     PM_UNLOCK();
+     if (dropped) {
+         static unsigned s_ndrop;
+@@ -138,6 +152,61 @@
+     return *dx || *dy;
+ }
+ 
++/* KZ3_MOUSE_FEED (patch 2108, tests): a thread that adds the events' counts at a constant speed per wall time
++ * (pad_mouse.h pad_mouse_feed_owed), so a run measures the look against a steady hand, which KZ3_MOUSE_SCRIPT (a share
++ * per look update) cannot. Starts at the first look take; logs its start and its total. */
++static PadMouseEv s_fev[PAD_MOUSE_SCRIPT_MAX];
++static int        s_nfev = -1;
++int pad_mouse_feed_active(void)
++{
++    if (s_nfev < 0) {
++        int bad = 0;
++        const char* e = getenv("KZ3_MOUSE_FEED");
++        s_nfev = e && *e ? pad_mouse_script_parse(e, s_fev, PAD_MOUSE_SCRIPT_MAX, &bad) : 0;
++        if (e && *e)
++            fprintf(stderr, "[mouse] feed: %d event(s) (counts per second, seconds), %d unreadable\n", s_nfev, bad);
++    }
++    return s_nfev > 0;
++}
++#ifdef _WIN32
++static DWORD WINAPI pm_feed_thread(LPVOID unused)
++{
++    (void)unused;
++    LARGE_INTEGER qf, q0, q;
++    QueryPerformanceFrequency(&qf);
++    QueryPerformanceCounter(&q0);
++    long long sx[PAD_MOUSE_SCRIPT_MAX] = {0}, sy[PAD_MOUSE_SCRIPT_MAX] = {0}, tx = 0, ty = 0;
++    double end = 0.0;
++    for (int i = 0; i < s_nfev; i++) if (s_fev[i].t + s_fev[i].left > end) end = s_fev[i].t + s_fev[i].left;
++    for (;;) {
++        QueryPerformanceCounter(&q);
++        const double el = (double)(q.QuadPart - q0.QuadPart) / (double)qf.QuadPart;
++        int ax = 0, ay = 0;
++        for (int i = 0; i < s_nfev; i++) {
++            const long long ox = pad_mouse_feed_owed(s_fev[i].dx, s_fev[i].t, s_fev[i].left, el);
++            const long long oy = pad_mouse_feed_owed(s_fev[i].dy, s_fev[i].t, s_fev[i].left, el);
++            ax += (int)(ox - sx[i]); ay += (int)(oy - sy[i]);
++            sx[i] = ox; sy[i] = oy;
++        }
++        if (ax || ay) { pad_mouse_add(ax, ay); tx += ax; ty += ay; }
++        if (el > end) break;
++        Sleep(1);
++    }
++    fprintf(stderr, "[mouse] feed done: %lld,%lld counts\n", tx, ty);
++    return 0;
++}
++static void pm_feed_start(void)
++{
++    static volatile LONG s_started;
++    if (s_started || !pad_mouse_feed_active() || InterlockedExchange(&s_started, 1)) return;
++    HANDLE h = CreateThread(NULL, 0, pm_feed_thread, NULL, 0, NULL);
++    if (h) CloseHandle(h);
++    fprintf(stderr, "[mouse] feed started%s\n", h ? "" : ": CreateThread failed");
++}
++#else
++static void pm_feed_start(void) { (void)pad_mouse_feed_active(); }
++#endif
++
+ #ifdef _WIN32
+ /* Patch 2097 (RSX pass 92): cursor hiding and mouse lock by pad_cursor_decide (pad_mouse.h), on the window's thread
+  * only. The cursor is hidden by answering WM_SETCURSOR over the client area with SetCursor(NULL) (no ShowCursor:
+diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+--- a/libs/input/pad_mouse.h
++++ b/libs/input/pad_mouse.h
+@@ -62,6 +62,8 @@
+ #define PAD_MOUSE_USER_SENS_DEF  2.5f
+ #define PAD_MOUSE_SENS_DEFAULT   (PAD_MOUSE_USER_SENS_DEF * PAD_MOUSE_DEG_PER_COUNT * 0.017453292519943295f)
+ #define PAD_LOOK_IDLE_FRAMES     4u       /* frames without a take = no look consumer */
++#define PAD_LOOK_Q               512      /* patch 2108: arrival-time ring entries */
++#define PAD_LOOK_MERGE_TB        79800ull /* patch 2108: adds within 1 ms of the newest entry merge into it */
+ 
+ /* kz3.ini [input] keys -> the switches above (port/kz3/main.cpp copies a key into its variable when that is unset;
+  * the environment wins). */
+@@ -178,6 +180,11 @@
+     unsigned  take_frame;  /* frame of the last take */
+     int       taken;       /* a take has happened */
+     long long dropped;     /* |dx|+|dy| dropped since the last take (stale counts of an idle stretch) */
++    /* patch 2108 (RSX pass 103): when each kept count arrived (guest timebase, 79.8 MHz), oldest first. Adds closer
++     * than PAD_LOOK_MERGE_TB to the newest entry, or into a full ring, merge into the newest (it keeps the later
++     * time). Counts added without a time (pad_look_acc_add) are not in the ring: every take hands them out. */
++    struct { unsigned long long tb; long long dx, dy; } q[PAD_LOOK_Q];
++    int qh, qn;
+ } PadLookAcc;
+ 
+ static inline int pad_look_acc_idle(const PadLookAcc* a, unsigned frame)
+@@ -190,6 +197,7 @@
+     if (pad_look_acc_idle(a, frame) && a->add_frame != frame && (a->dx || a->dy)) {
+         a->dropped += (a->dx < 0 ? -a->dx : a->dx) + (a->dy < 0 ? -a->dy : a->dy);
+         a->dx = a->dy = 0;
++        a->qn = 0;
+     }
+ }
+ static inline void pad_look_acc_add(PadLookAcc* a, int dx, int dy, unsigned frame)
+@@ -210,11 +218,69 @@
+     *dy = (int)y;
+     if (dropped) *dropped = a->dropped;
+     a->dx = a->dy = 0;
++    a->qn = 0;
+     a->dropped = 0;
+     a->take_frame = frame;
+     a->taken = 1;
+ }
+ 
++/* Patch 2108 (RSX pass 103): look counts on the game's clock. KZ3's look update runs once per logic slot (1/15 s of
++ * game time, the RE notes s.6.2), but the slot runs at whatever wall time the frame loop reaches it, so a
++ * take of "everything since the last take" hands each slot a wall-time share that swings with the frame cadence
++ * (RSX pass 102: 0, 1 or 2 presented frames between updates). pad_look_acc_add_at stamps each add with its arrival
++ * time on the guest timebase; pad_look_acc_take_until hands out only the counts that arrived up to `cut` (the host
++ * time the caller maps the simulated slot to) and keeps the later ones for the next update, so equal slots get equal
++ * wall-time windows. Same idle/drop rule as pad_look_acc_take. */
++static inline void pad_look_acc_add_at(PadLookAcc* a, int dx, int dy, unsigned frame, unsigned long long tb)
++{
++    pad_look_acc_add(a, dx, dy, frame);
++    if (!dx && !dy) return;
++    if (a->qn) {
++        const int t = (a->qh + a->qn - 1) % PAD_LOOK_Q;
++        if (a->qn == PAD_LOOK_Q || (tb >= a->q[t].tb && tb - a->q[t].tb < PAD_LOOK_MERGE_TB) || tb < a->q[t].tb) {
++            a->q[t].dx += dx;
++            a->q[t].dy += dy;
++            if (tb > a->q[t].tb) a->q[t].tb = tb;
++            return;
++        }
++    }
++    const int i = (a->qh + a->qn) % PAD_LOOK_Q;
++    a->q[i].tb = tb;
++    a->q[i].dx = dx;
++    a->q[i].dy = dy;
++    a->qn++;
++}
++static inline void pad_look_acc_take_until(PadLookAcc* a, unsigned frame, unsigned long long cut, int* dx, int* dy,
++                                           long long* dropped)
++{
++    pad_look_acc_age(a, frame);
++    while (a->qn && a->q[a->qh].tb <= cut) { a->qh = (a->qh + 1) % PAD_LOOK_Q; a->qn--; }
++    long long kx = 0, ky = 0;   /* still kept: arrived after cut */
++    for (int k = 0; k < a->qn; k++) { kx += a->q[(a->qh + k) % PAD_LOOK_Q].dx; ky += a->q[(a->qh + k) % PAD_LOOK_Q].dy; }
++    long long x = a->dx - kx, y = a->dy - ky;
++    if (x > 0x7FFFFFFF) x = 0x7FFFFFFF; else if (x < -0x7FFFFFFF) x = -0x7FFFFFFF;
++    if (y > 0x7FFFFFFF) y = 0x7FFFFFFF; else if (y < -0x7FFFFFFF) y = -0x7FFFFFFF;
++    *dx = (int)x;
++    *dy = (int)y;
++    if (dropped) *dropped = a->dropped;
++    a->dx = kx;
++    a->dy = ky;
++    a->dropped = 0;
++    a->take_frame = frame;
++    a->taken = 1;
++}
++
++/* KZ3_MOUSE_FEED (tests, patch 2108): "T:CX,CY*D" feeds CX,CY counts per second of wall time for D seconds from T
++ * seconds after the first look take, through pad_mouse_add (so they get arrival times like Raw Input). Several events
++ * add up. pad_mouse_feed_due: the counts event e owes by `el` seconds since the first take (sent = already fed). */
++static inline long long pad_mouse_feed_owed(double rate, double t, double dur, double el)
++{
++    double s = el - t;
++    if (s <= 0.0) return 0;
++    if (s > dur) s = dur;
++    return (long long)(rate * s);
++}
++
+ /* New yaw delta and pitch for one look update. yaw/pitch hold the game's values on entry. ads = the weapon's look
+  * scale (1.0 without a weapon); pitch limits are applied when pmin <= pmax and both are finite (the game's pitch
+  * is already clamped, so only the sum needs it). Returns 1 when anything was added. */
+@@ -267,7 +333,7 @@
+     return d;
+ }
+ 
+-/* KZ3_MOUSE_SCRIPT */
++/* KZ3_MOUSE_SCRIPT (per look update) and KZ3_MOUSE_FEED (patch 2108: counts per second of wall time, same syntax) */
+ typedef struct {
+     double t;
+     int dx, dy;
+@@ -376,6 +442,12 @@
+ /* Patch 2099: the guest frame clock of the accumulator (cellGcm_flip_request_count unless set; host tests). pad_mouse.c
+  * references cellGcm_flip_request_count (cellGcmSys.c): a standalone link (host test) defines a stub, as cellPad.c's tests do. */
+ void pad_mouse_set_frame_clock(unsigned (*fn)(void));
++/* Patch 2108: the arrival clock for pad_mouse_add (main.cpp: the guest timebase ppu_timebase_now); NULL = no times,
++ * every take hands out everything. pad_mouse_take_until: as pad_mouse_take, but only the counts that arrived up to
++ * `cut` (same clock). pad_mouse_feed_active: a KZ3_MOUSE_FEED is set (the hook logs every update then). */
++void pad_mouse_set_time_clock(unsigned long long (*fn)(void));
++int  pad_mouse_take_until(double now, unsigned long long cut, int* dx, int* dy);
++int  pad_mouse_feed_active(void);
+ 
+ #ifdef _WIN32
+ #include <windows.h>

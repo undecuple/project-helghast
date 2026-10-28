@@ -1,0 +1,279 @@
+KZ3 patch 2093: device-resident vertex cache fill without UPLOAD-heap reads, and its profiler (LD_VTX_DEV_PROF=1); pass 88.
+
+Patch 2092's fill built the draw's topology indices in the index ring (an UPLOAD-heap mapping, write-combined) and
+then copied them ring -> staging block: a read of write-combined memory, 4.81 ms/frame for 2.5 MB of fills on K4
+(r88-p1), most of the +3.8 ms that 2092 added to the walker's vertex copy bucket. The indices are now built in a CPU
+scratch (rsx_vd_scratch) and copied to the ring and to the staging block from there (rsx_vd_stage_write), so both
+UPLOAD mappings are only written: fill-stage 4.81 -> 0.08 ms/frame, copy bucket 6.81 -> 2.22 ms/frame (r88-p2). The
+ring gets its indices before any early return of the fill, as before. Output bytes unchanged.
+
+LD_VTX_DEV_PROF=1 (diagnostic, default off): QPC timers around the parts of the cache path (key, evict, valid,
+ring, spans, fill-idx, fill-alloc, fill-malloc, fill-src, fill-stage, fill-queue, fill-drop, idx) in
+`[vtx-dev-prof]` (cumulative ms) and a new-key classification in `[vtx-dev-keys]` (moved = same vertex stream and
+same index bytes under another index offset; new-idx = same stream, new index bytes; reentry = a key seen before;
+fresh = new stream), both printed with `[vtx-dev]` every 256 frames.
+
+Host test: tools/smoke/test_vtx_dev.sh (adds the scratch growth and the staging layout: payload | pad | indices,
+ring and staging indices equal, nothing written outside).
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -10193,6 +10193,25 @@
+                 /* patch 2092 */ inval_content_dyn, dev_hits, dev_hit_bytes, dev_fills, dev_fill_bytes, dev_full,
+                 dev_copy_full, dev_frees, miss_bytes, hit_draw_bytes, all_bytes, all_draws; } g_vc_st;
+ 
++/* Patch 2093: LD_VTX_DEV_PROF=1 times the parts of the cache path ([vtx-dev-prof], QPC ticks, cumulative) and
++ * classifies every new key ([vtx-dev-keys]): same vertex stream and same index bytes seen before under another key
++ * (the index offset moved), same stream with new index bytes, a key seen before (re-entry after eviction), new. */
++enum { VDP_KEY, VDP_EVICT, VDP_VALID, VDP_RING, VDP_SPANS, VDP_FIDX, VDP_FALLOC, VDP_FMALLOC, VDP_FSRC, VDP_FSTAGE,
++       VDP_FQUEUE, VDP_FDROP, VDP_IDX, VDP_N };
++static const char* const g_vdp_name[VDP_N] = { "key", "evict", "valid", "ring", "spans", "fill-idx", "fill-alloc",
++    "fill-malloc", "fill-src", "fill-stage", "fill-queue", "fill-drop", "idx" };
++static long long g_vdp[VDP_N];
++static u64 g_vdp_src_bytes, g_vdp_src_n;
++static int g_vdp_on = -1;
++static int ld_vdp_on(void) { if (g_vdp_on < 0) g_vdp_on = getenv("LD_VTX_DEV_PROF") && getenv("LD_VTX_DEV_PROF")[0] == '1'; return g_vdp_on; }
++#define VDP_T0(name) const long long name = g_vdp_on > 0 ? rsx_perf_now() : 0
++#define VDP_ADD(i, t0) do { if (t0) g_vdp[i] += rsx_perf_now() - (t0); } while (0)
++#define LD_KS_BITS 18u
++static u64* g_ks_full; static u64* g_ks_vs; static u64* g_ks_vi;   /* lossy hash sets (one u64 per slot) */
++static struct { u64 nk, nk_idx, moved, newidx, reentry, fresh, nk_main_idx, nk_idx_cnt, moved_idx_cnt; } g_ks;
++static u32 g_vc_vkn;   /* ld_vc_key: words of the key before the index part */
++static int ld_ks_test_set(u64* t, u64 h) { u64* s = &t[(h ^ (h >> 29)) & ((1u << LD_KS_BITS) - 1u)]; const int hit = *s == h; *s = h; return hit; }
++
+ static void write_topology_indices(u32 prim, u32* indices);
+ static int ld_vc_full(void);   /* pass 49 */
+ 
+@@ -10242,6 +10261,7 @@
+     }
+     k[n++] = dc.n_arr;
+     for (u32 i = 0; i < dc.n_arr; i++) { k[n++] = dc.arr[i].first; k[n++] = dc.arr[i].count; }
++    g_vc_vkn = n;   /* patch 2093 */
+     k[n++] = dc.n_idx;
+     if (dc.n_idx) {
+         rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
+@@ -10304,6 +10324,38 @@
+ static const u8* ld_vc_ptr_cb(void* ctx, const rsx_vd_span* sp) { (void)ctx; return (const u8*)guest_ptr(sp->loc, sp->off, sp->len); }
+ static void ld_vd_free_block(ld_vc_entry* e);   /* patch 2092 */
+ 
++/* Patch 2093: classify a new key (g_vc_key[0..n), full hash h). Diagnostic only (LD_VTX_DEV_PROF=1). */
++static void ld_ks_new_key(u64 h, u32 n)
++{
++    if (!g_ks_full) {
++        g_ks_full = (u64*)calloc(1u << LD_KS_BITS, 8); g_ks_vs = (u64*)calloc(1u << LD_KS_BITS, 8);
++        g_ks_vi = (u64*)calloc(1u << LD_KS_BITS, 8);
++        if (!g_ks_full || !g_ks_vs || !g_ks_vi) { g_vdp_on = 0; return; }
++    }
++    g_ks.nk++;
++    const int re = ld_ks_test_set(g_ks_full, h);
++    if (!dc.n_idx) { if (re) g_ks.reentry++; else g_ks.fresh++; return; }
++    g_ks.nk_idx++;
++    rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
++    const u32 esz = ia.is_u32 ? 4u : 2u;
++    u64 ih = 1469598103934665603ull, cnt = 0;
++    for (u32 i = 0; i < dc.n_idx; i++) {
++        const u8* p = dc.idx[i].count ? guest_ptr(ia.location, ia.offset + dc.idx[i].first * esz, dc.idx[i].count * esz) : NULL;
++        if (p) ih = fnv1a(p, dc.idx[i].count * esz, ih);
++        cnt += dc.idx[i].count;
++    }
++    g_ks.nk_idx_cnt += cnt;
++    if (ia.location == 1u) g_ks.nk_main_idx++;
++    const u64 vh = fnv1a(g_vc_key, g_vc_vkn * 4u, 0x2093ull);
++    const u64 vih = vh ^ (ih * 0x9E3779B97F4A7C15ull);
++    const int vs = ld_ks_test_set(g_ks_vs, vh), vi = ld_ks_test_set(g_ks_vi, vih);
++    if (re) g_ks.reentry++;
++    else if (vi) { g_ks.moved++; g_ks.moved_idx_cnt += cnt; }
++    else if (vs) g_ks.newidx++;
++    else g_ks.fresh++;
++    (void)n;
++}
++
+ static void ld_vc_drop(ld_vc_entry* e)
+ {
+     if (e->dev_len) ld_vd_free_block(e);   /* patch 2092 */
+@@ -10318,6 +10370,8 @@
+ {
+     *slot = NULL;
+     g_vc_st.draws++;
++    if (g_vdp_on < 0) ld_vdp_on();   /* patch 2093 */
++    VDP_T0(k_t0);
+     const u32 n = ld_vc_key(prim, layout);
+     if (!n) return NULL;
+     if (!g_vc) { g_vc = (ld_vc_entry*)calloc(LD_VC_SLOTS, sizeof(ld_vc_entry)); if (!g_vc) return NULL; }
+@@ -10330,6 +10384,8 @@
+     ld_vc_entry* e = LD_VC_SAME(w0) ? w0 : LD_VC_SAME(w1) ? w1 : !w0->state ? w0 : !w1->state ? w1
+                    : ((u32)(g_ld_frames - w0->last) >= (u32)(g_ld_frames - w1->last) ? w0 : w1);
+ #undef LD_VC_SAME
++    VDP_ADD(VDP_KEY, k_t0);
++    VDP_T0(ev_t0);
+     if (e->state && (e->h != h || e->key_n != n || memcmp(e->key, g_vc_key, n * 4u))) {
+         ld_vc_drop(e); free(e->key); memset(e, 0, sizeof(*e)); g_vc_st.evict++;
+     }
+@@ -10338,8 +10394,12 @@
+         e->key = (u32*)malloc(n * 4u);
+         if (!e->key) return NULL;
+         memcpy(e->key, g_vc_key, n * 4u); e->key_n = n; e->h = h; e->state = 1; g_vc_st.seen++;
++        VDP_ADD(VDP_EVICT, ev_t0);
++        if (g_vdp_on > 0) ld_ks_new_key(h, n);   /* patch 2093 */
+         return NULL;   /* filled at the second sight */
+     }
++    VDP_ADD(VDP_EVICT, ev_t0);
++    VDP_T0(va_t0);
+     if (e->state == 2) {
+         int bad = 0;
+         for (u32 i = 0; i < e->n_spans && !bad; i++)
+@@ -10360,6 +10420,7 @@
+                 if (ld_vc_sample(e->spans[i].loc, e->spans[i].off, e->spans[i].len) != e->sh[i]) bad = 1;
+             if (bad) { g_vc_st.inval_sample++; ld_vc_drop(e); }
+         }
++        VDP_ADD(VDP_VALID, va_t0);
+         if (!bad) { g_vc_st.hits++; g_vc_st.hit_verts += e->n_verts; return e; }
+     }
+     if (e->dyn == 3) { g_vc_st.inel_main++; return NULL; }
+@@ -10418,8 +10479,21 @@
+ static int ld_vd_fill(ld_vc_entry* e, u32 prim, const void* vb, u32 vb_bytes, u32 ib_bytes, u32 n_tri, int indexed,
+                       u32* ib_out)
+ {
+-    if (indexed) write_topology_indices(prim, ib_out);
++    /* Patch 2093: the indices are built in CPU memory and copied to the ring and the staging block from there.
++     * 2092 built them in the ring and copied ring -> staging: a read of UPLOAD-heap (write-combined) memory,
++     * 4.8 ms/frame for 2.5 MB on K4 (r88-p1). */
++    VDP_T0(fi_t0);
++    static u32* scratch; static u32 scratch_cap;
++    const u32* ix = NULL;
++    if (indexed) {
++        /* the ring gets its indices here, before any early return (the draw reads them from the ring) */
++        if (rsx_vd_scratch(&scratch, &scratch_cap, ib_bytes)) {
++            write_topology_indices(prim, scratch); ix = scratch; memcpy(ib_out, ix, ib_bytes);
++        } else { write_topology_indices(prim, ib_out); VDP_ADD(VDP_FIDX, fi_t0); return 0; }   /* out of memory */
++    }
++    VDP_ADD(VDP_FIDX, fi_t0);
+     if (!ld_vd_ready()) return 0;
++    VDP_T0(fa_t0);
+     if (g_vd.n_cp + 1u > LD_VD_COPIES) { g_vc_st.dev_copy_full++; return 0; }
+     ld_vc_merge(e);
+     u32 src_bytes = 0;
+@@ -10427,12 +10501,19 @@
+     if (g_vc_bytes + src_bytes > ld_vc_budget()) { g_vc_st.full++; return 0; }
+     if (!indexed) ib_bytes = 0;
+     const u32 vb_r = rsx_vd_round(vb_bytes), len = vb_r + ib_bytes;
++    VDP_T0(fd_t0);
+     ld_vc_drop(e);
++    VDP_ADD(VDP_FDROP, fd_t0);
+     const u32 off = ld_vd_alloc(&g_vd.a, len);
+     if (off == RSX_VD_NONE) { g_vc_st.dev_full++; return 0; }
+     const u32 so = ld_vd_alloc(&g_vd.sa, len);
+     if (so == RSX_VD_NONE) { g_vc_st.dev_full++; ld_vd_release(off, len); return 0; }
++    VDP_ADD(VDP_FALLOC, fa_t0);   /* includes fill-drop */
++    VDP_T0(fm_t0);
+     u8* src = (u8*)malloc((size_t)src_bytes + 1u);
++    VDP_ADD(VDP_FMALLOC, fm_t0);
++    VDP_T0(fs_t0);
++    g_vdp_src_bytes += src_bytes; g_vdp_src_n++;
+     if (!src) { ld_vd_release(off, len); rsx_vd_free_now(&g_vd.sa, so, len); return 0; }
+     u8* c = src;
+     for (u32 i = 0; i < e->n_cmp; i++) {
+@@ -10440,11 +10521,15 @@
+         if (!p) { free(src); ld_vd_release(off, len); rsx_vd_free_now(&g_vd.sa, so, len); return 0; }
+         memcpy(c, p, e->cmp[i].len); c += e->cmp[i].len;
+     }
++    VDP_ADD(VDP_FSRC, fs_t0);
++    VDP_T0(fg_t0);
+     /* the staging block holds payload | pad | indices, one copy; free once the next submit's copy list ran */
+-    memcpy(g_vd.stage_mapped + so, vb, vb_bytes);
+-    if (ib_bytes) memcpy(g_vd.stage_mapped + so + vb_r, ib_out, ib_bytes);
++    rsx_vd_stage_write(g_vd.stage_mapped + so, NULL, vb, vb_bytes, vb_r, ix, ib_bytes);   /* patch 2093 */
++    VDP_ADD(VDP_FSTAGE, fg_t0);
++    VDP_T0(fq_t0);
+     g_vd.cp[g_vd.n_cp].src_off = so; g_vd.cp[g_vd.n_cp].dst_off = off; g_vd.cp[g_vd.n_cp].len = len; g_vd.n_cp++;
+     rsx_vd_free_later(&g_vd.sa, so, len, g.fence_value + 1u);
++    VDP_ADD(VDP_FQUEUE, fq_t0);
+     e->src = src; e->src_bytes = src_bytes; g_vc_bytes += src_bytes;
+     e->data = NULL; e->dev_off = off; e->dev_len = len; e->dev_vb = vb_r;
+     e->vb_bytes = vb_bytes; e->ib_bytes = ib_bytes; e->n_tri = n_tri; e->indexed = (u8)indexed;
+@@ -10459,7 +10544,9 @@
+                               u32 n_tri, int indexed, u32* ib_out)
+ {
+     if (!verify) {   /* classify first: a draw that cannot be cached costs no copy */
++        VDP_T0(sp_t0);
+         const int sp = ld_vc_spans(e);
++        VDP_ADD(VDP_SPANS, sp_t0);
+         if (sp <= 0) {
+             if (sp < 0) { g_vc_st.inel_main_verts += dc.n_verts; e->dyn = 3; }
+             else { g_vc_st.nostore++; g_vc_st.inel_other_verts += dc.n_verts; }
+@@ -10552,6 +10639,21 @@
+             (unsigned long long)g_vc_st.inval_content_dyn, (unsigned long long)g_vc_st.dev_full,
+             (unsigned long long)g_vc_st.dev_copy_full, (double)g_vd.a.used / 1048576.0, g_vd.a.n_pd,
+             (double)g_vd.sa.used / 1048576.0, g_vd.a.n_fr);
++    if (g_vdp_on > 0) {   /* patch 2093 */
++        static double ms_per_tick = 0.0;
++        if (ms_per_tick == 0.0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); ms_per_tick = 1000.0 / (double)f.QuadPart; }
++        char b[640]; int o = 0;
++        for (int i = 0; i < VDP_N && o < (int)sizeof b - 48; i++)
++            o += snprintf(b + o, sizeof b - (size_t)o, " %s=%.1f", g_vdp_name[i], (double)g_vdp[i] * ms_per_tick);
++        fprintf(stderr, "[vtx-dev-prof] frame=%u ms%s src-n=%llu src-bytes=%.1fMB\n", g_ld_frames, b,
++                (unsigned long long)g_vdp_src_n, (double)g_vdp_src_bytes / 1048576.0);
++        fprintf(stderr, "[vtx-dev-keys] frame=%u new=%llu indexed=%llu moved=%llu new-idx=%llu reentry=%llu fresh=%llu "
++                        "idx-main=%llu idx-count=%llu moved-idx-count=%llu\n", g_ld_frames,
++                (unsigned long long)g_ks.nk, (unsigned long long)g_ks.nk_idx, (unsigned long long)g_ks.moved,
++                (unsigned long long)g_ks.newidx, (unsigned long long)g_ks.reentry, (unsigned long long)g_ks.fresh,
++                (unsigned long long)g_ks.nk_main_idx, (unsigned long long)g_ks.nk_idx_cnt,
++                (unsigned long long)g_ks.moved_idx_cnt);
++    }
+ }
+ 
+ static const float* dc_vertex_attr(
+@@ -13038,10 +13140,12 @@
+     if (vc_fill && !vc_hit) g_vc_st.miss_bytes += draw_vb_bytes + draw_ib_bytes;   /* patch 2092 */
+     if (vc_hit) g_vc_st.hit_draw_bytes += draw_vb_bytes + draw_ib_bytes;
+     g_vc_st.all_bytes += draw_vb_bytes + draw_ib_bytes; g_vc_st.all_draws++;
++    VDP_T0(rg_t0);   /* patch 2093 */
+     if (draw_payload_bytes && !vd_hit)
+         memcpy(
+             g.vb_mapped + g.vb_used, vertex_data,
+             (size_t)draw_payload_bytes);
++    VDP_ADD(VDP_RING, rg_t0);
+     u32 vg_block_off = 0;   /* patch 2076: from g.vb_used */
+     if (dc.vg) {
+         vg_block_off = (u32)((((u64)g.vb_used + draw_payload_bytes + 255u) & ~(u64)255u) - g.vb_used);
+@@ -13055,9 +13159,12 @@
+     } else if (vc_fill && dc.fetch_ok)
+         ld_vc_after_fetch(vc_fill, vc_verify, prim, vertex_data, (u32)draw_vb_bytes, (u32)draw_ib_bytes, n_tri,
+                           indexed, (u32*)((u8*)g.ib_mapped + g.ib_used));
+-    else if (indexed)
++    else if (indexed) {
++        VDP_T0(ix_t0);   /* patch 2093 */
+         write_topology_indices(
+             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
++        VDP_ADD(VDP_IDX, ix_t0);
++    }
+     LDW_ADD(RSX_PERF_W_VTX_T, vcopy_t0);
+     LDW_ADD(RSX_PERF_W_VTX_COPY_T, vcopy_t0);   /* patch 2033 */
+ 
+--- a/libs/video/rsx_vtx_dev.h
++++ b/libs/video/rsx_vtx_dev.h
+@@ -146,4 +146,24 @@
+     return RSX_VD_HIT;
+ }
+ 
++/* Patch 2093: a fill's bytes come only from CPU memory. *buf, *cap = a scratch for the draw's u32 indices, grown to
++ * `bytes` (1 = ready). The topology indices are built there, then copied to the index ring and the staging block:
++ * both are UPLOAD-heap mappings (write-combined), which are written but never read (2092 copied ring -> staging,
++ * 4.8 ms/frame for 2.5 MB on K4). Staging block layout: payload | pad to vb_r | indices; ring_ib (optional) gets
++ * the indices too. */
++static inline int rsx_vd_scratch(uint32_t** buf, uint32_t* cap, uint32_t bytes)
++{
++    if (*cap >= bytes) return 1;
++    uint32_t* n = (uint32_t*)realloc(*buf, bytes);
++    if (!n) return 0;
++    *buf = n; *cap = bytes;
++    return 1;
++}
++static inline void rsx_vd_stage_write(uint8_t* stage, uint8_t* ring_ib, const void* vb, uint32_t vb_bytes, uint32_t vb_r,
++                                      const uint32_t* ix, uint32_t ib_bytes)
++{
++    memcpy(stage, vb, vb_bytes);
++    if (ib_bytes) { memcpy(stage + vb_r, ix, ib_bytes); if (ring_ib) memcpy(ring_ib, ix, ib_bytes); }
++}
++
+ #endif /* RSX_VTX_DEV_H */

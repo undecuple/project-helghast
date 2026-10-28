@@ -1,0 +1,35 @@
+KZ3 patch 1126 (SPU pass 106): upstream ps3recomp PR #489 by erikomis (MIT, head b3a75d98), "each host thread runs
+HLE-to-guest callbacks on a stack of its own", ported onto KZ3's ppu_loader patches (1009, 1020, 1080, 1116, ...).
+
+ppu_guest_call / ppu_guest_call_ct started every callback at the fixed EA 0xCFFE0000 on every host thread (the
+PPU_THREAD_LOCAL held one constant), so callbacks delivered at the same time from two host threads (KZ3: GCM
+vblank/flip from the ticker, others from the main and decoder threads) and a callback nested in another wrote over
+each other's frames; 0xCFFE0000 also lies below the stack region, in the RSX local window cellGcmSys reports
+(0xC0000000). Now the top 16 MB of the stack region (VM_CB_STACK_BASE = 0xDF000000) is 64 slots of 256 KB, one per
+host thread on its first callback (more than 64: the last slot is shared, logged once per thread as
+"[ppu] guest_call: more than 64 host threads ... SHARED"); a nested callback starts 0x400 below the outer one's sp.
+vm_stack_allocate stops at VM_CB_STACK_BASE (240 MB left for guest thread stacks: KZ3's 53 threads take ~1.7 MB in a
+K4 run, spu-r105c-a1's sys_ppu_thread_create stack= sizes; bump allocator). KZ3's main stack is at 0x0FF00000 (port
+main.cpp STACK_TOP), outside the region. ASSUMPTION: no guest fiber switch happens inside a callback on one host
+thread (a second fiber's callback would start at the slot top again, as all callbacks did before).
+Also: patch 1020's g_pt_val read in vm_read32 moves inside its #ifdef _WIN32 (the variable is Windows-only), so the
+POSIX host tests that build the real ppu_loader.cpp compile; no change on Windows.
+Test: the PR's runtime/ppu/tests/test_ppu_guest_call_stack.cpp + tools/test_ppu_guest_call_stack.py (5 checks), via
+tools/spu/test_r106_guest_call_stack.sh.
+
+Rebased on ps3recomp v0.18.0 (SPU pass 108): shrinks to 1020's `g_pt_val` read under `_WIN32` (callback stacks = upstream #489).
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index dec8ce9f..0b14320a 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1873,8 +1873,8 @@ uint32_t vm_read32(uint64_t a) { VM_RD_FAST(a, uint32_t, 4, __builtin_bswap32);
+         if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
+         if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
++#ifdef _WIN32   /* patch 1126: g_pt_val is Windows-only (patch 1020); POSIX host tests build this file */
+     if (g_pt_val >= 0) { g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v); }
+-#ifdef _WIN32
+     /* PT report: the hunted truncated value is being READ BACK from a slot we saw
+      * get truncated and never restored -> this read (about to free it) is the bug's
+      * consumption; print the ORIGINAL truncating writer we recorded. */

@@ -1,0 +1,103 @@
+KZ3 patch 1089 (SPU pass 67): the common exponent-255 lanes of fa/fs/fm (patches 1071/1079) resolved inline inside
+the unlikely branch, without the call to spu__xr_fixv: an exponent-0 operand (fm -> +0, fa/fs -> the other word),
+fm products >= 2^129 (biased exponents summing to >= 383 -> sign | Smax), fa/fs operands more than 28 exponents apart
+(the larger word, minus one unit when the signs differ, +0 at exponent 0). These are the K4 probe's top cases (0 *
+frest(0), Smax + x, Smax * Smax, 0 - 0xFFFFFFFF). Other lanes still go to spu__xr_fixv; the hot path is unchanged.
+Bit-identical to the 1071 lane forms (tools/spu/test_spu_xr.c check_1089). KZ3_SPU_XRQ=0 keeps the old path.
+
+--- a/runtime/spu/spu_drain.c	2026-10-14 13:46:19.341414411 -0500
++++ b/runtime/spu/spu_drain.c	2026-10-14 13:50:00.058728811 -0500
+@@ -50,6 +50,7 @@
+  * the host call site (return address of the cold function = the lifted function's code) and every exponent-255
+  * operand word. Shared tables, relaxed atomics (opt-in, perturbs the run). A summary every 2^20 lanes. */
+ int g_kz3_xr_stats = 0;
++int g_kz3_spu_xrq = 1;   /* patch 1089: exponent-255 zero/far/saturated lanes of fa/fs/fm inline (KZ3_SPU_XRQ=0 = all per lane) */
+ #define XRS_SITES 1024
+ #define XRS_WORDS 512
+ static unsigned long long s_xrs_key[32 * 216], s_xrs_lanes, s_xrs_vec;
+@@ -133,6 +134,7 @@
+ __attribute__((constructor)) static void kz3_spu_fastcg_init(void)
+ {
+     g_kz3_xr_stats = getenv("KZ3_SPU_XRSTATS") && *getenv("KZ3_SPU_XRSTATS") == '1';   /* patch 1088 */
++    g_kz3_spu_xrq = !(getenv("KZ3_SPU_XRQ") && *getenv("KZ3_SPU_XRQ") == '0');   /* patch 1089 */
+     const char* e = getenv("KZ3_SPU_FASTCG");
+     if (e && *e >= '0' && *e <= '9') g_kz3_spu_fastcg_level = atoi(e);
+     if (e && *e == '1' && !e[1]) g_kz3_spu_fastcg_level = 1 << 30;   /* "1" = on (round-27 runs used 0/1) */
+--- a/runtime/spu/spu_helpers.h	2026-10-14 13:46:19.337414321 -0500
++++ b/runtime/spu/spu_helpers.h	2026-10-14 13:52:16.828632801 -0500
+@@ -311,6 +311,55 @@
+ #  define SPU_XR_RET(m, r, a, b, op, imm) do { const unsigned _xm = (m); \
+     if (__builtin_expect(_xm != 0, 0)) return spu__xr_fix(r, a, b, _xm, op, imm); return r; } while (0)
+ #endif
++/* KZ3 patch 1089 (SPU pass 67): the common exponent-255 lanes of fa/fs/fm without the call. The K4 probe (patch 1088,
++ * ~5 M vectors per second) found them nearly all of three kinds: a zero operand (0 * frest(0) = 0 * 0x7FFFFC00, and
++ * 0 - 0xFFFFFFFF), Smax (0x7FFFFFFF) plus a normal value, and Smax * Smax. Inside the unlikely branch (the hot path is
++ * unchanged), the lanes of m that are one of these get their exact value from a few integer SSE operations, and only
++ * the lanes left go to spu__xr_fixv:
++ * - fm: an exponent-0 operand -> +0; biased exponents summing to >= 383 (product >= 2^129) -> sign | Smax;
++ * - fa/fs (fs: b with its sign flipped, as spu__fa_lane): an exponent-0 operand -> the other word (+0 if both);
++ *   exponents more than 28 apart -> the larger word, minus one unit in its last place when the signs differ (the sum
++ *   truncated towards zero: the smaller operand is under 1/32 unit), +0 if that leaves exponent 0.
++ * Same values as spu__fa_lane / spu__fm_lane (tools/spu/test_spu_xr.c check_1089 compares both on 112 M lanes);
++ * KZ3_SPU_XRQ=0 sends every lane to spu__xr_fixv as before. */
++#if defined(__SSE4_1__)
++#include <smmintrin.h>
++extern int g_kz3_spu_xrq;
++static inline __attribute__((always_inline)) __m128 spu__xrq(__m128 r, __m128 a, __m128 b, unsigned* m, int op) {
++    const __m128i E = _mm_set1_epi32(0x7F800000), Z = _mm_setzero_si128(), S = _mm_set1_epi32((int)0x80000000u);
++    const __m128i x = _mm_castps_si128(a);
++    __m128i y = _mm_castps_si128(b), v, done;
++    if (op == SPU_XR_FS) y = _mm_xor_si128(y, S);
++    const __m128i ex = _mm_and_si128(x, E), ey = _mm_and_si128(y, E);
++    const __m128i zx = _mm_cmpeq_epi32(ex, Z), zy = _mm_cmpeq_epi32(ey, Z);
++    if (op == SPU_XR_FM) {
++        const __m128i z = _mm_or_si128(zx, zy);
++        const __m128i sat = _mm_cmpgt_epi32(_mm_add_epi32(_mm_srli_epi32(ex, 23), _mm_srli_epi32(ey, 23)), _mm_set1_epi32(382));
++        v = _mm_andnot_si128(z, _mm_or_si128(_mm_and_si128(_mm_xor_si128(x, y), S), _mm_set1_epi32(0x7FFFFFFF)));
++        done = _mm_or_si128(z, sat);
++    } else {
++        const __m128i M = _mm_set1_epi32(0x7FFFFFFF);
++        const __m128i d = _mm_abs_epi32(_mm_sub_epi32(_mm_srli_epi32(ex, 23), _mm_srli_epi32(ey, 23)));
++        __m128i fr = _mm_add_epi32(_mm_blendv_epi8(y, x, _mm_cmpgt_epi32(_mm_and_si128(x, M), _mm_and_si128(y, M))),
++                                    _mm_srai_epi32(_mm_xor_si128(x, y), 31));
++        fr = _mm_andnot_si128(_mm_cmpeq_epi32(_mm_and_si128(fr, E), Z), fr);
++        v = _mm_blendv_epi8(fr, _mm_andnot_si128(zy, y), zx);
++        v = _mm_blendv_epi8(v, x, _mm_andnot_si128(zx, zy));
++        done = _mm_or_si128(_mm_or_si128(zx, zy), _mm_cmpgt_epi32(d, _mm_set1_epi32(28)));
++    }
++    const __m128i bit = _mm_setr_epi32(1, 2, 4, 8);
++    done = _mm_and_si128(done, _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32((int)*m), bit), bit));
++    *m &= ~(unsigned)_mm_movemask_ps(_mm_castsi128_ps(done));
++    return _mm_castsi128_ps(_mm_blendv_epi8(_mm_castps_si128(r), v, done));
++}
++#  define SPU_XR_RET_Q(m, r, a, b, op) do { unsigned _xm = (m); \
++    if (__builtin_expect(_xm != 0, 0)) { __m128 _xr, _xa, _xb; memcpy(&_xr, &(r), 16); memcpy(&_xa, &(a), 16); \
++        memcpy(&_xb, &(b), 16); if (g_kz3_spu_xrq && g_kz3_spu_xr) _xr = spu__xrq(_xr, _xa, _xb, &_xm, op); \
++        if (_xm) _xr = spu__xr_fixv(_xr, _xa, _xb, _xm, op, 0); memcpy(&(r), &_xr, 16); } \
++    return r; } while (0)
++#else
++#  define SPU_XR_RET_Q(m, r, a, b, op) SPU_XR_RET(m, r, a, b, op, 0)
++#endif
+ 
+ /* FI decodes the base and step fields produced by the hardware estimate
+  * instructions; its second operand is not an ordinary reciprocal float. */
+@@ -547,8 +596,8 @@
+ #else
+ #  define SPU__F2(r, a, b, ps, sc) for (int i = 0; i < 4; i++) (r)._f32[i] = sc
+ #endif
+-SPU_HOT u128 spu_fa(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_add_ps, a._f32[i] + b._f32[i]); SPU_XR_RET(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FA, 0); }
+-SPU_HOT u128 spu_fs(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_sub_ps, a._f32[i] - b._f32[i]); SPU_XR_RET(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FS, 0); }
++SPU_HOT u128 spu_fa(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_add_ps, a._f32[i] + b._f32[i]); SPU_XR_RET_Q(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FA); }
++SPU_HOT u128 spu_fs(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_sub_ps, a._f32[i] - b._f32[i]); SPU_XR_RET_Q(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FS); }
+ 
+ /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
+  * The canonical immediates 173 and 155 are identity conversions. */
+@@ -565,7 +614,7 @@
+ SPU_HOT u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f);
+     SPU_XR_RET(spu__xr_mask(r), r, a, a, SPU_XR_CUFLT, i8); }
+-SPU_HOT u128 spu_fm(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_mul_ps, a._f32[i] * b._f32[i]); SPU_XR_RET(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FM, 0); }   /* patch 1079 */
++SPU_HOT u128 spu_fm(u128 a, u128 b) { u128 r; SPU__F2(r, a, b, _mm_mul_ps, a._f32[i] * b._f32[i]); SPU_XR_RET_Q(spu__xr_mask3(a, b, r), r, a, b, SPU_XR_FM); }   /* patch 1079 */
+ /* KZ3 patch 1035: fused multiply-add without the libm call. Without -mfma, fmaf is MinGW's software
+  * routine (with frexp/ldexp inside; ~3 % of the level's SPURS samples in SPU pass 21). The product of two
+  * floats is exact in double, so s = a*b + c has one double rounding; rounding s to float then equals the

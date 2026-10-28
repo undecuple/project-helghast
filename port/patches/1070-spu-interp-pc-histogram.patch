@@ -1,0 +1,30 @@
+KZ3 patch 1070 (SPU pass 55): the SPU interpreter can count how often each pc of one run executes. A thread-local
+array (g_spu_interp_pc_hist, _lo, _n), NULL = off, so nothing changes unless a caller sets it around a run.
+KZ3_TS_INTERP=1 (port/spu/kz3_ts_interp.c) uses it to see which branches the Gfx.TextureStreaming job takes.
+Diagnostic only; not an upstream candidate on its own.
+
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -331,6 +331,11 @@
+ }
+ 
+ uint32_t g_spu_interp_last_pc = 0;
++/* KZ3 patch 1070 (SPU pass 55): per-pc execution counts of one interpreted run, for the calling thread only.
++ * A caller sets g_spu_interp_pc_hist to an array of _n counters for pcs _lo.._lo+4*_n, runs the interpreter and
++ * clears it again (KZ3_TS_INTERP=1 uses it to see which branches the TextureStreaming job takes). NULL = off. */
++_Thread_local uint32_t* g_spu_interp_pc_hist = 0;
++_Thread_local uint32_t g_spu_interp_pc_hist_lo = 0, g_spu_interp_pc_hist_n = 0;
+ uint64_t g_spu_interp_steps   = 0;
+ 
+ /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
+@@ -478,6 +483,10 @@
+         if (plo) { if (ctx->pc < *plo) *plo = ctx->pc; if (ctx->pc > *phi) *phi = ctx->pc; if (nsteps) *nsteps = steps; }
+         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_interp_rejoin_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+         g_spu_interp_last_pc = ctx->pc;
++        if (g_spu_interp_pc_hist) {   /* KZ3 patch 1070 */
++            const uint32_t o = (ctx->pc - g_spu_interp_pc_hist_lo) >> 2;
++            if (o < g_spu_interp_pc_hist_n) g_spu_interp_pc_hist[o]++;
++        }
+         if (_g1>0) {
+             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
+             if (inr) { _g1in = 1; }

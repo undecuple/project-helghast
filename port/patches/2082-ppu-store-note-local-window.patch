@@ -1,0 +1,275 @@
+KZ3 patch 2082: recompiled PPU stores into the RSX local window mark the texture page bitmap.
+
+Pass 75's LD_TEX_WATCH run (work/proton/r75-chk) named the writer of the location-0 texture misses: vm_write64 on a
+PPU thread storing into the 0x0FFxxxxx mip spans, which noted nothing (SPU puts, fs reads, NV0039/NV3089/NV308A and
+write-backs do). Every PPU store now tests one byte per 64 KiB guest page (g_ppu_vm_page, the table of patch 1091)
+for a new NOTE bit (0x10) after the store: vm_write8..64 through VM_WRITE_COH, and the lifted inline stores (stvx,
+dcbz, stwbrx, sthbrx, stvebx/ehx/ewx) through PPU_ST_NOTE in the lifter preamble. A set bit calls ppu_store_note ->
+the hook cellGcmSys installs at cellGcmInit (gcm_ppu_note_pages_ea -> rsx_live_draw_note_guest_write_pages(0, ...)),
+which also sets the bit on the 256 MB local window. LD_PPU_STORE_NOTE=0 leaves the bits clear (old behaviour).
+LD_TEX_WRITER tags the notes "ppu-store". Not covered: stwcx/stdcx reservation stores and host HLE writes.
+
+Also LD_FEAT_LOG=1 counts volume textures (SET_TEXTURE_FORMAT dimension 3) per sampled unit: header volume=N
+frames=F, rows "volume" with aux = depth<<24 | height<<12 | width (for upstream PR 335).
+
+Host test: tools/smoke/test_ppu_store_note.sh (compiles the patch's own blocks; checks + ns/store timing).
+Refreshed for v0.15.0 (SPU pass 85): upstream's lifter writes the byte-reversed and vector stores through
+VM_RAW_ST / vm_raw_st16 (aligned single-copy atomic) instead of memcpy; the notes follow those, and the two direct
+vm_base stores v0.15.0 added (stdbrx, stvlx/stvrx) note too.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 121c284..0a4d4ab 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -18,6 +18,7 @@
+ #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+ #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+ void cellGcm_spu_guest_write_hook_install(void);   /* patch 2033 */
++void cellGcm_ppu_store_note_install(void);         /* patch 2082 */
+ static void gcm_note_pages_ea(u32 ea, u32 size);           /* patch 2033 */
+ #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
+ #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
+@@ -511,6 +512,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+      */
+     s_config.localAddress    = 0xC0000000;  /* typical RSX local mem base */
+     s_config.localSize       = 256 * 1024 * 1024;  /* 256 MB */
++    if (rsx_live_draw_enabled()) cellGcm_ppu_store_note_install();   /* patch 2082 */
+     s_config.ioAddress       = ioAddress;
+     s_config.ioSize          = ioSize;
+     s_config.memoryFrequency = 650000000;   /* 650 MHz */
+@@ -4025,6 +4027,35 @@ void cellGcm_spu_guest_write_hook_install(void)
+     if (spu_set_guest_write_hook) spu_set_guest_write_hook(gcm_spu_note_pages_ea);   /* 2033; tag 2081 */
+     if (fs_set_guest_write_hook) fs_set_guest_write_hook(gcm_fs_note_pages_ea);   /* patch 2078; tag 2081 */
+ }
++/* KZ3 patch 2082: recompiled PPU stores into the RSX local window. The PPU runtime (ppu_loader.cpp) tests one
++ * byte per 64 KB guest page on every store (vm_write8..64 and the lifted inline stores) and calls this hook for
++ * the pages that carry its NOTE bit, which is set here on the local window once its address is known. Pass 75's
++ * LD_TEX_WATCH run named the writer of the location-0 texture misses: vm_write64 on a PPU thread (the 0x0FFxxxxx
++ * mip spans). Weak references: host tests link without the PPU runtime. LD_PPU_STORE_NOTE=0 leaves the bits clear
++ * (the old behaviour: PPU stores into local memory note nothing). */
++extern void ppu_set_store_note_hook(void (*hook)(uint32_t ea, uint32_t size)) __attribute__((weak));
++extern void ppu_store_note_pages(uint32_t ea, uint32_t size, int on) __attribute__((weak));
++static int s_ppu_note_tag;   /* LD_TEX_WRITER on: tag the notes "ppu-store" */
++static void gcm_ppu_note_pages_ea(uint32_t ea, uint32_t size)
++{
++    const u32 off = ea - s_config.localAddress;
++    if (off >= s_config.localSize) return;
++    if (size > s_config.localSize - off) size = s_config.localSize - off;
++    if (s_ppu_note_tag) rsx_live_draw_set_write_source(8u);
++    rsx_live_draw_note_guest_write_pages(0u, off, size);
++    if (s_ppu_note_tag) rsx_live_draw_set_write_source(0u);
++}
++void cellGcm_ppu_store_note_install(void)
++{
++    const char* e = getenv("LD_PPU_STORE_NOTE");
++    if ((e && e[0] == '0') || !ppu_set_store_note_hook || !ppu_store_note_pages || !s_config.localSize) return;
++    const char* w = getenv("LD_TEX_WRITER");
++    s_ppu_note_tag = (w && w[0] && w[0] != '0') ? 1 : 0;
++    ppu_set_store_note_hook(gcm_ppu_note_pages_ea);
++    ppu_store_note_pages(s_config.localAddress, s_config.localSize, 1);
++    printf("[cellGcmSys] PPU stores into local memory 0x%08X+0x%X mark texture pages (patch 2082)\n",
++           s_config.localAddress, s_config.localSize);
++}
+ void cellGcm_note_guest_write_ea(u32 ea, u32 size)
+ {
+     if (!size || !rsx_live_draw_enabled()) return;
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index ab19948..de93fb1 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -3276,9 +3276,10 @@ static u32 ld_tex_hash_big(void)
+  * ([tex-watch]: host rip, [rsp], thread id, guest offset), which names a PPU writer. ASSUMPTION: a host ReadFile
+  * into a protected page fails instead of faulting; host file reads are tracked (2078), so a watched page they hit
+  * is a read error in that run, logged by the fs layer. */
+-enum { LD_WS_OTHER = 0, LD_WS_SPU, LD_WS_FS, LD_WS_NV0039, LD_WS_NV3089, LD_WS_NV308A, LD_WS_WB, LD_WS_EA, LD_WS_N };
++enum { LD_WS_OTHER = 0, LD_WS_SPU, LD_WS_FS, LD_WS_NV0039, LD_WS_NV3089, LD_WS_NV308A, LD_WS_WB, LD_WS_EA,
++       LD_WS_PPU /* patch 2082: PPU stores (cellGcmSys.c gcm_ppu_note_pages_ea) */, LD_WS_N };
+ static const char* const g_ld_ws_name[LD_WS_N] = { "other", "spu-put", "fs-read", "nv0039", "nv3089", "nv308a",
+-                                                   "writeback", "ea-note" };
++                                                   "writeback", "ea-note", "ppu-store" };
+ #define LD_WS_PAGES 4096u
+ static u8 g_ld_ws_src[LD_WS_PAGES];
+ static u32 g_ld_ws_frame[LD_WS_PAGES];
+@@ -8717,6 +8718,10 @@ static void ld_gamma_log(u32 unit, const rsx_dsp_texture* t)
+ typedef struct { u32 kind, fmt, remap, aux, zalias, target, tfmt; unsigned long long n; } ld_feat_row;
+ static ld_feat_row g_ld_feat[512]; static u32 g_ld_feat_n; static unsigned long long g_ld_feat_draws;
+ static unsigned long long g_ld_feat_pk_fec, g_ld_feat_pk_fbc;
++/* Patch 2082: volume textures (SET_TEXTURE_FORMAT dimension 3) per sampled unit, for upstream PR 335 (3D
++ * textures): kind "volume", aux = depth << 24 | height << 12 | width (each clipped to its field), total in the
++ * header next to the walker's frame count. */
++static unsigned long long g_ld_feat_vol;
+ static int ld_feat_on(void)
+ {
+     static int on = -1;
+@@ -8735,9 +8740,9 @@ static void ld_feat_row_add(u32 kind, u32 fmt, u32 remap, u32 aux, u32 zalias, u
+ }
+ static void ld_feat_dump(void)
+ {
+-    static const char* kn[] = {"onech-remap", "gamma", "gamma-alpha", "gamma-signed", "packer"};
+-    fprintf(stderr, "[feat] draws=%llu packer1FEC=%llu packer1FBC=%llu (rows %u)\n", g_ld_feat_draws,
+-            g_ld_feat_pk_fec, g_ld_feat_pk_fbc, g_ld_feat_n);
++    static const char* kn[] = {"onech-remap", "gamma", "gamma-alpha", "gamma-signed", "packer", "volume"};
++    fprintf(stderr, "[feat] draws=%llu packer1FEC=%llu packer1FBC=%llu volume=%llu frames=%u (rows %u)\n",
++            g_ld_feat_draws, g_ld_feat_pk_fec, g_ld_feat_pk_fbc, g_ld_feat_vol, (unsigned)g_ld_frames, g_ld_feat_n);
+     for (u32 i = 0; i < g_ld_feat_n; i++) {
+         const ld_feat_row* r = &g_ld_feat[i];
+         fprintf(stderr, "[feat] %s fmt=0x%02x remap=0x%04x aux=0x%x zalias=%u target=0x%08x tfmt=%u n=%llu\n",
+@@ -8765,6 +8770,13 @@ static void ld_feat_unit(const rsx_dsp_texture* t, int zalias)
+     const u32 rm = r16 ? r16 : 0xAAE4u;
+     if (((base >= 0x90u && base <= 0x94u) || base == 0x9Cu) && rm != 0xAAE4u)
+         ld_feat_row_add(0, base, rm, 0, (u32)zalias, sf.color_offset[0], sf.color_format);
++    if (t->dimension == 3) {   /* patch 2082 */
++        const u32 d0 = t->depth ? t->depth : 1u;
++        const u32 w = t->width > 0xFFFu ? 0xFFFu : t->width, h = t->height > 0xFFFu ? 0xFFFu : t->height;
++        const u32 d = d0 > 0xFFu ? 0xFFu : d0;
++        g_ld_feat_vol++;
++        ld_feat_row_add(5, base, rm, d << 24 | h << 12 | w, (u32)zalias, sf.color_offset[0], sf.color_format);
++    }
+     const u32 gam = (t->wrap >> 20) & 0xFu;
+     if (gam) {
+         ld_feat_row_add(1, base, rm, gam, (u32)zalias, sf.color_offset[0], sf.color_format);
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 8792490..713a1a3 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1497,7 +1497,22 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
+         } else {                                                              \
+             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+         }                                                                     \
++        VM_STORE_NOTE(a, n);   /* KZ3 patch 2082 */                           \
+     } while (0)
++/* ---- KZ3 patch 2082 begin: store note gate (tools/smoke/test_ppu_store_note.sh compiles this block) ---- */
++/* KZ3 patch 2082: page bit NOTE of g_ppu_vm_page (defined with patch 1091 below) marks the pages whose PPU stores
++ * a host consumer must hear about (the RSX local window: the renderer's texture page bitmap). Tested after the
++ * store, so the consumer sees the note only once the bytes are in memory. Only the first byte's page is tested. */
++#define PPU_VM_PAGE_NOTE 0x10u
++extern "C" unsigned char g_ppu_vm_page[65536];
++extern "C" void ppu_store_note(uint32_t ea, uint32_t size);
++#define VM_STORE_NOTE(a, n)                                                                                       \
++    do {                                                                                                          \
++        if (__builtin_expect(__atomic_load_n(&g_ppu_vm_page[(uint32_t)(a) >> 16], __ATOMIC_RELAXED)                \
++                             & PPU_VM_PAGE_NOTE, 0))                                                              \
++            ppu_store_note((uint32_t)(a), (uint32_t)(n));                                                         \
++    } while (0)
++/* ---- KZ3 patch 2082 end ---- */
+ 
+ extern "C" {
+ /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
+@@ -1623,6 +1638,30 @@ static void vm_inline_open(void)
+         if (pg != ref_page) __atomic_or_fetch(&g_ppu_vm_page[pg], 1u, __ATOMIC_RELAXED);
+     __atomic_thread_fence(__ATOMIC_RELEASE);
+ }
++/* ---- KZ3 patch 2082 begin: store note hook ---- */
++/* KZ3 patch 2082: PPU stores into pages with the NOTE bit call a hook after the store (vm_write8..64 through
++ * VM_WRITE_COH; the lifted code's inline stores -- stvx, dcbz, stwbrx, sthbrx, stvebx/ehx/ewx -- through the same
++ * test in the ppu_lifter.py preamble). The renderer installs the hook and sets the bit on the RSX local window
++ * (cellGcmSys.c: recompiled PPU stores into local memory noted nothing, so the texture cache's clean-page skip had
++ * to leave location 0 out, RSX pass 75). Other pages pay one byte load and a not-taken branch per store. */
++static void (*volatile s_ppu_store_note_hook)(uint32_t ea, uint32_t size);
++extern "C" void ppu_set_store_note_hook(void (*hook)(uint32_t ea, uint32_t size)) { s_ppu_store_note_hook = hook; }
++extern "C" void ppu_store_note_pages(uint32_t ea, uint32_t size, int on)
++{
++    if (!size) return;
++    const uint64_t end = (uint64_t)ea + size - 1u;
++    for (uint64_t pg = ea >> 16; pg <= (end >> 16) && pg < 65536u; pg++) {
++        if (on) __atomic_or_fetch(&g_ppu_vm_page[pg], (unsigned char)PPU_VM_PAGE_NOTE, __ATOMIC_RELAXED);
++        else    __atomic_and_fetch(&g_ppu_vm_page[pg], (unsigned char)~PPU_VM_PAGE_NOTE, __ATOMIC_RELAXED);
++    }
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++}
++extern "C" __attribute__((noinline)) void ppu_store_note(uint32_t ea, uint32_t size)
++{
++    void (*hook)(uint32_t, uint32_t) = s_ppu_store_note_hook;
++    if (hook) hook(ea, size);
++}
++/* ---- KZ3 patch 2082 end ---- */
+ static void vm_fast_init(void)
+ {
+     const char* en = getenv("KZ3_VM_FAST");
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 5f70b39..4e2f053 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -518,6 +518,18 @@ static inline __attribute__((always_inline)) uint64_t ppu_vmi_read64(uint64_t a)
+ #endif
+ /* ---- KZ3 patch 1091 end ---- */
+ 
++/* ---- KZ3 patch 2082 begin: inline store note ---- */
++/* KZ3 patch 2082: the inline stores below (stvx, dcbz, stwbrx, sthbrx, stdbrx, stvebx/ehx/ewx, stvlx/stvrx) write
++ * vm_base directly, so
++ * they run the same page test as vm_write* (runtime/ppu/ppu_loader.cpp, VM_STORE_NOTE): a page with the NOTE bit
++ * (0x10 in g_ppu_vm_page, the RSX local window once the renderer sets it) calls ppu_store_note after the store. */
++extern "C" unsigned char g_ppu_vm_page[65536];
++extern "C" void ppu_store_note(uint32_t ea, uint32_t size);
++#define PPU_ST_NOTE(ea, n)                                                                                   \\
++    do { if (__builtin_expect(__atomic_load_n(&g_ppu_vm_page[(uint32_t)(ea) >> 16], __ATOMIC_RELAXED) & 0x10u, 0)) \\
++             ppu_store_note((uint32_t)(ea), (n)); } while (0)
++/* ---- KZ3 patch 2082 end ---- */
++
+ /* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
+  * Looks up the guest address in CTR via a hash table and calls the
+  * corresponding host function. Handles OPD resolution. */
+@@ -2648,7 +2660,8 @@ class PPULifter:
+                 loop = "for (uint32_t i = 16u - sh; i < 16u; i++) m[i - (16u - sh)] = s[i];"
+             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint32_t sh = (uint32_t)(ea & 0xF); "
+                     f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+-                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {loop} }}")
++                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {loop} "
++                    f"PPU_ST_NOTE(ea & ~0xFULL, 16); }}")   # patch 2082: the touched quadword
+ 
+         if mn == "lwaux":
+             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+@@ -2658,7 +2671,7 @@ class PPULifter:
+         if mn == "stdbrx":
+             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint64_t raw = ctx->gpr[{rs}]; "
+-                    f"VM_RAW_ST(uint64_t, ea, raw); }}")   # host LE = byte-reversed
++                    f"VM_RAW_ST(uint64_t, ea, raw); PPU_ST_NOTE(ea, 8); }}")   # host LE = byte-reversed; note: 2082
+ 
+         # ------- String word load/store -------
+         # NB bytes (lswi: NB field, 0 = 32; lswx: XER[25:31]) move between memory
+@@ -2695,7 +2708,7 @@ class PPULifter:
+             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
+                     f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
+-                    f"VM_RAW_ST(uint32_t, ea, raw); }}")
++                    f"VM_RAW_ST(uint32_t, ea, raw); PPU_ST_NOTE(ea, 4); }}")   # patch 2082
+ 
+         if mn == "lhbrx":
+             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+@@ -2716,7 +2729,7 @@ class PPULifter:
+             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
+                     f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
+-                    f"VM_RAW_ST(uint16_t, ea, raw); }}")
++                    f"VM_RAW_ST(uint16_t, ea, raw); PPU_ST_NOTE(ea, 2); }}")   # patch 2082
+ 
+         # ------- Load algebraic -------
+         if mn == "lwax":
+@@ -2753,7 +2766,7 @@ class PPULifter:
+             ra = _reg_idx(ops[0])
+             rb = _reg_idx(ops[1])
+             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
+-                    f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
++                    f"memset(vm_base + (uint32_t)ea, 0, 128); PPU_ST_NOTE(ea, 128); }}")   # patch 2082
+ 
+         if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
+             return f"/* {mn}: cache hint, no-op */;"
+@@ -2851,7 +2864,7 @@ class PPULifter:
+             ra = _reg_idx(ops[1])
+             rb = _reg_idx(ops[2])
+             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
+-                    f"vm_raw_st16(ea, &ctx->vr[{vs}]); }}")
++                    f"vm_raw_st16(ea, &ctx->vr[{vs}]); PPU_ST_NOTE(ea, 16); }}")   # patch 2082
+ 
+         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
+         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
+@@ -2900,7 +2913,7 @@ class PPULifter:
+             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
+                     f"ea &= ~{size - 1}ULL; "
+                     f"{{ uint{size*8}_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); "
+-                    f"VM_RAW_ST(uint{size*8}_t, ea, _e); }} }}")
++                    f"VM_RAW_ST(uint{size*8}_t, ea, _e); }} PPU_ST_NOTE(ea, {size}); }}")   # patch 2082
+ 
+         if mn == "lvsl" or mn == "lvsr":
+             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
