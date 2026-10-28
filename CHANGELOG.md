@@ -3,12 +3,13 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
-## [Unreleased]
+## [0.1.4] - 2026-10-28 (pre-release)
 
 ### Fixed
 - Mouse look no longer holds still and then jumps to a new direction in busy scenes (seen at the start of the first level): mouse, keyboard and pointer input is now read on every frame tick. In our tests at that spot the view follows the mouse without jumps.
 - Opening Options > Wireless Controller or Options > Display after installing a new version no longer ends the level with error 20000: the game's file cache is rebuilt once when the installed version changes, so the first start after an update loads a little slower.
 - The game log now records the scheduler and memory lines that tell us whether a fix is in your build.
+- When the first start asks for the decrypted EBOOT, a folder is accepted too: the setup looks for EBOOT.elf in it and in its USRDIR folder, and says so when it is not there.
 
 ## [0.1.3] - 2026-10-28 (pre-release)
 

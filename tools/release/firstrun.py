@@ -1410,7 +1410,9 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
         r = ask(f"{q} [{'Y/n' if default else 'y/N'}] ").strip().lower()
         return default if not r else r.startswith("y")
 
-    def folder(q, default, need_dir=True, iso=False):
+    def folder(q, default, need_dir=True, iso=False, inside=()):
+        """A folder (need_dir) or a file. For a file, a folder answer is searched for the `inside` names (relative
+        paths, in order): players give the folder that holds EBOOT.elf as often as the file itself."""
         while True:
             r = ask(f"{q}" + (f" [{default}]" if default else "") + ": ").strip().strip('"')
             r = os.path.expanduser(r or default or "")
@@ -1419,7 +1421,15 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
             if r and (os.path.isdir(r) or (iso and os.path.isfile(r) and r.lower().endswith(".iso"))
                       if need_dir else os.path.isfile(r)):
                 return os.path.abspath(r)
-            say(f"  not found: {r or '(empty)'}")
+            if r and not need_dir and os.path.isdir(r):
+                hit = next((os.path.join(r, n) for n in inside if os.path.isfile(os.path.join(r, n))), "")
+                if hit:
+                    say(f"  using {os.path.abspath(hit)}")
+                    return os.path.abspath(hit)
+                say(f"  not found: {r} is a folder without " + " or ".join(n.replace("/", os.sep) for n in inside)
+                    + "; give the file itself, or press Enter for the path in brackets")
+                continue
+            say(f"  not found: {r or '(empty)'}" + ("" if need_dir else " (no such file)"))
 
     prev = {}
     try:
@@ -1450,7 +1460,8 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
         elf = elf or (prev.get("eboot", "") if prev.get("update") == upd else "") or \
             (auto if os.path.isfile(auto) else "")
         if not skip:
-            elf = folder("Decrypted EBOOT (EBOOT.elf; Enter = find it)", elf, need_dir=False)
+            elf = folder("Decrypted EBOOT: the EBOOT.elf file or the folder holding it (Enter = the path in brackets, or find it)", elf,
+                         need_dir=False, inside=("EBOOT.elf", "USRDIR/EBOOT.elf"))
         while True:
             rc, text = check(dump, upd, elf)
             say(text.rstrip())

@@ -381,6 +381,16 @@ def main():
         go = fr.interactive(a12, root12, "x.log", [], ask=lambda q: next(answers), out=io.StringIO(),
                             check=lambda *x: (1, "FAIL D1: x\n"))
         check(go is False, "12 quit after a failed check")
+        # 12d. the EBOOT question takes the folder holding EBOOT.elf (a player gave the update's folder, 0.1.3)
+        empty12 = os.path.join(t12, "empty")
+        os.makedirs(empty12, exist_ok=True)
+        got, o12d = [], io.StringIO()
+        answers = iter([d12, u12, empty12, u12, "q"])
+        fr.interactive(a12, root12, "x.log", [], ask=lambda q: next(answers), out=o12d,
+                       check=lambda *x: (got.append(x[2]), (1, "FAIL D1: x\n"))[1])
+        o = o12d.getvalue()
+        check(got == [os.path.abspath(os.path.join(u12, "USRDIR", "EBOOT.elf"))] and "is a folder without" in o
+              and "using " in o, f"12d EBOOT folder answer: {got} {o[-300:]!r}")
 
         # 12b. --check-first: the folders from setup are checked before any folder question
         a12b = types.SimpleNamespace(dump=d12, update=u12, eboot="", build=os.path.join(t12, "b"), portable=False,

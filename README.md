@@ -20,7 +20,7 @@
 *Helghast* is the name of the game's own faction; Project Helghast is a fan project, not official and not
 affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games.
 
-You need your own Killzone 3 disc dump (a folder with PS3_GAME, or a decrypted ISO), the 1.14 update and a decrypted EBOOT from your own copy. Version <!-- version -->0.1.3<!-- /version --> is a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
+You need your own Killzone 3 disc dump (a folder with PS3_GAME, or a decrypted ISO), the 1.14 update and a decrypted EBOOT from your own copy. Version <!-- version -->0.1.4<!-- /version --> is a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 A PC port of **Killzone 3** (PS3, 2011) made by **static recompilation**: the game's PowerPC (PPU) and Cell SPU
 code is translated to C ahead of time and compiled into a native Windows x64 program, so no CPU emulator runs at
@@ -105,7 +105,7 @@ Start-menu "Open saves folder" entry say which rule decided, for example `data: 
 
 ## Getting it
 
-**Download:** <!-- version -->[v0.1.3](https://github.com/undecuple/project-helghast/releases/tag/v0.1.3)<!-- /version --> is a pre-release (partly
+**Download:** <!-- version -->[v0.1.4](https://github.com/undecuple/project-helghast/releases/tag/v0.1.4)<!-- /version --> is a pre-release (partly
 playable). Get `Project-Helghast-setup.exe` (recommended) or the portable zip from the
 [releases page](https://github.com/undecuple/project-helghast/releases) and check it against `SHA256SUMS`. The installer
 checks your own disc dump, 1.14 update and decrypted EBOOT, then recompiles and builds the game's code on your own

@@ -11,7 +11,7 @@ place to read. Nothing here is shipped or downloaded by this project.
 |---|---|---|---|---|
 | Disc dump | The folder that holds `PS3_GAME`, or a decrypted `.iso` file | `PS3_GAME/PARAM.SFO`, `PS3_GAME/USRDIR/EBOOT.BIN`, and the game archive `PS3_GAME/USRDIR/data_ps3.psarc` (or its parts `data_ps3.psarc.66600`, `.66601`, ... with no gap) | The `PS3_GAME` folder itself, or `PS3_GAME/USRDIR`, picked one or two levels too deep (the setup steps up to the folder above `PS3_GAME`) | Open the folder: you should see `PS3_GAME`, and in it `PARAM.SFO` and `USRDIR`. The archive is about 9.6 GB |
 | 1.14 update | The update folder | `PARAM.SFO`, `USRDIR/EBOOT.BIN` and `USRDIR/added_data_ps3.psarc.edat` | Its `USRDIR` folder picked by mistake (the setup steps up to the folder above) | Open the folder: `PARAM.SFO` sits next to `USRDIR`. Its `APP_VER` must be 01.14 |
-| Decrypted 1.14 EBOOT | The file `EBOOT.elf` | A 64-bit PowerPC ELF file, not the encrypted `EBOOT.BIN` | If `USRDIR/EBOOT.elf` is already inside the update folder, the setup uses it and does not ask | The file starts with the letters `ELF`; an encrypted file starts with `SCE`. Its size is 21,228,256 bytes for 1.14 |
+| Decrypted 1.14 EBOOT | The file `EBOOT.elf` | A 64-bit PowerPC ELF file, not the encrypted `EBOOT.BIN` | If `USRDIR/EBOOT.elf` is already inside the update folder, the setup uses it and does not ask. When the console asks for it, give the file or the folder that holds it, or press Enter to use the path shown in brackets | The file starts with the letters `ELF`; an encrypted file starts with `SCE`. Its size is 21,228,256 bytes for 1.14 |
 
 A decrypted ISO is read in place by the first-run check; its files are copied into the install folder once. An
 encrypted ISO is refused.

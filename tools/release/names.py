@@ -17,7 +17,7 @@ Internal names stay as they are on a rename: kz3.exe, the KZ3_* switches, the kz
 the runtime's Killzone3-PC- log prefix. Shipped in the payload next to launch.py (assemble_payload.py FILES).
 """
 
-VERSION = "0.1.3"                            # the release version; tools/release/test_version_agree.py checks every mirror
+VERSION = "0.1.4"                            # the release version; tools/release/test_version_agree.py checks every mirror
 PRODUCT = "Project Helghast"                    # every title a player reads (installer, launcher, site, art)
 TAG = "Killzone 3 // Unofficial PC Port"          # the "GAME // UNOFFICIAL PC PORT" tag (art: upper case)
 DESCRIPTION = f"{TAG} (static recompilation)"    # the findable description line (pass 21: carries the tag)
