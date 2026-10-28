@@ -73,7 +73,7 @@ Scripts that hold a host or path you may need to adapt:
 
 ## 6. What the user supplies
 
-Your users supply their own copy of the game: the US disc (BCUS98234) dumped as a folder and the 1.14 update. No
+Your users supply their own copy of the game: the US disc (BCUS98234) as a decrypted dump (a folder or an ISO file) and the 1.14 update. No
 game files are shipped here or by a release. The EBOOT used for lifting comes from the player's own copy; for
 dumping and EBOOT questions see [RPCS3](https://rpcs3.net) and its documentation. The port reads the dump in place
 and never copies it. [requirements.md](requirements.md) lists what a player needs.

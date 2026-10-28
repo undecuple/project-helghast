@@ -4,7 +4,7 @@
 Runs the checks, then lifts and compiles the port on the player's machine, as a table of steps (name, weight, command
 builder, done-marker). Standard library only, Python 3.11+, Windows and Linux.
 
-    firstrun.py --dump DIR --update DIR [--eboot FILE] [--root DIR] [--build DIR] [--jobs N] [--toolchain DIR]
+    firstrun.py --dump DIR|ISO --update DIR [--eboot FILE] [--root DIR] [--build DIR] [--jobs N] [--toolchain DIR]
                 [--log-dir DIR] [--log-name NAME] [--dry-run]
     firstrun.py --interactive [--portable] [same options; --dump/--update/--eboot become the defaults it offers]
 
@@ -17,6 +17,11 @@ builder, done-marker). Standard library only, Python 3.11+, Windows and Linux.
   --toolchain  an llvm-mingw folder (bin/x86_64-w64-mingw32-clang[.exe]), built with cmake/llvm-mingw.cmake; default:
                the payload's <root>/toolchain/llvm-mingw when present (pass 8), else cmake/mingw-w64.cmake (NixOS cross).
                The payload's toolchain/cmake, toolchain/ninja and (Windows) toolchain/python are used when present.
+  --dump       the decrypted disc dump folder (holds PS3_GAME), or a decrypted disc ISO file. For an ISO the check step
+               first checks the image (firstrun_check.py), then copies PS3_DISC.SFB and everything under PS3_GAME out of
+               it into <root>/game/disc (the folder the installer's "copy the game files" uses) and the rest of the build
+               uses that folder as the dump; the ISO is only read. Files already extracted with the same size are kept;
+               not enough free disk space (the missing bytes + 1 GiB) stops with a message before anything is written.
   --log-dir    folder the setup.exe / zip was started from (Inno passes {src}); not writable -> the temp folder
   --log-name   default names.SETUP_LOG (Project-Helghast-setup.log); an earlier log of the same name is renamed with its start time
   --status-file  also keep the LOG line and the latest PROGRESS/RESULT line in this file (for the Inno wizard)
@@ -63,6 +68,7 @@ Weights: stage B at 4 jobs (pass 12, plan 4.11, measured on the 1.00 tree; not r
 step's is an estimate.
 """
 import argparse
+import dataclasses
 import datetime
 import hashlib
 import json
@@ -113,6 +119,9 @@ class Ctx:
     root: str
     build: str
     dump: str = ""
+    iso: str = ""                   # the decrypted ISO the player picked, until the check step has extracted it
+    progress: Callable | None = field(default=None, repr=False)   # (done, total) -> PROGRESS line, set by the Runner
+    say: Callable | None = field(default=None, repr=False)        # line -> the run's output and log, set by the Runner
     update: str = ""
     eboot: str = ""
     jobs: int = 1
@@ -361,6 +370,7 @@ def cm_path(p, sep=os.sep):
 
 
 def cmd_configure(c):
+    refuse_future_files(c)
     a = [c.cmake, "-S", os.path.join(c.root, "port", "kz3"), "-B", c.b("obj"), "-G", "Ninja",
          "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_C_FLAGS_RELEASE={RELEASE_FLAGS}",
          f"-DCMAKE_CXX_FLAGS_RELEASE={RELEASE_FLAGS}", f"-DPS3RECOMP_DIR={cm_path(c.ps3recomp)}",
@@ -477,7 +487,45 @@ def record_sources(c):
             json.dump(cur, f, indent=0, sort_keys=True)
 
 
+FUTURE_SLACK_S = 120   # a file this far past the clock counts as future-dated
+
+
+def future_files(c, now=None):
+    """Port files dated in the future (by more than FUTURE_SLACK_S): ninja regenerates build.ninja forever when a CMake
+    input is newer than anything it writes ("manifest 'build.ninja' still dirty after 100 tries"). Seen 2026-10-28 with
+    an installer that kept the build machine's UTC times as local times (fixed: kz3.iss TimeStampsInUTC=yes). Scans the
+    installed sources (not build/, game/ or the toolchain) and the EBOOT the build embeds. -> (count, newest path)."""
+    now = time.time() if now is None else now
+    n, worst, worst_t = 0, None, 0.0
+    paths = []
+    for top in ("port", "cmake", "ps3recomp", "re", "tools"):
+        for d, dirs, files in os.walk(os.path.join(c.root, top)):
+            paths += [os.path.join(d, f) for f in files]
+    if c.eboot:
+        paths.append(c.eboot)
+    for p in paths:
+        try:
+            t = os.stat(p).st_mtime
+        except OSError:
+            continue
+        if t > now + FUTURE_SLACK_S:
+            n += 1
+            if t > worst_t:
+                worst, worst_t = p, t
+    return n, worst
+
+
+def refuse_future_files(c):
+    n, worst = future_files(c)
+    if n:
+        raise StepFailed(
+            f"{n} file(s) of the port are dated in the future (newest: {worst}), so the build cannot settle. Check that "
+            "the PC's date, time and time zone are right; then reinstall with the current installer, or wait until "
+            "that time has passed and run the setup again.")
+
+
 def cmd_compile(c):
+    refuse_future_files(c)
     return [[c.cmake, "--build", c.b("obj"), "-j", str(c.jobs)]]
 
 
@@ -524,6 +572,86 @@ def place_ps3_fonts(c):
     return dest
 
 
+class StepFailed(Exception):
+    """A step's in-process work failed; the message is for the player (the Runner logs it and ends with RESULT ok=0)."""
+
+
+ISO_NAMES = {n.lower(): n for n in ("PS3_DISC.SFB", "PS3_GAME/PARAM.SFO", "PS3_GAME/USRDIR/EBOOT.BIN",
+                                     "PS3_GAME/USRDIR/data_ps3.psarc")}   # the disc's own spelling
+ISO_MARGIN = 1 << 30           # free space kept beyond the bytes still to copy out of the ISO
+
+
+def iso_dest(c):
+    """Where an ISO's files go: the folder the installer's "copy the game files" uses for a folder dump."""
+    return os.path.join(c.root, "game", "disc")
+
+
+def iso_extract(c, say=print, progress=None, free=None):
+    """Copy PS3_DISC.SFB and every file under PS3_GAME out of the decrypted ISO c.iso into iso_dest(c), then point
+    c.dump there. Files already there with the size the ISO says are kept (a half copy resumes; a copy is written as
+    <name>.part and renamed). The runtime reads PARAM.SFO, USRDIR/data_ps3.psarc, the patch folders, the trophy files
+    (TROPDIR) and the icon from PS3_GAME; the EBOOT.BIN is the check's. Raises StepFailed with a plain message."""
+    import iso9660
+    dest = iso_dest(c)
+    try:
+        with iso9660.Iso(c.iso) as im:
+            files = [("PS3_DISC.SFB", e) for e in [im.lookup("PS3_DISC.SFB")] if e is not None and not e.is_dir]
+            files += [("PS3_GAME/" + rel, e) for rel, e in im.walk("PS3_GAME")]
+            if not any(r == "PS3_GAME/PARAM.SFO" for r, _ in files):
+                raise StepFailed("the ISO holds no PS3_GAME/PARAM.SFO")
+            for _, e in files:
+                if not im.in_image(e):
+                    raise StepFailed("the ISO is truncated (a file reaches past the end of the image); get a complete copy")
+            total = sum(e.size for _, e in files)
+
+            def target(rel):      # the runtime opens these by their disc names; ISO 9660 stores upper case
+                rel = ISO_NAMES.get(rel.lower(), rel)
+                return os.path.join(dest, *rel.split("/"))
+
+            def have(rel, e):
+                p = target(rel)
+                return os.path.isfile(p) and os.path.getsize(p) == e.size
+            todo = [(r, e) for r, e in files if not have(r, e)]
+            need = sum(e.size for _, e in todo)
+            if need:
+                os.makedirs(dest, exist_ok=True)
+                avail = (free or shutil.disk_usage)(dest).free
+                if avail < need + ISO_MARGIN:
+                    raise StepFailed(
+                        f"Not enough free disk space to copy the game files out of the ISO: {(need + ISO_MARGIN) / GIB:.1f} GiB "
+                        f"are needed (the copy is {need / GIB:.1f} GiB) and {avail / GIB:.1f} GiB are free on the drive of "
+                        f"{dest}. Free some space, or install into a folder on a drive with more room, and run the setup again")
+            say(f"iso: {len(files)} files, {total / GIB:.2f} GiB from {os.path.basename(c.iso)}; "
+                f"{len(files) - len(todo)} already extracted, {need / GIB:.2f} GiB to copy into {dest}")
+            done = total - need
+            for rel, e in todo:
+                p = target(rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                base = done
+
+                def cb(d, t, base=base):
+                    if progress:
+                        progress(base + d, total)
+                im.copy(rel, p, cb)
+                done += e.size
+            if progress:
+                progress(total, total)
+    except iso9660.IsoEncrypted as e:
+        raise StepFailed(str(e))
+    except iso9660.IsoError as e:
+        raise StepFailed(f"cannot read the ISO: {e}")
+    except OSError as e:
+        raise StepFailed(f"copying out of the ISO failed: {e.strerror or e} ({e.filename or dest})")
+    c.dump = dest
+    say(f"iso: extracted; the dump is now {dest}")
+
+
+def after_check(c):
+    if c.iso and c.dump == c.iso:
+        iso_extract(c, say=c.say or (lambda s: print(s, flush=True)), progress=c.progress)
+    after_record(c)
+
+
 def after_record(c):
     """Write paths.json (the launcher reads it): the three paths and the check's facts."""
     os.makedirs(c.build, exist_ok=True)
@@ -532,8 +660,8 @@ def after_record(c):
     except OSError as e:   # a font folder that cannot be read: the fonts are optional, keep the original
         print(f"firmware fonts: not copied ({e.strerror}); kz3.ini points at the original folder", flush=True)
     with open(c.b("paths.json"), "w", encoding="utf-8") as f:
-        json.dump({"dump": c.dump, "update": c.update, "eboot": c.eboot, "facts": c.facts, "font_dir": c.font_dir,
-                   "font_src": c.font_src, "lang": c.lang, "window_size": c.window_size}, f, indent=2)
+        json.dump({"dump": c.dump, "iso": c.iso, "update": c.update, "eboot": c.eboot, "facts": c.facts,
+                   "font_dir": c.font_dir, "font_src": c.font_src, "lang": c.lang, "window_size": c.window_size}, f, indent=2)
 
 
 def eboot_stat(path):
@@ -646,7 +774,7 @@ def write_game_ini(c):
 
 
 STEPS = [   # weights: % of stage B at 4 jobs (pass 12, plan 4.11): load 20 s, ppu 30, SPU pass 103, compile 312 of 469 s
-    Step("check", "Checking the game files", 1, cmd_check, always=True, after=after_record),
+    Step("check", "Checking the game files", 1, cmd_check, always=True, after=after_check),
     Step("load", "Loading the EBOOT", 4, cmd_load, clean=lambda c: [c.b("analysis")]),
     Step("inventory", "Finding SPU programs", 1, cmd_inventory,
          clean=lambda c: [c.b("analysis", "jobmods"), c.b("analysis", "spu_images")]),
@@ -682,8 +810,13 @@ def shaders_wanted(root, choice):
     return cp.get("shaders", "prepare", fallback="0").strip() == "1"
 
 
-def steps_for(root, choice, steps=None):
+ISO_CHECK_WEIGHT = 8    # the check step also copies ~10 GiB out of an ISO: a bigger share of the bar than the plain check
+
+
+def steps_for(root, choice, steps=None, iso=False):
     steps = list(STEPS if steps is None else steps)
+    if iso:
+        steps = [dataclasses.replace(s, weight=max(s.weight, ISO_CHECK_WEIGHT)) if s.name == "check" else s for s in steps]
     return steps + [SHADER_STEP] if shaders_wanted(root, choice) else steps
 
 
@@ -1031,8 +1164,16 @@ class Runner:
                 t = time.monotonic()
                 for d in step.clean(ctx):
                     safe_clean(ctx, d)
-                cmds = step.commands(ctx)
-                self.progress(i, 0, len(cmds) or 1)
+                try:
+                    cmds = step.commands(ctx)
+                except StepFailed as e:
+                    self.emit(str(e))
+                    return self.result(False, step.name)
+                iso_copy = step.name == "check" and bool(ctx.iso) and ctx.dump == ctx.iso   # permille scale: 10 = checked
+                units = 1000 if iso_copy else (len(cmds) or 1)
+                ctx.say = self.emit
+                ctx.progress = self.iso_progress(i)
+                self.progress(i, 0, units)
                 failed = False
                 for k, argv in enumerate(cmds):
                     rc, out = self.run_cmd(i, argv)
@@ -1050,9 +1191,13 @@ class Runner:
                             self.emit(bad)
                             return self.result(False, step.name)
                     if not step.ninja:
-                        self.progress(i, k + 1, len(cmds))
+                        self.progress(i, 10 if iso_copy else k + 1, units)
                 if step.after and not failed:
-                    step.after(ctx)
+                    try:
+                        step.after(ctx)
+                    except StepFailed as e:
+                        self.emit(str(e))
+                        return self.result(False, step.name)
                 if not cmds or step.ninja or failed:
                     self.progress(i, 1, 1)
                 if failed:
@@ -1065,6 +1210,20 @@ class Runner:
             self.log.write("## cancelled: the running step left no marker, the next start resumes here")
             self.emit(f"RESULT ok=0 step=cancelled elapsed={int(time.monotonic() - self.t0)}")
             return 130
+
+    def iso_progress(self, i):
+        """(done, total) bytes of the ISO copy -> PROGRESS lines on the check step's permille scale (10..1000), at most
+        one per 0.5 %; a Stop request ends the copy."""
+        last = [-1]
+
+        def cb(done, total):
+            if self.stop_requested:
+                raise Cancelled()
+            v = 10 + int(990 * done / total) if total else 1000
+            if v - last[0] >= 5 or v >= 1000:
+                last[0] = v
+                self.progress(i, v, 1000)
+        return cb
 
     def take_check(self, out):
         """Keep the check's facts (EBOOT size/hash) so a changed input invalidates the later markers."""
@@ -1101,7 +1260,9 @@ def header(ctx, log_path, fallback):
             f"# root {ctx.root}", f"# build {ctx.build}",
             f"# toolchain {ctx.toolchain or 'cmake/mingw-w64.cmake (cross)'}, cmake {ctx.cmake}, "
             f"ninja {ctx.ninja or '(PATH)'}, python {ctx.python}",
-            f"# dump {ctx.dump}", f"# update {ctx.update}", f"# eboot {ctx.eboot or '(auto)'}",
+            f"# dump {ctx.dump}" + (f" (decrypted ISO; its files are copied to {iso_dest(ctx)})"
+                                  if ctx.iso and ctx.dump == ctx.iso else ""),
+            f"# update {ctx.update}", f"# eboot {ctx.eboot or '(auto)'}",
             f"# tree built for the {EBOOT_VERS[ctx.ver]['check']} EBOOT"] + \
         ([f"# log folder not writable, using {os.path.dirname(log_path)}"] if fallback else [])
 
@@ -1191,13 +1352,14 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
         r = ask(f"{q} [{'Y/n' if default else 'y/N'}] ").strip().lower()
         return default if not r else r.startswith("y")
 
-    def folder(q, default, need_dir=True):
+    def folder(q, default, need_dir=True, iso=False):
         while True:
             r = ask(f"{q}" + (f" [{default}]" if default else "") + ": ").strip().strip('"')
             r = os.path.expanduser(r or default or "")
             if not r and not need_dir:
                 return ""
-            if r and (os.path.isdir(r) if need_dir else os.path.isfile(r)):
+            if r and (os.path.isdir(r) or (iso and os.path.isfile(r) and r.lower().endswith(".iso"))
+                      if need_dir else os.path.isfile(r)):
                 return os.path.abspath(r)
             say(f"  not found: {r or '(empty)'}")
 
@@ -1217,7 +1379,7 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
     upd = a.update or rp.get("update", "") or prev.get("update", "") or guess
     elf = a.eboot or ""
     while True:
-        dump = folder("Disc dump folder (the one holding PS3_GAME)", dump)
+        dump = folder("Disc dump: the folder holding PS3_GAME, or a decrypted .iso file", dump, iso=True)
         upd = folder("1.14 update folder (dev_hdd0/game/<title id>: BCUS98234, or BCES01007)", upd)
         auto = os.path.join(upd, "USRDIR", "EBOOT.elf")
         elf = elf or (prev.get("eboot", "") if prev.get("update") == upd else "") or \
@@ -1526,13 +1688,14 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     if a.interactive and not a.dry_run:
         if not interactive(a, root, pick_log(a.log_dir or None, a.log_name)[0], notes, ask=ask, out=out):
             quit_early = True
-    steps = steps_for(root, a.shaders) if steps is None else steps
+    is_iso = bool(a.dump) and os.path.isfile(a.dump)      # a decrypted disc ISO instead of a dump folder
+    steps = steps_for(root, a.shaders, iso=is_iso) if steps is None else steps
     if (a.interactive or a.bar) and not a.dry_run:
         out = ConsoleBar(out, steps)
     bundled = payload_tools(root)
     toolchain = os.path.abspath(a.toolchain) if a.toolchain else bundled.get("llvm_mingw", "")
     ctx = Ctx(root=root, build=os.path.abspath(a.build or os.path.join(root, "build")),
-              dump=os.path.abspath(a.dump), update=os.path.abspath(a.update) if a.update else "",
+              dump=os.path.abspath(a.dump), iso=os.path.abspath(a.dump) if is_iso else "", update=os.path.abspath(a.update) if a.update else "",
               eboot=os.path.abspath(a.eboot) if a.eboot else "",
               jobs=a.jobs or jobs_for(available_ram(), clang=bool(toolchain), cores=os.cpu_count()),
               toolchain=toolchain,

@@ -376,6 +376,102 @@ def main():
             check(os.path.basename(loader_in) == "EBOOT.elf" and os.path.dirname(loader_in) == c13.b("analysis")
                   and open(loader_in, "rb").read() == b"\x7fELFstub", f"13 staged name for {nm}: {loader_in!r}")
             check(c13.eboot == ef and os.path.exists(ef), f"13 player's file untouched for {nm}")
+
+        # 14. a decrypted ISO as the dump: the check step copies PS3_DISC.SFB and PS3_GAME into <root>/game/disc,
+        # the later steps see that folder, the bar stays monotonic, a second run copies nothing, failures are plain
+        from iso_fixture import build_iso
+        t14 = os.path.join(tmp, "t14")
+        os.makedirs(os.path.join(t14, "root"))
+        iso14 = os.path.join(t14, "game.iso")
+        files14 = {"PS3_DISC.SFB": b".SFB" + b"\0" * 8, "PS3_GAME/PARAM.SFO": b"\0PSF" + b"s" * 30,
+                   "PS3_GAME/ICON0.PNG": b"png", "PS3_GAME/TROPDIR/NPWR01569_00/TROPHY.TRP": b"trp",
+                   "PS3_GAME/USRDIR/EBOOT.BIN": b"SCE\0" + b"e" * 20,
+                   "PS3_GAME/USRDIR/data_ps3.psarc": b"PSAR" + bytes(range(256)) * 80}
+        build_iso(iso14, files14, multi={"PS3_GAME/USRDIR/data_ps3.psarc": 4096})
+        seen14 = os.path.join(t14, "seen.txt")
+        steps14 = [fr.Step("check", "Check", 1, lambda c: [], always=True, after=fr.after_check),
+                   fr.Step("b", "B", 2, lambda c: [append(seen14, c.dump + "\n")])]
+        out14 = io.StringIO()
+        args14 = ["--dump", iso14, "--root", os.path.join(t14, "root"), "--jobs", "1", "--log-dir", os.path.join(t14, "dl")]
+        rc = fr.main(args14, steps=steps14, out=out14)
+        dest14 = os.path.join(t14, "root", "game", "disc")
+        check(rc == 0, f"14 rc {rc}: {out14.getvalue()[-300:]}")
+        got14 = {os.path.relpath(os.path.join(d, n), dest14).replace(os.sep, "/"): open(os.path.join(d, n), "rb").read()
+                 for d, _, ns in os.walk(dest14) for n in ns}
+        want14 = {k.replace("DATA_PS3.PSARC", "data_ps3.psarc"): v for k, v in files14.items()}
+        check(got14 == want14, f"14 extracted tree equals the ISO's files: {sorted(got14)}")
+        check(open(seen14).read().strip() == dest14, "14 later steps see the extracted folder as the dump")
+        pj = json.load(open(os.path.join(t14, "root", "build", "paths.json")))
+        check(pj["dump"] == dest14 and pj["iso"] == iso14, "14 paths.json records the folder and the ISO")
+        pr14 = progress(out14.getvalue())
+        pc14 = [float(x["pct"]) for x in pr14]
+        check(pc14 == sorted(pc14) and pc14[-1] == 100.0, f"14 pct monotonic to 100: {pc14}")
+        check(any(x["name"] == "check" and x["total"] == "1000" and x["done"] == "1000" for x in pr14), "14 copy progress ends at 1000/1000")
+        check(fr.steps_for(tmp, "off", iso=True)[0].weight > fr.STEPS[0].weight, "14 the check step weighs more for an ISO")
+        out14 = io.StringIO()
+        rc = fr.main(args14, steps=steps14, out=out14)
+        check(rc == 0 and "0.00 GiB to copy" in out14.getvalue() and not any(
+            n.endswith(".part") for _, _, ns in os.walk(dest14) for n in ns), "14 a second run copies nothing")
+        # a file cut short is copied again; the others are kept
+        victim = os.path.join(dest14, "PS3_GAME", "USRDIR", "data_ps3.psarc")
+        with open(victim, "r+b") as f:
+            f.truncate(100)
+        c14 = fr.Ctx(root=os.path.join(t14, "root"), build=os.path.join(t14, "b"), iso=iso14, dump=iso14)
+        said = []
+        fr.iso_extract(c14, say=said.append)
+        check(open(victim, "rb").read() == files14["PS3_GAME/USRDIR/data_ps3.psarc"] and c14.dump == dest14, "14 a short file is copied again")
+        # not enough room
+        import collections
+        shutil.rmtree(dest14)
+        c14 = fr.Ctx(root=os.path.join(t14, "root"), build=os.path.join(t14, "b"), iso=iso14, dump=iso14)
+        try:
+            fr.iso_extract(c14, say=said.append, free=lambda p: collections.namedtuple("U", "free")(1000))
+            check(False, "14 low disk space refused")
+        except fr.StepFailed as e:
+            check("Not enough free disk space" in str(e) and "GiB" in str(e) and not os.path.exists(os.path.join(dest14, "PS3_GAME")),
+                  f"14 low disk space refused before writing: {e}")
+        # encrypted-looking and non-ISO images
+        enc = bytearray(2048 * 40)
+        enc[0:4] = b"\0\0\0\2"
+        enc[8:24] = b"\0\0\0\0\0\0\0\x0f\0\0\0\x10\0\0\0\x1e"
+        bad14 = os.path.join(t14, "enc.iso")
+        open(bad14, "wb").write(bytes(enc))
+        c14 = fr.Ctx(root=os.path.join(t14, "root"), build=os.path.join(t14, "b"), iso=bad14, dump=bad14)
+        try:
+            fr.iso_extract(c14, say=said.append)
+            check(False, "14 encrypted ISO refused")
+        except fr.StepFailed as e:
+            check(str(e) == "this ISO is encrypted; use a decrypted dump", f"14 encrypted ISO message: {e}")
+        open(bad14, "wb").write(b"not an iso" * 5000)
+        try:
+            fr.iso_extract(c14, say=said.append)
+            check(False, "14 non-ISO refused")
+        except fr.StepFailed as e:
+            check("cannot read the ISO" in str(e), f"14 non-ISO message: {e}")
+        # the interactive prompt takes a .iso file as the dump (and still re-asks a missing path)
+        picked = []
+        answers = iter([os.path.join(t14, "nope.iso"), iso14, u12, "", "q"])
+        a14 = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t14, "b"), portable=False)
+        go = fr.interactive(a14, root12, "x.log", [], ask=lambda q: next(answers), out=io.StringIO(),
+                            check=lambda d, u, e: (picked.append(d), (1, "FAIL D1: x\n"))[1])
+        check(go is False and picked == [iso14], f"14 interactive accepts a decrypted .iso as the dump: {picked}")
+        # 15 future-dated port files (an installer that kept the build machine's UTC times as local ones): found and
+        # refused with the plain message before configure/compile; files at the right time pass
+        t15 = os.path.join(tmp, "t15")
+        os.makedirs(os.path.join(t15, "port", "kz3"))
+        f15 = os.path.join(t15, "port", "kz3", "CMakeLists.txt")
+        open(f15, "w").close()
+        c15 = types.SimpleNamespace(root=t15, eboot="")
+        check(fr.future_files(c15) == (0, None), "15 a file at the right time is not future-dated")
+        later = time.time() + 3 * 3600
+        os.utime(f15, (later, later))
+        n15, w15 = fr.future_files(c15)
+        check(n15 == 1 and w15 == f15, f"15 a file 3 h in the future is found: {n15} {w15}")
+        try:
+            fr.refuse_future_files(c15)
+            check(False, "15 refuse_future_files raises")
+        except fr.StepFailed as e:
+            check("dated in the future" in str(e) and "time zone" in str(e), f"15 plain message: {e}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("test_firstrun:", "PASS" if not FAILS else f"FAIL ({len(FAILS)})")

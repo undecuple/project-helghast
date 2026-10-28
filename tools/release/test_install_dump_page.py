@@ -61,6 +61,26 @@ check("ResolveDump(DumpPage.Values[0])" in pt and "ResolveUpdate(UpdatePage.Valu
 check(re.search(r'Source: "\{code:UpdateSrc\}\\\*"; DestDir: "\{app\}\\game\\dev_hdd0\\game\\\{code:DiscTitleId\}"', t),
       "[Files] puts the update under the disc's title id")
 check("DiscTitleId('')" in func("BuildUpdate"), "BuildUpdate uses the disc's title id")
+# a decrypted ISO as the dump (pass 58): light page check (name + file), the verdict is firstrun_check's
+f = func("IsIsoPick")
+check("'.iso'" in f and "FileExists(Path)" in f and "not DirExists(Path)" in f and "CompareText(ExtractFileExt" in f,
+      "IsIsoPick: an existing file named *.iso")
+check("LoadStringFromFile" not in f and "TFileStream" not in f, "IsIsoPick does not read the 10 GB file")
+check("IsIsoPick(D) then Exit" in func("ResolveDump"), "ResolveDump leaves an ISO pick alone")
+check("IsIsoPick(Dir) then Exit" in func("DumpProblem") and "was not found" in func("DumpProblem"),
+      "DumpProblem accepts an ISO file, names a missing .iso")
+check("IsIsoPick(Dump) then Exit" in func("DiscIdOf"), "DiscIdOf is empty for an ISO (the id is read inside by firstrun)")
+check("UpdateIdProblem" in func("UpdateIdProblem") and "(DiscId <> '')" in func("UpdateIdProblem"),
+      "the update's id is compared only when the disc's id is known")
+check("CopyGameData and not IsIsoPick(DumpPage.Values[0])" in func("CopyDumpFolder"), "an ISO is not copied by [Files]")
+check(re.search(r'Source: "\{code:DumpSrc\}\\\*";[^\n]*Check: CopyDumpFolder', t), "[Files] dump copy uses CopyDumpFolder")
+check("not IsIsoPick(DumpPage.Values[0])" in func("BuildDump"), "BuildDump passes the ISO itself to firstrun.py")
+check("SfoField(AddBackslash(UpdatePage.Values[0])" in func("DiscTitleId"), "DiscTitleId falls back to the update's id for an ISO")
+f = func("DumpIsoClick")
+check("GetOpenFileName(" in f and "*.iso" in f, "Browse for ISO opens a file dialog filtered to *.iso")
+check("DumpIsoBtn.OnClick := @DumpIsoClick" in code and "DumpInfo.Top := DumpIsoBtn.Top" in code, "ISO button on the dump page")
+check("IsIsoPick(DumpPage.Values[0]) then begin" in nb and "less than 14 GB free" in nb, "dump page warns about disk space for an ISO")
+check("/DUMP=<dump folder or .iso>" in t, "silent /DUMP= documents .iso")
 braced = [c for c in re.findall(r"\{[^}]*\}", code) if "{" in c[1:] and not c.startswith("{#")]
 check(not braced, "no '{' inside a { } comment in [Code]")
 check(not [l for l in code.splitlines() if re.match(r"\s*#\d", l)], "no [Code] line starts with a #NN constant")

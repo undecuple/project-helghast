@@ -5,7 +5,7 @@ decrypted EBOOT and compiled on your machine. Nothing of the game is in this rep
 
 There are two ways to get a build:
 
-- **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.1<!-- /version --> pre-release.** It checks your disc dump and
+- **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.2<!-- /version --> pre-release.** It checks your disc dump and
   the 1.14 update, then lifts and compiles the game's code on your machine with a bundled compiler, behind one
   progress bar, with a full install log. Download it from the
   [releases page](https://github.com/undecuple/project-helghast/releases).
@@ -20,7 +20,7 @@ From your own copy of the game (details and sizes in [requirements.md](requireme
 
 | Item | Notes |
 |---|---|
-| Killzone 3, US disc **BCUS98234**, dumped as a decrypted folder | `PS3_GAME/USRDIR/data_ps3.psarc` and the rest of the disc. The EU disc (**BCES01007**) is accepted as an untested region (a player's report shows the same 1.14 EBOOT hash as the US version); other releases are not supported yet. The update goes under the same title id. |
+| Killzone 3, US disc **BCUS98234**, as a decrypted folder (PS3_GAME) or a decrypted ISO file | `PS3_GAME/USRDIR/data_ps3.psarc` and the rest of the disc. With an ISO the setup copies its game files (about 10 GB) into the install folder once; an encrypted ISO is refused. The EU disc (**BCES01007**) is accepted as an untested region (a player's report shows the same 1.14 EBOOT hash as the US version); other releases are not supported yet. The update goes under the same title id. |
 | Update **1.14** | Your own copy of the update; the port's target version. The PS3 emulator RPCS3 and its documentation are the usual place to learn how a PS3 update is installed. |
 | The **decrypted EBOOT** | `EBOOT.elf`, the decrypted form of the update's `EBOOT.BIN`, comes from your own copy of the game (this project provides no tools or instructions for it; the PS3 emulator RPCS3 and its documentation are the usual place people start). No PS3 firmware is needed. |
 

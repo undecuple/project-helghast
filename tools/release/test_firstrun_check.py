@@ -252,6 +252,67 @@ def main():
                 os.environ["OneDrive"] = old
         rc, out = run(["--dump", d, "--update", u] + small + hashes(got) + ["--root", "/x/OneDrive/p", "--build", "/x/b"])
         check("--root without OneDrive env passes", rc == 0 and "O1" not in out, out)
+
+        # decrypted ISO as --dump (iso_fixture.py builds tiny images): same D-codes from inside the image
+        from iso_fixture import build_iso
+        i = os.path.join(tmp, "iso")
+        os.makedirs(i)
+        sfo = os.path.join(i, "p.sfo")
+        write_sfo(sfo, {"APP_VER": "01.00", "CATEGORY": "DG", "TITLE": "Synthetic", "TITLE_ID": "BCUS98234", "VERSION": "01.01"})
+        sfo_bytes = open(sfo, "rb").read()
+        files = {"PS3_DISC.SFB": b".SFB" + b"\0" * 8, "PS3_GAME/PARAM.SFO": sfo_bytes,
+                 "PS3_GAME/USRDIR/EBOOT.BIN": fc.SELF_MAGIC + b"\0" * 60,
+                 "PS3_GAME/USRDIR/data_ps3.psarc": fc.PSARC_MAGIC + b"\0" * 6000}
+        iso = build_iso(os.path.join(i, "game.iso"), files, multi={"PS3_GAME/USRDIR/data_ps3.psarc": 2048})
+        rc, out = run(["--dump", iso, "--update", u] + small + hashes(got))
+        check("ISO: complete decrypted ISO passes", rc == 0 and "OK   D1:" in out and "OK   D3:" in out, out)
+        check("ISO: INFO line names the image", "dump: decrypted ISO game.iso" in out, out)
+        rc, out = run(["--dump", iso, "--update", u, "--json"] + small + hashes(got))
+        check("ISO: facts read from inside", json.loads(out)["facts"]["disc"]["TITLE_ID"] == "BCUS98234", out)
+        rc, out = run(["--dump", iso, "--update", u, "--min-psarc-bytes", "99999"] + hashes(got))
+        check("ISO: small psarc fails D3", rc == 1 and "FAIL D3" in out, out)
+        eu = dict(files)
+        write_sfo(sfo, {"APP_VER": "01.00", "CATEGORY": "DG", "TITLE": "Synthetic", "TITLE_ID": "BCES01007"})
+        eu["PS3_GAME/PARAM.SFO"] = open(sfo, "rb").read()
+        isoeu = build_iso(os.path.join(i, "eu.iso"), eu)
+        rc, out = run(["--dump", isoeu] + small + hashes(got))
+        check("ISO: EU id warns D1", "WARN D1" in out and "EU disc" in out, out)
+        write_sfo(sfo, {"APP_VER": "01.00", "CATEGORY": "DG", "TITLE": "Other", "TITLE_ID": "NPUB30001"})
+        eu["PS3_GAME/PARAM.SFO"] = open(sfo, "rb").read()
+        rc, out = run(["--dump", build_iso(os.path.join(i, "o.iso"), eu)] + small + hashes(got))
+        check("ISO: another title id fails D1", rc == 1 and "FAIL D1" in out and "NPUB30001" in out, out)
+        nofile = {k: v for k, v in files.items() if "psarc" not in k}
+        rc, out = run(["--dump", build_iso(os.path.join(i, "n.iso"), nofile)] + small + hashes(got))
+        check("ISO: no psarc fails D3", rc == 1 and "FAIL D3" in out and "no PS3_GAME/USRDIR/data_ps3.psarc" in out, out)
+        rc, out = run(["--dump", build_iso(os.path.join(i, "e.iso"), {"PS3_DISC.SFB": b"x"})] + small + hashes(got))
+        check("ISO: no PARAM.SFO fails D1", rc == 1 and "FAIL D1" in out, out)
+        # encrypted: files whose magic is wrong
+        scrambled = dict(files)
+        scrambled["PS3_GAME/USRDIR/data_ps3.psarc"] = bytes(range(200)) * 30
+        rc, out = run(["--dump", build_iso(os.path.join(i, "s.iso"), scrambled)] + small + hashes(got))
+        check("ISO: unreadable files are 'encrypted' (I1)", rc == 1 and "FAIL I1: this ISO is encrypted; use a decrypted dump" in out, out)
+        scrambled = dict(files)
+        scrambled["PS3_GAME/PARAM.SFO"] = bytes(range(100))
+        rc, out = run(["--dump", build_iso(os.path.join(i, "s2.iso"), scrambled)] + small + hashes(got))
+        check("ISO: unreadable PARAM.SFO is 'encrypted' (I1)", rc == 1 and "FAIL I1" in out, out)
+        # region table in sector 0, no volume descriptor
+        reg = bytearray(2048 * 40)
+        reg[0:4] = struct.pack(">I", 2)
+        reg[8:24] = struct.pack(">IIII", 0, 15, 16, 30)
+        open(os.path.join(i, "r.iso"), "wb").write(bytes(reg))
+        rc, out = run(["--dump", os.path.join(i, "r.iso")] + small + hashes(got))
+        check("ISO: region table image is I1", rc == 1 and "FAIL I1" in out, out)
+        # not an ISO, truncated
+        open(os.path.join(i, "x.iso"), "wb").write(b"hello" * 100000)
+        rc, out = run(["--dump", os.path.join(i, "x.iso")] + small + hashes(got))
+        check("ISO: not an ISO is I2, not 'encrypted'", rc == 1 and "FAIL I2" in out and "I1" not in out, out)
+        data = open(iso, "rb").read()
+        open(os.path.join(i, "t.iso"), "wb").write(data[:len(data) - 3000])
+        rc, out = run(["--dump", os.path.join(i, "t.iso")] + small + hashes(got))
+        check("ISO: truncated image fails D3", rc == 1 and "FAIL D3" in out and "truncated" in out, out)
+        # a folder still works and has no ISO line
+        rc, out = run(["--dump", d, "--update", u] + small + hashes(got))
+        check("folder dump: no ISO line", "decrypted ISO" not in out, out)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"firstrun_check: {'PASS' if not FAILS else 'FAIL ' + ', '.join(FAILS)}")

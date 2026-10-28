@@ -7,7 +7,7 @@ a scrub and a manifest. Standard library only, Python 3.8+.
     assemble_payload.py --dry-run [--repo DIR] [--toolchain CACHE] [--fonts DIR]
 
 What goes in (the allowlist, RULES below; nothing else is ever copied):
-  kz3-setup/      tools/release/{firstrun,firstrun_check,version_check,crash_report,launch,lift_fixups,names}.py, eboot_sha256.json and the lift tools
+  kz3-setup/      tools/release/{firstrun,firstrun_check,iso9660,version_check,crash_report,launch,lift_fixups,names}.py, eboot_sha256.json and the lift tools
                   firstrun.py calls
                   (tools/jobmods.py, tools/elf_info.py, tools/spu/{lift_spu,gen_spu_register,kz3ver}.py)
   re/data/        the three SPU seed/map tables the SPU lift reads (recovered numbers)
@@ -68,6 +68,7 @@ TOOLKIT = "work/ps3recomp-patched"  # "/" on every OS: it is printed, matched in
 RULES = [
     ("tools/release/firstrun.py", "kz3-setup/release/firstrun.py", "file", {}),
     ("tools/release/firstrun_check.py", "kz3-setup/release/firstrun_check.py", "file", {}),
+    ("tools/release/iso9660.py", "kz3-setup/release/iso9660.py", "file", {}),   # firstrun: a decrypted disc ISO as the game source
     ("tools/release/version_check.py", "kz3-setup/release/version_check.py", "file", {}),
     ("tools/release/crash_report.py", "kz3-setup/release/crash_report.py", "file", {}),
     ("tools/release/launch.py", "kz3-setup/release/launch.py", "file", {}),

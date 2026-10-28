@@ -19,7 +19,11 @@
 ; the latest-release JSON; a newer release opens its page in the browser only on a second click; offline = one line
 ; in the log. The finish page and the build-error dialog offer "Open log" and "Report a problem" (the issues page).
 ;
-; Silent installs: /VERYSILENT /SUPPRESSMSGBOXES [/DUMP=<dump> /UPDATE=<update folder> [/EBOOT=<EBOOT.elf>]].
+; The disc dump is a folder (holds PS3_GAME) or a decrypted disc ISO file (.iso): for an ISO the page checks only the
+; name and that the file exists; firstrun.py's first step reads the disc inside it (firstrun_check.py, iso9660.py),
+; copies the game files out into {app}\game\disc and builds from there.
+;
+; Silent installs: /VERYSILENT /SUPPRESSMSGBOXES [/DUMP=<dump folder or .iso> /UPDATE=<update folder> [/EBOOT=<EBOOT.elf>]].
 ; The game folders come from these parameters, else the earlier install's recorded folders, else its build\paths.json;
 ; none known = the files are installed and the first start of the launcher asks for them (one log line, exit code 0);
 ; a folder given or recorded that fails the presence check, or only some of them, = nothing installed, one log line,
@@ -33,7 +37,7 @@
 ; site's palette and fonts; our own artwork); native controls, no skin add-on. Texts in the site's voice: short, direct.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.1"
+  #define AppVersion "0.1.2"
 #endif
 #ifndef Payload
   ; ASSUMPTION: where the payload assembly will put the tree
@@ -117,6 +121,10 @@ DefaultDirName={localappdata}\Programs\{#AppDirName}
 DisableDirPage=no
 ; Browse appends the app's own folder name; the Pascal code below keeps the last folder name ours (uninstall removes {app})
 AppendDefaultDirName=yes
+; File times are stored in UTC and converted to the player's time zone on install. Inno's default keeps the compile
+; machine's local time as is: the release builder runs in UTC, so a player west of UTC got every source file dated hours
+; in the future and ninja stopped with "manifest 'build.ninja' still dirty after 100 tries" (a player's log, 2026-10-28).
+TimeStampsInUTC=yes
 DefaultGroupName={#AppDirName}
 DisableProgramGroupPage=yes
 ; The Start-menu folder follows the current name, not a previous install's (after a rename)
@@ -222,7 +230,7 @@ Source: "{#FontDir}\Rajdhani-Bold.ttf"; Flags: dontcopy
 ; Advanced: "Copy the game files into the install" (opt-in, ~33 GB) with Inno's own progress, so the
 ; originals may go. The update keeps RPCS3's dev_hdd0\game\<disc title id> layout (BCUS98234, or BCES01007 for the EU disc) (launch.rpcs3_hdd0). Never removed
 ; by the uninstaller on its own: it asks (CurUninstallStepChanged), the copy may be the player's only one.
-Source: "{code:DumpSrc}\*"; DestDir: "{app}\game\disc"; Flags: external recursesubdirs createallsubdirs ignoreversion uninsneveruninstall; Check: CopyGameData
+Source: "{code:DumpSrc}\*"; DestDir: "{app}\game\disc"; Flags: external recursesubdirs createallsubdirs ignoreversion uninsneveruninstall; Check: CopyDumpFolder
 Source: "{code:UpdateSrc}\*"; DestDir: "{app}\game\dev_hdd0\game\{code:DiscTitleId}"; Flags: external recursesubdirs createallsubdirs ignoreversion uninsneveruninstall; Check: CopyGameData
 Source: "{code:EbootSrc}"; DestDir: "{app}\game"; DestName: "EBOOT.elf"; Flags: external ignoreversion uninsneveruninstall; Check: CopyEbootFile
 
@@ -260,9 +268,8 @@ Filename: "{app}\kz3-install.ini"; Section: "shaders"; Key: "prepare"; String: "
 ; Crash reports (Advanced page, opt-in): the switch (report=1 only when ticked)
 Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "report"; String: "1"; Check: CrashOn
 Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "report"; String: "0"; Check: not CrashOn
-; the build's address always (the launcher's "Crash reports on or off" can turn reports on later); empty in a build
-; without one, and then nothing can be turned on. report=1 is the only switch that sends.
-Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "dsn"; String: "{#CrashDSN}"
+; The build's address (crash dsn) is written from [Code] (CurStepChanged, WriteCrashDsn), not here: Inno's setup log
+; prints every [INI] value, and players attach that log to public bug reports.
 
 [Icons]
 Name: "{group}\{#AppDirName}"; Filename: "{app}\{#LauncherExe}"; WorkingDir: "{app}"
@@ -339,7 +346,7 @@ var
   FmaCombo, MemCombo, WinCombo, LangCombo: TNewComboBox;
   EbootPage: TInputFileWizardPage;
   BuildOK, BuildStopped: Boolean;
-  StopBtn, FontBrowse: TNewButton;
+  StopBtn, FontBrowse, DumpIsoBtn: TNewButton;
   StopFile: String;
   OurLog: String;
   CheckBtn, ReleaseBtn: TNewButton;
@@ -516,6 +523,15 @@ begin
   Result := CompareText(ExtractFileName(RemoveBackslashUnlessRoot(Dir)), Name) = 0;
 end;
 
+{ The pick is a decrypted disc ISO: an existing file whose name ends in .iso. The page does not open it (Pascal here
+  cannot seek in a 10 GB file); firstrun_check.py reads the image's PARAM.SFO, EBOOT.BIN and data_ps3.psarc in the
+  first build step and says "this ISO is encrypted; use a decrypted dump" or what else is wrong }
+function IsIsoPick(Path: String): Boolean;
+begin
+  Path := Trim(Path);
+  Result := (Path <> '') and (CompareText(ExtractFileExt(Path), '.iso') = 0) and FileExists(Path) and not DirExists(Path);
+end;
+
 { A pick of PS3_GAME or PS3_GAME\USRDIR (one or two levels too deep) becomes the folder that holds PS3_GAME }
 function ResolveDump(Dir: String): String;
 var
@@ -523,6 +539,7 @@ var
 begin
   D := RemoveBackslashUnlessRoot(Trim(Dir));
   Result := D;
+  if IsIsoPick(D) then Exit;
   if (D = '') or FileExists(AddBackslash(D) + 'PS3_GAME\PARAM.SFO') then Exit;
   if EndsWithName(D, 'USRDIR') and EndsWithName(ExtractFileDir(D), 'PS3_GAME') then D := ExtractFileDir(D);
   if EndsWithName(D, 'PS3_GAME') then begin
@@ -598,6 +615,8 @@ end;
 
 function DiscIdOf(Dump: String): String;
 begin
+  Result := '';
+  if IsIsoPick(Dump) then Exit;      { an ISO: the id is read inside the image by the first build step }
   Result := SfoField(AddBackslash(Dump) + 'PS3_GAME\PARAM.SFO', 'TITLE_ID');
 end;
 
@@ -605,6 +624,9 @@ end;
 function DiscTitleId(Param: String): String;
 begin
   Result := DiscIdOf(DumpPage.Values[0]);
+  { an ISO: the update's own id (the build step checks that it is the disc's) }
+  if (Result = '') and IsIsoPick(DumpPage.Values[0]) then
+    Result := SfoField(AddBackslash(UpdatePage.Values[0]) + 'PARAM.SFO', 'TITLE_ID');
   if RegionOf(Result) = '' then Result := 'BCUS98234';
 end;
 
@@ -613,9 +635,12 @@ function DumpProblem(Dir: String; var Id: String): String;
 begin
   Id := '';
   Result := '';
-  if not FileExists(AddBackslash(Dir) + 'PS3_GAME\PARAM.SFO') then
+  if IsIsoPick(Dir) then Exit
+  else if (CompareText(ExtractFileExt(Dir), '.iso') = 0) and not DirExists(Dir) then
+    Result := 'The ISO file ' + Dir + ' was not found.'
+  else if not FileExists(AddBackslash(Dir) + 'PS3_GAME\PARAM.SFO') then
     Result := 'This folder does not look like a Killzone 3 disc dump: PS3_GAME\PARAM.SFO is missing. Select the ' +
-      'folder that holds PS3_GAME (picking PS3_GAME itself also works).'
+      'folder that holds PS3_GAME (picking PS3_GAME itself also works), or a decrypted .iso file.'
   else begin
     Id := DiscIdOf(Dir);
     if Id = '' then
@@ -854,6 +879,12 @@ begin
   Result := IsAdvanced and CopyDataChk.Checked;
 end;
 
+{ The dump folder is copied by Inno; an ISO is not (firstrun.py extracts it into the same game\disc folder) }
+function CopyDumpFolder: Boolean;
+begin
+  Result := CopyGameData and not IsIsoPick(DumpPage.Values[0]);
+end;
+
 function CrashOn: Boolean;
 begin
   Result := IsAdvanced and CrashChk.Enabled and CrashChk.Checked;
@@ -888,7 +919,8 @@ end;
 { The game paths firstrun.py gets: the picked folders, or their copies in the install }
 function BuildDump: String;
 begin
-  if CopyGameData then Result := ExpandConstant('{app}\game\disc') else Result := DumpPage.Values[0];
+  if CopyGameData and not IsIsoPick(DumpPage.Values[0]) then Result := ExpandConstant('{app}\game\disc')
+  else Result := DumpPage.Values[0];
 end;
 
 function BuildUpdate: String;
@@ -907,12 +939,25 @@ begin
 end;
 
 { The page names what it found in the picked folder (the title id), so a wrong pick is clear before Next }
+procedure DumpIsoClick(Sender: TObject);
+var
+  F: String;
+begin
+  F := DumpPage.Values[0];
+  if not IsIsoPick(F) then F := '';
+  if GetOpenFileName('Pick your decrypted Killzone 3 disc image', F, '', 'ISO images (*.iso)|*.iso|All files|*.*', 'iso') then
+    DumpPage.Values[0] := F;
+end;
+
 procedure DumpEditChange(Sender: TObject);
 var
   D, Id: String;
 begin
   D := ResolveDump(DumpPage.Values[0]);
   if Trim(D) = '' then DumpInfo.Caption := ''
+  else if IsIsoPick(D) then
+    DumpInfo.Caption := 'ISO image ' + ExtractFileName(D) + '. Setup checks the disc inside it when the build starts, ' +
+      'then copies its game files (about 10 GB) into the install folder.'
   else if DumpProblem(D, Id) = '' then begin
     if RegionOf(Id) = 'EU' then DumpInfo.Caption := 'Found: ' + Id + ' (EU disc, untested region)'
     else DumpInfo.Caption := 'Found: ' + Id + ' (US disc)';
@@ -930,13 +975,22 @@ begin
     'shaders, cleanup');
   DumpPage := CreateInputDirPage(wpSelectTasks, 'Your disc dump',
     'Killzone 3, US disc (BCUS98234; the EU disc BCES01007 is untested), decrypted.',
-    'Pick the folder that holds PS3_GAME (picking PS3_GAME itself also works). Setup never changes it, and reads it in place unless you choose to copy ' +
-    'it (Advanced).', False, '');
-  DumpPage.Add('Disc dump folder (holds PS3_GAME):');
+    'Pick the folder that holds PS3_GAME (picking PS3_GAME itself also works), or a decrypted .iso file. Setup never ' +
+    'changes it, and reads a folder in place unless you choose to copy it (Advanced); the files of an ISO are copied ' +
+    'out of it into the install folder (about 10 GB).', False, '');
+  DumpPage.Add('Disc dump folder (holds PS3_GAME) or decrypted ISO file:');
+  DumpIsoBtn := TNewButton.Create(DumpPage);
+  DumpIsoBtn.Parent := DumpPage.Surface;
+  DumpIsoBtn.Left := 0;
+  DumpIsoBtn.Top := DumpPage.Edits[0].Top + DumpPage.Edits[0].Height + ScaleY(8);
+  DumpIsoBtn.Width := ScaleX(150);
+  DumpIsoBtn.Height := ScaleY(24);
+  DumpIsoBtn.Caption := 'Browse for &ISO file...';
+  DumpIsoBtn.OnClick := @DumpIsoClick;
   DumpInfo := TNewStaticText.Create(DumpPage);
   DumpInfo.Parent := DumpPage.Surface;
   DumpInfo.Left := 0;
-  DumpInfo.Top := DumpPage.Edits[0].Top + DumpPage.Edits[0].Height + ScaleY(10);
+  DumpInfo.Top := DumpIsoBtn.Top + DumpIsoBtn.Height + ScaleY(10);
   DumpInfo.AutoSize := False;
   DumpInfo.WordWrap := True;
   DumpInfo.Width := DumpPage.SurfaceWidth;
@@ -1027,6 +1081,9 @@ function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoType
 begin
   if CopyGameData then
     Result := MemoDirInfo + NewLine + NewLine + 'Your game files (copied into the install, about 33 GB):' + NewLine
+  else if IsIsoPick(DumpPage.Values[0]) then
+    Result := MemoDirInfo + NewLine + NewLine +
+      'Your game files (the ISO''s files are copied into the install, about 10 GB; the update is read in place):' + NewLine
   else
     Result := MemoDirInfo + NewLine + NewLine + 'Your game files (read in place, never copied):' + NewLine;
   Result := Result +
@@ -1179,7 +1236,16 @@ begin
       MsgBox(Problem, mbError, MB_OK);
       Result := False;
     end else begin
-      Log('disc dump: ' + DumpPage.Values[0] + ', TITLE_ID ' + D + ' (' + RegionOf(D) + ')');
+      if IsIsoPick(DumpPage.Values[0]) then begin
+        Log('disc dump: decrypted ISO ' + DumpPage.Values[0] + ' (read by the build''s first step)');
+        { the copy out of the ISO: about 10 GB for the game files, room for the build }
+        if GetSpaceOnDisk64(ExtractFileDrive(WizardDirValue), FreeB, TotalB) and
+           (FreeB < Int64(14) * 1024 * 1024 * 1024) then
+          Result := MsgBox('The install folder''s drive has less than 14 GB free; copying the game files out of the ' +
+            'ISO needs about 10 GB and the build about 4 GB more. Go on anyway?', mbConfirmation,
+            MB_YESNO or MB_DEFBUTTON2) = IDYES;
+      end else
+        Log('disc dump: ' + DumpPage.Values[0] + ', TITLE_ID ' + D + ' (' + RegionOf(D) + ')');
       if (RegionOf(D) = 'EU') and (not EuNoted) then begin
         EuNoted := True;
         MsgBox('EU disc (BCES01007): untested region. A player''s report shows the same 1.14 EBOOT as the US ' +
@@ -1258,7 +1324,7 @@ begin
     Exit;
   end;
   Missing := '';
-  if DumpPage.Values[0] = '' then Missing := '/DUMP= (the disc dump folder)'
+  if DumpPage.Values[0] = '' then Missing := '/DUMP= (the disc dump folder or ISO)'
   else if UpdatePage.Values[0] = '' then Missing := '/UPDATE= (the 1.14 update folder)';
   if Missing <> '' then
     Result := 'Silent install stopped: ' + Missing + ' is missing; give /DUMP= and /UPDATE= (and /EBOOT= when the ' +
@@ -1442,8 +1508,17 @@ begin
   SaveStringsToFile(InstallLogPath(''), Lines, True);
 end;
 
+{ The build's crash-report address, always written (the launcher's "Crash reports on or off" can turn reports on
+  later; empty in a build without one, and then nothing can be turned on; report=1 is the only switch that sends).
+  Written here, not in [INI], so the setup log never shows it: Inno logs each [INI] value. }
+procedure WriteCrashDsn;
+begin
+  SetIniString('crash', 'dsn', '{#CrashDSN}', ExpandConstant('{app}\kz3-install.ini'));
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
+  if CurStep = ssPostInstall then WriteCrashDsn;
   if (CurStep = ssPostInstall) and WizardIsTaskSelected('buildnow') then begin
     if SilentNoBuild then Log('silent install: build skipped (no game folders); the first start of {#AppDirName} builds')
     else RunBuild;

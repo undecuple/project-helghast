@@ -20,7 +20,7 @@
 *Helghast* is the name of the game's own faction; Project Helghast is a fan project, not official and not
 affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games.
 
-You need your own Killzone 3 disc dump, the 1.14 update and a decrypted EBOOT from your own copy. Version <!-- version -->0.1.1<!-- /version --> is a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
+You need your own Killzone 3 disc dump (a folder with PS3_GAME, or a decrypted ISO), the 1.14 update and a decrypted EBOOT from your own copy. Version <!-- version -->0.1.2<!-- /version --> is a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 A PC port of **Killzone 3** (PS3, 2011) made by **static recompilation**: the game's PowerPC (PPU) and Cell SPU
 code is translated to C ahead of time and compiled into a native Windows x64 program, so no CPU emulator runs at
@@ -105,7 +105,7 @@ Start-menu "Open saves folder" entry say which rule decided, for example `data: 
 
 ## Getting it
 
-**Download:** <!-- version -->[v0.1.1](https://github.com/undecuple/project-helghast/releases/tag/v0.1.1)<!-- /version --> is a pre-release (partly
+**Download:** <!-- version -->[v0.1.2](https://github.com/undecuple/project-helghast/releases/tag/v0.1.2)<!-- /version --> is a pre-release (partly
 playable). Get `Project-Helghast-setup.exe` (recommended) or the portable zip from the
 [releases page](https://github.com/undecuple/project-helghast/releases) and check it against `SHA256SUMS`. The installer
 checks your own disc dump, 1.14 update and decrypted EBOOT, then recompiles and builds the game's code on your own
@@ -119,7 +119,7 @@ caches would land in the wrong folder) or your launch settings, and it does not 
 
 ## Requirements
 
-See [docs/requirements.md](docs/requirements.md): the US disc (BCUS98234) dumped as a folder (the EU disc, BCES01007, is accepted as an untested region; other releases are not supported yet), the 1.14 update,
+See [docs/requirements.md](docs/requirements.md): the US disc (BCUS98234) as a decrypted dump, a folder (PS3_GAME) or an ISO file (the EU disc, BCES01007, is accepted as an untested region; other releases are not supported yet), the 1.14 update,
 the decrypted EBOOT of your own copy (no firmware needed; this project doesn't provide decryption tools or instructions; the PS3 emulator RPCS3 and its documentation are the usual place people start), and a Direct3D 12 GPU. Hardware figures are provisional until
 the game runs at speed.
 

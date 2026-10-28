@@ -6,7 +6,10 @@ file sizes.
 
     firstrun_check.py --dump DIR [--update DIR] [--eboot FILE] [--json] [--min-psarc-bytes N] [--hashes FILE]
 
-  --dump    the decrypted disc dump folder (holds PS3_GAME/PARAM.SFO)
+  --dump    the decrypted disc dump folder (holds PS3_GAME/PARAM.SFO), or a decrypted disc ISO file (a file, not a
+            folder): then PARAM.SFO, EBOOT.BIN and data_ps3.psarc are read from inside the image (iso9660.py) with the
+            same D1-D3 checks plus an INFO line "dump: decrypted ISO <name>". I1 FAIL: the ISO is encrypted ("this ISO is
+            encrypted; use a decrypted dump"); I2 FAIL: the ISO cannot be read (not an ISO, damaged, truncated).
   --update  the installed 1.14 update folder, where a PS3 or RPCS3 keeps it: .../dev_hdd0/game/<title id>
             (BCUS98234 or, untested, BCES01007; its TITLE_ID must be the disc's; holds PARAM.SFO and USRDIR/EBOOT.BIN)
   --eboot   the decrypted EBOOT (an ELF); default: <update>/USRDIR/EBOOT.elf, else <dump>/PS3_GAME/USRDIR/EBOOT.elf
@@ -56,7 +59,11 @@ HASHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eboot_sh
 
 def read_sfo(path):
     """PARAM.SFO -> dict (same decoder as tools/disc_info.py)."""
-    d = open(path, "rb").read()
+    return parse_sfo(open(path, "rb").read())
+
+
+def parse_sfo(d):
+    """The bytes of a PARAM.SFO -> dict."""
     if d[:4] != b"\0PSF":
         raise ValueError("not a PARAM.SFO (bad magic)")
     _, _, kt, dt, n = struct.unpack("<4sIIII", d[:20])
@@ -110,7 +117,9 @@ def check_onedrive_tree(r, root, build, env=None):
 def game_files(dump, update, eboot):
     """The files the build reads."""
     f = []
-    if dump:
+    if dump and os.path.isfile(dump):
+        f.append(dump)
+    elif dump:
         u = os.path.join(dump, "PS3_GAME", "USRDIR")
         f += [os.path.join(dump, "PS3_GAME", "PARAM.SFO"), os.path.join(u, "EBOOT.BIN"),
               os.path.join(u, "data_ps3.psarc")]
@@ -179,6 +188,10 @@ def check_sfo(r, path, code, what, expect=None):
     except (ValueError, struct.error, IndexError) as e:
         r.fail(code, f"{what}: PARAM.SFO unreadable ({e})")
         return None
+    return sfo_report(r, sfo, code, what, expect)
+
+
+def sfo_report(r, sfo, code, what, expect=None):
     tid = sfo.get("TITLE_ID")
     if tid not in TITLE_IDS:
         r.fail(code, f"{what}: TITLE_ID is {tid!r}, not Killzone 3 (US {TITLE_ID} or, untested, EU BCES01007)")
@@ -194,15 +207,24 @@ def check_sfo(r, path, code, what, expect=None):
 
 def check_dump(r, dump, min_psarc):
     sfo = check_sfo(r, os.path.join(dump, "PS3_GAME", "PARAM.SFO"), "D1", "disc dump")
+    eboot = os.path.join(dump, "PS3_GAME", "USRDIR", "EBOOT.BIN")
+    psarc = os.path.join(dump, "PS3_GAME", "USRDIR", "data_ps3.psarc")
+    dump_files(r, sfo,
+               (os.path.getsize(eboot), head(eboot, 4)) if os.path.isfile(eboot) else None,
+               (os.path.getsize(psarc), head(psarc, 4)) if os.path.isfile(psarc) else None, min_psarc)
+
+
+def dump_files(r, sfo, eboot, psarc, min_psarc, psarc_cut=False):
+    """D1 facts and the D2 / D3 checks from what was read: eboot / psarc = (size, first four bytes) or None (absent).
+    psarc_cut: the file's bytes reach past the end of its (ISO) image."""
     if sfo:
         r.facts["disc"] = {k: sfo.get(k) for k in ("TITLE_ID", "TITLE", "VERSION", "APP_VER", "CATEGORY")}
         if sfo.get("CATEGORY") != "DG":
             r.warn("D1", f"disc dump: CATEGORY {sfo.get('CATEGORY')!r}, a disc game is 'DG' (an installed copy?)")
-    eboot = os.path.join(dump, "PS3_GAME", "USRDIR", "EBOOT.BIN")
-    if not os.path.isfile(eboot):
+    if eboot is None:
         r.fail("D2", "disc dump: no PS3_GAME/USRDIR/EBOOT.BIN (dump incomplete)")
     else:
-        magic, size = head(eboot, 4), os.path.getsize(eboot)
+        size, magic = eboot
         r.facts["disc_eboot_bin"] = {"size": size, "magic": magic.hex()}
         if magic == SELF_MAGIC:
             r.ok("D2", f"disc EBOOT.BIN is an encrypted SELF ({size:,} bytes; expected: the disc one is never used directly)")
@@ -212,18 +234,58 @@ def check_dump(r, dump, min_psarc):
             r.fail("D2", f"disc EBOOT.BIN has magic {magic!r}: neither SELF nor ELF (bad dump)")
         if magic == SELF_MAGIC and size != DISC_EBOOT_BIN_SIZE:
             r.warn("D2", f"disc EBOOT.BIN is {size:,} bytes, the US disc's is {DISC_EBOOT_BIN_SIZE:,} (another version?)")
-    psarc = os.path.join(dump, "PS3_GAME", "USRDIR", "data_ps3.psarc")
-    if not os.path.isfile(psarc):
+    if psarc is None:
         r.fail("D3", "disc dump: no PS3_GAME/USRDIR/data_ps3.psarc (the game's data archive)")
     else:
-        magic, size = head(psarc, 4), os.path.getsize(psarc)
+        size, magic = psarc
         r.facts["psarc"] = {"size": size}
-        if magic != PSARC_MAGIC:
+        if psarc_cut:
+            r.fail("D3", f"data_ps3.psarc ({size:,} bytes) reaches past the end of the ISO file: the ISO looks truncated")
+        elif magic != PSARC_MAGIC:
             r.fail("D3", f"data_ps3.psarc does not start with PSAR (magic {magic!r}): not a PSARC, or still encrypted")
         elif size < min_psarc:
             r.fail("D3", f"data_ps3.psarc is {size:,} bytes, less than {min_psarc:,}: the dump looks truncated")
         else:
             r.ok("D3", f"data_ps3.psarc present ({size / 2**30:.2f} GiB)")
+
+
+ISO_ENCRYPTED = "this ISO is encrypted; use a decrypted dump"
+
+
+def check_dump_iso(r, path, min_psarc):
+    """The same D1-D3 from inside a decrypted ISO (iso9660.py). I1 FAIL = encrypted (the file table or the files are
+    unreadable: no volume descriptor behind a region table, or a file whose first bytes are not its format's magic),
+    I2 FAIL = the image cannot be read (not an ISO, damaged, truncated)."""
+    import iso9660
+    r.ok("D0", f"INFO: dump: decrypted ISO {os.path.basename(path)}")
+    try:
+        with iso9660.Iso(path) as im:
+            sfo, info, cut = None, {}, False
+            se = im.lookup("PS3_GAME/PARAM.SFO")
+            if se is None or se.is_dir or not im.in_image(se):
+                r.fail("D1", "disc dump: no PS3_GAME/PARAM.SFO inside the ISO")
+            else:
+                im.check_magic("PS3_GAME/PARAM.SFO", b"\0PSF")
+                try:
+                    sfo = sfo_report(r, parse_sfo(im.read("PS3_GAME/PARAM.SFO")), "D1", "disc dump")
+                except (ValueError, struct.error, IndexError) as e:
+                    r.fail("D1", f"disc dump: PARAM.SFO unreadable ({e})")
+            for key, rel in (("eboot", "PS3_GAME/USRDIR/EBOOT.BIN"), ("psarc", "PS3_GAME/USRDIR/data_ps3.psarc")):
+                e = im.lookup(rel)
+                if e is None or e.is_dir:
+                    info[key] = None
+                    continue
+                inside = im.in_image(e)
+                if key == "psarc":
+                    cut = not inside
+                info[key] = (e.size, im.read(rel, 4) if inside else b"")
+                if inside and info[key][1] not in ((SELF_MAGIC, ELF_MAGIC) if key == "eboot" else (PSARC_MAGIC,)):
+                    raise iso9660.IsoEncrypted(ISO_ENCRYPTED)
+            dump_files(r, sfo, info.get("eboot"), info.get("psarc"), min_psarc, cut and bool(info.get("psarc")))
+    except iso9660.IsoEncrypted:
+        r.fail("I1", ISO_ENCRYPTED)
+    except iso9660.IsoError as e:
+        r.fail("I2", f"disc ISO unreadable: {e}")
 
 
 def check_update(r, upd, disc_id=None):
@@ -329,10 +391,13 @@ def main(argv=None):
     r = Report()
     check_onedrive_tree(r, a.root, a.build)
     # before anything is read: opening an online-only placeholder would start a download of the 9 GB archive
-    if check_online_only(r, a.dump if os.path.isdir(a.dump) else "", a.update if a.update and os.path.isdir(a.update) else "",
+    iso = os.path.isfile(a.dump)     # a decrypted disc ISO instead of a folder
+    if check_online_only(r, a.dump if os.path.exists(a.dump) else "", a.update if a.update and os.path.isdir(a.update) else "",
                          a.eboot or ""):
         return finish(r, a)
-    if not os.path.isdir(a.dump):
+    if iso:
+        check_dump_iso(r, a.dump, a.min_psarc_bytes)
+    elif not os.path.isdir(a.dump):
         r.fail("D0", f"dump folder not found: {a.dump}")
     else:
         check_dump(r, a.dump, a.min_psarc_bytes)
@@ -347,7 +412,9 @@ def main(argv=None):
     if not elf:
         # RPCS3 writes EBOOT.elf next to EBOOT.BIN; a dump decrypted some other way may hold an ELF as EBOOT.BIN.
         cand = [os.path.join(a.update, "USRDIR", n) for n in ("EBOOT.elf", "EBOOT.BIN")] if a.update else []
-        cand += [os.path.join(a.dump, "PS3_GAME", "USRDIR", n) for n in ("EBOOT.elf", "EBOOT.BIN")]
+        if not iso:
+            cand += [os.path.join(a.dump, "PS3_GAME", "USRDIR", n) for n in ("EBOOT.elf", "EBOOT.BIN")]
+        cand = cand or [os.path.join(os.path.dirname(a.dump), "EBOOT.elf")]
         elf = next((c for c in cand if os.path.isfile(c) and head(c, 4) == ELF_MAGIC), cand[0])
     check_eboot_elf(r, elf, a.target)
     check_eboot_hash(r, elf, a.hashes)
