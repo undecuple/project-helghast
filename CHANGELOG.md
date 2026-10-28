@@ -3,6 +3,11 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
+## [0.1.1] - 2026-10-27 (pre-release)
+
+### Added
+- Opt-in crash reports: when turned on (installer, Advanced page, or "Crash reports on or off" in the Start menu), the launcher sends one scrubbed report after a crash; never a memory dump, never a crash from before you turned it on.
+
 ## [0.1.0] - 2026-10-27 (pre-release)
 
 First published release: a Windows installer and a portable zip that check your own disc dump and 1.14 update, then

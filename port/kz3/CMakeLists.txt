@@ -2,7 +2,7 @@
 # Lifted code: work/recomp (tools/lift.sh, not committed). Toolkit: third_party/ps3recomp (pinned).
 cmake_minimum_required(VERSION 3.20)
 project(kz3
-    VERSION 0.1.0
+    VERSION 0.1.1
     LANGUAGES C CXX
     DESCRIPTION "Recompiled PS3 game project (ps3recomp)"
 )
