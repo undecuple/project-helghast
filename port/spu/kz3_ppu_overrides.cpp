@@ -579,8 +579,8 @@ void schedule(ppu_context* ctx, FiberSched* fs)
                 uint32_t wid = q.valid ? q.wid : 0;
                 uint32_t old = kz3_spurs_ready_kick(wid, 8);
                 g_fiber_rekicks++;
-                fprintf(stderr, "[fiber] stall workaround 1 after %.1f s: ReadyCountSwap(wid %u, 8) re-issued (old %u); re-kicks so far %llu\n",
-                        t - brk.t0, wid, old, g_fiber_rekicks);
+                fprintf(stderr, "[fiber] S=0x%08X stall workaround 1 after %.1f s: ReadyCountSwap(wid %u, 8) re-issued (old %u); re-kicks so far %llu\n",
+                        S, t - brk.t0, wid, old, g_fiber_rekicks);
             }
             if (ds && (act & KZ3_DS_COMPLETE)) {
                 /* KZ3_FIBER_COMPLETE=1 opts in (RE pass 70: the preferred way out is the runtime's run budget,
@@ -590,15 +590,15 @@ void schedule(ppu_context* ctx, FiberSched* fs)
                     uint32_t sl = S + kSlot0 + i * kSlotSize, w = gr32(sl);
                     if (!gr32(sl + 4) || !w || kz3_ds_classify(w, fs->wait_lr[i], nullptr) == KZ3_STALL_OTHER) continue;
                     if (!complete_on) {
-                        fprintf(stderr, "[fiber] stall workaround 2 after %.1f s: would write the completion value *0x%08X = 0x%X for slot %u "
+                        fprintf(stderr, "[fiber] S=0x%08X stall workaround 2 after %.1f s: would write the completion value *0x%08X = 0x%X for slot %u "
                                 "(KZ3_FIBER_COMPLETE=1 enables it; loses this entity's push-buffer section for one frame)\n",
-                                t - brk.t0, w, gr32(sl + 0x14), i);
+                                S, t - brk.t0, w, gr32(sl + 0x14), i);
                         continue;
                     }
                     g_fiber_completions++;
-                    fprintf(stderr, "[fiber] stall workaround 2 after %.1f s: writing the completion value *0x%08X = 0x%X for slot %u "
+                    fprintf(stderr, "[fiber] S=0x%08X stall workaround 2 after %.1f s: writing the completion value *0x%08X = 0x%X for slot %u "
                             "(was 0x%X; this entity's push-buffer section is lost for one frame); completions so far %llu\n",
-                            t - brk.t0, w, gr32(sl + 0x14), i, gr32(w), g_fiber_completions);
+                            S, t - brk.t0, w, gr32(sl + 0x14), i, gr32(w), g_fiber_completions);
                     gw32(w, gr32(sl + 0x14));
                 }
                 continue;   /* the scheduler's own check resumes the fibers */
@@ -632,11 +632,11 @@ static void kz3_fiber_run_all(ppu_context* ctx)
     const uint32_t count = list ? gr32(list) : 0, entries = list ? gr32(list + 4) : 0;
     g_fiber_runs++;
     if (flog())
-        fprintf(stderr, "[fiber] run_all #%llu S=0x%08X list=0x%08X count=%u entries=0x%08X first={0x%08X,0x%08X} lr=0x%08X "
-                "(jobs so far %llu, waits %llu)\n", g_fiber_runs, S, list, count, entries, count ? gr32(entries) : 0,
+        fprintf(stderr, "[fiber] S=0x%08X run_all #%llu list=0x%08X count=%u entries=0x%08X first={0x%08X,0x%08X} lr=0x%08X "
+                "(jobs so far %llu, waits %llu)\n", S, g_fiber_runs, list, count, entries, count ? gr32(entries) : 0,
                 count ? gr32(entries + 4) : 0, (uint32_t)ctx->lr, g_fiber_jobs, g_fiber_waits);
     if (!S || !count || t_fs_n >= 4 || find_sched(S)) {
-        fprintf(stderr, "[fiber] run_all S=0x%08X count=%u depth %d: not run (NULL scheduler, empty list or nesting)\n",
+        fprintf(stderr, "[fiber] S=0x%08X run_all count=%u depth %d: not run (NULL scheduler, empty list or nesting)\n",
                 S, count, t_fs_n);
         return;
     }
@@ -673,7 +673,7 @@ static void kz3_fiber_run_all(ppu_context* ctx)
     schedule(ctx, fs);
     if (fs->dead) guest_fiber_destroy(fs->dead);
     t_fs_n--;
-    if (flog()) fprintf(stderr, "[fiber] run_all S=0x%08X done (jobs %llu, waits %llu, finishes %llu)\n", S, g_fiber_jobs,
+    if (flog()) fprintf(stderr, "[fiber] S=0x%08X run_all done (jobs %llu, waits %llu, finishes %llu)\n", S, g_fiber_jobs,
                         g_fiber_waits, g_fiber_finishes);
     gw32(S + 0x280, 0);                       /* the done path of @0x000C3864 */
     gw32(S + 0x300, 0);
@@ -689,7 +689,7 @@ static void kz3_fiber_wait(ppu_context* ctx, void (*orig)(ppu_context*))
     const uint32_t S = (uint32_t)ctx->gpr[3];
     FiberSched* fs = find_sched(S);
     if (!fs || guest_fiber_current() == fs->home) {
-        fprintf(stderr, "[fiber] wait S=0x%08X outside a fiber; running the lifted body\n", S);
+        fprintf(stderr, "[fiber] S=0x%08X wait outside a fiber; running the lifted body\n", S);
         orig(ctx);
         return;
     }
@@ -724,7 +724,7 @@ static void kz3_fiber_finish(ppu_context* ctx, void (*orig)(ppu_context*))
     const uint32_t S = (uint32_t)ctx->gpr[3];
     FiberSched* fs = find_sched(S);
     if (!fs || guest_fiber_current() == fs->home) {
-        fprintf(stderr, "[fiber] finish S=0x%08X outside a fiber; running the lifted body\n", S);
+        fprintf(stderr, "[fiber] S=0x%08X finish outside a fiber; running the lifted body\n", S);
         orig(ctx);
         return;
     }
@@ -736,7 +736,7 @@ static void kz3_fiber_finish(ppu_context* ctx, void (*orig)(ppu_context*))
     if (flog()) fprintf(stderr, "[fiber] S=0x%08X finish slot %d (#%llu)\n", S, i, g_fiber_finishes);
     fs->dead = guest_fiber_current();
     guest_fiber_switch(fs->home);
-    fprintf(stderr, "[fiber] finished fiber resumed (S=0x%08X)\n", S);
+    fprintf(stderr, "[fiber] fatal: finished fiber resumed (S=0x%08X)\n", S);
     abort();
 }
 #ifdef KZ3_FIBER_V100

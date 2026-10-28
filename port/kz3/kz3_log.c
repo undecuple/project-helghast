@@ -311,7 +311,7 @@ static const route_t k_routes[] = {
     R("zalias", D), R("usercmd", D), R("NV0039", D), R("texture-cache", D), R("shader-disk-cache", D),
     /* fiber breaker (port/spu/kz3_ppu_overrides.cpp): "[fiber] S=... waiting N s" is runprofile_kz3.py's
      * spu-job-chain-stall signature; its "  slot" continuation lines and the watchdog "sample" lines belong with it.
-     * The per-job "S=... wait/resume/start/finish slot" lines are behind KZ3_FIBER_LOG (off by default), so info is
+     * The per-job "S=... wait/resume/start/finish slot" lines are behind KZ3_FIBER_LOG (default: the first 24 events), so info is
      * cheap. deadlock/watchdog/fatal are anomalies the breaker reports once. The plain tag stays debug (pass 72). */
     RW("fiber", "fatal", E), RW("fiber", "deadlock", W), RW("fiber", "watchdog", W),
     RW("fiber", "S=", I), RW("fiber", "  slot", I), RW("fiber", "sample", I),
@@ -650,7 +650,10 @@ void kz3_log_flush(void)
 
 int kz3_log_fflush(FILE* f)
 {
-    if (f == stdout || f == stderr) return 0;    /* nothing is buffered; a partial line stays pending */
+    /* A redirected caller's partial line stays pending. The CRT stream is flushed all the same: files without the
+     * redirect (the SPU probes, kz3_stall_diag.c, kz3_cpu_check.c) still write it, and ps3_stdio_init() makes it
+     * fully buffered (64 KB), so ps3_stdio's flush thread and its exit flush, which arrive here, are their only flush
+     * (SPU pass 115: UCRT builds lost those lines). */
     return fflush(f);
 }
 

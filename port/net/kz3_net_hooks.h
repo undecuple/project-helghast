@@ -40,6 +40,7 @@
 #define KZ3_NET_GUEST_PTR_OK(p) ((uint32_t)(p) >= 0x10000u && (uint32_t)(p) < 0xF0000000u)
 #endif
 #include "kz3_gum_diag.h"   /* pass 29: who raises GUM error 20000 */
+#include "kz3_fios_stamp.h"  /* pass 41: the FIOS disk cache follows the served disc contents (patch 4024) */
 
 #ifdef __cplusplus
 extern "C" {

@@ -1,0 +1,51 @@
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+--- a/libs/input/pad_mouse.c
++++ b/libs/input/pad_mouse.c
+@@ -187,6 +187,10 @@
+     return s_nfev > 0;
+ }
+ #ifdef _WIN32
++/* KZ3 patch 2123 (RSX pass 117): KZ3_MOUSE_FEED_POST=1 sends the feed's counts as posted window messages, which the
++ * window's thread turns into pad_mouse_add like WM_INPUT, so a test run sees the same delivery delay a real mouse gets
++ * when that thread pumps late (the direct feed added from its own thread and never saw it). */
++static void pm_feed_deliver(int dx, int dy);
+ static DWORD WINAPI pm_feed_thread(LPVOID unused)
+ {
+     (void)unused;
+@@ -206,7 +210,7 @@
+             ax += (int)(ox - sx[i]); ay += (int)(oy - sy[i]);
+             sx[i] = ox; sy[i] = oy;
+         }
+-        if (ax || ay) { pad_mouse_add(ax, ay); tx += ax; ty += ay; }
++        if (ax || ay) { pm_feed_deliver(ax, ay); tx += ax; ty += ay; }
+         if (el > end) break;
+         Sleep(1);
+     }
+@@ -233,6 +237,19 @@
+  * we set it) on focus loss, minimise, title-bar drag/resize, the system menu and close. */
+ #define PAD_MOUSE_WM_ATTACH (WM_APP + 0x69)
+ static HWND           s_hwnd;        /* the game window (set with or without mouse look) */
++#define PAD_MOUSE_WM_FEED (WM_APP + 0x6A)   /* patch 2123: a KZ3_MOUSE_FEED_POST add (wParam dx, lParam dy) */
++static void pm_feed_deliver(int dx, int dy)
++{
++    static int s_post = -1;
++    if (s_post < 0) {
++        const char* e = getenv("KZ3_MOUSE_FEED_POST");
++        s_post = e && e[0] == '1';
++        fprintf(stderr, "[mouse] feed delivery: %s\n", s_post ? "posted to the window's thread (KZ3_MOUSE_FEED_POST=1)"
++                                                             : "direct from the feed thread");
++    }
++    if (s_post && s_hwnd && PostMessageA(s_hwnd, PAD_MOUSE_WM_FEED, (WPARAM)(LONG_PTR)dx, (LPARAM)(LONG_PTR)dy)) return;
++    pad_mouse_add(dx, dy);
++}
+ static int            s_raw;         /* Raw Input registered */
+ static int            s_clipped;     /* our ClipCursor is in force */
+ static PadCursorState s_cs = { 0, 0, 0, 0, 0, 0, 1, 0 };
+@@ -367,6 +384,7 @@
+ int pad_mouse_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
+ {
+     if (msg == PAD_MOUSE_WM_ATTACH) { pm_attach_here(hwnd); *res = 0; return 1; }
++    if (msg == PAD_MOUSE_WM_FEED) { pad_mouse_add((int)(LONG_PTR)wp, (int)(LONG_PTR)lp); *res = 0; return 1; }
+     if (!s_hwnd || hwnd != s_hwnd) return 0;
+     if (pm_menu_wndmsg(hwnd, msg, wp, lp, res)) return 1;
+     switch (msg) {

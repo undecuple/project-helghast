@@ -1,0 +1,30 @@
+KZ3 patch 4024: a cellFsOpen pre-open hook (KZ3 only). A port hook is told the guest path and the resolved host path
+before cellFsOpen stats or opens anything. port/net/kz3_fios_stamp.h uses it on the first open of FIOS's disk cache
+(/dev_hdd1/cache/<title>/fios/cache.idx or cache.dat): a cache built by another port build or other KZ3_ switches
+holds blocks of disc files the port rewrites (menu pages), FIOS treats a changed disc file as a failed read, and the
+menu request fails with GUM error 20000 (network pass 41, the RE notes s.35). The hook removes that cache first, as
+FIOS does with a cache it rejects (patch 4018), so FIOS builds a new one. The hook must be quick and must not block.
+
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -87,6 +87,12 @@
+ extern "C" void (*g_ps3_fs_open_hook)(const char* guest_path);
+ void (*g_ps3_fs_open_hook)(const char* guest_path) = NULL;
+ 
++/* KZ3 patch 4024: called with the guest path and the resolved host path before cellFsOpen opens anything, so a port
++ * hook can put the host side in order first (port/net/kz3_fios_stamp.h: a FIOS disk cache built against other
++ * disc contents is removed before FIOS opens it). Quick, non-blocking; it must not change the path. */
++extern "C" void (*g_ps3_fs_preopen_hook)(const char* guest_path, const char* host_path);
++void (*g_ps3_fs_preopen_hook)(const char* guest_path, const char* host_path) = NULL;
++
+ /* CELL_FS return / mode / flag constants. */
+ #define CELL_OK              0
+ #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
+@@ -279,6 +285,7 @@
+     { char dec_path[1200];
+       const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
+       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
++    if (g_ps3_fs_preopen_hook) g_ps3_fs_preopen_hook(gpath, hpath);   /* KZ3 patch 4024 */
+ 
+     /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
+      * O_WRONLY without create+truncate, or O_CREAT without O_TRUNC), so build

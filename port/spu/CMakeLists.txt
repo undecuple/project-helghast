@@ -134,3 +134,22 @@ if(DEFINED RECOMP_DIR AND EXISTS "${RECOMP_DIR}/ppu_recomp.h")
         set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/kz3_ppu_overrides.cpp" APPEND PROPERTY COMPILE_DEFINITIONS KZ3_WITH_NET)
     endif()
 endif()
+
+# Stdio redirect for the PPU override sources (SPU pass 115). Their fprintf(stderr) lines ([fiber], [heap],
+# [lump-stage], [label], ...) went to the CRT's stderr, which ps3_stdio_init() makes fully buffered (64 KB); the
+# runtime's flush thread calls fflush(stderr) from a redirected TU, where it is the logger's no-op kz3_log_fflush.
+# MinGW GCC builds still showed them on stdout because C++ fprintf there is __mingw_fprintf (one fputc per character
+# into msvcrt); llvm-mingw builds (UCRT fprintf: the release pipeline, players' builds) kept them in the buffer until
+# a real fflush (kz3_stall_diag.c) or lost them when the process was killed, and no build put them in the log file.
+# Redirected, they go through kz3_log like the runtime's lines (log file, stdout echo, crash ring; [tag] -> level
+# table in kz3_log.c). Only these two files: they print only from guest calls, after kz3_log_init. The probes'
+# install lines run from the SPU registration constructor before kz3_log_init and would reach only the ring
+# (see the RE notes "Pass 115"). Same switch as port/kz3 (KZ3_LOG_REDIRECT, declared there after this file;
+# "not defined yet" counts as its default ON).
+set(KZ3_SPU_LOG_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/../kz3/kz3_log.h")
+if(DEFINED RECOMP_DIR AND EXISTS "${RECOMP_DIR}/ppu_recomp.h" AND (NOT DEFINED KZ3_LOG_REDIRECT OR KZ3_LOG_REDIRECT)
+   AND EXISTS "${KZ3_SPU_LOG_HEADER}")
+    set(KZ3_SPU_LOG_REDIRECTED "${CMAKE_CURRENT_SOURCE_DIR}/kz3_ppu_overrides.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/guest_fiber.c")
+    set_property(SOURCE ${KZ3_SPU_LOG_REDIRECTED} APPEND PROPERTY COMPILE_DEFINITIONS KZ3_LOG_REDIRECT_STDIO)
+    set_property(SOURCE ${KZ3_SPU_LOG_REDIRECTED} APPEND PROPERTY COMPILE_OPTIONS -include "${KZ3_SPU_LOG_HEADER}")
+endif()

@@ -991,6 +991,49 @@ static unsigned kz3_vblank_tick_ms(void)
 #endif
 }
 
+/* RSX pass 117: the message pump inside the vblank catch-up loop. The inner loop below fires every vblank tick the
+ * clock is behind, and each tick drains the FIFO (the walker: tens of ms per frame when a level is heavy), so while a
+ * drain takes longer than the 16 ms tick the backlog grows and the loop runs on for up to 240 ticks without returning
+ * to the pump. Raw Input (WM_INPUT), keys and window messages then wait seconds and arrive in one burst: the player
+ * log of 2026-10-28 has "raw stats: 2164 relative report(s) in 0.0 s" and look takes of 2000-3600 counts at once
+ * while [pace] p50 was 42-60 ms (the RE notes "Pass 117"). KZ3_PUMP_TICK=0 = the old pump (outer loop only).
+ * kz3_pump_note: the longest gap between two pumps, a line per gap over 250 ms (first 20) and a summary every 10 s. */
+static int kz3_pump_tick_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("KZ3_PUMP_TICK");
+        on = !(e && e[0] == '0');
+        fprintf(stderr, "[pump] message pump %s\n", on ? "on every vblank tick (default; KZ3_PUMP_TICK=0 = outer loop only)"
+                                                       : "in the outer loop only (KZ3_PUMP_TICK=0)");
+    }
+    return on;
+}
+static void kz3_pump_note(int fired)
+{
+    static LARGE_INTEGER s_qf, s_last, s_win;
+    static double s_max;
+    static unsigned s_n, s_long, s_lines;
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    if (!s_qf.QuadPart) { QueryPerformanceFrequency(&s_qf); s_last = s_win = q; return; }
+    const double gap = (double)(q.QuadPart - s_last.QuadPart) * 1e3 / (double)s_qf.QuadPart;
+    s_last = q;
+    s_n++;
+    if (gap > s_max) s_max = gap;
+    if (gap > 250.0) {
+        s_long++;
+        if (s_lines++ < 20)
+            fprintf(stderr, "[pump] gap %.0f ms between message pumps (flip=%u, %d vblank tick(s) in that pass)\n", gap,
+                    cellGcm_flip_request_count(), fired);
+    }
+    const double win = (double)(q.QuadPart - s_win.QuadPart) / (double)s_qf.QuadPart;
+    if (win >= 10.0) {
+        fprintf(stderr, "[pump] last %.1f s: %u pumps, longest gap %.0f ms, %u gap(s) over 250 ms\n", win, s_n, s_max, s_long);
+        s_win = q; s_n = s_long = 0; s_max = 0.0;
+    }
+}
+
 static DWORD WINAPI frame_clock(LPVOID)
 {
     kz3_log_set_thread_label("frame");
@@ -1031,6 +1074,14 @@ static DWORD WINAPI frame_clock(LPVOID)
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
             if (rsx_ok) cellGcm_rsx_process_fifo();
+            /* RSX pass 117: pump on every tick too, so a catch-up pass does not hold the window's messages back */
+            if (rsx_ok && kz3_pump_tick_on()) {
+                if (kz3_rsx_pump() != 0) {
+                    kz3_exit_on_window_close();   /* does not return */
+                    rsx_ok = 0;
+                }
+                kz3_pump_note(fired + 1);
+            }
             next_tick += tick_ms;        /* ~60 Hz (patch 2107: 120 / 240 Hz for the 60 / 120 limits) */
             fired++;
         }
@@ -1052,6 +1103,7 @@ static DWORD WINAPI frame_clock(LPVOID)
                 rsx_ok = 0;
                 continue;
             }
+            kz3_pump_note(fired);
             /* Present on a guest flip. A present on a fixed clock can catch the
              * drain mid-frame and flash a partial one. Before the first flip
              * present freely, so the window is not blank during boot. */

@@ -201,7 +201,9 @@ jobs:
           sha256sum Project-Helghast-setup.exe Project-Helghast-*-portable.zip > SHA256SUMS
           cat SHA256SUMS
           pre=""; case "$VERSION" in 0.*) pre="--prerelease" ;; esac
-          printf '%s\n' "Project Helghast $VERSION. Windows installer and portable zip. You need your own Killzone 3 disc dump and the 1.14 update; neither is included or downloaded. SHA-256 sums: SHA256SUMS (and the .sha256 files). See the README for what it does and what goes online." > notes.txt
+          # the body comes from the CHANGELOG section of this version; no section or no items fails the job (no generic text)
+          python3 "$GITHUB_WORKSPACE/tools/release/release_notes.py" "$VERSION" --root "$GITHUB_WORKSPACE" --out notes.txt
+          cat notes.txt
           gh release create "$GITHUB_REF_NAME" --draft $pre --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.txt \
             Project-Helghast-setup.exe Project-Helghast-setup.exe.sha256 \
             Project-Helghast-*-portable.zip Project-Helghast-*-portable.zip.sha256 SHA256SUMS
