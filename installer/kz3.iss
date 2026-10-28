@@ -283,6 +283,7 @@ Name: "{group}\Move saves and settings"; Filename: "{app}\{#LauncherExe}"; Param
 Name: "{group}\Export pipeline template"; Filename: "{app}\{#LauncherExe}"; Parameters: "--export-template"; WorkingDir: "{app}"
 ; One zip of logs and settings (user names removed) for a bug report; text in tools/release/support_text.py
 Name: "{group}\Crash reports on or off"; Filename: "{app}\{#LauncherExe}"; Parameters: "--crash-reports"; WorkingDir: "{app}"
+Name: "{group}\Discord status on or off"; Filename: "{app}\{#LauncherExe}"; Parameters: "--discord-status"; WorkingDir: "{app}"
 Name: "{group}\Make a support package"; Filename: "{app}\{#LauncherExe}"; Parameters: "--support-package"; WorkingDir: "{app}"
 Name: "{group}\Project page"; Filename: "{#SiteURL}"
 Name: "{group}\Uninstall {#AppDirName}"; Filename: "{uninstallexe}"; IconFilename: "{app}\kz3-uninstall.ico"

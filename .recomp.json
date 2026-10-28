@@ -20,6 +20,7 @@
     {"label": "Features", "url": "https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md"},
     {"label": "Requirements", "url": "https://github.com/undecuple/project-helghast/blob/main/docs/requirements.md"},
     {"label": "Building", "url": "https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md"},
+    {"label": "Releases", "url": "https://github.com/undecuple/project-helghast/releases"},
     {"label": "Release criteria", "url": "https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md"}
   ],
   "help": ["Testing on real Windows with NVIDIA GPUs", "RSX/graphics performance"],

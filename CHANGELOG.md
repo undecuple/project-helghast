@@ -3,6 +3,16 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
+## [Unreleased]
+
+### Fixed
+- Settings you add to `kz3.ini` by hand (for example `discord_presence = 1`) are kept when the game starts. Comments in the file are not kept.
+- When the game opens a file to create, truncate or append to it, the request is read with the PS3's flag values. No visible change from this has been seen yet.
+
+### Added
+- Options > Display > Discord status (On/Off, off by default): shows "Playing Killzone 3" and your chapter on your Discord profile through the Discord app on this PC; the choice is saved in kz3.ini (discord_presence).
+- Start menu entry "Discord status on or off": shows whether the Discord status is on and switches it (the port tells the Discord app on this PC what to show on your profile; nothing is sent when it is off; the Discord app must be running).
+
 ## [0.1.4] - 2026-10-28 (pre-release)
 
 ### Fixed

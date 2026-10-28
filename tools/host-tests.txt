@@ -133,12 +133,15 @@ port/vfs/test_native_rekey.sh
 tools/smoke/test_cam_interp.sh
 tools/release/test_licenses_match.py
 tools/release/test_uninstall_covers.py
+tools/release/test_game_ini_keep.py
 tools/release/test_install_dir_rule.py
 tools/release/test_install_dump_page.py
 tools/release/test_iso9660.py
 tools/release/test_crash_report.py
 tools/release/test_bump_version.py
 tools/release/test_release_notes.py
+tools/release/test_recomp_card.py
 tools/release/test_release_check.py
 port/vfs/test_splitfile.sh
 tools/spu/test_r115_logroute.sh
+tools/upstream/test_sys_fs_flags.sh

@@ -44,7 +44,7 @@ static const kz3_ini_key_t kz3_ini_keys[] = {
     {"edat_cache", "PS3_EDAT_CACHE", 1},
     {"shader_cache", "RSX_SHADER_CACHE_DIR", 1},
     {"mouse_look", "KZ3_MOUSE_LOOK", 0}, /* patch 2097: default on, 0 = off */
-    {"discord_presence", "KZ3_DISCORD_PRESENCE", 0},   /* network pass 33: Discord Rich Presence, 1 = on (default off) */
+    {"discord_presence", "KZ3_DISCORD_PRESENCE", 0},   /* net rounds 33/42: Discord Rich Presence, 1 = on (default off); the Options > Display row writes it */
     {"discord_client_id", "KZ3_DISCORD_CLIENT_ID", 0}, /* the Discord application id; empty = the project's own */
 };
 #define KZ3_INI_NKEYS (sizeof kz3_ini_keys / sizeof kz3_ini_keys[0])

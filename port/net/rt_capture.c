@@ -12,7 +12,7 @@
  *   CLIENT_CONNECT_READY_REQUIRE (0x23) -> SERVER_CONNECT_ACCEPT_TCP (0x07); CLIENT_CONNECT_READY_TCP (0x21) ->
  *                                SERVER_CONNECT_COMPLETE (0x1A) (pass 5, section 10: the first Medius request follows)
  * Pass 6 (section 11), Medius messages in CLIENT_APP_TOSERVER (0x0B), answered in SERVER_APP (0x0A):
- *   1/0xC8 GetUniverseInformation -> 4/0x1E UniverseVariableSvoURLResponse (empty URL, when asked for) and
+ *   1/0xC8 GetUniverseInformation -> 4/0x1E UniverseVariableSvoURLResponse (RTCAP_SVO_URL, when asked for) and
  *                                4/0x11 UniverseVariableInformationResponse: one universe whose DNS is the MUIS host
  *                                name (mapped to the server by the egress policy) and port the MAS listener
  *   1/0x03 or 4/0x8B SessionBegin -> 1/0x04 SessionBeginResponse (success, session key RTCAP_SESSION_KEY)
@@ -410,7 +410,7 @@ static size_t med_reply(const uint8_t* p, size_t len, uint8_t* out, size_t cap)
     if (cls == 1 && type == 0xC8 && len >= 2 + MED_MSGID + 3 + 4) {           /* GetUniverseInformation */
         uint32_t filter = le32(p + 2 + MED_MSGID + 3);
         size_t n = 0, b;
-        if (filter & (1u << 9)) {   /* SVO URL asked: empty, 1-byte length. Its MessageID must be the request's:
+        if (filter & (1u << 9)) {   /* SVO URL asked: RTCAP_SVO_URL, 1-byte length. Its MessageID must be the request's:
                                      * KZ3's 4/0x11 handler 0xA1A8FC compares the two and fails with MediusFail
                                      * (-966) otherwise (run net-r6-mas2 with an empty id; section 11) */
             uint8_t svo[MED_MSGID + 1 + sizeof(RTCAP_SVO_URL)];

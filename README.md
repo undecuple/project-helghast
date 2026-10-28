@@ -85,7 +85,7 @@ Nothing, unless you ask for it. Each item is off until you turn it on, and this 
   a tracker address show the option as not available.
 - **Project website** (`site/`): viewing it loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit. The repository, installer and game do not.
 - **Online multiplayer** (planned): only through a self-hosted server you choose.
-- **Discord status** (optional, off unless you set `discord_presence = 1` in `kz3.ini`): the port tells the Discord
+- **Discord status** (optional, off unless you turn it on in Options > Display > Discord status, with "Discord status on or off" in the Start menu, or with `discord_presence = 1` in `kz3.ini`): the port tells the Discord
   app on your own PC what to show on your profile (the activity text, the game's process id and the port's Discord
   application id), through the app's local connection. The port itself sends nothing over the network for it; the
   Discord app shares the status as it does for other games. Still being tested.
@@ -173,8 +173,9 @@ Gameplay changes stay optional. See [ROADMAP.md](docs/ROADMAP.md).
 
 ## Related projects
 
-**Project Pyrrhus**: Killzone 2 (PS3) ported to PC the same way, by static recompilation. In development, not
-public yet; a link follows when it is.
+**[Project Pyrrhus](https://github.com/undecuple/project-pyrrhus)**: Killzone 2 (PS3) ported to PC the same way, by static
+recompilation, with a Windows [pre-release](https://github.com/undecuple/project-pyrrhus/releases). Early
+and partly playable: its first level loads and draws, checked in one scripted run. Its README has the current state.
 
 **Planned:** once the Killzone 2 and Killzone 3 ports are finished, the same static recompilation approach will be
 applied to every Ratchet & Clank game released on the PS3.

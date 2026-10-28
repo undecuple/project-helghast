@@ -520,6 +520,12 @@ static void kz3_pu_patch_serve(char* path, size_t cap, int* state, char* outp, s
     if (*state != 1 && s_pu_prev_miss) s_pu_prev_miss(path, cap);
 }
 
+/* Net pass 42: Options > Display gets the row "Discord status" (port/net/kz3_discord.c kd_patch_display_gum) on top
+ * of the page main.cpp serves (the hook behind this one: patch 2095/2110's rows, tooltip panel and Lua). */
+#include "kz3_discord.h"
+static char s_pd_out[1100];
+static int  s_pd_state;              /* 0 not tried, 1 written, -1 served as main.cpp serves it */
+
 static void kz3_prompts_miss_hook(char* path, size_t cap)
 {
     char low[1100];
@@ -534,6 +540,12 @@ static void kz3_prompts_miss_hook(char* path, size_t cap)
         kz3_host_composed_check(KZ3_PROMPTS_GUM_KEY, "the prompts row");   /* net 40: one-place list */
         kz3_pu_patch_serve(path, cap, &s_pu_state, s_pu_out, sizeof s_pu_out, "advancedcontroller.gum",
                            kz3_prompts_patch_gum, "Layout and Prompts row");
+        return;
+    }
+    if (u && !strcmp(u + 7, KZ3_HC_DISPLAY)) {
+        kz3_host_composed_check(KZ3_HC_DISPLAY, "the Discord status row");
+        kz3_pu_patch_serve(path, cap, &s_pd_state, s_pd_out, sizeof s_pd_out, "displaysettings-net.gum",
+                           kd_patch_display_gum, "Discord status row");
         return;
     }
     if (u && !strcmp(u + 7, KZ3_CTL_GUM_KEY)) {

@@ -1,0 +1,184 @@
+KZ3 patch 1139 (the same change as patch 6036 of the Killzone 2 port, Project Pyrrhus): lv2 sys_fs_open
+(syscall 801) decodes the console's CELL_FS_O_* values. runtime/syscalls/sys_fs.h had its own hex set (O_CREAT 0x100,
+O_EXCL 0x400, O_APPEND 0x2000) where the console, libs/filesystem/cellFs.h and runtime/ppu/ppu_fs.cpp have CREAT
+0x40, EXCL 0x80, TRUNC 0x200, APPEND 0x400. KZ3's EBOOT calls syscall 801 itself (open wrapper func_00AC6864) with
+fopen's words: 0x241 for "w" (TRUNC happened to agree), fopen "a" built from 0x400/0x40 was read as WRONLY|EXCL (no
+create, writes at offset 0). One header, include/ps3emu/cell_fs_flags.h, now defines the flags for sys_fs.h, cellFs.h
+and ppu_fs.cpp. sys_fs_open also answers O_CREAT|O_EXCL on an existing path with CELL_EEXIST and "w"/"a" without
+O_CREAT on a missing file with CELL_ENOENT; its log lines show the flags word. Host test:
+tools/upstream/test_sys_fs_flags.sh. Applies after 0004 and 1127 (both touch sys_fs.c). Local carry: upstream
+sp00nznet/ps3recomp PR #620 (open) fixes the same values (CREAT 0000100, EXCL 0000200, TRUNC 0001000, APPEND
+0002000) with EEXIST handling; drop this patch when #620 merges.
+
+diff --git a/include/ps3emu/cell_fs_flags.h b/include/ps3emu/cell_fs_flags.h
+new file mode 100644
+index 0000000..a46186c
+--- /dev/null
++++ b/include/ps3emu/cell_fs_flags.h
+@@ -0,0 +1,31 @@
++/*
++ * cell_fs_flags.h -- the CELL_FS_O_* open flags, one definition for every
++ * filesystem path: the lv2 syscall (runtime/syscalls/sys_fs.c, sys_fs_open,
++ * syscall 801), the cellFs HLE in runtime/ppu/ppu_fs.cpp and the one in
++ * libs/filesystem/cellFs.c.
++ *
++ * These are the console's values (the SDK spells them in octal, as POSIX
++ * does). A guest passes the same word to cellFsOpen and to syscall 801: an
++ * EBOOT that links its C library's open() statically issues `sc` 801 itself
++ * with flags such as 0x241 (O_WRONLY|O_CREAT|O_TRUNC, fopen "w") or 0x441
++ * (O_WRONLY|O_CREAT|O_APPEND, fopen "a").
++ *
++ * sys_fs.h used to carry its own hex set (O_CREAT 0x100, O_EXCL 0x400,
++ * O_APPEND 0x2000), so sys_fs_open read 0x40 as nothing and 0x400 as O_EXCL:
++ * a create on the syscall path was missed and an append opened for write at
++ * offset 0. Keeping one header stops the three copies drifting apart again.
++ */
++#ifndef PS3EMU_CELL_FS_FLAGS_H
++#define PS3EMU_CELL_FS_FLAGS_H
++
++#define CELL_FS_O_RDONLY    000000
++#define CELL_FS_O_WRONLY    000001
++#define CELL_FS_O_RDWR      000002
++#define CELL_FS_O_ACCMODE   000003
++#define CELL_FS_O_CREAT     000100   /* 0x40 */
++#define CELL_FS_O_EXCL      000200   /* 0x80 */
++#define CELL_FS_O_TRUNC     001000   /* 0x200 */
++#define CELL_FS_O_APPEND    002000   /* 0x400 */
++#define CELL_FS_O_MSELF     010000   /* 0x1000 */
++
++#endif /* PS3EMU_CELL_FS_FLAGS_H */
+diff --git a/libs/filesystem/cellFs.h b/libs/filesystem/cellFs.h
+index aea007c..f6c58a7 100644
+--- a/libs/filesystem/cellFs.h
++++ b/libs/filesystem/cellFs.h
+@@ -25,16 +25,8 @@ extern "C" {
+  * Constants
+  * -----------------------------------------------------------------------*/
+ 
+-/* File open flags */
+-#define CELL_FS_O_RDONLY    000000
+-#define CELL_FS_O_WRONLY    000001
+-#define CELL_FS_O_RDWR      000002
+-#define CELL_FS_O_ACCMODE   000003
+-#define CELL_FS_O_CREAT     000100
+-#define CELL_FS_O_EXCL      000200
+-#define CELL_FS_O_TRUNC     001000
+-#define CELL_FS_O_APPEND    002000
+-#define CELL_FS_O_MSELF     010000
++/* File open flags: one definition with the lv2 syscall path (sys_fs.h). */
++#include "ps3emu/cell_fs_flags.h"
+ 
+ /* Seek whence */
+ #define CELL_FS_SEEK_SET    0
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 3ca4665..73d91e2 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -101,20 +101,14 @@ void (*g_ps3_fs_preopen_hook)(const char* guest_path, const char* host_path) = N
+ #define CELL_FS_ENOSYS       (-2147418109)   /* 0x80010003 */
+ #define CELL_FS_S_IFDIR      0x4000u
+ #define CELL_FS_S_IFREG      0x8000u
+-#define CELL_FS_O_RDONLY     0
+-#define CELL_FS_O_WRONLY     1
+-#define CELL_FS_O_RDWR       2
+-/* Open flags: the PS3 SDK values (octal), byte for byte the set
+- * libs/filesystem/cellFs.h declares. The hex guesses that used to be here
+- * (O_CREAT 0x0200, O_TRUNC 0x0400, O_APPEND 0x0100) put the right numbers on
+- * the wrong names -- 0x200 and 0x400 are TRUNC and APPEND, not CREAT and
+- * TRUNC -- so a title opening a file with O_RDWR|O_CREAT (flags 0x42 =
+- * 000002 | 000100) hit an unnamed bit and got a plain read-only open; the file
+- * was never created. */
+-#define CELL_FS_O_CREAT      0x0040   /* 000100 */
+-#define CELL_FS_O_TRUNC      0x0200   /* 001000 */
+-#define CELL_FS_O_APPEND     0x0400   /* 002000 */
+-#define CELL_FS_O_EXCL       0x0080   /* 000200 */
++/* Open flags: the PS3 SDK values (octal), from the one header the lv2
++ * syscall path (sys_fs.h) and libs/filesystem/cellFs.h share. The hex guesses
++ * that used to be here (O_CREAT 0x0200, O_TRUNC 0x0400, O_APPEND 0x0100) put
++ * the right numbers on the wrong names -- 0x200 and 0x400 are TRUNC and
++ * APPEND, not CREAT and TRUNC -- so a title opening a file with
++ * O_RDWR|O_CREAT (flags 0x42 = 000002 | 000100) hit an unnamed bit and got a
++ * plain read-only open; the file was never created. */
++#include "../../include/ps3emu/cell_fs_flags.h"
+ #define CELL_FS_SEEK_SET     0
+ #define CELL_FS_SEEK_CUR     1
+ #define CELL_FS_SEEK_END     2
+diff --git a/runtime/syscalls/sys_fs.c b/runtime/syscalls/sys_fs.c
+index 707d468..b854f95 100644
+--- a/runtime/syscalls/sys_fs.c
++++ b/runtime/syscalls/sys_fs.c
+@@ -435,6 +435,25 @@ int64_t sys_fs_open(ppu_context* ctx)
+             mode = "rb";
+     }
+ 
++    /* What the fopen modes above do not say (the flags are the console values
++     * since include/ps3emu/cell_fs_flags.h; the old hex set never let O_EXCL
++     * or a lone O_APPEND through): O_CREAT|O_EXCL refuses a path that exists,
++     * and without O_CREAT a missing file is ENOENT -- "wb" and "ab" would
++     * create it. */
++    {
++        struct stat _se;
++        const int _exists = stat(host_path, &_se) == 0;
++        if ((flags & CELL_FS_O_CREAT) && (flags & CELL_FS_O_EXCL) && _exists) {
++            fprintf(stderr, "[sys_fs] open -> EEXIST (flags 0x%x): %s\n", (unsigned)flags, host_path);
++            return (int64_t)(int32_t)CELL_EEXIST;
++        }
++        if (!(flags & CELL_FS_O_CREAT) && !_exists && (mode[0] == 'w' || mode[0] == 'a')) {
++            fprintf(stderr, "[sys_fs] open FAILED: %s (flags 0x%x, no O_CREAT, does not exist)\n", host_path,
++                    (unsigned)flags);
++            return (int64_t)(int32_t)CELL_ENOENT;
++        }
++    }
++
+     FILE* fp = fopen(host_path, mode);
+ 
+     /* Transient open failures: on Windows an existing, correctly-pathed file can
+@@ -469,7 +488,8 @@ int64_t sys_fs_open(ppu_context* ctx)
+ 
+     /* If CREAT flag set and file doesn't exist, try creating it */
+     if (!fp && (flags & CELL_FS_O_CREAT)) {
+-        fp = fopen(host_path, "w+b");
++        mode = "w+b";
++        fp = fopen(host_path, mode);
+     }
+ 
+     /* A DIRECTORY open is not a failure. fopen() cannot open one on Windows,
+@@ -488,12 +508,12 @@ int64_t sys_fs_open(ppu_context* ctx)
+ 
+     if (!fp) {
+         { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
+-          fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
+-                  host_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
++          fprintf(stderr, "[sys_fs] open FAILED: %s (flags 0x%x, errno=%d %s, exists=%d, size=%lld)\n",
++                  host_path, (unsigned)flags, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
+         return (int64_t)(int32_t)CELL_ENOENT;
+     }
+ 
+-    fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
++    fprintf(stderr, "[sys_fs] open OK: %s (flags 0x%x, mode %s)\n", host_path, (unsigned)flags, mode);
+ 
+     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+     f->active = 1;
+diff --git a/runtime/syscalls/sys_fs.h b/runtime/syscalls/sys_fs.h
+index dbe84c4..ca79139 100644
+--- a/runtime/syscalls/sys_fs.h
++++ b/runtime/syscalls/sys_fs.h
+@@ -65,15 +65,9 @@ extern "C" {
+ #define CELL_FS_S_IRGRP   0000040
+ #define CELL_FS_S_IROTH   0000004
+ 
+-/* Open flags */
+-#define CELL_FS_O_RDONLY   0x000000
+-#define CELL_FS_O_WRONLY   0x000001
+-#define CELL_FS_O_RDWR     0x000002
+-#define CELL_FS_O_ACCMODE  0x000003
+-#define CELL_FS_O_CREAT    0x000100
+-#define CELL_FS_O_TRUNC    0x000200
+-#define CELL_FS_O_EXCL     0x000400
+-#define CELL_FS_O_APPEND   0x002000
++/* Open flags: the console values, shared with cellFs (was a hex set with
++ * O_CREAT 0x100, O_EXCL 0x400 and O_APPEND 0x2000, which no guest sends). */
++#include "../../include/ps3emu/cell_fs_flags.h"
+ 
+ /* Seek modes */
+ #define CELL_FS_SEEK_SET   0

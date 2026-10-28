@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kz3_cat.h"
 #include "spu_context.h"
 #include "spu_interp.h"
 #include "kz3_spu_skip.h"
@@ -25,15 +26,15 @@ static uint32_t s_hist[0xD00];
 static void hist_dump(long run)
 {
     char b[400];
-    int k = snprintf(b, sizeof b, "[ts-hist] run %ld:", run), n = 0;
+    int k = kz3_cat(b, sizeof b, 0, "[ts-hist] run %ld:", run), n = 0;
     for (uint32_t i = 0; i < 0xD00;) {
         uint32_t j = i;
         while (j + 1 < 0xD00 && s_hist[j + 1] == s_hist[i]) j++;
         if (s_hist[i]) {
-            k += snprintf(b + k, sizeof b - (size_t)k, " %X-%X:%u", 0x4000 + 4 * i, 0x4000 + 4 * j, s_hist[i]);
+            k = kz3_cat(b, sizeof b, k, " %X-%X:%u", 0x4000 + 4 * i, 0x4000 + 4 * j, s_hist[i]);
             if (++n == 12) {
                 fprintf(stderr, "%s\n", b);
-                k = snprintf(b, sizeof b, "[ts-hist] run %ld:", run);
+                k = kz3_cat(b, sizeof b, 0, "[ts-hist] run %ld:", run);
                 n = 0;
             }
         }

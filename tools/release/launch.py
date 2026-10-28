@@ -40,6 +40,9 @@ one scrubbed event (at most one per session); after the game, a dialog says whet
 ("Crash reports on or off", Start menu) shows the state and switches it; without a dsn it says "not available in this
 build". Nothing else goes online.
 
+Discord status (opt-in, discord_presence = 1 in kz3.ini): --discord-status ("Discord status on or off", Start menu)
+shows the state and switches it. kz3.ini keeps every key the player added (write_game_ini).
+
 --prepare-shaders: "Prepare shaders again" (Start menu entry): the warm-up session of shaders.py --force in a console
 window; needs a finished build.
 
@@ -578,19 +581,79 @@ def game_ini(root, paths, portable, environ, appdata=None, build=None, localappd
     return v
 
 
-def write_game_ini(root, values, build=None):
-    """Write <root>/build/kz3.ini; -> its path. The runtime opens files with the ANSI code page (fopen), so on Windows
+def _ini_text(path):
+    """The text of an ini file, or None: UTF-8 (with or without BOM), else the ANSI code page the file is written in."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("mbcs" if os.name == "nt" else "latin-1", "replace")
+
+
+def extra_game_ini(path):
+    """The lines of kz3.ini the launcher does not own -> [(section, key, line)] in file order: every key=value line
+    whose key is not one of GAME_INI_KEYS (the runtime ignores sections, so an owned key is dropped wherever it
+    stands: the launcher's value wins). Lines before any [section] get section "". Comments and blank lines are not
+    kept (the file's own header is rewritten on each start)."""
+    text = _ini_text(path)
+    out, sec = [], ""
+    owned = {k for _, k in GAME_INI_KEYS}
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            sec = s[1:-1].strip()
+        elif s and s[0] not in ";#" and "=" in s:
+            k = s.split("=", 1)[0].strip()
+            if k and k.lower() not in owned:
+                out.append((sec, k, s))
+    return out
+
+
+def set_game_ini_key(root, key, value, section="game", build=None):
+    """Set one hand-editable key in kz3.ini (the line is replaced where it stands, else added under [section]); every
+    other key stays; -> the path. The launcher-owned values are the ones already in the file."""
+    p = os.path.join(build or os.path.join(root, "build"), GAME_INI)
+    extra = extra_game_ini(p)
+    line, hit = f"{key} = {value}", False
+    for i, (sec, k, _) in enumerate(extra):
+        if k.lower() == key.lower():
+            extra[i] = (sec, k, line)
+            hit = True
+    if not hit:
+        extra.append((section, key, line))
+    return write_game_ini(root, read_game_ini(p), build=build, extra=extra)
+
+
+def write_game_ini(root, values, build=None, extra=None):
+    """Write <root>/build/kz3.ini; -> its path. Every other key=value line already in the file (a setting the player
+    added, e.g. discord_presence = 1) is kept, with its section, after the launcher's keys (extra_game_ini; comments
+    are not kept). The runtime opens files with the ANSI code page (fopen), so on Windows
     the file is in that code page ("mbcs"); a path it cannot encode falls back to UTF-8 (such a path would not open
     either way: ASSUMPTION, non-ANSI install paths are untested)."""
     p = os.path.join(build or os.path.join(root, "build"), GAME_INI)
+    extra = extra_game_ini(p) if extra is None else extra
     lines, sec = [GAME_INI_HEAD.rstrip("\n")], None
+    done = set()
     for s, k in GAME_INI_KEYS:
         if k == "eboot" and not values.get(k):
             continue   # step 9s: the EBOOT is inside kz3.exe
         if s != sec:
+            if sec is not None:
+                lines += [e[2] for e in extra if e[0].lower() == sec]
+                done.add(sec)
             lines += ["", f"[{s}]"]
             sec = s
         lines.append(f"{k} = {values.get(k, '')}")
+    if sec is not None:
+        lines += [e[2] for e in extra if e[0].lower() == sec or e[0] == ""]
+        done.add(sec)
+    for s in dict.fromkeys(e[0] for e in extra):
+        if s and s.lower() not in done:
+            lines += ["", f"[{s}]"] + [e[2] for e in extra if e[0] == s]
     text = "\n".join(lines) + "\n"
     try:
         data = text.encode("mbcs" if os.name == "nt" else "utf-8")
@@ -857,6 +920,24 @@ def crash_toggle(root, ui):
     return 0
 
 
+DISCORD_KEY = "discord_presence"
+
+
+def discord_toggle(root, ui):
+    """--discord-status: say whether the Discord status is on and offer to switch (writes discord_presence = 1|0 into
+    kz3.ini, every other key stays)."""
+    p = os.path.join(root, "build", GAME_INI)
+    on = read_game_ini(p).get(DISCORD_KEY, "0").strip().lower() in ("1", "true", "yes", "on")
+    what = ("the port tells the Discord app on this PC what to show on your profile (\"Playing Killzone 3\" with the "
+            "current chapter). Nothing is sent when it is off. The Discord app must be running.")
+    if ui.ask(f"Discord status is on: {what}\n\nTurn the Discord status off?" if on else
+              f"Discord status is off.\n\nTurn it on? If you do, {what}"):
+        set_game_ini_key(root, DISCORD_KEY, "0" if on else "1")
+        note(root, f"discord status: {'off' if on else 'on'}")
+        ui.info(f"Discord status is {'off' if on else 'on'}. It applies the next time the game starts.")
+    return 0
+
+
 def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(HERE)))
@@ -875,6 +956,8 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
                     help='"Make a support package": one zip of logs and settings (user names removed) for a bug report')
     ap.add_argument("--crash-reports", action="store_true",
                     help='"Crash reports on or off": show whether crash reports are sent and switch them')
+    ap.add_argument("--discord-status", action="store_true",
+                    help='"Discord status on or off": show whether the Discord status is on and switch it')
     ap.add_argument("--out", default="", help="with --support-package: the folder for the zip (default: the Desktop)")
     ap.add_argument("--export-template", action="store_true",
                     help='"Export pipeline template": run the game with LD_PSO_TEMPLATE_OUT in the data folder, then '
@@ -898,6 +981,8 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
 
     if a.crash_reports:
         return crash_toggle(root, ui)
+    if a.discord_status:
+        return discord_toggle(root, ui)
     if a.support_package:
         return support_package(root, ini, environ, a.out, ui, today)
 

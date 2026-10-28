@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kz3_cat.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -91,19 +92,19 @@ static void dump(const char* why, uint32_t e, long polls, uint32_t ret)
     const uint32_t d = e + 4, h = r32(d), spurs = r32(d + 4), wid = r32(d + 8);
     char b[4096];
     int p = 0;
-    p += snprintf(
-        b + p, sizeof b - p,
+    p = kz3_cat(
+        b, sizeof b, p,
         "[ama-probe] %s t=%llu E=0x%08X lr=0x%08X polls=%ld ret=%u E+8=0x%X E+3C=%u H=0x%08X spurs=0x%08X wid=%u "
         "H+8(list)=%u cap=%u arrays=%08X %08X %08X %08X\n",
         why, now_ms(), e, g_cur_lr, polls, ret, r32(e + 8), r32(e + 0x3C), h, spurs, wid, r32(h + 8), r32(h + 0x2C),
         r32(h + 0x30), r32(h + 0x34), r32(h + 0x38), r32(h + 0x3C));
     for (int t = 0; t < 4; t++) {
-        p += snprintf(b + p, sizeof b - p, "[ama-probe]   row%d:", t);
-        for (int k = 0; k < 8; k++) p += snprintf(b + p, sizeof b - p, " %04X", r16(h + 0x40 + 16 * t + 2 * k));
-        p += snprintf(b + p, sizeof b - p, "\n");
+        p = kz3_cat(b, sizeof b, p, "[ama-probe]   row%d:", t);
+        for (int k = 0; k < 8; k++) p = kz3_cat(b, sizeof b, p, " %04X", r16(h + 0x40 + 16 * t + 2 * k));
+        p = kz3_cat(b, sizeof b, p, "\n");
     }
     if (wid < 16 && ok(spurs))
-        p += snprintf(b + p, sizeof b - p, "[ama-probe]   spurs w%u: ready=%u idle2=%u curcont=%u pendcont=%u\n", wid,
+        p = kz3_cat(b, sizeof b, p, "[ama-probe]   spurs w%u: ready=%u idle2=%u curcont=%u pendcont=%u\n", wid,
                       r8(spurs + wid), r8(spurs + 0x10 + wid), r8(spurs + 0x20 + wid), r8(spurs + 0x30 + wid));
     /* list 3 (the list the push writes) and the current list's entries around the ticket */
     const uint32_t lists[2] = {3, r32(h + 8)};
@@ -112,21 +113,21 @@ static void dump(const char* why, uint32_t e, long polls, uint32_t ret)
         if (t > 3 || (li == 1 && t == 3)) continue;
         const uint32_t arr = r32(h + 0x30 + 4 * t), tk = r16(h + 0x40 + 16 * t);
         const uint32_t lo = tk >= 6 ? tk - 6 : 0;
-        p += snprintf(b + p, sizeof b - p, "[ama-probe]   list%u ticket=%u entries[%u..]:", t, tk, lo);
+        p = kz3_cat(b, sizeof b, p, "[ama-probe]   list%u ticket=%u entries[%u..]:", t, tk, lo);
         for (uint32_t i = lo; i < lo + 14 && p < (int)sizeof b - 40; i++)
-            p += snprintf(b + p, sizeof b - p, " %u:%08X.%08X", i, r32(arr + 8 * i), r32(arr + 8 * i + 4));
-        p += snprintf(b + p, sizeof b - p, "\n");
+            p = kz3_cat(b, sizeof b, p, " %u:%08X.%08X", i, r32(arr + 8 * i), r32(arr + 8 * i + 4));
+        p = kz3_cat(b, sizeof b, p, "\n");
     }
     const long np = g_npush;
     for (long i = np > NPUSH ? np - NPUSH : 0; i < np && p < (int)sizeof b - 200; i++) {
         const int s = (int)(i % NPUSH);
         const uint32_t cl = (uint32_t)g_push[s].hdr;
-        p += snprintf(b + p, sizeof b - p,
+        p = kz3_cat(b, sizeof b, p,
                       "[ama-probe]   push#%ld t=%llu G=0x%08X lr=0x%08X r5=%016llX r4=0x%llX ticket %u->%u cl:", i + 1,
                       g_push[s].t, g_push[s].g, g_push[s].lr, (unsigned long long)g_push[s].hdr,
                       (unsigned long long)g_push[s].swap, g_push[s].ticket_before, g_push[s].ticket_after);
-        for (int k = 0; k < 8; k++) p += snprintf(b + p, sizeof b - p, " %08X", r32(cl + 4 * k));
-        p += snprintf(b + p, sizeof b - p, "\n");
+        for (int k = 0; k < 8; k++) p = kz3_cat(b, sizeof b, p, " %08X", r32(cl + 4 * k));
+        p = kz3_cat(b, sizeof b, p, "\n");
     }
     fputs(b, stderr);
     fflush(stderr);

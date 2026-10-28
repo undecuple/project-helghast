@@ -3661,7 +3661,7 @@ int main(int argc, char** argv)
     kz3_logging_start();   /* first: every line below goes to the log file */
     atexit(kz3_log_shutdown);
     const char* eboot = kz3_boot_inputs(argc, argv);   /* argv[1] / kz3.ini / beside the exe (release pass 26) */
-    kz3_discord_start();                               /* off unless discord_presence=1; background thread */
+    kz3_discord_start();                               /* off unless discord_presence=1 or the Options row; installs the row's bridge */
     atexit(kz3_discord_stop);
 
 #ifdef _WIN32

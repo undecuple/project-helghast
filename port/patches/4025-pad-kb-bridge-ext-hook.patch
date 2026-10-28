@@ -1,0 +1,25 @@
+KZ3 patch 4025: an extension hook in pad_kb_ui_cmd (KZ3 only). The Options pages' Lua bridge ("kb:..." through
+gPlayerProfile:SetTimeZone, port/kz3/main.cpp) ends in pad_kb_ui_cmd for every command main.cpp does not answer
+itself. A port module sets g_pad_kb_ext_cmd to answer its own commands before the Keyboard page's table: network pass 42's
+Options > Display row "Discord status" ("discord state|on|off", port/net/kz3_discord.c, which turns the presence on
+or off at once and saves kz3.ini discord_presence). The hook runs on the guest's Lua thread and must not block long.
+
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -531,10 +531,16 @@
+ 
+ static int pad_remap_family_port0(void);   /* 4014, defined with the remap below */
+ 
++/* KZ3 patch 4025: a port hook that answers the bridge commands of rows the pad library does not own (network pass 42:
++ * port/net/kz3_discord.c, "discord [state|on|off]" from the Options > Display row Discord status). Returns 1 when it
++ * answered (out = the reply), 0 to leave the command to the Keyboard page's table. */
++int (*g_pad_kb_ext_cmd)(const char* cmd, char* out, size_t n) = NULL;
++
+ /* The Keyboard page's command entry (port/kz3/main.cpp calls it from the Lua bridge). See pad_kb_ui_command. */
+ int pad_kb_ui_cmd(const char* cmd, char* out, size_t n)
+ {
+     int changed;
++    if (g_pad_kb_ext_cmd && g_pad_kb_ext_cmd(cmd, out, n)) return 0;   /* 4025 */
+     AcquireSRWLockExclusive(&s_kb_lock);
+     pad_kb_ensure_loaded();
+     s_kb_ui.pm.family = pad_remap_family_port0();   /* 4014 */

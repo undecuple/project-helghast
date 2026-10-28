@@ -31,6 +31,8 @@ jobs:
         run: nix develop .#ci --command bash tools/ps3recomp-patched.sh
       - name: Host tests (no game data; list in tools/host-tests.txt)
         run: nix develop .#ci --command bash tools/run-host-tests.sh --gh -j "$(nproc)"
+      - name: Project card (.recomp.json) is current
+        run: python3 tools/release/recomp_card.py
 
   secrets:
     runs-on: ubuntu-latest

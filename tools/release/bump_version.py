@@ -149,6 +149,12 @@ def main(argv=None):
     if r.returncode:
         print(r.stdout[-2000:], file=sys.stderr)
         return 1
+    r = subprocess.run([sys.executable, str(root / "tools/release/recomp_card.py"), "--root", str(root)],
+                       capture_output=True, text=True)
+    print("recomp_card: " + ((r.stdout.strip().splitlines() or [""])[-1] if not r.returncode else "FAILED"))
+    if r.returncode:
+        print(r.stderr[-2000:], file=sys.stderr)
+        return 1
     return 0
 
 

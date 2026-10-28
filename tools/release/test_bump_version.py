@@ -110,6 +110,13 @@ def main():
         r = os.popen(f"{sys.executable} {root}/tools/release/test_version_agree.py").read()
         check(r.strip().endswith("PASS"), "test_version_agree passes on the copy")
 
+        card = bump_version.at(root, "public/.recomp.json")
+        good = card.read_text(encoding="utf-8")
+        card.write_text(good.replace('"in-progress"', '"released"'), encoding="utf-8")
+        rc, _, err = run(root, new)
+        check(rc != 0 and "recomp_card" in err, "a card that disagrees stops the bump nonzero")
+        card.write_text(good, encoding="utf-8")
+
         after = snapshot(root)
         rc, out, _ = run(root, new, "--date", "2031-05-05")
         check(rc == 0 and snapshot(root) == after, "second run with the same version changes nothing")

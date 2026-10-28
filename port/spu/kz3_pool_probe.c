@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kz3_cat.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -80,16 +81,16 @@ static void state(char* b, int n)
 {
     const uint32_t S = 0x13F5040u, R = S + 4, M = 0x13F4FE0u;
     const unsigned cnt = r32(S + 0x6C), q = r32(R + 0x1C), h = r32(R + 0x18);
-    int k = snprintf(b, (size_t)n, "on=%u pend=%u req=%u:", vm_base[S], r32(S + 0x4C), cnt);
-    for (unsigned i = 0; i < cnt && i < 8; i++) k += snprintf(b + k, (size_t)(n - k), " %u", r16(S + 0x60 + 2 * i));
-    k += snprintf(b + k, (size_t)(n - k), " | busy=%u idx=%d infl=0x%08X(id %u e=%u) q=%u:", vm_base[R + 4],
+    int k = kz3_cat(b, (size_t)n, 0, "on=%u pend=%u req=%u:", vm_base[S], r32(S + 0x4C), cnt);
+    for (unsigned i = 0; i < cnt && i < 8; i++) k = kz3_cat(b, (size_t)n, k, " %u", r16(S + 0x60 + 2 * i));
+    k = kz3_cat(b, (size_t)n, k, " | busy=%u idx=%d infl=0x%08X(id %u e=%u) q=%u:", vm_base[R + 4],
                   (int)r32(R), h, h ? r16(h + 0xC) : 0, ok(h) ? vm_base[h + 0xE] : 0, q);
     const uint32_t qa = r32(R + 0x20);
     for (unsigned i = 0; i < q && i < 6 && k < n - 60; i++) {
         const uint32_t e = qa + 0x14 * i, eh = r32(e + 0x10);
-        k += snprintf(b + k, (size_t)(n - k), " [%u st%u sz0x%X]", r16(eh + 0xC), r32(eh + 0x14), r32(e + 0xC));
+        k = kz3_cat(b, (size_t)n, k, " [%u st%u sz0x%X]", r16(eh + 0xC), r32(eh + 0x14), r32(e + 0xC));
     }
-    snprintf(b + k, (size_t)(n - k), " | m38=%u m3C=%u rd8=%08X/%08X/%08X lst=0x%08X", r32(M + 0x38), r32(M + 0x3C),
+    kz3_cat(b, (size_t)n, k, " | m38=%u m3C=%u rd8=%08X/%08X/%08X lst=0x%08X", r32(M + 0x38), r32(M + 0x3C),
              r32(R + 8), r32(R + 0xC), r32(R + 0x10), r32(R + 0x28));
 }
 
@@ -245,15 +246,15 @@ void kz3_pool_probe_job(uint32_t obj, int after)
     lines++;
     static const unsigned six[6] = {1531, 1535, 1536, 1565, 1569, 1573};
     char b[700];
-    int k = snprintf(b, sizeof b, "[pool-probe] job42 #%ld t=%llu obj+4=0x%08X +8=0x%08X +C=0x%08X banks=%u", calls,
+    int k = kz3_cat(b, sizeof b, 0, "[pool-probe] job42 #%ld t=%llu obj+4=0x%08X +8=0x%08X +C=0x%08X banks=%u", calls,
                      now_ms(), r32(obj + 4), r32(obj + 8), r32(obj + 0xC), nb);
     for (unsigned i = 0; i < nb && i < 4; i++) {
         const uint32_t bk = obj + 0x20 + 0x810 * i;
-        k += snprintf(b + k, sizeof b - (size_t)k, " | b%u:", i);
-        for (unsigned w = 0; w < 6; w++) k += snprintf(b + k, sizeof b - (size_t)k, " %08X", r32(bk + 4 * w));
+        k = kz3_cat(b, sizeof b, k, " | b%u:", i);
+        for (unsigned w = 0; w < 6; w++) k = kz3_cat(b, sizeof b, k, " %08X", r32(bk + 4 * w));
         for (uint32_t o = 0; o + 2 <= 0x810 && k < (int)sizeof b - 30; o += 2)
             for (int s = 0; s < 6; s++)
-                if (r16(bk + o) == six[s]) k += snprintf(b + k, sizeof b - (size_t)k, " id%u@+0x%X", six[s], o);
+                if (r16(bk + o) == six[s]) k = kz3_cat(b, sizeof b, k, " id%u@+0x%X", six[s], o);
     }
     fprintf(stderr, "%s\n", b);
     fflush(stderr);
@@ -268,8 +269,8 @@ void kz3_pool_probe_job(uint32_t obj, int after)
 static void wline(const char* tag, uint32_t ea, unsigned nw)
 {
     char b[400];
-    int k = snprintf(b, sizeof b, "[pool-probe] deep %s @0x%08X:", tag, ea);
-    for (unsigned w = 0; w < nw && k < (int)sizeof b - 12; w++) k += snprintf(b + k, sizeof b - (size_t)k, " %08X", r32(ea + 4 * w));
+    int k = kz3_cat(b, sizeof b, 0, "[pool-probe] deep %s @0x%08X:", tag, ea);
+    for (unsigned w = 0; w < nw && k < (int)sizeof b - 12; w++) k = kz3_cat(b, sizeof b, k, " %08X", r32(ea + 4 * w));
     fprintf(stderr, "%s\n", b);
 }
 void kz3_pool_probe_deep(uint32_t obj)
@@ -314,9 +315,9 @@ void kz3_pool_probe_deep(uint32_t obj)
         for (unsigned j = 0; j < ng && j < 8; j++) {
             const unsigned c = r16(g + 0xC);
             char b[300];
-            int k = snprintf(b, sizeof b, "[pool-probe] deep   grp%u hdr %08X %08X %08X n=%u ids:", j, r32(g), r32(g + 4),
+            int k = kz3_cat(b, sizeof b, 0, "[pool-probe] deep   grp%u hdr %08X %08X %08X n=%u ids:", j, r32(g), r32(g + 4),
                              r32(g + 8), c);
-            for (unsigned q = 0; q < c && q < 16; q++) k += snprintf(b + k, sizeof b - (size_t)k, " %u", r16(g + 0xE + 2 * q));
+            for (unsigned q = 0; q < c && q < 16; q++) k = kz3_cat(b, sizeof b, k, " %u", r16(g + 0xE + 2 * q));
             fprintf(stderr, "%s\n", b);
             g += 0xE + 2 * c;
         }

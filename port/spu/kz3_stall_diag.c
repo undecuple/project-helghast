@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kz3_cat.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -195,7 +196,7 @@ static void sd_arena(const spu_context* c)
     if (!n || n > 1024 || !sd_readable(lab & ~3u, 4) || !sd_readable(tab & ~3u, 4 * n)) return;
     const uint32_t L = be32p(vm_base + (lab & ~3u));
     char b[1400];
-    int o = snprintf(b, sizeof b,
+    int o = kz3_cat(b, sizeof b, 0,
                      "[stall-diag]   arena rec@LS%05X N=%u stride=0x%X stamps@%08X base=%08X ctr@%08X label@%08X=%08X "
                      "epoch=%08X stamps:",
                      r85, n, stride, tab, base, ctr, lab, L, ep);
@@ -204,7 +205,7 @@ static void sd_arena(const spu_context* c)
         const uint32_t W = be32p(vm_base + (tab & ~3u) + 4 * i);
         const int fr = kz3_arena_free(L, W);
         nfree += fr ? 1u : 0u;
-        if (i < 64 && o < (int)sizeof b - 16) o += snprintf(b + o, sizeof b - (size_t)o, " %08X%s", W, fr ? "*" : "");
+        if (i < 64 && o < (int)sizeof b - 16) o = kz3_cat(b, sizeof b, o, " %08X%s", W, fr ? "*" : "");
     }
     fprintf(stderr, "%s (free by the test: %u)\n", b, nfree);
 }
@@ -218,23 +219,23 @@ static void sd_arena(const spu_context* c)
 static void sd_hex(char* b, int n, int* o, const uint8_t* p, unsigned len)
 {
     for (unsigned i = 0; i < len && *o < n - 12; i += 4)
-        *o += snprintf(b + *o, (size_t)(n - *o), " %08X", be32p(p + i));
+        *o = kz3_cat(b, (size_t)n, *o, " %08X", be32p(p + i));
 }
 static void sd_jm(const spu_context* c)
 {
     static int dumps;
     if (c->image_id != 2 || ++dumps > 16) return;
     char b[1600];
-    int o = snprintf(b, sizeof b, "[stall-diag]   jm LS 12A0..12FF:");
+    int o = kz3_cat(b, sizeof b, 0, "[stall-diag]   jm LS 12A0..12FF:");
     sd_hex(b, sizeof b, &o, c->ls + 0x12A0, 0x60);
-    o += snprintf(b + o, sizeof b - (size_t)o, " | 1410=%08X 1420=%08X | 1440:", ls32(c, 0x1410), ls32(c, 0x1420));
+    o = kz3_cat(b, sizeof b, o, " | 1410=%08X 1420=%08X | 1440:", ls32(c, 0x1410), ls32(c, 0x1420));
     sd_hex(b, sizeof b, &o, c->ls + 0x1440, 16);
-    o += snprintf(b + o, sizeof b - (size_t)o, " | 14E0:");
+    o = kz3_cat(b, sizeof b, o, " | 14E0:");
     sd_hex(b, sizeof b, &o, c->ls + 0x14E0, 32);
     fprintf(stderr, "%s\n", b);
     const uint32_t hdr = ls32(c, 0x1410) & ~0x7Fu;
     if (hdr >= 0x10000u && sd_readable(hdr, 128)) {
-        o = snprintf(b, sizeof b, "[stall-diag]   jm list header line %08X:", hdr);
+        o = kz3_cat(b, sizeof b, 0, "[stall-diag]   jm list header line %08X:", hdr);
         sd_hex(b, sizeof b, &o, vm_base + hdr, 128);
         fprintf(stderr, "%s\n", b);
     }
@@ -243,7 +244,7 @@ static void sd_jm(const spu_context* c)
         for (int w = 0; w < 4; w++) {
             const uint32_t ea = ls32(c, base + 4 * w) & ~0xFu;
             if (ea < 0x10000u || ea >= 0xF0000000u || !sd_readable(ea, 16)) continue;
-            o = snprintf(b, sizeof b, "[stall-diag]   jm LS%04X word%d -> %08X:", base, w, ea);
+            o = kz3_cat(b, sizeof b, 0, "[stall-diag]   jm LS%04X word%d -> %08X:", base, w, ea);
             sd_hex(b, sizeof b, &o, vm_base + ea, 16);
             fprintf(stderr, "%s (u16 +0xE = %u)\n", b, (unsigned)((vm_base[ea + 0xE] << 8) | vm_base[ea + 0xF]));
         }
@@ -268,20 +269,20 @@ static void sd_describe_spu(struct sd_slot* s, spu_context* c, unsigned long lon
         c->int_enable, c->event_mask, c->event_status, c->resv_valid, c->resv_ea, c->atomic_stat, c->list_stall_mask,
         c->list_stall_stat);
     char b[900];
-    int o = snprintf(b, sizeof b, "[stall-diag]   r3-r8:");
+    int o = kz3_cat(b, sizeof b, 0, "[stall-diag]   r3-r8:");
     for (int r = 3; r <= 8; r++)
-        o += snprintf(b + o, sizeof b - (size_t)o, " %08X.%08X", c->gpr[r]._u32[0], c->gpr[r]._u32[1]);
-    o += snprintf(b + o, sizeof b - (size_t)o, " r80-r97:");
+        o = kz3_cat(b, sizeof b, o, " %08X.%08X", c->gpr[r]._u32[0], c->gpr[r]._u32[1]);
+    o = kz3_cat(b, sizeof b, o, " r80-r97:");
     for (int r = 80; r <= 97 && o < (int)sizeof b - 12; r++)
-        o += snprintf(b + o, sizeof b - (size_t)o, " %08X", c->gpr[r]._u32[0]);
+        o = kz3_cat(b, sizeof b, o, " %08X", c->gpr[r]._u32[0]);
     fprintf(stderr, "%s\n", b);
     /* saved link registers up the SPU stack: back chain at [sp], the caller's lr at [back + 16] (SPU ABI) */
-    o = snprintf(b, sizeof b, "[stall-diag]   stack lrs:");
+    o = kz3_cat(b, sizeof b, 0, "[stall-diag]   stack lrs:");
     uint32_t f = sp;
     for (int k = 0; k < 10 && f && f < 0x3FFF0u; k++) {
         const uint32_t back = ls32(c, f) & 0x3FFF0u;
         if (!back || back <= f) break;
-        o += snprintf(b + o, sizeof b - (size_t)o, " 0x%05X", ls32(c, back + 16) & 0x3FFFFu);
+        o = kz3_cat(b, sizeof b, o, " 0x%05X", ls32(c, back + 16) & 0x3FFFFu);
         f = back;
     }
     fprintf(stderr, "%s\n", b);
@@ -297,8 +298,8 @@ static void sd_describe_spu(struct sd_slot* s, spu_context* c, unsigned long lon
         }
         sd_sleep_ms(1);
     }
-    o = snprintf(b, sizeof b, "[stall-diag]   pcs:");
-    for (int m = 0; m < 8 && cnt[m]; m++) o += snprintf(b + o, sizeof b - (size_t)o, " 0x%05X:%u", pcs[m], cnt[m]);
+    o = kz3_cat(b, sizeof b, 0, "[stall-diag]   pcs:");
+    for (int m = 0; m < 8 && cnt[m]; m++) o = kz3_cat(b, sizeof b, o, " 0x%05X:%u", pcs[m], cnt[m]);
     fprintf(stderr, "%s\n", b);
     sd_arena(c);
     if (s->kind == 1) sd_jm(c);
@@ -337,9 +338,9 @@ static void sd_scan(unsigned long long now)
                     s->tid, now - t0, s->b, fv, s->lr, s->a, ow, gw);
             if (sd_readable(s->b & ~0x7Fu, 128)) {
                 char b[600];
-                int o = snprintf(b, sizeof b, "[stall-diag]   flag line@%08X:", s->b & ~0x7Fu);
+                int o = kz3_cat(b, sizeof b, 0, "[stall-diag]   flag line@%08X:", s->b & ~0x7Fu);
                 for (int w = 0; w < 32; w++)
-                    o += snprintf(b + o, sizeof b - (size_t)o, " %08X", be32p(vm_base + (s->b & ~0x7Fu) + 4 * w));
+                    o = kz3_cat(b, sizeof b, o, " %08X", be32p(vm_base + (s->b & ~0x7Fu) + 4 * w));
                 fprintf(stderr, "%s\n", b);
             }
         } else {
