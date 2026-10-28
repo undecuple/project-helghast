@@ -29,6 +29,22 @@ FAILS = []
 PY = sys.executable
 
 
+def eof_iter(items):
+    """Scripted answers that raise EOFError when they run out, like a real closed stdin."""
+    it = iter(items)
+
+    class _A:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            try:
+                return next(it)
+            except StopIteration:
+                raise EOFError from None
+    return _A()
+
+
 def check(cond, what):
     if not cond:
         FAILS.append(what)
@@ -344,7 +360,7 @@ def main():
         root12, dl12 = os.path.join(t12, "root"), os.path.join(t12, "dl")
         os.makedirs(root12)
         os.makedirs(dl12)
-        answers = iter([os.path.join(t12, "nope"), d12, u12, "", "", "n", "n", "", ""])   # font: skip; cleanup: keep
+        answers = eof_iter([os.path.join(t12, "nope"), d12, u12, "", "", "n", "n", "", ""])   # font: skip; cleanup: keep
         asked = []
 
         def ask(q):
@@ -365,7 +381,7 @@ def main():
 
         a12 = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t12, "b"), portable=False)
         res = iter([(1, "FAIL U0: update folder not found\n"), (0, "OK   D1: fine\n")])
-        answers = iter([d12, u12, "", "", "", "y", "y", "", "n"])
+        answers = eof_iter([d12, u12, "", "", "", "y", "y", "", "n"])
         notes, o12 = [], io.StringIO()
         go = fr.interactive(a12, root12, "x.log", notes, ask=lambda q: next(answers), out=o12,
                             check=lambda *x: next(res),
@@ -377,7 +393,7 @@ def main():
         ini = open(os.path.join(root12, "kz3-install.ini")).read()
         check("portable = 0" in ini and "check_updates = 1" in ini and "prepare = 0" in ini,
               f"12 ini after opt-in (Enter at the shader question = warm while playing): {ini!r}")
-        answers = iter([d12, u12, "", "q"])
+        answers = eof_iter([d12, u12, "", "q"])
         go = fr.interactive(a12, root12, "x.log", [], ask=lambda q: next(answers), out=io.StringIO(),
                             check=lambda *x: (1, "FAIL D1: x\n"))
         check(go is False, "12 quit after a failed check")
@@ -385,7 +401,7 @@ def main():
         empty12 = os.path.join(t12, "empty")
         os.makedirs(empty12, exist_ok=True)
         got, o12d = [], io.StringIO()
-        answers = iter([d12, u12, empty12, u12, "q"])
+        answers = eof_iter([d12, u12, empty12, u12, "q"])
         fr.interactive(a12, root12, "x.log", [], ask=lambda q: next(answers), out=o12d,
                        check=lambda *x: (got.append(x[2]), (1, "FAIL D1: x\n"))[1])
         o = o12d.getvalue()
@@ -401,14 +417,14 @@ def main():
         def chk12b(*x):
             seen.append(x)
             return next(res)
-        answers = iter(["", "n", "n"])     # Enter = check again; version check n; start build n
+        answers = eof_iter(["", "n", "n"])     # Enter = check again; version check n; start build n
         go = fr.interactive(a12b, root12, "x.log", notes12b, ask=lambda q: (asked.append(q), next(answers))[1],
                             out=io.StringIO(), check=chk12b)
         check(len(seen) == 2 and seen[0][0] == os.path.abspath(d12) and seen[0][1] == os.path.abspath(u12) and
               not any("Disc dump" in q or "update folder" in q or "font folder" in q for q in asked) and
               a12b.font_dir == os.path.abspath("auto-resolved") and any("checked first" in n for n in notes12b),
               f"12b check-first checks the given folders first, asks only after the FAIL: {asked}")
-        answers = iter(["c", d12, u12, "", "n", "n", "n", "n"])
+        answers = eof_iter(["c", d12, u12, "", "n", "n", "n", "n"])
         asked.clear()
         res = iter([(1, "FAIL U0: x\n"), (0, "OK\n")])
         a12b.dump, a12b.update = d12, u12
@@ -526,7 +542,7 @@ def main():
             check("cannot read the ISO" in str(e), f"14 non-ISO message: {e}")
         # the interactive prompt takes a .iso file as the dump (and still re-asks a missing path)
         picked = []
-        answers = iter([os.path.join(t14, "nope.iso"), iso14, u12, "", "q"])
+        answers = eof_iter([os.path.join(t14, "nope.iso"), iso14, u12, "", "q"])
         a14 = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t14, "b"), portable=False)
         go = fr.interactive(a14, root12, "x.log", [], ask=lambda q: next(answers), out=io.StringIO(),
                             check=lambda d, u, e, *t: (picked.append(d), (1, "FAIL D1: x\n"))[1])
@@ -616,7 +632,7 @@ def main():
         a17 = types.SimpleNamespace(dump=d17, update=u17, eboot=old17, build=os.path.join(t17, "b"), portable=False,
                                     check_first=True, font_dir="", font_dir_set=True, shaders="off", rpcs3="off")
         asked17 = []
-        answers = iter(["", "n", "n"])     # Enter = the update's EBOOT.elf offered in brackets; no version check; no build
+        answers = eof_iter(["", "n", "n"])     # Enter = the update's EBOOT.elf offered in brackets; no version check; no build
 
         def ask17(q):
             asked17.append(q)
@@ -631,7 +647,7 @@ def main():
         check(go is False and a17.eboot == good17 and "OK   E1" in o, f"17 the new EBOOT passes: {a17.eboot}")
         # negative control: a D1 failure keeps the old question (fix, check again, change, quit), not the EBOOT one
         asked17.clear()
-        answers = iter(["q"])
+        answers = eof_iter(["q"])
         fr.interactive(types.SimpleNamespace(**{**vars(a17), "eboot": good17}), root12, "x.log", [], ask=ask17,
                        out=io.StringIO(), check=lambda *x: (1, "FAIL D1: x\n"))
         check(asked17 and "Fix the FAIL lines" in asked17[0], f"17 control: other FAILs keep the folder question {asked17}")

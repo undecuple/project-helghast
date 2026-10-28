@@ -1,28 +1,43 @@
 # GitHub Pages: publishes only site/ (the generated project page) and the screenshots it links, docs/screenshots/.
-# No Discussions feed. Dormant until the maintainer sets the repository variable PAGES_ENABLED to "true" (Settings,
-# Secrets and variables, Actions, Variables) and Settings, Pages, Source to "GitHub Actions": without the variable
-# both jobs are skipped on every push. Triggers: a push to main that touches site/ or docs/screenshots/, and
-# workflow_dispatch.
+# Dormant until the maintainer sets the repository variable PAGES_ENABLED to "true" (Settings, Secrets and variables,
+# Actions, Variables) and Settings, Pages, Source to "GitHub Actions": without the variable both jobs are skipped.
+#
+# Discussions board: the build asks GitHub's GraphQL API (with this job's own GITHUB_TOKEN, read-only) for the latest
+# discussions and renders the site's Discussions section from them. WHAT GOES ONLINE: only the titles (capped), author
+# logins, dates, reply counts and discussion links of four categories (Announcements, Game Requests, General, Q&A),
+# published as static HTML on the project's own Pages site. Never a post body, avatar or image, no script, no embed.
+# The token is read by tools/release/discussions_feed.py only, never printed and never handed to website.py.
+# No snapshot (no token, API down) leaves the committed static page with plain links.
+#
+# Triggers: a push to main that touches site/ or docs/screenshots/, a new, edited, deleted or re-categorised discussion,
+# a new or deleted comment, a daily run as the fallback, and workflow_dispatch. Bursts collapse to one build (concurrency).
 name: pages
 
 on:
   push:
     branches: [main]
     paths: ["site/**", "docs/screenshots/**", ".github/workflows/pages.yml"]
+  discussion:
+    types: [created, edited, deleted, category_changed]
+  discussion_comment:
+    types: [created, deleted]
+  schedule:
+    - cron: "23 4 * * *"   # daily fallback for missed events
   workflow_dispatch:
 
 permissions: {}   # each job asks for what it needs
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: true   # a burst of events leaves one build: the newest
 
 jobs:
   build:
     if: vars.PAGES_ENABLED == 'true'
     permissions:
       contents: read
-      pages: read   # actions/configure-pages reads the Pages site
+      pages: read         # actions/configure-pages reads the Pages site
+      discussions: read   # the board snapshot
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -39,6 +54,18 @@ jobs:
           touch _site/.nojekyll
           printf '%s\n' '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=site/"><title>Redirect</title><a href="site/">site/</a>' > _site/index.html
           test -s _site/site/index.html
+      - name: Discussions board snapshot (optional, never fails the build)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # read by discussions_feed.py only
+        run: |
+          set -uo pipefail
+          python3 tools/release/discussions_feed.py feed.json || true
+      - name: Render the page with the snapshot
+        run: |
+          set -euo pipefail
+          if [ -s feed.json ]; then
+            python3 tools/release/website.py --feed feed.json --out _site/site/index.html
+          fi
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
         with:
           path: _site

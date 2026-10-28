@@ -21,6 +21,7 @@ import names  # noqa: E402
 
 COPY = ("public", "installer/kz3.iss", "installer/launcher/launcher.rc", "port/kz3/CMakeLists.txt", "port/kz3/app.rc",
         "tools/features.py", "docs/features.tsv", "docs/requirements.md", "docs/checkpoints/README.md")
+PUBLIC_DOCS = ("docs/BUILDING.md", "docs/ROADMAP.md", "docs/GETTING-FILES.md", "docs/FEATURES.md", "docs/RELEASE-CRITERIA.md", "docs/screenshots", "site")
 bad = 0
 
 
@@ -30,22 +31,41 @@ def check(ok, what):
     print(("ok   " if ok else "FAIL ") + what)
 
 
+def copy_one(src, out):
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        shutil.copytree(src, out, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+    else:
+        shutil.copy2(src, out)
+
+
 def make_copy(dst):
-    if not (REAL / "public").is_dir():   # the public export: public/ is the repo root, so copy the tree as it is
-        shutil.copytree(REAL, dst, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns(".git", "third_party", "build", "work", "__pycache__"))
-        return
+    """Copy only the files the test needs: the COPY list (in the public export, public/X is X at the root, pass 65: no
+    copy of the whole tree, which another process creating and deleting files in it could break mid-copy)."""
+    export = not (REAL / "public").is_dir()
     for rel in COPY:
-        src, out = REAL / rel, dst / rel
-        out.parent.mkdir(parents=True, exist_ok=True)
-        if src.is_dir():
-            shutil.copytree(src, out, ignore=shutil.ignore_patterns(".git"))
+        if export and rel == "public":
+            for p in REAL.iterdir():   # the public files at the root: top-level files, the docs it edits and site/
+                if p.is_file():
+                    shutil.copy2(p, dst / p.name)
+            for f in PUBLIC_DOCS:
+                if (REAL / f).exists():
+                    copy_one(REAL / f, dst / f)
+            continue
+        if export and rel.startswith("public/"):
+            rel_src = rel[len("public/"):]
         else:
-            shutil.copy2(src, out)
-    (dst / "tools/release").mkdir(parents=True)
-    for p in (REAL / "tools/release").iterdir():
+            rel_src = rel
+        if export and not (REAL / rel_src).exists():
+            continue   # the export lacks some internal files
+        copy_one(REAL / rel_src, dst / (rel_src if export else rel))
+    (dst / "tools/release").mkdir(parents=True, exist_ok=True)
+    for p in sorted((REAL / "tools/release").iterdir()):
         if p.is_file() and p.suffix in (".py", ".json"):
-            shutil.copy2(p, dst / "tools/release" / p.name)
+            try:
+                shutil.copy2(p, dst / "tools/release" / p.name)
+            except FileNotFoundError:
+                pass
 
 
 def snapshot(root):

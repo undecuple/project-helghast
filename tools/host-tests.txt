@@ -28,6 +28,7 @@ tools/release/test_rpcs3_import.py
 tools/release/test_assemble_payload.py
 tools/release/test_version_check.py
 tools/release/test_website.py
+tools/release/test_pages_workflow.py
 tools/upstream/test_lifter_chunks.py
 tools/spu/test_kz3_fiber_stall.sh
 tools/release/test_launch.py
@@ -138,6 +139,9 @@ tools/release/test_install_dir_rule.py
 tools/release/test_install_dump_page.py
 tools/release/test_install_eboot_page.py
 tools/release/test_input_reasons.py
+tools/release/test_lift_inputs_agree.py
+tools/release/test_install_update_page.py
+tools/release/test_clock_check.py
 tools/release/test_iso9660.py
 tools/release/test_crash_report.py
 tools/release/test_bump_version.py

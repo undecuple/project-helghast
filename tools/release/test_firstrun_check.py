@@ -75,13 +75,18 @@ def make_dump(root, title_id="BCUS98234", eboot_magic=fc.SELF_MAGIC, psarc_bytes
     return d
 
 
+def add_update_edat(upd):
+    """The update's data archive (U3): every fixture that models a complete update calls this."""
+    open(os.path.join(upd, "USRDIR", fc.UPDATE_EDAT), "wb").write(b"NPD\0" + b"\0" * 60)
+
+
 def make_update(root, app_ver="01.14", elf_size=21_228_256, title_id="BCUS98234"):
     u = os.path.join(root, "hdd0", "game", title_id)
     write_sfo(os.path.join(u, "PARAM.SFO"),
               {"APP_VER": app_ver, "CATEGORY": "GD", "TITLE": "Synthetic", "TITLE_ID": title_id})
     os.makedirs(os.path.join(u, "USRDIR"))
     open(os.path.join(u, "USRDIR", "EBOOT.BIN"), "wb").write(fc.SELF_MAGIC + b"\0" * 60)
-    open(os.path.join(u, "USRDIR", fc.UPDATE_EDAT), "wb").write(b"NPD\0" + b"\0" * 60)
+    add_update_edat(u)
     write_elf(os.path.join(u, "USRDIR", "EBOOT.elf"), elf_size)
     return u
 
@@ -123,6 +128,15 @@ def main():
         j = json.loads(out)
         check("json shape", j["ok"] is True and {"code", "level", "message"} <= set(j["checks"][0])
               and j["facts"]["eboot_elf"]["version"] == "1.14" and j["facts"]["disc"]["TITLE_ID"] == "BCUS98234", out)
+
+        # U3 (pass 66): the update without added_data_ps3.psarc.edat fails, naming the file and why; the installer's
+        # update page requires the same file (test_install_update_page.py)
+        u3 = make_update(os.path.join(tmp, "noedat"))
+        os.remove(os.path.join(u3, "USRDIR", fc.UPDATE_EDAT))
+        rc, out = run(["--dump", d, "--update", u3] + small)
+        check("update without the data archive fails U3 naming the file", rc == 1 and "FAIL U3" in out
+              and fc.UPDATE_EDAT in out and "menu screens" in out, out)
+        check("update with the data archive passes U3", levels(run(["--dump", d, "--update", u] + small)[1], "U3") == {"OK"})
 
         rc, out = run(["--dump", d] + small)
         check("no --update warns", "WARN U0" in out, out)

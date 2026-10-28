@@ -16,7 +16,7 @@
 <header id="top" class="box">
 <div class="logo"><span class="emblem" aria-hidden="true"><svg viewBox="0 0 100 70" focusable="false"><polygon class="e1" points="0,42 50,0 100,42 72,42 50,23.5 28,42"/><polygon class="e2" points="0,70 50,28 100,70 72,70 50,51.5 28,70"/></svg></span><div class="wm"><p class="tag">Killzone 3 // Unofficial PC Port</p><h1>PROJECT<span>HELGHAST</span></h1></div><span class="sticker wip">WIP</span><p class="slogan">Built on your PC<br>from your own game</p></div>
 <ul class="util"><li><a href="https://github.com/undecuple/project-helghast">GitHub</a></li><li><a href="https://github.com/undecuple/project-helghast/discussions">Discussions</a></li><li><a href="https://github.com/undecuple/project-helghast/releases">Releases</a></li><li><a href="#channels">Channels</a></li></ul>
-<nav class="tabs"><a class="i-home on" href="#top">Home</a><a class="i-shots" href="#shots">Screens</a><a class="i-status" href="#status">Status</a><a class="i-req" href="#requirements">Requirements</a><a class="i-inst" href="#install">Install</a><a class="i-comm" href="https://github.com/undecuple/project-helghast/discussions">Community</a><a class="i-git" href="https://github.com/undecuple/project-helghast">GitHub</a><a class="cta-box" href="https://github.com/undecuple/project-helghast"><b>Source on GitHub</b>Read the code, build it yourself</a></nav>
+<nav class="tabs"><a class="i-home on" href="#top">Home</a><a class="i-shots" href="#shots">Screens</a><a class="i-status" href="#status">Status</a><a class="i-req" href="#requirements">Requirements</a><a class="i-inst" href="#install">Install</a><a class="i-comm" href="#discussions">Discussions</a><a class="i-git" href="https://github.com/undecuple/project-helghast">GitHub</a><a class="cta-box" href="https://github.com/undecuple/project-helghast"><b>Source on GitHub</b>Read the code, build it yourself</a></nav>
 <div class="intro">
 <p class="desc">Killzone 3 // Unofficial PC Port (static recompilation)</p>
 <p class="what">A Windows x64 port of the 2011 PS3 game, made by static recompilation: the game&#x27;s PowerPC and SPU code is translated to C ahead of time and compiled into a native PC program, so no CPU emulator runs at play time. The GPU is still translated as it runs (RSX to Direct3D 12); native replacements come step by step.</p>
@@ -167,8 +167,8 @@
 <tr><td>Subtitles in movies and cutscenes</td><td>Subtitle cards and in-game subtitles</td><td><span class="st st-ok">works</span><br><span class="small">In-level (in-game) subtitles were not reached; the prenarrative text cards are part of the movie and show with either setting</span></td></tr>
 </tbody></table></div></details>
 <h3>What the port adds</h3>
-<p>31 available now, 27 planned. Changes to gameplay stay optional.</p>
-<details><summary>All 58 features</summary>
+<p>32 available now, 27 planned. Changes to gameplay stay optional.</p>
+<details><summary>All 59 features</summary>
 <div class="tw"><table>
 <thead><tr><th>Feature</th><th>State</th><th>Default</th></tr></thead>
 <tbody>
@@ -198,6 +198,7 @@
 <tr><td>Esc goes back in menus on the keyboard, as Circle does on a pad (Backspace still works)</td><td>available</td><td>on</td></tr>
 <tr><td>Frame rate limit 30, 60 or 120 (Options &gt; Display &gt; Frame rate limit, display.ini fps_limit); above 30 a warning says game logic tied to the frame rate may misbehave</td><td>available</td><td>on</td></tr>
 <tr><td>Field of view setting for the campaign and co-op (Options &gt; Display &gt; Field of view, Default or 70-110; display.ini fov); aiming down sights stays relative</td><td>available</td><td>opt-in</td></tr>
+<tr><td>Keyboard and mouse count as their own controller while a pad is connected, so one pad plus the keyboard can play split-screen co-op; a single player on pad and keyboard plays as before</td><td>available</td><td>default on</td></tr>
 <tr><td>Bloom strength setting (Options &gt; Display &gt; Bloom, 0-100 % in steps of 10; display.ini bloom); 100 is the game&#x27;s own look, 0 removes the glow</td><td>available</td><td>100</td></tr>
 <tr><td>Pad layouts: the game&#x27;s own scheme by default, a Modern preset, or a Custom layout per action (33 groups, swap on conflict, copy Default or Modern, keybinds.ini [pad actions]); Options &gt; Controls &gt; Advanced Settings &gt; Layout and Prompts page</td><td>available</td><td>opt-in (the game&#x27;s own layout is the default)</td></tr>
 <tr><td>Option pages that match the game: descriptions for the port&#x27;s rows in the game&#x27;s tooltip panel, the Display list scrolling inside the game&#x27;s list area, Reset to defaults covering the port&#x27;s rows, and a menu pointer in the game&#x27;s colours</td><td>available</td><td>on</td></tr>
@@ -300,9 +301,16 @@
 <div class="nb"><a class="frame" href="../docs/screenshots/20261008-040732Z_kz3-main-menu.png"><img src="../docs/screenshots/20261008-040732Z_kz3-main-menu.png" alt="" loading="lazy"></a><div class="nt"><p>Main menu, drawn by the port&#x27;s Direct3D 12 renderer. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261008-040732Z_kz3-main-menu.png">Full size<span aria-hidden="true"> &gt;</span></a></p>
 </div></div>
 </article>
+<article id="discussions" class="news board">
+<h2>Discussions</h2>
+<p class="meta">on GitHub · General and game requests</p>
+<p>Questions, ideas and screenshots of your own runs are welcome in the project's discussions on GitHub (posting needs a GitHub account).</p>
+<p class="btns"><a class="btn" href="https://github.com/undecuple/project-helghast/discussions/categories/general">Start a discussion</a><a class="btn alt" href="https://github.com/undecuple/project-helghast/discussions">All discussions</a></p>
+<p class="small">Game requests: <a href="https://github.com/undecuple/project-helghast/discussions/categories/game-requests">ask for another game</a>. Install and hardware questions: <a href="https://github.com/undecuple/project-helghast/discussions/categories/q-a">Q&amp;A</a>.</p>
+</article>
 <article id="about" class="news">
 <h2>About the port</h2>
-<p class="meta">by the project · how it works · 58 port features</p>
+<p class="meta">by the project · how it works · 59 port features</p>
 <div class="nb"><span class="frame pic-about" aria-hidden="true"></span><div class="nt"><p>The port is built on <a href="https://github.com/sp00nznet/ps3recomp">ps3recomp</a> (MIT): the PPU code and the game's SPU programs are lifted to C, the PS3 system libraries the game calls are reimplemented, and the game's RSX command stream is replayed on Direct3D 12. The game's archive is read in place from your dump. It is tested on Windows x64 under Proton; a native Linux build is planned. What comes next: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/ROADMAP.md">the roadmap</a>.</p>
 <p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/HOW-IT-WORKS.md">The technical overview<span aria-hidden="true"> &gt;</span></a></p>
 <p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>

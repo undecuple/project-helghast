@@ -692,6 +692,30 @@ begin
   Result := SfoField(AddBackslash(Dump) + 'PS3_GAME\PARAM.SFO', 'TITLE_ID');
 end;
 
+{ The first subfolder of Dir that holds a Killzone 3 PS3_GAME (PARAM.SFO with one of the four title ids), else '': other
+  games' dumps on a drive root are not offered (public report 2026-10) }
+function SubDisc(Dir: String): String;
+var
+  FR: TFindRec;
+  More: Boolean;
+begin
+  Result := '';
+  if not DirExists(Dir) then Exit;
+  if FindFirst(AddBackslash(Dir) + '*', FR) then begin
+    try
+      More := True;
+      while More and (Result = '') do begin
+        if (FR.Name <> '.') and (FR.Name <> '..') and ((FR.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+           (RegionOf(DiscIdOf(AddBackslash(Dir) + FR.Name)) <> '') then
+          Result := AddBackslash(Dir) + FR.Name;
+        More := FindNext(FR);
+      end;
+    finally
+      FindClose(FR);
+    end;
+  end;
+end;
+
 { The title id of the picked disc dump; the update goes under it (dev_hdd0\game\<id>) }
 function DiscTitleId(Param: String): String;
 begin
@@ -745,7 +769,7 @@ begin
   else if not DirExists(AddBackslash(Dir) + 'PS3_GAME') then begin
     { pass 64: say what is there (a drive root given as the dump read as an EBOOT problem) }
     Result := Dir + ' holds no PS3_GAME folder (' + FolderSummary(Dir) + ')';
-    Sub := SubWith(Dir, 'PS3_GAME\PARAM.SFO');
+    Sub := SubDisc(Dir);
     if Sub <> '' then Result := Result + '; PS3_GAME is one folder down: pick ' + Sub;
     { issue #12: the update folder given as the dump (PARAM.SFO and USRDIR\EBOOT.BIN, no PS3_GAME) }
     if FileExists(AddBackslash(Dir) + 'PARAM.SFO') and FileExists(AddBackslash(Dir) + 'USRDIR\EBOOT.BIN') then
@@ -1562,7 +1586,8 @@ begin
       { A missing 1.14 update stops here; Next again = check again. }
       MsgBox('The 1.14 update was not found in this folder: ' + UpdateProblem(UpdatePage.Values[0]) + #13#10 + #13#10 +
         'The update folder is the installed update (dev_hdd0\game\BCUS98234, or your region''s id) and holds ' +
-        'PARAM.SFO, USRDIR\EBOOT.BIN and USRDIR\added_data_ps3.psarc.edat. The port is built on 1.14.' + #13#10 + #13#10 +
+        'PARAM.SFO, USRDIR\EBOOT.BIN and USRDIR\added_data_ps3.psarc.edat (the update''s data archive: the 1.14 menu screens, the multiplayer map scripts ' +
+        'and files that override the disc''s). The port is built on 1.14.' + #13#10 + #13#10 +
         'Use the 1.14 update from your own console, or the one installed in RPCS3 ' +
         '(see RPCS3''s documentation).' + #13#10 + #13#10 +
         'Then select the folder again and press Next to check again.', mbError, MB_OK);

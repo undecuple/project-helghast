@@ -12,7 +12,7 @@ What the PS3 version of Killzone 3 does and how far the port reproduces it (sect
 | declined | will not be done | 0 |
 | not applicable | has no equivalent on PC | 2 |
 
-Port-only features: 31 available now, 27 planned.
+Port-only features: 32 available now, 27 planned.
 
 **Estimated parity with the PS3 version: 65 %** (an estimate: works counts 1, partial 1/2, not yet verified 1/4, not yet 0; declined and not-applicable features are left out).
 
@@ -164,6 +164,7 @@ Non-original features are opt-in where they change gameplay; display and input i
 | Esc goes back in menus on the keyboard, as Circle does on a pad (Backspace still works) | available | on | Checked under Proton with scripted keys |
 | Frame rate limit 30, 60 or 120 (Options > Display > Frame rate limit, display.ini fps_limit); above 30 a warning says game logic tied to the frame rate may misbehave | available | on | Default 30, the game's own; the limit only raises the cap, the levels still run at about 16-22 frames/s |
 | Field of view setting for the campaign and co-op (Options > Display > Field of view, Default or 70-110; display.ini fov); aiming down sights stays relative | available | opt-in | Default keeps the game's own; off in every multiplayer mode |
+| Keyboard and mouse count as their own controller while a pad is connected, so one pad plus the keyboard can play split-screen co-op; a single player on pad and keyboard plays as before | available | default on | Mouse look still turns the first player's view (planned); checked with scripted input, not yet by hand |
 | Bloom strength setting (Options > Display > Bloom, 0-100 % in steps of 10; display.ini bloom); 100 is the game's own look, 0 removes the glow | available | 100 | Row, saved value and the scaled strength checked under Proton in K4 (frames at 100, 50 and 0 compared; the effect is modest in that scene); other levels and 1.00 not run |
 | Pad layouts: the game's own scheme by default, a Modern preset, or a Custom layout per action (33 groups, swap on conflict, copy Default or Modern, keybinds.ini [pad actions]); Options > Controls > Advanced Settings > Layout and Prompts page | available | opt-in (the game's own layout is the default) | The Modern preset changes gameplay buttons only (on foot), applied inside the game's own action table; menus keep Cross to confirm and Circle to go back, checked in the Options screens in one run. The Modern preset follows the Killzone Shadow Fall layout (fire R2, aim L2, grenade R1, reload Square, jump Cross); in one level fire, reload, jump and aim worked on the new buttons (2026-10-27); Modern keeps Use on Circle and its controller picture shows no L1 line; Use at a use prompt is not checked. Custom: checked on screen only; not played in a level, real-pad capture unchecked. The Layout and Prompts page has row descriptions and a picture per layout and the game's controller page shows the Xbox and keyboard prompt sets. Its full effect in a level is not yet confirmed |
 | Option pages that match the game: descriptions for the port's rows in the game's tooltip panel, the Display list scrolling inside the game's list area, Reset to defaults covering the port's rows, and a menu pointer in the game's colours | available | on | Checked under Proton by screenshot; the pointer and the menu sounds still need a check by hand |

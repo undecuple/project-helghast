@@ -41,6 +41,13 @@ check(g.index("one folder down") < g.index("It looks like the 1.14 update folder
 f = func("ResolveDump")
 check("'PS3_GAME\\PARAM.SFO'" in f and "EndsWithName(D, 'USRDIR')" in f and "EndsWithName(D, 'PS3_GAME')" in f and
       "ExtractFileDir" in f, "ResolveDump walks up from PS3_GAME and PS3_GAME\\USRDIR")
+f = func("SubDisc")
+check("RegionOf(DiscIdOf(" in f and "FindFirst" in f, "SubDisc offers only subfolders whose PS3_GAME has a Killzone 3 title id")
+g = func("DumpProblem")
+check("Sub := SubDisc(Dir)" in g and "SubWith(Dir, 'PS3_GAME" not in g,
+      "DumpProblem's one-folder-down hint comes from SubDisc, not any PS3_GAME")
+check(code.index("function RegionOf") < code.index("function SubDisc") < code.index("function DumpProblem"),
+      "SubDisc sits after RegionOf and DiscIdOf, before DumpProblem (Pascal Script order)")
 f = func("ResolveUpdate")
 check("'USRDIR'" in f and "PARAM.SFO" in f and "ExtractFileDir" in f, "ResolveUpdate takes USRDIR to the update folder")
 f = func("SfoField")
@@ -197,7 +204,7 @@ check("FindFirst" in sw and "FileExists(AddBackslash(Dir) + FR.Name + '\\' + Rel
 check(code.find("function FolderSummary") < code.find("function DumpProblem") and
       code.find("function SubWith") < code.find("function DumpProblem") and
       code.find("function UpdateProblem") > code.find("function UpdateOK"), "helpers are declared before their users")
-check("Dir + ' holds no PS3_GAME folder (' + FolderSummary(Dir)" in dp and "SubWith(Dir, 'PS3_GAME\\PARAM.SFO')" in dp
+check("Dir + ' holds no PS3_GAME folder (' + FolderSummary(Dir)" in dp and "SubDisc(Dir)" in dp
       and "not DirExists(AddBackslash(Dir) + 'PS3_GAME')" in dp, "DumpProblem says what a folder without PS3_GAME holds")
 check("that is a disc dump, not the update" in up and "' does not hold ' + Miss" in up and "SubWith(Dir, 'PARAM.SFO')" in up
       and "UpdateOK(Dir) then Exit" in up, "UpdateProblem names the path, the missing files or the disc dump")

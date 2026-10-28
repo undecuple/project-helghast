@@ -3,6 +3,13 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
+## [Unreleased]
+
+### Fixed
+- When the PC clock is behind the install's files (the build would repeat itself), the setup stops with a message that shows both times and how to set the clock.
+- An update folder without `USRDIR\added_data_ps3.psarc.edat` is refused by the setup's first check as well as by its update page, with a message that names the file and says what it holds (the 1.14 menu screens, the multiplayer map scripts and files that override the disc's).
+- The setup's folder hints offer only Killzone 3 dumps (other games' dumps on a drive root are not named), name every `.iso` file in the folder or one level down on a drive root beside the folder hints, and take the update's `USRDIR` as the update folder even when it holds a `PARAM.SFO` (reported by a player on Reddit). The interactive check stops with its FAIL lines when no input is left instead of repeating.
+
 ## [0.1.5] - 2026-10-28 (pre-release)
 
 ### Fixed

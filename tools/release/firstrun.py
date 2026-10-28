@@ -1559,8 +1559,14 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
             elif "U0" in text or "U1" in text or "U2" in text or "E1" in text:
                 say("")
                 say(UPDATE_HELP)
-            r = ask(RPCS3_TEXT.CHECK_AGAIN if guide else
-                    "Fix the FAIL lines, then Enter = check again, c = change the folders, q = quit: ").strip().lower()
+            try:
+                r = ask(RPCS3_TEXT.CHECK_AGAIN if guide else
+                        "Fix the FAIL lines, then Enter = check again, c = change the folders, q = quit: ").strip().lower()
+            except (EOFError, StopIteration):
+                say("")
+                say("No more input: stopping with the FAIL lines above.")
+                notes.append("# interactive check stopped: input ended")
+                return False
             if r.startswith("q"):
                 return False
             if r.startswith("c"):

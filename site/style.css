@@ -261,3 +261,6 @@ footer h4 { color: #ff3b30; border-bottom: 2px solid #d61c14; padding-bottom: 4p
   .news, .promo { padding: 16px 14px 16px; }
   .fcols { grid-template-columns: minmax(0, 1fr); }
 }
+
+.board h3 { font-size: 17px; margin: 14px 0 6px; }
+.board .btns { margin: 14px 0 8px; }

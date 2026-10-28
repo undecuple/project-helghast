@@ -54,6 +54,7 @@ def make_rpcs3(base, app_ver="01.14", with_update=True, with_elf=False, saves=("
                       {"APP_VER": app_ver, "CATEGORY": "GD", "TITLE": "Synthetic", "TITLE_ID": "BCUS98234"})
         os.makedirs(os.path.join(upd, "USRDIR"))
         open(os.path.join(upd, "USRDIR", "EBOOT.BIN"), "wb").write(fc.SELF_MAGIC + b"\0" * 60)
+        tfc.add_update_edat(upd)
         if with_elf:
             tfc.write_elf(os.path.join(upd, "USRDIR", "EBOOT.elf"), 21_228_256)
     for n in saves:
@@ -149,6 +150,33 @@ def main():
         check(any(q == T.CHECK_AGAIN for q in asked), "5 asked to check again")
         check("OK   E1" in o and a.eboot == elf, f"5 decrypted EBOOT accepted: {a.eboot!r}")
         os.remove(elf)
+        # 5b. (pass 67) input that has ended while a FAIL remains: the wizard returns with the FAIL lines, never spins
+        import signal
+        import time
+        import types
+        for label, ending in (("EOF", None),):
+            r5b, _, u5b = make_rpcs3(os.path.join(tmp, "t5b" + label[:3]), with_elf=True)
+            os.remove(os.path.join(u5b, "USRDIR", fc.UPDATE_EDAT))          # U3 stays a FAIL
+            a5b = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(tmp, "b5b"), portable=True,
+                                        rpcs3=r5b, font_dir="", shaders="off")
+            out5b, n5b, left = io.StringIO(), [], {"n": 0}
+
+            def ask5b(q, ending=ending, left=left):
+                left["n"] += 1
+                if ending is None:          # a closed stdin: the first prompts are answered, then input() raises
+                    if left["n"] > 4:
+                        raise EOFError
+                    return ""
+                return ending(q)
+            if hasattr(signal, "SIGALRM"):
+                signal.alarm(10)
+            t0 = time.time()
+            go5b = fr.interactive(a5b, os.path.join(tmp, "r5b"), "x.log", n5b, ask=ask5b, out=out5b,
+                                  vcheck=lambda v: {"status": "error", "current": v, "latest": "", "url": ""})
+            if hasattr(signal, "SIGALRM"):
+                signal.alarm(0)
+            check(go5b is False and "FAIL U3" in out5b.getvalue() and time.time() - t0 < 5 and left["n"] < 20,
+                  f"5b {label}: returns False with the FAIL line within seconds ({left['n']} questions)")
         # 6. saves: no / yes / conflict kept / conflict replaced
         r6, _, _ = make_rpcs3(os.path.join(tmp, "t6"), saves=("BCUS98234-AUTO", "BCUS98234-SAVE1"))
         snap6 = snapshot(r6)

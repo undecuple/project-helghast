@@ -106,10 +106,12 @@ def main():
                and top.count('<a class="btn') == 2 and 'class="cta-box"' in top and 'class="learn" href="#shot-1"' in page
                and 'id="shot-1"' in page and page.count('class="promo pic"') == 1,
                "intro above the column (what, status, own copy, two buttons), CTA box, banner link, picture promo")
-        expect(f'class="i-comm" href="{website.DISC}"' in page and 'id="community"' in page
+        expect('class="i-comm" href="#discussions"' in page and 'id="community"' in page and 'id="discussions"' in page
+               and f'href="{website.DISC_GENERAL}">Start a discussion' in page and f'href="{website.DISC}">All discussions' in page
+               and 'class="feed board"' not in page and "Questions, ideas and screenshots" in page
                and "Join the discussion" in page and 'class="feed"' not in page and 'class="news ann"' not in page
-               and page.count(f'href="{website.DISC_QA}"') == 2 and page.count(f'href="{website.DISC_ANN}"') == 2,
-               "Community tab, static community box, Q&A links in install and requirements, Discuss links on the two static entries")
+               and page.count(f'href="{website.DISC_QA}"') == 3 and page.count(f'href="{website.DISC_ANN}"') == 2,
+               "Discussions tab and board with static links only, static community box, Q&A links in install and requirements, Discuss links on the two static entries")
         expect(page.count('<li class="row"><span class="thumb tb-part"') == len(website.KEY_ROWS)
                and page.count('<span class="sticker wip">WIP<') == 1
                and page.count('<i class="on"></i>') == 10, "key rows (all partial here), the hero's WIP sticker; meters lit 9 (6 of 7 partial) + 1 (1 not yet)")
@@ -144,13 +146,15 @@ def main():
     snap = {"items": [
         {"title": "Release <script>alert(1)</script> notes", "category": "Announcements", "author": website.names.OWNER,
          "created": "2026-10-16T10:00:00Z", "replies": 3, "url": U + "1"},
-        {"title": "Secret chat", "category": "Q&A", "author": "bob", "created": "2026-10-15", "replies": 1, "url": U + "2"},
+        {"title": "Secret chat", "category": "Off topic", "author": "bob", "created": "2026-10-15", "replies": 1, "url": U + "2"},
         {"title": "My run", "category": "Show and tell", "author": "al<b>", "created": "2026-10-15", "replies": 0, "url": U + "3"},
         {"title": "Evil link", "category": "Show and tell", "author": "eve", "created": "2026-10-15", "replies": 0,
          "url": "https://example.com/discussions/4"},
-        {"title": "Nice " + "x" * 300, "category": "Show and tell", "author": "carol", "created": "2026-10-14", "replies": 1,
+        {"title": "Nice " + "x" * 300, "category": "General", "author": "carol", "created": "2026-10-14", "replies": 1,
          "url": U + "5", "body": "SECRETBODY", "avatar": "https://example.com/a.png"},
         {"title": "Community post", "category": "Announcements", "author": "dave", "created": "2026-10-13", "replies": 2, "url": U + "6"},
+        {"title": "Please port Game X", "category": "Game Requests", "author": "erin", "created": "2026-10-12", "replies": 0, "url": U + "7"},
+        {"title": "Hostile <img src=x> \"q\"", "category": "General", "author": "fay", "created": "2026-10-11", "replies": 1, "url": U + "8"},
     ]}
     with tempfile.TemporaryDirectory() as t:
         root = pathlib.Path(t) / "feed"
@@ -164,12 +168,19 @@ def main():
         pg = out.read_text()
         expect("<script>" not in pg and "Release &lt;script&gt;alert(1)&lt;/script&gt; notes" in pg, "feed title not escaped")
         expect("Secret chat" not in pg and "al&lt;b&gt;" not in pg and "example.com" not in pg
-               and "SECRETBODY" not in pg and "Evil link" not in pg, "category/login/URL filter or body/avatar leak")
+               and "SECRETBODY" not in pg and "Evil link" not in pg and "My run" not in pg and "<img src=x" not in pg
+               and "Hostile &lt;img src=x&gt; &quot;q&quot;" in pg, "category/login/URL filter or body/avatar leak")
         expect(pg.count('class="news ann"') == 1 and f'href="{U}1"' in pg and "3 comments" in pg,
                "only the owner's Announcements become news entries (with count and Discuss link)")
         expect(f'href="{U}5"' in pg and ("x" * 100) not in pg and "…" in pg and "carol · 2026-10-14 · 1 reply" in pg,
                "box row missing, title not capped, or reply wording wrong")
         expect("dave · 2026-10-13 · 2 replies" in pg and "Join the discussion" in pg, "community announcement row / join link")
+        board = pg.split('id="discussions"', 1)[1].split("</article>", 1)[0]
+        expect("Latest in General" in board and "<h3>Game requests</h3>" in board and f'href="{U}7"' in board
+               and f'href="{U}8"' in board and "erin · 2026-10-12 · 0 replies" in board and "carol · 2026-10-14 · 1 reply" in board
+               and "Start a discussion" in board and "All discussions" in board and f'href="{U}1"' not in board
+               and "avatar" not in board and "<img" not in board and "<script" not in board,
+               "board: General and Game Requests rows with author/date/count, links, no Announcements rows, no image or script")
         expect(not website.lint(pg), f"lint on the feed page: {website.lint(pg)}")
         expect(run("--root", str(root), "--feed", str(pathlib.Path(t) / "missing.json"), "--out", str(out))[0] == 0
                and 'class="feed"' not in out.read_text() and "Join the discussion" in out.read_text(), "missing snapshot not static")
@@ -204,7 +215,17 @@ def main():
             rc3 = discussions_feed.main([str(wr)], environ={"GITHUB_TOKEN": "tok-SECRET"}, opener=ok)
         saved = wr.read_text()
         expect(rc3 == 0 and sent.get("auth") == "Bearer tok-SECRET" and "tok-SECRET" not in saved and "SECRETBODY" not in saved
-               and len(json.loads(saved)["items"]) == 3 and "Secret chat" not in saved, "fetcher snapshot wrong or leaks the token")
+               and len(json.loads(saved)["items"]) == 5 and "Secret chat" not in saved, "fetcher snapshot wrong or leaks the token")
+
+    # per-category caps: a flood of Announcements does not crowd out General; categories outside the four are dropped
+    flood = [{"title": f"A{k}", "category": "Announcements", "author": "x", "created": f"2026-10-{20 + k % 9:02d}",
+              "replies": 0, "url": U + str(100 + k)} for k in range(40)]
+    flood.append({"title": "G", "category": "General", "author": "x", "created": "2020-01-01", "replies": 0, "url": U + "999"})
+    flood.append({"title": "Ideas", "category": "Ideas", "author": "x", "created": "2026-10-30", "replies": 0, "url": U + "998"})
+    kept = discussions_feed.clean_items(flood)
+    expect(sum(i["category"] == "Announcements" for i in kept) == 5 and any(i["category"] == "General" for i in kept)
+           and not any(i["category"] == "Ideas" for i in kept) and discussions_feed.CATEGORIES == ("Announcements", "Game Requests", "General", "Q&A"),
+           "per-category caps keep General, allowlist is the four categories")
 
     # Sixth pass: the generated changelog and to-do boxes, the button strip, the dividers.
     with tempfile.TemporaryDirectory() as d:

@@ -149,6 +149,57 @@ def main():
         rc, rs, _ = run(["--dump", e, "--update", f2, "--eboot", elf])
         check("control: the same folders, not drive roots, are searched one level only", rc == 1 and
               "looks like" not in " ".join(rs) and "(2 folders, 0 files)" in rs[0], rs)
+        # pass 67: other games' dumps on a drive root are not candidates; ISOs are named beside folder hints
+        g = os.path.join(tmp, "g")
+        for n, tid in (("Katamari", "BCUS98001"), ("GT5", "BCES00569"), ("GT6", "BCUS99999")):
+            shutil.copytree(make_dump(os.path.join(tmp, "o" + n), title_id=tid), os.path.join(g, n + "_dump"))
+        shutil.copytree(os.path.join(tmp, "oKatamari", "dump"), os.path.join(g, "KatamariFlat"))
+        check("looks_like_disc: another title id is no disc", not fc.looks_like_disc(os.path.join(g, "KatamariFlat")) and
+              fc.has_ps3_game(os.path.join(g, "KatamariFlat")) and fc.disc_title_id(os.path.join(g, "KatamariFlat")) == "BCUS98001")
+        check("looks_like_disc: every accepted id is a disc", all(
+            fc.looks_like_disc(make_dump(os.path.join(tmp, "id" + i), title_id=i)) for i in fc.TITLE_IDS))
+        check("looks_like_disc: no PARAM.SFO is no disc", not fc.looks_like_disc(os.path.join(tmp, "e")))
+        real_root = fc.is_drive_root
+        fc.is_drive_root = lambda p: os.path.abspath(p) == g
+        try:
+            check("candidates: only other games' dumps give none", fc.candidates(g, 2) == ([], []), fc.candidates(g, 2))
+            shutil.copytree(d, os.path.join(g, "Games", "KZ3"))
+            check("candidates: the Killzone 3 dump among them is the only one", fc.candidates(g, 2)[0] == [os.path.join(g, "Games", "KZ3")],
+                  fc.candidates(g, 2))
+            open(os.path.join(g, "game.iso"), "wb").write(b"x")
+            os.makedirs(os.path.join(g, "Isos"))
+            open(os.path.join(g, "Isos", "kz3.iso"), "wb").write(b"x")
+            rc, rs, _ = run(["--dump", g, "--update", u, "--eboot", elf])
+        finally:
+            fc.is_drive_root = real_root
+        check("hint: folder hint and both ISO files named together, no other game", rc == 1 and
+              f"looks like {os.path.join(g, 'Games', 'KZ3')}: pick that folder" in rs[0] and "Katamari" not in rs[0] and "GT5" not in rs[0]
+              and "game.iso" in rs[0] and os.path.join(g, "Isos", "kz3.iso") in rs[0] and "pick that file" in rs[0], rs)
+        # an ISO in a plain folder is named beside a folder hint too
+        p2 = os.path.join(tmp, "p2")
+        os.makedirs(os.path.join(p2, "dump"))
+        shutil.copytree(d, os.path.join(p2, "KZ3"))
+        open(os.path.join(p2, "a.iso"), "wb").write(b"x")
+        txt, _ = fc.disc_found(p2)
+        check("hint: ISO named beside the folder hint (not a drive root)", "pick that folder" in txt and "the ISO file a.iso: pick that file" in txt, txt)
+        # PARAM.SFO inside the update's USRDIR does not block the step up
+        u2 = os.path.join(tmp, "u2")
+        shutil.copytree(u, u2)
+        shutil.copy(os.path.join(u2, "PARAM.SFO"), os.path.join(u2, "USRDIR", "PARAM.SFO"))
+        check("resolve_update: USRDIR holding a PARAM.SFO still resolves to its parent",
+              fc.resolve_update(os.path.join(u2, "USRDIR")) == u2, fc.resolve_update(os.path.join(u2, "USRDIR")))
+        check("resolve_update: the update folder and other folders are unchanged",
+              fc.resolve_update(u2) == u2 and fc.resolve_update(tmp) == tmp)
+        rc, rs, _ = run(["--dump", d, "--update", os.path.join(u2, "USRDIR"), "--eboot", elf])
+        check("a USRDIR with PARAM.SFO given as the update passes", rc == 0 and not any("1.14 update failed" in x for x in rs), rs)
+        # U3 wording: only what is known
+        u3 = os.path.join(tmp, "u3")
+        shutil.copytree(u, u3)
+        os.remove(os.path.join(u3, "USRDIR", fc.UPDATE_EDAT))
+        rc, rs, j = run(["--dump", d, "--update", u3, "--eboot", elf])
+        msg = " ".join(str(x) for x in j.get("checks", j.get("results", []))) + " ".join(rs)
+        check("U3 wording: names the file and the installer page, claims nothing unmeasured",
+              "which 1.14 does not" not in msg and "disc data" not in msg and fc.UPDATE_EDAT in msg, msg[:600])
         # issue #12: roles swapped or mixed up
         rc, rs, _ = run(["--dump", u, "--update", d, "--eboot", elf])
         check("swapped: the update given as the disc", rc == 1 and rs[0].startswith(f"Disc dump failed: {u} looks like the "

@@ -33,6 +33,8 @@ file sizes.
             (file attributes 0x400000, 0x40000 or 0x1000); checked before any file is read, so nothing downloads.
             O3 (OK, INFO): the dump or update is inside OneDrive but fully local.
 
+  T1 FAIL (--root): the PC clock is more than 5 minutes behind the newest file of the install (stat only, at most 4000 files).
+
 One line per check: OK / WARN / FAIL <code>: <message>. Exit 0 = no FAIL, 1 = at least one FAIL, 2 = usage.
 --json prints {"ok": bool, "checks": [{"code", "level", "message"}], "facts": {...}} instead. Numbers come from
 the RE notes and a known-good dump (ASSUMPTION where marked); no game content is embedded.
@@ -453,7 +455,9 @@ def check_update(r, upd, disc_id=None):
     if os.path.isfile(edat):
         r.ok("U3", f"update data archive present ({os.path.getsize(edat):,} bytes)")
     else:
-        r.warn("U3", f"1.14 update: no USRDIR/{UPDATE_EDAT}; the update's data layer will be missing (disc data only)")
+        r.fail("U3", f"1.14 update: no USRDIR/{UPDATE_EDAT}. It is the update's data archive (the 1.14 menu screens, the "
+                     "multiplayer map scripts and files that override the disc's). The installer's update page asks for the same "
+                     "file. Use the complete installed update")
 
 
 def check_eboot_elf(r, elf, target="1.14", update=None):
@@ -572,9 +576,10 @@ def resolve_dump(path):
 
 def resolve_update(path):
     """A pick of the update's USRDIR -> the update folder (the one holding PARAM.SFO); anything else unchanged."""
-    if not path or not os.path.isdir(path) or _is(path, "PARAM.SFO"):
+    if not path or not os.path.isdir(path):
         return path
     p = os.path.normpath(os.path.abspath(path))
+    # a PARAM.SFO inside USRDIR itself (put there by hand or a tool) must not block the step up to the update folder
     if os.path.basename(p).upper() == "USRDIR" and _is(os.path.dirname(p), "PARAM.SFO"):
         return os.path.dirname(p)
     return path
@@ -594,9 +599,21 @@ def is_drive_root(path):
     return os.path.dirname(p) == p
 
 
-def looks_like_disc(d):
-    """A folder holding PS3_GAME/PARAM.SFO (a disc dump)."""
+def disc_title_id(d):
+    """The TITLE_ID of d/PS3_GAME/PARAM.SFO, or "" when there is none or it is unreadable."""
+    kind = _sfo_kind(os.path.join(d, "PS3_GAME", "PARAM.SFO")) if _is(d, "PS3_GAME", "PARAM.SFO") else None
+    return (kind[0] or "") if kind else ""
+
+
+def has_ps3_game(d):
+    """A folder holding PS3_GAME/PARAM.SFO, of any game."""
     return _is(d, "PS3_GAME", "PARAM.SFO")
+
+
+def looks_like_disc(d):
+    """A folder holding PS3_GAME/PARAM.SFO whose TITLE_ID is one of the accepted Killzone 3 ids (TITLE_IDS): the
+    other games' dumps on a drive root are not offered as the disc dump."""
+    return disc_title_id(d) in TITLE_IDS
 
 
 def looks_like_update(d):
@@ -625,6 +642,8 @@ def candidates(top, depth):
                 sub = os.path.join(d, n)
                 if looks_like_disc(sub):
                     discs.append(sub)
+                elif has_ps3_game(sub):
+                    pass          # another game's dump: never a candidate (not descended into either)
                 elif looks_like_update(sub):
                     updates.append(sub)
                 else:
@@ -652,6 +671,17 @@ def _hint(path, want):
     return f"; {path} is a drive root" * root + f"; {where}, " + "; ".join(parts)
 
 
+def _isos(path):
+    """.iso files in path, and one level down when path is a drive root: full paths for the subfolder ones, else names
+    (at most 3)."""
+    dirs, files = _entries(path)
+    out = [n for n in files if n.lower().endswith(".iso")]
+    if is_drive_root(path):
+        for d in dirs:
+            out += [os.path.join(path, d, n) for n in _entries(os.path.join(path, d))[1] if n.lower().endswith(".iso")]
+    return out[:3]
+
+
 def disc_found(path):
     """-> (what the disc input path holds, structural): structural = the input is the wrong thing altogether, so
     the D1-D3 messages add nothing."""
@@ -677,11 +707,14 @@ def disc_found(path):
     if looks_like_ps3_game(path):
         return what + "; it holds a disc PARAM.SFO directly, so it looks like the PS3_GAME folder under another name", True
     hint = _hint(path, "disc")
-    isos = [n for n in files if n.lower().endswith(".iso")]
+    isos = _isos(path)
     if hint:
         what += hint
-    elif isos:
-        what += f"; it holds the ISO file {isos[0]}: pick that file"
+    if isos:
+        what += "; " + ("it holds the ISO file " if len(isos) == 1 else "it holds the ISO files ") + \
+            ", ".join(isos) + ": pick that file"
+    if hint or isos:
+        pass
     elif not dirs and not files:
         what += " (the folder is empty)"
     else:
@@ -696,7 +729,7 @@ def update_found(path):
         return f"{path} is a file, not a folder" + (
             " (an update package, not an installed update)" if path.lower().endswith(".pkg") else ""), True
     dirs, files = _entries(path)
-    if looks_like_disc(path) or _find(dirs, "PS3_GAME"):     # issue #12 the other way round
+    if has_ps3_game(path) or _find(dirs, "PS3_GAME"):     # issue #12 the other way round
         return (f"{path} holds PS3_GAME, so it looks like the disc dump, not the update: give it as the disc dump, "
                 "and the installed update folder as the 1.14 update"), True
     if looks_like_ps3_game(path):
@@ -765,6 +798,52 @@ def input_reasons(r, dump, update, eboot):
     return lines
 
 
+CLOCK_SLACK = 300          # seconds the PC clock may be behind the newest installed file before T1 FAILs
+CLOCK_MAX_FILES = 4000     # files looked at (stat only) by T1
+CLOCK_SKIP = ("build", "game", ".git", "work")
+
+
+def newest_mtime(root, max_files=CLOCK_MAX_FILES, skip=CLOCK_SKIP):
+    """(newest st_mtime, file count) over the install's files; stat only, at most max_files files, top folders first."""
+    newest, n = 0.0, 0
+    stack = [root]
+    while stack and n < max_files:
+        d = stack.pop(0)
+        try:
+            with os.scandir(d) as it:
+                ents = list(it)
+        except OSError:
+            continue
+        for e in ents:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if not (d == root and e.name.lower() in skip):
+                        stack.append(e.path)
+                elif n < max_files:
+                    newest = max(newest, e.stat(follow_symlinks=False).st_mtime)
+                    n += 1
+            except OSError:
+                pass
+    return newest, n
+
+
+def check_clock(r, root, now=None, slack=CLOCK_SLACK):
+    """T1 (pass 65): ninja treats files dated after the PC clock as changed in the future and loops. FAIL when the clock is
+    more than `slack` seconds behind the newest file of the install."""
+    if not root or not os.path.isdir(root):
+        return
+    import time
+    now = time.time() if now is None else now
+    newest, n = newest_mtime(root)
+    if n and newest > now + slack:
+        fmt = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+        r.fail("T1", f"the PC clock ({fmt(now)}) is earlier than the install's files (newest {fmt(newest)}), so the build would "
+                     "loop. Set the clock right (Windows: Settings > Time & language > Date & time > Set time automatically), "
+                     "then start again.")
+    elif n:
+        r.ok("T1", "the PC clock is not behind the install's files")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dump", required=True)
@@ -789,6 +868,7 @@ def main(argv=None):
         r.ok("U0", f"INFO: {a.update} is the update's USRDIR; using the update folder: {upd}")
     a.dump, a.update = dump, upd
     check_onedrive_tree(r, a.root, a.build)
+    check_clock(r, a.root)
     # before anything is read: opening an online-only placeholder would start a download of the 9 GB archive
     iso = os.path.isfile(a.dump)     # a decrypted disc ISO instead of a folder
     if check_online_only(r, a.dump if os.path.exists(a.dump) else "", a.update if a.update and os.path.isdir(a.update) else "",

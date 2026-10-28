@@ -21,11 +21,11 @@ import urllib.request
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import names  # noqa: E402
 
-CATEGORIES = ("Announcements", "Show and tell")
+CATEGORIES = ("Announcements", "Game Requests", "General", "Q&A")   # the four that exist; anything else is dropped
+CAP = {"Announcements": 5, "Game Requests": 5, "General": 8, "Q&A": 5}   # newest N kept per category, so one busy one never crowds out another
 TITLE_MAX = 90
-MAX_ITEMS = 8
 API = "https://api.github.com/graphql"
-QUERY = ("query($o:String!,$r:String!){repository(owner:$o,name:$r){discussions(first:30,"
+QUERY = ("query($o:String!,$r:String!){repository(owner:$o,name:$r){discussions(first:100,"
          "orderBy:{field:CREATED_AT,direction:DESC}){nodes{title url createdAt category{name} "
          "author{login} comments{totalCount}}}}}")
 URL_RE = re.compile(r"^" + re.escape(names.REPO_URL) + r"/discussions/\d+$")
@@ -55,7 +55,12 @@ def clean_items(items):
             title = title[:TITLE_MAX - 1].rstrip() + "…"
         out.append({"title": title, "category": cat, "author": login, "created": date[:10],
                     "replies": max(0, n), "url": url})
-    return out[:MAX_ITEMS]
+    kept, count = [], dict.fromkeys(CATEGORIES, 0)
+    for it in sorted(out, key=lambda i: i["created"], reverse=True):     # newest first inside each category
+        if count[it["category"]] < CAP[it["category"]]:
+            count[it["category"]] += 1
+            kept.append(it)
+    return kept
 
 
 def from_graphql(data):

@@ -35,6 +35,8 @@ DESC = names.DESCRIPTION   # the findable description line
 DISC = REPO + "/discussions"                         # GitHub Discussions of the repository (opt-in community channel)
 DISC_ANN = DISC + "/categories/announcements"
 DISC_QA = DISC + "/categories/q-a"
+DISC_GENERAL = DISC + "/categories/general"
+DISC_REQUESTS = DISC + "/categories/game-requests"
 PSREWIRED = "https://psrewired.com/servers/23044"   # informational link only; nothing in the port connects there
 # The one-paragraph "what this is" text, shown at the top of the page.
 WHAT = ("A Windows x64 port of the 2011 PS3 game, made by static recompilation: the game's PowerPC and SPU code is "
@@ -181,8 +183,42 @@ def feed_news(items):
     return out
 
 
+def board_list(items, category, n):
+    """Rows of one category for the board: title link, author login, date, reply count (validated items only)."""
+    rows = [i for i in items if i["category"] == category][:n]
+    if not rows:
+        return ""
+    out = "<ul class=\"feed board\">\n"
+    for i in rows:
+        r = i["replies"]
+        out += (f"<li><a href=\"{esc(i['url'])}\">{esc(i['title'])}</a>"
+                f"<span>{esc(i['author'])} · {esc(i['created'])} · {r} repl{'y' if r == 1 else 'ies'}</span></li>\n")
+    return out + "</ul>\n"
+
+
+def discussions_board(items):
+    """The Discussions tab's section: latest General threads and a smaller Game Requests list, from the validated snapshot
+    (titles, logins, dates, counts only; no bodies, avatars, images or scripts). Without a snapshot: the static links."""
+    w = ["<article id=\"discussions\" class=\"news board\">\n<h2>Discussions</h2>\n"
+         "<p class=\"meta\">on GitHub · General and game requests</p>\n"]
+    gen, req = board_list(items, "General", 6), board_list(items, "Game Requests", 4)
+    if gen:
+        w.append("<h3>Latest in General</h3>\n" + gen)
+    if req:
+        w.append("<h3>Game requests</h3>\n" + req)
+    if not (gen or req):
+        w.append("<p>Questions, ideas and screenshots of your own runs are welcome in the project's discussions on GitHub "
+                 "(posting needs a GitHub account).</p>\n")
+    w.append(f"<p class=\"btns\"><a class=\"btn\" href=\"{esc(DISC_GENERAL)}\">Start a discussion</a>"
+             f"<a class=\"btn alt\" href=\"{esc(DISC)}\">All discussions</a></p>\n"
+             f"<p class=\"small\">Game requests: <a href=\"{esc(DISC_REQUESTS)}\">ask for another game</a>. "
+             f"Install and hardware questions: <a href=\"{esc(DISC_QA)}\">Q&amp;A</a>.</p>\n</article>\n")
+    return "".join(w)
+
+
 def community_box(items):
     """Sidebar box: the latest allowlisted discussions as plain rows, or the static link when there are none."""
+    items = [i for i in items if i["category"] in ("Announcements", "Q&A")][:5]    # General and requests are on the board
     w = ["<section id=\"community\" class=\"promo\">\n<h2>From the community</h2>\n"]
     if items:
         w.append("<ul class=\"feed\">\n")
@@ -324,7 +360,7 @@ def render(root, problems, feed=()):
     # platform marks. Everything stacks on phones (style.css).
     tabs = (("i-home on", "#top", "Home"), ("i-shots", "#shots", "Screens"), ("i-status", "#status", "Status"),
             ("i-req", "#requirements", "Requirements"), ("i-inst", "#install", "Install"),
-            ("i-comm", DISC, "Community"), ("i-git", REPO, "GitHub"))
+            ("i-comm", "#discussions", "Discussions"), ("i-git", REPO, "GitHub"))
     links = "".join(f"<a class=\"{c}\" href=\"{esc(h)}\">{t}</a>" for c, h, t in tabs)
     w("<header id=\"top\" class=\"box\">\n<div class=\"logo\"><span class=\"emblem\" aria-hidden=\"true\">" + EMBLEM_SVG + "</span>"
       f"<div class=\"wm\"><p class=\"tag\">{esc(names.TAG)}</p>"
@@ -444,6 +480,7 @@ def render(root, problems, feed=()):
           f"<div class=\"nt\"><p>{esc(caption)}. A screenshot of the port running on Windows x64 (tested under "
           "Proton), drawn by its Direct3D 12 renderer.</p>" + more(src, "Full size") + "</div></div>\n</article>\n")
 
+    w(discussions_board(feed))
     w("<article id=\"about\" class=\"news\">\n<h2>About the port</h2>\n"
       f"<p class=\"meta\">by the project · how it works · {len(port)} port features</p>\n"
       "<div class=\"nb\"><span class=\"frame pic-about\" aria-hidden=\"true\"></span><div class=\"nt\">"

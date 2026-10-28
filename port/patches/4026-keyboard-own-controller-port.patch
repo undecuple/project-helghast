@@ -1,0 +1,267 @@
+KZ3 patch 4026 (network pass 43): keyboard and mouse count as their own controller, so split-screen co-op needs one pad
+only. Before, patch 2037 OR'ed the keys into port 0, so one pad + keyboard was one controller and the
+co-op gate (numactivecontrollers < 2 -> dlg_controlerror) refused.
+
+New libs/input/pad_kbport.h (platform-free; host test tools/net/test_kb_port.c): the game's player-per-slot table
+(1.14 Game 0x015FCF80 + 0x9C + i * 0x90, 1.00 0x01587880 + 0x94 + i * 0x90; the EBOOT checked by two code words of
+the assignment function 0x004D5ED0 / 1.00 0x004C8FD4) and the route: while a host pad is connected, the keyboard is
+reported as one more connected controller on the first port without a pad; its keys go to that port alone once the
+game has given that slot a player (the co-op player 2), else into the port of the game's player 1 (single player and
+menus keep pad + keyboard on one player, as before). No pad, an unknown EBOOT or KZ3_KB_OWN_PORT=0: as before.
+Logs "[kbport] ..." once per change (route, the game's players by slot, the slots it sees connected).
+Test input: KZ3_TEST_FAKE_PAD=1 (port 0 counts as a host pad), KZ3_KB_SCRIPT / KZ3_KB_SCRIPT_FILE (PAD_SCRIPT's
+grammar and clock, pressed as keyboard input). KZ3-specific (the game's table); the idea of a keyboard port next to
+the pads is general.
+
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -21,6 +21,7 @@
+ /* KZ3 patch 2098 (RSX pass 93): menu mouse hooks (port/kz3/main.cpp sets them; pad_menu_mouse.h has the rules). */
+ #include "pad_menu_mouse.h"
+ #include "pad_mouse.h"
++#include "pad_kbport.h"   /* KZ3 patch 4026 */
+ unsigned (*g_pad_menu_bits_hook)(unsigned pad_buttons, int pad_active) = NULL;
+ /* KZ3 patch 2106: a game menu has the focus, so the "back" keys (Esc) are menu Back (pad_keybinds.h pad_kb_eval). Only
+  * when the port tracks the game's menus (2098's hook installed: a GUM context was found for this EBOOT); otherwise
+@@ -110,7 +111,8 @@
+ static int           s_port_dev[PAD_MAX_HOST_PORTS];
+ static int           s_port_motion[PAD_MAX_HOST_PORTS];
+ static PadLastDevice s_last_dev = { PAD_DEV_NONE, -1 };
+-static int           s_keys_active = 0;   /* this poll had keyboard/mouse input (pad_poll_keyboard) */
++static int           s_keys_active = 0;
++static unsigned long long s_pad_t0_ms;   /* 4026: the first cellPadGetData (KZ3_KB_SCRIPT clock) */   /* this poll had keyboard/mouse input (pad_poll_keyboard) */
+ 
+ #if PAD_BACKEND_SDL
+ typedef struct PadSdlGamepad PadSdlGamepad;   /* SDL_Gamepad */
+@@ -663,16 +665,74 @@
+     s_keys_active = (s_kb_state.buttons || s_kb_state.dirs || pad_mouse_activity_take()) ? 1 : 0;
+ }
+ 
++/* 4026: the keyboard's own port (pad_kbport.h). The game's player table is read from guest memory. */
++static uint32_t pad_kbp_rd32(uint32_t ea) { return vm_read32(ea); }
++static void pad_kb_script_eval(PadKbState* k);   /* 4026 test input, after the PAD_SCRIPT parser below */
++static PkpRoute pad_kb_route(void)
++{
++    static int ver = -2, own = -1, fake = -1;
++    static char said[96];
++    int pad_on[PKP_SLOTS] = { 0 }, player[PKP_SLOTS];
++    int n = (int)(s_max_connect < PKP_SLOTS ? s_max_connect : PKP_SLOTS), have;
++    PkpRoute r;
++    char line[96];
++    if (own < 0) {
++        const char* e = getenv("KZ3_KB_OWN_PORT"); own = !(e && !strcmp(e, "0"));
++        e = getenv("KZ3_TEST_FAKE_PAD"); fake = e && *e && strcmp(e, "0") ? 1 : 0;
++        if (!own) { printf("[kbport] KZ3_KB_OWN_PORT=0: keyboard merged into port 0\n"); fflush(stdout); }
++        if (fake) { printf("[kbport] KZ3_TEST_FAKE_PAD: port 0 counts as a host pad (test)\n"); fflush(stdout); }
++    }
++    if (fake && !s_host_state[0].connected) {   /* a neutral pad on port 0; PAD_SCRIPT drives it in cellPadGetData */
++        pad_host_release(&s_host_state[0]);
++        s_host_state[0].connected = 1;
++    }
++    for (int i = 0; i < n; i++) pad_on[i] = s_host_state[i].connected;
++    if (!own) { r.kb_port = -1; r.target = 0; r.exclusive = 0; return r; }
++    if (ver == -2) {
++        ver = pkp_detect(pad_kbp_rd32);
++        printf("[kbport] player table: %s\n", ver < 0 ? "EBOOT not recognised, keyboard stays on port 0" : pkp_versions[ver].name);
++        fflush(stdout);
++    }
++    have = pkp_players(ver, pad_kbp_rd32, player);
++    r = pkp_route(pad_on, n, have ? player : NULL);
++    if (have) snprintf(line, sizeof line, "%d %d %d players %d %d %d %d %d %d %d", r.kb_port, r.target, r.exclusive,
++                       player[0], player[1], player[2], player[3], player[4], player[5], player[6]);
++    else snprintf(line, sizeof line, "%d %d %d no player table", r.kb_port, r.target, r.exclusive);
++    if (strcmp(line, said)) {
++        uint32_t c = 0;
++        if (ver >= 0) for (int i = 0; i < PKP_SLOTS; i++)
++            c |= (uint32_t)(vm_read8(pkp_versions[ver].base + pkp_versions[ver].conn_off + (uint32_t)i * 0x90u) ? 1 : 0) << i;
++        snprintf(said, sizeof said, "%s", line);
++        if (r.kb_port < 0) printf("[kbport] keyboard on port 0 (no own port: %s)\n",
++                                  !have ? "no player table yet" : "no pad");
++        else printf("[kbport] keyboard = controller on port %d, keys %s port %d (game players by slot: %s; slots connected 0x%02x)\n",
++                    r.kb_port, r.exclusive ? "only on its own" : "added to player 1's", r.target,
++                    have ? strchr(strstr(line, "players"), ' ') + 1 : "-", c);
++        fflush(stdout);
++    }
++    return r;
++}
++
+ /* Port 0 = the XInput pad (if any) plus the keys. Without a pad, port 0 is the keys alone and is reported
+- * connected, as before (a title must see a pad to be playable on the keyboard). */
++ * connected, as before (a title must see a pad to be playable on the keyboard). 4026: with a pad, the keys are one
++ * more controller on the first free port (pad_kbport.h), added to player 1's port until the game gives that
++ * controller a player of its own. */
+ static void pad_merge_keyboard(void)
+ {
+     static int off = -1;
+-    PadHostState* hs = &s_host_state[0];
+-    const PadKbState* k = &s_kb_state;
++    PadKbState kst = s_kb_state;
++    const PadKbState* k = &kst;
+     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+-    int had_pad = hs->connected;
+     if (off) return;
++    PkpRoute route = pad_kb_route();
++    pad_kb_script_eval(&kst);
++    if (route.kb_port >= 0) {   /* the keyboard's controller: neutral when its keys go to player 1 */
++        PadHostState* kp = &s_host_state[route.kb_port];
++        pad_host_release(kp);
++        kp->connected = 1;
++    }
++    PadHostState* hs = &s_host_state[route.target];
++    int had_pad = route.target == 0 ? hs->connected : 1;
+     /* (2038's "pad input makes the pad the last device again" is pad_prompt_track now, patch 4011) */
+     if (!hs->connected) {
+         memset(hs, 0, sizeof *hs);
+@@ -692,8 +752,8 @@
+     if (k->buttons & PKB_L2) hs->trigger_l2 = 255;
+     if (k->buttons & PKB_R2) hs->trigger_r2 = 255;
+     { static int said = -1;
+-      if (said != had_pad) { said = had_pad;
+-          printf("[cellPad] keyboard input on port 0 (%s)\n", had_pad ? "with the XInput pad" : "no XInput pad");
++      if (said != had_pad + 2 * route.target) { said = had_pad + 2 * route.target;
++          printf("[cellPad] keyboard input on port %d (%s)\n", route.target, had_pad ? "with a pad" : "no pad");
+           fflush(stdout); } }
+ }
+ #endif
+@@ -1771,10 +1831,39 @@
+  * were fixed.) These used to be redeclared here with a 64-bit address
+  * parameter, which conflicts with the header now that it is included. */
+ 
++#ifdef _WIN32
++/* 4026 (test input): KZ3_KB_SCRIPT="..." and KZ3_KB_SCRIPT_FILE=path, PAD_SCRIPT's grammar and clock (seconds from the
++ * first cellPadGetData), pressed as keyboard input: the buttons as the keys' buttons, a stick held past half way as that
++ * direction. So one run drives a pad (PAD_SCRIPT, with KZ3_TEST_FAKE_PAD) and the keyboard apart. */
++static void pad_kb_script_eval(PadKbState* k)
++{
++    static int on = -1;
++    static PadScript s;
++    if (on < 0) {
++        const char* e = getenv("KZ3_KB_SCRIPT"); const char* pf = getenv("KZ3_KB_SCRIPT_FILE");
++        memset(&s, 0, sizeof s);
++        if (e && *e) pad_script_parse(&s, e);
++        if (pf && *pf) { char* t = pad_script_read_file(pf); if (t) { pad_script_parse(&s, t); free(t); } }
++        on = s.n > 0;
++        if (on || s.bad) { printf("[kbport] KZ3_KB_SCRIPT: %d event(s), %d unparsable\n", s.n, s.bad); fflush(stdout); }
++    }
++    if (!on || !s_pad_t0_ms) return;
++    unsigned m = 0; unsigned char ax[6]; int ax_set = 0;
++    pad_script_poll(&s, pad_clock(s_pad_t0_ms), &m, ax, &ax_set);
++    k->buttons |= (unsigned short)m;
++    if (ax_set) {
++        if (ax[0] < 64) k->dirs |= 1u << PKB_LS_LEFT;  else if (ax[0] > 192) k->dirs |= 1u << PKB_LS_RIGHT;
++        if (ax[1] < 64) k->dirs |= 1u << PKB_LS_UP;    else if (ax[1] > 192) k->dirs |= 1u << PKB_LS_DOWN;
++        if (ax[2] < 64) k->dirs |= 1u << PKB_RS_LEFT;  else if (ax[2] > 192) k->dirs |= 1u << PKB_RS_RIGHT;
++        if (ax[3] < 64) k->dirs |= 1u << PKB_RS_UP;    else if (ax[3] > 192) k->dirs |= 1u << PKB_RS_DOWN;
++    }
++}
++#endif
++
+ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
+ {
+     { static int _once = 0;
+-      if (!_once++) printf("[cellPad] GetData polling begins (port %u)\n", port_no); }
++      if (!_once++) { printf("[cellPad] GetData polling begins (port %u)\n", port_no); s_pad_t0_ms = GetTickCount64(); } }
+     if (!s_pad_initialized)
+         return CELL_PAD_ERROR_NOT_OPENED;
+ 
+diff -ruN a/libs/input/pad_kbport.h b/libs/input/pad_kbport.h
+--- a/libs/input/pad_kbport.h
++++ b/libs/input/pad_kbport.h
+@@ -0,0 +1,96 @@
++/* KZ3 patch 4026 (network pass 43): keyboard and mouse as their own controller, so split-screen co-op needs one pad
++ * only.
++ *
++ * Before: the keys were OR'ed into port 0 (patch 2037), so one pad + keyboard was one controller and the co-op gate
++ * (mainmenu.gum CoopSelected: settings controller/numactivecontrollers < 2 -> dlg_controlerror) refused.
++ *
++ * The game (1.14 addresses; 1.00 in pkp_versions): numactivecontrollers = Game+0x840 (0x004D73CC, read by the
++ * settings writer 0x008CF6D0 under the name at 0x00EDDB14), counted by GameInput::UpdatePads 0x004D6308 over 7 slots
++ * at Game+0x18 + i*0x90 whose device is connected (slot+0x80 byte) and of type 0 (standard pad; type 4 counted at
++ * +0x844). The slot's player: int32 at slot+0x84 (Game+0x9C + i*0x90), -1 = none (0x004D17FC sets all 7 to -1).
++ * Players are given out by 0x004D5ED0 each frame: nplayers = 1, or 2 when the session [0x0141C030] exists and
++ * [Game+0x778]+0x100 (the split-screen game) is set; player p keeps its slot while connected (3 s grace when it is
++ * lost), else gets the first connected standard slot without a player, in slot order. GameInput::CopyPadStateForPlayer
++ * 0x004D0528 reads a player's pad through that map (0x004D0418). So player 1 = the first connected port, player 2
++ * (co-op) = the next one. PadDriver::ThreadBody 0x00073D40 polls ports 0..6 (cellPadPeriphGetInfo, cellPadGetData).
++ *
++ * Rule (automatic, no setting): while a host pad is connected, the keyboard is reported as one more controller on the
++ * first port without a pad. Its keys go to that port only once the game has given that slot a player (the co-op
++ * player 2, or player 1 when the pad is gone); until then (every single-player game and all menus outside a co-op
++ * session) they go into the port of the game's player 1, as before 4026. So one player on pad + keyboard plays as
++ * today, and the co-op gate sees two controllers. With no pad, the keys are port 0 alone as before. An EBOOT not
++ * recognised (another title, a changed binary): no own port, as before. KZ3_KB_OWN_PORT=0 turns it off.
++ * Platform-free (host test tools/net/test_kb_port.c). */
++#ifndef PAD_KBPORT_H
++#define PAD_KBPORT_H
++#include <stdint.h>
++
++#define PKP_SLOTS 7
++
++typedef uint32_t (*pkp_rd32_fn)(uint32_t ea);
++
++typedef struct {
++    const char* name;
++    uint32_t chk_addr[2], chk_word[2];   /* two words of the player-assignment function 0x004D5ED0 (1.14) */
++    uint32_t base;                       /* the GameInput/Game object */
++    uint32_t player_off;                 /* base + player_off + i * 0x90 = slot i's player (int32, -1 none) */
++    uint32_t conn_off;                   /* base + conn_off + i * 0x90 = slot i connected (byte) */
++} PkpVersion;
++
++static const PkpVersion pkp_versions[2] = {
++    /* 1.00 0x004C8FD4: lwz r4,0x94(r3) at +0x74, lwz r3,0x768(r30) at +0x40 */
++    { "1.00", { 0x004C9048u, 0x004C9014u }, { 0x80830094u, 0x807E0768u }, 0x01587880u, 0x94u, 0x90u },
++    /* 1.14 0x004D5ED0: lwz r4,0x9c(r3) at +0x74, lwz r3,0x778(r30) at +0x40 */
++    { "1.14", { 0x004D5F44u, 0x004D5F10u }, { 0x8083009Cu, 0x807E0778u }, 0x015FCF80u, 0x9Cu, 0x98u },
++};
++
++/* -1 = neither EBOOT. */
++static inline int pkp_detect(pkp_rd32_fn rd32)
++{
++    for (int v = 0; v < 2; v++) {
++        const PkpVersion* p = &pkp_versions[v];
++        if (rd32(p->chk_addr[0]) == p->chk_word[0] && rd32(p->chk_addr[1]) == p->chk_word[1]) return v;
++    }
++    return -1;
++}
++
++/* The game's player per slot. Returns 0 when the table is not set up yet (boot: zeroed memory reads as player 0
++ * everywhere; once set up at least PKP_SLOTS - 4 slots hold -1, since at most players 0..3 exist). */
++static inline int pkp_players(int ver, pkp_rd32_fn rd32, int player[PKP_SLOTS])
++{
++    int none = 0;
++    if (ver < 0) return 0;
++    for (int i = 0; i < PKP_SLOTS; i++) {
++        int32_t p = (int32_t)rd32(pkp_versions[ver].base + pkp_versions[ver].player_off + (uint32_t)i * 0x90u);
++        if (p < -1 || p > 3) return 0;
++        player[i] = p;
++        if (p == -1) none++;
++    }
++    return none >= PKP_SLOTS - 4;
++}
++
++typedef struct {
++    int kb_port;     /* the keyboard's own port (reported connected), -1 = none */
++    int target;      /* the port the keys are added to */
++    int exclusive;   /* 1: target == kb_port (the game gave the keyboard's slot a player) */
++} PkpRoute;
++
++/* pad_on[i]: a host pad on port i (before the keys); nports usable ports; player = pkp_players' table or NULL. */
++static inline PkpRoute pkp_route(const int* pad_on, int nports, const int* player)
++{
++    PkpRoute r = { -1, 0, 0 };
++    int any = 0, kb = -1;
++    if (nports > PKP_SLOTS) nports = PKP_SLOTS;
++    for (int i = 0; i < nports; i++) {
++        if (pad_on[i]) any = 1;
++        else if (kb < 0) kb = i;
++    }
++    if (!any || !player || kb < 0) return r;   /* no pad, unknown EBOOT, every port taken: as before */
++    r.kb_port = kb;
++    if (player[kb] >= 0) { r.target = kb; r.exclusive = 1; return r; }
++    for (int i = 0; i < nports; i++)
++        if (player[i] == 0 && pad_on[i]) { r.target = i; return r; }
++    return r;   /* no player 1 yet: port 0, as before */
++}
++
++#endif

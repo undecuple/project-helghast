@@ -55,6 +55,7 @@ A `WARN` lets it go on. The full log is next to the installer.
 | O1 | FAIL | The install folder or the build folder is inside OneDrive | Choose a folder outside OneDrive and run the setup again |
 | O2 | FAIL | A game file exists only online in OneDrive | See the OneDrive section below |
 | O3 | OK | Information only: a game folder is inside OneDrive but its files are on this device | Nothing |
+| T1 | OK / FAIL | The PC clock is earlier than the newest file of the install (more than 5 minutes), so the build would loop | Set the clock right (Windows: Settings > Time & language > Date & time > Set time automatically), then start again |
 
 When a check fails, the setup's message box and the console show one line per input that failed, labelled
 `Disc dump`, `1.14 update` or `EBOOT`: the path it looked at, what is there, and what that folder or file must hold.
