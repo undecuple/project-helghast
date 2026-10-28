@@ -29,6 +29,10 @@ check("IsProtectedFolder" in t and "{userdocs}" in t and "{win}" in t, "system a
 code = t[t.find("[Code]"):]
 braced = [c for c in re.findall(r"\{[^}]*\}", code) if "{" in c[1:] and not c.startswith("{#")]
 check(not braced, "no '{' inside a { } comment in [Code]: " + "; ".join(b[:40] for b in braced[:3]))
+# ISPP reads any line that starts with '#' as a preprocessor directive ("Unknown preprocessor directive"), so no
+# [Code] line may start with a #13#10-style character constant
+hashlines = [l.strip()[:40] for l in code.splitlines() if re.match(r"\s*#\d", l)]
+check(not hashlines, "no [Code] line starts with a #NN character constant: " + "; ".join(hashlines[:3]))
 m = re.search(r"function PrepareToInstall.*?DefaultEboot;", t, re.S)
 check(m and "InstallDirProblem(ExpandConstant('{app}'))" in m.group(0) and
       m.group(0).index("InstallDirProblem") < m.group(0).index("if not WizardSilent"),

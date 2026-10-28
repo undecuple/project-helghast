@@ -1004,8 +1004,8 @@ begin
       { A missing 1.14 update stops here; Next again = check again. }
       MsgBox('The 1.14 update was not found in this folder (PARAM.SFO, USRDIR\EBOOT.BIN and ' +
         'USRDIR\added_data_ps3.psarc.edat are needed). The port is built on 1.14.' + #13#10 + #13#10 +
-        'Use the 1.14 update from your own console, or the one installed in RPCS3 (see RPCS3''s documentation).' +
-        #13#10 + #13#10 +
+        'Use the 1.14 update from your own console, or the one installed in RPCS3 ' +
+        '(see RPCS3''s documentation).' + #13#10 + #13#10 +
         'Then select the folder again and press Next to check again.', mbError, MB_OK);
       Result := False;
     end;
