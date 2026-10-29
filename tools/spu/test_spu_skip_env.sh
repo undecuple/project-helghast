@@ -28,6 +28,7 @@ int kz3_cull_empty_entry(struct spu_context* ctx, int image_id, void* user) { (v
 void kz3_ts_interp_install(void) {} /* kz3_ts_interp.c (KZ3_TS_INTERP=1, SPU pass 55): not under test here */
 void kz3_stall_diag_install(void) {} /* kz3_stall_diag.c (KZ3_STALL_DIAG=1, SPU pass 63): not under test here */
 void kz3_frame_trace_install(void) {} /* kz3_frame_trace.c (KZ3_FRAME_TRACE, SPU pass 66): not under test here */
+void kz3_jobhook_install(void) {} /* kz3_jobhook.c (KZ3_JOB_CAPTURE / KZ3_NATIVE_JOB, SPU pass 120): tools/spu/test_r120_jobreplay.sh */
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
 int main(void)

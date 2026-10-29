@@ -1,0 +1,86 @@
+diff -ruN a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1825,6 +1825,14 @@
+  * 2029's submit, as at the end of a pass). */
+ static volatile u32 s_park_wake_io = 0xFFFFFFFFu;
+ static HANDLE s_park_wake_ev = NULL;
++/* KZ3 patch 2129 (RSX pass 122, from KZ2's 6038): a pass whose park budget is spent ended on the park and the frame
++ * thread then slept a flat 4 ms (port/kz3/main.cpp frame_clock), so an SPU PUT that released the park in that sleep
++ * was seen 0-4 ms late. The pass now leaves the park published (s_park_idle_io, s_park_wake_io), and
++ * cellGcm_park_idle_wait (the frame thread's sleep) waits on the same wake event the PUT hook sets, with the sleep's
++ * own length as the limit (no new timeout). KZ3_PARK_IDLE_WAKE=1 turns it on (default off, see cellGcm_park_idle_wait). */
++static volatile u32 s_park_idle_io = 0xFFFFFFFFu;
++static volatile u32 s_park_idle_word;
++static volatile LONG s_park_put_wakes;   /* PUTs that covered a published park (the in-pass waits of 1087 included) */
+ static int gcm_park_wake_wait(u32 park_io)
+ {
+     static int s_ms = -1;
+@@ -1842,7 +1850,13 @@
+     const u32 ea = gcm_io2ea(park_io);
+     if (!ea) return 0;
+     if (park_io != s_last_io) { s_last_io = park_io; s_slices = 0; s_word = vm_read32(ea); }
+-    if (s_slices >= (u32)s_ms) { s_slices = 0; return 0; }   /* this pass's budget is spent: end it as before */
++    if (s_slices >= (u32)s_ms) {   /* this pass's budget is spent: end it as before */
++        s_slices = 0;
++        s_park_idle_word = s_word;   /* patch 2129: the frame thread's sleep waits for this park's release */
++        __atomic_store_n(&s_park_idle_io, park_io, __ATOMIC_RELEASE);
++        __atomic_store_n(&s_park_wake_io, park_io, __ATOMIC_RELEASE);
++        return 0;
++    }
+     if (s_slices == 0 && rsx_live_draw_enabled()) rsx_live_draw_submit_pending();
+     s_slices++;
+     __atomic_store_n(&s_park_wake_io, park_io, __ATOMIC_RELEASE);
+@@ -1851,6 +1865,43 @@
+     return 1;
+ }
+ 
++/* Patch 2129: the frame thread's idle sleep of ms milliseconds. When the last pass ended on an unreleased park, wait
++ * on the park's wake event instead (set by gcm_note_spu_put when a PUT covers the park word), at most ms; a park
++ * already released skips the sleep. Returns 0 slept, 1 woken by the PUT, 2 released before the wait, 3 timed out. */
++int cellGcm_park_idle_wait(unsigned ms)
++{
++    static int on = -1;
++    static unsigned long long n[4];
++    static ULONGLONG s_last_log;
++    if (on < 0) {
++        const char* e = getenv("KZ3_PARK_IDLE_WAKE");
++        on = e && *e == '1';   /* off by default: run r122-j1 saw no PUT wake at all (see the summary line) */
++        fprintf(stderr, "[cellGcmSys] park idle wake (patch 2129): %s\n",
++                on ? "on (KZ3_PARK_IDLE_WAKE=1: the frame thread's sleep ends when an SPU PUT releases the park)" : "off (flat sleep; KZ3_PARK_IDLE_WAKE=1 on)");
++    }
++    const u32 io = __atomic_exchange_n(&s_park_idle_io, 0xFFFFFFFFu, __ATOMIC_ACQ_REL);
++    int r = 0;
++    if (!on || io == 0xFFFFFFFFu || !s_park_wake_ev) Sleep(ms);
++    else {
++        const u32 ea = gcm_io2ea(io);
++        if (ea && vm_read32(ea) == s_park_idle_word)
++            r = WaitForSingleObject(s_park_wake_ev, ms) == WAIT_OBJECT_0 ? 1 : 3;
++        else r = 2;
++        __atomic_store_n(&s_park_wake_io, 0xFFFFFFFFu, __ATOMIC_RELEASE);
++    }
++    n[r]++;
++    if (on) {
++        const ULONGLONG now = GetTickCount64();
++        if (now - s_last_log >= 60000) {
++            if (s_last_log)
++                fprintf(stderr, "[cellGcmSys] park idle wake: sleeps %llu, park waits woken by the PUT %llu, released before %llu, timed out %llu; "
++                        "PUTs over a published park %ld\n", n[0], n[1], n[2], n[3], (long)s_park_put_wakes);
++            s_last_log = now;
++        }
++    }
++    return r;
++}
++
+ void gcm_note_spu_put(u32 ea, u32 size)
+ {
+     if (!size || size > 0x40000u) return;
+@@ -1859,7 +1910,7 @@
+     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
+     /* KZ3 patch 1087: this PUT patches the park the walker waits on: wake it (gcm_park_wake_wait) */
+     { const u32 pw = __atomic_load_n(&s_park_wake_io, __ATOMIC_ACQUIRE);
+-      if (pw != 0xFFFFFFFFu && pw - io < size && s_park_wake_ev) SetEvent(s_park_wake_ev); }
++      if (pw != 0xFFFFFFFFu && pw - io < size && s_park_wake_ev) { InterlockedIncrement(&s_park_put_wakes); SetEvent(s_park_wake_ev); } }
+ 
+     /* Coalesce with the previous block when an SPU emits one buffer in several
+      * transfers -- otherwise only the last fragment is remembered and the

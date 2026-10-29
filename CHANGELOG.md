@@ -5,7 +5,26 @@ project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEA
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-29 (pre-release)
+
+### Added
+- The setup finds a portable RPCS3 (an unzipped folder with `rpcs3.exe` beside its `config`) in Downloads, Desktop, Documents, the program-files and games folders, the drive roots and beside the installer, and accepts its `config` or `dev_hdd0` folder as the folder you pick. A moved, localised or OneDrive-redirected Desktop, Documents or Downloads folder is searched too (read from Windows' user shell folders; checked by host tests, not yet on Windows).
+- The port's own screens follow the game's language through `lang\port_ui.tsv`, which the setup now installs next to `kz3.exe` (the translations are machine-made; corrections are welcome).
+- Closing the window asks through the game's own exit dialog (in a level the pause menu opens first) instead of quitting at once.
+- The window remembers its place and size between starts (`display.ini`). Maximizing the window switches to borderless full screen, and F11 toggles it.
+- Options > Display > When unfocused (Keep running, Mute, Pause): what the game does when its window loses focus. Pausing does not apply in online play.
+- Keyboard and mouse count as their own controller when a pad is connected, so local split-screen co-op can be played with one pad plus the keyboard and mouse (the keys act for player 1 until the game gives the keyboard a player).
+
 ### Fixed
+- Exclusive full screen (Options > Display > Fullscreen, or `mode = fullscreen` in `display.ini`) resizes the picture after every switch, and if Windows refuses a frame in full screen the game drops to borderless full screen for the session and keeps drawing instead of freezing (the choice stays in `display.ini`; the Options row then reads Borderless). Checked under Proton, including forced failures; not yet confirmed on native Windows.
+- In first person, the arms and weapon follow the view while you turn with the mouse instead of jittering against it. Checked under Proton in the jungle level: the arms stayed within about 1 pixel of the view (before: a spread of about 13 pixels, up to 66).
+- The setup's log no longer keeps your Windows user name when a path is written in its escaped form (doubled backslashes, as in an error message or a list of paths) or URL-encoded. Reported by @feanor-noldorin (project-pyrrhus#9).
+- `bump_version.py` keeps each file's line endings instead of writing Windows line endings when run on Windows. Reported by @feanor-noldorin (project-pyrrhus#9).
+- The helmet visor keeps its authored field of view at any Field of view setting, and cinematics keep the game's own field of view (`KZ3_FOV_VISOR=0` and `KZ3_FOV_CINE=0` turn these off). Checked on the field-of-view test sheet and a start-up run.
+- Audio: the audio thread is kept on the performance cores of hybrid CPUs. In our paired test runs the audio thread's missed deadlines fell from about 200 to about 41 per 10 seconds; the frame rate did not change.
+- The game's clock calls use the Windows wall clock (an upstream ps3recomp fix, #633), so time reads advance as the game expects.
+- On laptops with two GPUs, the game now asks Windows for the high-performance GPU instead of taking Windows' default adapter, and the log lists every GPU found and the one chosen. On the sister port, which shares this code, a player's log showed the integrated GPU chosen on a laptop that also has a dedicated GPU (reported by @feanor-noldorin, project-pyrrhus#13); not reproduced here. Checked under Proton; not yet confirmed on a hybrid laptop.
+- Building the port from source on native Windows (Git Bash): the build scripts find a real Python (never the Microsoft Store shortcut), stop early with a clear message when git's line-ending conversion rewrote the sources, and the Linux-only host tests are skipped on Windows. Reported by @feanor-noldorin (project-pyrrhus#9).
 - When the PC clock is behind the install's files (the build would repeat itself), the setup stops with a message that shows both times and how to set the clock.
 - An update folder without `USRDIR\added_data_ps3.psarc.edat` is refused by the setup's first check as well as by its update page, with a message that names the file and says what it holds (the 1.14 menu screens, the multiplayer map scripts and files that override the disc's).
 - The setup's folder hints offer only Killzone 3 dumps (other games' dumps on a drive root are not named), name every `.iso` file in the folder or one level down on a drive root beside the folder hints, and take the update's `USRDIR` as the update folder even when it holds a `PARAM.SFO` (reported by a player on Reddit). The interactive check stops with its FAIL lines when no input is left instead of repeating.

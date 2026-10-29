@@ -145,12 +145,111 @@ def _wine_home():
     return v
 
 
-def _candidate_paths(hint):
+_PORTABLE_MAX = 40   # folders examined per base, so a huge Downloads folder cannot stall the wizard
+
+
+_SHELL_FOLDERS = ("Desktop", "Personal", "{374DE290-123F-4565-9164-39C4925E467B}")   # Desktop, Documents, Downloads
+
+
+def _expand_percent(v):
+    """Expand %NAME% (case-insensitive, any OS; an unknown name stays and the value is then dropped)."""
+    env = {k.upper(): x for k, x in os.environ.items()}
+    return re.sub(r"%([^%]+)%", lambda m: env.get(m.group(1).upper(), m.group(0)), v)
+
+
+def _shell_folders(winreg=None):
+    """The user's real Desktop / Documents / Downloads from HKCU Explorer "User Shell Folders" (moved, localised or
+    OneDrive-redirected folders). REG_EXPAND_SZ values get their environment variables expanded. [] off Windows or on
+    any registry error; `winreg` is injectable for the host test."""
+    if winreg is None:
+        try:
+            import winreg
+        except ImportError:
+            return []
+    out = []
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
+    except OSError:
+        return []
+    try:
+        for name in _SHELL_FOLDERS:
+            try:
+                v, _t = winreg.QueryValueEx(key, name)
+            except OSError:
+                continue
+            if isinstance(v, str) and v.strip():
+                v = _expand_percent(v.strip())
+                if "%" not in v:
+                    out.append(Path(v))
+    finally:
+        try:
+            winreg.CloseKey(key)
+        except Exception:
+            pass
+    return out
+
+
+def _portable_bases(winreg=None):
+    """Folders in which a portable RPCS3 (rpcs3.exe beside its own config/ and dev_hdd0/, unzipped anywhere) is usually
+    put: Downloads, Desktop, Documents, the home folder, the program-files and games roots, the drive roots, and
+    beside the installer / current folder. Windows only; nothing outside these is scanned (pyrrhus issue #9 report,
+    adapted: a portable RPCS3 was found only through an explicit hint)."""
+    bases = list(_shell_folders(winreg))
+    home = Path.home()
+    for n in ("Downloads", "Desktop", "Documents", "Games", "Emulators"):
+        bases.append(home / n)
+    bases.append(home)
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "PUBLIC"):
+        v = os.environ.get(var)
+        if v:
+            bases.append(Path(v))
+    for d in "CDEFGH":
+        for n in ("", "Games", "Emulators", "Emulator", "PS3"):
+            bases.append(Path(f"{d}:\\") / n)
+    for p in (os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else "", os.getcwd()):
+        if p:
+            bases.append(Path(p))
+            bases.append(Path(p).parent)
+    seen, out = set(), []
+    for b in bases:
+        k = os.path.normcase(os.path.normpath(str(b)))
+        if k not in seen:
+            seen.add(k)
+            out.append(b)
+    return out
+
+
+def _portable_candidates(bases):
+    """-> [(folder, "portable")]: each base itself, and its direct subfolders whose name contains 'rpcs3', where
+    rpcs3.exe sits beside a config/ or dev_hdd0/ folder or a vfs.yml/games.yml (a portable layout). Never recursive."""
+    out, seen = [], set()
+    for b in bases:
+        try:
+            if not b.is_dir():
+                continue
+            subs = [b] + [d for d in sorted(b.iterdir())[:_PORTABLE_MAX * 20] if "rpcs3" in d.name.lower() and d.is_dir()]
+        except OSError:
+            continue
+        for d in subs[:_PORTABLE_MAX]:
+            try:
+                ok = (d / "rpcs3.exe").is_file() and any((d / n).exists() for n in ("config", "dev_hdd0", "vfs.yml", "games.yml"))
+            except OSError:
+                ok = False
+            k = os.path.normcase(str(d))
+            if ok and k not in seen:
+                seen.add(k)
+                out.append((d, "portable"))
+    return out
+
+
+def _candidate_paths(hint, portable_bases=None):
     c = []
     if hint:
         h = Path(hint)
         if h.is_file():
             h = h.parent
+        if h.name.lower() in ("config", "dev_hdd0", "dev_flash") and (h.parent / "rpcs3.exe").is_file():
+            h = h.parent   # the player picked the portable folder's config/ or dev_hdd0/ child
         c.append((h, "hint"))
     if _is_windows():
         for var, sub, src in (("LOCALAPPDATA", ("Programs", "rpcs3"), "windows-localappdata"),
@@ -158,6 +257,8 @@ def _candidate_paths(hint):
             base = os.environ.get(var)
             if base:
                 c.append((Path(base).joinpath(*sub), src))
+    if _is_windows() or portable_bases is not None:
+        c.extend(_portable_candidates(_portable_bases() if portable_bases is None else portable_bases))
     home = Path.home()
     if not _is_windows():
         xdg = os.environ.get("XDG_CONFIG_HOME")
@@ -202,9 +303,9 @@ def _make_candidate(root: Path, source: str) -> dict:
             "source": source}
 
 
-def find_rpcs3(hint=None) -> list[dict]:
+def find_rpcs3(hint=None, portable_bases=None) -> list[dict]:
     seen, out = set(), []
-    for path, source in _candidate_paths(hint):
+    for path, source in _candidate_paths(hint, portable_bases):
         try:
             ok = path.is_dir()
         except OSError:

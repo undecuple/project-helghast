@@ -55,9 +55,19 @@
 #include "kz3_ini.h"   /* kz3.ini next to the exe: no launch options needed (release pass 26) */
 #include "../net/kz3_discord.h" /* Discord Rich Presence, opt-in (network pass 33) */
 #include "../net/kz3_host_composed.h" /* every .gum key the port rewrites or generates (network pass 40) */
+#include "../net/kz3_tr.h" /* the port UI text in the game's language (network pass 45) */
 #include "kz3_embed.h" /* the player's EBOOT.elf linked into kz3.exe (release step 9s) */
 #include "kz3_log.h"   /* file log, levels, crash files (also force-included with the stdio redirect) */
 #include "kz3_vfs_root.h" /* the game root from the EBOOT path (disc layout, else PS3_GAME above it, else ".") */
+#ifdef _WIN32
+/* RSX pass 125 (public issue #13 on the KZ2 port, same code): hybrid laptops run an exe on the integrated GPU unless it
+ * exports these two symbols (NVIDIA Optimus and AMD PowerXpress read them from the exe, not from a DLL). The DXGI
+ * high-performance adapter request in the D3D12 backend (patch 2099 area) stays; this covers the driver's own switch. */
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
 
 #ifdef _WIN32
 /* timeBeginPeriod: <windows.h> arrives with WIN32_LEAN_AND_MEAN set, which
@@ -699,6 +709,21 @@ extern "C" int  rsx_display_get_scaling(void);
 extern "C" int  rsx_display_get_filter(void);
 extern "C" int  rsx_display_set_vsync(int on);   /* patch 2103: Options > Display > VSync */
 extern "C" int  rsx_display_get_vsync(void);
+/* Patch 2126 (RSX pass 120): window management (rsx_window_place.h): placement, maximize, close asks, focus. */
+#include "rsx_window_place.h"
+extern "C" void rsx_display_configure_window(const rsx_wp* saved, int maximize_borderless, int (*close_ask)(int src),
+                                             void (*focus)(int focused, int minimized));   /* rsx_null_backend.c */
+extern "C" int  rsx_display_get_window(rsx_wp* out);
+extern "C" int  rsx_display_get_maximize(void);
+extern "C" volatile int g_audio_out_silent;   /* cellAudio.c (patch 2126) */
+static int kz3_close_ask(int src);              /* below, with the menu mouse (it reads the GUM state) */
+static void kz3_focus_changed(int focused, int minimized);
+static int kz3_close_bridge(const char* cmd, char* out, size_t n);
+static void kz3_close_ask_poll(void);
+static rsx_wp s_wp_saved;                       /* display.ini window_* */
+static int s_maxbl_saved = -1;                  /* display.ini maximize (-1 missing = borderless) */
+static volatile LONG s_unf = RSX_UNF_KEEP;      /* When unfocused, in force */
+static int s_unf_saved = RSX_UNF_KEEP;
 
 /* Patch 2107 (RSX pass 102): Motion blur and the frame rate limit, display.ini motion_blur / fps_limit beside the window
  * settings. The window's thread saves through kz3_display_save (its four values); the two rows here save through it
@@ -750,12 +775,27 @@ static BOOL CALLBACK kz3_dm_lock_init(PINIT_ONCE, PVOID, PVOID*) { InitializeCri
 static void kz3_display_save(int mode, int scaling, int filter, int vsync)
 {
     wchar_t p[1100];
-    char t[2048];
+    char t[4096];
     InitOnceExecuteOnce(&s_dm_save_once, kz3_dm_lock_init, NULL, NULL);
     EnterCriticalSection(&s_dm_save_lock);
     s_dm_saved[0] = mode; s_dm_saved[1] = scaling; s_dm_saved[2] = filter; s_dm_saved[3] = vsync;
-    const int n = rsx_dm_ini_write_ext4(t, sizeof t, mode, scaling, filter, vsync, s_mb_saved, s_fps_saved, s_fov_saved,
-                                        s_h169_saved, s_bloom_saved);
+    int n = rsx_dm_ini_write_ext4(t, sizeof t, mode, scaling, filter, vsync, s_mb_saved, s_fps_saved, s_fov_saved,
+                                  s_h169_saved, s_bloom_saved);
+    if (n > 0 && (size_t)n < sizeof t) {   /* patch 2126: When unfocused, maximize, the window */
+        rsx_wp w;
+        if (!rsx_display_get_window(&w)) w = s_wp_saved;
+        const int mx = s_maxbl_saved >= 0 ? s_maxbl_saved : rsx_display_get_maximize();
+        int k = snprintf(t + n, sizeof t - (size_t)n,
+                         "# unfocused = keep | mute | pause: while the window is in the background, keep running, silence the\n"
+                         "# game's sound, or open the pause menu once (in play). KZ3_UNFOCUSED overrides it for one run.\n"
+                         "unfocused = %s\n"
+                         "# maximize = borderless | window: the maximize button and a title-bar double-click switch to Borderless\n"
+                         "# (Restore or Alt+Enter goes back), or maximize the window keeping its picture shape.\n"
+                         "maximize = %s\n", rsx_unf_name(s_unf_saved), mx ? "borderless" : "window");
+        if (k > 0 && (size_t)(n + k) < sizeof t) n += k;
+        k = rsx_wp_ini_write(t + n, sizeof t - (size_t)n, &w);
+        if (k > 0 && (size_t)(n + k) < sizeof t) n += k;
+    }
     char fb[16];
     bool ok = false;
     if (pad_kb_sibling_path(L"display.ini", p, 1100)) {
@@ -800,6 +840,10 @@ static void kz3_display_load(void)
             if (fv >= 0) s_fov_saved = fv;
             const int hv = rsx_dm_ini_hud169(t);   /* patch 2113 */
             if (hv >= 0) s_h169_saved = hv;
+            const int uf = rsx_dm_ini_unfocused(t);   /* patch 2126 */
+            if (uf >= 0) s_unf_saved = uf;
+            s_maxbl_saved = rsx_dm_ini_maximize(t);
+            rsx_wp_ini_read(t, &s_wp_saved);
             printf("[display] %ls: mode %s, scaling %s, filter %s, vsync %s, motion blur %d, fps limit %s\n", p,
                    mode >= 0 ? rsx_dm_name(mode) : "(none)", scaling >= 0 ? rsx_dm_scaling_name(scaling) : "(none)",
                    filter >= 0 ? rsx_dm_filter_name(filter) : "(none)", vsync >= 0 ? rsx_dm_vsync_name(vsync) : "(none)",
@@ -836,6 +880,14 @@ static void kz3_display_load(void)
            (int)s_bloom_eff, ble >= 0 ? " (KZ3_BLOOM)" : "",
            rsx_dm_fps_name((int)s_fps_eff), fpe > 0 ? " (KZ3_FPS_LIMIT)" : "");
     rsx_live_draw_set_hud169(s_h169_saved);   /* patch 2113; KZ3_HUD_169 wins for one run (rsx_live_draw.c) */
+    {   /* patch 2126 */
+        e = getenv("KZ3_UNFOCUSED");
+        const int ue = e && *e ? rsx_unf_parse(e) : -1;
+        InterlockedExchange(&s_unf, ue >= 0 ? ue : s_unf_saved);
+        printf("[display] when unfocused: %s%s; maximize: %s; saved window: %s\n", rsx_unf_name((int)s_unf),
+               ue >= 0 ? " (KZ3_UNFOCUSED)" : "", s_maxbl_saved == 0 ? "window" : "borderless", s_wp_saved.valid ? "yes" : "none");
+    }
+    rsx_display_configure_window(&s_wp_saved, s_maxbl_saved, kz3_close_ask, kz3_focus_changed);
     rsx_display_configure(mode, scaling, filter, vsync, kz3_display_save);
 }
 #endif
@@ -1034,6 +1086,7 @@ static void kz3_pump_note(int fired)
     }
 }
 
+extern "C" int cellGcm_park_idle_wait(unsigned ms);   /* patch 2129 */
 static DWORD WINAPI frame_clock(LPVOID)
 {
     kz3_log_set_thread_label("frame");
@@ -1054,9 +1107,26 @@ static DWORD WINAPI frame_clock(LPVOID)
      * physics run on the timebase, not on vblanks (the RE notes s.6-7). */
     for (;;) {
         const unsigned tick_ms = kz3_vblank_tick_ms();
-        Sleep(tick_ms < 16 ? 1 : 4);
+        if (tick_ms < 16) Sleep(1);
+        else cellGcm_park_idle_wait(4);   /* patch 2129 (RSX pass 122): ends early when an SPU PUT releases the park */
         ULONGLONG now = GetTickCount64();
 
+        /* RSX pass 120 (with patch 2127): vblanks are wall-clock interrupts; a pass that held this thread (a blocked
+         * Present, a long drain or load) does not owe the guest the ones it missed. Firing them afterwards (up to 240
+         * at once, the old rule) released a burst of frames on return (a hand-play log: [pace] p50 9.9 ms after
+         * a 27 s stall). A backlog over 250 ms is dropped; a normal heavy pass (tens of ms) still gets every tick.
+         * Default (maintainer 2026-10-28): the old catch-up rule; KZ3_VBLANK_CATCHUP=0 enables the drop, pending a 3-pair A/B. */
+        {
+            static int s_catchup = -1;
+            if (s_catchup < 0) { const char* e = getenv("KZ3_VBLANK_CATCHUP"); s_catchup = !(e && *e == '0'); }   /* maintainer 2026-10-28: drop rule opt-in (=0) until a 3-pair A/B */
+            if (!s_catchup && (long long)(now - next_tick) > 250) {
+                static unsigned s_drops;
+                if (s_drops++ < 20)
+                    KZ3_LOGI("pace", "vblank backlog of %llu ms dropped (the frame thread was held; no catch-up burst)",
+                             (unsigned long long)(now - next_tick));
+                next_tick = now;
+            }
+        }
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
             cellGcmTickVBlank();
@@ -1104,6 +1174,7 @@ static DWORD WINAPI frame_clock(LPVOID)
                 continue;
             }
             kz3_pump_note(fired);
+            kz3_close_ask_poll();   /* patch 2126: an ask the game did not answer closes */
             /* Present on a guest flip. A present on a fixed clock can catch the
              * drain mid-frame and flash a partial one. Before the first flip
              * present freely, so the window is not blank during boot. */
@@ -1454,6 +1525,22 @@ static void kz3_kb_set(ppu_context* ctx)
             return;
         }
 #endif
+#ifdef _WIN32
+        if (!strncmp(cmd, "unfocused", 9) && (cmd[9] == 0 || cmd[9] == ' ')) {   /* When unfocused row (patch 2126) */
+            const int v = cmd[9] ? rsx_unf_parse(cmd + 10) : -1;
+            if (v >= 0) {
+                InterlockedExchange(&s_unf, v);
+                s_unf_saved = v;
+                kz3_display_save_extra();
+                kz3_focus_changed(-1, -1);   /* the mute follows the new setting at once */
+            }
+            snprintf(s_kb_reply, sizeof s_kb_reply, "%s", rsx_unf_name(v >= 0 ? v : (int)s_unf));
+            s_kb_pending = 1;
+            printf("[kb-page] '%s' -> '%s'\n", cmd, s_kb_reply);
+            return;
+        }
+        if (kz3_close_bridge(cmd, s_kb_reply, sizeof s_kb_reply)) { s_kb_pending = 1; return; }   /* patch 2126 */
+#endif
         if (!strcmp(cmd, "exit")) {   /* main menu EXIT GAME, confirmed (RSX pass 61) */
             kz3_exit_game_request();
             snprintf(s_kb_reply, sizeof s_kb_reply, "ok");
@@ -1519,6 +1606,17 @@ static std::string kz3_kb_cmd(const char* c) { char o[512]; pad_kb_ui_cmd(c, o, 
  * highlight class (`mystats`, the leaderboards' "this is you" cell; 2 px lower to match the plain cell's baseline;
  * SetVisible swaps them, because SetClass adds a class and nothing takes it off again: r38-e2), and the footer sits
  * alone between the list and the legend. */
+/* Net pass 45: expand the kz3_tr.h markers (@tr{key|English} ...) in the game's language; English on failure. */
+static std::string kz3_tr_page(const std::string& t)
+{
+    char* r = nullptr;
+    size_t n = kz3_tr_render(t.data(), t.size(), &r);
+    if (!r) return t;
+    std::string o(r, n);
+    free(r);
+    return o;
+}
+
 static std::string kz3_kb_page_gum(void)
 {
     int rows = atoi(kz3_kb_cmd("rows").c_str());
@@ -1531,11 +1629,11 @@ static std::string kz3_kb_page_gum(void)
          "\t\toncancel=\"back()\" labelcancel=\"@key{menu_legend_back}\" onstart=\"back()\"\n"
          "\t\tonoptions=\"script(kbscript, SetToDefault)\" labeloptions=\"@key{menu_legend_default}\">\n\n"
          "\t\t@include{file:///hudelements/type3.gum}\n\n"
-         "\t\t<text class=\"pagetitle\">Change the keyboard controls</text>\n"   /* RSX pass 104: as the sibling Options pages */
+         "\t\t<text class=\"pagetitle\">@tr{kb.title|Change the keyboard controls}</text>\n"   /* RSX pass 104: as the sibling Options pages */
          "\t\t<text class=\"sectiontitle\">@key{menu_options}</text>\n\n"
-         "\t\t<text id=\"hdr_0\" x=\"457\" y=\"66\" width=\"150\" text-align=\"center\">PRIMARY</text>\n"
-         "\t\t<text id=\"hdr_1\" x=\"617\" y=\"66\" width=\"150\" text-align=\"center\">SECONDARY</text>\n"
-         "\t\t<list id=\"lst_keys\" class=\"PEDS\" width=\"760\" height=\"360\" labelaccept=\"Change\"\n"
+         "\t\t<text id=\"hdr_0\" x=\"457\" y=\"66\" width=\"150\" text-align=\"center\">@tru{kb.hdr_primary|Primary}</text>\n"
+         "\t\t<text id=\"hdr_1\" x=\"617\" y=\"66\" width=\"150\" text-align=\"center\">@tru{kb.hdr_secondary|Secondary}</text>\n"
+         "\t\t<list id=\"lst_keys\" class=\"PEDS\" width=\"760\" height=\"360\" labelaccept=\"@key{menu_startup_controls_change}\"\n"
          "\t\t\tonaccept=\"script(kbscript, Bind)\" onleft=\"script(kbscript, SlotLeft)\" onright=\"script(kbscript, SlotRight)\">\n";
     for (int r = 0; r < rows; r++) {
         char line[768];
@@ -1594,9 +1692,9 @@ static std::string kz3_kb_page_gum(void)
          "\t\t\tlocal st = Cmd(\"state\")\n"
          "\t\t\tlocal t = Cmd(\"hint\")\n"
          "\t\t\tif (st == \"capture\") then\n"
-         "\t\t\t\tt = \"Press a key for \"..Lab(Cmd(\"cap\"))..\". \"..Cmd(\"caphint\")\n"
+         "\t\t\t\tt = @trx{kb.capture|Press a key for {0}. Esc cancels, Delete clears.|Lab(Cmd(\"cap\"))}\n"
          "\t\t\telseif (st == \"conflict\") then\n"
-         "\t\t\t\tt = Cmd(\"cf key\")..\" is bound to both \"..Lab(Cmd(\"cf a\"))..\" and \"..Lab(Cmd(\"cf b\"))..\".\"\n"
+         "\t\t\t\tt = @trx{kb.conflict|{0} is bound to both {1} and {2}.|Cmd(\"cf key\")|Lab(Cmd(\"cf a\"))|Lab(Cmd(\"cf b\"))}\n"
          "\t\t\telseif (st == \"timeout\") then\n"
          "\t\t\t\tt = Cmd(\"status\")\n"
          "\t\t\tend\n"
@@ -1811,6 +1909,60 @@ static std::string kz3_kb_link_rows(const std::string& in, int* added)
     return out;
 }
 
+/* Close asks first (RSX pass 120, patch 2126; ENHANCEMENT): a page that holds the port's exit dialog (the main menu's
+ * EXIT GAME and the pause menu's QUIT TO DESKTOP, below) also gets
+ *   - onoptions (Square: the RE notes "Menu events") on the innermost panel around the row: KZ3CloseAsk asks the
+ *     host (kb:closeask) and opens the dialog only when the window's X is pending, so a player's own Square does nothing;
+ *   - a kb:askpage call at the top of its OnPageOn (a new OnPageOn when the page has none): the host learns that page's
+ *     GUM root, so it presses Square only on a page that can show the dialog;
+ *   - a kb:closeno call on No, so the host can close the pause menu it opened.
+ * Returns the text unchanged when the panel is missing or already has an onoptions. */
+static std::string kz3_close_ask_rows(const std::string& in, const char* script, const char* row_mark)
+{
+    std::string s = in;
+    std::string low = s;
+    for (char& c : low) c = (char)tolower((unsigned char)c);
+    const size_t b = s.find(row_mark);
+    if (b == std::string::npos) return in;
+    size_t k = low.rfind("<panel", b), te = std::string::npos;
+    while (k != std::string::npos) {
+        te = low.find('>', k);
+        const bool self = te != std::string::npos && te > k && low[te - 1] == '/';
+        const size_t cl = low.find("</panel", te);
+        if (te != std::string::npos && !self && (cl == std::string::npos || cl > b)) break;
+        k = k ? low.rfind("<panel", k - 1) : std::string::npos;
+    }
+    if (k == std::string::npos || te == std::string::npos || low.substr(k, te - k).find("onoptions") != std::string::npos) {
+        printf("[close] %s: no free panel onoptions around the exit row: X closes at once on this page\n", script);
+        return in;
+    }
+    const std::string yes = "\t\t\t\tgPlayerProfile:SetTimeZone(\"kb:exit\")\n";
+    const size_t f = s.find("function OnKZ3ExitClose(event)");
+    const size_t y = f == std::string::npos ? f : s.find(yes, f);
+    if (y == std::string::npos) return in;
+    s.insert(y + yes.size(), "\t\t\telse\n\t\t\t\tgPlayerProfile:SetTimeZone(\"kb:closeno\")\n");
+    std::string fn = std::string("function KZ3CloseAsk(event)\n"
+        "\t\t\tevent:SetHandled(true)\n"
+        "\t\t\tgPlayerProfile:SetTimeZone(\"kb:closeask\")\n"
+        "\t\t\tif (gPlayerProfile:GetTimeZone() == \"yes\") then\n"
+        "\t\t\t\tgMenu:DoAction(\"dialog(dlg_kz3_exit, ") + script + ", OnKZ3ExitClose)\")\n"
+        "\t\t\tend\n"
+        "\t\tend\n\n\t\t";
+    low = s;
+    for (char& c : low) c = (char)tolower((unsigned char)c);
+    const size_t op = low.find("function onpageon()");
+    if (op == std::string::npos) fn = "function OnPageOn()\n\t\t\tgPlayerProfile:SetTimeZone(\"kb:askpage\")\n\t\tend\n\n\t\t" + fn;
+    s.insert(f, fn);                                              /* f < every later offset used below? no: recompute */
+    if (op != std::string::npos) {
+        const size_t op2 = (op > f ? op + fn.size() : op);
+        const size_t nl = s.find('\n', op2);
+        if (nl != std::string::npos) s.insert(nl + 1, "\t\t\tgPlayerProfile:SetTimeZone(\"kb:askpage\")\n");
+    }
+    s.insert(te, std::string(" onoptions=\"script(") + script + ", KZ3CloseAsk)\"");   /* te is before every insert above */
+    printf("[close] %s: the window's X opens the exit dialog on this page%s\n", script, op == std::string::npos ? " (OnPageOn added)" : "");
+    return s;
+}
+
 /* EXIT GAME (RSX pass 61): MAINMENU.GUM gets a row after CREDITS, a confirm dialog shaped like
  * the game's own quit dialog (common/includes/dialogquit.gum: Yes/No from the game's strings, No focused, cancelable)
  * and two functions in its mainmenuscript; Yes calls the Lua bridge with "kb:exit". Returns the text unchanged
@@ -1830,9 +1982,9 @@ static std::string kz3_exit_rows(const std::string& in, int* added)
         dl == std::string::npos || dl > sc) return in;
     size_t ls = in.rfind('\n', b);
     std::string indent = ls == std::string::npos ? "" : in.substr(ls + 1, b - ls - 1);
-    const std::string row = "\n" + indent + "<listitem id=\"ltm_kz3_exit\" label=\"EXIT GAME\" onaccept=\"script(mainmenuscript, KZ3ExitGame)\"/>";
+    const std::string row = "\n" + indent + "<listitem id=\"ltm_kz3_exit\" label=\"@tru{exit.main|Exit game}\" onaccept=\"script(mainmenuscript, KZ3ExitGame)\"/>";
     const std::string dlg =
-        "\n\n\t<dialog id=\"dlg_kz3_exit\" label=\"Exit Killzone 3 and return to the desktop?\" default-focus=\"dlg_kz3_exit_no\"\n"
+        "\n\n\t<dialog id=\"dlg_kz3_exit\" label=\"@tr{exit.confirm|Exit Killzone 3 and return to the desktop?}\" default-focus=\"dlg_kz3_exit_no\"\n"
         "\t\tcancelable=\"true\">\n"
         "\t\t<dialogoption id=\"dlg_kz3_exit_yes\" label=\"@key{menu_dialog_yes}\" value=\"yes\"/>\n"
         "\t\t<dialogoption id=\"dlg_kz3_exit_no\" label=\"@key{menu_dialog_no}\" value=\"no\"/>\n"
@@ -1851,7 +2003,7 @@ static std::string kz3_exit_rows(const std::string& in, int* added)
     out.insert(dl + 9, dlg);
     out.insert(e + 2, row);
     *added = 1;
-    return out;
+    return kz3_close_ask_rows(out, "mainmenuscript", "id=\"ltm_kz3_exit\"");   /* patch 2126 */
 }
 
 /* QUIT TO DESKTOP (RSX pass 109): a row right after the pause menu's own Quit row (campaign/campaignoptions.gum and
@@ -1874,7 +2026,7 @@ static std::string kz3_pause_exit_rows(const std::string& in, int* added)
     std::string row = in.substr(b, e + 2 - b);          /* the game's Quit row: same class, so same look */
     size_t la = row.find("label=\"@key{menu_quit}\"");
     if (la == std::string::npos) return in;
-    row.replace(la, 23, "label=\"QUIT TO DESKTOP\"");
+    row.replace(la, 23, "label=\"@tru{exit.pause|Quit to desktop}\"");
     size_t oa = row.find("onaccept=\"");
     size_t ob = oa == std::string::npos ? oa : row.find('"', oa + 10);
     if (ob == std::string::npos) return in;
@@ -1904,7 +2056,7 @@ static std::string kz3_pause_exit_rows(const std::string& in, int* added)
     out.insert(g, add);
     out.insert(e + 2, "\n" + indent + row);
     *added = 1;
-    return out;
+    return kz3_close_ask_rows(out, "kz3exitscript", "label=\"@tru{exit.pause|Quit to desktop}\"");   /* patch 2126 */
 }
 
 static void (*s_kb_prev_miss)(char*, size_t) = nullptr;
@@ -1951,8 +2103,10 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
     if (!page && link < 0) { if (s_kb_prev_miss) s_kb_prev_miss(path, cap); return; }
     EnterCriticalSection(&s_kb_vfs_lock);
     static bool done[8] = { false, false, false, false, false, false, false, false };
+    static int done_lang[8];   /* network pass 45: a page written in another language is generated again */
     std::string out = s_kb_dir + "/" + (page ? std::string("keyboardsettings.gum") : key.substr(key.rfind('/') + 1));
     int slot = page ? 4 : link;
+    if (done[slot] && done_lang[slot] != kz3_tr_lang()) done[slot] = false;
     if (!done[slot]) {
         if (page) {
             std::string g = kz3_kb_page_gum();
@@ -1963,7 +2117,8 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
                 if (f) { g.clear(); char b[4096]; size_t m; while ((m = fread(b, 1, sizeof b, f)) > 0) g.append(b, m); fclose(f); }
                 printf("[kb-page] KZ3_KB_PAGE_FILE=%s %s\n", pf, f ? "served" : "NOT readable (generated page)");
             }
-            done[slot] = kz3_write_file(out, g);
+            done[slot] = kz3_write_file(out, kz3_tr_page(g));   /* net 45: the kz3_tr.h markers in the game's language */
+            done_lang[slot] = kz3_tr_lang();
             printf("[kb-page] page %s (%zu bytes)%s\n", done[slot] ? "written" : "NOT written", g.size(),
                    key.find("mainmenu") != std::string::npos ? " in place of the main menu (KZ3_KB_PAGE_TEST)" : "");
         } else {
@@ -2001,7 +2156,8 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
                     patched.replace(at, from.size(), to);
                 if (n) printf("[kb-page] KZ3_TEST_ONLINE_COOP: Co-op row -> %s (%d site(s))\n", to.c_str(), n);
             }
-            done[slot] = added > 0 && kz3_write_file(out, patched);
+            done[slot] = added > 0 && kz3_write_file(out, kz3_tr_page(patched));   /* net 45 */
+            done_lang[slot] = kz3_tr_lang();
             printf("[kb-page] %s: %d %s row(s) added%s\n", key.c_str(), added,
                    link == 6 ? "Display" : link == 5 ? "EXIT GAME" : link == 7 ? "pause-menu" : "Keyboard + Mouse",
                    done[slot] ? "" : " (served unchanged)");
@@ -2249,12 +2405,104 @@ static void kz3_diag_summary(void)
 }
 static void kz3_vf17_diag(ppu_context* ctx) { s_vf17_n++; kz3_diag_lr("GameViewGame::vf17", (uint32_t)ctx->lr, ctx); s_vf17_orig(ctx); }
 static void kz3_vf27_diag(ppu_context* ctx) { s_vf27_n++; kz3_diag_lr("GameViewGame::vf27", (uint32_t)ctx->lr, ctx); s_vf27_orig(ctx); kz3_diag_summary(); }
+static uint32_t s_v28_A, s_v28_B, s_v28_self;
+static unsigned s_v28_flip;
+/* RSX pass 122: arms follow the view (KZ3_ARMS_FOLLOW, test KZ3_ARMS_TEST=<rad>). The fill (patch 2116) rotates only the
+ * camera; the first-person body (the local player's HumanoidRep, vptr 0x00F57650) is drawn from its own pose, so arms
+ * and weapon sat off the view by the fill's rotation, a different amount every frame. At the writer, the rep's pose
+ * (ASSUMPTION: Rep+0x60 rows 0-2 basis, row 3 position, as the camera Rep) gets the same world-space rotation the
+ * camera got, about the camera position; the original rows go back at the rep's next vf28 call (unless the game
+ * rewrote them first), so nothing outside this frame's drawing sees the change. */
+static uint32_t s_arms_self;
+static float s_arms_orig[16], s_arms_new[16];
+static float s_arms_dyaw;
+static int kz3_arms_on(void)
+{
+    /* default on with the fill (KZ3_MOUSE_LATCH=2); KZ3_ARMS_FOLLOW=0 off */
+    static const int on = [] { const char* e = getenv("KZ3_ARMS_FOLLOW"); return !(e && e[0] == '0') && kz3_latch_on() == 2; }();
+    return on;
+}
+static float kz3_arms_test(void)
+{
+    static const float t = [] { const char* e = getenv("KZ3_ARMS_TEST"); return e ? (float)atof(e) : 0.0f; }();
+    return t;
+}
+static void kz3_arms_restore(uint32_t self)
+{
+    if (!s_arms_self || s_arms_self != self) return;
+    int same = 1;
+    for (int i = 0; i < 16 && same; i++) same = kz3_bef(self + 0x60 + 4 * i) == s_arms_new[i];
+    if (same) for (int i = 0; i < 16; i++) kz3_wbef(self + 0x60 + 4 * i, s_arms_orig[i]);
+    /* run r122-j2t: the rep's previous pose +0xA0 is a copy of +0x60 made before this call: give it the game's value too */
+    same = 1;
+    for (int i = 0; i < 16 && same; i++) same = kz3_bef(self + 0xA0 + 4 * i) == s_arms_new[i];
+    if (same) for (int i = 0; i < 16; i++) kz3_wbef(self + 0xA0 + 4 * i, s_arms_orig[i]);
+    s_arms_self = 0;
+}
+static void kz3_arms_follow(uint32_t src, const float cam0[3][3], int log)
+{
+    const unsigned flip = cellGcm_flip_request_count();
+    const uint32_t self = s_v28_flip == flip ? s_v28_self : 0;
+    s_arms_dyaw = 0.0f;
+    auto hlog = [&](void) {
+        if (!log || !self) return;
+        printf("[hrep] flip=%u self=0x%08X p0=%.5f,%.5f,%.5f p1=%.5f,%.5f,%.5f p2=%.5f,%.5f,%.5f p3=%.3f,%.3f,%.3f "
+               "q0=%.5f,%.5f,%.5f q3=%.3f,%.3f,%.3f a124=%.4f c3=%.3f,%.3f,%.3f arms=%.5f\n", flip, self,
+               kz3_bef(self + 0x60), kz3_bef(self + 0x64), kz3_bef(self + 0x68), kz3_bef(self + 0x70), kz3_bef(self + 0x74),
+               kz3_bef(self + 0x78), kz3_bef(self + 0x80), kz3_bef(self + 0x84), kz3_bef(self + 0x88), kz3_bef(self + 0x90),
+               kz3_bef(self + 0x94), kz3_bef(self + 0x98), kz3_bef(self + 0xA0), kz3_bef(self + 0xA4), kz3_bef(self + 0xA8),
+               kz3_bef(self + 0xD0), kz3_bef(self + 0xD4), kz3_bef(self + 0xD8), kz3_bef(self + 0x124),
+               kz3_bef(src + 0x30), kz3_bef(src + 0x34), kz3_bef(src + 0x38), s_arms_dyaw);
+    };
+    if (!self || !(kz3_arms_on() || kz3_arms_test() != 0.0f)) { hlog(); return; }
+    float m1[3][3];
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) m1[i][j] = kz3_bef(src + 0x10 * i + 4 * j);
+    if (kz3_arms_test() != 0.0f) {   /* test: a fixed yaw instead of the latch's rotation */
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) m1[i][j] = cam0[i][j];
+        pad_look_latch_rotate(m1, kz3_arms_test(), 0.0f);
+    }
+    /* X = cam0^T m1 (rows are world vectors, cam0 orthonormal): any world vector v maps to v X */
+    float X[3][3], d = 0.0f;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+            X[i][j] = cam0[0][i] * m1[0][j] + cam0[1][i] * m1[1][j] + cam0[2][i] * m1[2][j];
+            d += fabsf(X[i][j] - (i == j ? 1.0f : 0.0f));
+        }
+    if (!(d > 1e-7f) || !(d < 3.0f)) { hlog(); return; }
+    const float c[3] = {kz3_bef(src + 0x30), kz3_bef(src + 0x34), kz3_bef(src + 0x38)};
+    for (int i = 0; i < 16; i++) s_arms_orig[i] = kz3_bef(self + 0x60 + 4 * i);
+    for (int i = 0; i < 16; i++) s_arms_new[i] = s_arms_orig[i];
+    for (int r = 0; r < 4; r++) {
+        float v[3];
+        for (int j = 0; j < 3; j++) v[j] = s_arms_orig[4 * r + j] - (r == 3 ? c[j] : 0.0f);
+        for (int j = 0; j < 3; j++)
+            s_arms_new[4 * r + j] = v[0] * X[0][j] + v[1] * X[1][j] + v[2] * X[2][j] + (r == 3 ? c[j] : 0.0f);
+    }
+    for (int i = 0; i < 16; i++) if (!isfinite(s_arms_new[i])) { hlog(); return; }
+    for (int i = 0; i < 16; i++) kz3_wbef(self + 0x60 + 4 * i, s_arms_new[i]);
+    s_arms_self = self;
+    s_arms_dyaw = atan2f(X[0][1], X[0][0]);
+    hlog();   /* after the change: p0 = the drawn rep basis */
+    static int s_said;
+    if (!s_said++) printf("[arms] follow on (%s) first at flip=%u self=0x%08X\n", kz3_arms_test() != 0.0f ? "KZ3_ARMS_TEST" : "KZ3_ARMS_FOLLOW", flip, self);
+}
 static void kz3_vf28_diag(ppu_context* ctx)
 {
     if (s_writer_flip == cellGcm_flip_request_count()) s_vf28_after++; else s_vf28_before++;
     kz3_latch_trace('V');
     kz3_diag_lr("HumanoidRep::vf28", (uint32_t)ctx->lr, ctx);
+    /* RSX pass 122: remember the local player's rep ([this+0x12C] = the local entity) of this flip for kz3_arms_follow and
+     * the [hrep] log; restore the rows kz3_arms_follow changed last frame before the original runs. */
+    const uint32_t self = (uint32_t)ctx->gpr[3], A = (uint32_t)ctx->gpr[4], B = (uint32_t)ctx->gpr[5];
+    kz3_arms_restore(self);
     s_vf28_orig(ctx);
+    const uint32_t ent = ml_ok(self) ? ml_r32(self + 0x12C) : 0, loc = ml_local_entity(kMouse114.players);
+    { static int s_said; if (!s_said && ml_ok(loc)) { s_said = 1; printf("[vf28] first call: self=0x%08X [self+0x12C]=0x%08X local=0x%08X A=0x%08X B=0x%08X\n", self, ent, loc, A, B); } }
+    if (ml_ok(A) && ml_ok(B) && ent && ent == loc) {
+        /* RSX pass 122 run r122-j1: A and B stayed identity on every call (the early-out; 3096 calls in jungle), so the
+         * weapon is not placed from the Camera here; the [hrep] line at the writer logs the rep's own pose instead. */
+        s_v28_A = A; s_v28_B = B; s_v28_self = self; s_v28_flip = cellGcm_flip_request_count();
+    }
 }
 
 /* Render-time camera interpolation (RSX pass 107, patch 2114 + this hook, ENHANCEMENT candidate, OFF: measured
@@ -2375,6 +2623,171 @@ static void kz3_cam_interp(ppu_context* ctx, uint32_t src, int log)
 
 static int s_fov_applied;
 static double s_fov_k = 1.0;
+static double s_fov_half, s_fov_half2;   /* RSX pass 121: the writer's half angle, game and applied (radians) */
+/* RSX pass 121 (helmet visor, RE pass 174): per view (the writer's r31), the game's and the applied angles of the last
+ * camera writer call: horizontal = 2 * half (authored, at 16:9), vertical = 2 atan(tan(half) / A) (Camera FieldOfView).
+ * Read by the FirstPersonOverlay vf27 hook (kz3_fov_visor). */
+struct Kz3FovView { uint32_t view; float hg, hw, vg, vw; int applied; };
+static Kz3FovView s_fov_views[4];
+static int s_fov_log = -1;
+static const char* kz3_class_name(uint32_t obj);
+static int kz3_fov_cinematic(uint32_t view, const char** why);
+static void kz3_fov_dump(const char* tag, int slot, uint32_t a, uint32_t n)   /* KZ3_FOV_LOG=2: changed words only */
+{
+    static uint32_t prev[2][0x100];
+    if (!ml_ok(a) || n > 0x400) return;
+    char line[4096]; int o = snprintf(line, sizeof line, "[fovdump] flip=%u %s=0x%08X", cellGcm_flip_request_count(), tag, a);
+    for (uint32_t i = 0; i < n / 4 && o < (int)sizeof line - 24; i++) {
+        const uint32_t w = ml_r32(a + i * 4);
+        if (w != prev[slot][i]) { o += snprintf(line + o, sizeof line - o, " %X:%08X", i * 4, w); prev[slot][i] = w; }
+    }
+    printf("%s\n", line);
+}
+static void kz3_fov_cam_note(ppu_context* ctx, uint32_t src, float h, float z)
+{
+    if (s_fov_log < 0) { const char* e = getenv("KZ3_FOV_LOG"); s_fov_log = e && e[0] >= '1' && e[0] <= '2' ? e[0] - '0' : 0; }
+    if (!s_fov_log) return;
+    /* the camera entity Rep the overlay's vf27 reads: E = ([view+0x2C] - 0xC)->+0xE8 (as the latch, re-data 174.3) */
+    const uint32_t view = (uint32_t)ctx->gpr[31];
+    uint32_t E = 0;
+    const uint32_t cur = ml_ok(view) ? ml_r32(view + 0x2C) : 0;
+    if (cur > 0xC && ml_ok(cur - 0xC)) E = ml_r32(cur - 0xC + 0xE8);
+    const uint32_t vt = ml_ok(E) ? ml_r32(E) : 0, opd = ml_ok(vt) ? ml_r32(vt + 0x6C) : 0, f27 = ml_ok(opd) ? ml_r32(opd) : 0;
+    const int b239 = ml_ok(E) ? (int)(ml_r32(E + 0x238) >> 16 & 0xFF) : -1;
+    static uint32_t s_vt; static int s_b; static float s_h;
+    if (vt != s_vt || b239 != s_b || fabsf(h - s_h) > 0.01f) {
+        s_vt = vt; s_b = b239; s_h = h;
+        const char* en = "";
+        const int cine = kz3_fov_cinematic(view, &en);
+        printf("[fovcam] rep=%s ent=%s cinematic=%d\n", kz3_class_name(E), en, cine);
+        printf("[fovcam] flip=%u view=0x%08X E=0x%08X vptr=0x%08X vf27=0x%08X b239=%d f240=%.3f gameFOV(vf27 src)=%.3f src hfov=%.3f zoom=%.4f d0=%.3f blend=0x%08X\n",
+               cellGcm_flip_request_count(), view, E, vt, f27, b239, ml_ok(E) ? ml_rf(E + 0x240) : 0.f,
+               ml_ok(E) && ml_ok(ml_r32(E + 0x12C)) && ml_ok(ml_r32(ml_r32(E + 0x12C) + 0xE4)) ? ml_rf(ml_r32(ml_r32(E + 0x12C) + 0xE4) + 0x74) : 0.f,
+               h, z, ml_ok(view) ? ml_rf(view + 0xD0) : 0.f, ml_ok(view) ? ml_r32(view + 0x38) : 0);
+        fflush(stdout);
+    }
+    /* RSX pass 121 step 3 probe: the first-person camera Rep and its entity, every 60 flips (diff against the last dump) */
+    static unsigned s_dflip;
+    const unsigned fl = cellGcm_flip_request_count();
+    if (s_fov_log == 2 && vt == 0x00F46BF8u && fl - s_dflip >= 60) {
+        s_dflip = fl;
+        kz3_fov_dump("rep", 0, E, 0x300);
+        kz3_fov_dump("ent", 1, ml_ok(E) ? ml_r32(E + 0x12C) : 0, 0x300);
+        fflush(stdout);
+    }
+}
+/* RSX pass 121 (cinematics keep the game's own field of view). The game's own class of an object: vtable slot 0 is
+ * its RTTI getter, `lis r3,hi; addi(c) r3,r3,lo; blr`, and the RTTI object's +0x30 is the class name (1.14 checked
+ * statically: FirstPersonCameraEntityRep 0x00BEBD20 -> 0x013EF320 -> "FirstPersonCameraEntityRep", CameraEntityRep
+ * 0x00B95EA0 -> 0x013D2170 -> "CameraEntityRep"). Cached per vptr. */
+static const char* kz3_class_name(uint32_t obj)
+{
+    static uint32_t vts[32]; static const char* names[32]; static int n;
+    if (!ml_ok(obj)) return "";
+    const uint32_t vt = ml_r32(obj);
+    for (int i = 0; i < n; i++) if (vts[i] == vt) return names[i];
+    const char* nm = "?";
+    const uint32_t opd = ml_ok(vt) ? ml_r32(vt) : 0, fn = ml_ok(opd) ? ml_r32(opd) : 0;
+    if (ml_ok(fn)) {
+        const uint32_t i0 = ml_r32(fn), i1 = ml_r32(fn + 4), i2 = ml_r32(fn + 8);
+        if ((i0 >> 16) == 0x3C60u && ((i1 >> 16) == 0x3063u || (i1 >> 16) == 0x3863u) && i2 == 0x4E800020u) {
+            const uint32_t rtti = (i0 << 16) + (uint32_t)(int32_t)(int16_t)(i1 & 0xFFFF);
+            const uint32_t str = ml_ok(rtti) ? ml_r32(rtti + 0x30) : 0;
+            if (ml_ok(str)) {
+                const char* c = (const char*)(vm_base + str);
+                size_t k = 0;
+                while (k < 64 && c[k] >= 0x20 && c[k] < 0x7F) k++;
+                if (k > 0 && k < 64 && c[k] == 0) nm = c;
+            }
+        }
+    }
+    if (n < 32) { vts[n] = vt; names[n] = nm; n++; }
+    return nm;
+}
+/* The active camera's entity (E = the camera Rep the writer blends, E+0x12C = its entity, re-data 174.3) is a
+ * scripted camera: the plain CameraEntity (mission_0's opening cinematic, flips ~3510-3960 of run r121-m0f110c: Rep
+ * CameraEntityRep, hfov 90; the player's camera is FirstPersonCameraEntity) or SequenceCameraEntity. Every gameplay
+ * camera has its own subclass (FirstPerson*, VehicleInternal*, *FollowCamera*, Flyover*, *DeathCamera*, Spectator*).
+ * ASSUMPTION: the plain CameraEntity is used only by scripted sequences (re-data request, RSX pass 121). */
+/* RSX pass 125 (gate, RE pass 176/180): there is no global cinematic flag. The camera stack is the CameraManager at
+ * [GameWorld]+0x4C (count +0x84, data +0x88, 12-byte entries, first word = the entry's handle, top = last). Only the
+ * camera-event classes' start methods push the cinematic cameras (CameraManager::Push 1.14 0x331F04 | 1.00 0x325CC4 at
+ * lr 0x704EC4 / 0x700A10 / 0x6F5950 | 1.00 0x6EF8F4 / 0x6EB440 / 0x6E0388), but those calls are direct calls inside the
+ * lift (a function-table hook on Push never fires: run r125-m0f110b logged no push), so the start methods themselves
+ * are wrapped (they are virtual: CameraEventInstance::vf14 1.14 0x704C20, AnimatedCameraEventInstance 0x700D40,
+ * AnimatedPlayerCameraEventInstance 0x701FC0, the PlayAnimation-type 0x6F56E4 and its two siblings 0x6F59A4 / 0x6F5AFC)
+ * and a new top entry that appears while one runs is recorded. Cinematic = the top entry is a recorded handle; a recorded
+ * handle no longer on the stack is forgotten. Mount cameras (0x5DD240 | 0x5C8C10) and the other pushers are never
+ * recorded. The old RTTI class test is gone (plain CameraEntity cameras are used by mounts and others too). */
+struct Kz3CineVer { uint32_t gw, fn[6]; };
+static constexpr Kz3CineVer kCine100 = {0x013A6D7Cu, {0x006EF650u, 0x006EB770u, 0x006EC9F0u, 0x006E011Cu, 0x006E03DCu, 0x006E0534u}},
+                            kCine114 = {0x0141C030u, {0x00704C20u, 0x00700D40u, 0x00701FC0u, 0x006F56E4u, 0x006F59A4u, 0x006F5AFCu}};
+static const Kz3CineVer* s_cine_v;
+static void (*s_cine_orig[6])(ppu_context*);
+static uint32_t s_cine_mgr, s_cine_h[16];
+static int s_cine_n;
+static uint32_t kz3_cine_top(uint32_t mgr, uint32_t* cnt)
+{
+    *cnt = ml_ok(mgr) ? ml_r32(mgr + 0x84) : 0;
+    const uint32_t data = ml_ok(mgr) ? ml_r32(mgr + 0x88) : 0;
+    if (*cnt == 0 || *cnt > 64 || !ml_ok(data)) { *cnt = 0; return 0; }
+    return ml_r32(data + (*cnt - 1) * 12);
+}
+static void kz3_cine_start(ppu_context* ctx, int k)
+{
+    const uint32_t gw = kz3_be32(s_cine_v->gw), mgr = ml_ok(gw) ? ml_r32(gw + 0x4C) : 0;
+    uint32_t c0 = 0, c1 = 0;
+    const uint32_t t0 = kz3_cine_top(mgr, &c0);
+    s_cine_orig[k](ctx);
+    const uint32_t t1 = kz3_cine_top(mgr, &c1);
+    static int nlog;
+    if (nlog < 40) { nlog++; printf("[fovcam] camera event start #%d: stack %u -> %u top 0x%08X -> 0x%08X flip=%u\n", k, c0, c1, t0, t1, cellGcm_flip_request_count()); fflush(stdout); }
+    if (c1 > c0 && t1 != t0) {
+        s_cine_mgr = mgr;
+        for (int i = 0; i < s_cine_n; i++) if (s_cine_h[i] == t1) return;
+        if (s_cine_n < 16) s_cine_h[s_cine_n++] = t1;
+        else { memmove(s_cine_h, s_cine_h + 1, 15 * 4); s_cine_h[15] = t1; }
+    }
+}
+template <int K> static void kz3_cine_start_k(ppu_context* ctx) { kz3_cine_start(ctx, K); }
+static void kz3_cine_init(void)
+{
+    s_cine_v = s_asp == &kAspect114 ? &kCine114 : &kCine100;
+    static void (*const fns[6])(ppu_context*) = {kz3_cine_start_k<0>, kz3_cine_start_k<1>, kz3_cine_start_k<2>,
+                                                 kz3_cine_start_k<3>, kz3_cine_start_k<4>, kz3_cine_start_k<5>};
+    int n = 0;
+    for (int k = 0; k < 6; k++)
+        if ((s_cine_orig[k] = kz3_lifted_fn(s_cine_v->fn[k]))) { ppu_register_function(s_cine_v->fn[k], fns[k]); n++; }
+    printf("[fovcam] cinematic gate: %d of 6 camera-event start methods hooked (%s)\n", n, s_asp == &kAspect114 ? "1.14" : "1.00");
+}
+static int kz3_fov_cinematic(uint32_t view, const char** why)
+{
+    (void)view;
+    if (why) *why = "stack";
+    if (!s_cine_n || !ml_ok(s_cine_mgr)) return 0;
+    const uint32_t cnt = ml_r32(s_cine_mgr + 0x84), data = ml_r32(s_cine_mgr + 0x88);
+    if (cnt == 0 || cnt > 64 || !ml_ok(data)) { s_cine_n = 0; return 0; }
+    for (int i = 0; i < s_cine_n;) {   /* forget the handles that left the stack */
+        int on = 0;
+        for (uint32_t k = 0; k < cnt && !on; k++) on = ml_r32(data + k * 12) == s_cine_h[i];
+        if (on) i++; else { memmove(s_cine_h + i, s_cine_h + i + 1, (size_t)(s_cine_n - i - 1) * 4); s_cine_n--; }
+    }
+    const uint32_t top = ml_r32(data + (cnt - 1) * 12);
+    for (int i = 0; i < s_cine_n; i++) if (s_cine_h[i] == top) return 1;
+    return 0;
+}
+static void kz3_fov_view_note(uint32_t view, double A0, double A1)   /* at the writer's vf22 return, after 2109 */
+{
+    int i = 0;
+    while (i < 4 && s_fov_views[i].view && s_fov_views[i].view != view) i++;
+    if (i == 4) i = 0;
+    Kz3FovView& v = s_fov_views[i];
+    v.view = view;
+    v.hg = (float)(2.0 * s_fov_half); v.hw = (float)(2.0 * s_fov_half2);
+    v.vg = A0 > 0 ? (float)(2.0 * atan(tan(s_fov_half) / A0)) : 0.f;
+    v.vw = A1 > 0 ? (float)(2.0 * atan(tan(s_fov_half) / A1)) : 0.f;
+    v.applied = s_fov_applied;
+}
 static void kz3_cam_fov(ppu_context* ctx)
 {
     const uint32_t src = (uint32_t)ctx->gpr[29];
@@ -2388,26 +2801,43 @@ static void kz3_cam_fov(ppu_context* ctx)
     const double half = ctx->fpr[31] * (double)c4;
     s_fov_applied = 0;
     s_fov_k = 1.0;
+    s_fov_half = half; s_fov_half2 = half;
+    kz3_fov_cam_note(ctx, src, h, z);   /* RSX pass 121 probe (KZ3_FOV_LOG=1) */
     const int fov = (int)s_fov_deg;
-    static int s_type_said = -2;
+    static int s_type_said = -2, s_fov_said = -1;
     const int type = fov ? kz3_game_type() : 0;
-    if (fov && type != s_type_said) {
-        s_type_said = type;
+    if (fov && (type != s_type_said || fov != s_fov_said)) {   /* RSX pass 119: also when the setting changes */
+        s_type_said = type; s_fov_said = fov;
         printf("[fov] %d deg (base %.1f), game type %d: %s\n", fov, kz3_fov_base(), type,
                type == 0 ? "applied" : "OFF outside the campaign (multiplayer, Botzone)");
         fflush(stdout);
     }
-    if (fov && type == 0 && half > 1e-4 && half < 1.5) {
+    /* no widening while a scripted-sequence camera is active (KZ3_FOV_CINE=1 widens cinematics too, the old way) */
+    static const int s_cine_keep = [] { const char* e = getenv("KZ3_FOV_CINE"); return !(e && e[0] == '1'); }();
+    const char* cwhy = "";
+    const int cine = fov && type == 0 && s_cine_keep ? kz3_fov_cinematic((uint32_t)ctx->gpr[31], &cwhy) : 0;
+    static int s_cine_said = -1;
+    if (fov && type == 0 && cine != s_cine_said) {
+        s_cine_said = cine;
+        printf("[fov] %s (camera entity %s) flip=%u\n", cine ? "cinematic camera: game's own field of view" : "gameplay camera: field of view applied",
+               cwhy, cellGcm_flip_request_count());
+        fflush(stdout);
+    }
+    if (fov && type == 0 && !cine && half > 1e-4 && half < 1.5) {
         double h2 = half * (double)fov / kz3_fov_base();
         if (h2 > 1.45) h2 = 1.45;   /* 166 degrees */
         s_fov_k = tan(half) / tan(h2);
+        s_fov_half2 = h2;
         s_fov_applied = 1;
     }
     static int s_log = -1;
     if (s_log < 0) { const char* a = getenv("KZ3_CAM_LOG"); const char* b = getenv("KZ3_MOUSE_LOG");
                      s_log = (a && a[0] == '1') || (b && b[0] == '1'); }
     if (src_ok) kz3_cam_interp(ctx, src, s_log == 1);   /* RSX pass 107: interpolated pose first, then the latch on top */
+    float cam0[3][3] = {};
+    if (src_ok) for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) cam0[i][j] = kz3_bef(src + 0x10 * i + 4 * j);
     if (src_ok && (s_log == 1 || kz3_latch_on())) kz3_cam_latch(ctx, src);   /* RSX pass 105: before the pose copy */
+    if (src_ok) kz3_arms_follow(src, cam0, s_log == 1);   /* RSX pass 122 */
     static float s_hz[32][2];
     static int s_nhz;
     int k = 0;
@@ -2456,7 +2886,11 @@ static void kz3_vf22_aspect(ppu_context* ctx)   /* GameViewGame::vf22 @0x007E590
             }
         }
     }
-    if (lr == s_asp->lr_fov && s_fov_applied) ctx->fpr[1] = (double)(float)(ctx->fpr[1] * s_fov_k);   /* RSX pass 103 */
+    if (lr == s_asp->lr_fov) {
+        const double A0 = ctx->fpr[1];
+        if (s_fov_applied) ctx->fpr[1] = (double)(float)(ctx->fpr[1] * s_fov_k);   /* RSX pass 103 */
+        kz3_fov_view_note((uint32_t)ctx->gpr[31], A0, ctx->fpr[1]);   /* RSX pass 121 */
+    }
 }
 
 /* HUD world projection in the 16:9 box (RSX pass 108, patch 2115; ENHANCEMENT, display, with 2113; design
@@ -2477,9 +2911,30 @@ static constexpr Kz3HudProjVer kHudProj100 = {0x0031E120u, 0x007EA52Cu}, kHudPro
 static void (*s_cvf17_orig)(ppu_context*);
 static uint32_t s_hudp_lr;
 static int s_hudp_on = 1, s_hudp_log;
+/* RSX pass 119 probe (KZ3_VF17_LOG=1): every distinct Camera::vf17 caller (lr) once, then counts every 10 s: which code
+ * builds a projection from the Camera, for the Field of view question (which frustum the helmet visor overlay uses). */
+static int s_vf17_log = -1;
+static void kz3_vf17_lr_note(uint32_t lr, uint32_t cam)
+{
+    static uint32_t lrs[32]; static uint64_t cnt[32]; static int n; static ULONGLONG last;
+    int i = 0;
+    while (i < n && lrs[i] != lr) i++;
+    if (i == n && n < 32) { lrs[n] = lr; cnt[n] = 0; n++;
+        printf("[vf17] new caller lr=0x%08X cam=0x%08X flip=%u\n", lr, cam, cellGcm_flip_request_count()); fflush(stdout); }
+    if (i < 32) cnt[i]++;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last >= 10000) {
+        last = now;
+        char line[1024]; int o = snprintf(line, sizeof line, "[vf17] counts flip=%u:", cellGcm_flip_request_count());
+        for (int k = 0; k < n && o < (int)sizeof line - 32; k++) o += snprintf(line + o, sizeof line - o, " %08X=%llu", lrs[k], (unsigned long long)cnt[k]);
+        printf("%s\n", line); fflush(stdout);
+    }
+}
 static void kz3_cam_vf17_hud(ppu_context* ctx)   /* Camera::vf17 0x00329D80 (1.00 0x0031E120) */
 {
     const uint32_t lr = (uint32_t)ctx->lr, out = (uint32_t)ctx->gpr[3];
+    if (s_vf17_log < 0) { const char* e = getenv("KZ3_VF17_LOG"); s_vf17_log = e && e[0] == '1'; }
+    if (s_vf17_log) kz3_vf17_lr_note(lr, (uint32_t)ctx->gpr[4]);
     s_cvf17_orig(ctx);
     if (lr != s_hudp_lr || out < 0x10000u || out >= 0xF0000000u) return;
     float kx = 1.0f, ky = 1.0f;
@@ -2518,6 +2973,71 @@ static void kz3_hud_proj_init(void)
            v == &kHudProj114 ? "1.14" : "1.00", s_hudp_on ? "box frustum while the 2D layer is squeezed" : "off (KZ3_HUD_PROJ=0)");
 }
 
+/* Helmet visor at a wider field of view (RSX pass 121, design the RE notes Pass 174.3-174.4). The first-person
+ * overlay (FirstPersonAnimatedOverlayResource: visor mesh authored for resource.FOV degrees) hands the renderer the
+ * ratio resource.FOV / camera-entity FOV in view+0x6D4 (1.00 +0x6C4), computed in 0x0087B1B0 (1.00 0x00858440) from
+ * the camera Rep's vf27 (vtable +0x6C; the game's own, unwidened FOV), called at lr 0x0087B23C (1.00 0x008584CC).
+ * The draw multiplies the ratio by the widened Camera, so with patch 2109 the visor shrinks to an inset. The hook
+ * returns vf27 x widened / game for that one call only (ratio' = ratio x game / widened), so the overlay's FOV is
+ * resource.FOV again; every other vf27 caller (the weapon's FPFOVMultiplier, streaming) is untouched.
+ * KZ3_FOV_VISOR=0 off (old inset), =1 horizontal angle ratio (default), =2 vertical (Camera FieldOfView) ratio. */
+struct Kz3VisorVer { uint32_t lr, f27[2], ratio_off, store; };
+static constexpr Kz3VisorVer kVisor100 = {0x008584CCu, {0x005A1C94u, 0x003543D0u}, 0x6C4u, 0x008584F8u},
+                             kVisor114 = {0x0087B23Cu, {0x005B60A4u, 0x003604E8u}, 0x6D4u, 0x0087B280u};
+static const Kz3VisorVer* s_vis;
+static void (*s_vis_orig[2])(ppu_context*);
+static int s_vis_mode = 1;
+static void kz3_fov_visor(ppu_context* ctx, int k)
+{
+    const uint32_t lr = (uint32_t)ctx->lr, V = (uint32_t)ctx->gpr[30];
+    s_vis_orig[k](ctx);
+    if (lr != s_vis->lr) return;
+    const double cam = ctx->fpr[1], res = ctx->fpr[31];
+    const Kz3FovView* fv = nullptr;
+    for (const Kz3FovView& v : s_fov_views) if (v.view && v.view == V) fv = &v;
+    double q = 1.0;
+    if (fv && fv->applied && s_vis_mode) {
+        if (s_vis_mode == 2 && fv->vg > 0.f && fv->vw > 0.f) q = (double)fv->vw / fv->vg;
+        else if (fv->hg > 0.f && fv->hw > 0.f) q = (double)fv->hw / fv->hg;
+        if (q > 0.2 && q < 5.0) ctx->fpr[1] = (double)(float)(cam * q);
+        else q = 1.0;
+    }
+    if (s_fov_log >= 1) {
+        static ULONGLONG last;
+        const ULONGLONG now = GetTickCount64();
+        if (now - last >= 1000) {
+            last = now;
+            printf("[fovvis] flip=%u V=0x%08X f27=%d resFOV=%.4f camFOV=%.4f ratio=%.5f prev[+0x%X]=%.5f V+0x64=%.5f "
+                   "view=%d applied=%d hg=%.4f hw=%.4f vg=%.4f vw=%.4f q=%.5f -> ratio'=%.5f\n", cellGcm_flip_request_count(), V, k,
+                   res, cam, cam != 0 ? res / cam : 0.0, s_vis->ratio_off, ml_ok(V) ? ml_rf(V + s_vis->ratio_off) : 0.f,
+                   ml_ok(V) ? ml_rf(V + 0x64) : 0.f, fv != nullptr, fv ? fv->applied : -1, fv ? fv->hg : 0.f, fv ? fv->hw : 0.f,
+                   fv ? fv->vg : 0.f, fv ? fv->vw : 0.f, q, ctx->fpr[1] != 0 ? res / ctx->fpr[1] : 0.0);
+            fflush(stdout);
+        }
+    }
+}
+static void kz3_fov_visor0(ppu_context* ctx) { kz3_fov_visor(ctx, 0); }
+static void kz3_fov_visor1(ppu_context* ctx) { kz3_fov_visor(ctx, 1); }
+static void kz3_fov_visor_init(void)
+{
+    const char* e = getenv("KZ3_FOV_VISOR");
+    if (e && e[0] >= '0' && e[0] <= '2') s_vis_mode = e[0] - '0';
+    const Kz3VisorVer* v = s_asp == &kAspect114 ? &kVisor114 : &kVisor100;
+    /* checks: the bctrl before lr, the stfs f31,ratio(r30), FirstPersonCameraEntityRep::vf27's lbz r4,0x239(r3),
+     * CameraEntityRep::vf27's lfs f1,0x74(r3) */
+    if ((kz3_be32(v->lr - 4) & 0xFFE0FFFFu) != 0x4E800421u || kz3_be32(v->store) != (0xD3FE0000u | v->ratio_off) ||
+        kz3_be32(v->f27[0] + 0xC) != 0x88830239u || kz3_be32(v->f27[1] + 8) != 0xC0230074u ||
+        !(s_vis_orig[0] = kz3_lifted_fn(v->f27[0])) || !(s_vis_orig[1] = kz3_lifted_fn(v->f27[1]))) {
+        printf("[fov] helmet visor hook NOT installed (instruction check failed, %s)\n", v == &kVisor114 ? "1.14" : "1.00");
+        return;
+    }
+    s_vis = v;
+    ppu_register_function(v->f27[0], kz3_fov_visor0);
+    ppu_register_function(v->f27[1], kz3_fov_visor1);
+    printf("[fov] helmet visor hook on vf27 0x%08X/0x%08X at lr 0x%08X (%s): %s\n", v->f27[0], v->f27[1], v->lr,
+           v == &kVisor114 ? "1.14" : "1.00", s_vis_mode == 0 ? "off (KZ3_FOV_VISOR=0)" : s_vis_mode == 2 ? "vertical ratio" : "horizontal ratio");
+}
+
 static void kz3_aspect_init(void)
 {
     s_aspect_on = rsx_display_get_aspect() == RSX_DM_ASPECT_SCREEN;
@@ -2532,19 +3052,25 @@ static void kz3_aspect_init(void)
     s_asp = v;
     ppu_register_function(v->vf22, kz3_vf22_aspect);
     kz3_hud_proj_init();   /* RSX pass 108, patch 2115 */
+    kz3_cine_init();       /* RSX pass 125 */
+    kz3_fov_visor_init();  /* RSX pass 121 */
     s_fov_ok = 1;
     if (kz3_latch_on()) printf("[latch] %s%s\n", kz3_latch_on() == 2 ? "render-rate fill ON (default; KZ3_MOUSE_LATCH=0 off, =1 pending counts only)"
                                                                    : "late-latch view rotation ON, pending counts only (KZ3_MOUSE_LATCH=1)",
                                v == &kAspect114 ? "" : ": 1.00 EBOOT, gate stays off (offsets not read)");
     /* RSX pass 105 diagnostics, 1.14 only (KZ3_CAM_LOG=1 or KZ3_MOUSE_LOG=1) */
     const char* cl = getenv("KZ3_CAM_LOG"); const char* ml = getenv("KZ3_MOUSE_LOG");
-    if (v == &kAspect114 && ((cl && cl[0] == '1') || (ml && ml[0] == '1'))) {
+    const int diag = (cl && cl[0] == '1') || (ml && ml[0] == '1');
+    if (v == &kAspect114 && (diag || kz3_arms_on() || kz3_arms_test() != 0.0f)) {
         struct { uint32_t a; void (**orig)(ppu_context*); void (*fn)(ppu_context*); } d[] = {
-            {0x00804B20u, &s_vf17_orig, kz3_vf17_diag}, {0x00806398u, &s_vf27_orig, kz3_vf27_diag},
-            {0x00661B48u, &s_vf28_orig, kz3_vf28_diag}};
-        for (auto& e : d)
+            {0x00661B48u, &s_vf28_orig, kz3_vf28_diag},   /* RSX pass 122: also for the arms follow */
+            {0x00804B20u, &s_vf17_orig, kz3_vf17_diag}, {0x00806398u, &s_vf27_orig, kz3_vf27_diag}};
+        if (kz3_arms_on()) printf("[arms] follow the view: ON (default with the fill; KZ3_ARMS_FOLLOW=0 off)\n");
+        for (int k = 0; k < (diag ? 3 : 1); k++) {   /* without the log only vf28 (the arms follow) */
+            auto& e = d[k];
             if ((*e.orig = kz3_lifted_fn(e.a))) ppu_register_function(e.a, e.fn);
             else printf("[latch] diag hook 0x%08X not found (not lifted)\n", e.a);
+        }
     }
     printf("[aspect] camera hook on GameViewGame::vf22 0x%08X (%s): %s\n", v->vf22, v == &kAspect100 ? "1.00" : "1.14",
            s_aspect_on ? "view at the client's aspect" : "field of view only");
@@ -2827,6 +3353,10 @@ MmState mm_state(uint32_t c)
 std::atomic_flag s_mm_busy = ATOMIC_FLAG_INIT;   /* never blocks a poll: another thread's poll skips instead */
 PadMenuInject s_mm_inj;
 PadMenuHover s_mm_hov;
+/* Patch 2126: the close/pause presses (START, Square, the test's answer), apart from the mouse's queue: they are also
+ * pressed in play, where the menu mouse's queue is cleared. Under s_mm_busy like s_mm_inj. */
+PadMenuInject s_ca_inj;
+void ca_frame_tick(void);
 
 /* Focus tag through the game's setter; 1 when the chain head is tag afterwards. */
 int mm_focus(ppu_context* ctx, uint32_t c, uint32_t tag, const KZ3MenuRect& r, float x, float y, const char* why)
@@ -2843,7 +3373,7 @@ int mm_focus(ppu_context* ctx, uint32_t c, uint32_t tag, const KZ3MenuRect& r, f
 void mm_lock(void) { while (s_mm_busy.test_and_set(std::memory_order_acquire)) {} }
 void mm_unlock(void) { s_mm_busy.clear(std::memory_order_release); }
 volatile int s_mm_active = 0;
-void mm_frame_tick(void) { mm_lock(); pmi_tick(&s_mm_inj); mm_unlock(); }
+void mm_frame_tick(void) { mm_lock(); pmi_tick(&s_mm_inj); pmi_tick(&s_ca_inj); mm_unlock(); ca_frame_tick(); }
 volatile double s_mm_pad_t = -1e9;   /* last poll with the pad's menu buttons or sticks in use (s) */
 
 /* The hover and click step, on the MENU thread (run 2026-10-21 r93-mm2: the pad is polled on guest thread 15, the GUM
@@ -2947,7 +3477,7 @@ unsigned kz3_menu_mouse_poll(unsigned pad_buttons, int pad_active)
     }
     if (s_mm_busy.test_and_set(std::memory_order_acquire)) return 0;
     if (!active) pmi_clear(&s_mm_inj);
-    const unsigned bits = pmi_bits(&s_mm_inj);
+    const unsigned bits = pmi_bits(&s_mm_inj) | pmi_bits(&s_ca_inj);   /* patch 2126 */
     s_mm_busy.clear(std::memory_order_release);
     return bits;
 }
@@ -2956,13 +3486,173 @@ void kz3_menu_mouse_sent(int delivered)
     if (s_mm_busy.test_and_set(std::memory_order_acquire)) return;
     const int was = s_mm_inj.sent;
     pmi_delivered(&s_mm_inj, delivered);
+    pmi_delivered(&s_ca_inj, delivered);   /* patch 2126 */
     const int ph = s_mm_inj.phase, now_sent = s_mm_inj.sent;
     const unsigned cur = s_mm_inj.cur;
     s_mm_busy.clear(std::memory_order_release);
     if (!was && now_sent)
         KZ3_LOGI("menu-mouse", "%s 0x%04X in a delivered pad packet", ph == 1 ? "press" : "release", cur);
 }
+/* ---------------------------------------------------------------------------
+ * Close asks first, When unfocused = Pause / Mute (RSX pass 120, patch 2126; ENHANCEMENTs). The rules are in
+ * rsx_window_place.h (rsx_close_decide, rsx_unf_*); the window side is rsx_null_backend.c. Every path:
+ *   - X button, Alt+F4, system menu / taskbar Close (WM_SYSCOMMAND SC_CLOSE) -> kz3_close_ask:
+ *       in play (no GUM page focused): START opens the pause menu (as Esc does), its OnPageOn registers the page
+ *         (kb:askpage), the next menu frame presses Square, the page's KZ3CloseAsk asks kb:closeask and opens the exit
+ *         dialog; No -> kb:closeno -> START again (BackToGame), the game runs on where it was;
+ *       on the main menu or the pause menu (the registered page): Square at once, then the same;
+ *       anything else (no menu tracking yet = boot, the loading screen, a movie, another menu page, a second X while
+ *         asking or while the dialog is up, KZ3_CLOSE_ASK=0): closes at once.
+ *     An ask the game does not answer in 5 s (pause menu not opening, a page without the dialog) closes at once
+ *     (kz3_close_ask_poll): a close request is never lost.
+ *   - Yes in the dialog: kb:exit -> a bare WM_CLOSE (kz3_exit_game_request) -> the clean exit, code 0.
+ *   - A bare WM_CLOSE (KZ3_TEST_CLOSE, tools/release/shaders.py, any outside tool) and WM_ENDSESSION: close at once.
+ *   - The crash path: the frame thread no longer pumps the window; the crash notice decides (unchanged).
+ * Test aid: KZ3_TEST_CLOSE_ANSWER=yes|no answers the dialog 3 s after it opened (UP, LEFT, CROSS = Yes; CIRCLE = No).
+ * -----------------------------------------------------------------------*/
+#define CA_START  0x0008u   /* DIGITAL1 START */
+#define CA_SQUARE 0x8000u   /* DIGITAL2 SQUARE (0x80) << 8: the GUM onoptions button */
+enum { CA_IDLE = 0, CA_WAIT_PAUSE = 1, CA_WAIT_ACK = 2, CA_DIALOG = 3 };
+volatile LONG s_ca = CA_IDLE;
+volatile LONG s_ca_via_pause = 0;
+volatile ULONGLONG s_ca_deadline = 0, s_ca_dialog_t = 0;
+volatile LONG s_ca_gen0 = 0, s_ask_gen = 0, s_ask_reg = 0;
+volatile uint32_t s_ask_root = 0;
+int s_ca_answer = -2;   /* KZ3_TEST_CLOSE_ANSWER: -2 unread, -1 none, 0 no, 1 yes */
+int s_ca_answered = 0;
+static const char* const kCaName[] = {"idle", "waiting for the pause menu", "waiting for the page", "dialog up"};
+
+void ca_push(unsigned bits) { mm_lock(); pmi_push(&s_ca_inj, bits); mm_unlock(); }
+
+/* The menu thread, once per menu frame (mm_frame_tick). */
+void ca_frame_tick(void)
+{
+    const uint32_t c = s_mm_C;
+    if (!c || !ml_ok(c)) return;
+    if (s_ask_reg) {   /* an exit-dialog page ran its OnPageOn: learn its root once its focus is in */
+        const MmState st = mm_state(c);
+        if (st.count > 0 && st.root) {
+            s_ask_reg = 0;
+            if (st.root != s_ask_root) KZ3_LOGI("close", "exit-dialog page up: GUM root tag 0x%08X", st.root);
+            s_ask_root = st.root;
+            InterlockedIncrement(&s_ask_gen);
+        }
+    }
+    if (s_ca == CA_WAIT_PAUSE && s_ask_gen != s_ca_gen0) {
+        const MmState st = mm_state(c);
+        if (st.count > 0 && st.root == s_ask_root) {
+            ca_push(CA_SQUARE);
+            s_ca_deadline = GetTickCount64() + 5000;
+            InterlockedExchange(&s_ca, CA_WAIT_ACK);
+            KZ3_LOGI("close", "pause menu up (root 0x%08X): Square for the exit dialog", st.root);
+        }
+    }
+    if (s_ca == CA_DIALOG && s_ca_answer >= 0 && !s_ca_answered && GetTickCount64() - s_ca_dialog_t > 3000) {
+        s_ca_answered = 1;
+        if (s_ca_answer) { ca_push(PMM_UP); ca_push(PMM_LEFT); ca_push(PMM_CROSS); }
+        else ca_push(PMM_CIRCLE);
+        KZ3_LOGI("close", "KZ3_TEST_CLOSE_ANSWER=%s: pressed", s_ca_answer ? "yes (UP, LEFT, CROSS)" : "no (CIRCLE)");
+    }
+}
 } // namespace
+
+/* The window's thread: WM_SYSCOMMAND SC_CLOSE (and the other sources, which always close). 1 = asking (keep the window). */
+static int kz3_close_ask(int src)
+{
+    if (s_ca_answer == -2) {
+        const char* a = getenv("KZ3_TEST_CLOSE_ANSWER");
+        s_ca_answer = a && !_stricmp(a, "yes") ? 1 : a && !_stricmp(a, "no") ? 0 : -1;
+    }
+    rsx_close_ctx cx;
+    memset(&cx, 0, sizeof cx);
+    const char* e = getenv("KZ3_CLOSE_ASK");
+    cx.off = e && *e == '0';
+    const uint32_t c = s_mm_C;
+    cx.ui = s_mm && c && ml_ok(c) && s_mm_tick_idx >= 0;
+    MmState st = {0, 0, 0, 0};
+    int excl = 0;
+    if (cx.ui) { st = mm_state(c); excl = vm_base[c + 0x20] != 0; }
+    const ULONGLONG now = GetTickCount64();
+    if (s_ca == CA_DIALOG && !excl) InterlockedExchange(&s_ca, CA_IDLE);   /* closed without an answer (cancel / Back) */
+    if ((s_ca == CA_WAIT_PAUSE || s_ca == CA_WAIT_ACK) && now > s_ca_deadline) InterlockedExchange(&s_ca, CA_IDLE);
+    cx.menu = st.count > 0;
+    cx.ask_page = cx.menu && st.root && st.root == s_ask_root;
+    cx.busy = s_ca != CA_IDLE;
+    const int d = rsx_close_decide(src, &cx);
+    KZ3_LOGI("close", "%s: %s (menu tracking %s, menu %s, root 0x%08X, exit page 0x%08X, state %s%s)", rsx_close_src_name(src),
+             rsx_close_name(d), cx.ui ? "on" : "off", cx.menu ? "up" : "none", st.root, s_ask_root, kCaName[s_ca & 3],
+             cx.off ? ", KZ3_CLOSE_ASK=0" : "");
+    if (d == RSX_CLOSE_NOW) return 0;
+    InterlockedExchange(&s_ca_via_pause, d == RSX_CLOSE_ASK_PAUSE);
+    s_ca_gen0 = s_ask_gen;
+    s_ca_deadline = now + 5000;
+    InterlockedExchange(&s_ca, d == RSX_CLOSE_ASK_MENU ? CA_WAIT_ACK : CA_WAIT_PAUSE);
+    ca_push(d == RSX_CLOSE_ASK_MENU ? CA_SQUARE : CA_START);
+    return 1;
+}
+
+/* The frame thread, after each pump: an ask the game did not answer in time closes (posted, so the usual path runs). */
+static void kz3_close_ask_poll(void)
+{
+    const LONG st = s_ca;
+    if ((st != CA_WAIT_PAUSE && st != CA_WAIT_ACK) || GetTickCount64() <= s_ca_deadline) return;
+    InterlockedExchange(&s_ca, CA_IDLE);
+    int n = 0;
+    EnumWindows(kz3_test_close_enum, (LPARAM)&n);
+    KZ3_LOGI("close", "no exit dialog within 5 s (%s): closing at once (WM_CLOSE to %d window(s))", kCaName[st & 3], n);
+}
+
+/* Lua bridge (the menu thread): kb:askpage, kb:closeask, kb:closeno. 1 = handled (out = the reply). */
+static int kz3_close_bridge(const char* cmd, char* out, size_t n)
+{
+    if (!strcmp(cmd, "askpage")) { InterlockedExchange(&s_ask_reg, 1); snprintf(out, n, "ok"); return 1; }
+    if (!strcmp(cmd, "closeask")) {
+        const int yes = s_ca == CA_WAIT_ACK;
+        if (yes) {
+            const uint32_t c = s_mm_C;
+            if (c && ml_ok(c)) { const MmState st = mm_state(c); if (st.count > 0 && st.root) s_ask_root = st.root; }
+            s_ca_dialog_t = GetTickCount64();
+            InterlockedExchange(&s_ca, CA_DIALOG);
+        }
+        KZ3_LOGI("close", "kb:closeask -> %s%s", yes ? "yes: exit dialog opens" : "no (no X pending: a player's own Square)",
+                 yes && s_ca_via_pause ? " over the pause menu" : "");
+        snprintf(out, n, "%s", yes ? "yes" : "no");
+        return 1;
+    }
+    if (!strcmp(cmd, "closeno")) {
+        if (s_ca == CA_DIALOG) {
+            const int back = s_ca_via_pause != 0;
+            InterlockedExchange(&s_ca, CA_IDLE);
+            if (back) ca_push(CA_START);   /* the pause menu we opened: BackToGame, the player is where they were */
+            KZ3_LOGI("close", "exit dialog: No%s", back ? ": START closes the pause menu it opened" : "");
+        }
+        snprintf(out, n, "ok");
+        return 1;
+    }
+    return 0;
+}
+
+/* The window's thread (rsx_null_backend.c rsx_wm_focus_note); (-1, -1) = the setting changed (Lua bridge thread). */
+static void kz3_focus_changed(int focused, int minimized)
+{
+    static int f = 1, m = 0;
+    const int was = f && !m;
+    if (focused >= 0) { f = focused; m = minimized; }
+    const int setting = (int)s_unf;
+    const int mute = rsx_unf_muted(setting, f, m);
+    if (mute != g_audio_out_silent) {
+        g_audio_out_silent = mute;
+        KZ3_LOGI("focus", "sound %s (When unfocused = %s)", mute ? "muted" : "back on", rsx_unf_name(setting));
+    }
+    if (focused < 0) return;
+    const uint32_t c = s_mm_C;
+    const int ui = s_mm && c && ml_ok(c) && s_mm_tick_idx >= 0;
+    const int in_play = ui && mm_state(c).count == 0 && s_ca == CA_IDLE;
+    if (rsx_unf_pause_now(setting, was, f && !m, in_play)) {
+        ca_push(CA_START);
+        KZ3_LOGI("focus", "focus lost in play: START (the game's pause menu; the game clock runs on)");
+    }
+}
 
 static void kz3_menu_mouse_install(void)
 {

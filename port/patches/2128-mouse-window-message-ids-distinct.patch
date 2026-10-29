@@ -1,0 +1,25 @@
+diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+--- a/libs/input/pad_mouse.c
++++ b/libs/input/pad_mouse.c
+@@ -237,7 +237,10 @@
+  * we set it) on focus loss, minimise, title-bar drag/resize, the system menu and close. */
+ #define PAD_MOUSE_WM_ATTACH (WM_APP + 0x69)
+ static HWND           s_hwnd;        /* the game window (set with or without mouse look) */
+-#define PAD_MOUSE_WM_FEED (WM_APP + 0x6A)   /* patch 2123: a KZ3_MOUSE_FEED_POST add (wParam dx, lParam dy) */
++/* KZ3 patch 2128 (RSX pass 122): 2123 gave the feed message WM_APP + 0x6A, the number 2098's menu message already had
++ * (PAD_MOUSE_WM_MENU below). pad_mouse_wndmsg tests the feed first, so every "menu up/gone" became a 1-count mouse add
++ * and the cursor stayed hidden and locked in every menu (a hand-play log: one "locked" line for 18 min). */
++#define PAD_MOUSE_WM_FEED (WM_APP + 0x6B)   /* patch 2123: a KZ3_MOUSE_FEED_POST add (wParam dx, lParam dy) */
+ static void pm_feed_deliver(int dx, int dy)
+ {
+     static int s_post = -1;
+@@ -498,6 +501,9 @@
+  * acting as pad buttons (cellPad.c pad_kb_down_win). WM_MOUSEMOVE keeps g_mouse_guest current at all times. */
+ #include "pad_menu_mouse.h"
+ #define PAD_MOUSE_WM_MENU (WM_APP + 0x6A)
++/* Patch 2128: every window message of this file has its own number. */
++typedef char pad_mouse_wm_ids_distinct[(PAD_MOUSE_WM_MENU != PAD_MOUSE_WM_FEED && PAD_MOUSE_WM_MENU != PAD_MOUSE_WM_ATTACH &&
++                                        PAD_MOUSE_WM_FEED != PAD_MOUSE_WM_ATTACH) ? 1 : -1];
+ #define PMQ_MAX 16
+ static volatile LONG   s_menu;          /* menu up (pad poll's view) */
+ static PadMenuMouseEv  s_mq[PMQ_MAX];   /* under s_lock */

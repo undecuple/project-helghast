@@ -298,6 +298,12 @@ def main():
         check(sorted(os.listdir(bf)) == ["Rajdhani-Bold.ttf", "Rajdhani-Medium.ttf"]
               and open(os.path.join(bf, "Rajdhani-Bold.ttf")).read() == "bold", "8 notice fonts placed in build/fonts")
         check(fr.place_fonts(root, os.path.join(root, "build")) == [], "8 fonts already in place: nothing copied")
+        write(os.path.join(root, "lang", "port_ui.tsv"), "k\ten\n")
+        check(fr.place_lang(root, os.path.join(root, "build")) == ["port_ui.tsv"]
+              and open(os.path.join(root, "build", "lang", "port_ui.tsv")).read() == "k\ten\n", "8 port_ui.tsv placed in build/lang")
+        check(fr.place_lang(root, os.path.join(root, "build")) == [], "8 lang table already in place: nothing copied")
+        write(os.path.join(root, "lang", "port_ui.tsv"), "k\ten\nj\tes\n")
+        check(fr.place_lang(root, os.path.join(root, "build")) == ["port_ui.tsv"], "8 a changed lang table is copied again")
         write(os.path.join(root, "fonts", "Rajdhani-Bold.ttf"), "bold v2")
         check(fr.place_fonts(root, os.path.join(root, "build")) == ["Rajdhani-Bold.ttf"], "8 a changed font is copied again")
         # SDL3.dll next to kz3.exe (patch 4010): placed from the payload, left alone when identical, replaced when changed

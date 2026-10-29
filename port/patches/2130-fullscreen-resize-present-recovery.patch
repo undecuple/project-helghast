@@ -1,0 +1,208 @@
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -15259,6 +15259,16 @@
+ static u32 g_dm_movie_w, g_dm_movie_h;
+ static int g_dm_fs;                           /* swap chain in exclusive fullscreen */
+ static u32 g_dm_resizes;
++/* KZ3 patch 2130 (RSX pass 124): a fullscreen transition needs ResizeBuffers before the next Present, also at an
++ * unchanged size. DXGI (SetFullscreenState remarks): "For the flip presentation model, after you transition the display
++ * state to full screen, you must call ResizeTarget to ensure that your call to IDXGISwapChain1::Present1 succeeds";
++ * the buffers follow with ResizeBuffers (D3D12 samples: WM_SIZE -> ResizeBuffers). 2095 resized only on a size change,
++ * and a borderless window is already the output's size, so the first Present after SetFullscreenState(TRUE) went out on
++ * the un-resized chain and failed with DXGI_ERROR_INVALID_CALL (the player's logs: Options -> fullscreen, and a fresh
++ * start with display.ini fullscreen at frame 0). g_dm_force_resize makes the next present resize regardless of size.
++ * g_dm_present_failed tells rsx_null_backend.c that exclusive fullscreen was dropped after a failed Present. */
++static int g_dm_force_resize;
++static volatile LONG g_dm_present_failed;
+ 
+ /* patch 2103: VSync. The swap chain is created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING whenever the factory reports
+  * DXGI_FEATURE_PRESENT_ALLOW_TEARING (harmless with vsync on). ResizeBuffers must repeat the flag. */
+@@ -15357,9 +15367,21 @@
+ {
+     u32 w, h;
+     if (!g.swap) return;
++    if (g_dm_fs) {   /* patch 2130: DXGI leaves exclusive fullscreen by itself (focus loss, Alt+Tab, another app) */
++        BOOL cur = FALSE;
++        g.swap->lpVtbl->GetFullscreenState(g.swap, &cur, NULL);
++        if (!cur) {
++            g_dm_fs = 0;
++            g_dm_force_resize = 1;
++            fprintf(stderr, "[display] exclusive fullscreen left by DXGI (focus loss): buffers resized (frame %u)\n", g_ld_frames);
++        }
++    }
+     ld_dm_client(&w, &h);
+-    if (w == g_dm_bb_w && h == g_dm_bb_h) return;
+-    ld_wait_fence(g.fence_value);                   /* every submitted list that used a back buffer is done */
++    if (w == g_dm_bb_w && h == g_dm_bb_h && !g_dm_force_resize) return;
++    if (g_dm_force_resize && g_dm_resizes < 64)
++        fprintf(stderr, "[display] ResizeBuffers after a fullscreen transition (%ux%u, frame %u)\n", w, h, g_ld_frames);
++    g_dm_force_resize = 0;
++    ld_wait_fence(g.fence_value);                 /* every submitted list that used a back buffer is done */
+     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++)
+         if (g.backbuf[i]) { g.backbuf[i]->lpVtbl->Release(g.backbuf[i]); g.backbuf[i] = NULL; }
+     const HRESULT hr = g.swap->lpVtbl->ResizeBuffers(g.swap, LD_SWAP_BUFFERS, w, h, DXGI_FORMAT_UNKNOWN, ld_swap_flags());
+@@ -15593,18 +15615,56 @@
+  * now, 0 = DXGI refused, -1 = no swap chain. */
+ int rsx_live_draw_set_fullscreen(int on)
+ {
+-    if (!g.ready || !g.swap) return -1;
++    /* patch 2130: leaving fullscreen works whenever the swap chain exists; entering needs a live renderer, and a swap
++     * chain whose renderer stopped (device removed) refuses (0) instead of "not up yet" (-1), which the window side
++     * retried at every pump (the player's log: 728 "waits for the swap chain" lines). -2 = DXGI is mid mode change:
++     * try again at the next pump. */
++    if (!g.swap) return -1;
++    if (on && !g.ready) return 0;
+     BOOL cur = FALSE;
+     g.swap->lpVtbl->GetFullscreenState(g.swap, &cur, NULL);
+-    if ((cur != FALSE) == (on != 0)) { g_dm_fs = on != 0; return 1; }
++    if ((cur != FALSE) == (on != 0)) {
++        if (g_dm_fs != (on != 0)) g_dm_force_resize = 1;
++        g_dm_fs = on != 0;
++        return 1;
++    }
+     const HRESULT hr = g.swap->lpVtbl->SetFullscreenState(g.swap, on ? TRUE : FALSE, NULL);
+     g.swap->lpVtbl->GetFullscreenState(g.swap, &cur, NULL);
+     g_dm_fs = cur != FALSE;
+     fprintf(stderr, "[display] SetFullscreenState(%s) hr=0x%08lX -> fullscreen state %s\n", on ? "TRUE" : "FALSE",
+             (unsigned long)hr, cur ? "TRUE" : "FALSE");
++    if (hr == DXGI_STATUS_MODE_CHANGE_IN_PROGRESS) return -2;
++    if (SUCCEEDED(hr)) {
++        /* patch 2130: target = the output's current mode (desktop resolution, no mode switch), then the buffers at
++         * the next present (g_dm_force_resize), before any Present on the transitioned chain. */
++        if (g_dm_fs) {
++            IDXGIOutput* out = NULL;
++            DXGI_OUTPUT_DESC od;
++            if (SUCCEEDED(g.swap->lpVtbl->GetContainingOutput(g.swap, &out)) && out) {
++                if (SUCCEEDED(out->lpVtbl->GetDesc(out, &od))) {
++                    DXGI_MODE_DESC md;
++                    memset(&md, 0, sizeof md);
++                    md.Width = (UINT)(od.DesktopCoordinates.right - od.DesktopCoordinates.left);
++                    md.Height = (UINT)(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
++                    md.Format = DXGI_FORMAT_UNKNOWN;
++                    const HRESULT rt = g.swap->lpVtbl->ResizeTarget(g.swap, &md);
++                    fprintf(stderr, "[display] ResizeTarget %ux%u hr=0x%08lX\n", md.Width, md.Height, (unsigned long)rt);
++                }
++                out->lpVtbl->Release(out);
++            }
++        }
++        g_dm_force_resize = 1;
++    }
+     return SUCCEEDED(hr) && (g_dm_fs == (on != 0)) ? 1 : 0;
+ }
+ 
++/* patch 2130: 1 once after a failed Present made the renderer leave exclusive fullscreen (rsx_null_backend.c then
++ * shows borderless for the session and says so); 0 otherwise. */
++int rsx_live_draw_take_present_failure(void)
++{
++    return InterlockedExchange(&g_dm_present_failed, 0) != 0;
++}
++
+ int rsx_live_draw_is_fullscreen(void)
+ {
+     BOOL cur = FALSE;
+@@ -17814,7 +17874,13 @@
+             s_nopresent = (e && *e == '1') ? 1 : 0;
+         }
+         const long long swap0 = rsx_perf_now();
++        /* patch 2130, test: LD_TEST_PRESENT_FAIL=N makes the Present of frame N return DXGI_ERROR_INVALID_CALL
++         * without presenting (the failure of the player's logs), so the recovery path runs under Proton, whose DXGI
++         * never failed there (run r90-fs). */
++        static long s_fail_at = -2;
++        if (s_fail_at == -2) { const char* e = getenv("LD_TEST_PRESENT_FAIL"); s_fail_at = e && *e ? atol(e) : -1; }
+         const HRESULT present_hr = s_nopresent ? S_OK
++            : (s_fail_at >= 0 && (long)g_ld_frames == s_fail_at) ? DXGI_ERROR_INVALID_CALL
+             : ld_present_swap();
+         rsx_perf_add(RSX_PERF_SWAP_T, rsx_perf_now() - swap0);
+         if (SUCCEEDED(present_hr))
+@@ -17826,8 +17892,32 @@
+                     (unsigned long)present_hr, g_ld_frames,
+                     target, g.surfaces[target].w, g.surfaces[target].h,
+                     g.width, g.height);
+-            ld_dump_dred("Present", present_hr);
+-            g.ready = 0;
++            /* patch 2130: a failed Present on a live device is a swap-chain state error (DXGI_ERROR_INVALID_CALL after
++             * a fullscreen transition), not a lost renderer: leave exclusive fullscreen, resize the buffers at the
++             * next present and keep drawing. Only a removed device stops the renderer (the old path for every
++             * failure: one bad Present sent all later draws to the null backend for the rest of the session). */
++            const HRESULT removed = g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
++            static u32 s_pf_lines;
++            BOOL fs_now = FALSE;
++            g.swap->lpVtbl->GetFullscreenState(g.swap, &fs_now, NULL);
++            fprintf(stderr, "[d3d-fail] Present: back buffers %ux%u, exclusive fullscreen %s, device %s (hr=0x%08lX)\n",
++                    g_dm_bb_w, g_dm_bb_h, fs_now ? "on" : "off", removed == S_OK ? "alive" : "removed", (unsigned long)removed);
++            if (removed == S_OK) {
++                if (fs_now || g_dm_fs) {
++                    const HRESULT ls = g.swap->lpVtbl->SetFullscreenState(g.swap, FALSE, NULL);
++                    g_dm_fs = 0;
++                    InterlockedExchange(&g_dm_present_failed, 1);
++                    fprintf(stderr, "[display] Present failed in exclusive fullscreen: SetFullscreenState(FALSE) hr=0x%08lX, "
++                            "borderless from here, renderer kept\n", (unsigned long)ls);
++                }
++                g_dm_force_resize = 1;
++                if (s_pf_lines++ < 8)
++                    fprintf(stderr, "[display] Present failed on a live device: swap chain resized at the next present, "
++                            "renderer kept (%u failures)\n", s_pf_lines);
++            } else {
++                ld_dump_dred("Present", present_hr);
++                g.ready = 0;
++            }
+         }
+     }
+ #if !defined(YZ_PERF_CLEAN)
+diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -63,8 +63,9 @@
+  * -----------------------------------------------------------------------*/
+ #include "rsx_display_mode.h"
+ #include "rsx_hud169.h"   /* patch 2113 */
+-extern int rsx_live_draw_set_fullscreen(int on);   /* 1 taken, 0 refused, -1 no swap chain yet (rsx_live_draw.c) */
++extern int rsx_live_draw_set_fullscreen(int on);   /* 1 taken, 0 refused, -1 no swap chain yet, -2 DXGI mode change in progress (rsx_live_draw.c) */
+ extern int rsx_live_draw_is_fullscreen(void);
++extern int rsx_live_draw_take_present_failure(void);   /* patch 2130 */
+ extern void rsx_live_draw_set_scaling(int scaling, int filter);   /* Fit/Stretch, Bilinear/Nearest */
+ extern void rsx_live_draw_set_vsync(int on);   /* patch 2103 */
+ 
+@@ -97,7 +98,9 @@
+     s_dm_save = save;
+ }
+ 
+-int rsx_display_get_mode(void) { return s_dm.mode; }
++/* patch 2130: the mode the window has, not only the choice: after exclusive fullscreen was refused or failed at Present
++ * the Options row reads Borderless (display.ini keeps the choice, tried again at the next start). */
++int rsx_display_get_mode(void) { return rsx_dm_effective(&s_dm, s_dm.mode); }
+ int rsx_display_get_scaling(void) { return s_dm_scaling; }
+ int rsx_display_get_filter(void) { return s_dm_filter; }
+ int rsx_display_get_vsync(void) { return s_dm_vsync; }
+@@ -163,11 +166,15 @@
+         }
+         if (m == RSX_DM_FULLSCREEN) {
+             const int r = rsx_live_draw_set_fullscreen(1);
+-            if (r < 0 && s_present_suppressed) {           /* live draw not up yet: retry at the next pump */
++            /* live draw not up yet (-1) or DXGI mid mode change (-2, patch 2130): retry at the next pump; logged once
++             * per wait (patch 2130: the player's log had 728 lines of one wait) */
++            if (r == -2 || (r == -1 && s_present_suppressed)) {
++                const int first = s_dm_pending != RSX_DM_FULLSCREEN;
+                 s_dm_pending = RSX_DM_FULLSCREEN;
+                 s_dm_applied = RSX_DM_BORDERLESS;
+                 pad_mouse_set_mode(h, s_dm_applied);   /* patch 2097: re-hide / re-clip for the new window */
+-                rsx_dm_log_client("exclusive fullscreen waits for the swap chain");
++                if (first) rsx_dm_log_client(r == -2 ? "exclusive fullscreen waits for DXGI's mode change"
++                                                     : "exclusive fullscreen waits for the swap chain");
+                 return;
+             }
+             s_dm_pending = -1;
+@@ -819,6 +826,12 @@
+ {
+     MSG msg;
+     if (s_dm_pending == RSX_DM_FULLSCREEN) rsx_dm_apply(RSX_DM_FULLSCREEN, "start");   /* patch 2095 */
++    /* patch 2130: a Present failed in exclusive fullscreen and the renderer left it: borderless for this session
++     * (display.ini keeps the choice; the renderer keeps drawing, never the null backend) */
++    if (rsx_live_draw_take_present_failure() && s_dm_applied == RSX_DM_FULLSCREEN) {
++        printf("[display] exclusive fullscreen failed at Present: borderless for this session\n");
++        rsx_dm_apply(rsx_dm_exclusive_refused(&s_dm), "fullscreen fallback");
++    }
+     rsx_dm_script_step();
+     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+         if (msg.message == WM_QUIT)

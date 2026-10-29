@@ -119,11 +119,13 @@ unsigned kz3_spu_skip_resolve(const char* skip_env, const char* cull_env, int* i
 void kz3_ts_interp_install(void);  /* kz3_ts_interp.c, KZ3_TS_INTERP=1 (SPU pass 55) */
 void kz3_stall_diag_install(void); /* kz3_stall_diag.c, KZ3_STALL_DIAG=1 (SPU pass 63) */
 void kz3_frame_trace_install(void); /* kz3_frame_trace.c, KZ3_FRAME_TRACE=FROM,TO (SPU pass 66) */
+void kz3_jobhook_install(void);     /* kz3_jobhook.c, KZ3_JOB_CAPTURE / KZ3_NATIVE_JOB (SPU pass 120) */
 void kz3_spu_apply_skip_env(void)
 {
     kz3_ts_interp_install();
     kz3_stall_diag_install();
     kz3_frame_trace_install();
+    kz3_jobhook_install();
     const char* a = getenv("KZ3_SPU_SKIP_OVL");
     const char* b = getenv("KZ3_CULL_AB");
     if ((!a || !*a) && (!b || !*b)) return;

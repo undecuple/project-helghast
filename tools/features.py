@@ -53,7 +53,7 @@ PUBLIC_PREFIXES = ("docs/checkpoints/", "docs/requirements.md", "docs/BUILDING.m
                    "docs/GLOSSARY.md", "docs/ROADMAP.md", "README.md", "NOTICE.md", "LICENSE",
                    ".github/CONTRIBUTING.md")
 # enhancements.md paragraphs that open with a bold title but are not features.
-IGNORED_ENTRIES = ("Facts from the RPCS3 wiki", "No console window",
+IGNORED_ENTRIES = ("Facts from the RPCS3 wiki", "No console window", "Present never blocks the frame thread",
                    "Split-screen upgrades")  # its public row waits for the gate (2026-10-22); remove once the row lands
 
 PS3_STATUS = {"works": "works", "partial": "partial", "not yet": "not yet", "unverified": "not yet verified",

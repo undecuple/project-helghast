@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kz3_host_composed.h"   /* every rewritten / generated .gum key (network pass 40) */
+#include "kz3_tr.h"              /* network pass 45: the port UI text in the game's language */
 
 #define KZ3_PADPAGE_KEY KZ3_GEN_PADLAYOUT
 #define KZ3_PADPAGE_OPEN "open(file:///common/padlayoutsettings.gum)"
@@ -39,6 +40,21 @@ static const char* const kz3_pa_labels[] = {
     "Mounted gun secondary fire", "Dismount", "AA gun fire", "AA gun secondary fire", "AA gun zoom",
 };
 #define KZ3_PA_N ((int)(sizeof kz3_pa_labels / sizeof kz3_pa_labels[0]))
+/* Net pass 45: the label of each group in the page's language: the game's own word where it has the same one
+ * (the RE notes 173.3: `@game:` = @key{...} in the GUM), else the port_ui.tsv key (pad.act.* ...). */
+static const char* const kz3_pa_trkeys[] = {
+    "@game:menu_controller_legend_primaryfire", "pad.aim", "@game:menu_controller_legend_quickthrow",
+    "@game:menu_controller_legend_reload_pickup", "@game:menu_controller_legend_use", "pad.crouch",
+    "@game:menu_controller_legend_closecombat", "pad.jump", "pad.sprint", "@game:menu_controller_legend_nextweapon",
+    "pad.act.flashlight", "@game:menu_controller_legend_sniperzoom_direction", "pad.act.jetpack_climb",
+    "pad.act.jetpack_boost", "@game:menu_controller_legend_objectives",
+    "pad.act.vehicle_fire", "pad.act.vehicle_secondary_fire", "pad.act.accelerate", "pad.act.vehicle_boost",
+    "pad.act.handbrake", "pad.act.exit_vehicle", "pad.act.vehicle_zoom", "pad.act.rear_view", "pad.act.reset_camera",
+    "pad.act.exo_fire", "pad.act.exo_secondary_fire", "pad.act.exo_zoom", "pad.act.exo_camera",
+    "pad.act.mounted_gun_secondary_fire", "pad.act.dismount", "pad.act.aa_gun_fire", "pad.act.aa_gun_secondary_fire",
+    "pad.act.aa_gun_zoom",
+};
+typedef char kz3_pa_trkeys_match[(sizeof kz3_pa_trkeys / sizeof kz3_pa_trkeys[0]) == (unsigned)KZ3_PA_N ? 1 : -1];
 #define KZ3_PA_N_FOOT 15
 #define KZ3_PADPAGE2_KEY KZ3_GEN_PADLAYOUT2
 #define KZ3_PADPAGE2_OPEN "open(file:///common/kz3padlayout2.gum)"
@@ -54,6 +70,16 @@ static const char* const kz3_pa_labels[] = {
     "\t\t\t\tonaccept=\"" KZ3_PADPAGE_OPEN "\"/>"
 
 typedef struct { char* p; size_t n, cap; int err; } Kz3PpBuf;
+static void kz3_pp_put(Kz3PpBuf* b, const char* s);
+/* Net pass 45: put a template with kz3_tr.h markers, rendered in the game's language. */
+static void kz3_pp_tr(Kz3PpBuf* b, const char* tmpl)
+{
+    char* r = NULL;
+    kz3_tr_render(tmpl, strlen(tmpl), &r);
+    if (!r) { b->err = 1; return; }
+    kz3_pp_put(b, r);
+    free(r);
+}
 static void kz3_pp_put(Kz3PpBuf* b, const char* s)
 {
     size_t k = strlen(s);
@@ -89,29 +115,36 @@ static char* kz3_pa_page(int first, int last, int main, size_t* out_n)
         "\t\tonoptions=\"script(pmscript, Unbind)\" labeloptions=\"Unbind\">\n\n"
         "\t\t@include{file:///hudelements/type3.gum}\n\n"
         "\t\t<text class=\"sectiontitle\">@key{menu_options}</text>\n");   /* the sibling Options pages' form (RSX pass 104) */
-    kz3_pp_put(&b, main ? "\t\t<text class=\"pagetitle\">Change the custom layout: on foot</text>\n\n"
-                        : "\t\t<text class=\"pagetitle\">Change the vehicle controls</text>\n\n");
-    kz3_pp_put(&b,
-        "\t\t<text id=\"hdr_0\" x=\"457\" y=\"66\" width=\"150\" text-align=\"center\">PAD BUTTON</text>\n"
-        "\t\t<list id=\"lst_pad\" class=\"PEDS\" width=\"760\" height=\"360\" labelaccept=\"Change\"\n"
+    kz3_pp_tr(&b, main ? "\t\t<text class=\"pagetitle\">@tr{pad.title_foot|Change the custom layout: on foot}</text>\n\n"
+                       : "\t\t<text class=\"pagetitle\">@tr{pad.title_veh|Change the vehicle controls}</text>\n\n");
+    kz3_pp_tr(&b,
+        "\t\t<text id=\"hdr_0\" x=\"457\" y=\"66\" width=\"150\" text-align=\"center\">@tru{pad.hdr|Pad button}</text>\n"
+        "\t\t<list id=\"lst_pad\" class=\"PEDS\" width=\"760\" height=\"360\" labelaccept=\"@key{menu_startup_controls_change}\"\n"
         "\t\t\tonaccept=\"script(pmscript, Bind)\">\n");
     for (r = first; r < last && r < KZ3_PA_N; r++) {
         snprintf(line, sizeof line,
-                 "\t\t\t<listitem id=\"row_%d\" value=\"%d\" label=\"%s\" width=\"720\">\n"
+                 "\t\t\t<listitem id=\"row_%d\" value=\"%d\" label=\"@tr{%s|%s}\" width=\"720\">\n"
                  "\t\t\t\t<text id=\"k0_%d\" x=\"380\" width=\"150\" text-align=\"center\"> </text>\n"
                  "\t\t\t\t<text id=\"c0_%d\" class=\"mystats\" visible=\"false\" x=\"380\" y=\"2\" width=\"150\" text-align=\"center\"> </text>\n"
                  "\t\t\t</listitem>\n",
-                 r, r, kz3_pa_labels[r], r, r);
-        kz3_pp_put(&b, line);
+                 r, r, kz3_pa_trkeys[r], kz3_pa_labels[r], r, r);
+        if (!strncmp(kz3_pa_trkeys[r], "@game:", 6))   /* the game's own word: its Localizer key */
+            snprintf(line, sizeof line,
+                     "\t\t\t<listitem id=\"row_%d\" value=\"%d\" label=\"@key{%s}\" width=\"720\">\n"
+                     "\t\t\t\t<text id=\"k0_%d\" x=\"380\" width=\"150\" text-align=\"center\"> </text>\n"
+                     "\t\t\t\t<text id=\"c0_%d\" class=\"mystats\" visible=\"false\" x=\"380\" y=\"2\" width=\"150\" text-align=\"center\"> </text>\n"
+                     "\t\t\t</listitem>\n",
+                     r, r, kz3_pa_trkeys[r] + 6, r, r);
+        kz3_pp_tr(&b, line);
     }
     if (main) {
         snprintf(line, sizeof line,
-                 "\t\t\t<listitem id=\"row_%d\" value=\"%d\" label=\"Vehicles, exo and guns\" width=\"720\" labelaccept=\"@key{menu_legend_select}\"/>\n"
-                 "\t\t\t<listitem id=\"row_%d\" value=\"%d\" label=\"Copy Default layout\" width=\"720\" labelaccept=\"@key{menu_legend_select}\"/>\n"
-                 "\t\t\t<listitem id=\"row_%d\" value=\"%d\" label=\"Copy Modern layout\" width=\"720\" labelaccept=\"@key{menu_legend_select}\"/>\n",
+                 "\t\t\t<listitem id=\"row_%d\" value=\"%d\" label=\"@tr{pad.vehicles|Vehicles, exo and guns}\" width=\"720\" labelaccept=\"@key{menu_legend_select}\"/>\n"
+                 "\t\t\t<listitem id=\"row_%d\" value=\"%d\" label=\"@tr{pad.copy_default|Copy Default layout}\" width=\"720\" labelaccept=\"@key{menu_legend_select}\"/>\n"
+                 "\t\t\t<listitem id=\"row_%d\" value=\"%d\" label=\"@tr{pad.copy_modern|Copy Modern layout}\" width=\"720\" labelaccept=\"@key{menu_legend_select}\"/>\n",
                  KZ3_PA_ROW_SUB, KZ3_PA_ROW_SUB, KZ3_PA_ROW_COPY_DEFAULT, KZ3_PA_ROW_COPY_DEFAULT, KZ3_PA_ROW_COPY_MODERN,
                  KZ3_PA_ROW_COPY_MODERN);
-        kz3_pp_put(&b, line);
+        kz3_pp_tr(&b, line);
     }
     kz3_pp_put(&b,
         "\t\t</list>\n\n"
@@ -122,7 +155,29 @@ static char* kz3_pa_page(int first, int last, int main, size_t* out_n)
         "\t<script id=\"pmscript\">\n<![CDATA[\n");
     snprintf(line, sizeof line, "\t\tgPmSel = -1\n\t\tgPaFirst = %d\n\t\tgPaLast = %d\n\t\tgPmReset = \"\"\n\n", first, last);
     kz3_pp_put(&b, line);
-    kz3_pp_put(&b,
+    /* network pass 45: the action names of the status line in the page's language (the bridge's are English; the
+     * game-word rows keep the bridge's name: their text comes from the Localizer, which C does not call here) */
+    kz3_pp_put(&b, "\t\tgPaLab = {}\n");
+    for (r = first; r < last && r < KZ3_PA_N; r++) {
+        if (!strncmp(kz3_pa_trkeys[r], "@game:", 6)) continue;
+        snprintf(line, sizeof line, "\t\tgPaLab[%d] = \"@trl{%s|%s}\"\n", r, kz3_pa_trkeys[r], kz3_pa_labels[r]);
+        kz3_pp_tr(&b, line);
+    }
+    kz3_pp_tr(&b,
+        "\t\tfunction Lab(r)\n"
+        "\t\t\tlocal t = gPaLab[tonumber(r)]\n"
+        "\t\t\tif (t == nil) then\n"
+        "\t\t\t\tt = Cmd(\"label \"..r)\n"
+        "\t\t\tend\n"
+        "\t\t\treturn t\n"
+        "\t\tend\n\n"
+        "\t\tfunction Preset()\n"
+        "\t\t\tlocal p = Cmd(\"preset\")\n"
+        "\t\t\tif (p == \"modern\") then\n"
+        "\t\t\t\tp = \"@trl{lp.v.modern|Modern shooter}\"\n"
+        "\t\t\tend\n"
+        "\t\t\treturn p\n"
+        "\t\tend\n\n"
         "\t\tfunction Cmd(c)\n"
         "\t\t\tgPlayerProfile:SetTimeZone(\"kb:pa \"..c)\n"
         "\t\t\treturn gPlayerProfile:GetTimeZone()\n"
@@ -148,22 +203,22 @@ static char* kz3_pa_page(int first, int last, int main, size_t* out_n)
         "\t\tend\n\n"
         "\t\tfunction Status()\n"
         "\t\t\tlocal st = Cmd(\"state\")\n"
-        "\t\t\tlocal t = \"Layout in use: custom.\"\n"
+        "\t\t\tlocal t = @trx{pad.layout_in_use_custom|Layout in use: custom.}\n"
         "\t\t\tif (Cmd(\"preset\") ~= \"custom\") then\n"
-        "\t\t\t\tt = \"Layout in use: \"..Cmd(\"preset\")..\". A change switches it to custom.\"\n"
+        "\t\t\t\tt = @trx{pad.layout_in_use|Layout in use: {0}. A change switches it to custom.|Preset()}\n"
         "\t\t\tend\n"
         "\t\t\tif (st == \"capture\") then\n"
-        "\t\t\t\tt = \"Press a pad button for \"..Cmd(\"label \"..Cmd(\"cap\"))..\". Delete clears, Esc cancels.\"\n"
+        "\t\t\t\tt = @trx{pad.capture|Press a pad button for {0}. Delete clears, Esc cancels.|Lab(Cmd(\"cap\"))}\n"
         "\t\t\telseif (st == \"swapped\") then\n"
-        "\t\t\t\tt = \"Bound. \"..Cmd(\"label \"..Cmd(\"other\"))..\" took the old button.\"\n"
+        "\t\t\t\tt = @trx{pad.swapped|Bound. {0} took the old button.|Lab(Cmd(\"other\"))}\n"
         "\t\t\telseif (st == \"bound\") then\n"
-        "\t\t\t\tt = \"Bound.\"\n"
+        "\t\t\t\tt = @trx{pad.bound|Bound.}\n"
         "\t\t\telseif (st == \"cleared\") then\n"
-        "\t\t\t\tt = \"Unbound.\"\n"
+        "\t\t\t\tt = @trx{pad.cleared|Unbound.}\n"
         "\t\t\telseif (st == \"refused\") then\n"
-        "\t\t\t\tt = \"The menu button stays on Start.\"\n"
+        "\t\t\t\tt = @trx{pad.refused|The menu button stays on Start.}\n"
         "\t\t\telseif (st == \"cancel\" or st == \"timeout\") then\n"
-        "\t\t\t\tt = \"Nothing changed.\"\n"
+        "\t\t\t\tt = @trx{pad.nochange|Nothing changed.}\n"
         "\t\t\tend\n"
         "\t\t\tgRoot:GetTag(\"txt_status\"):SetValue(t)\n"
         "\t\tend\n\n"
@@ -187,6 +242,7 @@ static char* kz3_pa_page(int first, int last, int main, size_t* out_n)
         "\t\t\tend\n"
         "\t\tend\n\n"
         "\t\tfunction OnPageOn()\n"
+        "\t\t\tgPlayerProfile:SetTimeZone(\"kb:lang \"..gPlayerProfile:GetLanguage())\n"   /* net 45: for the next page */
         "\t\t\tSelect()\n"
         "\t\t\tRefresh()\n"
         "\t\tend\n\n"

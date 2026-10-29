@@ -1,0 +1,281 @@
+KZ3 patch 1141 (SPU pass 120): job I/O capture hooks (every channel op, every DMA element, atomic completions)
+and a native-job hook at the WWS policy module's job-call bracket. Engine-generic: all hooks null unless a title
+installs them (KZ3: port/spu/kz3_jobhook.c). Host tests: tools/spu/test_r120_jobreplay.sh.
+Pass 121: selectWorkload answers (kind 6 through the channel hook) and interrupt take/iret (g_spu_jcap_irq,
+spu_drain.c + spu_interp.c) reach the capture too, so a replay can serve the kernel's answers and the handler's LS
+changes. The job-call bracket closes regardless of host depth for the frame trace and jobcost too (kinds 36/37
+in the frame trace mark the closes the depth test lost and brackets that never closed).
+
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1137,9 +1137,31 @@
+             ctx->ls[0x12C0], ctx->ls[0x12C1], ctx->ls[0x12C2], ctx->ls[0x12C3]);
+ }
+ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value);
++/* KZ3 patch 1141 (SPU pass 120): job I/O capture and native-job hook, engine-generic. All null/0 unless a title
++ * installs them (KZ3: port/spu/kz3_jobhook.c, KZ3_JOB_CAPTURE / KZ3_NATIVE_JOB); off = one predicted global test.
++ *  - g_spu_jcap_ch: every channel op of every SPU thread while set: kind 1 = rdch (value read), 2 = rchcnt
++ *    (count in _u32[0]), 3 = wrch (before it acts), 5 = an atomic MFC command just completed (ch = the command).
++ *  - g_spu_jcap_xfer (spu_dma.h): every DMA element after it moved (plain transfers and each list element).
++ *  - g_spu_jhook_on forces the PM's branches into job code through the resolver's job-call bracket (as patch
++ *    1114 does); g_spu_jhook_open then picks the function the job call runs (the lifted entry or a host one) and
++ *    g_spu_jhook_close runs when the job call has returned to the policy module's link. */
++void (*g_spu_jcap_ch)(spu_context*, int kind, uint32_t ch, const u128* v) SPU_READ_MOSTLY = 0;
++extern int g_spu_jhook_on;   /* defined in spu_drain.c with g_spu_jcap_xfer (linked by every lifted-code test) */
++void (SPU_ABI *(*g_spu_jhook_open)(spu_context*, uint32_t lr, void (SPU_ABI *fn)(spu_context*)))(spu_context*) = 0;
++void (*g_spu_jhook_close)(spu_context*) = 0;
+ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+ {
+     if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "wr", channel, value._u32[0]);
++    if (__builtin_expect(g_spu_jcap_ch != 0, 0)) {   /* patch 1141 */
++        void (*h)(spu_context*, int, uint32_t, const u128*) = g_spu_jcap_ch;
++        if (h) h(ctx, 3, channel, &value);
++        spu_wrch_impl(ctx, channel, value);
++        const uint32_t c = value._u32[0];
++        if (h && channel == MFC_Cmd &&
++            (c == MFC_GETLLAR_CMD || c == MFC_PUTLLC_CMD || c == MFC_PUTLLUC_CMD || c == MFC_PUTQLLUC_CMD))
++            h(ctx, 5, c, NULL);
++        return;
++    }
+     spu_wrch_impl(ctx, channel, value);
+ }
+ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
+@@ -1407,6 +1429,8 @@
+     if (g_kz3_j2_note) g_kz3_j2_note(ctx, channel & 31u);
+     u128 r = spu_rdch_impl(ctx, channel);
+     if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "rd", channel, r._u32[0]);
++    { void (*h)(spu_context*, int, uint32_t, const u128*) = g_spu_jcap_ch;   /* patch 1141 */
++      if (__builtin_expect(h != 0, 0)) h(ctx, 1, channel, &r); }
+     return r;
+ }
+ static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel)
+@@ -1512,7 +1536,15 @@
+ /* ===========================================================================
+  * Channel count (rchcnt) -- how many entries can be read/written right now
+  * ===========================================================================*/
+-uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
++static uint32_t spu_rchcnt_impl(spu_context* ctx, uint32_t channel);
++uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)   /* patch 1141: the capture sees the count */
++{
++    const uint32_t n = spu_rchcnt_impl(ctx, channel);
++    void (*h)(spu_context*, int, uint32_t, const u128*) = g_spu_jcap_ch;
++    if (__builtin_expect(h != 0, 0)) { u128 v = spu_splat_u32(n); h(ctx, 2, channel, &v); }
++    return n;
++}
++static uint32_t spu_rchcnt_impl(spu_context* ctx, uint32_t channel)
+ {
+     spu_honour_stop_request(ctx);
+     if (g_kz3_j2_note) g_kz3_j2_note(ctx, 32u + (channel & 31u));   /* KZ3 patch 1072 */
+@@ -3129,6 +3161,8 @@
+ void kz3_jobcall_open(spu_context* ctx, uint32_t lr)
+ {
+     const uint32_t jn = ((uint32_t)ctx->ls[0x12E2] << 8) | ctx->ls[0x12E3];
++    if (g_kz3_wtrace && t_kz3_jc.t0)   /* pass 121: the previous job call on this thread never closed (kind 37) */
++        kz3_wacct_trace(37 /* KZ3_WT_JOBCALL_LOST */, t_kz3_jc.site, t_kz3_jc.t0, kz3_wacct_now());
+     t_kz3_jc.t0 = g_kz3_wtrace ? kz3_wacct_now() : 1;
+     t_kz3_jc.h0 = g_kz3_jobcost ? spu_host_ns() : 0;
+     t_kz3_jc.lr = lr;
+@@ -3137,15 +3171,24 @@
+ }
+ void kz3_jobcall_close(spu_context* ctx, uint32_t pc)
+ {
+-    if (!t_kz3_jc.t0 || (pc & SPU_LS_MASK) != t_kz3_jc.lr || ctx->host_depth != t_kz3_jc.depth) return;
++    if (!t_kz3_jc.t0 || (pc & SPU_LS_MASK) != t_kz3_jc.lr) return;
++    /* patch 1141: the depth is not compared: the PM enters jobs with interrupts enabled (bisle), and an interrupt
++     * taken inside the job returns (iret) by a jump that leaves host_depth elsewhere. Pass 121: for every bracket
++     * user (the frame trace and jobcost too, not only the job hook); the frame trace marks such closes (kind 36,
++     * KZ3_WT_JOBCALL_DEPTH: the job calls the depth test used to lose) */
+     const int img = ctx->resident_ovl & 0xFFFF;
+-    if (g_kz3_wtrace)
+-        kz3_wacct_trace(33 /* KZ3_WT_JOBCALL */, t_kz3_jc.site | (uint32_t)img, t_kz3_jc.t0, kz3_wacct_now());
++    if (g_kz3_wtrace) {
++        const uint64_t t1 = kz3_wacct_now();
++        kz3_wacct_trace(33 /* KZ3_WT_JOBCALL */, t_kz3_jc.site | (uint32_t)img, t_kz3_jc.t0, t1);
++        if (ctx->host_depth != t_kz3_jc.depth)
++            kz3_wacct_trace(36 /* KZ3_WT_JOBCALL_DEPTH */, t_kz3_jc.site | (uint32_t)img, t_kz3_jc.t0, t1);
++    }
+     if (g_kz3_jobcost && t_kz3_jc.h0 && img > 0 && img < 512 && s_kz3_jobcost_f[img] > 1.0f) {   /* patch 1114 */
+         const uint64_t h1 = spu_host_ns();
+         const uint64_t until = h1 + (uint64_t)((double)(h1 - t_kz3_jc.h0) * (double)(s_kz3_jobcost_f[img] - 1.0f));
+         while (spu_host_ns() < until) { }
+     }
++    if (g_spu_jhook_close) g_spu_jhook_close(ctx);   /* patch 1141 */
+     t_kz3_jc.t0 = 0;
+ }
+ 
+@@ -3199,7 +3242,11 @@
+         SPU_HS(13);
+         return NULL;
+     }
+-    if (g_kz3_jobcost && ctx->image_id == 2 && t >= 0x4000) {   /* patch 1114: the PM's hop into job code opens a bracket */
++    if ((g_spu_jhook_on || g_kz3_jobcost) && t_kz3_jc.t0 && t == t_kz3_jc.lr) {   /* patch 1141: the job's return closes the bracket */
++        SPU_HS(13);
++        return NULL;
++    }
++    if ((g_kz3_jobcost || g_spu_jhook_on) && ctx->image_id == 2 && t >= 0x4000) {   /* patch 1114 (1141: jhook): the PM's hop into job code opens a bracket */
+         SPU_HS(13);
+         return NULL;
+     }
+@@ -3249,7 +3296,11 @@
+     return fn;
+ }
+ 
+-SPU_ABI void spu_indirect_branch(spu_context* ctx)
++SPU_ABI /* patch 1141 (SPU pass 121): the capture records each selectWorkload answer (a kernel service the HLE answers
++ * without channel ops) after it was made: kind 6, ch = the link it returns to, v = r3 */
++#define SPU_JCAP_KERN(c) do { void (*h_)(spu_context*, int, uint32_t, const u128*) = g_spu_jcap_ch; \
++    if (__builtin_expect(h_ != 0, 0)) h_((c), 6, (c)->pc & SPU_LS_MASK, &(c)->gpr[3]); } while (0)
++void spu_indirect_branch(spu_context* ctx)
+ {
+     if (__builtin_expect(g_spu_hop_on < 0, 0)) spu_hop_init();   /* KZ3 patch 1096 */
+     if (__builtin_expect(s_hop_stats != 0, 0)) {
+@@ -3261,6 +3312,11 @@
+         if (g_kz3_pmend_ib) { spu_recent_mark(ctx, 6, ctx->pc); spu_recent_mark(ctx, 7, ctx->gpr[0]._u32[0]); }
+     }
+     if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "ib", 0, ctx->gpr[0]._u32[0]);
++    /* patch 1141: a job that returns with SPU_RET's trampoline (host depth 0 after an interrupt's iret) reaches the
++     * PM's link here, where neither close point of the bracket sees it; close it when the resolver is asked for it. */
++    if (__builtin_expect(g_spu_jhook_on || g_kz3_wtrace != 0 || g_kz3_jobcost, 0) && t_kz3_jc.t0 &&
++        (ctx->pc & SPU_LS_MASK) == t_kz3_jc.lr && ctx->image_id == 2)
++        kz3_jobcall_close(ctx, ctx->pc);
+     if (__builtin_expect(g_spu_ovl_skip_any, 0) && ctx->resident_ovl > 0)
+         spu_overlay_skip_entry(ctx, ctx->resident_ovl);   /* KZ3 patch 1043 */
+     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
+@@ -3313,7 +3369,7 @@
+                   { extern uint32_t kz3_pm_select(const uint8_t*, uint32_t, uint32_t, int);
+                     ctx->gpr[3] = spu_make_preferred_u32(kz3_pm_select(ctx->ls, ctx->gpr[0]._u32[0], ctx->gpr[3]._u32[0], 1)); }
+                   ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+-                  return;
++                  { SPU_JCAP_KERN(ctx); return; }
+               } }
+             /* KZ3 patch 1074: the per-SPU kernel answers {wid, poll status} in r3's words 0 and 1 (the WWS PM's
+              * wrapper 0x3678 compares word 0 with wklCurrentId and stores word 1, the status, at LS 0x1520). */
+@@ -3328,7 +3384,7 @@
+                     ctx->gpr[3] = spu_make_preferred_u32((uint32_t)ksel);
+                     ctx->gpr[3]._u32[1] = kst;
+                     ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+-                    return;
++                    { SPU_JCAP_KERN(ctx); return; }
+                 }
+             }
+             /* KZ3 patch 1058 (RE pass 86): the WWS job-manager PM compares this answer with wklCurrentId (LS 0x1DC)
+@@ -3343,7 +3399,7 @@
+                   ++g_spurs_pm_polls;
+                   ctx->gpr[3] = spu_make_preferred_u32(ans);
+                   ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+-                  return;
++                  { SPU_JCAP_KERN(ctx); return; }
+               } }
+             /* cellSpursModulePoll: report "no contention — keep running".
+              * (One virtual SPU per workload here, so nothing ever preempts.) */
+@@ -3362,7 +3418,7 @@
+                           n, ctx->gpr[3]._u32[0]); }
+             ctx->gpr[3] = spu_make_preferred_u32(0);
+             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+-            return;
++            { SPU_JCAP_KERN(ctx); return; }
+         }
+     }
+     /* Synthetic HLE tasks have no resident taskset policy at 0xA70. Real
+@@ -3770,12 +3826,13 @@
+         /* KZ3 patch 1085: KZ3_FRAME_TRACE times each WWS job call: the jm policy module (image 2) branching from its
+          * own code into the job code buffer (LS[0x1320]) opens a record; it closes when control is back at the
+          * PM's link, here (the job returned normally) or in spu_drain_call_full (it ran on as trampolines). */
+-        if (__builtin_expect(g_kz3_wtrace != 0 || g_kz3_jobcost, 0) && ctx->image_id == 2) {   /* jobcost: patch 1114 */
++        if (__builtin_expect(g_kz3_wtrace != 0 || g_kz3_jobcost || g_spu_jhook_on, 0) && ctx->image_id == 2) {   /* jobcost: patch 1114, jhook: 1141 */
+             const uint32_t cb = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16) |
+                                 ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
+             const uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+             if (cb >= 0x4000 && ctx->pc >= cb && lr < cb) {
+                 kz3_jobcall_open(ctx, lr);
++                if (g_spu_jhook_open) fn = g_spu_jhook_open(ctx, lr, fn);   /* patch 1141 */
+                 fn(ctx);
+                 if (!g_spu_trampoline_fn) kz3_jobcall_close(ctx, ctx->pc);
+                 return;
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -179,6 +179,8 @@
+ extern volatile uint32_t g_spu_dma_watch_lo[SPU_DMA_WATCH_SLOTS], g_spu_dma_watch_hi[SPU_DMA_WATCH_SLOTS];
+ extern volatile long g_spu_dma_watch_hits[SPU_DMA_WATCH_SLOTS];
+ extern volatile int g_spu_dma_watch_on;
++/* KZ3 patch 1141: job I/O capture, every DMA element after it moved (null unless a title installs it). */
++extern void (*g_spu_jcap_xfer)(spu_context*, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd);
+ 
+ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                    uint32_t size, uint32_t cmd)
+@@ -887,6 +889,8 @@
+             uint32_t transfer_lsa = (dest_lsa & ~15u) | (eal & 15u);
+             int rc = mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
+             if (rc != 0) return rc;
++            if (__builtin_expect(g_spu_jcap_xfer != 0, 0))   /* patch 1141 */
++                g_spu_jcap_xfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
+             dest_lsa = (dest_lsa & ~15u) + ((xfer_size + 15u) & ~15u);
+         }
+ 
+@@ -1619,6 +1623,8 @@
+                                   ea & 0xFFFFFFFF00000000ull, size, cmd);
+     } else {
+         rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
++        if (__builtin_expect(g_spu_jcap_xfer != 0, 0) && rc == 0)   /* patch 1141 */
++            g_spu_jcap_xfer(spu, lsa, ea, size, cmd);
+     }
+ 
+     /* wwsjob batch-fetch probe: the claim path GETs the batch's command data
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -480,11 +480,15 @@
+  * the irete). State the handler legitimately publishes lives in LS/channels
+  * and is untouched. Per-ctx slots; no nesting (interrupts stay disabled
+  * until iret). */
++/* patch 1141 (SPU pass 121): the job capture sees an interrupt taken (enter 1, pc = srr0) and its iret (enter 0)
++ * so it can record what the handler changed in LS while the job was interrupted */
++extern void (*g_spu_jcap_irq)(spu_context*, int enter, uint32_t pc);
+ static void spu_irq_regs_save(spu_context* ctx)
+ {
+     ctx->irq_saved = 1;
+     ctx->irq_resume_pc = ctx->srr0;
+     memcpy(ctx->irq_gpr, ctx->gpr, sizeof ctx->irq_gpr);
++    if (__builtin_expect(g_spu_jcap_irq != 0, 0)) g_spu_jcap_irq(ctx, 1, ctx->srr0 & SPU_LS_MASK);
+ }
+ 
+ /* Called from spu_indirect_branch on every dispatch. Restores + clears when
+@@ -506,6 +510,7 @@
+                 ctx->int_enable) {
+                 memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
+                 ctx->irq_saved = 0;
++                if (__builtin_expect(g_spu_jcap_irq != 0, 0)) g_spu_jcap_irq(ctx, 0, ctx->pc & SPU_LS_MASK); /* 1141 */
+                 spu_recent_mark(ctx, 2, ctx->pc);   /* KZ3 patch 1068 */
+                 /* The iret completed below the frame that took the interrupt:
+                  * abandon the handler's host frames and resume there. */
+@@ -718,6 +723,11 @@
+ 
+ 
+ static void spu_drain_call_body(spu_context* ctx, uint32_t return_pc);
++/* KZ3 patch 1141: job capture / native-job hook switches (spu_channels.c describes them); here so every program that
++ * links the lifted-code contract has them. */
++int g_spu_jhook_on = 0;
++void (*g_spu_jcap_xfer)(spu_context*, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd) = 0;
++void (*g_spu_jcap_irq)(spu_context*, int enter, uint32_t pc) = 0;
+ /* KZ3 patch 1085: a WWS job call that ran on as trampolines ends when the PM's drain returns at its link */
+ void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
+ {
+@@ -728,7 +738,7 @@
+     ctx->hop_ret_pc = hop_ret_saved;
+     extern void (*g_kz3_wtrace)(const char*, int, uint32_t, uint64_t, uint64_t);
+     extern int g_kz3_jobcost;   /* KZ3 patch 1114 */
+-    if (__builtin_expect(g_kz3_wtrace != 0 || g_kz3_jobcost, 0)) {
++    if (__builtin_expect(g_kz3_wtrace != 0 || g_kz3_jobcost || g_spu_jhook_on, 0)) {
+         extern void kz3_jobcall_close(spu_context*, uint32_t);
+         kz3_jobcall_close(ctx, return_pc);
+     }
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -328,6 +328,8 @@
+         if (ctx->irq_saved && next == (ctx->irq_resume_pc & SPU_LS_MASK)) {
+             memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
+             ctx->irq_saved = 0;
++            { extern void (*g_spu_jcap_irq)(spu_context*, int, uint32_t);   /* patch 1141 */
++              if (__builtin_expect(g_spu_jcap_irq != 0, 0)) g_spu_jcap_irq(ctx, 0, next); }
+         }
+         break;
+     case SPU_biz:  if (PREF(DST) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;

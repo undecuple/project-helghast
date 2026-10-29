@@ -1,0 +1,9 @@
+# Frame-rate run segment (kz3-gpu-runs "Frame-rate runs move the player"): inside the measured window
+# the player turns a full circle with the right stick at a steady rate, then walks forward a few seconds.
+# Times here are RELATIVE (0 = segment start); level-run.sh takes absolute run seconds, so shift them first, e.g.
+#   awk -v b=215 -F: '/^[0-9]/{printf "%g:%s\n", $1+b, substr($0, index($0,":")+1); next} {print}' tools/pad/perf-turn-walk.pad > work/twNNN.pad
+# Grammar: port/patches/3006-cellpad-script-v2.patch (LX,LY,RX,RY in -1..1, Y -1 = forward; /D = hold D seconds).
+# Measured (RSX pass 122, run r122-j3 [cam] log, jungle on foot): right stick 0.5 turns 12.2 deg/s (8 s = 97.7 deg), so a
+# full circle takes 29.5 s. Full stick is faster but not measured, so the segment keeps the measured half stick.
+0:0,0,0.5,0/29.5     # turn right at half stick, 29.5 s = one full circle
+30:0,-1,0,0/4        # walk forward 4 s

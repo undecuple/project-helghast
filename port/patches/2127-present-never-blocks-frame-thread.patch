@@ -1,0 +1,79 @@
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -15175,7 +15175,53 @@
+ static int g_ld_tearing_ok;                   /* swap chain has the flag */
+ static int g_ld_vsync_logged = -1;
+ void rsx_live_draw_set_vsync(int on) { g_ld_vsync = on ? 1 : 0; }
+-static UINT ld_swap_flags(void) { return g_ld_tearing_ok ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0; }
++/* KZ3 patch 2127 (RSX pass 120): Present never holds the frame thread. That thread also ticks the guest's vblanks and
++ * drains the FIFO (port/kz3/main.cpp frame_clock), so a blocking Present stopped the guest's clock of frames: under
++ * Proton on a desktop machine, a window the compositor does not show (another screen focused, minimised, sometimes the
++ * pause menu) blocked each Present for ~1 s (logs 20261028-193340 / -193925: "[pump] gap ~1000 ms", one flip per pass,
++ * fps 1.0), and on return the backlog of vblanks ran as a burst. The swap chain now has a frame-latency waitable
++ * object (maximum latency 2); a Present whose slot is not free within LD_PRESENT_WAIT_MS (default 16 = one vblank
++ * tick) is skipped (the guest frame is not shown; the guest, its vblanks and its audio run on). LD_PRESENT_WAIT_MS=-1
++ * = the old blocking Present. "[present] skipped" lines count the skips. */
++static HANDLE g_ld_latency_ev;
++static int ld_present_wait_ms(void)
++{
++    static int ms = -2;
++    if (ms == -2) {
++        const char* e = getenv("LD_PRESENT_WAIT_MS");
++        ms = e && *e ? atoi(e) : 16;
++        if (ms < -1) ms = -1;
++        fprintf(stderr, "[present] %s (LD_PRESENT_WAIT_MS=%d, patch 2127)\n",
++                ms < 0 ? "blocking Present (old path)" : "frame-latency wait, a Present never blocks longer", ms);
++    }
++    return ms;
++}
++static UINT ld_swap_flags(void)
++{
++    return (g_ld_tearing_ok ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) |
++           (ld_present_wait_ms() >= 0 ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0);
++}
++/* 1 = present now; 0 = skip this one (no free slot within the wait). */
++static int ld_present_slot(void)
++{
++    static unsigned s_skip, s_skip_win, s_lines;
++    static ULONGLONG s_t0;
++    const int ms = ld_present_wait_ms();
++    if (ms < 0 || !g_ld_latency_ev) return 1;
++    if (WaitForSingleObject(g_ld_latency_ev, (DWORD)ms) == WAIT_OBJECT_0) {
++        if (s_skip_win) {
++            fprintf(stderr, "[present] presenting again after %u skipped (no free swap-chain slot; %u in all)\n", s_skip_win, s_skip);
++            s_skip_win = 0;
++        }
++        return 1;
++    }
++    s_skip++; s_skip_win++;
++    if (s_lines < 20 || GetTickCount64() - s_t0 > 10000) {
++        s_lines++; s_t0 = GetTickCount64();
++        fprintf(stderr, "[present] skipped: no free swap-chain slot within %d ms (%u in a row, %u in all)\n", ms, s_skip_win, s_skip);
++    }
++    return 0;
++}
+ /* Present with the interval and flags the setting asks for; logs "[rsx] vsync ..." once and on each change. */
+ static HRESULT ld_present_swap(void)
+ {
+@@ -15193,6 +15239,7 @@
+                 s_env >= 0 ? ", LD_PRESENT_INTERVAL set: interval from the environment" :
+                 g_dm_fs && !g_ld_vsync ? ", exclusive fullscreen: interval 0 without the flag" : "");
+     }
++    if (!ld_present_slot()) return S_OK;   /* patch 2127 */
+     return g.swap->lpVtbl->Present(g.swap, interval, tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+ }
+ 
+@@ -15645,6 +15692,12 @@
+     }
+     sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g.swap);
+     sc1->lpVtbl->Release(sc1);
++    if (g.swap && (scd.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)) {   /* patch 2127 */
++        const HRESULT lh = g.swap->lpVtbl->SetMaximumFrameLatency(g.swap, 2);
++        g_ld_latency_ev = g.swap->lpVtbl->GetFrameLatencyWaitableObject(g.swap);
++        fprintf(stderr, "[present] frame-latency waitable %s (SetMaximumFrameLatency hr=0x%08lX)\n",
++                g_ld_latency_ev ? "on" : "NOT available", (unsigned long)lh);
++    }
+     {   /* patch 2095: Alt+Enter is the window's (rsx_null_backend.c), not DXGI's */
+         const HRESULT mh = factory->lpVtbl->MakeWindowAssociation(factory, (HWND)hwnd, DXGI_MWA_NO_ALT_ENTER);
+         fprintf(stderr, "[display] swap chain %ux%u for a %ux%u guest image; MakeWindowAssociation(NO_ALT_ENTER) hr=0x%08lX\n",

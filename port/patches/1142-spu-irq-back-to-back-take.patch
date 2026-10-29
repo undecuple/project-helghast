@@ -1,0 +1,33 @@
+KZ3 patch 1142 (SPU pass 121): an interrupt taken at the resume point of a handler whose iret has not been
+completed yet (pc == srr0, interrupts on, registers not restored because no dispatch ran
+spu_irq_regs_maybe_restore in between) first completes that iret, so the saved register file is the
+interrupted code's and not the handler's. Engine-generic (any SPU interrupt handler with back-to-back events).
+g_spu_irq_b2b counts them. Upstream candidate.
+
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -582,6 +582,7 @@
+     fflush(stderr);
+ }
+ 
++volatile unsigned long g_spu_irq_b2b; /* patch 1142: back-to-back takes that completed a pending iret first */
+ void (SPU_ABI *spu_take_interrupt(spu_context* ctx,
+                           void (SPU_ABI *tf)(spu_context*)))(spu_context*)
+ {
+@@ -590,6 +591,16 @@
+         if (--g_sn_defer == 0) g_sn_defer_ctx = 0;
+         return tf;
+     }
++    /* KZ3 patch 1142 (SPU pass 121): the handler's iret put pc back at srr0 with interrupts on, and the next
++     * pending event is taken here before any dispatch ran spu_irq_regs_maybe_restore: complete that iret first
++     * (restore the interrupted code's registers), or the save below keeps the handler's registers as the
++     * interrupted code's and its iret hands them back to it. On hardware the handler restores the registers
++     * before iret, so a back-to-back take sees the interrupted code's registers. Seen in the WWS policy module's
++     * list stall-and-notify handling inside skinning job calls (KZ3 K4/jungle, two takes at srr0 0x4770 with no
++     * restore between them, SPU pass 121 captures). */
++    if (ctx->irq_saved && (ctx->pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK) &&
++        spu_irq_regs_maybe_restore(ctx))
++        g_spu_irq_b2b++;
+     const uint8_t* v = ctx->ls;      /* vector word at LS 0, big-endian */
+     uint32_t w = ((uint32_t)v[0] << 24) | ((uint32_t)v[1] << 16) |
+                  ((uint32_t)v[2] << 8) | v[3];

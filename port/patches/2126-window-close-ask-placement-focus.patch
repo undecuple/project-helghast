@@ -1,0 +1,563 @@
+diff -ruN a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -232,6 +232,7 @@
+ 
+ #if AUDIO_BACKEND_WASAPI
+ 
++volatile int g_audio_out_silent = 0;   /* KZ3 patch 2126: 1 = WASAPI buffers go out SILENT */
+ static IAudioClient*        s_wasapi_client = NULL;
+ static IAudioRenderClient*  s_wasapi_render = NULL;
+ static HANDLE               s_wasapi_event  = NULL;
+@@ -385,8 +386,11 @@
+         static int mute = -1;
+         if (mute < 0) mute = getenv("PS3_MUTE") ? 1 : 0;
+         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
++        /* KZ3 patch 2126: g_audio_out_silent (Options > Display > When unfocused = Mute, port/kz3/main.cpp) silences
++         * the port's own output the same way while the window is unfocused or minimised; the mix, the device pacing
++         * and the Windows mixer are untouched. */
+         s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
+-                                               mute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
++                                               (mute || g_audio_out_silent) ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+     }
+ }
+ 
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -459,6 +459,19 @@
+     wcscpy(s_kb_path, L"keybinds.ini");               /* no APPDATA: the working folder */
+ }
+ 
++/* KZ3 patch 2126: how many keybinds.ini inputs use this key (0 = free; rsx_null_backend.c lets F11 toggle fullscreen
++ * only when it is free). */
++static void pad_kb_ensure_loaded(void);
++int pad_kb_vk_bound(int vk)
++{
++    int n;
++    pad_kb_ensure_loaded();
++    AcquireSRWLockShared(&s_kb_lock);
++    n = pad_kb_key_uses(&s_kb, vk);
++    ReleaseSRWLockShared(&s_kb_lock);
++    return n;
++}
++
+ /* KZ3 patch 2095: a file beside keybinds.ini (the port's other settings, e.g. display.ini); 1 = *out holds its path. */
+ int pad_kb_sibling_path(const wchar_t* name, wchar_t* out, size_t n)
+ {
+diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -418,6 +418,7 @@
+ #define RSX_DM_DEF_MBLUR   "100"
+ #define RSX_DM_DEF_BLOOM   "100"
+ #define RSX_DM_DEF_FOV     "default"
++#define RSX_DM_DEF_UNF     "keep"   /* patch 2126: When unfocused */
+ #define RSX_DM_GUM_MBLUR 1   /* rsx_dm_patch_gum_opts: add the Motion blur row (patch 2107) */
+ #define RSX_DM_GUM_BLOOM 4   /* patch 2121: add the Bloom row */
+ #define RSX_DM_GUM_FOV   2   /* rsx_dm_patch_gum_opts: add the Field of view row (patch 2109) */
+@@ -451,6 +452,13 @@
+         "\t\t\t\t<selectitem value=\"30\">30 FPS</selectitem>\n"
+         "\t\t\t\t<selectitem value=\"60\">60 FPS</selectitem>\n"
+         "\t\t\t\t<selectitem value=\"120\">120 FPS</selectitem>\n"
++        "\t\t\t</select>\n\n\t\t\t"
++        /* patch 2126: what the game does while its window is in the background */
++        "<select id=\"slc_kz3_unfocused\" label=\"When unfocused\" onchange=\"script(settingscript,KZ3ChangeUnfocused)\"\n"
++        "\t\t\t\tdefault-value=\"keep\">\n"
++        "\t\t\t\t<selectitem value=\"keep\">Keep running</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"mute\">Mute</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"pause\">Pause</selectitem>\n"
+         "\t\t\t</select>\n\n\t\t\t";
+     static const char rsx_dm_gum_row_mb[] =   /* patch 2107: only when the MotionBlur hook is in the exe */
+         "<select id=\"slc_kz3_mblur\" label=\"Motion blur\" onchange=\"script(settingscript,KZ3ChangeMBlur)\"\n"
+@@ -547,7 +555,9 @@
+         "scripted events run wrong.\",\n"
+         "\t\t\tslc_kz3_mblur = \"Strength of the blur during fast camera movement. 100 is the game's own look, 0 is off.\",\n"
+         "\t\t\tslc_kz3_bloom = \"Strength of the glow around bright areas. 100 is the game's own look, 0 is off.\",\n"
+-        "\t\t\tslc_kz3_fov = \"Horizontal field of view in the campaign. Default is the game's own 80.\"\n"
++        "\t\t\tslc_kz3_fov = \"Horizontal field of view in the campaign. Default is the game's own 80.\",\n"
++        "\t\t\tslc_kz3_unfocused = \"What the game does while its window is in the background: keep running, mute it, or "
++        "open the pause menu.\"\n"
+         "\t\t}\n\n"
+         "\t\tfunction KZ3Tooltip(e)\n"
+         "\t\t\tlocal item = gRoot:GetTag(\"lst_options\"):GetSelectedItem()\n"
+@@ -565,6 +575,7 @@
+         "\t\t\tKZ3DisplayCmd(\"filter " RSX_DM_DEF_FILTER "\")\n"
+         "\t\t\tKZ3DisplayCmd(\"vsync " RSX_DM_DEF_VSYNC "\")\n"
+         "\t\t\tKZ3DisplayCmd(\"fps " RSX_DM_DEF_FPS "\")\n"
++        "\t\t\tKZ3DisplayCmd(\"unfocused " RSX_DM_DEF_UNF "\")\n"
+         "\t\t\tif (KZ3MBlurOn) then KZ3DisplayCmd(\"motionblur " RSX_DM_DEF_MBLUR "\") end\n"
+         "\t\t\tif (KZ3FovOn) then KZ3DisplayCmd(\"fov " RSX_DM_DEF_FOV "\") end\n"
+         "\t\t\tif (KZ3BloomOn) then KZ3DisplayCmd(\"bloom " RSX_DM_DEF_BLOOM "\") end\n"
+@@ -581,6 +592,7 @@
+         "\t\t\tgRoot:GetTag(\"slc_kz3_filter\"):SetValue(KZ3DisplayCmd(\"filter\"))\n"
+         "\t\t\tgRoot:GetTag(\"slc_kz3_vsync\"):SetValue(KZ3DisplayCmd(\"vsync\"))\n"
+         "\t\t\tgRoot:GetTag(\"slc_kz3_fps\"):SetValue(KZ3DisplayCmd(\"fps\"))\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_unfocused\"):SetValue(KZ3DisplayCmd(\"unfocused\"))\n"
+         "\t\t\tif (KZ3MBlurOn) then KZ3MBlurOn() end\n"
+         "\t\t\tif (KZ3FovOn) then KZ3FovOn() end\n"
+         "\t\t\tif (KZ3BloomOn) then KZ3BloomOn() end\n"
+@@ -620,6 +632,10 @@
+         "\t\t\te:SetHandled(true)\n"
+         "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"filter \"..e:GetSender():GetValue()) end\n"
+         "\t\tend\n\n"
++        "\t\tfunction KZ3ChangeUnfocused(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"unfocused \"..e:GetSender():GetValue()) end\n"
++        "\t\tend\n\n"
+         "\t\tfunction KZ3ChangeVSync(e)\n"
+         "\t\t\te:SetHandled(true)\n"
+         "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"vsync \"..e:GetSender():GetValue()) end\n"
+diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -305,6 +305,16 @@
+                 rsx_dm_log_client("test resize");
+             }
+         } else if (!strcmp(act, "log")) rsx_dm_log_client("test log");
++        /* patch 2126: sysclose = the X button's message, close = a scripted WM_CLOSE, blur/focus = WM_ACTIVATEAPP as the
++         * window manager sends it, minimize/restore = ShowWindow, maximize = the maximize button, f11 = the key */
++        else if (!strcmp(act, "sysclose")) PostMessageA(s_state.hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
++        else if (!strcmp(act, "close")) PostMessageA(s_state.hwnd, WM_CLOSE, 0, 0);
++        else if (!strcmp(act, "blur")) PostMessageA(s_state.hwnd, WM_ACTIVATEAPP, 0, 0);
++        else if (!strcmp(act, "focus")) PostMessageA(s_state.hwnd, WM_ACTIVATEAPP, 1, 0);
++        else if (!strcmp(act, "minimize")) ShowWindow(s_state.hwnd, SW_MINIMIZE);
++        else if (!strcmp(act, "restore")) ShowWindow(s_state.hwnd, SW_RESTORE);
++        else if (!strcmp(act, "maximize")) PostMessageA(s_state.hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0);
++        else if (!strcmp(act, "f11")) PostMessageA(s_state.hwnd, WM_KEYDOWN, VK_F11, 1);
+         else if (rsx_dm_parse(act) >= 0) rsx_display_set_mode(rsx_dm_parse(act));
+         else if (rsx_dm_parse_scaling(act) >= 0) rsx_display_set_scaling(rsx_dm_parse_scaling(act), -1);
+         else if (rsx_dm_parse_filter(act) >= 0) rsx_display_set_scaling(-1, rsx_dm_parse_filter(act));
+@@ -349,15 +359,201 @@
+     fflush(stdout);
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 2126 (RSX pass 120): window management, ENHANCEMENTs (rsx_window_place.h has the rules and the pure
++ * parts). On the window's thread like 2095:
++ *   - WM_SYSCOMMAND SC_CLOSE (X, Alt+F4, system menu, taskbar) asks the port (s_wm_close_ask, port/kz3/main.cpp opens
++ *     the game's exit dialog) and closes only when it declines; a bare WM_CLOSE (scripts, the dialog's Yes) and
++ *     WM_ENDSESSION close at once.
++ *   - placement: the windowed window is restored from display.ini at creation and saved on move/size end, on a
++ *     maximize change and at close (not while KZ3_WINDOW_SIZE / KZ3_DISPLAY rule the run).
++ *   - focus: WM_ACTIVATEAPP and minimise/restore go to s_wm_focus (the port's When unfocused setting).
++ *   - maximize (button, title-bar double-click: both arrive as SC_MAXIMIZE) in Windowed -> Borderless on that monitor;
++ *     Restore (SC_RESTORE while borderless and not minimised) and Alt+Enter go back to the saved window.
++ *     display.ini maximize = window keeps 2062's aspect maximise.
++ *   - F11 = Alt+Enter, unless keybinds.ini binds F11 (pad_kb_vk_bound, cellPad.c).
++ * -----------------------------------------------------------------------*/
++#include "rsx_window_place.h"
++extern int pad_kb_vk_bound(int vk) __attribute__((weak));   /* cellPad.c (patch 2126) */
++static rsx_wp s_wp_cfg, s_wp_cur;            /* from display.ini / as now */
++static SRWLOCK s_wp_lock = SRWLOCK_INIT;
++static int s_wp_env;                          /* KZ3_WINDOW_SIZE or KZ3_DISPLAY: neither restored nor saved */
++static int s_wp_was_max;
++static int s_wm_max_bl = RSX_MAX_BORDERLESS;
++static int (*s_wm_close_ask)(int src);
++static void (*s_wm_focus)(int focused, int minimized);
++static int s_wm_focused = 1, s_wm_min = 0;
++
++void rsx_display_configure_window(const rsx_wp* saved, int maximize_borderless, int (*close_ask)(int src),
++                                  void (*focus)(int focused, int minimized))
++{
++    if (saved) s_wp_cfg = *saved;
++    s_wp_cur = s_wp_cfg;
++    if (maximize_borderless >= 0) s_wm_max_bl = maximize_borderless;
++    s_wm_close_ask = close_ask;
++    s_wm_focus = focus;
++}
++/* For display.ini (any thread): the placement to write (the file's own while the run's env rules the window). */
++int rsx_display_get_window(rsx_wp* out)
++{
++    AcquireSRWLockShared(&s_wp_lock);
++    *out = s_wp_env ? s_wp_cfg : s_wp_cur;
++    ReleaseSRWLockShared(&s_wp_lock);
++    return out->valid;
++}
++int rsx_display_get_maximize(void) { return s_wm_max_bl; }
++
++typedef struct { rsx_wp_mon m[16]; char names[16][40]; int n; } rsx_wp_mons;
++static BOOL CALLBACK rsx_wp_enum(HMONITOR mon, HDC dc, LPRECT r, LPARAM lp)
++{
++    rsx_wp_mons* s = (rsx_wp_mons*)lp;
++    MONITORINFOEXA mi;
++    (void)dc; (void)r;
++    if (s->n >= 16) return FALSE;
++    mi.cbSize = sizeof mi;
++    if (!GetMonitorInfoA(mon, (MONITORINFO*)&mi)) return TRUE;
++    snprintf(s->names[s->n], sizeof s->names[0], "%s", mi.szDevice);
++    s->m[s->n].name = s->names[s->n];
++    s->m[s->n].ml = mi.rcMonitor.left; s->m[s->n].mt = mi.rcMonitor.top; s->m[s->n].mr = mi.rcMonitor.right; s->m[s->n].mb = mi.rcMonitor.bottom;
++    s->m[s->n].wl = mi.rcWork.left; s->m[s->n].wt = mi.rcWork.top; s->m[s->n].wr = mi.rcWork.right; s->m[s->n].wb = mi.rcWork.bottom;
++    s->m[s->n].primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
++    s->n++;
++    return TRUE;
++}
++
++/* The windowed window as it is now -> s_wp_cur; save = write display.ini. Maximized keeps the last normal rectangle. */
++static void rsx_wp_capture(const char* why, int save)
++{
++    HWND h = s_state.hwnd;
++    rsx_wp w;
++    if (!h || s_dm_applied != RSX_DM_WINDOWED || IsIconic(h)) return;
++    AcquireSRWLockShared(&s_wp_lock);
++    w = s_wp_cur;
++    ReleaseSRWLockShared(&s_wp_lock);
++    if (IsZoomed(h)) w.maximized = 1;
++    else {
++        RECT wr, cr;
++        HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
++        MONITORINFOEXA mi;
++        mi.cbSize = sizeof mi;
++        if (!GetWindowRect(h, &wr) || !GetClientRect(h, &cr) || cr.right < 160 || cr.bottom < 90) return;
++        w.x = wr.left; w.y = wr.top; w.w = cr.right; w.h = cr.bottom; w.maximized = 0;
++        if (mon && GetMonitorInfoA(mon, (MONITORINFO*)&mi)) {
++            snprintf(w.mon, sizeof w.mon, "%s", mi.szDevice);
++            w.ml = mi.rcMonitor.left; w.mt = mi.rcMonitor.top; w.mr = mi.rcMonitor.right; w.mb = mi.rcMonitor.bottom;
++        }
++        w.valid = 1;
++    }
++    AcquireSRWLockExclusive(&s_wp_lock);
++    s_wp_cur = w;
++    ReleaseSRWLockExclusive(&s_wp_lock);
++    printf("[window] %s: %dx%d at %d,%d on %s%s%s\n", why, w.w, w.h, w.x, w.y, w.mon[0] ? w.mon : "?",
++           w.maximized ? ", maximized" : "", s_wp_env ? " (KZ3_WINDOW_SIZE/KZ3_DISPLAY: not saved)" : "");
++    fflush(stdout);
++    if (save && !s_wp_env && s_dm_save) s_dm_save(s_dm.mode, s_dm_scaling, s_dm_filter, s_dm_vsync);
++}
++
++/* At creation: the saved placement -> outer x, y, w, h (1 = use them). */
++static int rsx_wp_initial(int* x, int* y, int* ow, int* oh)
++{
++    rsx_wp_mons ms;
++    int out[4], fb = 0, k, fw, fh;
++    const char* ws = getenv("KZ3_WINDOW_SIZE");
++    const char* dm = getenv("KZ3_DISPLAY");
++    s_wp_env = (ws && *ws) || (dm && *dm);
++    if (s_wp_env || !s_wp_cfg.valid) return 0;
++    memset(&ms, 0, sizeof ms);
++    EnumDisplayMonitors(NULL, NULL, rsx_wp_enum, (LPARAM)&ms);
++    rsx_win_frame_size(&fw, &fh);
++    k = rsx_wp_resolve(&s_wp_cfg, ms.m, ms.n, fw, fh, 320, 180, out, &fb);
++    if (k < 0) return 0;
++    *x = out[0]; *y = out[1]; *ow = out[2] + fw; *oh = out[3] + fh;
++    printf("[window] restored from display.ini: client %dx%d at %d,%d on %s%s%s\n", out[2], out[3], out[0], out[1],
++           ms.names[k], fb ? " (saved monitor gone or changed: primary, centred)" : "", s_wp_cfg.maximized ? ", maximized" : "");
++    return 1;
++}
++
++static void rsx_wm_focus_note(int focused, int minimized, const char* why)
++{
++    if (focused == s_wm_focused && minimized == s_wm_min) return;
++    s_wm_focused = focused; s_wm_min = minimized;
++    printf("[focus] %s: %s%s\n", why, focused ? "focused" : "not focused", minimized ? ", minimised" : "");
++    fflush(stdout);
++    if (s_wm_focus) s_wm_focus(focused, minimized);
++}
++
++static int rsx_wm_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
++{
++    if (msg == WM_SYSCOMMAND) {
++        const unsigned sc = (unsigned)(wp & 0xFFF0);
++        if (sc == SC_CLOSE) {
++            if (s_wm_close_ask && s_wm_close_ask(RSX_CLOSE_SRC_USER)) { *res = 0; return 1; }
++            return 0;                                    /* DefWindowProc -> WM_CLOSE -> closes */
++        }
++        if (sc == SC_MAXIMIZE && s_wm_max_bl && s_dm_applied == RSX_DM_WINDOWED) {
++            rsx_wp_capture("maximize", 0);
++            rsx_dm_apply(rsx_dm_set(&s_dm, RSX_DM_BORDERLESS), "Maximize -> borderless");
++            rsx_dm_save_now();
++            *res = 0;
++            return 1;
++        }
++        if (sc == SC_RESTORE && s_dm_applied == RSX_DM_BORDERLESS && !IsIconic(hwnd)) {
++            rsx_dm_apply(rsx_dm_set(&s_dm, RSX_DM_WINDOWED), "Restore -> windowed");
++            rsx_dm_save_now();
++            *res = 0;
++            return 1;
++        }
++        return 0;
++    }
++    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wp == VK_F11) {
++        static int said;
++        const int bound = pad_kb_vk_bound ? pad_kb_vk_bound(VK_F11) : 0;
++        if (!rsx_f11_toggles(bound)) {
++            if (!said++) { printf("[display] F11 is bound in keybinds.ini: it is that action only, no fullscreen toggle\n"); fflush(stdout); }
++            return 0;
++        }
++        if (!(lp & (1 << 30))) {                         /* not an auto-repeat; the same path as Alt+Enter */
++            rsx_dm_apply(rsx_dm_toggle(&s_dm), "F11");
++            rsx_dm_save_now();
++        }
++        *res = 0;
++        return 1;
++    }
++    if (msg == WM_EXITSIZEMOVE) { rsx_wp_capture("moved/sized", 1); return 0; }
++    if (msg == WM_SIZE) {
++        if (wp == SIZE_MINIMIZED) rsx_wm_focus_note(0, 1, "minimised");
++        else {
++            const int mx = wp == SIZE_MAXIMIZED;
++            if (s_wm_min) rsx_wm_focus_note(GetForegroundWindow() == hwnd, 0, "restored");
++            if (mx != s_wp_was_max && s_dm_applied == RSX_DM_WINDOWED) { s_wp_was_max = mx; rsx_wp_capture(mx ? "maximized" : "unmaximized", 1); }
++        }
++        return 0;
++    }
++    if (msg == WM_ACTIVATEAPP) { rsx_wm_focus_note(wp != 0, IsIconic(hwnd) ? 1 : 0, wp ? "activated" : "deactivated"); return 0; }
++    if (msg == WM_QUERYENDSESSION) { *res = TRUE; return 1; }
++    if (msg == WM_ENDSESSION) {
++        if (wp) {
++            rsx_wp_capture("end of session", 1);
++            printf("[window] end of session: closing\n"); fflush(stdout);
++            s_state.window_closed = 1;
++        }
++        *res = 0;
++        return 1;
++    }
++    return 0;
++}
++
+ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     LRESULT sized;
+     if (pad_mouse_wndmsg(hwnd, msg, wp, lp, &sized)) return sized;
+     if (rsx_dm_wndmsg(hwnd, msg, wp, lp, &sized)) return sized;   /* patch 2095 */
++    if (rsx_wm_msg(hwnd, msg, wp, lp, &sized)) return sized;      /* patch 2126 */
+     /* patch 2062's aspect-keeping drag and maximize: windowed only (patch 2095) */
+     if (s_dm_applied == RSX_DM_WINDOWED && rsx_win_size_msg(hwnd, msg, wp, lp, &sized)) return sized;
+     switch (msg) {
+     case WM_CLOSE:
++        rsx_wp_capture("close", 1);   /* patch 2126: the window as it was left */
+         s_state.window_closed = 1;
+         DestroyWindow(hwnd);
+         return 0;
+@@ -559,13 +755,17 @@
+     RECT wr = {0, 0, (LONG)cw, (LONG)ch};
+     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+ 
++    /* patch 2126: the window where the player left it (display.ini), unless KZ3_WINDOW_SIZE / KZ3_DISPLAY rule */
++    int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT, ow = wr.right - wr.left, oh = wr.bottom - wr.top;
++    const int placed = rsx_wp_initial(&wx, &wy, &ow, &oh);
+     s_state.hwnd = CreateWindowExA(
+         0, "ps3recomp_null",
+         title ? title : "ps3recomp",
+         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+-        CW_USEDEFAULT, CW_USEDEFAULT,
+-        wr.right - wr.left, wr.bottom - wr.top,
++        wx, wy,
++        ow, oh,
+         NULL, NULL, GetModuleHandle(NULL), NULL);
++    if (s_state.hwnd && placed && s_wp_cfg.maximized) { ShowWindow(s_state.hwnd, SW_MAXIMIZE); s_wp_was_max = 1; }
+ 
+     { extern int (*g_pad_mouse_to_guest)(int, int, int*, int*);   /* KZ3 patch 2098: pointer -> guest pixels */
+       g_pad_mouse_to_guest = rsx_display_client_to_ui; }   /* 2113: through the 16:9 squeeze */
+diff -ruN a/libs/video/rsx_window_place.h b/libs/video/rsx_window_place.h
+--- a/libs/video/rsx_window_place.h
++++ b/libs/video/rsx_window_place.h
+@@ -0,0 +1,207 @@
++/*
++ * KZ3 patch 2126 (RSX pass 120): window management rules, platform-free (host test: tools/smoke/test_window_place.sh).
++ * ENHANCEMENTs (display/comfort):
++ *   - close asks first: which close requests open the game's own exit dialog and which close at once (rsx_close_decide);
++ *   - the window is remembered: windowed client size, position, monitor and maximized state in display.ini [display]
++ *     (rsx_wp_ini_read / rsx_wp_ini_write) and where it comes back (rsx_wp_resolve: the saved monitor when it is still
++ *     there with the same rectangle, else the primary one, centred; always clamped to the work area);
++ *   - "When unfocused" = keep running | mute | pause (rsx_unf_*), never suspending the guest or its clock;
++ *   - maximize -> borderless (display.ini maximize = borderless | window).
++ * The Win32 side is in rsx_null_backend.c (KZ3's window), the game side (dialog, pause, mute) in port/kz3/main.cpp.
++ */
++#ifndef RSX_WINDOW_PLACE_H
++#define RSX_WINDOW_PLACE_H
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "rsx_display_mode.h"   /* rsx_dm_ini_value, rsx_dm_ieq, rsx_dm_trim */
++
++/* rsx_dm_ini_value, with the blanks after '=' dropped */
++static inline int rsx_wp_value(const char* t, const char* key, char* out, size_t cap)
++{
++    size_t i = 0;
++    if (!rsx_dm_ini_value(t, key, out, cap)) return 0;
++    while (out[i] == ' ' || out[i] == '\t') i++;
++    if (i) memmove(out, out + i, strlen(out + i) + 1);
++    return 1;
++}
++
++/* ---- Close (item 1) ----------------------------------------------------------------------------------------------
++ * Sources: USER = WM_SYSCOMMAND SC_CLOSE (the X button, Alt+F4, the system menu's and the taskbar's Close);
++ * SCRIPT = a bare WM_CLOSE (KZ3_TEST_CLOSE, tools/release/shaders.py, any outside tool, the exit dialog's own Yes);
++ * ENDSESSION = WM_ENDSESSION (logoff, shutdown). Only USER may ask. */
++enum { RSX_CLOSE_SRC_USER = 0, RSX_CLOSE_SRC_SCRIPT = 1, RSX_CLOSE_SRC_ENDSESSION = 2 };
++enum { RSX_CLOSE_NOW = 0, RSX_CLOSE_ASK_MENU = 1, RSX_CLOSE_ASK_PAUSE = 2 };
++typedef struct {
++    int off;        /* KZ3_CLOSE_ASK=0 */
++    int ui;         /* the port tracks the game's menus (2098's GUM context and frame tick) and the dialog rows are in */
++    int menu;       /* a GUM page has the focus */
++    int ask_page;   /* that page is one with the exit dialog (main menu, pause menu: it registered from its OnPageOn) */
++    int busy;       /* an ask is in flight or the dialog is up: a second X closes */
++    int fault;      /* the crash / fatal-error path */
++} rsx_close_ctx;
++static inline int rsx_close_decide(int src, const rsx_close_ctx* c)
++{
++    if (src != RSX_CLOSE_SRC_USER || c->off || c->fault || !c->ui || c->busy) return RSX_CLOSE_NOW;
++    if (c->menu) return c->ask_page ? RSX_CLOSE_ASK_MENU : RSX_CLOSE_NOW;   /* loading screen, movie, other pages */
++    return RSX_CLOSE_ASK_PAUSE;                                              /* play: pause menu first */
++}
++static inline const char* rsx_close_name(int d)
++{
++    return d == RSX_CLOSE_ASK_MENU ? "ask (dialog on this page)" : d == RSX_CLOSE_ASK_PAUSE ? "ask (pause menu, then dialog)" : "close now";
++}
++static inline const char* rsx_close_src_name(int s)
++{
++    return s == RSX_CLOSE_SRC_USER ? "X / Alt+F4 / system menu" : s == RSX_CLOSE_SRC_ENDSESSION ? "end of session" : "WM_CLOSE";
++}
++
++/* ---- When unfocused (item 3) -------------------------------------------------------------------------------------- */
++enum { RSX_UNF_KEEP = 0, RSX_UNF_MUTE = 1, RSX_UNF_PAUSE = 2 };
++static inline const char* rsx_unf_name(int v) { return v == RSX_UNF_MUTE ? "mute" : v == RSX_UNF_PAUSE ? "pause" : "keep"; }
++static inline int rsx_unf_parse(const char* s)   /* -1 unreadable */
++{
++    size_t n;
++    if (!s) return -1;
++    n = strlen(s);
++    while (n && (*s == ' ' || *s == '\t')) { s++; n--; }
++    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) n--;
++    if (rsx_dm_ieq(s, n, "keep") || rsx_dm_ieq(s, n, "run") || rsx_dm_ieq(s, n, "keep running")) return RSX_UNF_KEEP;
++    if (rsx_dm_ieq(s, n, "mute")) return RSX_UNF_MUTE;
++    if (rsx_dm_ieq(s, n, "pause")) return RSX_UNF_PAUSE;
++    return -1;
++}
++static inline int rsx_dm_ini_unfocused(const char* t)
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "unfocused", v, sizeof v) ? rsx_unf_parse(v) : -1;
++}
++/* Mute while the window is not the foreground one or is minimised (the port's own output only). */
++static inline int rsx_unf_muted(int setting, int focused, int minimized) { return setting == RSX_UNF_MUTE && (!focused || minimized); }
++/* Pause: once, on the change from focused to not focused, and only in play (no game menu up, nothing pending). */
++static inline int rsx_unf_pause_now(int setting, int was_focused, int focused, int in_play)
++{
++    return setting == RSX_UNF_PAUSE && was_focused && !focused && in_play;
++}
++
++/* ---- Maximize (item 4) and F11 (item 5) --------------------------------------------------------------------------- */
++enum { RSX_MAX_BORDERLESS = 1, RSX_MAX_WINDOW = 0 };
++static inline int rsx_dm_ini_maximize(const char* t)   /* 1 borderless, 0 window (2062's maximize), -1 missing */
++{
++    char v[32];
++    size_t n;
++    const char* p = v;
++    if (!rsx_wp_value(t, "maximize", v, sizeof v)) return -1;
++    n = strlen(v);
++    if (rsx_dm_ieq(p, n, "borderless") || rsx_dm_ieq(p, n, "on") || !strcmp(v, "1")) return RSX_MAX_BORDERLESS;
++    if (rsx_dm_ieq(p, n, "window") || rsx_dm_ieq(p, n, "off") || !strcmp(v, "0")) return RSX_MAX_WINDOW;
++    return -1;
++}
++/* F11 toggles like Alt+Enter unless keybinds.ini gives F11 to an action (then the action only). */
++static inline int rsx_f11_toggles(int f11_bound) { return !f11_bound; }
++
++/* ---- Window placement (item 2) ------------------------------------------------------------------------------------ */
++typedef struct {
++    int valid;
++    int x, y;           /* the window's outer top-left, virtual-screen pixels */
++    int w, h;           /* client size */
++    int maximized;
++    char mon[40];       /* monitor device name (MONITORINFOEX szDevice) */
++    int ml, mt, mr, mb; /* that monitor's rectangle when saved */
++} rsx_wp;
++typedef struct {
++    const char* name;
++    int ml, mt, mr, mb; /* monitor rectangle */
++    int wl, wt, wr, wb; /* work area */
++    int primary;
++} rsx_wp_mon;
++
++static inline int rsx_wp_int(const char* t, const char* key, int* out)
++{
++    char v[32];
++    char* e;
++    long x;
++    if (!rsx_dm_ini_value(t, key, v, sizeof v)) return 0;
++    x = strtol(v, &e, 10);
++    if (e == v || x < -100000 || x > 100000) return 0;
++    *out = (int)x;
++    return 1;
++}
++/* 1 with a usable placement (client at least 160x90); 0 = none (first start, or a hand-edited file). */
++static inline int rsx_wp_ini_read(const char* t, rsx_wp* wp)
++{
++    char v[64];
++    memset(wp, 0, sizeof *wp);
++    if (!rsx_wp_int(t, "window_x", &wp->x) || !rsx_wp_int(t, "window_y", &wp->y) || !rsx_wp_int(t, "window_width", &wp->w) ||
++        !rsx_wp_int(t, "window_height", &wp->h) || wp->w < 160 || wp->h < 90)
++        return 0;
++    rsx_wp_int(t, "window_maximized", &wp->maximized);
++    wp->maximized = wp->maximized != 0;
++    if (rsx_wp_value(t, "window_monitor", v, sizeof v)) {
++        size_t n = strlen(v);
++        if (n >= sizeof wp->mon) n = sizeof wp->mon - 1;
++        memcpy(wp->mon, v, n); wp->mon[n] = 0;
++    }
++    if (rsx_wp_value(t, "window_monitor_rect", v, sizeof v) &&
++        sscanf(v, "%d , %d , %d , %d", &wp->ml, &wp->mt, &wp->mr, &wp->mb) != 4)
++        wp->ml = wp->mt = wp->mr = wp->mb = 0;
++    wp->valid = 1;
++    return 1;
++}
++static inline int rsx_wp_ini_write(char* buf, size_t n, const rsx_wp* wp)
++{
++    if (!wp->valid) return snprintf(buf, n, "%s", "");
++    return snprintf(buf, n,
++                    "# window_* = the windowed window as it was last left (client size, outer top-left, monitor and its\n"
++                    "# rectangle, maximized 0 | 1). A missing or changed monitor puts the window on the primary one, centred.\n"
++                    "# KZ3_WINDOW_SIZE and KZ3_DISPLAY win for one run (then this is neither read nor written).\n"
++                    "window_x = %d\nwindow_y = %d\nwindow_width = %d\nwindow_height = %d\nwindow_maximized = %d\n"
++                    "window_monitor = %s\nwindow_monitor_rect = %d,%d,%d,%d\n",
++                    wp->x, wp->y, wp->w, wp->h, wp->maximized ? 1 : 0, wp->mon, wp->ml, wp->mt, wp->mr, wp->mb);
++}
++
++/* Where the saved window comes back: out[0..3] = outer x, y and client w, h, for a frame of fw x fh around the client.
++ * Returns the monitor index used and sets *fallback (1 = the saved monitor is gone or changed: primary, centred).
++ * The client keeps its aspect when it must shrink to fit the work area, and never goes under minw x minh.
++ * -1 = no monitors. */
++static inline int rsx_wp_resolve(const rsx_wp* wp, const rsx_wp_mon* m, int nm, int fw, int fh, int minw, int minh,
++                                 int out[4], int* fallback)
++{
++    int i, k = -1, ww, wh, cw = wp->w, ch = wp->h;
++    if (nm <= 0) return -1;
++    for (i = 0; i < nm && k < 0; i++)
++        if (m[i].name && wp->mon[0] && !strcmp(m[i].name, wp->mon) && m[i].ml == wp->ml && m[i].mt == wp->mt &&
++            m[i].mr == wp->mr && m[i].mb == wp->mb)
++            k = i;
++    *fallback = k < 0;
++    if (k < 0) {
++        for (i = 0; i < nm && k < 0; i++) if (m[i].primary) k = i;
++        if (k < 0) k = 0;
++    }
++    ww = m[k].wr - m[k].wl; wh = m[k].wb - m[k].wt;
++    if (cw + fw > ww || ch + fh > wh) {      /* shrink, keeping the aspect, to the largest that fits */
++        const int mw = ww - fw, mh = wh - fh;
++        if (mw > 0 && mh > 0) {
++            int nw = mw, nh = (int)((long long)mw * ch / cw);
++            if (nh > mh) { nh = mh; nw = (int)((long long)mh * cw / ch); }
++            cw = nw; ch = nh;
++        }
++    }
++    if (cw < minw) cw = minw;
++    if (ch < minh) ch = minh;
++    out[2] = cw; out[3] = ch;
++    if (*fallback) {
++        out[0] = m[k].wl + (ww - (cw + fw)) / 2;
++        out[1] = m[k].wt + (wh - (ch + fh)) / 2;
++    } else {
++        int x = wp->x, y = wp->y;
++        if (x + cw + fw > m[k].wr) x = m[k].wr - (cw + fw);
++        if (y + ch + fh > m[k].wb) y = m[k].wb - (ch + fh);
++        if (x < m[k].wl) x = m[k].wl;
++        if (y < m[k].wt) y = m[k].wt;
++        out[0] = x; out[1] = y;
++    }
++    return k;
++}
++
++#endif /* RSX_WINDOW_PLACE_H */

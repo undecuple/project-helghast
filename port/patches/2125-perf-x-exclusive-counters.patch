@@ -1,0 +1,451 @@
+gcm/live draw: exclusive [perf-x] counters for the method loop, the ld_flush split and program identity (RSX_PERF_X=1).
+
+Pass 119 (frame-rate ideas review): counters only, no behaviour change. Active only
+with RSX_PERF=1, RSX_PERF_X=1 and inside the RSX_PERF_PROF=A,B window; none nested in another 2125 timer.
+- Method loop (cellGcmSys.c, the per-word path every command takes while live draw is on, gcm_word_diag() = 1):
+  one command in 32 is timed word by word: the whole loop, the time inside rsx_live_draw_method and inside the
+  final dispatch (gcm_3d/2d_method, flip, user command; "2d" = the part outside gcm_3d_method). Scaled to all
+  commands of the period, minus the timer cost a calibration at the window start measures ("bias", printed once as
+  "[perf-x] calibration"): loop, live, disp, excl = loop - live - disp (io2ea per word, the diagnostic tests, the SET_OBJECT bookkeeping).
+- ld_flush split (rsx_live_draw.c, both the frames-in-flight and the single path): fence wait, info-queue drain,
+  retired-texture release, allocator reset, list reset; per second in [perf-x] and per frame (frame = present
+  flush) at the window end: "[perf-x-flush] frames=N ms/frame mean/p99/max".
+- Program identity in ld_pso: FP memo compare, FP size scan (END bit search), VP memo compare, VP FNV, FP key hash
+  (structural or FNV), rsx_fp_collect_constants: calls, bytes, ms and memo hits.
+Line "[perf-x] t=..." per second with the other [perf-*] lines.
+Diagnostic LD_TEX_WATCH=2 (pool mode, for the patch 2082 question): every 1024th presented frame write-protect the
+local range LD_TEX_WATCH_RANGE=LO,HI (hex local offsets, default 0x0FF00000,0x10000000) and log the first store into
+each 4 KB page ([tex-watch], up to 4096 lines; committed read-write pages only), whether or not the bitmap
+missed it. The handler now passes on a fault it cannot resolve (a page it did not protect: before, a store into a
+not yet committed page looped in the handler). LD_TEX_WATCH=1 is otherwise unchanged.
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2187,6 +2187,39 @@
+ static volatile int s_perf_walk_on;
+ static double s_perf_prof_a = -1, s_perf_prof_b = -1;
+ int rsx_perf_walk_on(void) { return s_perf_walk_on; }
++/* Patch 2125: the exclusive counters of [perf-x] (method loop, ld_flush split, program identity), RSX_PERF_X=1. */
++/* The timer pairs of the sampled words cost time themselves; some of it lands outside the two timed regions and would
++ * read as loop time. Once, at the window start, the same timer sequence runs around empty bodies: the per-word time
++ * outside the regions (bias_x) and inside each region (bias_r), in ticks x 1e3, subtracted in [perf-x]. */
++static long long s_x_bias_x1000 = -1, s_x_bias_r1000;
++static void gcm_x_calibrate(void)
++{
++    enum { N = 20000 };
++    long long in = 0;
++    const long long t0 = rsx_perf_now();
++    for (int i = 0; i < N; i++) {
++        const long long a = rsx_perf_now();
++        __asm__ __volatile__("" ::: "memory");
++        { const long long d = rsx_perf_now() - a; rsx_perf_add(RSX_PERF_X_CAL_DUMMY, d); in += d; }
++        const long long b = rsx_perf_now();
++        __asm__ __volatile__("" ::: "memory");
++        { const long long d = rsx_perf_now() - b; rsx_perf_add(RSX_PERF_X_CAL_DUMMY, d); in += d; }
++    }
++    const long long tot = rsx_perf_now() - t0;
++    s_x_bias_r1000 = in * 1000 / (2 * N);
++    s_x_bias_x1000 = (tot - in) * 1000 / N;
++    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
++    fprintf(stderr, "[perf-x] calibration: per sampled word %.1f ns outside the timed regions, %.1f ns inside each\n",
++            (double)s_x_bias_x1000 / 1000.0 * 1e9 / (double)f.QuadPart, (double)s_x_bias_r1000 / 1000.0 * 1e9 / (double)f.QuadPart);
++}
++int rsx_perf_x_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_PERF_X"); on = (e && *e && *e != '0') ? 1 : 0;
++                  if (on) fprintf(stderr, "[perf-x] exclusive counters on (RSX_PERF_X=1, patch 2125)\n"); }
++    if (on && s_perf_walk_on && s_x_bias_x1000 < 0) gcm_x_calibrate();
++    return on && s_perf_walk_on;
++}
+ void rsx_perf_add(int idx, long long v)
+ {
+     if (rsx_perf_enabled() && idx >= 0 && idx < RSX_PERF_COUNT)
+@@ -2409,6 +2442,32 @@
+                     tnow, d[RSX_PERF_W_VTX_REFS_T] * tk, d[RSX_PERF_W_VTX_REMAP_T] * tk,
+                     d[RSX_PERF_W_VTX_FETCH_T] * tk, d[RSX_PERF_W_VTX_COPY_T] * tk,
+                     d[RSX_PERF_W_VTX_REF_N], d[RSX_PERF_W_VTX_N], (double)d[RSX_PERF_W_VTX_BYTES] / 1048576.0);
++            if (d[RSX_PERF_W_ON] && d[RSX_PERF_X_METH_SAMP_N]) {   /* patch 2125: exclusive counters, ms in the last period */
++                /* sampled method commands scaled to all commands of the period (cmds of [perf-walk2]) */
++                const double sc = (double)d[RSX_PERF_W_METH_CMD_N] / (double)d[RSX_PERF_X_METH_SAMP_N];
++                /* bias: the calibration's timer cost per sampled word (words of the sampled commands) */
++                const double bw = (double)d[RSX_PERF_X_METH_SAMP_W] * sc * tk / 1000.0;
++                const double br = bw * (double)(s_x_bias_r1000 > 0 ? s_x_bias_r1000 : 0);
++                const double bx = bw * (double)(s_x_bias_x1000 > 0 ? s_x_bias_x1000 : 0);
++                const double lv = d[RSX_PERF_X_METH_LIVE_T] * tk * sc - br, dp = d[RSX_PERF_X_METH_DISP_T] * tk * sc - br,
++                             d2 = d[RSX_PERF_X_METH_D2_T] * tk * sc,
++                             lp = d[RSX_PERF_X_METH_LOOP_T] * tk * sc - 2 * br - bx;
++                fprintf(stderr,
++                    "[perf-x] t=%.0fs meth samp %lld/%lld words %lld loop %.1fms live %.1f disp %.1f (2d %.1f) excl %.1f bias %.1f"
++                    " | flush fence %.1f info %.1f rel %.1f alloc %.1f list %.1f"
++                    " | fpcmp %lld/%.2fMB %.2fms hit %lld fpsz %lld/%.2fMB %.2fms vpcmp %lld/%.2fMB %.2fms hit %lld"
++                    " vph %lld/%.2fMB %.2fms fph %lld/%.2fMB %.2fms hit %lld fpcc %lld/%.2fms\n",
++                    tnow, d[RSX_PERF_X_METH_SAMP_N], d[RSX_PERF_W_METH_CMD_N], d[RSX_PERF_X_METH_SAMP_W],
++                    lp, lv, dp, d2, lp - lv - dp, 2 * br + bx,
++                    d[RSX_PERF_X_FL_FENCE_T] * tk, d[RSX_PERF_X_FL_INFO_T] * tk, d[RSX_PERF_X_FL_REL_T] * tk,
++                    d[RSX_PERF_X_FL_ALLOC_T] * tk, d[RSX_PERF_X_FL_LIST_T] * tk,
++                    d[RSX_PERF_X_FPCMP_N], d[RSX_PERF_X_FPCMP_B] / 1048576.0, d[RSX_PERF_X_FPCMP_T] * tk, d[RSX_PERF_X_FPCMP_HIT],
++                    d[RSX_PERF_X_FPSZ_N], d[RSX_PERF_X_FPSZ_B] / 1048576.0, d[RSX_PERF_X_FPSZ_T] * tk,
++                    d[RSX_PERF_X_VPCMP_N], d[RSX_PERF_X_VPCMP_B] / 1048576.0, d[RSX_PERF_X_VPCMP_T] * tk, d[RSX_PERF_X_VPCMP_HIT],
++                    d[RSX_PERF_X_VPH_N], d[RSX_PERF_X_VPH_B] / 1048576.0, d[RSX_PERF_X_VPH_T] * tk,
++                    d[RSX_PERF_X_FPH_N], d[RSX_PERF_X_FPH_B] / 1048576.0, d[RSX_PERF_X_FPH_T] * tk, d[RSX_PERF_X_FPH_HIT],
++                    d[RSX_PERF_X_FPCC_N], d[RSX_PERF_X_FPCC_T] * tk);
++            }
+             { const int was = s_perf_walk_on;
+               s_perf_walk_on = s_perf_prof_a >= 0 && tnow >= s_perf_prof_a && tnow < s_perf_prof_b;
+               if (was && !s_perf_walk_on) rsx_live_draw_perf_dump(); }   /* patch 2045 */
+@@ -3341,6 +3400,10 @@
+                     continue;
+                 }
+             }
++            /* Patch 2125: one command in 32 is timed word by word (the loop, the live-draw call, the dispatch),
++             * so the loop's own cost outside both is measured without a timer pair on every word. */
++            static unsigned s_x_cmd;
++            const long long xs = (meth_t0 && rsx_perf_x_on() && ((++s_x_cmd & 31u) == 0)) ? rsx_perf_now() : 0;
+             for (u32 i = 0; i < count; i++) {
+                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                 if (!dea) break;
+@@ -3433,7 +3496,9 @@
+                  * canonicalises with & 0x1FFC itself. */
+                 if (wdiag) { static int live = -1;
+                   if (live < 0) live = rsx_live_draw_enabled();
+-                  if (live) { rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); s_rsx_perf_methods++; } }
++                  if (live) { const long long xl0 = xs ? rsx_perf_now() : 0;   /* patch 2125 */
++                              rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); s_rsx_perf_methods++;
++                              if (xs) rsx_perf_add(RSX_PERF_X_METH_LIVE_T, rsx_perf_now() - xl0); } }
+                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
+                  * (subchannel, method) pairs dispatched since the last report --
+                  * what a frame is actually made of when nothing draws. */
+@@ -3488,16 +3553,23 @@
+                  * truncates them.  Reconstruct the full address the same way
+                  * the draw-engine call above does. */
+                 { const u32 mfull = (subch << 13) | m;
++                const long long xd0 = xs ? rsx_perf_now() : 0;   /* patch 2125 */
+                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                     cellGcmQueueUserCommand(vm_read32(dea));
+                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
+                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
+                 } else if (subch == 0 || (subch == 1 && !s1_2d && !gcm_subch1_nv0039(m))) {
+                     gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
++                    if (xs) { rsx_perf_add(RSX_PERF_X_METH_DISP_T, rsx_perf_now() - xd0); goto x_disp_done; }
+                 } else
+                     gcm_2d_method(subch, m, vm_read32(dea));
++                if (xs) { const long long xd = rsx_perf_now() - xd0;
++                          rsx_perf_add(RSX_PERF_X_METH_DISP_T, xd); rsx_perf_add(RSX_PERF_X_METH_D2_T, xd); }
++                x_disp_done:;
+                 }
+             }
++            if (xs) { rsx_perf_add(RSX_PERF_X_METH_LOOP_T, rsx_perf_now() - xs); rsx_perf_add(RSX_PERF_X_METH_SAMP_N, 1);
++                      rsx_perf_add(RSX_PERF_X_METH_SAMP_W, count); }
+             if (meth_t0) { rsx_perf_add(RSX_PERF_W_METH_T, rsx_perf_now() - meth_t0); rsx_perf_add(RSX_PERF_W_METH_CMD_N, 1); }
+             s_fifo_getoff += 4 + count * 4;
+             continue;
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2443,6 +2443,51 @@
+     f->ps_cb = g.ps_cb; f->ps_cb_mapped = g.ps_cb_mapped;
+     f->srv_heap = g.srv_heap; f->smp_heap = g.smp_heap;
+ }
++/* Patch 2125 (RSX_PERF_X=1): ld_flush split per part and per frame (the frame ends at the present flush), so the
++ * window-end report has mean, p99 and max per frame. Parts: fence wait, info-queue drain, retired-texture release,
++ * allocator reset, list reset. */
++enum { LD_FX_FENCE, LD_FX_INFO, LD_FX_REL, LD_FX_ALLOC, LD_FX_LIST, LD_FX_PARTS, LD_FX_FRAMES = 16384 };
++static long long g_ld_fx_cur[LD_FX_PARTS];
++static float g_ld_fx_frame[LD_FX_PARTS][LD_FX_FRAMES];
++static u32 g_ld_fx_n;
++static void ld_fx_add(int part, long long t0)
++{
++    if (!t0) return;
++    const long long dt = rsx_perf_now() - t0;
++    g_ld_fx_cur[part] += dt;
++    rsx_perf_add(RSX_PERF_X_FL_FENCE_T + part, dt);
++}
++static void ld_fx_frame_end(void)
++{
++    if (!rsx_perf_x_on()) { memset(g_ld_fx_cur, 0, sizeof g_ld_fx_cur); return; }
++    if (g_ld_fx_n < LD_FX_FRAMES) {
++        for (int p = 0; p < LD_FX_PARTS; p++) g_ld_fx_frame[p][g_ld_fx_n] = (float)g_ld_fx_cur[p];
++        g_ld_fx_n++;
++    }
++    memset(g_ld_fx_cur, 0, sizeof g_ld_fx_cur);
++}
++static int ld_fx_cmp(const void* a, const void* b)
++{
++    const float x = *(const float*)a, y = *(const float*)b;
++    return x < y ? -1 : x > y;
++}
++static void ld_fx_report(double tick_ms)
++{
++    if (!g_ld_fx_n) return;
++    static const char* const nm[LD_FX_PARTS] = { "fence", "info", "release", "alloc-reset", "list-reset" };
++    char line[768]; int o = snprintf(line, sizeof line, "[perf-x-flush] frames=%u ms/frame mean/p99/max:", g_ld_fx_n);
++    for (int p = 0; p < LD_FX_PARTS; p++) {
++        double s = 0; for (u32 i = 0; i < g_ld_fx_n; i++) s += g_ld_fx_frame[p][i];
++        qsort(g_ld_fx_frame[p], g_ld_fx_n, sizeof(float), ld_fx_cmp);
++        const u32 i99 = (u32)((g_ld_fx_n - 1) * 0.99);
++        o += snprintf(line + o, sizeof line - (size_t)o, " %s %.3f/%.3f/%.3f", nm[p], s / g_ld_fx_n * tick_ms,
++                      g_ld_fx_frame[p][i99] * tick_ms, g_ld_fx_frame[p][g_ld_fx_n - 1] * tick_ms);
++    }
++    fprintf(stderr, "%s\n", line);
++    g_ld_fx_n = 0;
++}
++#define LD_FX_T0(name) const long long name = rsx_perf_x_on() ? rsx_perf_now() : 0
++
+ /* Block until the queue fence reaches v. 0 on a D3D12 failure. */
+ static int ld_wait_fence(u64 v)
+ {
+@@ -3064,19 +3109,25 @@
+                (size_t)g.n_retired_textures * sizeof(f->retired[0]));
+         f->n_retired = g.n_retired_textures;
+         g.n_retired_textures = 0;
+-        if (!ld_wait_fence(g.fr[nxt].fence)) return;
+-        ld_drain_info_queue("flush");
+-        ld_fr_release_retired(nxt);
++        { LD_FX_T0(fx); if (!ld_wait_fence(g.fr[nxt].fence)) return; ld_fx_add(LD_FX_FENCE, fx); }   /* patch 2125 */
++        { LD_FX_T0(fx); ld_drain_info_queue("flush"); ld_fx_add(LD_FX_INFO, fx); }
++        { LD_FX_T0(fx); ld_fr_release_retired(nxt); ld_fx_add(LD_FX_REL, fx); }
+         ld_fr_load(nxt);
+-        g.alloc->lpVtbl->Reset(g.alloc);
+-        if (g.calloc) g.calloc->lpVtbl->Reset(g.calloc);   /* patch 2053 */
+-        g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE(); ld_gt_begin();   /* patches 2045, 2052 */
++        { LD_FX_T0(fx);
++          g.alloc->lpVtbl->Reset(g.alloc);
++          if (g.calloc) g.calloc->lpVtbl->Reset(g.calloc);   /* patch 2053 */
++          ld_fx_add(LD_FX_ALLOC, fx); }
++        { LD_FX_T0(fx);
++          g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE(); ld_gt_begin();   /* patches 2045, 2052 */
++          ld_fx_add(LD_FX_LIST, fx); }
++        ld_fx_frame_end();
+         g.upload_used = 0;
+         g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
+         g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */ g.smp_ring_used = 0;
+         ld_rb_drain();   /* patch 2027: frame N-1 is done */
+         return;
+     }
++    LD_FX_T0(fx_fence);   /* patch 2125 */
+     if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
+ #if defined(YZ_PERF_PROFILE)
+         const LONGLONG wait_begin = ld_profile_qpc();
+@@ -3105,19 +3156,27 @@
+         g_ld_profile.total.fence_reason_qpc[reason] += wait_ticks;
+ #endif
+     }
+-    ld_drain_info_queue("flush");
++    ld_fx_add(LD_FX_FENCE, fx_fence);
++    { LD_FX_T0(fx); ld_drain_info_queue("flush"); ld_fx_add(LD_FX_INFO, fx); }
+     /* Dynamic guest textures can replace a cached D3D resource while an
+      * earlier draw in this command list still references the old one.  The
+      * fence above is the first safe point at which those old resources may be
+      * released. */
++    { LD_FX_T0(fx);
+     for (u32 i = 0; i < g.n_retired_textures; i++)
+         g.retired_textures[i]->lpVtbl->Release(g.retired_textures[i]);
+     g.n_retired_textures = 0;
+     ld_fr_release_retired(0);
+     ld_fr_release_retired(1);
++    ld_fx_add(LD_FX_REL, fx); }
++    { LD_FX_T0(fx);
+     g.alloc->lpVtbl->Reset(g.alloc);
+     if (g.calloc) g.calloc->lpVtbl->Reset(g.calloc);   /* patch 2053 */
++    ld_fx_add(LD_FX_ALLOC, fx); }
++    { LD_FX_T0(fx);
+     g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE(); ld_gt_begin();   /* patches 2045, 2052 */
++    ld_fx_add(LD_FX_LIST, fx); }
++    if (reason == LD_FLUSH_PRESENT) ld_fx_frame_end();
+     g.upload_used = 0;
+     ld_rb_drain();   /* patch 2027 */
+ #if defined(YZ_PERF_PROFILE)
+@@ -3127,9 +3186,11 @@
+ #endif
+ }
+ 
++static void ld_tw_pool_tick(void);   /* patch 2125: LD_TEX_WATCH=2 */
+ /* RSX_PERF (patch 2007): time every submit, split by reason. */
+ static void ld_flush(ld_flush_reason reason)
+ {
++    if (reason == LD_FLUSH_PRESENT) ld_tw_pool_tick();
+     if (!rsx_perf_enabled()) { ld_flush_body(reason); return; }
+     const long long t0 = rsx_perf_now();
+     ld_flush_body(reason);
+@@ -3790,6 +3851,7 @@
+ #define LD_TW_MAX 16u
+ static struct { volatile uintptr_t lo, hi; u32 off; } g_ld_tw[LD_TW_MAX];
+ static volatile LONG g_ld_tw_n, g_ld_tw_logged;
++static int g_ld_tw_pool;   /* patch 2125: LD_TEX_WATCH=2 */
+ static LONG CALLBACK ld_tw_handler(PEXCEPTION_POINTERS xp)
+ {
+     const EXCEPTION_RECORD* er = xp->ExceptionRecord;
+@@ -3799,11 +3861,12 @@
+     const LONG n = g_ld_tw_n;
+     for (LONG i = 0; i < n && i < (LONG)LD_TW_MAX; i++) {
+         if (a < g_ld_tw[i].lo || a >= g_ld_tw[i].hi) continue;
+-        DWORD old;
+-        VirtualProtect((void*)(a & ~(uintptr_t)0xFFF), 0x1000, PAGE_READWRITE, &old);   /* one-shot: let it store */
++        DWORD old = 0;
++        if (!VirtualProtect((void*)(a & ~(uintptr_t)0xFFF), 0x1000, PAGE_READWRITE, &old) || old != PAGE_READONLY)
++            return EXCEPTION_CONTINUE_SEARCH;   /* patch 2125: not a page this watch protected (e.g. not committed yet) */
+         const u64 rip = (u64)xp->ContextRecord->Rip, rsp0 = *(const u64*)(uintptr_t)xp->ContextRecord->Rsp;
+         const u64 mod = (u64)(uintptr_t)GetModuleHandleA(NULL);
+-        if (InterlockedIncrement(&g_ld_tw_logged) <= 256)
++        if (InterlockedIncrement(&g_ld_tw_logged) <= (g_ld_tw_pool ? 4096 : 256))
+             fprintf(stderr, "[tex-watch] frame=%u guest=0:0x%08X span=0:0x%08X rip=0x%llX (exe+0x%llX) [rsp]=0x%llX"
+                             " (exe+0x%llX) tid=%lu\n", g_ld_frames, g_ld_tw[i].off + (u32)(a - g_ld_tw[i].lo),
+                     g_ld_tw[i].off, (unsigned long long)rip, (unsigned long long)(rip - mod),
+@@ -3812,6 +3875,40 @@
+     }
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
++/* Patch 2125 diagnostic, LD_TEX_WATCH=2: every 1024th presented frame from frame 1024, write-protect the local range
++ * LD_TEX_WATCH_RANGE=LO,HI (local offsets, default 0x0FF00000,0x10000000: the mip pool at the top of VRAM where round
++ * 75 saw untracked PPU stores) and log the first store into each 4 KB page since the arm ([tex-watch], up to 4096
++ * lines): which code writes texture pages, whether or not the bitmap missed it (=1 arms only on a detected miss). */
++static void ld_tw_pool_tick(void)
++{
++    static int on = -1; static u32 lo_off = 0x0FF00000u, hi_off = 0x10000000u;
++    if (on < 0) {
++        const char* e = getenv("LD_TEX_WATCH"); on = (e && e[0] == '2') ? 1 : 0;
++        const char* r = getenv("LD_TEX_WATCH_RANGE");
++        if (r) { unsigned a, b; if (sscanf(r, "%x,%x", &a, &b) == 2 && b > a) { lo_off = a; hi_off = b; } }
++        if (on) fprintf(stderr, "[tex-watch] pool mode: local 0x%08X-0x%08X every 1024 frames (patch 2125)\n", lo_off, hi_off);
++    }
++    if (!on || !g_ld_frames || (g_ld_frames & 1023u)) return;
++    static PVOID veh;
++    if (!veh) veh = AddVectoredExceptionHandler(1, ld_tw_handler);
++    u8* hp = (u8*)guest_ptr(0u, lo_off, hi_off - lo_off);
++    if (!veh || !hp) return;
++    g_ld_tw_pool = 1;
++    const uintptr_t lo = ((uintptr_t)hp + 0xFFF) & ~(uintptr_t)0xFFF, hi = ((uintptr_t)hp + (hi_off - lo_off)) & ~(uintptr_t)0xFFF;
++    if (!g_ld_tw_n) {
++        g_ld_tw[0].off = lo_off + (u32)(lo - (uintptr_t)hp); g_ld_tw[0].lo = lo; g_ld_tw[0].hi = hi;
++        InterlockedIncrement(&g_ld_tw_n);
++    }
++    /* page by page, committed read-write pages only (the local window is committed on demand) */
++    u32 np = 0, nskip = 0;
++    for (uintptr_t p = lo; p < hi; p += 0x1000) {
++        MEMORY_BASIC_INFORMATION mi; DWORD old;
++        if (VirtualQuery((void*)p, &mi, sizeof mi) == sizeof mi && mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE &&
++            VirtualProtect((void*)p, 0x1000, PAGE_READONLY, &old)) np++;
++        else nskip++;
++    }
++    fprintf(stderr, "[tex-watch] pool armed frame=%u span=0:0x%08X pages=%u skipped=%u\n", g_ld_frames, g_ld_tw[0].off, np, nskip);
++}
+ static void ld_tex_writer_report(u32 location, u32 offset, u32 span)
+ {
+     if (location != 0u || !ld_tex_writer_on() || !span) return;
+@@ -3833,7 +3930,7 @@
+             span, g_ld_tc_last_hash, g_ld_frames, newest,
+             after ? "tracked write lost between bitmap and entry" : "untracked writer", buf);
+     static int watch = -1;
+-    if (watch < 0) { const char* e = getenv("LD_TEX_WATCH"); watch = (e && e[0] && e[0] != '0') ? 1 : 0; }
++    if (watch < 0) { const char* e = getenv("LD_TEX_WATCH"); watch = (e && e[0] == '1') ? 1 : 0; }   /* 2125: =2 pool mode */
+     if (!watch || g_ld_tw_n >= (LONG)LD_TW_MAX) return;
+     static PVOID veh;
+     if (!veh) veh = AddVectoredExceptionHandler(1, ld_tw_handler);
+@@ -3987,6 +4084,7 @@
+ {
+     LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+     const double tick_ms = 1000.0 / (double)(qf.QuadPart ? qf.QuadPart : 1);
++    ld_fx_report(tick_ms);   /* patch 2125 */
+     for (int which = 0; which < 3; which++) {
+         ld_rd_t* r = g_ld_rd[which]; const u32 n = g_ld_rd_n[which];
+         const char* tag = which == 0 ? "redecode" : which == 1 ? "hash" : "newtex";
+@@ -9603,10 +9701,16 @@
+     if (!fp_uc) { LD_PSO_BAIL("fragment program address does not resolve to guest memory"); return NULL; }
+     u32 fp_size = 0; int fp_same = 0;   /* patch 2029 memo */
+     if (ld_pso_memo() && g_ld_fpm.size && g_ld_fpm.loc == fp_loc && g_ld_fpm.off == fp_off) {
++        LD_FX_T0(fx);   /* patch 2125 */
+         const u8* q = guest_ptr(fp_loc, fp_off, g_ld_fpm.size);
+         if (q && !memcmp(q, g_ld_fpm.bytes, g_ld_fpm.size)) { fp_size = g_ld_fpm.size; fp_same = 1; }
++        if (fx) { rsx_perf_add(RSX_PERF_X_FPCMP_T, rsx_perf_now() - fx); rsx_perf_add(RSX_PERF_X_FPCMP_N, 1);
++                  rsx_perf_add(RSX_PERF_X_FPCMP_B, g_ld_fpm.size); rsx_perf_add(RSX_PERF_X_FPCMP_HIT, fp_same); }
+     }
+-    if (!fp_same) fp_size = rsx_fp_program_size(fp_uc, 0x10000);
++    if (!fp_same) { LD_FX_T0(fx);   /* patch 2125 */
++        fp_size = rsx_fp_program_size(fp_uc, 0x10000);
++        if (fx) { rsx_perf_add(RSX_PERF_X_FPSZ_T, rsx_perf_now() - fx); rsx_perf_add(RSX_PERF_X_FPSZ_N, 1);
++                  rsx_perf_add(RSX_PERF_X_FPSZ_B, fp_size); } }
+     if (!fp_size) {
+         /* No END-bit instruction in 64 KB: the bytes at (location, offset) are
+          * not a fragment program. Almost always the LOCATION is wrong, not the
+@@ -9765,32 +9869,43 @@
+     LDW_T0(gp_t2);
+     render_state_t rs;
+     decode_render_state(&rs);
++    { LD_FX_T0(fx);   /* patch 2125 */
+     if (rsx_fp_collect_constants(
+             fp_uc, fp_size, &g.fp_constants) < 0) {
+         LD_PSO_BAIL("fragment program constant collection failed");
+         return NULL;
+     }
++    if (fx) { rsx_perf_add(RSX_PERF_X_FPCC_T, rsx_perf_now() - fx); rsx_perf_add(RSX_PERF_X_FPCC_N, 1); } }
+     g.fp_alpha_ref = rsx_fp_alpha_ref(
+         rs.alpha_ref_raw, rs.alpha_ref_format);
+ 
+     u64 vp_h;   /* patch 2029: FNV of the VP, memoized; also g_ld_current_pso.vp_hash */
+     {
+         const u32 vn = vp_instrs * 16;
+-        if (ld_pso_memo() && vn == g_ld_vpm.n && !memcmp(vp_uc, g_ld_vpm.bytes, vn)) {
++        LD_FX_T0(fx);   /* patch 2125: the compare, then the hash */
++        const int vhit = ld_pso_memo() && vn == g_ld_vpm.n && !memcmp(vp_uc, g_ld_vpm.bytes, vn);
++        if (fx) { rsx_perf_add(RSX_PERF_X_VPCMP_T, rsx_perf_now() - fx); rsx_perf_add(RSX_PERF_X_VPCMP_N, 1);
++                  rsx_perf_add(RSX_PERF_X_VPCMP_B, vn == g_ld_vpm.n ? vn : 0); rsx_perf_add(RSX_PERF_X_VPCMP_HIT, vhit); }
++        if (vhit) {
+             vp_h = g_ld_vpm.h;
+             if (rsx_perf_walk_on()) rsx_perf_add(RSX_PERF_W_PSO_MEMO_N, 1);
+         } else {
++            LD_FX_T0(fh);
+             vp_h = fnv1a(vp_uc, vn, 1469598103934665603ull);
+             if (ld_pso_memo() && vn <= sizeof g_ld_vpm.bytes) {
+                 g_ld_vpm.n = vn; g_ld_vpm.h = vp_h; memcpy(g_ld_vpm.bytes, vp_uc, vn);
+             }
++            if (fh) { rsx_perf_add(RSX_PERF_X_VPH_T, rsx_perf_now() - fh); rsx_perf_add(RSX_PERF_X_VPH_N, 1);
++                      rsx_perf_add(RSX_PERF_X_VPH_B, vn); }
+         }
+     }
+     u64 key = vp_h;
+     const u32 fp_hmode = ld_fp_constants_buffered() ? 1u : 2u;
+     if (fp_same && g_ld_fpm.hvalid && g_ld_fpm.hmode == fp_hmode && g_ld_fpm.hseed == key) {
+         key = g_ld_fpm.h;
++        if (rsx_perf_x_on()) rsx_perf_add(RSX_PERF_X_FPH_HIT, 1);   /* patch 2125 */
+     } else {
++        LD_FX_T0(fx);   /* patch 2125 */
+         const u64 seed = key;
+         if (fp_hmode == 1u)
+             key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+@@ -9799,6 +9914,8 @@
+         if (ld_pso_memo() && g_ld_fpm.size == fp_size && g_ld_fpm.loc == fp_loc && g_ld_fpm.off == fp_off) {
+             g_ld_fpm.hvalid = 1; g_ld_fpm.hmode = fp_hmode; g_ld_fpm.hseed = seed; g_ld_fpm.h = key;
+         }
++        if (fx) { rsx_perf_add(RSX_PERF_X_FPH_T, rsx_perf_now() - fx); rsx_perf_add(RSX_PERF_X_FPH_N, 1);
++                  rsx_perf_add(RSX_PERF_X_FPH_B, fp_size); }
+     }
+     if (!key) {
+         LD_PSO_BAIL("shader hash collapsed to zero");
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -264,9 +264,26 @@
+      * guest bytes written */
+     RSX_PERF_W_NV3089_N, RSX_PERF_W_NV3089_T, RSX_PERF_W_NV3089_GPU_T, RSX_PERF_W_NV3089_COPY_T,
+     RSX_PERF_W_NV3089_ROWS_N, RSX_PERF_W_NV3089_BYTES,
++    /* patch 2125 (RSX_PERF_X=1, inside the window): exclusive counters, none nested in another 2125 timer.
++     * Method loop: commands timed (1 in 32), their whole-loop ticks, the ticks inside rsx_live_draw_method and
++     * inside the final dispatch (gcm_3d/2d_method, flip, user command); loop exclusive = loop - live - disp. */
++    RSX_PERF_X_METH_SAMP_N, RSX_PERF_X_METH_SAMP_W, RSX_PERF_X_METH_LOOP_T, RSX_PERF_X_METH_LIVE_T,
++    RSX_PERF_X_METH_DISP_T, RSX_PERF_X_METH_D2_T,   /* D2: the part of DISP that is not gcm_3d_method (2D engines, flip, user cmd) */
++    RSX_PERF_X_CAL_DUMMY,                           /* the calibration's stand-in for the per-word adds */
++    /* ld_flush split: fence wait, info-queue drain, retired-texture release, allocator reset, list reset */
++    RSX_PERF_X_FL_FENCE_T, RSX_PERF_X_FL_INFO_T, RSX_PERF_X_FL_REL_T, RSX_PERF_X_FL_ALLOC_T, RSX_PERF_X_FL_LIST_T,
++    /* program identity in ld_pso: FP memo compare, FP size scan, VP memo compare, VP FNV, FP key hash
++     * (ticks, calls, bytes) and memo hits */
++    RSX_PERF_X_FPCMP_T, RSX_PERF_X_FPCMP_N, RSX_PERF_X_FPCMP_B, RSX_PERF_X_FPCMP_HIT,
++    RSX_PERF_X_FPSZ_T, RSX_PERF_X_FPSZ_N, RSX_PERF_X_FPSZ_B,
++    RSX_PERF_X_VPCMP_T, RSX_PERF_X_VPCMP_N, RSX_PERF_X_VPCMP_B, RSX_PERF_X_VPCMP_HIT,
++    RSX_PERF_X_VPH_T, RSX_PERF_X_VPH_N, RSX_PERF_X_VPH_B,
++    RSX_PERF_X_FPH_T, RSX_PERF_X_FPH_N, RSX_PERF_X_FPH_B, RSX_PERF_X_FPH_HIT,
++    RSX_PERF_X_FPCC_T, RSX_PERF_X_FPCC_N,   /* rsx_fp_collect_constants (a scan of the FP on every draw) */
+     RSX_PERF_COUNT
+ };
+ int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
++int       rsx_perf_x_on(void);                 /* patch 2125: RSX_PERF_X=1 and inside the window */
+ void      rsx_live_draw_perf_dump(void);       /* patch 2045: [perf-redecode] when the window closes */
+ void      rsx_live_draw_submit_pending(void);  /* patch 2029: submit recorded work, no wait */
+ int       rsx_perf_enabled(void);

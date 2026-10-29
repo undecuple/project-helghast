@@ -2,6 +2,11 @@
 
 Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR273 queues the command, the pending-slot handoff wait kept.
 
+Spu pass 118: counters for the handoff wait (one [usercmd-wait] line per 10 s of walker user commands; KZ3_USERCMD_STATS=0
+off): calls, collisions (the slot still pending on entry), total and max wait in ms, replaced commands. Clean-room note:
+the behaviour facts behind the one-slot handoff (one pending cause, the RSX does not run ahead of an unserviced user
+interrupt) come from the discussions of RPCS3 PRs #19549 and #19732 (GPL-2.0); no RPCS3 code was read or copied.
+
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
@@ -51,7 +56,7 @@ diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
                      continue;
                  }
                  /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
-@@ -3657,6 +3663,28 @@ void cellGcmSetUserCommand(u32 cmd)
+@@ -3657,6 +3663,53 @@ void cellGcmSetUserCommand(u32 cmd)
  /* Called when a FIFO consumer retires a user-interrupt method. Publishing
   * the cause and pending marker is atomic; guest code runs later in the pump.
   * Like the driver cause register, multiple pending commands coalesce. */
@@ -59,8 +64,31 @@ diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 + * walker can issue the next before a pump has delivered the previous one. Give
 + * the pump up to ~50 ms to take it (the RSX does not run ahead of an unserviced
 + * interrupt either), then report and overwrite. */
++/* Spu pass 118: counters for the wait below, one [usercmd-wait] line per 10 s (KZ3_USERCMD_STATS=0 off): walker
++ * user commands n, collisions (slot still pending on entry), total and max wait in ms, replaced (not taken in 50 ms).
++ * t = ms on ps3_ms_now's clock. ASSUMPTION: one FIFO walker thread calls this, so plain statics suffice. */
++static void gcm_usercmd_stats(int coll, u64 wait_ns, int replaced)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("KZ3_USERCMD_STATS"); on = !(e && *e == '0'); }
++    if (!on) return;
++    static u64 t0, n, nc, nr, tot, mx, all_n, all_c, all_r;
++    const u64 now = get_timestamp_ns();
++    if (!t0) t0 = now;
++    n++; nc += coll != 0; nr += replaced != 0; tot += wait_ns; if (wait_ns > mx) mx = wait_ns;
++    if (now - t0 >= 10000000000ull) {
++        all_n += n; all_c += nc; all_r += nr;
++        fprintf(stderr, "[usercmd-wait] t=%llu n=%llu coll=%llu replaced=%llu wait_ms=%.3f max_ms=%.3f "
++                "all_n=%llu all_coll=%llu all_replaced=%llu\n", ps3_ms_now(), (unsigned long long)n,
++                (unsigned long long)nc, (unsigned long long)nr, tot / 1e6, mx / 1e6, (unsigned long long)all_n,
++                (unsigned long long)all_c, (unsigned long long)all_r);
++        t0 = now; n = nc = nr = tot = mx = 0;
++    }
++}
 +static void gcm_walker_user_command(u32 cmd)
 +{
++    const int coll = GCM_USER_PENDING_PEEK() != 0;   /* pass 118 counters */
++    const u64 w0 = coll ? get_timestamp_ns() : 0;
 +    for (int spin = 0; spin < 50; spin++) {
 +        if (!GCM_USER_PENDING_PEEK()) break;
 +#ifdef _WIN32
@@ -72,6 +100,8 @@ diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 +    { u64 old = GCM_USER_PENDING_PEEK(); static int n = 0;
 +      if (old && n++ < 8) fprintf(stderr, "[usercmd] pending 0x%08X not taken in 50 ms; replaced by 0x%08X\n",
 +                                  (u32)old, cmd); }
++    /* replaced = still pending now (a re-read; the [usercmd] line above is the exact record) */
++    gcm_usercmd_stats(coll, coll ? get_timestamp_ns() - w0 : 0, GCM_USER_PENDING_PEEK() != 0);
 +    { static unsigned long n = 0; if (n++ < 4 || (n % 1024) == 0)
 +        fprintf(stderr, "[usercmd] HLE #%lu cmd=0x%08X\n", n, cmd); }
 +    cellGcmQueueUserCommand(cmd);

@@ -1,0 +1,51 @@
+diff -ruN a/libs/video/rsx_d3d12_device.h b/libs/video/rsx_d3d12_device.h
+--- a/libs/video/rsx_d3d12_device.h
++++ b/libs/video/rsx_d3d12_device.h
+@@ -59,6 +59,7 @@
+ 
+ #ifdef _WIN32
+ #include <stdlib.h>
++#include <dxgi1_6.h>   /* RSX pass 125: IDXGIFactory6::EnumAdapterByGpuPreference */
+ 
+ /* One "[d3d12] device" line: who, how it was made, the adapter and the capabilities that matter. -> the adapter's
+  * DXGI_ADAPTER_FLAG_SOFTWARE (-1 = unknown). */
+@@ -120,6 +121,39 @@
+     if (bad) fprintf(stderr, "[d3d12] RSX_D3D12_WARP=%s not understood (1 = WARP only, 0 = never): auto\n", getenv("RSX_D3D12_WARP"));
+     HRESULT hw = E_FAIL;
+     if (rsx_warp_try_hw(mode)) {
++        /* RSX pass 125 (found by KZ2 in a player's logs, Pyrrhus issue 13: "live renderer, default adapter: Intel Arc" on a
++         * laptop with an RTX 4070): D3D12CreateDevice(NULL) takes Windows' default adapter, which on a hybrid laptop is
++         * the integrated GPU. First ask DXGI for the high-performance order (IDXGIFactory6::EnumAdapterByGpuPreference:
++         * external, then discrete, then integrated), skipping software adapters; log every adapter, each result and the
++         * chosen LUID. CELLMARK_IGPU asks for the low-power order (the backend's old A/B switch). The default adapter
++         * and WARP stay as the fallbacks. */
++        IDXGIFactory6* f6 = NULL;
++        if (f && SUCCEEDED(f->lpVtbl->QueryInterface(f, &IID_IDXGIFactory6, (void**)&f6)) && f6) {
++            const DXGI_GPU_PREFERENCE pref = getenv("CELLMARK_IGPU") ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
++                                                                      : DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
++            IDXGIAdapter1* ad = NULL;
++            for (UINT ai = 0; !*out && f6->lpVtbl->EnumAdapterByGpuPreference(f6, ai, pref, &IID_IDXGIAdapter1,
++                                                                             (void**)&ad) != DXGI_ERROR_NOT_FOUND; ai++) {
++                DXGI_ADAPTER_DESC1 d;
++                if (FAILED(ad->lpVtbl->GetDesc1(ad, &d))) { ad->lpVtbl->Release(ad); continue; }
++                const int soft = (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
++                HRESULT chr = soft ? S_FALSE : D3D12CreateDevice((IUnknown*)ad, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)out);
++                fprintf(stderr, "[d3d12] %s: adapter #%u (%s order) \"%ls\" vendor=0x%04X device=0x%04X flags=0x%X "
++                                "LUID=%08lX:%08lX vram=%llu MB: %s hr=0x%08lX\n", who, ai,
++                        pref == DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE ? "high-performance" : "minimum-power", d.Description,
++                        d.VendorId, d.DeviceId, d.Flags, (unsigned long)d.AdapterLuid.HighPart, (unsigned long)d.AdapterLuid.LowPart,
++                        (unsigned long long)(d.DedicatedVideoMemory >> 20),
++                        soft ? "software, skipped" : (SUCCEEDED(chr) && *out) ? "CHOSEN" : "D3D12CreateDevice failed", (unsigned long)chr);
++                if (!(SUCCEEDED(chr) && *out && !soft)) *out = NULL;
++                ad->lpVtbl->Release(ad);
++                ad = NULL;
++            }
++            f6->lpVtbl->Release(f6);
++            if (*out) {
++                rsx_d3d12_log_device(*out, f, who, "high-performance adapter");
++                return 0;
++            }
++        }
+         hw = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)out);
+         if (SUCCEEDED(hw) && *out) {
+             rsx_d3d12_log_device(*out, f, who, "default adapter");

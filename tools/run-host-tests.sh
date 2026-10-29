@@ -7,6 +7,8 @@
 #          list order, whatever order the tests finish in. Every test writes only to its own output dir (a mktemp
 #          dir or a dir named after the test) and reads the shared toolkit work/ps3recomp-patched without writing it,
 #          so tests may run side by side; a new test must keep that rule.
+#   Rows also listed in tools/host-tests-linux.txt need a Linux host (compiler, bwrap, /proc, symlinks): on another OS
+#   (Git Bash, MSYS, macOS) they are skipped, not failed.
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 GH=0; Q=0; J=1
@@ -23,13 +25,17 @@ done
 
 D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT
 tests=()
+LINUX_ONLY=" "
+case "$(uname -s 2>/dev/null)" in Linux) ;; *)
+  [[ -f tools/host-tests-linux.txt ]] && LINUX_ONLY=" $(grep -vE '^\s*(#|$)' tools/host-tests-linux.txt | tr -d '\r' | tr '\n' ' ') ";; esac
 while read -r t; do
   [[ -z "$t" || "$t" == \#* ]] && continue
-  # A test whose file is not in this tree is skipped when the developer-only tools are absent (merge-lane.sh is the
+  # A test whose file is not in this tree is skipped when the developer-only tools are absent (a developer-only tool is the
   # marker); in a full developer checkout a missing test is a failure.
   if [[ ! -e "$t" && ! -e tools/agents/merge-lane.sh ]]; then
     (( Q )) || echo "skip $t (private tooling, not exported)"; continue
   fi
+  if [[ "$LINUX_ONLY" == *" $t "* ]]; then (( Q )) || echo "skip $t (needs a Linux host)"; continue; fi
   tests+=("$t")
 done < tools/host-tests.txt
 

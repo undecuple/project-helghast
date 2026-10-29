@@ -14,7 +14,7 @@ on Windows' software renderer (2026-10-22); a full first-run build on Windows 10
 
 There are two ways to get a build:
 
-- **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.5<!-- /version --> pre-release.** It checks your disc dump and
+- **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.6<!-- /version --> pre-release.** It checks your disc dump and
   the 1.14 update, then lifts and compiles the game's code on your machine with a bundled compiler, behind one
   progress bar, with a full install log.
 - **A developer build from source with Nix**, described below: on Linux (how the port is developed and tested
@@ -146,6 +146,12 @@ steps unchanged but has not been run on WSL2 yet.**
    double-clicking `kz3.exe` does the same (see [Running](#running)). You need an NVIDIA GPU with Direct3D 12
    and a current driver.
 
+Building from a Windows shell without WSL2 (for example Git Bash) is not a supported path. If you try it anyway:
+set `git config --global core.autocrlf false` **before** cloning (with `true`, Git rewrites line endings in the
+ps3recomp submodule and the patches no longer apply), and make sure `python3` is a real Python 3 and not the
+Microsoft Store alias (Settings > Apps > Advanced app settings > App execution aliases, turn the `python3` entry
+off, or install Python from python.org).
+
 The installer does all of this on Windows without WSL2 or Nix (a bundled compiler; see the releases page).
 Do not install or build inside a OneDrive folder (it syncs the build's thousands of files while they are written), and keep your game files on this device (in OneDrive: "Always keep on this device"); the installer and the first-run check refuse both.
 
@@ -215,7 +221,8 @@ nix develop .#ci --command bash -c 'tools/ps3recomp-patched.sh && tools/run-host
 
 These are the checks CI runs on every push: shell lint, every patch applies to the pinned ps3recomp, and the host
 tests in `tools/host-tests.txt` (runtime fixes, the SPU tools, the release tools). They need no game data and no GPU.
-Graphics tests that need Direct3D 12 are built by `tools/smoke/build-host.sh` and run under Proton with
+They are written for Linux (CI runs them there): many compile a small C harness or use bubblewrap, so on Windows
+use WSL2 for them. Graphics tests that need Direct3D 12 are built by `tools/smoke/build-host.sh` and run under Proton with
 `tools/proton-test.sh`.
 
 An index of the scripts and folders in `tools/` is in [tools/README.md](../tools/README.md).

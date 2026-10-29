@@ -1085,6 +1085,7 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
     gargv = game_argv(root, paths, extra)
     note(root, f"kz3.ini: {write_game_ini(root, game_ini(root, paths, ini['portable'], environ))}")
     note(root, "game: " + " ".join(gargv) + f" (cwd {cwd}; the game's log is in build\\logs)")
+    fr.place_lang(root, os.path.dirname(gargv[0]))
     fr.place_fonts(root, os.path.dirname(gargv[0]))     # the notice fonts next to kz3.exe (RSX pass 38)
     fr.place_sdl3(root, os.path.dirname(gargv[0]))      # SDL3.dll next to kz3.exe: native pads (patch 4010)
     os.makedirs(cwd, exist_ok=True)

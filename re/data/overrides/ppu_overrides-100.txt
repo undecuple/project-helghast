@@ -156,3 +156,4 @@
 0031FB8C  # name-table lookup(table, &name, 1) -> object: KZ3_RAIL_PROBE=1 only from SetPath (lr 0x385A10) / CreateMover (lr 0x845D88) [100-only: diagnostic probe, SPU pass 65; 1.14 twin 0032BDBC not wired]
 00845D50  # CreateMover Lua native (row 0x13B5D84, OPD 0x1316830): KZ3_RAIL_PROBE=1 type name + new mover [100-only: diagnostic probe, SPU pass 65; 1.14 twin 00868740 not wired]
 001FB8F8  # BuildPost: Bloom strength (patch 2121, vp+0x230 scaled after the original; KZ3_BLOOM / display.ini bloom), RSX pass 114 [114=00207248 high]
+004C4C78  # GetLanguage(profile) = [profile+0xE90] or the mapped system language: result goes to the port UI text lookup (kz3_tr_note_lang, network pass 45; the RE notes 173.2) [114=004D10A4 high]

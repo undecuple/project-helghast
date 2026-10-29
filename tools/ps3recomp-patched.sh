@@ -9,6 +9,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 SUB=third_party/ps3recomp
 PT="${KZ3_PATCHED_DIR:-work/ps3recomp-patched}"   # override for tests only
+source "$ROOT/tools/pyresolve.sh"   # PY: python3, else py -3, else python (never the Microsoft Store alias)
+
+# Refuse early when git's autocrlf rewrote line endings in the checkout (Git for Windows default core.autocrlf=true):
+# the patches carry LF/CRLF context byte for byte, so git apply would fail much later with a confusing hunk error.
+# `git ls-files --eol` shows the stored (i/) and the working-tree (w/) ending; a mismatch is the autocrlf rewrite.
+# (Files that are CRLF in the repository itself, i/crlf w/crlf, are fine.) Skipped when git cannot tell.
+crlf_bad="$( { git -C "$SUB" ls-files --eol 2>/dev/null; git ls-files --eol port/patches 2>/dev/null; } |
+  awk '($1=="i/lf" && $2=="w/crlf") || ($1=="i/crlf" && $2=="w/lf") {n++} END {print n+0}')"
+if [[ "${crlf_bad:-0}" != 0 ]]; then
+  echo "ps3recomp-patched: $crlf_bad file(s) in third_party/ps3recomp or port/patches have different line endings than the repository stores" >&2
+  echo "  (git's core.autocrlf rewrote them). The patches would not apply. Fix: git config --global core.autocrlf false," >&2
+  echo "  then re-clone, or in this clone: git rm --cached -r -q . && git reset --hard (and the same inside third_party/ps3recomp)." >&2
+  exit 2
+fi
 
 # Build the patched tree in a scratch copy, then sync it into $PT replacing only files whose content changed, so
 # unchanged files keep their mtimes and the build recompiles only what the patch set really changed (2026-10-09:
@@ -28,7 +42,7 @@ for p in port/patches/*.patch; do
   echo "applied $p"
 done
 mkdir -p "$PT"
-python3 - "$NEW" "$PT" <<'PY'
+$PY - "$NEW" "$PT" <<'PY'
 import filecmp, os, shutil, sys
 new, pt = sys.argv[1:]
 changed = removed = 0

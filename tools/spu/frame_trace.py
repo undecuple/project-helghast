@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-frame timeline from a KZ3_FRAME_TRACE file (port/spu/kz3_frame_trace.c, runtime patch 1085; SPU pass 66).
 
-    python3 tools/spu/frame_trace.py work/proton/RUN/app/frametrace.bin [--release-img 244] [--frames N]
+    python3 tools/spu/frame_trace.py work/proton/RUN/app/frametrace.bin [--release-img 244] [--top N]
 
 Prints, averaged per frame (flip to flip): the walker's GCM park and what released it (the job call that ended last
 before the release, normally job 36 Gfx.Post.Unlock = image 244), how many SPU threads ran a job during the park,
@@ -15,7 +15,8 @@ import struct
 import sys
 
 KIND = {0: "hle", 1: "sc", 2: "usleep", 3: "label", 4: "ksleep", 5: "pmrun", 6: "job", 7: "kgap", 8: "kskip",
-        9: "park", 32: "flip", 33: "jobcall", 34: "ucmd-queue", 35: "ucmd-deliver"}
+        9: "park", 32: "flip", 33: "jobcall", 34: "ucmd-queue", 35: "ucmd-deliver",
+        36: "jobcall-depth", 37: "jobcall-lost"}
 
 
 def load(path):
@@ -96,6 +97,13 @@ def main():
     tot = sum(sum(v) for v in js.values())
     print("total job calls %.0f per frame, %.1f SPU-ms per frame over %d SPU threads" %
           (sum(len(v) for v in js.values()) / nf, per_frame(tot), len(spu_thr)))
+    # pass 121 (patch 1141): the bracket closes regardless of host depth; kind 36 marks the closes the old depth test
+    # lost (an interrupt inside the job call returned at another depth), kind 37 a job call that never closed
+    nd = collections.Counter(e[2] & 0xFFFF for e in ev if e[3] == 36 and f0 <= e[1] <= f1)
+    nl = sum(1 for e in ev if e[3] == 37 and f0 <= e[1] <= f1)
+    if nd or nl or any(e[3] == 36 for e in ev):
+        print("bracket: %d job calls closed at another host depth (dropped before pass 121: %s), %d never closed" %
+              (sum(nd.values()), ", ".join("img %d x%d" % kv for kv in nd.most_common(5)) or "-", nl))
     for img, v in sorted(js.items(), key=lambda kv: -sum(kv[1]))[:a.top]:
         v.sort()
         print("  img %3d  %6.1f/frame  %7.1f us  p90 %7.1f us  %6.2f ms/frame" %

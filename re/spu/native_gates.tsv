@@ -1,0 +1,15 @@
+# Native gates (SPU pass 122; KZ2's native_gates.tsv design): lifted SPU functions that hand over to a native host
+# implementation (port/spu/kz3_native_post.c, kz3_native_dof.c) when their env flag is set. tools/spu/lift_spu.py
+# native_gates() inserts the gate as the first statement of each listed function; the slot indexes
+# g_kz3_native_gate[] (defined once in port/spu/kz3_native_jobs.c). A gate returns 1 when it ran the whole subroutine
+# (the lifted body is skipped, the function returns to its link as `bi $r0`), 0 to run the lifted body. Rows are keyed
+# by lifted image name + LS address; the 1.00 twins (byte-identical modules, re/data/spu_map_114.tsv) have their own rows.
+# image	addr	slot	job	env	what
+job_011f9c80	0x4D00	0	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
+job_0117d880	0x4D00	1	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
+job_011f7d00	0x4D00	2	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
+job_0117b900	0x4D00	3	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
+job_011d4680	0x4DD0	4	Gfx.Post.Upsample	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
+job_01158280	0x4DD0	5	Gfx.Post.Upsample	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
+job_011f9c80	0x5780	6	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOF	unpack RGBM-style pixels to float4 times the per-pixel weight (4 pixels a step)
+job_0117d880	0x5780	7	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOF	unpack RGBM-style pixels to float4 times the per-pixel weight (4 pixels a step)

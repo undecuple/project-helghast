@@ -1,0 +1,135 @@
+KZ3 patch 4027 (network pass 45): the Keyboard page's own text in the game's language. The page lines the pad library
+builds (the idle hint "Enter change, Delete clear, ...", the capture / timeout / conflict status, the labels of the rows
+the game has no word for: the eight stick directions, Pause, Back) go through PAD_KB_TR(key, en): cellPad.c points it
+at g_pad_kb_tr, which port/net/kz3_discord.c sets to the port's lookup (port/net/kz3_tr.h kz3_tr, keys kb.* of
+port/text/port_ui.tsv); NULL or any other includer of pad_keybinds.h keeps the English text. {0}..{2} are filled by
+pad_kb_fmt (the lookup refuses a translation whose placeholders differ from the English text's).
+
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -22,6 +22,12 @@
+ #include "pad_menu_mouse.h"
+ #include "pad_mouse.h"
+ #include "pad_kbport.h"   /* KZ3 patch 4026 */
++
++/* KZ3 patch 4027 (network pass 45): the Keyboard page's own text in the game's language through the port's lookup
++ * (port/net/kz3_tr.h kz3_tr, set by port/net/kz3_discord.c at start); NULL = English. Before every include of
++ * pad_keybinds.h (POSIX and Windows paths below). */
++const char* (*g_pad_kb_tr)(const char* key, const char* en) = NULL;
++#define PAD_KB_TR(key, en) (g_pad_kb_tr ? g_pad_kb_tr((key), (en)) : (en))
+ unsigned (*g_pad_menu_bits_hook)(unsigned pad_buttons, int pad_active) = NULL;
+ /* KZ3 patch 2106: a game menu has the focus, so the "back" keys (Esc) are menu Back (pad_keybinds.h pad_kb_eval). Only
+  * when the port tracks the game's menus (2098's hook installed: a GUM context was found for this EBOOT); otherwise
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -627,6 +627,27 @@
+  * player's language and active preset; pass 38); `label` is the port's own fallback (file comments, host tests) and
+  * the page text for the eight stick directions and Start, which have no string of their own in the game. */
+ typedef struct { const char* input; const char* label; const char* button; } PadKbRow;
++
++/* KZ3 patch 4027 (network pass 45): the page text in the game's language. PAD_KB_TR(key, en) gives the text for a key of
++ * the port's table (port/text/port_ui.tsv: kb.row.<input>, kb.hint_*, kb.capture, kb.timeout, kb.conflict) or `en`;
++ * cellPad.c points it at the port's lookup (g_pad_kb_tr), everything else keeps English. {0}..{2} are filled by
++ * pad_kb_fmt. */
++#ifndef PAD_KB_TR
++#define PAD_KB_TR(key, en) (en)
++#endif
++static void pad_kb_fmt(char* out, size_t n, const char* t, const char* a0, const char* a1, const char* a2)
++{
++    const char* a[3] = { a0 ? a0 : "", a1 ? a1 : "", a2 ? a2 : "" };
++    size_t w = 0;
++    if (!n) return;
++    for (; t && *t; t++) {
++        if (t[0] == '{' && t[1] >= '0' && t[1] <= '2' && t[2] == '}') {
++            for (const char* s = a[t[1] - '0']; *s && w + 1 < n; s++) out[w++] = *s;
++            t += 2;
++        } else if (w + 1 < n) out[w++] = *t;
++    }
++    out[w] = 0;
++}
+ static const PadKbRow pad_kb_rows[] = {
+     { "ls_up", "Move forward", 0 },       { "ls_down", "Move back", 0 },
+     { "ls_left", "Strafe left", 0 },      { "ls_right", "Strafe right", 0 },
+@@ -643,6 +664,18 @@
+     { "back", "Back (menus)", 0 },        /* patch 2106 */
+ };
+ #define PKB_N_ROWS ((int)(sizeof pad_kb_rows / sizeof pad_kb_rows[0]))
++static const char* pad_kb_rows_button_of(int r) { return pad_kb_rows[r].button; }   /* 4027 */
++static const char* pad_kb_rows_label_of(int r) { return pad_kb_rows[r].label; }
++static const char* pad_kb_rows_input_of(int r) { return pad_kb_rows[r].input; }
++/* A row's label: the port's text for the rows the game has no word for (sticks, Start, Back), else the English
++ * fallback (the page shows the game's own action name for button rows). */
++static const char* pad_kb_row_label(int r)
++{
++    char key[40];
++    if (pad_kb_rows_button_of(r)) return pad_kb_rows_label_of(r);
++    snprintf(key, sizeof key, "kb.row.%s", pad_kb_rows_input_of(r));
++    return PAD_KB_TR(key, pad_kb_rows_label_of(r));
++}
+ 
+ #define PKB_VK_CANCEL 0x1B      /* Escape: cancels a capture (so the page cannot bind it; the file can) */
+ #define PKB_VK_CLEAR  0x2E      /* Delete: clears the slot being captured */
+@@ -807,15 +840,30 @@
+     size_t m;
+     if (pad_kb_ui_key_of(kb, "back", PKB_VK_CANCEL)) bk = pad_kb_ui_key_of(kb, "back", PKB_VK_CANCEL);   /* 2106: menu Back */
+     else if (bk != PKB_VK_CANCEL) bk = pad_kb_ui_key_of(kb, "circle", 0);    /* the page's Back is Circle, and Start */
+-    snprintf(out, n, "%s%s", ch ? pad_kb_key_short(ch) : "", ch ? " change, " : "");
++    char part[160];
++    out[0] = 0;
++    if (ch) {   /* 4027: each part in the game's language */
++        pad_kb_fmt(part, sizeof part, PAD_KB_TR("kb.hint_change", "{0} change"), pad_kb_key_short(ch), 0, 0);
++        snprintf(out, n, "%s, ", part);
++    }
+     m = strlen(out);
+-    snprintf(out + m, n - m, "Delete clear, ");
++    snprintf(out + m, n - m, "%s, ", PAD_KB_TR("kb.hint_clear", "Delete clear"));
+     m = strlen(out);
+-    if (l && r) { snprintf(cs, sizeof cs, "%s", pad_kb_key_short(l)); snprintf(out + m, n - m, "%s / %s column, ", cs, pad_kb_key_short(r)); }
++    if (l && r) {
++        snprintf(cs, sizeof cs, "%s", pad_kb_key_short(l));
++        pad_kb_fmt(part, sizeof part, PAD_KB_TR("kb.hint_column", "{0} / {1} column"), cs, pad_kb_key_short(r), 0);
++        snprintf(out + m, n - m, "%s, ", part);
++    }
+     m = strlen(out);
+-    if (rs) snprintf(out + m, n - m, "%s reset, ", pad_kb_key_short(rs));
++    if (rs) {
++        pad_kb_fmt(part, sizeof part, PAD_KB_TR("kb.hint_reset", "{0} reset"), pad_kb_key_short(rs), 0, 0);
++        snprintf(out + m, n - m, "%s, ", part);
++    }
+     m = strlen(out);
+-    if (bk) snprintf(out + m, n - m, "%s back, ", pad_kb_key_short(bk));
++    if (bk) {
++        pad_kb_fmt(part, sizeof part, PAD_KB_TR("kb.hint_back", "{0} back"), pad_kb_key_short(bk), 0, 0);
++        snprintf(out + m, n - m, "%s, ", part);
++    }
+     m = strlen(out);
+     if (m >= 2 && out[m - 2] == ',') { out[m - 2] = '.'; out[m - 1] = 0; }
+ }
+@@ -882,7 +930,7 @@
+     }
+     in = pad_kb_row_input(r);
+     if (!strcmp(verb, "rows")) { snprintf(out, n, "%d", PKB_N_ROWS); return 0; }
+-    if (!strcmp(verb, "label")) { snprintf(out, n, "%s", in >= 0 ? pad_kb_rows[r].label : ""); return 0; }
++    if (!strcmp(verb, "label")) { snprintf(out, n, "%s", in >= 0 ? pad_kb_row_label(r) : ""); return 0; }   /* 4027 */
+     if (!strcmp(verb, "src")) { snprintf(out, n, "%s", in >= 0 && pad_kb_rows[r].button ? pad_kb_rows[r].button : ""); return 0; }
+     if (!strcmp(verb, "key") || !strcmp(verb, "dup")) {
+         if (in < 0 || s < 0 || s >= PKB_SLOTS) { snprintf(out, n, verb[0] == 'k' ? "?" : ""); return 0; }
+@@ -944,10 +992,14 @@
+     if (!strcmp(verb, "hint")) { pad_kb_ui_hint(kb, out, n); return 0; }
+     if (!strcmp(verb, "caphint")) { snprintf(out, n, "Esc cancels, Delete clears."); return 0; }
+     if (!strcmp(verb, "status")) {
+-        if (u->phase != PKB_UI_IDLE)
+-            snprintf(out, n, "Press a key for %s. Esc cancels, Delete clears.", pad_kb_rows[u->row].label);
+-        else if (u->result == PKB_R_TIMEOUT) snprintf(out, n, "No key pressed: unchanged.");
+-        else if (k) snprintf(out, n, "%s is bound to both %s and %s.", pad_kb_key_short(k), pad_kb_rows[ca].label, pad_kb_rows[cb].label);
++        if (u->phase != PKB_UI_IDLE)   /* 4027: in the game's language */
++            pad_kb_fmt(out, n, PAD_KB_TR("kb.capture", "Press a key for {0}. Esc cancels, Delete clears."), pad_kb_row_label(u->row), 0, 0);
++        else if (u->result == PKB_R_TIMEOUT) snprintf(out, n, "%s", PAD_KB_TR("kb.timeout", "No key pressed: unchanged."));
++        else if (k) {
++            char ks[48];
++            snprintf(ks, sizeof ks, "%s", pad_kb_key_short(k));
++            pad_kb_fmt(out, n, PAD_KB_TR("kb.conflict", "{0} is bound to both {1} and {2}."), ks, pad_kb_row_label(ca), pad_kb_row_label(cb));
++        }
+         else pad_kb_ui_hint(kb, out, n);
+         return 0;
+     }

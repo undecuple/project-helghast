@@ -1,0 +1,97 @@
+gcm/fp: honour the fragment program's per-source input precision modifiers (LD_NO_SRC_PREC=1 old).
+
+From Killzone 2's patch 2094 (KZ2 main 61dcf86, notes-for-kz3 2026-10-21), ported to KZ3's tree under a free number;
+the decoder change is the same, KZ3 adds the one-time "[fp-prec]" log line.
+
+Cause: DWORD2 (SRC1) bits 19-27 hold a 3-bit input precision modifier per source (19-21 SRC0, 22-24 SRC1, 25-27
+SRC2; RPCS3's src0/1/2_prec_mod). The hardware clamps the operand to the precision's range after abs and before
+negate. The decompiler ignored the field, so a source the program meant as saturated ([0, 1]) or fixed9 ([-1, 1])
+reached the arithmetic unclamped. In KZ2 the soft-particle fade (MUL r2.w, r0, |r2| with SRC1 modifier 3) drew every
+smoke puff over distant scenery as saturated white.
+
+KZ3 (pass 116 scan of 99 unique fragment programs dumped from K2/K4 draws, work/rsx/r116/fpscan.py): 89 carry a
+non-zero field; the effective ones (1-4) are on MAD/MUL/ADD/DP3 sources (modifier 4 saturate on 38 instructions,
+3 fixed9 on 5); the most common value, 5 on NRM's SRC0 (268 instructions), is left unchanged as RPCS3 does.
+
+Fix: decode the three modifiers on non-branch instructions and wrap the source in clamp() after abs: 1 half
+(+-65504), 2 fixed12 [-2, 2], 3 fixed9 [-1, 1], 4 saturate [0, 1]; 0 and other values unchanged. ASSUMPTION: the
+ranges of values 1, 2 and 4 follow the destination precision field's meaning. The shader disk cache is keyed by the
+HLSL text, so the switch needs no key change. Host test: tools/smoke/test_fp_src_prec.sh.
+Behaviour follows RPCS3 (GPL-2.0), src0_prec_mod / src1_prec_mod / src2_prec_mod in its fragment-program decoder;
+read, not copied. Upstream candidate (any title).
+
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -339,9 +339,37 @@
+     int half;
+     int negate;
+     int abs;
++    int prec;       /* patch 2124: input precision modifier (SRC1 bits 19-27, 3 bits per source) */
+     char swz[5];    /* e.g. "xyzw" */
+ } Src;
+ 
++/* Patch 2124: each source operand carries a 3-bit input precision modifier in DWORD2 (SRC1): bits 19-21 for
++ * SRC0, 22-24 for SRC1, 25-27 for SRC2 (RPCS3 RSXFragmentProgram.h names them src0/1/2_prec_mod). The hardware
++ * clamps the operand to that precision's range after abs and before negate: 1 half (+-65504), 2 fixed12 [-2, 2],
++ * 3 fixed9 [-1, 1], 4 saturate [0, 1]; 0 and the rest leave it as is. Dropped until now, a soft-particle program
++ * (MUL r2.w, r0, |r2| with SRC1's modifier 3: alpha = texA * min(|z_particle - z_scene|, 1)) got the unclamped depth
++ * difference in metres and drew every smoke puff in front of distant scenery as saturated white.
++ * LD_NO_SRC_PREC=1 ignores the modifiers (old output). */
++static int fp_src_prec_mode(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("LD_NO_SRC_PREC"); on = (e && e[0] == '1') ? 0 : 1;
++        fprintf(stderr, "[fp-prec] source precision modifiers %s\n", on ? "on" : "off (LD_NO_SRC_PREC=1)");
++    }
++    return on;
++}
++static const char* fp_src_prec_clamp(int prec)
++{
++    switch (prec) {
++    case 1: return "-65504.0, 65504.0";
++    case 2: return "-2.0, 2.0";
++    case 3: return "-1.0, 1.0";
++    case 4: return "0.0, 1.0";
++    default: return NULL;
++    }
++}
++
+ int rsx_fp_src2_abs_seen[64];   /* patch 2057: per-opcode count of instructions with DWORD3 bit 18 set */
+ static int fp_src2_abs_mode(void)
+ {
+@@ -358,6 +386,7 @@
+     s->half   = (w & FP_SRC_HALF) ? 1 : 0;
+     s->negate = (w & FP_SRC_NEGATE) ? 1 : 0;
+     s->abs    = abs_bit ? 1 : 0;
++    s->prec   = 0;
+     for (int i = 0; i < 4; i++)
+         s->swz[i] = comp[(w >> (FP_SRC_SWZ_SHIFT + 2 * i)) & 3];
+     s->swz[4] = '\0';
+@@ -426,6 +455,14 @@
+     const char* pre = "";
+     const char* post = "";
+     if (s->abs)    { pre = "abs("; post = ")"; }
++    const char* range = fp_src_prec_clamp(s->prec);
++    if (range) {   /* patch 2124: abs, then the precision clamp, then negate */
++        char cl[220];
++        snprintf(cl, sizeof(cl), "clamp(%s%s%s, %s)", pre, swz, post, range);
++        if (s->negate) snprintf(buf, bufsz, "-(%s)", cl);
++        else           snprintf(buf, bufsz, "%s", cl);
++        return;
++    }
+     if (s->negate) snprintf(buf, bufsz, "-(%s%s%s)", pre, swz, post);
+     else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
+ }
+@@ -913,6 +950,11 @@
+         const int src2_abs = fp_src2_abs_mode();
+         if ((w3 & FP_SRC2_ABS) && !(w2 & FP_BRANCH)) fp_src2_abs_note(opcode);
+         decode_src(w3, src2_abs ? (int)(w3 & FP_SRC2_ABS) : 0, &s2);
++        if (!(w2 & FP_BRANCH) && fp_src_prec_mode()) {   /* patch 2124 */
++            s0.prec = (int)((w2 >> 19) & 7u);
++            s1.prec = (int)((w2 >> 22) & 7u);
++            s2.prec = (int)((w2 >> 25) & 7u);
++        }
+ 
+         /* Inline constant: any CONST source pulls the next 16 bytes as a
+          * float4 literal and advances past it. */

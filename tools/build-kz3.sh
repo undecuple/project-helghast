@@ -10,6 +10,7 @@
 set -euo pipefail
 DIR="${1:?usage: build-kz3.sh BUILD_DIR [cmake --build args]}"; shift
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/tools/pyresolve.sh"   # PY: python3, else py -3, else python (never the Microsoft Store alias)
 LOCKS="${KZ3_MAIN:-$ROOT}/work/locks"; mkdir -p "$LOCKS"
 # Refuse to build from a patched toolkit older than the patch set (run tools/ps3recomp-patched.sh, or kz3-check.sh,
 # first). KZ3_ALLOW_STALE_PATCHES=1 overrides, for builds that are meant to test an older set.
@@ -36,7 +37,7 @@ fi
 # KZ3_PRINT_LIFTS=1: print "VER RECOMP SPU LIFTVER" (the selected version, the pair this dir would use, the PPU lift's
 # own version) and exit (tools/assets/test_build_kz3.sh).
 recomp_l="" spu_l=""
-KV="$(cd "$ROOT" && python3 tools/spu/kz3ver.py ver recomp spu)" || exit 2
+KV="$(cd "$ROOT" && $PY tools/spu/kz3ver.py ver recomp spu)" || exit 2
 read -r def_ver def_recomp def_spu <<<"$KV"
 if [[ -f "$DIR/CMakeCache.txt" ]]; then
   recomp_l="$(sed -n 's/^RECOMP_DIR:[A-Z]*=//p' "$DIR/CMakeCache.txt")"
@@ -55,7 +56,7 @@ fi
 # The two lifts must be the same EBOOT version (the SPU registration fingerprints the version's images): the PPU lift's
 # stamp says which ELF it came from, the SPU lift's eboot_ver file which version it was made for. A 1.14 PPU lift built
 # against the 1.00 SPU lift (or the reverse) links and then fails at run time.
-ppu_ver="$(cd "$ROOT" && python3 tools/spu/kz3ver.py lift-ver "$recomp_l")" || exit 2
+ppu_ver="$(cd "$ROOT" && $PY tools/spu/kz3ver.py lift-ver "$recomp_l")" || exit 2
 if [[ "${KZ3_PRINT_LIFTS:-0}" == 1 ]]; then echo "$def_ver $recomp_l $spu_l $ppu_ver"; exit 0; fi
 if [[ -f "$recomp_l/ppu_recomp.h" && -f "$spu_l/eboot_ver" && "$(tr -d '[:space:]' < "$spu_l/eboot_ver")" != "$ppu_ver" ]]; then
   echo "build-kz3: the PPU lift $recomp_l is $ppu_ver but the SPU lift $spu_l holds $(tr -d '[:space:]' < "$spu_l/eboot_ver"):" \
@@ -77,7 +78,7 @@ if [[ -f "$gen" ]]; then
 fi
 if (( gen_stale )); then
   echo "build-kz3: regenerating $spu_l/gen (tools/spu/gen_spu_register.py changed)" >&2
-  (cd "$ROOT" && KZ3_EBOOT_VER="$ppu_ver" python3 tools/spu/gen_spu_register.py --lift "$spu_l" --out "$spu_l/gen" >/dev/null)
+  (cd "$ROOT" && KZ3_EBOOT_VER="$ppu_ver" $PY tools/spu/gen_spu_register.py --lift "$spu_l" --out "$spu_l/gen" >/dev/null)
 fi
 # The table that matches the lift being built (1.14 series step 4): 1.14 lifts are made from ppu_overrides-114.txt.
 table="$("$ROOT/tools/assets/lift_table.sh" "$ROOT" "$recomp_l")"
@@ -155,7 +156,7 @@ if [[ ! -f "$DIR/CMakeCache.txt" ]]; then
   [[ -f "$spu_l/gen/kz3_spu_register.c" ]] || { echo "build-kz3: no SPU lift in $spu_l (run tools/spu/lift_spu.sh)" >&2; exit 3; }
   echo "build-kz3: configuring $DIR (RECOMP_DIR=$recomp_l KZ3_SPU_DIR=$spu_l)" >&2
   cmake -S "$ROOT/port/kz3" -B "$DIR" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/mingw-w64.cmake" \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython3_EXECUTABLE="$(command -v python3)" \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython3_EXECUTABLE="$($PY -c 'import sys; print(sys.executable)')" \
         -DRECOMP_DIR="$recomp_l" -DKZ3_SPU_DIR="$spu_l" >/dev/null || exit 4
   cat "$ROOT/work/ps3recomp-patched/.kz3-patchset" > "$DIR/.kz3-toolkit-stamp" 2>/dev/null || true
 fi

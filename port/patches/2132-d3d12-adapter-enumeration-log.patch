@@ -1,0 +1,28 @@
+diff -ruN a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -789,12 +789,18 @@
+                      != DXGI_ERROR_NOT_FOUND; ai++) {
+                 DXGI_ADAPTER_DESC1 ad;
+                 adapter->lpVtbl->GetDesc1(adapter, &ad);
+-                if (!(ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+-                    SUCCEEDED(D3D12CreateDevice((IUnknown*)adapter,
+-                        D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device,
+-                        (void**)&s_d3d.device))) {
+-                    printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
+-                           (unsigned long long)(ad.DedicatedVideoMemory >> 20));
++                /* RSX pass 125: every adapter in the preference order, with the device creation result */
++                HRESULT chr = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? (HRESULT)1 :
++                    D3D12CreateDevice((IUnknown*)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device,
++                                      (void**)&s_d3d.device);
++                printf("[D3D12] adapter #%u (%s order): %ls vendor=0x%04X device=0x%04X flags=0x%X LUID=%08lX:%08lX "
++                       "VRAM %llu MB: %s\n", ai, pref == DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE ? "high-performance" : "minimum-power",
++                       ad.Description, ad.VendorId, ad.DeviceId, ad.Flags, (unsigned long)ad.AdapterLuid.HighPart,
++                       (unsigned long)ad.AdapterLuid.LowPart, (unsigned long long)(ad.DedicatedVideoMemory >> 20),
++                       (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? "software, skipped" :
++                       SUCCEEDED(chr) ? "CHOSEN (D3D12CreateDevice ok)" : "D3D12CreateDevice failed");
++                if (FAILED(chr)) printf("[D3D12]   hr=0x%08lX\n", (unsigned long)chr);
++                if (SUCCEEDED(chr) && s_d3d.device) {
+                     adapter->lpVtbl->Release(adapter);
+                     break;
+                 }

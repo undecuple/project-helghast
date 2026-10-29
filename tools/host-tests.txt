@@ -29,6 +29,7 @@ tools/release/test_assemble_payload.py
 tools/release/test_version_check.py
 tools/release/test_website.py
 tools/release/test_pages_workflow.py
+tools/release/test_export_refs.py
 tools/upstream/test_lifter_chunks.py
 tools/spu/test_kz3_fiber_stall.sh
 tools/release/test_launch.py
@@ -151,3 +152,13 @@ tools/release/test_release_check.py
 port/vfs/test_splitfile.sh
 tools/spu/test_r115_logroute.sh
 tools/upstream/test_sys_fs_flags.sh
+tools/port_ui_table.py
+tools/spu/test_r118_walltime.sh
+tools/smoke/test_window_place.sh
+tools/release/test_rpcs3_locate.py
+tools/release/test_rpcs3_locate.py
+tools/test_pyresolve_crlf.sh
+tools/spu/test_r120_jobreplay.sh
+tools/spu/test_r121_leaf.sh
+tools/spu/test_r121_irq_b2b.sh
+tools/spu/test_r122_native_blend.sh

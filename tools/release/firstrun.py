@@ -77,6 +77,7 @@ import json
 import os
 import platform
 import re
+import urllib.parse
 import shutil
 import signal
 import subprocess
@@ -755,6 +756,22 @@ def place_fonts(root, build):
     return done
 
 
+def place_lang(root, build):
+    """Copy <root>/lang/port_ui.tsv (shipped in the payload, assemble_payload RULES) to <build>/lang/, next to kz3.exe: the
+    runtime's port UI text (kz3_tr.h) reads <exe dir>\\lang\\port_ui.tsv cell by cell before its embedded copy, so a
+    table newer than the exe still applies. Copies only a missing or different file; -> names copied. Called after every
+    build and by the launcher before each start (network pass 45)."""
+    done = []
+    src, dst = os.path.join(root, "lang", "port_ui.tsv"), os.path.join(build, "lang", "port_ui.tsv")
+    if not os.path.isfile(src):
+        return done
+    if os.path.isfile(dst) and file_sha256(dst) == file_sha256(src):
+        return done
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copyfile(src, dst)
+    return ["port_ui.tsv"]
+
+
 def embed_supported(root):
     """The payload's runtime can link the EBOOT into kz3.exe (step 9s: port/kz3/kz3_eboot_blob.c). An older payload
     cannot; its exe still needs kz3.ini's eboot line."""
@@ -787,6 +804,7 @@ def after_stamp(c):
     if os.path.isfile(exe):
         shutil.copy2(exe, c.b("kz3.exe"))
     place_fonts(c.root, c.build)
+    place_lang(c.root, c.build)
     place_sdl3(c.root, c.build)
     record_sources(c)
     stamp = {"inputs": c.fingerprint(("lift", "runtime")), "parts": c.parts(), "version": port_version(c.root),
@@ -974,7 +992,11 @@ def lower_priority(run=None):
 # Any Windows user folder, also in CMake's object-path form (C_/Users/name/..., ':' and spaces become '_'): the user
 # name is replaced, so a dump in another account's folder or a mangled build path does not put a name in the log
 # (2026-10-21: a tester's log showed both after the home folder itself had been redacted).
-_USERS_RX = re.compile(r"(\b[A-Za-z][:_][\\/]Users[\\/])(?!%USERPROFILE%)([^\\/\r\n\"']+)", re.IGNORECASE)
+# Also the JSON/repr-escaped form (doubled backslashes) and the URL-encoded form (%3A, %5C, %2F), reported by
+# @feanor-noldorin (issue #9; KZ2 5b0cf61).
+_SEP = r"(?:\\{1,2}|/|%5C|%2F)"
+_USERS_RX = re.compile(r"(\b[A-Za-z](?::|_|%3A)" + _SEP + r"Users" + _SEP + r")(?!%USERPROFILE%)"
+                       r"((?:(?!%5C|%2F)[^\\/\r\n\"'])+)", re.IGNORECASE)
 
 
 def redactor():
@@ -985,7 +1007,12 @@ def redactor():
     for h in sorted(homes, key=len, reverse=True):
         h = h.rstrip("\\/")
         mangled = h.replace(":", "_").replace(" ", "_").replace("\\", "/")
-        for v in {h, h.replace("\\", "/"), h.replace("/", "\\"), mangled}:
+        back = h.replace("/", "\\")
+        fwd = h.replace("\\", "/")
+        # doubled backslashes (repr(), json.dumps) and URL-encoded forms (file:// URLs, query strings)
+        for v in {h, fwd, back, back.replace("\\", "\\\\"), mangled,
+                  urllib.parse.quote(fwd, safe="/:"), urllib.parse.quote(fwd, safe=""),
+                  urllib.parse.quote(back, safe=":"), urllib.parse.quote(back, safe="")}:
             pats.append(re.escape(v))
     rx = re.compile("|".join(pats), re.IGNORECASE if os.name == "nt" else 0) if pats else None
     def red(s):

@@ -86,8 +86,10 @@ int main(int argc, char** argv)
     check("unlisted image spins nothing", t < 6.0);
     t = call(c, 255, 4.0, 0x2000, 0);
     check("close at another pc spins nothing", t < 6.0);
+    /* patch 1141 (SPU pass 121): the bracket closes at the link regardless of host depth (an interrupt's iret inside
+     * the job leaves host_depth elsewhere), so a close at another depth still costs the job x3 */
     t = call(c, 255, 4.0, 0x1000, 1);
-    check("close at another depth spins nothing", t < 6.0);
+    check("close at another depth still closes (x3)", t > 11.5 && t < 16.0);
     t = call(c, 255, 2.0, 0x1000, 0);
     check("x3 again after the others (bracket re-armed)", t > 5.5 && t < 9.0);
     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);

@@ -2,7 +2,8 @@ KZ3 patch 4015 (diagnostics, network pass 28: the network error on the settings 
 KZ3_PAD_MOTION=0: the host pad's motion sensors are never turned on (the game reads a DS3 at rest).
 KZ3_PAD_TEST_SENSORS=X,Y,Z,G[,J] (test only): fixed SIXAXIS words (+-J counts of noise per read) on port 0 while the game has
 SENSOR_ON, and the prompts and motion tips see a DualShock 4 with sensors, so an Xvfb run looks like a held DS4.
-KZ3_WATCH32=EA[,EA...] (test only): logs every change of up to 8 guest words, checked on each SENSOR_ON pad read.
+KZ3_WATCH32=EA[,EA...] (test only): logs every change of up to 16 guest words, checked on each SENSOR_ON pad read; an entry
+*EA+OFF watches the word at OFF from the pointer stored at EA (network pass 44).
 
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
@@ -47,7 +48,7 @@ KZ3_WATCH32=EA[,EA...] (test only): logs every change of up to 8 guest words, ch
      int port = -1;
      int dev = pad_last_device_current(&s_last_dev, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS, &port);
      if (dev == PAD_DEV_KEYBOARD || port < 0 || port >= PAD_MAX_HOST_PORTS) return 0;
-@@ -1799,6 +1815,35 @@
+@@ -1799,6 +1815,44 @@
          data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = hs->has_sensor ? hs->sensor_y : 399;
          data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = hs->has_sensor ? hs->sensor_z : 512;
          data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = hs->has_sensor ? hs->sensor_g : 512;
@@ -60,17 +61,26 @@ KZ3_WATCH32=EA[,EA...] (test only): logs every change of up to 8 guest words, ch
 +                tst = e && sscanf(e, "%d,%d,%d,%d,%d", &tv[0], &tv[1], &tv[2], &tv[3], &tv[4]) >= 4;
 +                if (tst) { printf("[pad] test sensors on port 0: %d %d %d %d, noise %d\n", tv[0], tv[1], tv[2], tv[3], tv[4]); fflush(stdout); }
 +            }
-+            {   /* 4015 (test only): KZ3_WATCH32=EA[,EA...] logs every change of these guest words, checked per read */
-+                static int nw = -1; static uint32_t wa[8], wv[8];
++            {   /* 4015 (test only): KZ3_WATCH32=EA[,EA...] logs every change of these guest words, checked per read.
++                 * An entry *EA+OFF watches the word at OFF from the pointer stored at EA (heap objects; network pass 44). */
++                static int nw = -1; static uint32_t wa[16], wo[16], wv[16]; static unsigned char wi[16];
 +                if (nw < 0) {
 +                    nw = 0;
 +                    const char* w = getenv("KZ3_WATCH32");
-+                    while (w && *w && nw < 8) { char* e2; unsigned long a = strtoul(w, &e2, 0); if (e2 == w) break;
-+                        wa[nw] = (uint32_t)a; wv[nw] = vm_read32(wa[nw]); nw++; w = *e2 == ',' ? e2 + 1 : e2; }
++                    while (w && *w && nw < 16) { char* e2; int ind = *w == '*'; if (ind) w++;
++                        unsigned long a = strtoul(w, &e2, 0); if (e2 == w) break;
++                        unsigned long o = 0; if (ind && *e2 == '+') { const char* s2 = e2 + 1; o = strtoul(s2, &e2, 0); }
++                        wa[nw] = (uint32_t)a; wo[nw] = (uint32_t)o; wi[nw] = (unsigned char)ind; wv[nw] = 0xFFFFFFFFu; nw++;
++                        w = *e2 == ',' ? e2 + 1 : e2; }
 +                }
 +                for (int k = 0; k < nw; k++) {
-+                    uint32_t v = vm_read32(wa[k]);
-+                    if (v != wv[k]) { printf("[watch32] t=%llu ms 0x%08X: 0x%08X -> 0x%08X\n", (unsigned long long)GetTickCount64(), wa[k], wv[k], v); fflush(stdout); wv[k] = v; }
++                    uint32_t base = wi[k] ? vm_read32(wa[k]) : wa[k];
++                    /* a NULL or out-of-range pointer reads as 0xFFFFFFFF ("no object") */
++                    uint32_t v = (base && base < 0xF0000000u) ? vm_read32(base + wo[k]) : 0xFFFFFFFFu;
++                    if (v != wv[k]) {
++                        if (wi[k]) printf("[watch32] t=%llu ms *0x%08X+0x%X (0x%08X): 0x%08X -> 0x%08X\n", (unsigned long long)GetTickCount64(), wa[k], wo[k], base, wv[k], v);
++                        else printf("[watch32] t=%llu ms 0x%08X: 0x%08X -> 0x%08X\n", (unsigned long long)GetTickCount64(), wa[k], wv[k], v);
++                        fflush(stdout); wv[k] = v; }
 +                }
 +            }
 +            if (tst && port_no == 0)

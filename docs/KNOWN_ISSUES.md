@@ -11,18 +11,29 @@ linked below yet because none has been filed for these yet. If you hit one of th
 
 | Problem | Where it shows | Workaround | Status |
 |---|---|---|---|
-| [Frame rate about 16-22 in levels](#frame-rate) | in levels, both Proton and native Windows | none | open |
-| [Audio stutters now and then](#audio-stutter) | in levels | none known | open |
+| [Exclusive full screen: not yet confirmed on native Windows](#fullscreen) | Options > Display > Fullscreen, `mode = fullscreen` in `display.ini` | borderless full screen (Alt+Enter, F11 or maximize) | fix built, awaiting a native Windows check |
+| [Frame rate below 30 in heavy scenes (about 16-22 measured)](#frame-rate) | in levels, both Proton and native Windows | none | open |
+| [Audio is slightly short of real time and breaks up now and then](#audio-stutter) | in levels | none known | open |
 | [Windows and sky in far views look flat white](#flat-white) | far views in levels | none | open |
 | [Keyboard input intermittent under Steam/Proton](#keyboard-proton) | Steam with Proton | use a controller | open, cause not confirmed |
 | [Botzone: no full match played](#botzone) | offline Botzone matches | none needed to reach Career Selection | open |
 | [Split-screen: views offset, right view can flicker](#split-screen) | local two-player co-op | none | open |
-| [Co-op needs two controllers](#co-op-pads) | local two-player co-op | use two controllers | open (keyboard and mouse as player 2 is planned) |
+| [Co-op with one pad and the keyboard](#co-op-pads) | local two-player co-op | use two controllers | keyboard as second controller built, not yet played by hand |
+| [Offline Multiplayer: a second attempt hangs](#offline-multiplayer-second-attempt) | Multiplayer menu, offline | restart the game between attempts | open, cause found, fix pending |
 | [The mouse does nothing in some dialogs](#mouse-dialogs) | confirm dialogs, for example "Exit Killzone 3?" | keyboard or controller | open |
-| [Mouse look feels jumpy](#mouse-jumpy) | on foot | `KZ3_MOUSE_LATCH=0` switches the view to the game's own timing | open (hand check pending) |
+| [Mouse look judders](#mouse-jumpy) | on foot | `KZ3_MOUSE_LATCH=0` switches the view to the game's own timing | open (hand check pending) |
 | [A black level after skipping the closing movie](#skip-movie) | after the prologue | do not skip the movie | open |
 | [Controller settings page overlapped](#controller-page) | Options, controller page | none | rows on their own page; hand check pending |
 | ["Modern" controls: effect in a level not confirmed](#modern-controls) | in levels, modern layout | use the game's own layout | to be confirmed |
+
+## Fullscreen
+
+A player's logs on native Windows showed the picture freezing after the switch to exclusive full screen: Windows refused
+the first frame and the game kept running without drawing. The port now resizes the picture after every switch, and when
+Windows refuses a frame in full screen the game falls back to borderless full screen for the session and keeps drawing
+(the Options row then reads Borderless; the choice stays in `display.ini`). Checked under Proton, including forced
+failures; not yet confirmed on native Windows, where the original failure happened. If it still freezes, please open an
+issue with the game log. Status: fix built, awaiting a native Windows check.
 
 ## Frame rate
 
@@ -68,7 +79,11 @@ on the first build tested). Both were last seen 2026-10-22, under Proton. No wor
 
 The game's own two-player co-op checks for two controllers and shows "Controller for Second Player is missing" when it
 sees only one. With two controllers connected (and Steam Input off for the game) it works: first played 2026-10-22.
-Using the keyboard and mouse as the second player is not built yet. Status: open.
+The keyboard and mouse now count as their own controller when a pad is connected, so one pad plus the keyboard should do (the keys act for player 1 until the game gives the keyboard a player); this passed its host test and has not been played by hand yet. Status: open until a hand check.
+
+## Offline multiplayer second attempt
+
+Offline, the first Multiplayer attempt from the menu works as far as the game goes; starting Multiplayer a second time in the same session stays on "Connecting.." forever. The cause found is a second close of a session that is already idle; the fix is pending. Restarting the game clears it. Status: open.
 
 ## Mouse dialogs
 
@@ -81,7 +96,7 @@ Mouse look on foot turns the view but feels jumpy: the movement per frame altern
 Look input is cut on the game's own simulation clock and every mouse count is shown on the view at once (about 0 ms from
 counts to the picture). Where the shots go follows the game's 30 Hz simulation, about 35 ms behind the view; mounted guns
 follow the mouse within the gun's range, with the simulation's look timing. `KZ3_MOUSE_LATCH=0` switches the view to the
-game's own timing. The feel is not yet checked by hand. Status: open.
+game's own timing. The first-person arms and weapon follow the view (checked under Proton). The feel is not yet checked by hand. Status: open.
 
 ## Skip movie
 

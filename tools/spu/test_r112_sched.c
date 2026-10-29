@@ -32,6 +32,16 @@ int main(void)
     chk("scope off all", (uint64_t)kz3_sched_scope("0", 0), 0);
     chk("scope sets async", (uint64_t)kz3_sched_scope("sets", 1), 1);
     chk("scope sets kernel", (uint64_t)kz3_sched_scope("sets", 0), 0);
+    /* patch 1140: SPURS instance name list (exact, comma-separated) */
+    chk("spurs match default", (uint64_t)kz3_spurs_pcore_match("LoPrio", "LoPrio"), 1);
+    chk("spurs no match", (uint64_t)kz3_spurs_pcore_match("LoPrio", "HiPrio"), 0);
+    chk("spurs prefix only", (uint64_t)kz3_spurs_pcore_match("LoPrio", "LoPri"), 0);
+    chk("spurs longer", (uint64_t)kz3_spurs_pcore_match("LoPri", "LoPrio"), 0);
+    chk("spurs list second", (uint64_t)kz3_spurs_pcore_match("HiPrio,LoPrio", "LoPrio"), 1);
+    chk("spurs list first", (uint64_t)kz3_spurs_pcore_match("HiPrio,LoPrio", "HiPrio"), 1);
+    chk("spurs empty list", (uint64_t)kz3_spurs_pcore_match("", "LoPrio"), 0);
+    chk("spurs empty name", (uint64_t)kz3_spurs_pcore_match("LoPrio", ""), 0);
+    chk("spurs trailing comma", (uint64_t)kz3_spurs_pcore_match("LoPrio,", "LoPrio"), 1);
     printf(bad ? "test_r112_sched: FAIL\n" : "test_r112_sched: PASS\n");
     return bad != 0;
 }

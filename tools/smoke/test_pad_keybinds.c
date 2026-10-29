@@ -103,6 +103,7 @@ int main(void)
     CHECK(n > 0 && n < (int)sizeof buf, "format fits (%d bytes)", n);
     memset(&k, 0, sizeof k);
     for (n = 0; n < PRM_N; n++) k.padc[n] = (unsigned char)n;   /* 4013: the parser only writes the [pad] lines that differ */
+    pac_defaults(&k.pac);   /* 4023: likewise the [pad actions] lines (the caller starts from pad_kb_defaults) */
     logs = 0;
     bad = pad_kb_parse(&k, buf, logger, NULL);
     CHECK(bad == 0 && logs == 0 && memcmp(&k, &d, sizeof k) == 0, "round trip of the defaults (bad %d, logs %d)", bad,

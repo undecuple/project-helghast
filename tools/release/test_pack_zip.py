@@ -58,6 +58,7 @@ def payload(tmp):
     put(root, "port/kz3/main.cpp", "int main(){}\n")
     put(root, "toolchain/bin/clang.exe", b"MZ" + bytes(3 << 20))     # binary > 2 MB: allowed under toolchain/
     put(root, "Project Helghast.exe", b"MZ" + bytes(1000))
+    put(root, "lang/port_ui.tsv", "key\ten\tes\n")
     put(root, "fonts/Rajdhani-Medium.ttf", b"\0\1\0\0" + bytes(500))
     put(root, "fonts/Rajdhani-Bold.ttf", b"\0\1\0\0" + bytes(600))
     put(root, "licenses/Rajdhani-OFL.txt", "SIL OPEN FONT LICENSE Version 1.1\n")
@@ -91,10 +92,11 @@ def main():
             names = [i.filename for i in infos]
             same = all(z.read(f"Project Helghast/{rel}") == open(p, "rb").read() for rel, p in pz.walk(root))
         check(names == sorted(names) and all(n.startswith("Project Helghast/") for n in names)
-              and len(names) == 12 and "Project Helghast/manifest.json" in names, "sorted entries under the top folder",
+              and len(names) == 13 and "Project Helghast/manifest.json" in names, "sorted entries under the top folder",
               names)
         check({"Project Helghast/runtime/SDL3.dll", "Project Helghast/licenses/SDL3-LICENSE.txt"} <= set(names),
               "SDL3.dll and its licence are in the zip", names)
+        check("Project Helghast/lang/port_ui.tsv" in names, "the port UI text table is in the zip", names)
         check({"Project Helghast/fonts/Rajdhani-Medium.ttf", "Project Helghast/fonts/Rajdhani-Bold.ttf",
                "Project Helghast/licenses/Rajdhani-OFL.txt"} <= set(names), "the notice fonts and their OFL text are in the zip",
               names)

@@ -35,7 +35,9 @@ REQUIRED = ("run.cmd", "manifest.json", "VERSION.txt",
             # the runtime's error-notice fonts and their licence (assemble_payload FONTS; RSX pass 38)
             "fonts/Rajdhani-Medium.ttf", "fonts/Rajdhani-Bold.ttf", "licenses/Rajdhani-OFL.txt",
             # SDL3 for the pads (patch 4010) and its licence (assemble_payload SDL3_DEST)
-            "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt")
+            "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt",
+            # the port UI text table the runtime reads from <exe dir>\lang (net 45)
+            "lang/port_ui.tsv")
 NO_SCRUB_PREFIX = "toolchain/"
 
 

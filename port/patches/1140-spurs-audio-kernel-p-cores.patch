@@ -1,0 +1,88 @@
+KZ3 patch 1140 (SPU pass 117): the kernel threads of chosen SPURS instances (KZ3_SPU_PCORES_SPURS, comma-separated name
+prefixes, unset = "LoPrio", the audio SPU) are restricted to the performance cores like the spu_async_thread job threads
+(patch 1136). Pass 117 measured the LoPrio kernel thread (Amadeus/BrB audio) at 620-760 ms/s on a P-core in K2 and the
+scheduler leaving it on the E-cores for 10-20 s at a time at 1000 ms/s (saturated): audio units fell below real time and
+port 0 got 100-560 holes per 10 s, the in-level stutter. kz3_spu_thread_sched() now returns whether it restricted the
+thread. KZ3_SPU_PCORES=0 also turns this off. Upstream candidate (the mechanism; the default name is KZ3's).
+
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2485,6 +2485,8 @@
+             si->prefix, kt + 1, si->nthreads, si->ea, s_pm_off ? "DISABLED (PS3_NO_SPURS_PM)" : "enabled");
+     fflush(stderr);
+     if (kz3_wacct_on()) { char nm[40]; snprintf(nm, sizeof nm, "spurs-kern%d:%s", kt, si->prefix); kz3_wacct_name(nm); }
++    if (kz3_spurs_pcore_thread(si->prefix))   /* KZ3 patch 1140: the audio SPU (LoPrio) stays off the E-cores */
++        fprintf(stderr, "[spu-sched] SPURS \"%s\" kernel thread %d restricted to the performance cores (KZ3_SPU_PCORES_SPURS)\n", si->prefix, kt);
+     if (!kz3_kern_old()) { kz3_spu_loop(si, kt, (int)s_pm_off); return 0; }   /* KZ3 patch 1074 */
+ 
+     /* Instance change detector (SPURS_KERN_WATCH=1).
+--- a/runtime/spu/kz3_spu_sched.h
++++ b/runtime/spu/kz3_spu_sched.h
+@@ -47,14 +47,14 @@
+ #ifdef _WIN32
+ #include <windows.h>
+ #include <stdio.h>
+-static inline void kz3_spu_thread_sched(int async)
++static inline int kz3_spu_thread_sched(int async)
+ {
+     static volatile long s_state;          /* 0 = not computed, 1 = computing, 2 = done */
+     static uint64_t s_mask;
+     static ULONG s_ids[128]; static ULONG s_nids;
+     const char* e = getenv("KZ3_SPU_PCORES");
+     int scope = kz3_sched_scope(e, async);
+-    if (!scope) return;
++    if (!scope) return 0;
+     if (s_state != 2) {
+         if (__sync_val_compare_and_swap(&s_state, 0, 1) == 0) {
+             uint64_t m = 0;
+@@ -95,11 +95,46 @@
+         }
+         while (s_state != 2) Sleep(0);
+     }
+-    if (!s_mask) return;
+-    if (scope == 1 && s_nids && SetThreadSelectedCpuSets(GetCurrentThread(), s_ids, s_nids)) return;
+-    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)s_mask);
++    if (!s_mask) return 0;
++    if (scope == 1 && s_nids && SetThreadSelectedCpuSets(GetCurrentThread(), s_ids, s_nids)) return 1;
++    return SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)s_mask) != 0;
+ }
+ #else
+-static inline void kz3_spu_thread_sched(int async) { (void)async; }
++static inline int kz3_spu_thread_sched(int async) { (void)async; return 0; }
+ #endif
++
++/* KZ3 patch 1140 (SPU pass 117): the kernel threads of chosen SPURS instances are restricted like the async job threads.
++ *
++ * Measured (pass 117, KZ3_CPU_PROBE, i7-12700KF, Proton, K2 pyrrhus_outskirts, 1.14 exe): the one host thread of the
++ * LoPrio SPURS instance (the audio SPU: Amadeus/BrB, wid 9 + 5, the RE notes s.1-5) needs 620-760 ms of CPU per
++ * second on a P-core in the level; the scheduler moved it to the E-cores 16-19 for 10-20 s at a time, where it ran at
++ * 1000 ms/s (saturated): units per second fell below the 187.5 real-time rate and port 0 got 100-560 holes per 10 s
++ * (the in-level stutter). The thread has a real-time deadline and no margin on an E-core, as the Bink decoder (1136).
++ * KZ3_SPU_PCORES_SPURS = comma-separated SPURS name prefixes (exact match); unset = "LoPrio" (KZ3's audio instance,
++ * ASSUMPTION: the only one with a deadline; the HiPrio frame SPUs stay free, the pass 112 "all" A/B was worse);
++ * empty = none. KZ3_SPU_PCORES=0 turns this off too. kz3_spurs_pcore_match() is the pure part (test_r112_sched.c). */
++static inline int kz3_spurs_pcore_match(const char* list, const char* prefix)
++{
++    if (!list || !prefix || !prefix[0]) return 0;
++    size_t n = strlen(prefix);
++    for (const char* p = list; *p; ) {
++        const char* c = strchr(p, ',');
++        size_t l = c ? (size_t)(c - p) : strlen(p);
++        if (l == n && !strncmp(p, prefix, n)) return 1;
++        if (!c) break;
++        p = c + 1;
++    }
++    return 0;
++}
++
++/* Called by a SPURS kernel thread once its instance is known. Returns 1 when the thread was restricted. */
++static inline int kz3_spurs_pcore_thread(const char* prefix)
++{
++    const char* e = getenv("KZ3_SPU_PCORES");
++    if (e && e[0] == '0') return 0;
++    const char* l = getenv("KZ3_SPU_PCORES_SPURS");
++    if (!kz3_spurs_pcore_match(l ? l : "LoPrio", prefix)) return 0;
++    return kz3_spu_thread_sched(1);   /* async scope: the default affinity mask (or CPU sets with =sets) */
++}
++
+ #endif

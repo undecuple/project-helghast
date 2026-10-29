@@ -79,7 +79,7 @@ def main():
 
     # The payload's own folders: Inno removes the files it installed, but Python (kz3-setup, the embedded toolchain
     # python) writes __pycache__ beside them; the folder must go whole. Folders holding no program are exempt.
-    exempt = {"licenses", "fonts", "runtime"}
+    exempt = {"licenses", "fonts", "runtime", "lang"}   # lang: the UI text table only
     tops = {d.split("/")[0] for _, d, kind, _ in ap.RULES if "/" in d or kind == "tree"} | {"toolchain"}
     for t in sorted(tops - exempt):
         check(covered(t + "/__pycache__/x.pyc", pats), f"payload folder {t}/ goes whole (any __pycache__ in it)")

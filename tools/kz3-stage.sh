@@ -38,6 +38,8 @@ if [[ -f "${ttfs[0]}" ]]; then
 else
   echo "kz3-stage: no fonts in work/release/fonts (tools/release/installer_art.py --fetch-fonts): UI text falls back" >&2
 fi
+# The port's UI text table (network pass 45, port/net/kz3_tr.h): <exe dir>\lang\port_ui.tsv overrides the embedded copy.
+mkdir -p "$S/lang" && cp port/text/port_ui.tsv "$S/lang/"
 for f in "$G"/*; do [[ "$(basename "$f")" == USRDIR ]] || ln -s "$f" "$S/PS3_GAME/"; done
 for f in "$G"/USRDIR/*; do [[ "$(basename "$f")" == EBOOT.BIN ]] || ln -s "$f" "$S/PS3_GAME/USRDIR/"; done
 # 1.14: the installed update, read by the data overlay (psarc_vfs.cpp, port/vfs; wired on main in series step 4).

@@ -1,0 +1,53 @@
+Upstream PR #633 (sp00nznet/ps3recomp, https://github.com/sp00nznet/ps3recomp/pull/633), only its
+sys_time_get_current_time hunk (item 3 of the PR): on Windows LV2 syscall 145 returned QueryPerformanceCounter time since
+boot, so the guest wall clock read January 1970; POSIX already used CLOCK_REALTIME. Carried by SPU pass 118 from the PR
+description (the PR diff was not reachable from the sandbox): FILETIME (GetSystemTimePreciseAsFileTime on Windows 8+)
+minus the 1601-1970 offset. KZ3 reaches it through the guest libc time() at 1.14 0x00AC6068 (callers 0x00AA9BFC, a
+protocol routine with 0xCB01xx error codes, and the static initialiser 0x00E1F81C), a gettimeofday-like 0x00E1F6DC and three
+other call sites (the RE notes "Pass 118"). Host test tools/spu/test_r118_walltime.sh.
+
+--- a/runtime/syscalls/sys_timer.c	2026-10-28 17:20:31.548151547 -0500
++++ b/runtime/syscalls/sys_timer.c	2026-10-28 17:20:31.564212667 -0500
+@@ -371,6 +371,17 @@
+     return CELL_OK;
+ }
+ 
++/* ---- KZ3 patch 9633 begin: FILETIME -> Unix time (tools/spu/test_r118_walltime.sh compiles this block) ---- */
++/* A FILETIME counts 100 ns ticks since 1601-01-01 UTC; 11644473600 s lie between that and 1970-01-01. */
++static inline void sys_time_filetime_to_unix(uint64_t ticks, uint64_t* sec, uint64_t* nsec)
++{
++    const uint64_t epoch = 116444736000000000ULL;   /* 11644473600 s in 100 ns ticks */
++    const uint64_t t = ticks > epoch ? ticks - epoch : 0;
++    *sec  = t / 10000000ULL;
++    *nsec = (t % 10000000ULL) * 100ULL;
++}
++/* ---- KZ3 patch 9633 end ---- */
++
+ int64_t sys_time_get_current_time(ppu_context* ctx)
+ {
+     uint32_t sec_addr  = LV2_ARG_PTR(ctx, 0);
+@@ -379,14 +390,16 @@
+     uint64_t sec, nsec;
+ 
+ #ifdef _WIN32
+-    ensure_qpc_init();
+-    LARGE_INTEGER now;
+-    QueryPerformanceCounter(&now);
+-
+-    /* Convert QPC to seconds + nanoseconds */
+-    sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
+-    uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
+-    nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
++    /* KZ3 patch 9633 (after upstream PR #633): LV2 145 is the wall clock (seconds since 1970, like
++     * CLOCK_REALTIME in the POSIX branch below), not the time since boot. The QPC count this read before gave
++     * the guest's time() / gettimeofday a date in January 1970. */
++    FILETIME ft;
++#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
++    GetSystemTimePreciseAsFileTime(&ft);
++#else
++    GetSystemTimeAsFileTime(&ft);
++#endif
++    sys_time_filetime_to_unix(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime, &sec, &nsec);
+ #else
+     struct timespec ts;
+     clock_gettime(CLOCK_REALTIME, &ts);

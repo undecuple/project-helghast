@@ -1,6 +1,8 @@
 /* kz3_discord: see kz3_discord.h. Sends to the local Discord app only: the activity text below, the process id
  * and the application id. No account data, no network call of ours. */
 #include "kz3_discord.h"
+#define KZ3_TR_IMPLEMENTATION   /* network pass 45: the port UI text table lives in this always-linked file */
+#include "kz3_tr.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -281,15 +283,16 @@ int kd_cmd_parse(const char* cmd, int running, int* want, char* reply, size_t ca
 /* The row, the help text, the Lua. The values are the bridge's words; the labels the game's own On/Off keys, in the
  * game's order (Off first, as on Crosshair / HUD / Subtitles / Hints). */
 static const char kd_row[] =
-    "<select id=\"slc_kz3_discord\" label=\"Discord status\" onchange=\"script(settingscript,KZ3ChangeDiscord)\"\n"
+    "<select id=\"slc_kz3_discord\" label=\"@tr{discord.label|Discord status}\" onchange=\"script(settingscript,KZ3ChangeDiscord)\"\n"
     "\t\t\t\tdefault-value=\"off\">\n"
     "\t\t\t\t<selectitem value=\"off\">@key{menu_value_off}</selectitem>\n"
     "\t\t\t\t<selectitem value=\"on\">@key{menu_value_on}</selectitem>\n"
     "\t\t\t</select>\n\n\t\t\t";
 static const char kd_tip[] =
-    "\t\t\tslc_kz3_discord = \"Shows \\\"Playing Killzone 3\\\" and your chapter on your Discord profile through the Discord app "
-    "on this PC; nothing is sent when it is off.\",\n";
-static const char kd_on[] = "\t\t\tKZ3DiscordShow()\n";
+    "\t\t\tslc_kz3_discord = \"@trl{discord.tip|Shows \"Playing Killzone 3\" and your chapter on your Discord profile through the "
+    "Discord app on this PC; nothing is sent when it is off.}\",\n";
+/* network pass 45: the page also reports the game's language (kz3_tr.h) for the next port page it opens */
+static const char kd_on[] = "\t\t\tgPlayerProfile:SetTimeZone(\"kb:lang \"..gPlayerProfile:GetLanguage())\n\t\t\tKZ3DiscordShow()\n";
 static const char kd_reset[] = "\t\t\tKZ3DiscordCmd(\"off\")\n";
 static const char kd_lua[] =
     "\n\t\tgKz3Dc = 0\n"
@@ -330,10 +333,16 @@ char* kd_patch_display_gum(const char* in, size_t n, size_t* out_n)
     while (end > rst && (in[end - 1] == '\n' || in[end - 1] == '\r')) end--;   /* the Lua goes before the script's last newline */
     /* each insert after the end of its anchor's line */
     size_t pos[5] = { gamma, tip, on, rst, end };
-    const char* txt[5] = { kd_row, kd_tip, kd_on, kd_reset, kd_lua };
+    /* network pass 45: the row label and the help text in the game's language (kz3_tr.h markers) */
+    char* row = NULL;
+    char* tipt = NULL;
+    kz3_tr_render(kd_row, sizeof kd_row - 1, &row);
+    kz3_tr_render(kd_tip, sizeof kd_tip - 1, &tipt);
+    if (!row || !tipt) { free(row); free(tipt); return NULL; }
+    const char* txt[5] = { row, tipt, kd_on, kd_reset, kd_lua };
     for (int i = 1; i < 4; i++) {
         while (pos[i] < n && in[pos[i]] != '\n') pos[i]++;
-        if (pos[i] >= n) return NULL;
+        if (pos[i] >= n) { free(row); free(tipt); return NULL; }
         pos[i]++;
     }
     /* the gaps must be in file order (row, tip table, OnPageOn, reset, end) */
@@ -344,7 +353,7 @@ char* kd_patch_display_gum(const char* in, size_t n, size_t* out_n)
     size_t total = n + 1;
     for (int i = 0; i < 5; i++) total += strlen(txt[i]);
     char* o = (char*)malloc(total);
-    if (!o) return NULL;
+    if (!o) { free(row); free(tipt); return NULL; }
     size_t w = 0, r = 0;
     for (int k = 0; k < 5; k++) {
         int i = order[k];
@@ -355,6 +364,8 @@ char* kd_patch_display_gum(const char* in, size_t n, size_t* out_n)
     memcpy(o + w, in + r, n - r); w += n - r;
     o[w] = 0;
     *out_n = w;
+    free(row);
+    free(tipt);
     return o;
 }
 
@@ -403,6 +414,7 @@ static void on_open(const char* guest_path)
 
 extern void (*g_ps3_fs_open_hook)(const char*);                 /* patch 4021 */
 extern int (*g_pad_kb_ext_cmd)(const char* cmd, char* out, size_t n);   /* patch 4025 (cellPad.c pad_kb_ui_cmd) */
+extern const char* (*g_pad_kb_tr)(const char* key, const char* en);   /* patch 4027: the Keyboard page's text */
 
 static int pipe_read(HANDLE h, uint8_t* b, DWORD n, DWORD timeout_ms, const kd_worker_t* w)
 {
@@ -600,6 +612,7 @@ int kz3_discord_running(void)
 /* The row's bridge command ("kb:discord [state|on|off]", patch 4025): a set applies and saves at once. */
 static int kd_ext_cmd(const char* cmd, char* out, size_t n)
 {
+    if (kz3_tr_ext_cmd(cmd, out, n)) return 1;   /* network pass 45: "lang <id>" from the port's pages */
     int want = 0, running = kz3_discord_running();
     int r = kd_cmd_parse(cmd, running, &want, out, n);
     if (r == 0) return 0;
@@ -639,6 +652,7 @@ void kz3_discord_start(void)
 
     g_ps3_fs_open_hook = on_open;
     g_pad_kb_ext_cmd = kd_ext_cmd;
+    g_pad_kb_tr = kz3_tr;                  /* network pass 45 (patch 4027) */
     g_inited = 1;
     if (g_env_forced)
         fprintf(stderr, "[discord] KZ3_DISCORD_PRESENCE=%s wins over kz3.ini discord_presence for this run\n", env);

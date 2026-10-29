@@ -19,6 +19,39 @@ static int fails = 0;
         printf("\n");                                                                                                  \
     } while (0)
 
+/* RSX pass 125 (patch 2131): the page text carries kz3_tr.h markers (@tr{key|English}, @trl{...} in Lua strings); the port
+ * expands them in the game's language, English on failure. These tests check the English page, so expand them here the
+ * same way (the English literal), and count the markers in the raw page. */
+static int g_markers;
+static char* tr_english(char* in, size_t* n)
+{
+    char* o = (char*)malloc(strlen(in) + 1);
+    size_t k = 0;
+    for (const char* p = in; *p;) {
+        if (p[0] == '@' && p[1] == 't' && p[2] == 'r') {
+            const char* q = p + 3;
+            if (*q == 'l') q++;
+            if (*q == '{') {
+                const char* bar = strchr(q, '|');
+                const char* end = bar ? strchr(bar, '}') : NULL;
+                if (end) { g_markers++; memcpy(o + k, bar + 1, (size_t)(end - bar - 1)); k += (size_t)(end - bar - 1); p = end + 1; continue; }
+            }
+        }
+        o[k++] = *p++;
+    }
+    o[k] = 0;
+    free(in);
+    if (n) *n = k;
+    return o;
+}
+static char* t_gum_opts(const char* in, size_t n, size_t* out_n, unsigned opts)
+{
+    char* r = rsx_dm_patch_gum_opts(in, n, out_n, opts);
+    return r ? tr_english(r, out_n) : NULL;
+}
+#define rsx_dm_patch_gum(a, b, c) t_gum_opts(a, b, c, 0)
+#define rsx_dm_patch_gum_opts(a, b, c, d) t_gum_opts(a, b, c, d)
+
 static int rect_is(rsx_dm_rect r, int x, int y, int w, int h)
 {
     return r.x == x && r.y == y && r.w == w && r.h == h;
@@ -520,6 +553,7 @@ int main(void)
     test_ini();
     test_gum();
     test_aspect();
+    CHECK(g_markers >= 60, "patch 2131: the Display page rows, values, dialog and tooltips carry @tr markers (%d seen)", g_markers);
     printf("%s: %d failure(s)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

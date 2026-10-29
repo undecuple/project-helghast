@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Patch 1136 host test (tools/spu/test_r112_sched.c): the P-core mask choice. No game data.
+# Patch 1136/1140 host test (tools/spu/test_r112_sched.c): the P-core mask choice, the SPURS name list. No game data.
 #   nix develop --command tools/sandbox.sh -- tools/spu/test_r112_sched.sh
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"

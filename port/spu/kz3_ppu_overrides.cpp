@@ -1219,6 +1219,26 @@ KZ3_HOOK_REGION_LABEL(00327620, 000244C4)
 #endif
 #endif
 
+/* Net pass 45: the game's language for the port's own UI text (port/net/kz3_tr.h). GetLanguage v1.00 0x004C4C78 /
+ * 1.14 0x004D10A4 returns [profile+0xE90] (or the mapped system language when 0); Engine::Init, the language list
+ * and the menus' Lua (gPlayerProfile:GetLanguage) call it. The result is only noted (kz3_tr_note_lang, in
+ * port/net/kz3_discord.c, always linked); the return value is untouched. */
+#if defined(PPU_OVERRIDE_004C4C78) || defined(PPU_OVERRIDE_004D10A4)
+extern "C" void kz3_tr_note_lang(int id);
+#define KZ3_HOOK_GETLANGUAGE(ADDR)                                                                                     \
+    void func_##ADDR(ppu_context* ctx)                                                                                 \
+    {                                                                                                                  \
+        func_##ADDR##__lifted(ctx);                                                                                    \
+        kz3_tr_note_lang((int)(int32_t)ctx->gpr[3]);                                                                   \
+    }
+#ifdef PPU_OVERRIDE_004C4C78
+KZ3_HOOK_GETLANGUAGE(004C4C78)
+#endif
+#ifdef PPU_OVERRIDE_004D10A4
+KZ3_HOOK_GETLANGUAGE(004D10A4)
+#endif
+#endif
+
 /* ---- SPU pass 35 probes (off unless their switch is set; the rows are in ppu_overrides.txt) ---- */
 #if defined(PPU_OVERRIDE_00B37FBC) || defined(PPU_OVERRIDE_00B42FCC)   /* per-view result descriptor rebuild (RE pass 73 s.11.2): KZ3_CULL_PROBE=1 */
 extern "C" void kz3_cull_probe_desc(uint32_t desc_ea);
@@ -2533,5 +2553,38 @@ void func_00220A78(ppu_context* ctx)
     kz3_stall_diag_ppu_wait(1, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->lr);
     func_00220A78__lifted(ctx);
     kz3_stall_diag_ppu_wait(0, 0, 0, 0);
+}
+#endif
+
+#ifdef PPU_OVERRIDE_0014F1C4
+/* @0x0014F1C4 (1.14; 1.00 twin 0x0014AD44 uses byte +0x34, layout not mapped, no row) online session Close(M): sets
+ * the close-request byte M+0x38 (after telling M+0x58 when M+0x48 holds one of two known errors). The session Update
+ * 0x00150928 acts on +0x38 only while a session is open (+0x40 != 0: tear down, +0x38 = 0, +0x40 = 0); in state 0 it
+ * leaves the byte set for good, and the status getter 0x001514BC answers 2 (busy) while it is set, so the MP flow
+ * 0x008B5A70 (which starts M only on status 3) shows "Connecting.." forever (the RE notes s.38).
+ * SPU pass 119 caller log (runs spu119-close2/-close3, the RE notes "Pass 119"): after a cancelled/failed NetStart
+ * the game shuts the session down twice, both through Shutdown 0x007F89F4 (vt+0x38 of *0x15FD70C, whose last call is
+ * this Close): (1) from 0x004D553C (call returns to 0x004D5AAC; it then switches the front end with 0x004FBD08 /
+ * 0x0051BF14) while M is open (+0x40 = 1): Update tears it down the same frame but leaves the error status +0x44 = 4,
+ * because only the status refresh 0x0014FBD4 resets it and Update's teardown branch does not call the refresh;
+ * (2) one frame later from 0x008B6E90 ("shut down unless status is 3 or 2", r3+4 = M), which reads that stale 4 and
+ * closes again on the now idle M. All of it is guest code reading guest state; the only port inputs (the NetStart
+ * events) were varied by net 44 (1.5 s delay, two result codes) without effect. ASSUMPTION: the console does the same
+ * (a game bug, not a port difference); not checked on RPCS3 or hardware.
+ * Fix (game fix, KZ3_NETCLOSE_IDLE=0 = the original): a Close on an idle M (+0x40 == 0) completes at once, i.e. the
+ * lifted body runs (its +0x58 notification included) and the request byte is cleared again, which is exactly what the
+ * Update's teardown leaves behind when it handles a Close (+0x38 = 0). Closes on an open M are unchanged, so the
+ * online path's own shutdowns (always on an open session) take the original route. One [net-close] line per call. */
+#include <chrono>
+void func_0014F1C4(ppu_context* ctx)
+{
+    static const int s_on = [] { const char* e = getenv("KZ3_NETCLOSE_IDLE"); return !(e && e[0] == '0'); }();
+    const uint32_t m = (uint32_t)ctx->gpr[3], lr = (uint32_t)ctx->lr;
+    const uint32_t st = m ? vm_read32(m + 0x40) : 0xFFFFFFFFu;
+    func_0014F1C4__lifted(ctx);
+    const int idle = m && st == 0;
+    if (idle && s_on) vm_write8(m + 0x38, 0);
+    fprintf(stderr, "[net-close] Close M=%08X state=%u kind=%u status=%u lr=%08X%s\n", m, st, m ? vm_read32(m + 0x14) : 0,
+            m ? vm_read32(m + 0x44) : 0, lr, idle ? (s_on ? " idle: completed at once" : " idle: left pending (KZ3_NETCLOSE_IDLE=0)") : "");
 }
 #endif

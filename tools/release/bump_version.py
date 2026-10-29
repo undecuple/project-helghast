@@ -77,7 +77,7 @@ def edits(root, version, date):
 
     def edit(rel, fn):
         p = at(root, rel)
-        old = p.read_text(encoding="utf-8")
+        old = p.read_text(encoding="utf-8")  # universal newlines; the write below restores the file's own
         new = fn(old)
         if new != old:
             out[rel] = new
@@ -136,7 +136,11 @@ def main(argv=None):
     if a.check:
         return 0
     for rel, text in changed.items():
-        at(root, rel).write_text(text, encoding="utf-8")
+        # Keep each file's own line endings: read_text() gave "\n" and write_text() would write the platform's (CRLF on
+        # Windows). Issue #9, reported by @feanor-noldorin; KZ2 5b0cf61.
+        p = at(root, rel)
+        eol = "\r\n" if b"\r\n" in p.read_bytes() else "\n"
+        p.write_text(text, encoding="utf-8", newline=eol)
     if changed:
         r = subprocess.run([sys.executable, str(root / "tools/release/website.py"), "--root", str(root), "-q"])
         if r.returncode:

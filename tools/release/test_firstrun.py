@@ -16,6 +16,7 @@ check again / quit; the opt-in version check is asked first and logged; the cons
 import io
 import json
 import os
+import urllib.parse
 import re
 import shutil
 import sys
@@ -212,6 +213,15 @@ def main():
             check(red(r"# dump C:\Users\Other Name\Downloads\b") == r"# dump C:\Users\<user>\Downloads\b",
                   "8 redacts another account's folder")
             check(red("D:/Games/kz3") == "D:/Games/kz3", "8 leaves non-user paths alone")
+            # escaped and URL-encoded forms (issue #9, reported by @feanor-noldorin; KZ2 5b0cf61)
+            bk = home.replace("/", "\\")
+            check(red(repr(bk + "\\rpcs3")) == "'%USERPROFILE%\\\\rpcs3'", "8 redacts a repr() path")
+            check("Jane Doe" not in red(json.dumps([bk + "\\a"])), "8 redacts a JSON list of paths")
+            check(red(bk.replace("\\", "\\\\") + "\\\\x") == "%USERPROFILE%\\\\x", "8 redacts the doubled form")
+            check("Jane" not in red("file:///" + urllib.parse.quote(home.replace("\\", "/"), safe="/:") + "/x"), "8 redacts a URL-encoded path")
+            check("Jane" not in red(urllib.parse.quote(bk, safe="")) , "8 redacts a fully percent-encoded path")
+            check(red(json.dumps(r"C:\Users\Other Name\Downloads")) == r'"C:\\Users\\<user>\\Downloads"', "8 other account, JSON-escaped")
+            check(red("C%3A%5CUsers%5COther%20Name%5Cx") == "C%3A%5CUsers%5C<user>%5Cx", "8 other account, URL-encoded")
             # the path goes in argv, not in a repr()'d program text: repr doubles Windows backslashes in the logged command line
             say = py("import sys; print(sys.argv[1])") + [os.path.join(home, 'rpcs3', 'dev_hdd0')]
             rc, out = run(tmp, [fr.Step("say", "Say", 1, lambda c: [say])], "--build", os.path.join(tmp, "b8"))

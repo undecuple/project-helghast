@@ -1,0 +1,31 @@
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -15356,7 +15356,13 @@
+ static void ld_dm_get_buffers(void)
+ {
+     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {
+-        g.swap->lpVtbl->GetBuffer(g.swap, i, &IID_ID3D12Resource, (void**)&g.backbuf[i]);
++        /* patch 2133: GetBuffer's result is checked (a null back buffer got a null RTV and crashed later draws) */
++        const HRESULT gb = g.swap->lpVtbl->GetBuffer(g.swap, i, &IID_ID3D12Resource, (void**)&g.backbuf[i]);
++        if (FAILED(gb) || !g.backbuf[i]) {
++            g.backbuf[i] = NULL;
++            fprintf(stderr, "[display] GetBuffer(%u) after ResizeBuffers failed hr=0x%08lX\n", i, (unsigned long)gb);
++            continue;
++        }
+         LD_SM_INVALIDATE(), g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.backbuf[i], NULL, rtv_handle(i));
+     }
+ }
+@@ -15392,8 +15398,10 @@
+         g_dm_bb_w = w; g_dm_bb_h = h;               /* do not retry every frame; the blit scales into the old size */
+         {
+             D3D12_RESOURCE_DESC d;
+-            g.backbuf[0]->lpVtbl->GetDesc(g.backbuf[0], &d);
+-            g_dm_bb_w = (u32)d.Width; g_dm_bb_h = d.Height;
++            if (g.backbuf[0]) {
++                g.backbuf[0]->lpVtbl->GetDesc(g.backbuf[0], &d);
++                g_dm_bb_w = (u32)d.Width; g_dm_bb_h = d.Height;
++            }
+         }
+         return;
+     }
