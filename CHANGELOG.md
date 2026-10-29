@@ -3,9 +3,15 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
-## [Unreleased]
+## [0.1.7] - 2026-10-29 (pre-release)
+
+### Added
+- The mouse works in the game's confirmation dialogs: hovering an option highlights it as the pad does (checked in Exit game, Quit to desktop and Reset to defaults) and a click picks it (checked in Exit game and Reset to defaults), under Proton on the 1.14 update.
+- Optional gyro input from a DSU (cemuhook) server on this PC, for motion controls with pads that have sensors: off by default, set on the Layout and prompts page (checked with a test server only).
 
 ### Changed
+- Motion Sensor Function now defaults to Off for a pad without motion sensors (an Xbox pad, for example), so the motion sections read the stick instead; the on-screen hint still says to turn the controller, and the change has not yet been tried at the valve section. A pad with sensors keeps the game's default.
+- The light-probe SPU job runs as native code by default with the 1.14 update; `KZ3_NATIVE_JOB_LIGHTPROBES=0` runs the recompiled job instead. In a busy Frozen Shores scene it lowered that job's cost by about 40 % and raised the frame rate by about 0.7 frames/s (scripted runs, three alternated pairs under Proton; hand play is not measured).
 - The Discord status text and the setting's help line now say "Playing Project Helghast", which is what Discord shows.
 
 ### Fixed

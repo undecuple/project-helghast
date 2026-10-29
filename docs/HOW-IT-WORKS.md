@@ -13,7 +13,7 @@ recompilation with a runtime layer, plus native replacements where they matter. 
 | Part | How it runs today |
 |---|---|
 | PPU game code | recompiled ahead of time to C, compiled for x64 |
-| SPU programs and jobs | recompiled ahead of time; SPURS scheduling and DMA are reproduced by the runtime |
+| SPU programs and jobs | recompiled ahead of time; SPURS scheduling and DMA are reproduced by the runtime. One job runs as native C by default with the 1.14 update: the light-probe job (`KZ3_NATIVE_JOB_LIGHTPROBES=0` runs the recompiled job instead) |
 | Graphics | **translated at run time**: the game's RSX command stream is replayed on Direct3D 12, shaders translated from RSX microcode (the same kind of work an emulator's GPU layer does) |
 | Memory | the PS3's big-endian layout, kept as the recompiled code expects it |
 | System libraries (lv2, cell*) | reimplemented on PC APIs (high-level emulation) |

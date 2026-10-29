@@ -1,0 +1,168 @@
+diff -ruN a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c	2026-10-29 09:08:01.557223583 -0500
++++ b/libs/video/cellGcmSys.c	2026-10-29 09:08:01.558223606 -0500
+@@ -2271,6 +2271,19 @@
+     if (on && s_perf_walk_on && s_x_bias_x1000 < 0) gcm_x_calibrate();
+     return on && s_perf_walk_on;
+ }
++long long rsx_perf_get(int idx)   /* patch 2135 */
++{
++    return (rsx_perf_enabled() && idx >= 0 && idx < RSX_PERF_COUNT) ? __atomic_load_n(&g_rsx_perf[idx], __ATOMIC_RELAXED) : 0;
++}
++/* Patch 2135: RSX_PERF_DRAW=1 (with RSX_PERF=1 and RSX_PERF_PROF=A,B): per-draw stage distribution, [perf-draw]. Off: one
++ * cached flag test per draw, nothing else. */
++int rsx_perf_draw_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_PERF_DRAW"); on = (e && *e && *e != '0') ? 1 : 0;
++                  if (on) fprintf(stderr, "[perf-draw] per-draw stage distribution on (RSX_PERF_DRAW=1, patch 2135)\n"); }
++    return on && s_perf_walk_on;
++}
+ void rsx_perf_add(int idx, long long v)
+ {
+     if (rsx_perf_enabled() && idx >= 0 && idx < RSX_PERF_COUNT)
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c	2026-10-29 09:08:01.549223401 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-29 09:08:01.552223469 -0500
+@@ -4080,11 +4080,119 @@
+         r[*n].fmt = t->format; r[*n].span = span; r[*n].n = 1; r[*n].bytes = span; (*n)++;
+     }
+ }
++
++/* Patch 2135 (RSX pass 126): RSX_PERF_DRAW=1, inside the RSX_PERF_PROF window: the cost of each draw by stage as a
++ * distribution. sink_end() snapshots the stage counters of patches 2029/2033/2045 before and after sink_end_impl
++ * (only this thread adds them while a draw runs, async PSO builds excepted) and bins the per-draw delta in 0.25 us
++ * steps; [perf-draw] prints mean and p95 us per draw. Off: one cached flag test per draw. */
++enum { LD_PD_B = 640 };   /* 0.25 us buckets, 160 us; the last holds the rest */
++typedef struct { const char* name; int idx; int primary; unsigned long long sum, big; u32 h[LD_PD_B]; } ld_pd_stage;
++static ld_pd_stage g_pd[] = {
++    { "pre (camera repair, layout)", RSX_PERF_W_D_PRE_T, 1 }, { "surf (target/MRT/zeta resolve)", RSX_PERF_W_D_SURF_T, 1 },
++    { "vertex total", RSX_PERF_W_VTX_T, 1 },
++    { "  vtx refs", RSX_PERF_W_VTX_REFS_T, 0 }, { "  vtx remap", RSX_PERF_W_VTX_REMAP_T, 0 },
++    { "  vtx fetch/convert", RSX_PERF_W_VTX_FETCH_T, 0 }, { "  vtx copy to ring", RSX_PERF_W_VTX_COPY_T, 0 },
++    { "pso lookup total", RSX_PERF_W_PSO_T, 1 },
++    { "  pso pre", RSX_PERF_W_PSO_PRE_T, 0 }, { "  pso units", RSX_PERF_W_PSO_UNITS_T, 0 },
++    { "  pso key", RSX_PERF_W_PSO_KEY_T, 0 }, { "  pso find", RSX_PERF_W_PSO_FIND_T, 0 },
++    { "  pso build (new)", RSX_PERF_W_PSO_NEW_T, 0 },
++    { "ps constants (ring upload)", RSX_PERF_W_CONST_T, 1 },
++    { "texture loop (minus binds)", RSX_PERF_W_D_TEXLOOP_T, 1 }, { "texture binds", RSX_PERF_W_TEX_T, 1 },
++    { "  tex hash", RSX_PERF_W_TEX_HASH_T, 0 }, { "  tex new/decode", RSX_PERF_W_TEX_NEW_T, 0 },
++    { "  tex upload", RSX_PERF_W_TEX_UP_T, 0 },
++    { "descriptors+barriers+RT total", RSX_PERF_W_D_DESC_T, 1 },
++    { "  srv table", RSX_PERF_W_D_SRVTBL_T, 0 }, { "  sampler table", RSX_PERF_W_D_SMPTBL_T, 0 },
++    { "  surface barriers", RSX_PERF_W_D_BAR_T, 0 }, { "  RTV/DSV (omrt)", RSX_PERF_W_D_OMRT_T, 0 },
++    { "command recording (minus const)", RSX_PERF_W_D_REC_T, 1 },
++    { "post (write notes, render state)", RSX_PERF_W_D_POST_T, 1 }, { "  render-state decode", RSX_PERF_W_D_RS_T, 0 },
++};
++enum { LD_PD_N = (int)(sizeof g_pd / sizeof g_pd[0]) };
++static ld_pd_stage g_pd_all = { "draw (sink_end, timer pairs included)", 0, 0 }, g_pd_un = { "unattributed (draw - primary)", 0, 0 };
++static unsigned long long g_pd_draws, g_pd_cnt[5];   /* barriers, srv-table hits, new textures, new PSOs, sampler-map hits */
++static u32 g_pd_f0, g_pd_f1; static int g_pd_started;
++static const int g_pd_cidx[5] = { RSX_PERF_W_D_BAR_N, RSX_PERF_W_D_SRVTBL_HIT_N, RSX_PERF_W_TEX_NEW_N, RSX_PERF_W_PSO_NEW_N, RSX_PERF_W_D_SM_HIT_N };
++static const char* const g_pd_cname[5] = { "surface barriers", "srv-table hits", "new textures", "new PSOs", "sampler-table hits" };
++static const int g_pd_widx[] = { RSX_PERF_WALK_T, RSX_PERF_W_METH_T, RSX_PERF_W_DRAW_T, RSX_PERF_W_CLEAR_T, RSX_PERF_W_SUBMIT_T,
++                                 RSX_PERF_W_WAIT_RB_T, RSX_PERF_W_WAIT_OTHER_T, RSX_PERF_W_M2MF_T, RSX_PERF_W_NV3089_T,
++                                 RSX_PERF_W_WB_NV0039_T, RSX_PERF_W_WB_SYNC_T, RSX_PERF_FLUSH_T, RSX_PERF_GPUWAIT_T };
++static const char* const g_pd_wname[] = { "walker total", "method loop (incl. draws, clears, write-backs)", "draws (sink_end)", "clears",
++                                          "submit", "wait readback", "wait other", "m2mf", "nv3089 blits", "write-back nv0039",
++                                          "write-back sync", "ld_flush", "gpu wait (inside flush)" };
++enum { LD_PD_W = (int)(sizeof g_pd_widx / sizeof g_pd_widx[0]) };
++static long long g_pd_w0[LD_PD_W];
++static void ld_pd_bin(ld_pd_stage* s, long long ticks, double us_per_tick)
++{
++    if (ticks < 0) ticks = 0;
++    s->sum += (unsigned long long)ticks;
++    const double q = (double)ticks * us_per_tick * 4.0;
++    u32 b = q >= (double)(LD_PD_B - 1) ? (u32)(LD_PD_B - 1) : (u32)q;
++    if (b == LD_PD_B - 1) s->big++;
++    s->h[b]++;
++}
++static double ld_pd_pct(const ld_pd_stage* s, double p)
++{
++    unsigned long long n = 0; for (u32 i = 0; i < LD_PD_B; i++) n += s->h[i];
++    if (!n) return 0.0;
++    const unsigned long long want = (unsigned long long)((double)n * p + 0.999999);
++    unsigned long long a = 0;
++    for (u32 i = 0; i < LD_PD_B; i++) { a += s->h[i]; if (a >= want) return (double)(i + 1) * 0.25; }
++    return (double)LD_PD_B * 0.25;
++}
++static void ld_pd_draw(const rsx_dispatch* r, void* user, void (*fn)(void*, const rsx_dispatch*))
++{
++    static double upt = 0.0;
++    if (upt == 0.0) { LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); upt = 1.0e6 / (double)(qf.QuadPart ? qf.QuadPart : 1); }
++    long long b[LD_PD_N], c[5];
++    for (int i = 0; i < LD_PD_N; i++) b[i] = rsx_perf_get(g_pd[i].idx);
++    for (int i = 0; i < 5; i++) c[i] = rsx_perf_get(g_pd_cidx[i]);
++    if (!g_pd_started) {
++        g_pd_started = 1; g_pd_f0 = g_ld_frames;
++        for (int i = 0; i < LD_PD_W; i++) g_pd_w0[i] = rsx_perf_get(g_pd_widx[i]);
++    }
++    const long long t0 = rsx_perf_now();
++    fn(user, r);
++    const long long t1 = rsx_perf_now() - t0;
++    long long prim = 0;
++    for (int i = 0; i < LD_PD_N; i++) {
++        const long long d = rsx_perf_get(g_pd[i].idx) - b[i];
++        ld_pd_bin(&g_pd[i], d, upt);
++        if (g_pd[i].primary) prim += d;
++    }
++    for (int i = 0; i < 5; i++) g_pd_cnt[i] += (unsigned long long)(rsx_perf_get(g_pd_cidx[i]) - c[i]);
++    ld_pd_bin(&g_pd_all, t1, upt); ld_pd_bin(&g_pd_un, t1 - prim, upt);
++    g_pd_draws++; g_pd_f1 = g_ld_frames;
++}
++static void ld_pd_report(double tick_ms)
++{
++    if (!g_pd_started || !g_pd_draws) return;
++    const double us_tick = tick_ms * 1000.0, frames = (double)(g_pd_f1 - g_pd_f0 + 1), n = (double)g_pd_draws;
++    const double wall_us = (double)(rsx_perf_get(RSX_PERF_WALK_T) - g_pd_w0[0]) * us_tick;
++    fprintf(stderr, "[perf-draw] window frames %u..%u (%.0f), draws %llu (%.1f/frame); walker %.2f ms/frame = %.2f us/draw\n",
++            g_pd_f0, g_pd_f1, frames, g_pd_draws, n / frames, wall_us / 1000.0 / frames, wall_us / n);
++    fprintf(stderr, "[perf-draw] stage | mean us/draw | p95 us | %% of walker per draw | ms/frame\n");
++    const ld_pd_stage* all[LD_PD_N + 2];
++    for (int i = 0; i < LD_PD_N; i++) all[i] = &g_pd[i];
++    all[LD_PD_N] = &g_pd_all; all[LD_PD_N + 1] = &g_pd_un;
++    for (int i = 0; i < LD_PD_N + 2; i++) {
++        const ld_pd_stage* s = all[i];
++        const double us = (double)s->sum * us_tick;
++        fprintf(stderr, "[perf-draw] %-40s | %7.3f | %6.2f | %5.1f%% | %6.3f%s\n", s->name, us / n, ld_pd_pct(s, 0.95),
++                100.0 * (us / n) / (wall_us / n), us / 1000.0 / frames, s->big ? " (some >160us)" : "");
++    }
++    for (int i = 0; i < 5; i++)
++        fprintf(stderr, "[perf-draw] count %-20s %.2f/frame %.3f/draw\n", g_pd_cname[i], (double)g_pd_cnt[i] / frames, (double)g_pd_cnt[i] / n);
++    for (int i = 0; i < LD_PD_W; i++) {
++        const double us = (double)(rsx_perf_get(g_pd_widx[i]) - g_pd_w0[i]) * us_tick;
++        fprintf(stderr, "[perf-draw] walker %-46s %7.3f ms/frame %7.3f us/draw\n", g_pd_wname[i], us / 1000.0 / frames, us / n);
++    }
++}
++
+ void rsx_live_draw_perf_dump(void)   /* the reporter, when the RSX_PERF_PROF window closes */
+ {
+     LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+     const double tick_ms = 1000.0 / (double)(qf.QuadPart ? qf.QuadPart : 1);
+     ld_fx_report(tick_ms);   /* patch 2125 */
++    ld_pd_report(tick_ms);   /* patch 2135 */
+     for (int which = 0; which < 3; which++) {
+         ld_rd_t* r = g_ld_rd[which]; const u32 n = g_ld_rd_n[which];
+         const char* tag = which == 0 ? "redecode" : which == 1 ? "hash" : "newtex";
+@@ -14826,7 +14934,8 @@
+     const LONGLONG begin = ld_profile_qpc();
+ #endif
+     LDW_T0(draw_t0);
+-    sink_end_impl(user, r);
++    if (rsx_perf_draw_on() && draw_t0) ld_pd_draw(r, user, sink_end_impl);   /* patch 2135 */
++    else sink_end_impl(user, r);
+     LDW_ADD(RSX_PERF_W_DRAW_T, draw_t0);
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.sink_end_qpc += (u64)(ld_profile_qpc() - begin);
+diff -ruN a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h	2026-10-29 09:08:01.553223492 -0500
++++ b/libs/video/rsx_live_draw.h	2026-10-29 09:08:01.555223538 -0500
+@@ -283,6 +283,8 @@
+     RSX_PERF_COUNT
+ };
+ int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
++long long rsx_perf_get(int idx);               /* patch 2135: current value of a counter (0 unless RSX_PERF=1) */
++int       rsx_perf_draw_on(void);              /* patch 2135: RSX_PERF_DRAW=1 and inside the window */
+ int       rsx_perf_x_on(void);                 /* patch 2125: RSX_PERF_X=1 and inside the window */
+ void      rsx_live_draw_perf_dump(void);       /* patch 2045: [perf-redecode] when the window closes */
+ void      rsx_live_draw_submit_pending(void);  /* patch 2029: submit recorded work, no wait */

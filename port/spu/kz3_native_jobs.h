@@ -33,12 +33,15 @@ typedef struct {
     const char* kind;      /* kernel family (the diff harness picks its synthetic inputs by it) */
     uint32_t pool_lo, pool_hi;   /* constant pool the kernel was written for: LS [lo, hi), 8-byte aligned */
     uint64_t pool_hash;          /* FNV-1a 64 over its little-endian 8-byte words (tools/spu/native_pool.py) */
+    uint8_t def_on;              /* 1: native unless a switch says =0 (tsv column "default", SPU pass 127); 0: opt-in */
 } kz3_native_entry;
 
 extern const kz3_native_entry kz3_native_post[];
 extern const unsigned kz3_native_post_n;
 extern const kz3_native_entry kz3_native_dof[];
 extern const unsigned kz3_native_dof_n;
+extern const kz3_native_entry kz3_native_lp[];
+extern const unsigned kz3_native_lp_n;
 
 const kz3_native_entry* kz3_native_find(int slot);
 int kz3_native_run(spu_context* ctx, const kz3_native_entry* e);
@@ -49,9 +52,11 @@ int kz3_native_run(spu_context* ctx, const kz3_native_entry* e);
 
 extern volatile long g_kz3_native_calls[64], g_kz3_native_fallback[64];
 void kz3_native_count_print(int slot, long calls);
+void kz3_native_win_hit(int slot);   /* per-window call counter (10 s windows since the process start, SPU pass 125) */
 static inline void kz3_native_count(int slot)
 {
     const long c = __atomic_add_fetch(&g_kz3_native_calls[slot], 1, __ATOMIC_RELAXED);
+    kz3_native_win_hit(slot);
     if (__builtin_expect(c >= 1024 && !(c & (c - 1)), 0)) kz3_native_count_print(slot, c);
 }
 

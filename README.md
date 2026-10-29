@@ -20,7 +20,7 @@
 *Helghast* is the name of the game's own faction; Project Helghast is a fan project, not official and not
 affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games.
 
-You need your own Killzone 3 disc dump (a folder with PS3_GAME, or a decrypted ISO), the 1.14 update and a decrypted EBOOT from your own copy. Version <!-- version -->0.1.6<!-- /version --> is a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
+You need your own Killzone 3 disc dump (a folder with PS3_GAME, or a decrypted ISO), the 1.14 update and a decrypted EBOOT from your own copy. Version <!-- version -->0.1.7<!-- /version --> is a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 A PC port of **Killzone 3** (PS3, 2011) made by **static recompilation**: the game's PowerPC (PPU) and Cell SPU
 code is translated to C ahead of time and compiled into a native Windows x64 program, so no CPU emulator runs at
@@ -46,14 +46,14 @@ Guerrilla Games.
 
 ## Status
 
-As of 2026-10-28, on Windows x64, tested mostly under Proton on Linux (first runs on native Windows 11 on 2026-10-21 and on a Windows 10 test machine on 2026-10-22):
+As of 2026-10-29, on Windows x64, tested mostly under Proton on Linux (first runs on native Windows 11 on 2026-10-21 and on a Windows 10 test machine on 2026-10-22):
 
 | | |
 |---|---|
 | Boot, intro, menus | work at the game's 30 fps; the menu background's red haze and glow match the PS3 emulator RPCS3. Latin and Cyrillic text uses an open-font fallback; Chinese, Korean and Japanese text needs the PS3 system fonts, an optional folder you point the installer at from your own console's firmware files (no firmware is needed otherwise) |
 | First level | loads and runs for 10+ minutes (16 of 16 test runs clean). The video decoder threads are kept on performance cores of hybrid CPUs (`KZ3_SPU_PCORES=0` turns that off), because on efficiency cores they are the cause found for the loading-screen stall; no frame-rate effect was measured and the stall itself was not seen in those runs |
 | In-level HUD | drawn: level 2 shows the objective banner, ammo, grenades and crosshair; in the first level's opening the game shows only the objective marker and reticle, the same as the RPCS3 emulator at that point |
-| Input | Xbox (XInput) controllers work directly and PlayStation pads through Steam Input, with the game's own button layout and vibration; SDL3 input (DualShock 4, DualSense, Switch Pro, Xbox pads, rumble, motion sensors) is built in and only partly confirmed on real hardware. Layouts: the game's own, a modern-shooter preset, or a custom one set in an in-game editor. Keyboard and mouse work in the menus and in levels, with rebindable keys and mouse look (sensitivity under Options > Mouse). Details and what is not yet checked: [FEATURES.md](docs/FEATURES.md) |
+| Input | Xbox (XInput) controllers work directly and PlayStation pads through Steam Input, with the game's own button layout and vibration; SDL3 input (DualShock 4, DualSense, Switch Pro, Xbox pads, rumble, motion sensors) is built in and only partly confirmed on real hardware. Layouts: the game's own, a modern-shooter preset, or a custom one set in an in-game editor. Keyboard and mouse work in the menus and in levels, with rebindable keys and mouse look (sensitivity under Options > Mouse); the mouse also picks options in the game's confirmation dialogs. A pad without motion sensors gets Motion Sensor Function Off by default, so the motion sections read the stick (not yet tried that way; their hints still say to turn the controller). Details and what is not yet checked: [FEATURES.md](docs/FEATURES.md) |
 | Display | windowed or borderless with Alt+Enter, exclusive fullscreen as a setting, stretched or aspect-kept picture, bilinear or nearest filtering, VSync on or off, a Bloom setting, a frame rate limit of 30, 60 or 120 and a Field of view setting (Options > Display). In gameplay the view follows the window's shape (ultrawide and 16:10); the HUD, menus, subtitles and movies stay 16:9 and centred. Checked by hand at 1920x1080, other shapes only in test runs. Details: [FEATURES.md](docs/FEATURES.md) |
 | Campaign beyond level 1 | all 9 chapters load and play for minutes with a picture (picked with Select Chapter from a finished save; about 16-22 frames/s on a first visit depending on the chapter, one scripted run each on 2026-10-27). One chapter, Pyrrhus Outskirts (level 202), has been played by hand to its end in one session (about 29 minutes from a checkpoint, with a few bugs noted); the others have not been played through |
 | Saves | checkpoints save during play, Continue reloads them in a fresh run, and quitting to the main menu from the pause menu works; the save's PARAM.SFO is in the PS3's own format (moving a save to a console or an emulator is not tested) |
@@ -105,7 +105,7 @@ Start-menu "Open saves folder" entry say which rule decided, for example `data: 
 
 ## Getting it
 
-**Download:** <!-- version -->[v0.1.6](https://github.com/undecuple/project-helghast/releases/tag/v0.1.6)<!-- /version --> is a pre-release (partly
+**Download:** <!-- version -->[v0.1.7](https://github.com/undecuple/project-helghast/releases/tag/v0.1.7)<!-- /version --> is a pre-release (partly
 playable). Get `Project-Helghast-setup.exe` (recommended) or the portable zip from the
 [releases page](https://github.com/undecuple/project-helghast/releases) and check it against `SHA256SUMS`. No game
 code, assets or keys are ever shipped or downloaded: the setup builds the game's code on your own machine from your

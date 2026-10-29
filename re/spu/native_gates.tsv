@@ -1,15 +1,25 @@
 # Native gates (SPU pass 122; KZ2's native_gates.tsv design): lifted SPU functions that hand over to a native host
-# implementation (port/spu/kz3_native_post.c, kz3_native_dof.c) when their env flag is set. tools/spu/lift_spu.py
+# implementation (port/spu/kz3_native_post.c, kz3_native_dof.c) when their env flag is set (column default = 1: native unless the flag is 0; SPU pass 127: the 1.14 Gfx.LightProbes rows; the C table kz3_native_lp.c carries the same value, tools/spu/test_r127_native_default.sh checks both). tools/spu/lift_spu.py
 # native_gates() inserts the gate as the first statement of each listed function; the slot indexes
 # g_kz3_native_gate[] (defined once in port/spu/kz3_native_jobs.c). A gate returns 1 when it ran the whole subroutine
 # (the lifted body is skipped, the function returns to its link as `bi $r0`), 0 to run the lifted body. Rows are keyed
 # by lifted image name + LS address; the 1.00 twins (byte-identical modules, re/data/spu_map_114.tsv) have their own rows.
-# image	addr	slot	job	env	what
-job_011f9c80	0x4D00	0	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
-job_0117d880	0x4D00	1	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
-job_011f7d00	0x4D00	2	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
-job_0117b900	0x4D00	3	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
-job_011d4680	0x4DD0	4	Gfx.Post.Upsample	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
-job_01158280	0x4DD0	5	Gfx.Post.Upsample	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated
-job_011f9c80	0x5780	6	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOF	unpack RGBM-style pixels to float4 times the per-pixel weight (4 pixels a step)
-job_0117d880	0x5780	7	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOF	unpack RGBM-style pixels to float4 times the per-pixel weight (4 pixels a step)
+# image	addr	slot	job	env	what	default
+job_011f9c80	0x4D00	0	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated	0
+job_0117d880	0x4D00	1	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated	0
+job_011f7d00	0x4D00	2	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated	0
+job_0117b900	0x4D00	3	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated	0
+job_011d4680	0x4DD0	4	Gfx.Post.Upsample	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated	0
+job_01158280	0x4DD0	5	Gfx.Post.Upsample	KZ3_NATIVE_JOB_POSTMIX	blend an RGBA8 layer over the target in place: a + b * (256 - a.coverage) >> 8, saturated	0
+job_011f9c80	0x5780	6	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOF	unpack RGBM-style pixels to float4 times the per-pixel weight (4 pixels a step)	0
+job_0117d880	0x5780	7	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOF	unpack RGBM-style pixels to float4 times the per-pixel weight (4 pixels a step)	0
+job_0116d380	0x42D0	8	Gfx.LightProbes	KZ3_NATIVE_JOB_LIGHTPROBES	kd-tree 4-nearest probe search (spec 1.4)	1
+job_0116d380	0x45E8	9	Gfx.LightProbes	KZ3_NATIVE_JOB_LIGHTPROBES	SH-to-direction bake and fp16 pack (spec 1.8)	1
+job_010f0f00	0x42D0	10	Gfx.LightProbes	KZ3_NATIVE_JOB_LIGHTPROBES	kd-tree 4-nearest probe search (1.00 twin)	0
+job_010f0f00	0x45E8	11	Gfx.LightProbes	KZ3_NATIVE_JOB_LIGHTPROBES	SH-to-direction bake and fp16 pack (1.00 twin)	0
+job_0116d380	0x47F0	12	Gfx.LightProbes	KZ3_NATIVE_JOB_LIGHTPROBES	probe blend: kd search, inverse-distance weights, 9 SH quads (spec 1.5)	1
+job_0116d380	0x4180	13	Gfx.LightProbes	KZ3_NATIVE_JOB_LIGHTPROBES	SH band 1/2 attenuation in place (spec 1.7)	1
+job_010f0f00	0x47F0	14	Gfx.LightProbes	KZ3_NATIVE_JOB_LIGHTPROBES	probe blend (1.00 twin)	0
+job_010f0f00	0x4180	15	Gfx.LightProbes	KZ3_NATIVE_JOB_LIGHTPROBES	SH band 1/2 attenuation (1.00 twin)	0
+job_0116d380	0x4DD0	16	Gfx.LightProbes	KZ3_NATIVE_JOB_LP_LIGHT	dynamic-light SH: point, spot, directional (spec 1.6, decoded in pass 125)	1
+job_010f0f00	0x4DD0	17	Gfx.LightProbes	KZ3_NATIVE_JOB_LP_LIGHT	dynamic-light SH (1.00 twin)	0

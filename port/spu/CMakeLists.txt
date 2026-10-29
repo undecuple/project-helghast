@@ -72,6 +72,7 @@ add_library(kz3_spu OBJECT
     kz3_jobhook.c         # KZ3_JOB_CAPTURE / KZ3_NATIVE_JOB: job I/O capture + native-job hook (patch 1141, SPU pass 120)
     kz3_native_post.c     # Gfx.Post native kernels (SPU pass 122)
     kz3_native_dof.c      # DepthOfField native kernels (SPU pass 122)
+    kz3_native_lp.c       # LightProbes native kernels (SPU pass 123)
     kz3_native_jobs.c     # the job hook's KZ3 table (job manager LS layout, registered native jobs; empty)
     kz3_cam_watch.c       # KZ3_CAM_WATCH=1: page-guard write watch on the K2 render camera's matrix (SPU pass 56)
     kz3_hkquit_probe.c    # KZ3_JOIN2_PROBE=1: Havok pool teardown / JoinTask2 stall dump (T7 quit, SPU pass 57)

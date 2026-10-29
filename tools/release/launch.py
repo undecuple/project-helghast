@@ -434,9 +434,35 @@ def _is_dir_link(p):
     return bool(isj and isj(p))
 
 
+def _undo_link(link):
+    """Remove what a failed link attempt left at `link`: a reparse point (link, junction) or an EMPTY folder, nothing
+    else (rmdir refuses a folder with content, which stays). -> True when nothing is left there."""
+    if not os.path.lexists(link):
+        return True
+    try:
+        try:
+            os.unlink(link)
+        except OSError:
+            os.rmdir(link)
+    except OSError:
+        return False
+    return True
+
+
+def _link_error_words(text):
+    """Plain words for the Windows errors a link attempt gives."""
+    if "1392" in text:
+        return (" WinError 1392: the drive's file system may not support folder junctions, "
+                "or it may be damaged; the safe step is an install folder on an NTFS drive such as C:")
+    return ""
+
+
 def _make_dir_link(target, link):
-    """Directory junction on Windows (no admin rights or developer mode needed), else a symlink. -> error or ""."""
+    """Directory junction on Windows (no admin rights or developer mode needed), else a symlink. -> error or "".
+    A failed attempt removes what it created (CreateJunction makes the folder first and leaves it empty when the
+    reparse step fails; the symlink would then fail with WinError 183, exists), so the next try starts clean."""
     errs = []
+    existed = os.path.lexists(link)
     if os.name == "nt":
         try:
             import _winapi
@@ -444,12 +470,16 @@ def _make_dir_link(target, link):
             return ""
         except (ImportError, AttributeError, OSError) as e:
             errs.append(f"junction: {e}")
+            if not existed:
+                _undo_link(link)
     try:
         os.symlink(target, link, target_is_directory=True)
         return ""
     except (OSError, NotImplementedError) as e:
         errs.append(f"symlink: {e}")
-    return "; ".join(errs)
+        if not existed:
+            _undo_link(link)
+    return "; ".join(errs) + "." + _link_error_words("; ".join(errs))
 
 
 def link_free(root, build=None):
@@ -502,7 +532,7 @@ def ensure_vfs(root, dump, no_link=False):
                 os.rmdir(link)      # a junction on older Pythons; RemoveDirectory removes the link only
         except OSError as e:
             return v, f"Could not replace the old link {link} ({e})"
-    elif os.path.lexists(link):
+    elif os.path.lexists(link) and not (os.path.isdir(link) and _undo_link(link)):   # an empty folder (a failed attempt's leftover) goes
         return v, f"{link} is a real folder, not a link to the game folder; move it away and start again"
     err = _make_dir_link(target, link)
     if err:

@@ -60,5 +60,5 @@ int main(void)
     return bad != 0;
 }
 C
-cc -std=gnu17 -O1 -msse4.1 -w -I"$ROOT/port/spu" -I"$T/runtime/spu" -I"$T/include" -I"$T/runtime" "$OUT/t.c" "$ROOT/port/spu/kz3_native_post.c" "$ROOT/port/spu/kz3_native_dof.c" -lm -o "$OUT/t" || { echo "FAIL build"; exit 1; }
+cc -std=gnu17 -O1 -msse4.1 -w -I"$ROOT/port/spu" -I"$T/runtime/spu" -I"$T/include" -I"$T/runtime" "$OUT/t.c" "$ROOT/port/spu/kz3_native_post.c" "$ROOT/port/spu/kz3_native_dof.c" "$ROOT/port/spu/kz3_native_lp.c" "$ROOT/tools/spu/native_xr_stubs.c" -lm -o "$OUT/t" || { echo "FAIL build"; exit 1; }
 "$OUT/t" && echo PASS || { echo FAIL; exit 1; }

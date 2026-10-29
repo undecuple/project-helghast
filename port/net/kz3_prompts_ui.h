@@ -174,16 +174,24 @@ static const char kz3_padset_page[] =
     "\t\t\t<select id=\"slc_kz3_prompts\" width=\"555\" optionwidth=\"250\" label=\"@tr{lp.prompts|Button prompts}\" onchange=\"script(settingscript,KZ3ChangePrompts)\"\n"
     "\t\t\t\tdefault-value=\"auto\">\n"
     "\t\t\t\t<selectitem value=\"auto\">@tr{lp.v.auto|Auto}</selectitem>\n"
-    "\t\t\t\t<selectitem value=\"ps3\">PS3</selectitem>\n"
-    "\t\t\t\t<selectitem value=\"ps4\">PS4/PS5</selectitem>\n"
-    "\t\t\t\t<selectitem value=\"xbox\">Xbox</selectitem>\n"
-    "\t\t\t\t<selectitem value=\"keyboard\">Keyboard</selectitem>\n"
+    "\t\t\t\t<selectitem value=\"ps3\">@tr{lp.v.ps3|PS3}</selectitem>\n"
+    "\t\t\t\t<selectitem value=\"ps4\">@tr{lp.v.ps4|PS4/PS5}</selectitem>\n"
+    "\t\t\t\t<selectitem value=\"xbox\">@tr{lp.v.xbox|Xbox}</selectitem>\n"
+    "\t\t\t\t<selectitem value=\"keyboard\">@tr{lp.v.keyboard|Keyboard}</selectitem>\n"
     "\t\t\t</select>\n"
     "\t\t\t<select id=\"slc_kz3_layout\" width=\"555\" optionwidth=\"250\" label=\"@tr{lp.layout|Controller layout}\" onchange=\"script(settingscript,KZ3ChangeLayout)\"\n"
     "\t\t\t\tdefault-value=\"default\">\n"
-    "\t\t\t\t<selectitem value=\"default\">Default</selectitem>\n"
+    "\t\t\t\t<selectitem value=\"default\">@tr{lp.v.default|Default}</selectitem>\n"
     "\t\t\t\t<selectitem value=\"modern\">@tr{lp.v.modern|Modern shooter}</selectitem>\n"
     "\t\t\t\t<selectitem value=\"custom\">@tr{lp.v.custom|Custom}</selectitem>\n"
+    "\t\t\t</select>\n"
+    "\t\t\t<select id=\"slc_kz3_dsu\" width=\"555\" optionwidth=\"250\" label=\"@tr{lp.dsu|Gyro server (DSU)}\" onchange=\"script(settingscript,KZ3ChangeDsu)\"\n"
+    "\t\t\t\tdefault-value=\"off\">\n"
+    "\t\t\t\t<selectitem value=\"off\">@tr{lp.v.off|Off}</selectitem>\n"
+    "\t\t\t\t<selectitem value=\"26760\">26760</selectitem>\n"
+    "\t\t\t\t<selectitem value=\"26761\">26761</selectitem>\n"
+    "\t\t\t\t<selectitem value=\"26762\">26762</selectitem>\n"
+    "\t\t\t\t<selectitem value=\"26763\">26763</selectitem>\n"
     "\t\t\t</select>\n"
     "\t\t\t<listitem id=\"itm_kz3_custom\" label=\"@tr{lp.edit|Edit custom layout}\" width=\"320\" labelaccept=\"@key{menu_legend_select}\"\n"
     "\t\t\t\tonaccept=\"" KZ3_PADPAGE_OPEN "\"/>\n"
@@ -201,6 +209,7 @@ static const char kz3_padset_page[] =
     "\t\tgKz3Desc = {\n"
     "\t\t\tslc_kz3_prompts = \"@trl{lp.tip.prompts|Which buttons the prompts show. Auto follows the controller or keyboard used last.}\",\n"
     "\t\t\tslc_kz3_layout = \"@trl{lp.tip.layout|Modern is the Killzone Shadow Fall layout. Menus keep their buttons.}\",\n"
+    "\t\t\tslc_kz3_dsu = \"@trl{lp.tip.dsu|Gyro from a DSU server on this PC only (127.0.0.1). Pick its port; Off turns it off.}\",\n"
     "\t\t\titm_kz3_custom = \"@trl{lp.tip.edit|Set the button for each action. A change selects the Custom layout.}\"\n"
     "\t\t}\n"
     "\n"
@@ -212,6 +221,7 @@ static const char kz3_padset_page[] =
     "\t\t\tgRoot:GetTag(\"slc_kz3_prompts\"):SetValue(KZ3PromptsCmd(\"prompts\"))\n"
     "\t\t\tlocal v = KZ3PromptsCmd(\"padmap\")\n"
     "\t\t\tgRoot:GetTag(\"slc_kz3_layout\"):SetValue(v)\n"
+    "\t\t\tgRoot:GetTag(\"slc_kz3_dsu\"):SetValue(KZ3PromptsCmd(\"dsu\"))\n"
     "\t\t\tKZ3ShowPicture(v)\n"
     "\t\t\tgRoot:GetTag(\"txt_kz3_desc\"):SetValue(gKz3Desc[\"slc_kz3_prompts\"])\n"
     "\t\tend\n"
@@ -225,6 +235,11 @@ static const char kz3_padset_page[] =
     "\t\tfunction KZ3ChangePrompts(e)\n"
     "\t\t\te:SetHandled(true)\n"
     "\t\t\tKZ3PromptsCmd(\"prompts \"..e:GetSender():GetValue())\n"
+    "\t\tend\n"
+    "\n"
+    "\t\tfunction KZ3ChangeDsu(e)\n"
+    "\t\t\te:SetHandled(true)\n"
+    "\t\t\tKZ3PromptsCmd(\"dsu \"..e:GetSender():GetValue())\n"
     "\t\tend\n"
     "\n"
     "\t\tfunction KZ3ChangeLayout(e)\n"
@@ -242,6 +257,8 @@ static const char kz3_padset_page[] =
     "\t\t\tif (e:GetSender():GetValue() == \"yes\") then\n"
     "\t\t\t\tKZ3PromptsCmd(\"prompts auto\")\n"
     "\t\t\t\tKZ3PromptsCmd(\"padmap default\")\n"
+    "\t\t\t\tKZ3PromptsCmd(\"dsu off\")\n"
+    "\t\t\t\tgRoot:GetTag(\"slc_kz3_dsu\"):SetValue(\"off\")\n"
     "\t\t\t\tgRoot:GetTag(\"slc_kz3_prompts\"):SetValue(KZ3PromptsCmd(\"prompts\"))\n"
     "\t\t\t\tlocal v = KZ3PromptsCmd(\"padmap\")\n"
     "\t\t\t\tgRoot:GetTag(\"slc_kz3_layout\"):SetValue(v)\n"
@@ -252,10 +269,78 @@ static const char kz3_padset_page[] =
     "\t</script>\n"
     "</gum>\n";
 /* The Layout and Prompts page in the game's language (malloc'd, NUL-terminated, *out_n bytes; NULL without memory). */
+/* Net pass 46: the label column and the description panel follow the language (a Russian or Spanish label is wider than
+ * the 305 px the English page leaves, and a long description needs more than the 3 lines of the right-hand column).
+ * kz3_pu_weight: width of a text in "Latin letters" (Cyrillic and similar 1.25, kana/Han/Hangul 2.2). */
+static double kz3_pu_weight(const char* s)
+{
+    double w = 0;
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        if (*p < 0x80) w += 1;
+        else if (*p >= 0xF0) { w += 2.2; p += 3; }
+        else if (*p >= 0xE0) { w += (*p >= 0xE3) ? 2.4 : 1.0; p += 2; }
+        else if (*p >= 0xC0) { w += (*p >= 0xD0) ? 1.25 : 1.0; p += 1; }
+    }
+    return w;
+}
+
+/* replace every `from` in the rendered page (malloc'd *g, *n bytes) with `to`; returns the number of replacements */
+static int kz3_pu_replace(char** g, size_t* n, const char* from, const char* to)
+{
+    size_t fl = strlen(from), tl = strlen(to);
+    int hits = 0;
+    for (size_t i = 0; i + fl <= *n; ) {
+        if (memcmp(*g + i, from, fl)) { i++; continue; }
+        char* r = (char*)malloc(*n - fl + tl + 1);
+        if (!r) return hits;
+        memcpy(r, *g, i); memcpy(r + i, to, tl); memcpy(r + i + tl, *g + i + fl, *n - i - fl);
+        *n = *n - fl + tl; r[*n] = 0;
+        free(*g); *g = r; i += tl; hits++;
+    }
+    return hits;
+}
+
 static char* kz3_padset_gum(size_t* out_n)
 {
     char* g = NULL;
-    *out_n = kz3_tr_render(kz3_padset_page, sizeof kz3_padset_page - 1, &g);
+    size_t n = kz3_tr_render(kz3_padset_page, sizeof kz3_padset_page - 1, &g);
+    if (!g) { *out_n = n; return g; }
+    /* label column: 14.5 px per Latin capital plus the row's left padding; never below the English 305 px */
+    double lw = kz3_pu_weight(kz3_tr("lp.prompts", "Button prompts"));
+    double l2 = kz3_pu_weight(kz3_tr("lp.layout", "Controller layout"));
+    double l3 = kz3_pu_weight(kz3_tr("lp.edit", "Edit custom layout"));
+    double l5 = kz3_pu_weight(kz3_tr("lp.dsu", "Gyro server (DSU)"));
+    if (l2 > lw) lw = l2;
+    if (l5 > lw) lw = l5;
+    int label = (int)(lw * 14.5 + 50);
+    if (label < 305) label = 305;
+    int width = label + 250;
+    if (width > 555) {
+        char a[64], b[64];
+        snprintf(a, sizeof a, "width=\"%d\" optionwidth=\"250\"", width);
+        kz3_pu_replace(&g, &n, "width=\"555\" optionwidth=\"250\"", a);
+        if (width > 800) {
+            snprintf(b, sizeof b, "class=\"PEDS\" width=\"%d\"", width + 20);
+            kz3_pu_replace(&g, &n, "class=\"PEDS\" width=\"800\"", b);
+        }
+    }
+    int ew = (int)(l3 * 14.5 + 40);   /* the Edit row: its own width (320 px in English) */
+    if (ew > 320) {
+        char b[64];
+        snprintf(b, sizeof b, "width=\"%d\" labelaccept", ew);
+        kz3_pu_replace(&g, &n, "width=\"320\" labelaccept", b);
+    }
+    /* description panel: the right-hand column holds 3 lines; a longer text moves the panel left and widens it */
+    double d = kz3_pu_weight(kz3_tr("lp.tip.prompts", "Which buttons the prompts show. Auto follows the controller or keyboard used last."));
+    double d2 = kz3_pu_weight(kz3_tr("lp.tip.layout", "Modern is the Killzone Shadow Fall layout. Menus keep their buttons."));
+    double d3 = kz3_pu_weight(kz3_tr("lp.tip.edit", "Set the button for each action. A change selects the Custom layout."));
+    if (d2 > d) d = d2;
+    if (d3 > d) d = d3;
+    { double d5 = kz3_pu_weight(kz3_tr("lp.tip.dsu", "Gyro from a DSU server on this PC only (127.0.0.1). Pick its port; Off turns it off."));
+      if (d5 > d) d = d5; }
+    if (d > 90)
+        kz3_pu_replace(&g, &n, "class=\"tooltip\" y=\"" KZ3_PADSET_DESC_Y "\"", "class=\"tooltip\" x=\"45\" width=\"780\" y=\"" KZ3_PADSET_DESC_Y "\"");
+    *out_n = n;
     return g;
 }
 

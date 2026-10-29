@@ -105,21 +105,21 @@ static char* kz3_pa_page(int first, int last, int main, size_t* out_n)
     Kz3PpBuf b = { 0, 0, 0, 0 };
     char line[1024];
     int r;
-    kz3_pp_put(&b,
+    kz3_pp_tr(&b,
         "<gum default-focus=\"lst_pad\">\n\n"
         "\t<texture class=\"background\"/>\n"
         "\t<movie src=\"source:movies/MenuBackground.bik\" persistid=\"movie_back\"/>\n"
         "\t<timer id=\"pm_timer\" reset-on-input=\"false\" countdown=\"150\" on-timer-end=\"script(pmscript, Tick)\"/>\n\n"
         "\t<panel id=\"pnl_main\" class=\"safearea\" scrollable=\"false\"\n"
         "\t\toncancel=\"back()\" labelcancel=\"@key{menu_legend_back}\" onstart=\"back()\"\n"
-        "\t\tonoptions=\"script(pmscript, Unbind)\" labeloptions=\"Unbind\">\n\n"
+        "\t\tonoptions=\"script(pmscript, Unbind)\" labeloptions=\"@tr{pad.unbind|Unbind}\">\n\n"
         "\t\t@include{file:///hudelements/type3.gum}\n\n"
         "\t\t<text class=\"sectiontitle\">@key{menu_options}</text>\n");   /* the sibling Options pages' form (RSX pass 104) */
     kz3_pp_tr(&b, main ? "\t\t<text class=\"pagetitle\">@tr{pad.title_foot|Change the custom layout: on foot}</text>\n\n"
                        : "\t\t<text class=\"pagetitle\">@tr{pad.title_veh|Change the vehicle controls}</text>\n\n");
     kz3_pp_tr(&b,
-        "\t\t<text id=\"hdr_0\" x=\"457\" y=\"66\" width=\"150\" text-align=\"center\">@tru{pad.hdr|Pad button}</text>\n"
-        "\t\t<list id=\"lst_pad\" class=\"PEDS\" width=\"760\" height=\"360\" labelaccept=\"@key{menu_startup_controls_change}\"\n"
+        "\t\t<text id=\"hdr_0\" x=\"382\" y=\"106\" width=\"300\" text-align=\"center\">@tru{pad.hdr|Pad button}</text>\n"
+        "\t\t<list id=\"lst_pad\" class=\"PEDS\" y=\"186\" width=\"760\" height=\"280\" labelaccept=\"@key{menu_startup_controls_change}\"\n"
         "\t\t\tonaccept=\"script(pmscript, Bind)\">\n");
     for (r = first; r < last && r < KZ3_PA_N; r++) {
         snprintf(line, sizeof line,

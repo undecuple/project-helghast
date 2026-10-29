@@ -1,0 +1,24 @@
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -5715,7 +5715,20 @@
+               } }
+             entry->last_hash_frame = g_ld_frames;
+             entry->sf_seq = sf_before;   /* patch 2137 */
+-            if (g_ld_sf_flag) { g_ld_sf_flag = 0; if (readable && hash != entry->content_hash) g_ld_sf_st.changed++; }
++            if (g_ld_sf_flag) {
++                g_ld_sf_flag = 0;
++                if (readable && hash != entry->content_hash) {
++                    g_ld_sf_st.changed++;
++                    static int sf_log = -1; static u32 sf_logged;
++                    if (sf_log < 0) { const char* e = getenv("RSX_TEX_SAMEF_LOG"); sf_log = e && *e && *e != '0'; }
++                    if (sf_log && sf_logged < 400u) {   /* patch 2138: which texture, for the evidence frame pair */
++                        sf_logged++;
++                        fprintf(stderr, "[tex-samef-bind] frame=%u loc=%u off=0x%08X fmt=0x%02X %ux%u pitch=%u span=%u remap=0x%04X cube=%u dim=%u\n",
++                                g_ld_frames, t->location, t->offset, t->format, t->width, t->height, t->pitch, entry->span,
++                                t->remap & 0xFFFFu, t->cubemap, t->dimension);
++                    }
++                }
++            }
+             if (readable && hash != entry->content_hash) {
+                 /* patch 2035: offer the current resource for an in-place update */
+                 g_ld_tex_reuse = ld_tex_inplace_on() ? entry->tex : NULL;

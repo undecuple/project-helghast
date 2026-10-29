@@ -14,7 +14,7 @@ on Windows' software renderer (2026-10-22); a full first-run build on Windows 10
 
 There are two ways to get a build:
 
-- **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.6<!-- /version --> pre-release.** It checks your disc dump and
+- **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.7<!-- /version --> pre-release.** It checks your disc dump and
   the 1.14 update, then lifts and compiles the game's code on your machine with a bundled compiler, behind one
   progress bar, with a full install log.
 - **A developer build from source with Nix**, described below: on Linux (how the port is developed and tested

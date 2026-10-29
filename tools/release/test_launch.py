@@ -260,6 +260,45 @@ def main():
         check("real folder" in err and os.path.isfile(os.path.join(vl, "keep.txt")),
               f"8 a real PS3_GAME folder in vfs is never removed ({err})")
         shutil.rmtree(vl)
+        # 8d (pass 78): a half-made link. CreateJunction makes the folder, then fails (WinError 1392); the symlink then
+        # fails with 183. The attempt removes what it made; an older start's empty leftover goes; content stays.
+        import types
+        class FakeOS:
+            name = "nt"
+            def __init__(self, sym_err): self._sym_err = sym_err
+            def __getattr__(self, n): return getattr(os, n)
+            def symlink(self, *a, **k): raise self._sym_err
+        def junction_fail(target, link):
+            os.mkdir(link)
+            raise OSError("[WinError 1392] The file or directory is corrupted and unreadable")
+        real_os, real_wa = la.os, sys.modules.get("_winapi")
+        sys.modules["_winapi"] = types.SimpleNamespace(CreateJunction=junction_fail)
+        lk = os.path.join(tmp, "half", "PS3_GAME")
+        os.makedirs(os.path.dirname(lk))
+        try:
+            la.os = FakeOS(OSError("[WinError 183] Cannot create a file when that file already exists"))
+            err = la._make_dir_link(os.path.join(dump, "PS3_GAME"), lk)
+        finally:
+            la.os = real_os
+            if real_wa is None: del sys.modules["_winapi"]
+            else: sys.modules["_winapi"] = real_wa
+        check("1392" in err and "junctions" in err and "NTFS" in err and not os.path.lexists(lk),
+              f"8d failed junction + symlink: nothing left behind, cause in words ({err})")
+        os.makedirs(os.path.join(tmp, "x", "vfs"))
+        e_root = os.path.join(tmp, "x")
+        os.mkdir(os.path.join(e_root, "vfs", "PS3_GAME"))
+        v, err = la.ensure_vfs(e_root, dump)
+        check(err == "" and la._is_dir_link(os.path.join(e_root, "vfs", "PS3_GAME")),
+              f"8d empty leftover folder removed, link made on the next start ({err})")
+        os.unlink(os.path.join(e_root, "vfs", "PS3_GAME"))   # (posix symlink)
+        la._undo_link(os.path.join(e_root, "vfs", "PS3_GAME"))
+        write(os.path.join(e_root, "vfs", "PS3_GAME", "keep.txt"), "mine")
+        os.remove(os.path.join(e_root, "vfs", "link.json"))
+        v, err = la.ensure_vfs(e_root, dump)
+        check("real folder" in err and os.path.isfile(os.path.join(e_root, "vfs", "PS3_GAME", "keep.txt")),
+              "8d a folder with files stays and gives the error")
+        check(not la._undo_link(os.path.join(e_root, "vfs", "PS3_GAME")) and os.path.isfile(os.path.join(e_root, "vfs", "PS3_GAME", "keep.txt")),
+              "8d _undo_link refuses a folder with content")
         la.ensure_vfs(root, dump)
         check(os.path.isdir(os.path.join(root, "build", "cache", "edat")), "8 edat cache made")
         # 8c (round KZ3-03): link-free. A payload whose kz3_ini.h has KZ3_CACHE_ROOT reads the dump in place and

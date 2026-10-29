@@ -344,8 +344,17 @@ void kz3_tr_set_game_resolver(const char* (*fn)(const char* id)) { s_tr_resolver
 
 static const char* kz3_tr_find(const Kz3TrTable* t, const char* key, int id)
 {
-    for (unsigned i = 0; i < t->n; i++)
-        if (!strcmp(t->rows[i].key, key)) return t->rows[i].cell[id];   /* first row of a key wins */
+    size_t kl = strlen(key);
+    for (unsigned i = 0; i < t->n; i++) {
+        /* network pass 46: a row's key may list aliases ("disp.v.default,lp.v.default": one cell, two keys) */
+        const char* k = t->rows[i].key;
+        while (k && *k) {
+            const char* e = strchr(k, ',');
+            size_t l = e ? (size_t)(e - k) : strlen(k);
+            if (l == kl && !memcmp(k, key, kl)) return t->rows[i].cell[id];   /* first row of a key wins */
+            k = e ? e + 1 : NULL;
+        }
+    }
     return NULL;
 }
 /* Placeholder mask of s: bit k for each {k}, k 0..2; bit 3 for {3}..{9} (never allowed). */

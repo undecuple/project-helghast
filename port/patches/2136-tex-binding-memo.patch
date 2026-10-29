@@ -1,0 +1,343 @@
+--- a/libs/video/rsx_live_draw.c	2026-10-29 09:40:34.611337569 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-29 09:52:52.569699508 -0500
+@@ -3982,6 +3982,7 @@
+ }
+ 
+ /* Walker, at the flip: move the live bits aside and flag the entries under them. */
++static void ld_tm_stat_print(void);   /* patch 2136 */
+ static void ld_td_flip(void)
+ {
+     int any = 0;
+@@ -4037,6 +4038,7 @@
+                 (unsigned long long)g_ld_tc.miss_net[1]);
+         memset(&g_ld_tc, 0, sizeof g_ld_tc);
+     }
++    if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) ld_tm_stat_print();   /* patch 2136 */
+ }
+ 
+ /* KZ3 patch 2045 diagnostic (RSX_PERF window only): which textures get re-decoded, by source. Patch 2046: exact
+@@ -5539,18 +5541,62 @@
+ /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
+  * descriptor-only cache, re-hash the source once per frame and refresh the
+  * D3D resource when the game rewrites the same guest address. */
+-static u32 texture_srv_slot(const rsx_dsp_texture* t)
++/* KZ3 patch 2136 (RSX pass 127): per-unit binding memo, RSX_TEX_CACHE=1 (default off; =2 also verifies every hit).
++ * The texture loop of sink_end_impl resolves each enabled unit from its registers: decode, sampler key + slot (linear
++ * scan of up to 128 sampler keys), zeta-alias kind, colour-surface scan (up to 64), the texture index lookup, then the
++ * entry's per-frame hash decision. A memo row per unit keeps what the registers resolved to when the unit took the
++ * plain texture-cache path (no colour surface, no zeta). Rows are keyed by the unit's 9 raw registers (0x1A00+u*32 ..
++ * +0x1C, SIZE1 0x1840+u*4; they fully determine rsx_dsp_texture, and the resolution does not depend on the unit
++ * number), 4096 rows direct-mapped by a hash of the words. A draw reuses a row when:
++ *   - the 9 words are equal,
++ *   - g_ld_surf_gen / g_ld_zgen (bumped wherever a colour surface or a zeta gets a location/offset/size) are the same:
++ *     a row is only recorded when NO colour surface (the draw's target included) and no zeta sits at the texture's
++ *     address, so the surface scan, the feedback check and the zeta lookup find nothing for any target,
++ *   - the cache entry still holds the same key (eviction or recycling changes it),
++ *   - g_ld_tex_memo_epoch is the same (device (re)initialisation; sampler slots are append-only otherwise).
++ * Content coherence is NOT the memo's business: a hit still runs texture_srv_slot_entry, the same per-entry code as
++ * before (keycap refresh, once-per-frame hash decision with the page bitmap of every tracked writer, re-decode, LRU),
++ * so a guest write to the texture's pages forces the re-check exactly as with the memo off. Diagnostic switches that
++ * read or rewrite units in the loop turn the memo off (ld_tex_memo_on). Notes: the RE notes "Pass 127". */
++static u32 g_ld_surf_gen = 1, g_ld_zgen = 1, g_ld_tex_memo_epoch = 1;
++static u32 g_ld_tsl_index = UINT32_MAX;   /* the entry texture_srv_slot resolved to (UINT32_MAX: none / not memoisable) */
++static u32 texture_srv_slot_entry(const rsx_dsp_texture* t, u32 i);
++static u32 texture_srv_slot_new(const rsx_dsp_texture* t);
++static void ld_tsl_prologue(const rsx_dsp_texture* t)
+ {
+-    const u32 remap = t->remap & 0xFFFF;
+-    static int refresh_enabled = -1;
+-    if (refresh_enabled < 0)
+-        refresh_enabled = getenv("RSX_NO_TEX_REFRESH") ? 0 : 1;
+     if (g_gv_on) ld_gv_drain();   /* patch 2017: explicit writes from other threads */
+     if (g_gv_watch[0].armed | g_gv_watch[1].armed | g_gv_watch[2].armed | g_gv_watch[3].armed |
+         g_gv_watch[4].armed | g_gv_watch[5].armed | g_gv_watch[6].armed | g_gv_watch[7].armed)
+         ld_gv_watch_bind(t->location, t->offset, texture_source_span(t));
+-
++}
++static int ld_tex_entry_is(u32 i, const rsx_dsp_texture* t)   /* patch 2136: the ld_tex_index_find match */
++{
++    if (i >= g.n_textures) return 0;
++    const texcache_t* entry = &g.textures[i];
++    return entry->location == t->location && entry->offset == t->offset && entry->format == t->format &&
++           entry->width == t->width && entry->height == t->height && entry->pitch == t->pitch &&
++           entry->remap == (t->remap & 0xFFFFu) && entry->cubemap == t->cubemap && entry->dimension == t->dimension &&
++           entry->depth == t->depth;
++}
++static u32 texture_srv_slot(const rsx_dsp_texture* t)
++{
++    const u32 remap = t->remap & 0xFFFF;
++    g_ld_tsl_index = UINT32_MAX;
++    ld_tsl_prologue(t);
+     for (u32 i = ld_tex_index_find(t, remap); i != UINT32_MAX; i = UINT32_MAX) {   /* patch 2033: indexed */
++        g_ld_tsl_index = i;
++        return texture_srv_slot_entry(t, i);
++    }
++    return texture_srv_slot_new(t);
++}
++/* Patch 2136: the existing-entry part of texture_srv_slot, unchanged (it was the body of the indexed lookup). */
++static u32 texture_srv_slot_entry(const rsx_dsp_texture* t, u32 i)
++{
++    const u32 remap = t->remap & 0xFFFF;
++    static int refresh_enabled = -1;
++    if (refresh_enabled < 0)
++        refresh_enabled = getenv("RSX_NO_TEX_REFRESH") ? 0 : 1;
++    {
+         texcache_t* entry = &g.textures[i];
+         if (entry->kc_kind && entry->tex &&
+             (ld_keycaps_sig_frame(g_ld_frames) ^ ld_kc_l1_sig(g_ld_frames)) != entry->kc_sig) {   /* patch 2039, 2117 */
+@@ -5663,7 +5709,11 @@
+         if (ld_tex_recycle_on()) rsx_tex_lru_touch(&g_ld_tex_lru, g_ld_tex_lru_link, i);   /* patch 2075 */
+         return entry->tex ? SRV_TEXTURE_BASE + i : SRV_WHITE;
+     }
+-
++}
++/* Patch 2136: the new-entry part of texture_srv_slot, unchanged. g_ld_tsl_index = the entry now holding this key. */
++static u32 texture_srv_slot_new(const rsx_dsp_texture* t)
++{
++    const u32 remap = t->remap & 0xFFFF;
+     u32 index;
+     ID3D12Resource* evicted = NULL;
+     const int cache_was_full = g.n_textures >= MAX_TEXTURES;
+@@ -5748,11 +5798,13 @@
+         if (recycle && cache_was_full) rsx_tex_lru_touch(&g_ld_tex_lru, g_ld_tex_lru_link, index);   /* patch 2075 */
+         *entry = replacement;
+         ld_tex_index_insert(index);   /* patch 2033 */
++        g_ld_tsl_index = index;   /* patch 2136 */
+         write_texture_srv(index, entry);
+     } else {
+         if (!cache_was_full) {
+             g.textures[index] = replacement;
+             ld_tex_index_insert(index);   /* patch 2033: a failed decode stays cached as SRV_WHITE, as before */
++            g_ld_tsl_index = index;   /* patch 2136 */
+         } else {
+             ld_tex_index_insert(index);   /* patch 2033: the evicted key was removed above; re-index the old entry */
+         }
+@@ -6109,6 +6161,7 @@
+         if (s->swin[j].tex) { retire_texture(s->swin[j].tex); s->swin[j].tex = NULL; }
+     s->tex = replacement;
+     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
++    g_ld_surf_gen++;   /* patch 2136: the binding memo's surface scan result may change */
+     s->fmt = want_fmt;
+     s->colour_gen = 0;   /* patch 2044: a new resource holds no colour yet */
+ #if !defined(YZ_PERF_CLEAN)
+@@ -6962,6 +7015,7 @@
+     }
+     z->location = location;
+     z->offset = offset;
++    g_ld_zgen++;   /* patch 2136 */
+     z->w = want_w;
+     z->h = want_h;
+     z->had_write = 0;
+@@ -13703,6 +13757,122 @@
+     return on;
+ }
+ 
++/* Patch 2136: KZ3_HUD_169_LOG=2, read once (the texture loop called getenv twice for every small A8R8G8B8 bind). */
++static int ld_h169_log2(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("KZ3_HUD_169_LOG"); on = (e && e[0] == '2') ? 1 : 0; }
++    return on;
++}
++/* KZ3 patch 2136: the binding memo (design and invalidation rule above texture_srv_slot). */
++typedef struct {
++    u32 raw[9];          /* unit registers 0x1A00+u*32 .. +0x1C and SIZE1 0x1840+u*4 */
++    rsx_dsp_texture t;   /* rsx_dsp_get_texture of raw (memcmp-able: built from a memset) */
++    u32 surf_gen, zgen, epoch, idx, smp;
++    u32 valid;
++} ld_tex_memo_row;
++#define LD_TM_ROWS 4096u
++static ld_tex_memo_row g_ld_tm[LD_TM_ROWS];
++static struct { u64 hits, rec, no_row, regs, gen, entry, bad, hchk_hit, hdiff_hit, hchk_bind, hdiff_bind, surf; } g_ld_tms;
++static inline u32 ld_tm_row(const u32 raw[9])
++{
++    u32 h = 2166136261u;
++    for (u32 k = 0; k < 9u; k++) h = (h ^ raw[k]) * 16777619u;
++    return (h ^ (h >> 15)) & (LD_TM_ROWS - 1u);
++}
++/* Record-time condition: no colour surface at all at the texture's address (then the scan and the feedback check
++ * find nothing whatever the target, while g_ld_surf_gen is unchanged). */
++static int ld_tm_surface_free(const rsx_dsp_texture* t)
++{
++    for (u32 i = 0; i < g.n_surfaces; i++)
++        if (g.surfaces[i].location == t->location && g.surfaces[i].offset == t->offset) return 0;
++    return 1;
++}
++/* 0 off (default), 1 on, 2 on + verify every hit (fresh resolution must give the memo's answer; [tex-memo] bad=N)
++ * and a 1-in-16 content-hash spot check of hits and of non-hit texture binds (hdiff = hash now != the entry's). */
++static int ld_tex_memo_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("RSX_TEX_CACHE");
++        on = (e && e[0] == '2') ? 2 : (e && e[0] && e[0] != '0') ? 1 : 0;
++        /* diagnostics that read or rewrite the units inside the loop (or need every unit's text) keep the full path */
++        static const char* const diag[] = { "LD_UNITS", "LD_PS1_BUF0", "LD_UVDBG", "LD_ALIAS_DBG", "LD_ZPROBE",
++                                            "LD_FEAT_LOG", "KZ3_HUD_169_LOG" };
++        const char* why = NULL;
++        for (u32 k = 0; on && k < sizeof diag / sizeof diag[0]; k++) {
++            const char* d = getenv(diag[k]);   /* those read "set at all", except KZ3_HUD_169_LOG (=2 only) */
++            if (d && (k + 1u < sizeof diag / sizeof diag[0] || d[0] == '2')) { why = diag[k]; on = 0; }
++        }
++        if (e && e[0] && e[0] != '0')
++            fprintf(stderr, "[tex-memo] binding memo %s (RSX_TEX_CACHE=%s, patch 2136)%s%s\n", on ? "on" : "OFF", e,
++                    why ? ", off because of " : "", why ? why : "");
++    }
++    return on;
++}
++static inline void ld_tm_raw(u32 u, u32 raw[9])
++{
++    const u32 base = 0x1A00u + u * 0x20u;   /* M_TEX_OFFSET (rsx_dispatch.c) */
++    for (u32 k = 0; k < 8u; k++) raw[k] = rsx_dsp_reg(&g.rsx, base + k * 4u);
++    raw[8] = rsx_dsp_reg(&g.rsx, 0x1840u + u * 4u);   /* M_TEX_SIZE1 */
++}
++/* Can tex_zalias_kind(t) be anything but ZALIAS_NONE while the zeta list (g_ld_zgen) stays as it is? It reads the
++ * zeta's had_write/snapshot_valid/depth_format, which change between draws, so a unit is memoised only when no zeta
++ * at all sits at its address (or its format/shape never aliases). */
++static int ld_tm_zalias_free(const rsx_dsp_texture* t)
++{
++    const u32 base = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
++    if (base == TEX_FMT_DEPTH24_D8) return 0;
++    if (base != TEX_FMT_DEPTH16 && base != TEX_FMT_DEPTH16_F && base != TEX_FMT_X16 && base != TEX_FMT_A8R8G8B8) return 1;
++    if (t->dimension != 2 || t->cubemap) return 1;
++    for (u32 i = 0; i < g.n_zdepths; i++)
++        if (g.zdepths[i].location == t->location && g.zdepths[i].offset == t->offset) return 0;
++    return 1;
++}
++/* Fresh resolution for the verify mode: would the full loop body have reached texture_srv_slot with this entry? */
++static int ld_tm_verify(u32 u, const ld_tex_memo_row* m, u32 target)
++{
++    rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
++    if (memcmp(&t, &m->t, sizeof t) || !t.enabled) return 1;
++    u32 skey[4]; sampler_key(&t, skey);
++    if (sampler_slot(&t, skey) != m->smp) return 2;
++    if (!ld_tm_zalias_free(&t) || tex_zalias_kind(&t) != ZALIAS_NONE) return 3;
++    for (u32 i = 0; i < g.n_surfaces; i++)
++        if (g.surfaces[i].location == t.location && g.surfaces[i].offset == t.offset && i != target) return 4;
++    if (target < g.n_surfaces && g.surfaces[target].location == t.location && g.surfaces[target].offset == t.offset)
++        return 5;
++    if (ld_tex_index_find(&t, t.remap & 0xFFFFu) != m->idx) return 6;
++    return 0;
++}
++static void ld_tm_hash_spot(const rsx_dsp_texture* t, u32 idx, int hit)
++{
++    static u32 n;
++    if ((++n & 15u) || idx >= g.n_textures || !g.textures[idx].tex) return;
++    const u32 span = texture_source_span(t);
++    if (!span || span > (1u << 20)) return;
++    int readable = 0;
++    const u64 h = texture_content_hash(t, &readable);
++    if (!readable) return;
++    const int diff = h != g.textures[idx].content_hash;
++    if (hit) { g_ld_tms.hchk_hit++; g_ld_tms.hdiff_hit += (u64)diff; }
++    else { g_ld_tms.hchk_bind++; g_ld_tms.hdiff_bind += (u64)diff; }
++    if (diff && hit) { static u32 nl; if (nl++ < 16)
++        fprintf(stderr, "[tex-memo] hash differs on a hit: frame=%u %u:0x%08X %ux%u fmt=0x%02X last_hash=%u\n", g_ld_frames,
++                t->location, t->offset, t->width, t->height, t->format, g.textures[idx].last_hash_frame); }
++}
++static void ld_tm_stat_print(void)
++{
++    if (!ld_tex_memo_on()) return;
++    fprintf(stderr, "[tex-memo] frame=%u hits=%llu records=%llu miss: empty=%llu other-regs=%llu surface=%llu gen=%llu entry=%llu"
++                    " | verify bad=%llu | hash spot hits %llu/%llu differ, binds %llu/%llu differ\n", g_ld_frames,
++            (unsigned long long)g_ld_tms.hits, (unsigned long long)g_ld_tms.rec, (unsigned long long)g_ld_tms.no_row,
++            (unsigned long long)g_ld_tms.regs, (unsigned long long)g_ld_tms.surf, (unsigned long long)g_ld_tms.gen,
++            (unsigned long long)g_ld_tms.entry, (unsigned long long)g_ld_tms.bad, (unsigned long long)g_ld_tms.hdiff_hit,
++            (unsigned long long)g_ld_tms.hchk_hit, (unsigned long long)g_ld_tms.hdiff_bind,
++            (unsigned long long)g_ld_tms.hchk_bind);
++    memset(&g_ld_tms, 0, sizeof g_ld_tms);
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -14133,7 +14303,40 @@
+               }
+           }
+       } }
++    const int tm_on = ld_tex_memo_on();   /* patch 2136 */
+     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) {
++        u32 tm_raw[9];
++        if (tm_on) {   /* patch 2136: binding memo hit = the full body below would bind the same entry and sampler */
++            ld_tm_raw(u, tm_raw);
++            if (!(tm_raw[3] >> 31)) continue;   /* control0 bit 31 = rsx_dsp_texture.enabled: `if (!t.enabled) continue` below */
++            ld_tex_memo_row* m = &g_ld_tm[ld_tm_row(tm_raw)];
++            if (!m->valid) g_ld_tms.no_row++;
++            else if (memcmp(m->raw, tm_raw, sizeof tm_raw)) g_ld_tms.regs++;
++            else if (m->surf_gen != g_ld_surf_gen || m->zgen != g_ld_zgen || m->epoch != g_ld_tex_memo_epoch) g_ld_tms.gen++;
++            else if (!ld_tex_entry_is(m->idx, &m->t)) { g_ld_tms.entry++; m->valid = 0; }
++            else {
++                if (ld_unit_mask_bind_on() && !((g_ld_fp_units_cur >> u) & 1u)) {   /* patch 2045, as below */
++                    if (rsx_perf_walk_on()) rsx_perf_add(RSX_PERF_W_D_UNIT_SKIP_N, 1);
++                    continue;
++                }
++                g_ld_tms.hits++;
++                if (tm_on == 2) {
++                    const int why = ld_tm_verify(u, m, target);
++                    if (why) { static u32 nl; g_ld_tms.bad++;
++                               if (nl++ < 32) fprintf(stderr, "[tex-memo] verify FAILED frame=%u unit=%u %u:0x%08X reason=%d\n",
++                                                      g_ld_frames, u, m->t.location, m->t.offset, why); }
++                }
++                texture_mask |= 1u << u;
++                smp_slots[u] = m->smp;
++                LDW_T0(tex_t0);
++                ld_tsl_prologue(&m->t);
++                slots[u] = texture_srv_slot_entry(&m->t, m->idx);
++                LDW_ADD(RSX_PERF_W_TEX_T, tex_t0);
++                if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
++                if (tm_on == 2) ld_tm_hash_spot(&m->t, m->idx, 1);
++                continue;
++            }
++        }
+         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+         /* LD_PS1_BUF0=1 -- DIAGNOSTIC, not a fix. Force a 24-bit PS1 VRAM
+          * bind at buffer 1 (offset 0x4003C0) to sample buffer 0 (0x400000).
+@@ -14321,7 +14524,7 @@
+                         g.surfaces[target].offset, u, t.offset, sampled, zeta_pref, current_zslot, self_zeta_read);
+         }
+         if (((g_ld_fp_units_cur >> u) & 1u) && (t.format & 0x9Fu) == 0x85u && t.width * t.height * 4u <= 0x40000u &&
+-            getenv("KZ3_HUD_169_LOG") && getenv("KZ3_HUD_169_LOG")[0] == '2') {   /* A8R8G8B8 alpha byte statistics (big-endian: byte 0) */
++            ld_h169_log2()) {   /* patch 2136: cached */   /* A8R8G8B8 alpha byte statistics (big-endian: byte 0) */
+             const u8* gp = (const u8*)guest_ptr(t.location, t.offset, t.width * t.height * 4u);
+             if (gp) {
+                 u32 z = 0, f = 0, n = t.width * t.height;
+@@ -14342,7 +14545,7 @@
+                 }
+             }
+         }
+-        if (((g_ld_fp_units_cur >> u) & 1u) && g_h169_txn < 200)   /* patch 2118 diagnostics */
++        if (((g_ld_fp_units_cur >> u) & 1u) && g_h169_txn < 200 && ld_h169_log2())   /* patch 2118 diagnostics (2136: only when [h169d] can print it) */
+             g_h169_txn += snprintf(g_h169_tx + g_h169_txn, sizeof g_h169_tx - (size_t)g_h169_txn, " u%u:0x%X/%ux%u f%02X r%04X->%d", u,
+                                    t.offset, t.width, t.height, t.format, t.remap & 0xFFFFu, sampled);
+         if (sampled < 0 && !zeta_pref && g.surfaces[target].location == t.location &&
+@@ -14452,6 +14655,14 @@
+                 slots[u] = texture_srv_slot(&t);
+                 LDW_ADD(RSX_PERF_W_TEX_T, tex_t0);
+                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
++                if (tm_on && g_ld_tsl_index != UINT32_MAX && ld_tm_zalias_free(&t) && ld_tm_surface_free(&t)) {   /* 2136 */
++                    ld_tex_memo_row* m = &g_ld_tm[ld_tm_row(tm_raw)];
++                    memcpy(m->raw, tm_raw, sizeof tm_raw);
++                    m->t = t; m->surf_gen = g_ld_surf_gen; m->zgen = g_ld_zgen;
++                    m->epoch = g_ld_tex_memo_epoch; m->idx = g_ld_tsl_index; m->smp = smp_slots[u]; m->valid = 1;
++                    g_ld_tms.rec++;
++                    if (tm_on == 2) ld_tm_hash_spot(&t, g_ld_tsl_index, 0);
++                } else if (tm_on && g_ld_tsl_index != UINT32_MAX) g_ld_tms.surf++;   /* texture path, not memoisable */
+             }
+         }
+     }
+@@ -16042,6 +16253,7 @@
+     /* sampler heaps */
+     D3D12_DESCRIPTOR_HEAP_DESC shd = {0};
+     shd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
++    g_ld_tex_memo_epoch++;   /* patch 2136: a new sampler heap; memo rows from before are void */
+     shd.NumDescriptors = SMP_CACHE_SLOTS + 1; shd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+     g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &shd, &IID_ID3D12DescriptorHeap, (void**)&g.smp_cpu_heap);
+     shd.NumDescriptors = SMP_RING_TABLES * SMP_TABLE_SIZE;
+@@ -19161,6 +19373,7 @@
+ #endif
+     if (g.dev) g.dev->lpVtbl->Release(g.dev);
+     memset(&g, 0, sizeof(g));
++    g_ld_tex_memo_epoch++;   /* patch 2136 */
+     rsx_tex_lru_init(&g_ld_tex_lru);   /* patch 2075: the cache is empty again */
+     if (dc.verts) { free(dc.verts); dc.verts = NULL; dc.cap_verts = 0; }
+     if (dc.refs) { free(dc.refs); dc.refs = NULL; dc.cap_refs = 0; }

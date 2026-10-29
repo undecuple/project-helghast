@@ -1631,9 +1631,9 @@ static std::string kz3_kb_page_gum(void)
          "\t\t@include{file:///hudelements/type3.gum}\n\n"
          "\t\t<text class=\"pagetitle\">@tr{kb.title|Change the keyboard controls}</text>\n"   /* RSX pass 104: as the sibling Options pages */
          "\t\t<text class=\"sectiontitle\">@key{menu_options}</text>\n\n"
-         "\t\t<text id=\"hdr_0\" x=\"457\" y=\"66\" width=\"150\" text-align=\"center\">@tru{kb.hdr_primary|Primary}</text>\n"
-         "\t\t<text id=\"hdr_1\" x=\"617\" y=\"66\" width=\"150\" text-align=\"center\">@tru{kb.hdr_secondary|Secondary}</text>\n"
-         "\t\t<list id=\"lst_keys\" class=\"PEDS\" width=\"760\" height=\"360\" labelaccept=\"@key{menu_startup_controls_change}\"\n"
+         "\t\t<text id=\"hdr_0\" x=\"424\" y=\"106\" width=\"216\" text-align=\"center\">@tru{kb.hdr_primary|Primary}</text>\n"
+         "\t\t<text id=\"hdr_1\" x=\"584\" y=\"106\" width=\"216\" text-align=\"center\">@tru{kb.hdr_secondary|Secondary}</text>\n"
+         "\t\t<list id=\"lst_keys\" class=\"PEDS\" y=\"186\" width=\"760\" height=\"280\" labelaccept=\"@key{menu_startup_controls_change}\"\n"
          "\t\t\tonaccept=\"script(kbscript, Bind)\" onleft=\"script(kbscript, SlotLeft)\" onright=\"script(kbscript, SlotRight)\">\n";
     for (int r = 0; r < rows; r++) {
         char line[768];
@@ -1653,7 +1653,7 @@ static std::string kz3_kb_page_gum(void)
         g += line;
     }
     g += "\t\t</list>\n\n"
-         "\t\t<text id=\"txt_status\" x=\"60\" y=\"532\" width=\"900\"> </text>\n\n"
+         "\t\t<text id=\"txt_status\" x=\"60\" y=\"532\" width=\"1100\"> </text>\n\n"
          "\t\t@include{file:///common/includes/dialogconfirm.gum}\n"
          "\t</panel>\n\n"
          "\t<data id=\"settings\" src=\"object://settings\"/>\n\n"
@@ -3114,14 +3114,19 @@ struct MmVer {
     /* RE pass 146: tag -> widget = Q_lookup(Q, tag+0xEC), Q = *(*(Menu+0x70)+8) (F vtable f_vt); widget fields */
     uint32_t q_lookup, f_vt, cursor_vt, border, vis, parent, wq, cur_focus;
     uint32_t clip_vt[3];   /* scissor classes: ScrollingPanel (VERIFIED), List, Panel (ASSUMPTION, RE pass 146) */
+    /* RSX pass 128 (RE pass 186): dialogs. DialogOptionTag / DialogTag / DialogWidget vtables, the DialogWidget's
+     * ButtonWidget vector (count, array), the DialogTag's Select(tag, i) and SelectedIndex(tag). */
+    uint32_t opt_vt, dlg_vt, dw_vt, dw_cnt, dw_arr, sel_fn, selidx_fn;
 };
 constexpr MmVer kMm[2] = {
     {"1.00", 0x0010CB34u, 0x013D4818u, 0x00EAB4A0u, 0x00EAC250u, 0x00EAC2A0u, 0x0011B974u, 0xE0u, 0x001062C0u,
      {0x00EACA80u, 0x00EACCD8u, 0x00EACD50u, 0x00EACDC8u, 0x00EACB10u, 0x00EACB88u, 0x00EACF78u},
-     0x0011230Cu, 0x00EABCC8u, 0x00EAD258u, 0x90u, 0x130u, 0x100u, 0x114u, 0x144u, {0x00EAD868u, 0x00EAD7F0u, 0x00EAD508u}},
+     0x0011230Cu, 0x00EABCC8u, 0x00EAD258u, 0x90u, 0x130u, 0x100u, 0x114u, 0x144u, {0x00EAD868u, 0x00EAD7F0u, 0x00EAD508u},
+     0x00EABC48u, 0x00EABBD8u, 0x00EAD348u, 0x148u, 0x14Cu, 0x001101A4u, 0x0010FE24u},
     {"1.14", 0x0010ED9Cu, 0x01449E98u, 0x00F25280u, 0x00F26038u, 0x00F26088u, 0x0011E1A0u, 0xF0u, 0x00108784u,
      {0x00F26868u, 0x00F26AC0u, 0x00F26B38u, 0x00F26BB0u, 0x00F268F8u, 0x00F26970u, 0x00F26D60u},
-     0x00114704u, 0x00F25AB0u, 0x00F27050u, 0x94u, 0x140u, 0x110u, 0x124u, 0x15Cu, {0x00F27660u, 0x00F275E8u, 0x00F27300u}},
+     0x00114704u, 0x00F25AB0u, 0x00F27050u, 0x94u, 0x140u, 0x110u, 0x124u, 0x15Cu, {0x00F27660u, 0x00F275E8u, 0x00F27300u},
+     0x00F25A30u, 0x00F259C0u, 0x00F27140u, 0x160u, 0x164u, 0x001124E8u, 0x00112168u},
 };
 /* Wrapped vtable slots: the Gum code ones of the base tag vtable and of the list/page tag vtable that holds the pad
  * navigation handler (the shared 0xB0xxxx stubs are left alone). Slot 10 = the event handler. */
@@ -3213,7 +3218,7 @@ int mm_kind(uint32_t w)   /* index in the whitelist, -1 = not a focus target */
     for (int k = 0; k < 7; k++) if (vt == s_mm->wl[k]) return k;
     return -1;
 }
-struct MmPick { uint32_t tag, widget; int n_cands, n_nodes; KZ3MenuRect r; };
+struct MmPick { uint32_t tag, widget; int n_cands, n_nodes; KZ3MenuRect r; int dlg_idx; uint32_t dlg_tag; };
 constexpr int kMmNodes = 768;
 /* Q, the page widget context of the Menu that owns tag (RE pass 146): Menu = tag+0x14, F = Menu+0x70 (vtable f_vt),
  * Q = F+8. 0 when the chain does not check out. */
@@ -3263,7 +3268,7 @@ MmPick mm_pick(ppu_context* ctx, uint32_t root, float x, float y)
     static uint32_t ctag[kMmNodes], cwid[kMmNodes];
     struct Fr { uint32_t tag; int depth; };
     static Fr stack[kMmNodes];
-    MmPick out = {0, 0, 0, 0, {0, 0, 0, 0}};
+    MmPick out = {0, 0, 0, 0, {0, 0, 0, 0}, -1, 0};
     const uint32_t q = mm_q(root);
     if (!q) return out;
     int sp = 0, nc = 0;
@@ -3301,6 +3306,107 @@ MmPick mm_pick(ppu_context* ctx, uint32_t root, float x, float y)
         cand[id].enabled = 0;
     }
     return out;
+}
+
+/* Dialog (RSX pass 128, RE pass 186): the focused tag is a DialogOptionTag whose parent is the DialogTag; the options'
+ * widgets are ButtonWidgets in the DialogWidget's vector (*(Q+0x4C)), not in the tag->widget map. Returns the
+ * DialogTag (0 = no dialog up). */
+uint32_t mm_dialog(uint32_t focused, uint32_t* dw_out, uint32_t* q_out)
+{
+    if (!ml_ok(focused) || ml_r32(focused) != s_mm->opt_vt) return 0;
+    const uint32_t dt = ml_r32(focused + 0x10);
+    if (!ml_ok(dt) || ml_r32(dt) != s_mm->dlg_vt) return 0;
+    const uint32_t q = mm_q(focused);
+    if (!q) return 0;
+    const uint32_t dw = ml_r32(q + 0x4C);
+    if (!ml_ok(dw) || ml_r32(dw) != s_mm->dw_vt) return 0;
+    *dw_out = dw; *q_out = q;
+    return dt;
+}
+uint32_t mm_dlg_option(ppu_context* ctx, uint32_t dt, int i)   /* DialogTag->vf24(i), vtable +0x60 */
+{
+    const uint32_t vt = ml_r32(dt), opd = ml_ok(vt) ? ml_r32(vt + 0x60) : 0;
+    if (!ml_ok(opd)) return 0;
+    return mm_call(ctx, ml_r32(opd), ml_r32(opd + 4), dt, (uint32_t)i, 0, 0);
+}
+int mm_dlg_count(ppu_context* ctx, uint32_t dt)   /* vf23(), vtable +0x5C */
+{
+    const uint32_t vt = ml_r32(dt), opd = ml_ok(vt) ? ml_r32(vt + 0x5C) : 0;
+    if (!ml_ok(opd)) return 0;
+    return (int)mm_call(ctx, ml_r32(opd), ml_r32(opd + 4), dt, 0, 0, 0);
+}
+MmPick mm_pick_dialog(ppu_context* ctx, uint32_t dt, uint32_t dw, float x, float y)
+{
+    MmPick out = {0, 0, 0, 0, {0, 0, 0, 0}, -1, 0};
+    const uint32_t n = ml_r32(dw + s_mm->dw_cnt), arr = ml_r32(dw + s_mm->dw_arr);
+    if (n == 0 || n > 16 || !ml_ok(arr)) return out;
+    static KZ3MenuCand cand[16];
+    KZ3MenuRect clip = {(int)ml_r32(dw + s_mm->rect), (int)ml_r32(dw + s_mm->rect + 4), (int)ml_r32(dw + s_mm->rect + 8),
+                        (int)ml_r32(dw + s_mm->rect + 12)};
+    int nc = 0;
+    int idx[16];
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t b = ml_r32(arr + 4 * i);
+        if (!ml_ok(b) || mm_kind(b) != 0 || vm_base[b + s_mm->vis] == 0) continue;
+        const KZ3MenuRect r = mm_hit_rect(b);
+        if (r.r <= r.l || r.b <= r.t) continue;
+        KZ3MenuCand& c = cand[nc];
+        c = KZ3MenuCand();
+        c.id = nc; c.l = r.l; c.t = r.t; c.r = r.r; c.b = r.b; c.depth = 1;
+        c.n_clips = 0;
+        if (clip.r > clip.l && clip.b > clip.t) { c.clip[0] = clip; c.n_clips = 1; }
+        c.enabled = 1; c.focusable = 1;
+        idx[nc++] = (int)i;
+    }
+    out.n_cands = nc;
+    const int id = kz3_menu_hit_test(cand, nc, x, y, 0);
+    if (id >= 0) {
+        out.dlg_idx = idx[id];
+        out.dlg_tag = dt;
+        out.tag = mm_dlg_option(ctx, dt, idx[id]);
+        out.widget = ml_r32(arr + 4 * (uint32_t)idx[id]);
+        out.r = {cand[id].l, cand[id].t, cand[id].r, cand[id].b};
+    }
+    return out;
+}
+/* First look at each new dialog: dw, count, rects, button <-> option mapping, the DialogWidget's raw words (RE pass 186 s.3.5). */
+void mm_dialog_log(ppu_context* ctx, uint32_t dt, uint32_t dw, uint32_t focused)
+{
+    static uint32_t last_dw = 0, last_dt = 0;
+    if (last_dw == dw && last_dt == dt) return;
+    last_dw = dw; last_dt = dt;
+    const uint32_t n = ml_r32(dw + s_mm->dw_cnt), arr = ml_r32(dw + s_mm->dw_arr);
+    KZ3_LOGI("dialog-mouse", "dialog up: DialogTag 0x%08X (%u child tag(s) at +4/+8), DialogWidget 0x%08X, buttons %u (array 0x%08X), vf23 count %d, focused option 0x%08X, SelectedIndex %u, DialogWidget rect %d,%d,%d,%d",
+             dt, ml_r32(dt + 4), dw, n, arr, mm_dlg_count(ctx, dt), focused, mm_call(ctx, s_mm->selidx_fn, s_mm_toc, dt, 0, 0, 0),
+             (int)ml_r32(dw + s_mm->rect), (int)ml_r32(dw + s_mm->rect + 4), (int)ml_r32(dw + s_mm->rect + 8), (int)ml_r32(dw + s_mm->rect + 12));
+    for (uint32_t i = 0; i < n && i < 16 && ml_ok(arr); i++) {
+        const uint32_t b = ml_r32(arr + 4 * i);
+        const uint32_t ot = mm_dlg_option(ctx, dt, (int)i);
+        const uint32_t ca = ml_r32(dt + 8);
+        KZ3_LOGI("dialog-mouse", "  button %u: 0x%08X vt 0x%08X (kind %d) vis %u rect %d,%d,%d,%d border %d | option vf24 0x%08X, child[%u] 0x%08X: %s | opt vt 0x%08X label 0x%08X value 0x%08X",
+                 i, b, ml_ok(b) ? ml_r32(b) : 0, ml_ok(b) ? mm_kind(b) : -9, ml_ok(b) ? vm_base[b + s_mm->vis] : 0,
+                 ml_ok(b) ? (int)ml_r32(b + s_mm->rect) : 0, ml_ok(b) ? (int)ml_r32(b + s_mm->rect + 4) : 0,
+                 ml_ok(b) ? (int)ml_r32(b + s_mm->rect + 8) : 0, ml_ok(b) ? (int)ml_r32(b + s_mm->rect + 12) : 0,
+                 ml_ok(b) ? (int)ml_r32(b + s_mm->border) : 0, ot, i, ml_ok(ca) ? ml_r32(ca + 4 * i) : 0,
+                 ml_ok(ca) && ml_r32(ca + 4 * i) == ot ? "same" : "DIFFERENT", ml_ok(ot) ? ml_r32(ot) : 0,
+                 ml_ok(ot) ? ml_r32(ot + 0x16C) : 0, ml_ok(ot) ? ml_r32(ot + 0x170) : 0);
+    }
+    char buf[512];
+    int o = 0;
+    for (uint32_t k = s_mm->dw_cnt + 0x10; k < s_mm->dw_cnt + 0x50 && o < 480; k += 4)
+        o += snprintf(buf + o, sizeof buf - (size_t)o, " +%X=%08X", k, ml_r32(dw + k));
+    KZ3_LOGI("dialog-mouse", "  DialogWidget words:%s", buf);
+}
+/* Hover/click target: the game's own Select(DialogTag, i) unless SelectedIndex already is i. 1 when option i is selected afterwards. */
+int mm_dialog_select(ppu_context* ctx, const MmPick& p, const char* why, float x, float y)
+{
+    const uint32_t before = mm_call(ctx, s_mm->selidx_fn, s_mm_toc, p.dlg_tag, 0, 0, 0);
+    if ((int)before == p.dlg_idx) return 1;
+    mm_call(ctx, s_mm->sel_fn, s_mm_toc, p.dlg_tag, (uint32_t)p.dlg_idx, 0, 0);
+    const uint32_t after = mm_call(ctx, s_mm->selidx_fn, s_mm_toc, p.dlg_tag, 0, 0, 0);
+    KZ3_LOGI("dialog-mouse", "%s: Select(DialogTag 0x%08X, %d) at %.0f,%.0f rect %d,%d-%d,%d: SelectedIndex %u -> %u", why, p.dlg_tag,
+             p.dlg_idx, x, y, p.r.l, p.r.t, p.r.r, p.r.b, before, after);
+    return (int)after == p.dlg_idx;
 }
 
 /* RE pass 146's one-run checklist, once (the first look with a focused item): one line per item. */
@@ -3418,7 +3524,25 @@ void mm_menu_step(ppu_context* ctx)
                 checked++;
             }
         }
-        if (hover) {
+        uint32_t dlg_dw = 0, dlg_q = 0;
+        const uint32_t dlg_dt = mm_dialog(st.focused, &dlg_dw, &dlg_q);
+        if (dlg_dt) mm_dialog_log(ctx, dlg_dt, dlg_dw, st.focused);
+        else {   /* pass 128: why no dialog (once per focused tag) */
+            static uint32_t said = 0;
+            if (s_mm_log && said != st.focused) {
+                said = st.focused;
+                const uint32_t par = ml_r32(st.focused + 0x10), q = mm_q(st.focused);
+                KZ3_LOGI("dialog-mouse", "modal, no dialog: focused 0x%08X vt 0x%08X (opt 0x%08X), parent 0x%08X vt 0x%08X (dlg 0x%08X), Q 0x%08X, Q+0x4C 0x%08X vt 0x%08X (dw 0x%08X)",
+                         st.focused, ml_r32(st.focused), s_mm->opt_vt, par, ml_ok(par) ? ml_r32(par) : 0, s_mm->dlg_vt, q,
+                         q ? ml_r32(q + 0x4C) : 0, q && ml_ok(ml_r32(q + 0x4C)) ? ml_r32(ml_r32(q + 0x4C)) : 0, s_mm->dw_vt);
+            }
+        }
+        if (hover && dlg_dt) {
+            const MmPick p = mm_pick_dialog(ctx, dlg_dt, dlg_dw, gx, gy);
+            if (s_mm_log)
+                KZ3_LOGI("dialog-mouse", "look %.0f,%.0f: %d candidate(s), hit option %d tag 0x%08X", gx, gy, p.n_cands, p.dlg_idx, p.tag);
+            if (p.dlg_idx >= 0) mm_dialog_select(ctx, p, "hover", gx, gy);
+        } else if (hover) {
             const MmPick p = mm_pick(ctx, st.root, gx, gy);
             if (s_mm_log)
                 KZ3_LOGI("menu-mouse", "look %.0f,%.0f: %d node(s), %d candidate(s), hit 0x%08X widget 0x%08X (focused 0x%08X)",
@@ -3427,7 +3551,18 @@ void mm_menu_step(ppu_context* ctx)
         }
         for (int i = 0; i < n; i++) {
             int hit = -1, deferred = 0;
-            if (ev[i].kind == PMM_EV_LEFT && ev[i].valid) {
+            if (ev[i].kind == PMM_EV_LEFT && ev[i].valid && dlg_dt) {
+                const MmPick p = mm_pick_dialog(ctx, dlg_dt, dlg_dw, ev[i].x, ev[i].y);
+                if (p.dlg_idx >= 0) {
+                    const int was = (int)mm_call(ctx, s_mm->selidx_fn, s_mm_toc, dlg_dt, 0, 0, 0);
+                    if (mm_dialog_select(ctx, p, "click", ev[i].x, ev[i].y)) {
+                        hit = 0;
+                        deferred = was != p.dlg_idx;
+                        KZ3_LOGI("dialog-mouse", "click on option %d (tag 0x%08X): CROSS follows%s", p.dlg_idx, p.tag,
+                                 deferred ? " a frame later" : "");
+                    }
+                }
+            } else if (ev[i].kind == PMM_EV_LEFT && ev[i].valid) {
                 const MmPick p = mm_pick(ctx, st.root, ev[i].x, ev[i].y);
                 if (p.tag) {
                     hit = 0;

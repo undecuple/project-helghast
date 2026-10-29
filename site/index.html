@@ -22,7 +22,7 @@
 <p class="what">A Windows x64 port of the 2011 PS3 game, made by static recompilation: the game&#x27;s PowerPC and SPU code is translated to C ahead of time and compiled into a native PC program, so no CPU emulator runs at play time. The GPU is still translated as it runs (RSX to Direct3D 12); native replacements come step by step.</p>
 <p class="headline">Status: <strong>Partly playable</strong></p>
 <p class="note">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>
-<p class="note">v0.1.6 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
+<p class="note">v0.1.7 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
 <p class="btns"><a class="btn" href="#status">See the status</a><a class="btn alt" href="https://github.com/undecuple/project-helghast">Source on GitHub</a></p>
 </div>
 </header>
@@ -327,14 +327,14 @@
 <section id="changelog" class="promo term">
 <h2>Changelog</h2>
 <ul class="clog">
+<li><time datetime="2026-10-29">10-29</time><span>The mouse works in the game&#x27;s confirmation dialogs: hovering an option highlights it as the pad does...</span></li>
+<li><time datetime="2026-10-29">10-29</time><span>Optional gyro input from a DSU (cemuhook) server on this PC, for motion controls with pads that have...</span></li>
+<li><time datetime="2026-10-29">10-29</time><span>Motion Sensor Function now defaults to Off for a pad without motion sensors (an Xbox pad, for example), so...</span></li>
+<li><time datetime="2026-10-29">10-29</time><span>The Discord status text and the setting&#x27;s help line now say &quot;Playing Project Helghast&quot;, which is what...</span></li>
+<li><time datetime="2026-10-29">10-29</time><span>A moved or renamed install folder (the portable zip unpacked, built, then moved) no longer reuses the build...</span></li>
+<li><time datetime="2026-10-29">10-29</time><span>The setup and the portable zip&#x27;s first check refuse an install or build folder whose path contains `[`, `]`...</span></li>
 <li><time datetime="2026-10-29">10-29</time><span>The setup finds a portable RPCS3 (an unzipped folder with `rpcs3.exe` beside its `config`) in Downloads...</span></li>
 <li><time datetime="2026-10-29">10-29</time><span>Closing the window asks through the game&#x27;s own exit dialog (in a level the pause menu opens first) instead...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>The window remembers its place and size between starts (`display.ini`). Maximizing the window switches to...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>Options &gt; Display &gt; When unfocused (Keep running, Mute, Pause): what the game does when its window loses...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>Keyboard and mouse count as their own controller when a pad is connected, so local split-screen co-op can be...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>Exclusive full screen (Options &gt; Display &gt; Fullscreen, or `mode = fullscreen` in `display.ini`) resizes the...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>In first person, the arms and weapon follow the view while you turn with the mouse instead of jittering...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>The setup&#x27;s log no longer keeps your Windows user name when a path is written in its escaped form (doubled...</span></li>
 </ul>
 <p class="small">Newest first; the full list is in <a href="https://github.com/undecuple/project-helghast/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
 </section>
@@ -368,8 +368,8 @@
 </section>
 <section id="install" class="promo">
 <h2>Install</h2>
-<p class="headline"><strong>v0.1.6 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
-<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.6">v0.1.6</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10-30 minutes. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
+<p class="headline"><strong>v0.1.7 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
+<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.7">v0.1.7</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10-30 minutes. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
 <p>You can also build the port from source: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md">building</a>.</p>
 <h3>What goes online</h3>
 <p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on), opt-in crash reports (sent by the launcher after a crash when you opt in, with your names, addresses and folders removed, never a memory dump), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast#what-goes-online">README</a>.</p>

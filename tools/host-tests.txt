@@ -160,3 +160,5 @@ tools/release/test_rpcs3_locate.py
 tools/test_pyresolve_crlf.sh
 tools/spu/test_r121_irq_b2b.sh
 tools/spu/test_r122_native_blend.sh
+tools/spu/test_r123_native_lp.sh
+tools/spu/test_r125_native_lp.sh

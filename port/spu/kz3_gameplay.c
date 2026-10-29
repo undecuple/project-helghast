@@ -37,10 +37,21 @@ int kz3_sp_unlock_apply(uint8_t* profile, uint32_t ea)
 /* ---- B8 ---- */
 static int g_six_logged = 0;
 
+#if defined(_WIN32) || defined(KZ3_SIXAXIS_PAD_LAYER)
+/* network pass 48: the pad layer's answer (cellPad.c, patches 4010/4011/4028): the device in use has working motion
+ * sensors (SDL accelerometer/gyro enabled, or DSU samples arriving); the keyboard, XInput pads and pads without
+ * sensors (an Xbox-style pad) answer 0. Host tests define KZ3_SIXAXIS_PAD_LAYER and supply the function. */
+extern int pad_prompt_motion(void);
 int kz3_pad_has_gyro(void)
 {
-    return 0; /* ASSUMPTION: no gyro passthrough yet; the maintainer's pad layer replaces this when SDL sensors exist */
+    return pad_prompt_motion() != 0;
 }
+#else
+int kz3_pad_has_gyro(void)
+{
+    return 0; /* no pad layer in a host test build */
+}
+#endif
 
 uint8_t kz3_sixaxis_filter(uint8_t b)
 {

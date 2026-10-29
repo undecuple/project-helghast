@@ -1,0 +1,136 @@
+--- a/libs/video/rsx_live_draw.c	2026-10-29 12:28:02.858393039 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-29 12:46:34.387307920 -0500
+@@ -412,6 +412,7 @@
+     u64 content_hash;
+     u32 last_hash_frame;
+     u32 hash_seq;   /* patch 2083: LD_TEX_WRITER mark sequence read before the last hash */
++    u32 sf_seq;     /* patch 2137: g_ld_sf_seq read before the last hash */
+     u64 last_use_serial;
+     u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
+     u32 quiet;  /* patch 2033: consecutive hashes that found the same bytes (saturating) */
+@@ -3693,8 +3694,26 @@
+                                                    "writeback", "ea-note", "ppu-store" };
+ #define LD_WS_PAGES 4096u
+ #include "rsx_tex_writer.h"   /* patch 2083: one packed stamp per page (frame, mark sequence, source) */
++#include "rsx_tex_samef.h"   /* patch 2137 */
+ static volatile u64 g_ld_ws[LD_WS_PAGES];
+ static volatile LONG g_ld_ws_seq;
++/* Patch 2137: RSX_TEX_SAMEF=1 re-hashes a texture bound again in the frame of its hash when a tracked writer stamped
++ * its pages after that hash (default 0 = off; =2 only counts those binds). [tex-samef] every 256 frames. */
++static volatile LONG g_ld_sf_seq;
++static u32 g_ld_sf_pg[2][LD_SF_PAGES];
++static struct { u64 flagged, changed, vchecks, untracked; } g_ld_sf_st;
++static int g_ld_sf_flag;
++static int ld_sf_mode(void)
++{
++    static int m = -1;
++    if (m < 0) {
++        const char* e = getenv("RSX_TEX_SAMEF");
++        m = e ? atoi(e) : 0;
++        if (m < 0 || m > 3) m = 0;
++        if (m) fprintf(stderr, "[tex-samef] same-frame re-check %s (RSX_TEX_SAMEF=%d, patch 2137)\n", m == 2 ? "count only" : m == 3 ? "on + verify (diagnostic)" : "on", m);
++    }
++    return m;
++}
+ static __thread u32 t_ld_ws;
+ void rsx_live_draw_set_write_source(u32 src) { t_ld_ws = src < LD_WS_N ? src : 0u; }
+ static int ld_tex_writer_on(void)
+@@ -3710,6 +3729,7 @@
+     if (location > 1u || !size) return;
+     const u64 end = (u64)offset + size - 1u;
+     const u32 p0 = offset >> 16, p1 = (u32)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
++    if (ld_sf_mode()) ld_sf_stamp(g_ld_sf_pg[location], offset, size, (u32)InterlockedIncrement(&g_ld_sf_seq));   /* patch 2137 */
+     if (location == 0u && ld_tex_writer_on()) {   /* patch 2081 diagnostic; 2083: one store per page */
+         const u64 v = ld_ws_pack(g_ld_frames, (u32)InterlockedIncrement(&g_ld_ws_seq), t_ld_ws);
+         for (u32 p = p0; p <= p1 && p < LD_WS_PAGES; p++) g_ld_ws[p] = v;
+@@ -4039,6 +4059,12 @@
+         memset(&g_ld_tc, 0, sizeof g_ld_tc);
+     }
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) ld_tm_stat_print();   /* patch 2136 */
++    if (ld_sf_mode() && (g_ld_frames % 256u) == 255u) {   /* patch 2137 */
++        fprintf(stderr, "[tex-samef] frame=%u mode=%d flagged=%llu rehash_changed=%llu verify_checks=%llu untracked_late=%llu marks=%u\n", g_ld_frames, ld_sf_mode(),
++                (unsigned long long)g_ld_sf_st.flagged, (unsigned long long)g_ld_sf_st.changed,
++                (unsigned long long)g_ld_sf_st.vchecks, (unsigned long long)g_ld_sf_st.untracked, (u32)g_ld_sf_seq);
++        memset(&g_ld_sf_st, 0, sizeof g_ld_sf_st);
++    }
+ }
+ 
+ /* KZ3 patch 2045 diagnostic (RSX_PERF window only): which textures get re-decoded, by source. Patch 2046: exact
+@@ -5617,6 +5643,20 @@
+             fprintf(stderr, "[keycap] refresh frame=%u src=%u:0x%08X sig %08X (%s)\n", g_ld_frames, t->location,
+                     t->offset, want, r ? "uploaded" : "decode failed");
+         }
++        if (entry->tex && entry->last_hash_frame == g_ld_frames && ld_sf_mode() && entry->location < 2u &&
++            (u32)g_ld_sf_seq != entry->sf_seq &&
++            ld_sf_after(g_ld_sf_pg[entry->location], entry->offset, entry->span, entry->sf_seq)) {   /* patch 2137 */
++            g_ld_sf_st.flagged++;
++            if (ld_sf_mode() != 2) { entry->last_hash_frame = g_ld_frames - 1u; entry->written = 1; g_ld_sf_flag = 1; }
++        } else if (ld_sf_mode() == 3 && entry->tex && entry->last_hash_frame == g_ld_frames && entry->span &&
++                   entry->span <= 0x40000u) {
++            /* diagnostic: hash again; a difference no tracked writer stamped is an untracked (PPU store) late write */
++            int rd = 0;
++            const u64 h2 = texture_content_hash(t, &rd);
++            g_ld_sf_st.vchecks++;
++            if (rd && h2 != entry->content_hash) { g_ld_sf_st.untracked++; entry->last_hash_frame = g_ld_frames - 1u; entry->written = 1; }
++        }
++        const u32 sf_before = (u32)g_ld_sf_seq;   /* patch 2137 */
+         if (refresh_enabled && entry->tex &&
+             entry->last_hash_frame != g_ld_frames &&
+             ld_tex_hash_due(entry->location, entry->offset, entry->span, entry->last_hash_frame,
+@@ -5674,6 +5714,8 @@
+                               t->pitch);
+               } }
+             entry->last_hash_frame = g_ld_frames;
++            entry->sf_seq = sf_before;   /* patch 2137 */
++            if (g_ld_sf_flag) { g_ld_sf_flag = 0; if (readable && hash != entry->content_hash) g_ld_sf_st.changed++; }
+             if (readable && hash != entry->content_hash) {
+                 /* patch 2035: offer the current resource for an in-place update */
+                 g_ld_tex_reuse = ld_tex_inplace_on() ? entry->tex : NULL;
+@@ -5713,6 +5755,7 @@
+ /* Patch 2136: the new-entry part of texture_srv_slot, unchanged. g_ld_tsl_index = the entry now holding this key. */
+ static u32 texture_srv_slot_new(const rsx_dsp_texture* t)
+ {
++    const u32 sf_at_start = (u32)g_ld_sf_seq;   /* patch 2137 */
+     const u32 remap = t->remap & 0xFFFF;
+     u32 index;
+     ID3D12Resource* evicted = NULL;
+@@ -5774,6 +5817,7 @@
+     replacement.depth = t->depth;
+     replacement.last_hash_frame = g_ld_frames;
+     replacement.hash_seq = (u32)g_ld_ws_seq;   /* patch 2083 (after the decode: a mark in between reads as untracked) */
++    replacement.sf_seq = sf_at_start;   /* patch 2137 */
+     replacement.last_use_serial = ++g_ld_texture_use_serial;
+     replacement.span = texture_source_span(t);
+     {
+--- a/libs/video/rsx_tex_samef.h	1969-12-31 18:00:00.000000000 -0600
++++ b/libs/video/rsx_tex_samef.h	1969-12-31 18:00:00.000000000 -0600
+@@ -0,0 +1,29 @@
++/* KZ3 patch 2137 (RSX pass 129): per-64 KB-page write sequence for the same-frame texture re-check (RSX_TEX_SAMEF).
++ * Every tracked write (ld_td_mark) takes the next value of a global counter and stamps the pages it covers with it.
++ * A texture entry records the counter just before its hash read the guest bytes; at a later bind in the SAME frame a
++ * page stamped after that value means a tracked writer landed after the hash, so the entry is re-hashed (the bitmap
++ * flip alone only flags it for the next frame: one frame late). Sequences are wrap-safe, 0 = never stamped.
++ * Host test: tools/smoke/test_tex_samef.sh. */
++#pragma once
++#include <stdint.h>
++#define LD_SF_PAGES 65536u   /* 64 KB pages over a 4 GB offset space */
++
++static inline void ld_sf_stamp(uint32_t* pg, uint32_t offset, uint32_t size, uint32_t seq)
++{
++    if (!size) return;
++    const uint64_t end = (uint64_t)offset + size - 1u;
++    const uint32_t p0 = offset >> 16, p1 = (uint32_t)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
++    for (uint32_t p = p0; ; p++) { pg[p] = seq; if (p == p1) break; }
++}
++/* Is any page of [offset, offset+span) stamped after `since`? span 0 = unknown, never claimed. */
++static inline int ld_sf_after(const uint32_t* pg, uint32_t offset, uint32_t span, uint32_t since)
++{
++    if (!span) return 0;
++    const uint64_t end = (uint64_t)offset + span - 1u;
++    const uint32_t p0 = offset >> 16, p1 = (uint32_t)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
++    for (uint32_t p = p0; ; p++) {
++        if (pg[p] != 0 && (int32_t)(pg[p] - since) > 0) return 1;
++        if (p == p1) break;
++    }
++    return 0;
++}
