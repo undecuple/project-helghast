@@ -121,6 +121,20 @@ def onedrive_root_of(path, env=None):
     return ""
 
 
+CMAKE_BAD_CHARS = "[];"
+
+
+def check_path_chars(r, root, build):
+    """P1 (FAIL): the install root or the build folder holds [ ] or ;. CMake treats them as list/bracket syntax
+    inside its own module code, so configure stops in the compiler detection (public issue 20). Silent when fine."""
+    for what, path in (("install folder", root), ("build folder", build)):
+        bad = sorted({c for c in (path or "") if c in CMAKE_BAD_CHARS})
+        if bad:
+            r.fail("P1", f"the {what} {path} contains {' '.join(repr(c) for c in bad)}: the build tools (CMake) cannot "
+                         "use a folder name with [ ] or ; and stop while configuring. Move or unpack it to a folder "
+                         "whose whole path has none of [ ] ; (for example C:\\Games\\Project Helghast) and run it again")
+
+
 def file_attributes(path):
     """Windows st_file_attributes of `path` (0 elsewhere or when unreadable). Reads no file content."""
     try:
@@ -867,6 +881,7 @@ def main(argv=None):
     if upd != a.update:
         r.ok("U0", f"INFO: {a.update} is the update's USRDIR; using the update folder: {upd}")
     a.dump, a.update = dump, upd
+    check_path_chars(r, a.root, a.build)
     check_onedrive_tree(r, a.root, a.build)
     check_clock(r, a.root)
     # before anything is read: opening an online-only placeholder would start a download of the 9 GB archive

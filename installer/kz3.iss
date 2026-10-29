@@ -1472,6 +1472,20 @@ begin
     ((Prof <> '') and ((D = Lowercase(Prof)) or (D = Lowercase(Prof + '\Downloads'))));
 end;
 
+{ The first of [ ] ; in Dir, or '' when there is none: a CMake installed under such a folder fails its own compiler
+  detection while configuring (public issue 20) }
+function HasCMakeBadChar(Dir: String): String;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Length(Dir) do
+    if (Dir[I] = '[') or (Dir[I] = ']') or (Dir[I] = ';') then begin
+      Result := Dir[I];
+      Exit;
+    end;
+end;
+
 { True when Dir is OneDrive's folder or inside it (the OneDrive, OneDriveConsumer and OneDriveCommercial
   environment variables, case-insensitive prefix match on whole path components; the same for silent installs) }
 function InOneDrive(Dir: String): Boolean;
@@ -1500,7 +1514,11 @@ var
 begin
   Result := '';
   D := RemoveBackslashUnlessRoot(Dir);
-  if CompareText(ExtractFileName(D), '{#AppDirName}') <> 0 then
+  if HasCMakeBadChar(D) <> '' then
+    Result := 'The folder ' + D + ' contains the character "' + HasCMakeBadChar(D) + '". The build tools (CMake) cannot ' +
+      'use a folder name with [ ] or ; and would stop while configuring. Choose a folder whose whole path has none of ' +
+      '[ ] ; (the default, %LOCALAPPDATA%\Programs\{#AppDirName}, is fine).'
+  else if CompareText(ExtractFileName(D), '{#AppDirName}') <> 0 then
     Result := 'The install folder must be called "{#AppDirName}" (it is: ' + D + ').'
   else if InOneDrive(D) then
     Result := 'The folder ' + D + ' is inside OneDrive, which syncs the build''s thousands of files while it runs ' +

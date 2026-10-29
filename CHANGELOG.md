@@ -5,6 +5,9 @@ project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEA
 
 ## [Unreleased]
 
+### Fixed
+- The setup and the portable zip's first check refuse an install or build folder whose path contains `[`, `]` or `;` with a plain message, instead of stopping at step 6 of 9 (configure) with a CMake compiler-detection error: the build tools cannot use such a folder name. Reported by @Rainy101 (#20).
+
 ## [0.1.6] - 2026-10-29 (pre-release)
 
 ### Added

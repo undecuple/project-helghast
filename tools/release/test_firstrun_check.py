@@ -401,6 +401,20 @@ def main():
                 del os.environ["OneDrive"]
             else:
                 os.environ["OneDrive"] = old
+        # P1 (public issue 20): [ ] ; in the install or build folder
+        for ch in "[];":
+            r = fc.Report()
+            fc.check_path_chars(r, "D:\\recomp" + ch + "\\Project Helghast", "D:\\ok\\build")
+            check(f"P1 fails for {ch!r} in the install folder", [(c["code"], c["level"]) for c in r.checks] == [("P1", "FAIL")]
+                  and "install folder" in r.checks[0]["message"] and "cannot" in r.checks[0]["message"])
+        r = fc.Report()
+        fc.check_path_chars(r, "D:\\ok\\Project Helghast", "D:\\b" + "[1]" + "\\build")
+        check("P1 fails for a build folder with [1] and names it", len(r.checks) == 1 and "build folder" in r.checks[0]["message"])
+        r = fc.Report()
+        fc.check_path_chars(r, "D:\\Games (x86)\\Project Helghast", "")
+        check("P1 silent for a fine path and an empty build", r.checks == [])
+        rc, out = run(["--dump", d, "--update", u] + small + hashes(got) + ["--root", "/x[y/p", "--build", "/x/b"])
+        check("--root with [ fails P1 end to end", rc == 1 and levels(out, "P1") == {"FAIL"}, out)
         rc, out = run(["--dump", d, "--update", u] + small + hashes(got) + ["--root", "/x/OneDrive/p", "--build", "/x/b"])
         check("--root without OneDrive env passes", rc == 0 and "O1" not in out, out)
 
