@@ -59,10 +59,11 @@ def main():
         def CloseKey(self, key):
             pass
     os.environ["KZ3FAKE"] = "/od"
-    sf = [str(x) for x in L._shell_folders(FakeWR())]
-    check(len(sf) == 3 and all(x.startswith("/od") for x in sf), f"registry shell folders expanded ({sf})")
+    od = os.path.normpath("/od")   # "\\od" on Windows, where Path prints backslashes
+    sf = [os.path.normpath(str(x)) for x in L._shell_folders(FakeWR())]
+    check(len(sf) == 3 and all(x.startswith(od) for x in sf), f"registry shell folders expanded ({sf})")
     b = L._portable_bases(FakeWR())
-    check(str(b[0]).startswith("/od") and len({os.path.normpath(str(x)) for x in b}) == len(b), "registry folders first, no duplicates")
+    check(os.path.normpath(str(b[0])).startswith(od) and len({os.path.normpath(str(x)) for x in b}) == len(b), "registry folders first, no duplicates")
     class NoWR(FakeWR):
         def OpenKey(self, root, sub):
             raise OSError("none")
