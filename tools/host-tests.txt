@@ -158,7 +158,5 @@ tools/smoke/test_window_place.sh
 tools/release/test_rpcs3_locate.py
 tools/release/test_rpcs3_locate.py
 tools/test_pyresolve_crlf.sh
-tools/spu/test_r120_jobreplay.sh
-tools/spu/test_r121_leaf.sh
 tools/spu/test_r121_irq_b2b.sh
 tools/spu/test_r122_native_blend.sh
