@@ -935,7 +935,7 @@ def discord_toggle(root, ui):
     kz3.ini, every other key stays)."""
     p = os.path.join(root, "build", GAME_INI)
     on = read_game_ini(p).get(DISCORD_KEY, "0").strip().lower() in ("1", "true", "yes", "on")
-    what = ("the port tells the Discord app on this PC what to show on your profile (\"Playing Killzone 3\" with the "
+    what = ("the port tells the Discord app on this PC what to show on your profile (\"Playing Project Helghast\" with the "
             "current chapter). Nothing is sent when it is off. The Discord app must be running.")
     if ui.ask(f"Discord status is on: {what}\n\nTurn the Discord status off?" if on else
               f"Discord status is off.\n\nTurn it on? If you do, {what}"):

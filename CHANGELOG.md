@@ -5,6 +5,9 @@ project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEA
 
 ## [Unreleased]
 
+### Changed
+- The Discord status text and the setting's help line now say "Playing Project Helghast", which is what Discord shows.
+
 ### Fixed
 - A moved or renamed install folder (the portable zip unpacked, built, then moved) no longer reuses the build tree of the old folder: the next start empties `build/obj`, runs configure and compile again (the lifted code is kept) and says why in one line, instead of failing on the old paths or creating the old folder again. Recorded game paths below the old folder follow the move. The setup no longer proposes a previous install folder that holds `[`, `]` or `;` or no longer exists: it proposes the default folder and says why. Reported by @Rainy101 (#20).
 - The setup and the portable zip's first check refuse an install or build folder whose path contains `[`, `]` or `;` with a plain message, instead of stopping at step 6 of 9 (configure) with a CMake compiler-detection error: the build tools cannot use such a folder name. Reported by @Rainy101 (#20).

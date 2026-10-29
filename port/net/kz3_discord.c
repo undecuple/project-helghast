@@ -289,7 +289,7 @@ static const char kd_row[] =
     "\t\t\t\t<selectitem value=\"on\">@key{menu_value_on}</selectitem>\n"
     "\t\t\t</select>\n\n\t\t\t";
 static const char kd_tip[] =
-    "\t\t\tslc_kz3_discord = \"@trl{discord.tip|Shows \"Playing Killzone 3\" and your chapter on your Discord profile through the "
+    "\t\t\tslc_kz3_discord = \"@trl{discord.tip|Shows \"Playing Project Helghast\" and your chapter on your Discord profile through the "
     "Discord app on this PC; nothing is sent when it is off.}\",\n";
 /* network pass 45: the page also reports the game's language (kz3_tr.h) for the next port page it opens */
 static const char kd_on[] = "\t\t\tgPlayerProfile:SetTimeZone(\"kb:lang \"..gPlayerProfile:GetLanguage())\n\t\t\tKZ3DiscordShow()\n";
