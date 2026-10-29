@@ -155,6 +155,7 @@ def ctx_for(root, paths):
 def decide(root):
     """-> (action, reason); action is one of first-build, missing-inputs, resume, rebuild, run."""
     build = os.path.join(root, "build")
+    fr.heal_moved_paths(root, build)   # a moved install: recorded paths below the old folder follow it (issue 20 follow-up)
     paths = load_json(os.path.join(build, "paths.json"))
     if not paths or not paths.get("dump"):
         return "first-build", "The port is not built on this computer yet"
@@ -164,6 +165,8 @@ def decide(root):
     stamp = load_json(os.path.join(build, "build-stamp.json"))
     if not stamp or not os.path.isfile(os.path.join(build, "kz3.exe")):
         return "resume", "The last build did not finish"
+    if fr.root_moved(fr.Ctx(root=root, build=build))[0]:
+        return "rebuild", "The install folder was moved or renamed since the port was built (configure and compile again)"
     if paths.get("eboot") and stamp.get("eboot_stat") != fr.eboot_stat(paths["eboot"]):
         return "rebuild", "The EBOOT changed since the port was built (lift and compile again)"
     now, then = ctx_for(root, paths).parts(), stamp.get("parts") or {}
@@ -466,8 +469,10 @@ def ensure_vfs(root, dump, no_link=False):
     (removing a link never touches its target; a real PS3_GAME folder there is left alone).
 
     The player's dump is read in place and never written: the runtime's writes (psarc-cache, /dev_hdd1 cache) land
-    in <root>/vfs. A real folder already named PS3_GAME there is never removed (error instead); a link to another
-    dump (the player picked a new folder) is replaced; removing a link leaves its target alone."""
+    in <root>/vfs. A real folder named PS3_GAME there that our link record does not name is never removed (error
+    instead); with our record (a moved install keeps the old link text) only an empty one can go (rmdir; a non-empty
+    one gives an error); a link to another dump (the player picked a new folder) is replaced; removing a link leaves
+    its target alone."""
     v = vfs_root(root)
     link = os.path.join(v, "PS3_GAME")
     target = os.path.join(dump, "PS3_GAME")
@@ -487,7 +492,7 @@ def ensure_vfs(root, dump, no_link=False):
             except OSError:
                 pass
         return v, ""
-    if _is_dir_link(link) or (os.path.isdir(link) and (load_json(rec) or {}).get("link") == link):
+    if _is_dir_link(link) or (os.path.isdir(link) and (load_json(rec) or {}).get("link")):   # any record of ours: a moved install keeps the old link text
         if (load_json(rec) or {}).get("target") == target and os.path.isdir(link):
             return v, ""
         try:
@@ -695,6 +700,8 @@ def setup_paths(root):
     cp = configparser.ConfigParser()
     cp.read(os.path.join(root, "kz3-install.ini"), encoding="utf-8")
     g = {k: cp.get("paths", k, fallback="").strip() for k in ("dump", "update", "eboot", "font_dir")}
+    bad = [k for k, v in g.items() if any(c in v for c in fr.CMAKE_BAD)]
+    g = {k: ("" if k in bad else v) for k, v in g.items()}   # a recorded path with [ ] ; is dropped and asked again
     return g if g["dump"] and g["update"] else {}
 
 

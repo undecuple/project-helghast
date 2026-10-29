@@ -179,6 +179,12 @@ class Ctx:
     def b(self, *rel):
         return os.path.join(self.build, *rel)
 
+    def rooted(self, p):
+        """A path for the fingerprint: one inside the install root is keyed relative to it ("<root>/game/disc"), so a
+        moved or renamed install folder keeps its finished lift steps; an outside path is keyed as is."""
+        rel = path_under(p, self.root)
+        return p if rel is None else "<root>/" + rel
+
     def env(self):
         """Child environment: the bundled compiler, CMake and Ninja first on PATH (release layout, plan 3)."""
         extra = [os.path.join(self.toolchain, "bin")] if self.toolchain else []
@@ -198,7 +204,7 @@ class Ctx:
         """The build's inputs as three hashes (pass 4, plan 7): `base` = the folders and the EBOOT's identity from
         the check; `lift` = what the lifts read besides the EBOOT (lift_inputs_hash); `runtime` = the port version
         (VERSION.txt). A new release that changes only the runtime glue recompiles without lifting again."""
-        key = {"dump": self.dump, "update": self.update, "eboot": self.eboot,
+        key = {"dump": self.rooted(self.dump), "update": self.rooted(self.update), "eboot": self.rooted(self.eboot),
                "eboot_elf": self.facts.get("eboot_elf"), "update_sfo": self.facts.get("update")}
         if "lift" not in self.cache:
             self.cache["lift"] = lift_inputs_hash(self)
@@ -210,6 +216,122 @@ class Ctx:
         its Step.keys, so a lift-input change re-runs the lifts but not the load and inventory steps."""
         p = self.parts()
         return p["base"] if not keys else _h16("|".join([p["base"]] + [p[k] for k in keys]))
+
+
+# ------------------------------------------------------------------------------------------------- moved install folder
+CMAKE_BAD = "[];"   # CMake treats these as list/bracket syntax in paths (firstrun_check.CMAKE_BAD_CHARS)
+
+
+def _norm(p):
+    return os.path.normcase(os.path.normpath(p)) if p else ""
+
+
+def path_under(p, root):
+    """The part of `p` below `root` with forward slashes ("" for the root itself), or None when it is outside."""
+    a, b = _norm(os.path.abspath(p)) if p else "", _norm(os.path.abspath(root)) if root else ""
+    if not a or not b:
+        return None
+    if a == b:
+        return ""
+    if a.startswith(b.rstrip(os.sep) + os.sep):
+        return a[len(b.rstrip(os.sep)) + 1:].replace(os.sep, "/")
+    return None
+
+
+def same_dir(a, b):
+    """The same folder: equal after normalising, or (both exist) the same file system object."""
+    if _norm(a) == _norm(b):
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def cmake_cache_dirs(obj):
+    """-> (CMAKE_HOME_DIRECTORY, CMAKE_CACHEFILE_DIR) of <obj>/CMakeCache.txt, "" for a missing entry or file."""
+    home = cdir = ""
+    try:
+        with open(os.path.join(obj, "CMakeCache.txt"), encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if ln.startswith("CMAKE_HOME_DIRECTORY:"):
+                    home = ln.split("=", 1)[1].strip()
+                elif ln.startswith("CMAKE_CACHEFILE_DIR:"):
+                    cdir = ln.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return home, cdir
+
+
+def root_moved(ctx):
+    """Public issue 20 follow-up: was <build>/obj (or the last finished build) made under another install
+    folder? obj/CMakeCache.txt and build.ninja hold absolute paths: cmake refuses a cache from another folder and ninja
+    would create the old output folders again, so the tree must not be reused. Compares the cache's source and cache
+    folders with this root's, and the stamp's recorded root. -> (moved, old root or "")."""
+    home, cdir = cmake_cache_dirs(ctx.b("obj"))
+    if home or cdir:   # the cache decides while obj/ has one: a cache made here is current, whatever the stamp says
+        if home and not same_dir(home, os.path.join(ctx.root, "port", "kz3")):
+            ok = _norm(home).endswith(_norm(os.path.join("port", "kz3")))
+            return True, os.path.dirname(os.path.dirname(home)) if ok else ""
+        return (bool(cdir) and not same_dir(cdir, ctx.b("obj"))), ""
+    rec = (load_stamp(ctx) or {}).get("root")
+    if rec and not same_dir(rec, ctx.root):
+        return True, rec
+    return False, ""
+
+
+def rebase_path(p, old, new):
+    """`p` with the leading folder `old` replaced by `new` when it lies below `old`, else `p`."""
+    rel = path_under(p, old) if (p and old) else None
+    return p if rel is None else os.path.normpath(os.path.join(new, *rel.split("/"))) if rel else new
+
+
+def heal_moved_paths(root, build):
+    """The recorded paths below the old install folder (an ISO copied to <root>/game/disc, the copied game files, the
+    font copy) are rewritten in build/paths.json for the new folder; folders outside the install stay. Idempotent and
+    quiet. -> the old root when the install was moved, else "". The launcher calls it before it decides, firstrun at
+    its start."""
+    ctx = Ctx(root=root, build=build)
+    moved, old = root_moved(ctx)
+    if not moved or not old:
+        return "" if not moved else old
+    p = os.path.join(build, "paths.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        return old
+    ch = False
+    for k in ("dump", "iso", "update", "eboot", "font_dir", "font_src"):
+        if isinstance(j.get(k), str) and j[k]:
+            n = rebase_path(j[k], old, root)
+            ch |= n != j[k]
+            j[k] = n
+    if ch:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(j, f, indent=2)
+    return old
+
+
+def handle_moved_root(ctx, steps):
+    """The first run's side of root_moved: empty obj/ through the clean path and drop the configure, compile and stamp
+    markers, so those three run again (the lifted and analysis sources hold no absolute
+    path, so they stay).
+    -> the line for the console, or "" when the root did not move."""
+    moved, old = root_moved(ctx)
+    if not moved:
+        return ""
+    safe_clean(ctx, ctx.b("obj"))
+    for i, st in enumerate(steps):
+        if st.name in ("configure", "compile", "stamp"):
+            try:
+                os.remove(marker_path(ctx, i, st))
+            except OSError:
+                pass
+    return ("The install folder was moved or renamed" + (f" (it was {old})" if old else "") +
+            ": the compiler's files in build/obj name the old folder, so configure and compile run again "
+            "(the lifted code is kept).")
+
 
 
 @dataclass
@@ -809,7 +931,7 @@ def after_stamp(c):
     record_sources(c)
     stamp = {"inputs": c.fingerprint(("lift", "runtime")), "parts": c.parts(), "version": port_version(c.root),
              "eboot_stat": eboot_stat(c.eboot), "facts": c.facts, "jobs": c.jobs,
-             "toolchain": c.toolchain or "cross", "spu_fma": c.spu_fma, "eboot_embedded": file_sha256(c.eboot) if embed_supported(c.root) else "",
+             "toolchain": c.toolchain or "cross", "root": c.root, "spu_fma": c.spu_fma, "eboot_embedded": file_sha256(c.eboot) if embed_supported(c.root) else "",
              "cache_root": cache_root_supported(c.root),
              "built": datetime.datetime.now().isoformat(timespec="seconds")}
     pf = os.path.join(c.ps3recomp, ".kz3-patchset")
@@ -1527,6 +1649,9 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
             prev = json.load(f)
     except (OSError, ValueError):
         pass
+    for k in ("dump", "update", "eboot"):   # a recorded path with [ ] ; is not offered again
+        if any(c in str(prev.get(k, "")) for c in CMAKE_BAD):
+            notes.append(f"# recorded {k} path dropped (holds [ ] or ;): {prev.pop(k)}")
     guess = next((os.path.expanduser(g) for g in RPCS3_UPDATE_GUESSES if os.path.isdir(os.path.expanduser(g))), "")
     say(NOTICE_TEXT)
     say(f"Log: {log_path}")
@@ -1799,6 +1924,8 @@ class ConsoleBar:
         kv = dict(x.split("=", 1) for x in ln.split()[1:] if "=" in x)
         if ln.startswith("LOG "):
             self.out.write(f"Log: {kv.get('path', '')}\n")
+        elif ln.startswith("NOTE "):
+            self.out.write(("\n" if self.tty and self.last else "") + ln[5:] + "\n")
         elif ln.startswith("REASON "):
             self.reasons.append(ln[len("REASON "):])
         elif ln.startswith("PROGRESS "):
@@ -1887,6 +2014,7 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     if not a.dump and not a.interactive:
         ap.error("--dump is required (or --interactive)")
     root = os.path.abspath(a.root)
+    heal_moved_paths(root, os.path.abspath(a.build or os.path.join(root, "build")))   # before anything reads paths.json
     notes, quit_early = [], False
     if a.interactive and not a.dry_run:
         if not interactive(a, root, pick_log(a.log_dir or None, a.log_name)[0], notes, ask=ask, out=out):
@@ -1953,6 +2081,9 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
         return 1
     if os.name != "nt":
         signal.signal(signal.SIGTERM, _interrupt)
+    why_moved = handle_moved_root(ctx, steps)
+    if why_moved:
+        r.emit("NOTE " + why_moved)
     if cpu_changed(ctx, steps):
         log.write("# the CPU's AVX + FMA3 answer changed since the last build: configure and compile run again")
     try:

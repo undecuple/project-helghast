@@ -34,6 +34,42 @@ jobs:
       - name: Project card (.recomp.json) is current
         run: python3 tools/release/recomp_card.py
 
+  # The release build runs these tests on windows-latest; a Windows-only failure (path, line-end or registry
+  # behaviour) would otherwise only show up when a release is built. Same shell, line endings and python3 shim as
+  # release.yml's installer job. No installer build, no secrets.
+  release-tools-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: python3 on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\nexec python "$@"\n' > "$RUNNER_TEMP/bin/python3"
+          chmod +x "$RUNNER_TEMP/bin/python3"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Host tests of the release tools
+        # every test runs; the step fails at the end and names the failed ones
+        run: |
+          failed=""
+          for t in tools/release/test_*.py; do
+            python3 "$t" || failed="$failed $t"
+          done
+          if [ -n "$failed" ]; then echo "::error::failed host tests:$failed"; exit 1; fi
+
   secrets:
     runs-on: ubuntu-latest
     steps:

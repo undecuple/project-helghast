@@ -1263,9 +1263,62 @@ begin
   else DumpInfo.Caption := 'No Killzone 3 dump found here: PS3_GAME\PARAM.SFO is missing.';
 end;
 
+{ The first of [ ] ; in Dir, or '' when there is none: a CMake installed under such a folder fails its own compiler
+  detection while configuring (public issue 20) }
+function HasCMakeBadChar(Dir: String): String;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Length(Dir) do
+    if (Dir[I] = '[') or (Dir[I] = ']') or (Dir[I] = ';') then begin
+      Result := Dir[I];
+      Exit;
+    end;
+end;
+
+var
+  StaleDirNote: String;
+
+{ The folder an earlier install of this app recorded (Inno's uninstall key, per-user or machine-wide), or '' }
+function PreviousInstallDir: String;
+var
+  K, S: String;
+begin
+  Result := '';
+  K := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{08141EE8-C3FD-416B-9F09-5977CFF2F6A3}_is1';
+  if RegQueryStringValue(HKCU, K, 'Inno Setup: App Path', S) or RegQueryStringValue(HKLM, K, 'Inno Setup: App Path', S) then
+    Result := RemoveBackslashUnlessRoot(S);
+end;
+
+{ Public issue 20 follow-up: Inno proposes the folder of the previous install. When that folder holds [ ] ; (the
+  build fails there) or no longer exists (renamed or moved by hand), the folder page proposes the default folder
+  instead and says why; the old folder is never recreated. A normal previous folder stays (upgrade in place). Only
+  acts on the proposal itself: a folder typed or passed with /DIR= that differs from the recorded one is left alone;
+  /DIR= naming the recorded folder itself, when it holds [ ] ; or no longer exists, is replaced by the default too
+  (logged). }
+procedure DropStalePreviousDir;
+var
+  Prev, Why: String;
+begin
+  Prev := PreviousInstallDir;
+  if (Prev = '') or (CompareText(RemoveBackslashUnlessRoot(WizardDirValue), Prev) <> 0) then Exit;
+  if HasCMakeBadChar(Prev) <> '' then
+    Why := 'contains the character "' + HasCMakeBadChar(Prev) + '", which the build tools cannot use'
+  else if not DirExists(Prev) then
+    Why := 'no longer exists'
+  else
+    Exit;
+  WizardForm.DirEdit.Text := ExpandConstant('{localappdata}\Programs\{#AppDirName}');
+  StaleDirNote := 'The folder of the earlier install (' + Prev + ') ' + Why + ', so the default folder is proposed.';
+  WizardForm.SelectDirBrowseLabel.Caption := StaleDirNote + ' ' + WizardForm.SelectDirBrowseLabel.Caption;
+  Log('install folder: the previous folder ' + Prev + ' ' + Why + '; proposing the default');
+end;
+
 procedure InitializeWizard;
 begin
   ApplyHeadingFonts;
+  DropStalePreviousDir;
   TypePage := CreateInputOptionPage(wpWelcome, 'Setup type', 'How much do you want to choose?',
     'Recommended asks only for your game files and uses the defaults. Advanced shows every option.', True, False);
   TypePage.Add('&Recommended: your disc dump and the 1.14 update, nothing else');
@@ -1409,6 +1462,7 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
+  if (CurPageID = wpSelectDir) and (StaleDirNote = '') then DropStalePreviousDir;
   if (CurPageID = wpFinished) and BuildFailed then begin
     if BuildStopped then
       WizardForm.FinishedLabel.Caption := '{#AppName} is installed; the build was stopped. Start {#AppName} ' +
@@ -1470,20 +1524,6 @@ begin
     (D = Lowercase(RemoveBackslashUnlessRoot(ExpandConstant('{userdocs}')))) or
     (D = Lowercase(RemoveBackslashUnlessRoot(ExpandConstant('{userdesktop}')))) or
     ((Prof <> '') and ((D = Lowercase(Prof)) or (D = Lowercase(Prof + '\Downloads'))));
-end;
-
-{ The first of [ ] ; in Dir, or '' when there is none: a CMake installed under such a folder fails its own compiler
-  detection while configuring (public issue 20) }
-function HasCMakeBadChar(Dir: String): String;
-var
-  I: Integer;
-begin
-  Result := '';
-  for I := 1 to Length(Dir) do
-    if (Dir[I] = '[') or (Dir[I] = ']') or (Dir[I] = ';') then begin
-      Result := Dir[I];
-      Exit;
-    end;
 end;
 
 { True when Dir is OneDrive's folder or inside it (the OneDrive, OneDriveConsumer and OneDriveCommercial
