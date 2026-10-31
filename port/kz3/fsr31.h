@@ -82,6 +82,7 @@ typedef struct kz3_fsr31_camera_dispatch_desc {
     float frame_time_ms;
     float sharpness;
     uint32_t reset;
+    uint32_t use_reactive_mask;
 } kz3_fsr31_camera_dispatch_desc;
 
 /*
@@ -116,7 +117,24 @@ void kz3_fsr31_note_camera_planes(
 int kz3_fsr31_get_camera(kz3_fsr31_camera_state* out_state);
 int kz3_fsr31_dispatch(const kz3_fsr31_dispatch_desc* desc);
 /*
- * Generates camera-rotation motion vectors and dispatches FSR into an
+ * The capture source must be an RGBA8 render-resolution texture in
+ * D3D12_RESOURCE_STATE_RENDER_TARGET. It is restored to that state before
+ * returning. A pre-upscale capture is accepted only after an opaque capture
+ * of the same resource in the current adapter context.
+ */
+int kz3_fsr31_capture_opaque_color(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* color,
+    uint32_t width,
+    uint32_t height);
+int kz3_fsr31_capture_pre_upscale_color(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* color,
+    uint32_t width,
+    uint32_t height);
+/*
+ * Generates depth-aware camera motion vectors and, when requested, a
+ * reactive mask from the current capture pair before dispatching FSR into an
  * adapter-owned output. On success the returned resource is in
  * D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE and remains owned by the adapter.
  */
