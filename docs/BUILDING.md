@@ -225,6 +225,10 @@ or a separate UI layer, so moving objects, particles, menus, and text can ghost 
 this warning before selecting it. Releases place AMD's signed `amd_fidelityfx_dx12.dll` beside `kz3.exe`; a missing
 or rejected runtime, incoherent camera/depth input, split-screen view, or dispatch error is logged and falls back
 to Bilinear without preventing the game from starting.
+An initial native Windows run from the main menu through the first campaign level at 1920x1080 was confirmed on
+2026-10-31; broader scene, GPU and Proton quality coverage remains future work.
+The complete dataflow, resource states, validation evidence and planned quality work are documented in
+[FSR-3.1.md](FSR-3.1.md).
 
 ## Tests without the game
 

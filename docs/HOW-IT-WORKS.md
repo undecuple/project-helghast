@@ -53,6 +53,7 @@ game code where it pays off ([roadmap](ROADMAP.md)).
    color and depth surfaces, jitter primary 3D draws, generate camera-rotation motion vectors, and temporally
    upscale before scan-out gamma. It uses a port-owned adapter around AMD's dynamically loaded FidelityFX runtime
    and falls back to the ordinary bilinear presentation path when any required input or capability is unavailable.
+   Architecture, inputs and current limitations: [FSR-3.1.md](FSR-3.1.md).
 7. **Running.** The result is `kz3.exe`, a native Windows program. On Linux it runs under Proton, which is where it
    is mostly tested (it has also run natively on Windows 11 and on a Windows 10 test machine); a native Linux build is planned.
 
