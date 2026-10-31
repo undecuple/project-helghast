@@ -49,7 +49,10 @@ game code where it pays off ([roadmap](ROADMAP.md)).
 6. **Graphics.** The game builds RSX command buffers exactly as on the PS3. The runtime walks them as they are
    written and replays them on Direct3D 12: RSX vertex and fragment programs are translated to HLSL, render
    targets and textures are mirrored on the GPU, and the targets that the SPU post-processing chain reads from
-   memory (MLAA, bloom, depth of field) are written back.
+   memory (MLAA, bloom, depth of field) are written back. An opt-in experimental FSR 3.1 path can pair the primary
+   color and depth surfaces, jitter primary 3D draws, generate camera-rotation motion vectors, and temporally
+   upscale before scan-out gamma. It uses a port-owned adapter around AMD's dynamically loaded FidelityFX runtime
+   and falls back to the ordinary bilinear presentation path when any required input or capability is unavailable.
 7. **Running.** The result is `kz3.exe`, a native Windows program. On Linux it runs under Proton, which is where it
    is mostly tested (it has also run natively on Windows 11 and on a Windows 10 test machine); a native Linux build is planned.
 

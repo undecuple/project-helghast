@@ -105,7 +105,8 @@ def test_real_manifest():
     check(ft.validate(m, strict=True) != [] or all(c["sha256"] != ft.TO_FILL for c in m["components"]),
           "--strict refuses TO-FILL / TO-CONFIRM")
     names = {c["name"] for c in m["components"]}
-    check({"llvm-mingw", "cmake", "ninja", "python"} <= names, "manifest pins llvm-mingw, cmake, ninja, python", names)
+    check({"fidelityfx-sdk", "llvm-mingw", "cmake", "ninja", "python"} <= names,
+          "manifest pins FidelityFX, llvm-mingw, cmake, ninja, python", names)
     lg = [c for c in m["components"] if c["name"] == "lgpl-2.1-text"][0]
     check(lg.get("kind") == "repo" and "url" not in lg, "lgpl-2.1-text comes from the repository, not the network", lg)
     check(os.path.isfile(ft.repo_file(lg["repo_path"])) and
@@ -147,6 +148,8 @@ def test_validator():
         "licence file without name": [comp("a", "a", "https://x/a.zip", license_globs=["L"]),
                                       comp("al", "a", "https://x/L", archive="file")],
         "bad placeholder": [comp("a", "a", "https://x/{nope}.zip", license_globs=["L"])],
+        "unsafe selective members": [comp("a", "a", "https://x/a.zip", stage_only=True,
+                                           members=["ok", "../escape"])],
     }
     for what, comps in cases.items():
         probs = ft.validate({"format": 1, "components": comps})
@@ -229,6 +232,17 @@ def test_fetch_and_payload(tmp):
             ok = True
         check(ok and not os.path.exists(os.path.join(tmp, "badout")), f"unpack refuses {what}")
     check(not os.path.exists(os.path.join(tmp, "evil")), "nothing written outside by the zip-slip case")
+    selective = make_zip(os.path.join(src, "selective.zip"), {"keep/a": "a", "drop/b": "b"})
+    selected_out = os.path.join(tmp, "selected")
+    n = ft.unpack_zip(selective, selected_out, False, ["keep/a"])
+    check(n == 1 and os.path.isfile(os.path.join(selected_out, "keep", "a")) and
+          not os.path.exists(os.path.join(selected_out, "drop")), "selective extraction keeps only exact members")
+    try:
+        ft.unpack_zip(selective, os.path.join(tmp, "selected-missing"), False, ["missing"])
+        ok = False
+    except ValueError:
+        ok = True
+    check(ok, "selective extraction refuses a missing member")
 
     # ---- payload
     repo = os.path.join(tmp, "repo")

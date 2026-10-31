@@ -119,6 +119,11 @@ def validate(m, schemes=("https",), strict=False):
             # staged by stage_sdl3.py into runtime/); no dest, group or licence-globs bookkeeping
             if e["archive"] != "zip":
                 bad.append(f"{where}: stage_only needs archive zip")
+            members = e.get("members")
+            if members is not None and (not isinstance(members, list) or not members or
+                                        len(members) != len(set(members)) or
+                                        any(not isinstance(p, str) or not safe_rel(p) for p in members)):
+                bad.append(f"{where}: members must be a non-empty list of unique plain relative paths")
         elif e["archive"] == "zip":
             groups_main.add(e["group"])
             if not safe_rel(e.get("dest", "")):
@@ -206,9 +211,10 @@ def hash_from_list(text, filename):
 
 
 # ---------------------------------------------------------------------------------------------------------- unpack
-def unpack_zip(path, out, strip_top):
+def unpack_zip(path, out, strip_top, members=None):
     """Extract into out (which must not exist). Refuses unsafe member names and symlinks; strip_top drops the one
-    top-level folder every member shares (refused when there is not exactly one)."""
+    top-level folder every member shares (refused when there is not exactly one). members, when present, extracts
+    only those exact archive paths after validating the whole archive."""
     with zipfile.ZipFile(path) as z:
         infos = [i for i in z.infolist() if not i.is_dir()]
         names = [i.filename for i in infos]
@@ -221,6 +227,12 @@ def unpack_zip(path, out, strip_top):
             tops = {n.split("/", 1)[0] for n in names}
             if len(tops) != 1 or any("/" not in n for n in names):
                 raise ValueError(f"strip_top: expected one top folder, found {sorted(tops)[:5]}")
+        if members is not None:
+            by_name = {i.filename: i for i in infos}
+            missing = [n for n in members if n not in by_name]
+            if missing:
+                raise ValueError(f"members: not in archive: {missing}")
+            infos = [by_name[n] for n in members]
         part = out + ".partial"
         if os.path.lexists(part):
             shutil.rmtree(part)
@@ -315,7 +327,7 @@ def fetch_one(raw, cache, fill, manifest_path, opener=open_url, out=sys.stdout):
     tree = os.path.join(cache, "trees", name)
     try:
         if e["archive"] == "zip":
-            n = unpack_zip(dl, tree, bool(e.get("strip_top")))
+            n = unpack_zip(dl, tree, bool(e.get("strip_top")), e.get("members"))
         else:
             if os.path.lexists(tree):
                 shutil.rmtree(tree)

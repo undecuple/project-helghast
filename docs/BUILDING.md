@@ -216,8 +216,10 @@ Alt+Enter writes it, and you can edit it while the game is closed. Its keys are:
 mode = windowed
 ; stretch (default): the picture fills the window; fit: the picture keeps its shape, with bars
 scaling = stretch
-; bilinear (default) or nearest
+; bilinear (default), nearest, or fsr31 (experimental FSR 3.1 temporal upscaling)
 filter = bilinear
+; FSR RCAS sharpening, 0.0 to 1.0 in steps of 0.1; ignored by bilinear and nearest
+fsr_sharpness = 0.2
 ; on (default) or off: off shows each frame as soon as it is ready, which can tear (Options > Display > VSync)
 vsync = on
 ```
