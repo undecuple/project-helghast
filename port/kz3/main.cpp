@@ -59,6 +59,9 @@
 #include "kz3_embed.h" /* the player's EBOOT.elf linked into kz3.exe (release step 9s) */
 #include "kz3_log.h"   /* file log, levels, crash files (also force-included with the stdio redirect) */
 #include "kz3_vfs_root.h" /* the game root from the EBOOT path (disc layout, else PS3_GAME above it, else ".") */
+#if defined(KZ3_FSR31)
+#include "fsr31.h"
+#endif
 #ifdef _WIN32
 /* RSX pass 125 (public issue #13 on the KZ2 port, same code): hybrid laptops run an exe on the integrated GPU unless it
  * exports these two symbols (NVIDIA Optimus and AMD PowerXpress read them from the exe, not from a DLL). The DXGI
@@ -709,6 +712,7 @@ extern "C" int  rsx_display_get_scaling(void);
 extern "C" int  rsx_display_get_filter(void);
 extern "C" int  rsx_display_set_vsync(int on);   /* patch 2103: Options > Display > VSync */
 extern "C" int  rsx_display_get_vsync(void);
+extern "C" void rsx_live_draw_set_fsr_sharpness(int thousandths);
 /* Patch 2126 (RSX pass 120): window management (rsx_window_place.h): placement, maximize, close asks, focus. */
 #include "rsx_window_place.h"
 extern "C" void rsx_display_configure_window(const rsx_wp* saved, int maximize_borderless, int (*close_ask)(int src),
@@ -767,6 +771,8 @@ static int s_fov_saved;
 static int s_fov_ok;              /* the camera hook is installed (the Options row shows only then) */
 static int s_h169_saved = 1;      /* patch 2113: display.ini hud_169 (2D layer kept 16:9), default on */
 extern "C" void rsx_live_draw_set_hud169(int on);   /* rsx_live_draw.c */
+static volatile LONG s_fsr_sharpness_eff = RSX_DM_FSR_SHARPNESS_DEFAULT;
+static int s_fsr_sharpness_saved = RSX_DM_FSR_SHARPNESS_DEFAULT;
 static int s_dm_saved[4] = { RSX_DM_WINDOWED, RSX_DM_STRETCH, RSX_DM_BILINEAR, RSX_DM_VSYNC_ON };
 static CRITICAL_SECTION s_dm_save_lock;
 static INIT_ONCE s_dm_save_once = INIT_ONCE_STATIC_INIT;
@@ -779,8 +785,9 @@ static void kz3_display_save(int mode, int scaling, int filter, int vsync)
     InitOnceExecuteOnce(&s_dm_save_once, kz3_dm_lock_init, NULL, NULL);
     EnterCriticalSection(&s_dm_save_lock);
     s_dm_saved[0] = mode; s_dm_saved[1] = scaling; s_dm_saved[2] = filter; s_dm_saved[3] = vsync;
-    int n = rsx_dm_ini_write_ext4(t, sizeof t, mode, scaling, filter, vsync, s_mb_saved, s_fps_saved, s_fov_saved,
-                                  s_h169_saved, s_bloom_saved);
+    int n = rsx_dm_ini_write_ext5(
+        t, sizeof t, mode, scaling, filter, vsync, s_mb_saved, s_fps_saved,
+        s_fov_saved, s_h169_saved, s_bloom_saved, s_fsr_sharpness_saved);
     if (n > 0 && (size_t)n < sizeof t) {   /* patch 2126: When unfocused, maximize, the window */
         rsx_wp w;
         if (!rsx_display_get_window(&w)) w = s_wp_saved;
@@ -802,8 +809,11 @@ static void kz3_display_save(int mode, int scaling, int filter, int vsync)
         FILE* f = _wfopen(p, L"wb");
         ok = f && fwrite(t, 1, (size_t)n, f) == (size_t)n;
         if (f) fclose(f);
-        printf("[display] %ls: mode %s, scaling %s, filter %s, vsync %s, motion blur %d, bloom %d, fps limit %s, fov %s %s\n", p,
-               rsx_dm_name(mode), rsx_dm_scaling_name(scaling), rsx_dm_filter_name(filter), rsx_dm_vsync_name(vsync),
+        char fs[16];
+        printf("[display] %ls: mode %s, scaling %s, filter %s, FSR sharpness %s, vsync %s, motion blur %d, bloom %d, fps limit %s, fov %s %s\n", p,
+               rsx_dm_name(mode), rsx_dm_scaling_name(scaling), rsx_dm_filter_name(filter),
+               rsx_dm_fsr_sharpness_name(s_fsr_sharpness_saved, fs, sizeof fs),
+               rsx_dm_vsync_name(vsync),
                s_mb_saved, s_bloom_saved, rsx_dm_fps_name(s_fps_saved), rsx_dm_fov_name(s_fov_saved, fb, sizeof fb),
                ok ? "saved" : "NOT saved");
     }
@@ -831,6 +841,8 @@ static void kz3_display_load(void)
             scaling = rsx_dm_ini_scaling(t);
             filter = rsx_dm_ini_filter(t);
             vsync = rsx_dm_ini_vsync(t);
+            const int sharpness = rsx_dm_ini_fsr_sharpness(t);
+            if (sharpness >= 0) s_fsr_sharpness_saved = sharpness;
             const int mb = rsx_dm_ini_motion_blur(t), fps = rsx_dm_ini_fps(t);
             if (mb >= 0) s_mb_saved = mb;
             const int bl = rsx_dm_ini_bloom(t);   /* patch 2121 */
@@ -875,10 +887,20 @@ static void kz3_display_load(void)
     e = getenv("KZ3_FOV");
     const int fve = e && *e ? rsx_dm_parse_fov(e) : -1;
     InterlockedExchange(&s_fov_deg, fve >= 0 ? fve : s_fov_saved);
+    e = getenv("KZ3_FSR_SHARPNESS");
+    const int fse = e && *e ? rsx_dm_parse_fsr_sharpness(e) : -1;
+    InterlockedExchange(
+        &s_fsr_sharpness_eff,
+        fse >= 0 ? fse : s_fsr_sharpness_saved);
+    rsx_live_draw_set_fsr_sharpness((int)s_fsr_sharpness_eff);
     { char fb[16]; printf("[display] field of view %s%s\n", rsx_dm_fov_name((int)s_fov_deg, fb, sizeof fb), fve >= 0 ? " (KZ3_FOV)" : ""); }
     printf("[display] motion blur %s%s, bloom %d%s, fps limit %s%s\n", mbe >= 0 ? (mbe ? "on" : "OFF (diagnostic: garbles the picture)") : "always on (no row)", mbe >= 0 ? " (KZ3_MOTION_BLUR)" : "",
            (int)s_bloom_eff, ble >= 0 ? " (KZ3_BLOOM)" : "",
            rsx_dm_fps_name((int)s_fps_eff), fpe > 0 ? " (KZ3_FPS_LIMIT)" : "");
+    { char fs[16]; printf("[display] FSR sharpness %s%s\n",
+          rsx_dm_fsr_sharpness_name(
+              (int)s_fsr_sharpness_eff, fs, sizeof fs),
+          fse >= 0 ? " (KZ3_FSR_SHARPNESS)" : ""); }
     rsx_live_draw_set_hud169(s_h169_saved);   /* patch 2113; KZ3_HUD_169 wins for one run (rsx_live_draw.c) */
     {   /* patch 2126 */
         e = getenv("KZ3_UNFOCUSED");
@@ -1507,6 +1529,25 @@ static void kz3_kb_set(ppu_context* ctx)
                 kz3_display_save_extra();
             }
             snprintf(s_kb_reply, sizeof s_kb_reply, "%s", rsx_dm_fps_name((int)s_fps_eff));
+            s_kb_pending = 1;
+            printf("[kb-page] '%s' -> '%s'\n", cmd, s_kb_reply);
+            return;
+        }
+        if (!strncmp(cmd, "fsrsharpness", 12) &&
+            (cmd[12] == 0 || cmd[12] == ' ')) {
+            const int v = cmd[12] ?
+                rsx_dm_parse_fsr_sharpness(cmd + 13) : -1;
+            if (v >= 0) {
+                InterlockedExchange(&s_fsr_sharpness_eff, v);
+                s_fsr_sharpness_saved = v;
+                rsx_live_draw_set_fsr_sharpness(v);
+                kz3_display_save_extra();
+            }
+            char fs[16];
+            snprintf(
+                s_kb_reply, sizeof s_kb_reply, "%s",
+                rsx_dm_fsr_sharpness_name(
+                    (int)s_fsr_sharpness_eff, fs, sizeof fs));
             s_kb_pending = 1;
             printf("[kb-page] '%s' -> '%s'\n", cmd, s_kb_reply);
             return;
@@ -2788,6 +2829,11 @@ static void kz3_fov_view_note(uint32_t view, double A0, double A1)   /* at the w
     v.vw = A1 > 0 ? (float)(2.0 * atan(tan(s_fov_half) / A1)) : 0.f;
     v.applied = s_fov_applied;
 }
+#if defined(KZ3_FSR31)
+static uint32_t s_fsr_camera_view, s_fsr_camera_flip;
+static float s_fsr_camera_pose[16], s_fsr_camera_hfov;
+static int s_fsr_camera_pending;
+#endif
 static void kz3_cam_fov(ppu_context* ctx)
 {
     const uint32_t src = (uint32_t)ctx->gpr[29];
@@ -2838,6 +2884,20 @@ static void kz3_cam_fov(ppu_context* ctx)
     if (src_ok) for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) cam0[i][j] = kz3_bef(src + 0x10 * i + 4 * j);
     if (src_ok && (s_log == 1 || kz3_latch_on())) kz3_cam_latch(ctx, src);   /* RSX pass 105: before the pose copy */
     if (src_ok) kz3_arms_follow(src, cam0, s_log == 1);   /* RSX pass 122 */
+#if defined(KZ3_FSR31)
+    if (src_ok) {
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                s_fsr_camera_pose[i * 4 + j] = kz3_bef(src + 0x10 * i + 4 * j);
+        s_fsr_camera_view = (uint32_t)ctx->gpr[31];
+        s_fsr_camera_flip = cellGcm_flip_request_count();
+        const double view_ratio = rsx_display_view_ratio();
+        const double horizontal_half = view_ratio > 1.0 ?
+            atan(tan(s_fov_half2) * view_ratio) : s_fov_half2;
+        s_fsr_camera_hfov = (float)(2.0 * horizontal_half);
+        s_fsr_camera_pending = 1;
+    }
+#endif
     static float s_hz[32][2];
     static int s_nhz;
     int k = 0;
@@ -2890,6 +2950,23 @@ static void kz3_vf22_aspect(ppu_context* ctx)   /* GameViewGame::vf22 @0x007E590
         const double A0 = ctx->fpr[1];
         if (s_fov_applied) ctx->fpr[1] = (double)(float)(ctx->fpr[1] * s_fov_k);   /* RSX pass 103 */
         kz3_fov_view_note((uint32_t)ctx->gpr[31], A0, ctx->fpr[1]);   /* RSX pass 121 */
+#if defined(KZ3_FSR31)
+        if (s_fsr_camera_pending &&
+            s_fsr_camera_view == (uint32_t)ctx->gpr[31]) {
+            for (const Kz3FovView& fv : s_fov_views) {
+                if (fv.view == s_fsr_camera_view && fv.vw > 0.0f) {
+                    kz3_fsr31_note_camera(
+                        s_fsr_camera_flip,
+                        s_fsr_camera_view,
+                        s_fsr_camera_pose,
+                        s_fsr_camera_hfov,
+                        fv.vw);
+                    break;
+                }
+            }
+            s_fsr_camera_pending = 0;
+        }
+#endif
     }
 }
 
@@ -2937,6 +3014,18 @@ static void kz3_cam_vf17_hud(ppu_context* ctx)   /* Camera::vf17 0x00329D80 (1.0
     if (s_vf17_log) kz3_vf17_lr_note(lr, (uint32_t)ctx->gpr[4]);
     s_cvf17_orig(ctx);
     if (lr != s_hudp_lr || out < 0x10000u || out >= 0xF0000000u) return;
+#if defined(KZ3_FSR31)
+    /*
+     * ASSUMPTION: Camera::vf17's first two floats are the near and far
+     * distances. The existing RE established the four following frustum
+     * extents; strict plausibility checks in the bridge keep FSR unavailable
+     * instead of accepting another vf17 layout.
+     */
+    kz3_fsr31_note_camera_planes(
+        cellGcm_flip_request_count(),
+        kz3_bef(out),
+        kz3_bef(out + 4));
+#endif
     float kx = 1.0f, ky = 1.0f;
     const int sq = rsx_live_draw_hud169_factors(&kx, &ky);
     if (s_hudp_log) {

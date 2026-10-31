@@ -204,14 +204,25 @@ Alt+Enter writes it, and you can edit it while the game is closed:
 mode = windowed
 ; stretch (default): the picture fills the window; fit: the picture keeps its shape, with bars
 scaling = stretch
-; bilinear (default) or nearest
+; bilinear (default), nearest, or fsr31 (experimental FSR 3.1 temporal upscaling)
 filter = bilinear
+; FSR RCAS sharpening, 0.0 to 1.0 in steps of 0.1; ignored by bilinear and nearest
+fsr_sharpness = 0.2
 ; on (default) or off: off shows each frame as soon as it is ready, which can tear (Options > Display > VSync)
 vsync = on
 ```
 
 `KZ3_DISPLAY=windowed|borderless|fullscreen` sets the mode for one run without saving it. `KZ3_ASPECT=16:9` (or
 `off`) keeps the PS3's 16:9 view in gameplay instead of following the window's shape.
+`KZ3_DISPLAY_FILTER=bilinear|nearest|fsr31` and `KZ3_FSR_SHARPNESS=0.0..1.0` override the corresponding settings
+for one run.
+
+FSR 3.1 is opt-in and experimental. It is used only when the output is larger than the game's fixed 1280x720
+render image. The first implementation has camera-rotation motion vectors but not object motion, a reactive mask,
+or a separate UI layer, so moving objects, particles, menus, and text can ghost or shimmer. The Options page shows
+this warning before selecting it. Releases place AMD's signed `amd_fidelityfx_dx12.dll` beside `kz3.exe`; a missing
+or rejected runtime, incoherent camera/depth input, split-screen view, or dispatch error is logged and falls back
+to Bilinear without preventing the game from starting.
 
 ## Tests without the game
 
