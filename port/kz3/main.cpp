@@ -3002,13 +3002,17 @@ static void kz3_vf22_aspect(ppu_context* ctx)   /* GameViewGame::vf22 @0x007E590
  * KZ3_HUD_PROJ=0 turns it off for one run (A/B); KZ3_HUD_PROJ_LOG=1 prints the frustum once a second. */
 #include "rsx_hud169.h"
 extern "C" int rsx_live_draw_hud169_factors(float* kx, float* ky);   /* rsx_live_draw.c (patch 2113) */
-struct Kz3HudProjVer { uint32_t vf17, lr; };
-static constexpr Kz3HudProjVer kHudProj100 = {0x0031E120u, 0x007EA52Cu}, kHudProj114 = {0x00329D80u, 0x0080BDECu};
+struct Kz3HudProjVer { uint32_t vf17, lr, scene_lr; };
+static constexpr Kz3HudProjVer kHudProj100 = {0x0031E120u, 0x007EA52Cu, 0x007F0A98u},
+                                kHudProj114 = {0x00329D80u, 0x0080BDECu, 0x008123B8u};
 static void (*s_cvf17_orig)(ppu_context*);
 static uint32_t s_hudp_lr;
+#if defined(KZ3_FSR31)
+static uint32_t s_fsr_projection_lr;
+#endif
 static int s_hudp_on = 1, s_hudp_log;
-/* RSX pass 119 probe (KZ3_VF17_LOG=1): every distinct Camera::vf17 caller (lr) once, then counts every 10 s: which code
- * builds a projection from the Camera, for the Field of view question (which frustum the helmet visor overlay uses). */
+/* RSX pass 119 probe (KZ3_VF17_LOG=1): every distinct Camera::vf17 caller and its first returned projection, then
+ * counts every 10 s; default off. */
 static int s_vf17_log = -1;
 static void kz3_vf17_lr_note(uint32_t lr, uint32_t cam)
 {
@@ -3032,19 +3036,34 @@ static void kz3_cam_vf17_hud(ppu_context* ctx)   /* Camera::vf17 0x00329D80 (1.0
     if (s_vf17_log < 0) { const char* e = getenv("KZ3_VF17_LOG"); s_vf17_log = e && e[0] == '1'; }
     if (s_vf17_log) kz3_vf17_lr_note(lr, (uint32_t)ctx->gpr[4]);
     s_cvf17_orig(ctx);
-    if (lr != s_hudp_lr || out < 0x10000u || out >= 0xF0000000u) return;
+    if (s_vf17_log && out >= 0x10000u && out < 0xF0000000u) {
+        static uint32_t callers[32];
+        static int ncallers;
+        int i = 0;
+        while (i < ncallers && callers[i] != lr) i++;
+        if (i == ncallers && ncallers < 32) {
+            callers[ncallers++] = lr;
+            printf(
+                "[vf17] result lr=0x%08X out=0x%08X f0..8=%.6f %.6f %.6f\n",
+                lr, out, kz3_bef(out), kz3_bef(out + 4), kz3_bef(out + 8));
+            fflush(stdout);
+        }
+    }
 #if defined(KZ3_FSR31)
-    /*
-     * ASSUMPTION: Camera::vf17's first two floats are the near and far
-     * distances. The existing RE established the four following frustum
-     * extents; strict plausibility checks in the bridge keep FSR unavailable
-     * instead of accepting another vf17 layout.
-     */
-    kz3_fsr31_note_camera_planes(
-        cellGcm_flip_request_count(),
-        kz3_bef(out),
-        kz3_bef(out + 4));
+    if (lr == s_fsr_projection_lr &&
+        out >= 0x10000u && out < 0xF0000000u) {
+        /*
+         * Camera::vf17's second and third floats are the near and far
+         * distances for the scene projection. The bridge rejects implausible
+         * values and conflicting projections within one guest frame.
+         */
+        kz3_fsr31_note_camera_planes(
+            cellGcm_flip_request_count(),
+            kz3_bef(out + 4),
+            kz3_bef(out + 8));
+    }
 #endif
+    if (lr != s_hudp_lr || out < 0x10000u || out >= 0xF0000000u) return;
     float kx = 1.0f, ky = 1.0f;
     const int sq = rsx_live_draw_hud169_factors(&kx, &ky);
     if (s_hudp_log) {
@@ -3076,6 +3095,9 @@ static void kz3_hud_proj_init(void)
         return;
     }
     s_hudp_lr = v->lr;
+#if defined(KZ3_FSR31)
+    s_fsr_projection_lr = v->scene_lr;
+#endif
     ppu_register_function(v->vf17, kz3_cam_vf17_hud);
     printf("[hudproj] HUD world projection hook on Camera::vf17 0x%08X at lr 0x%08X (%s): %s\n", v->vf17, v->lr,
            v == &kHudProj114 ? "1.14" : "1.00", s_hudp_on ? "box frustum while the 2D layer is squeezed" : "off (KZ3_HUD_PROJ=0)");

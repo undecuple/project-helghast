@@ -220,11 +220,13 @@ The launcher creates this file with every display key at its default (also `moti
 for one run.
 
 FSR 3.1 is opt-in and experimental. It is used only when the output is larger than the game's fixed 1280x720
-render image. The first implementation has camera-rotation motion vectors but not object motion, a reactive mask,
-or a separate UI layer, so moving objects, particles, menus, and text can ghost or shimmer. The Options page shows
-this warning before selecting it. Releases place AMD's signed `amd_fidelityfx_dx12.dll` beside `kz3.exe`; a missing
-or rejected runtime, incoherent camera/depth input, split-screen view, or dispatch error is logged and falls back
-to Bilinear without preventing the game from starting.
+render image. It now uses the full-resolution deferred depth for camera rotation and translation, plus a generated
+reactive mask from the scene before and after its transparent/overlay draws. It still has no object motion,
+complete particle mask, separate transparency/composition mask, or separate UI layer, so moving objects,
+particles, menus, and text can ghost or shimmer. The Options page shows this warning before selecting it. Releases
+place AMD's signed `amd_fidelityfx_dx12.dll` beside `kz3.exe`; a missing or rejected runtime, incoherent
+camera/depth input, split-screen view, or dispatch error is logged and falls back to Bilinear without preventing
+the game from starting.
 An initial native Windows run from the main menu through the first campaign level at 1920x1080 was confirmed on
 2026-10-31; broader scene, GPU and Proton quality coverage remains future work.
 The complete dataflow, resource states, validation evidence and planned quality work are documented in
