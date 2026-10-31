@@ -136,6 +136,7 @@ tools/upstream/test_fs_stat_times.sh
 port/vfs/test_native_rekey.sh
 tools/smoke/test_cam_interp.sh
 tools/smoke/test_fsr31_motion.sh
+tools/smoke/test_fsr31_inputs.sh
 tools/release/test_licenses_match.py
 tools/release/test_uninstall_covers.py
 tools/release/test_game_ini_keep.py

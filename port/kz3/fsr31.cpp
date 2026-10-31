@@ -34,11 +34,23 @@ struct FsrState {
     uint32_t flags = 0;
     ID3D12Resource* motion_vectors = nullptr;
     ID3D12Resource* output = nullptr;
+    ID3D12Resource* opaque_color = nullptr;
+    ID3D12Resource* pre_upscale_color = nullptr;
+    ID3D12Resource* reactive_mask = nullptr;
     ID3D12DescriptorHeap* motion_heap = nullptr;
     ID3D12RootSignature* motion_root_signature = nullptr;
     ID3D12PipelineState* motion_pipeline = nullptr;
+    D3D12_RESOURCE_STATES opaque_color_state =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_RESOURCE_STATES pre_upscale_color_state =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     bool motion_is_compute_read = false;
     bool output_is_pixel_read = false;
+    bool reactive_is_compute_read = false;
+    uint64_t capture_serial = 0;
+    uint64_t opaque_capture_serial = 0;
+    uint64_t pre_upscale_capture_serial = 0;
+    ID3D12Resource* capture_source = nullptr;
     std::string status = "FSR 3.1 has not been initialized";
 };
 
@@ -50,6 +62,7 @@ struct CameraBridge {
     uint64_t plane_flip = UINT64_MAX;
     float near_plane = 0.0f;
     float far_plane = 0.0f;
+    bool planes_ambiguous = false;
 };
 
 CameraBridge g_camera;
@@ -125,10 +138,20 @@ void destroy_camera_resources_locked()
     release(g_fsr.motion_pipeline);
     release(g_fsr.motion_root_signature);
     release(g_fsr.motion_heap);
+    release(g_fsr.reactive_mask);
+    release(g_fsr.pre_upscale_color);
+    release(g_fsr.opaque_color);
     release(g_fsr.output);
     release(g_fsr.motion_vectors);
+    g_fsr.opaque_color_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_fsr.pre_upscale_color_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     g_fsr.motion_is_compute_read = false;
     g_fsr.output_is_pixel_read = false;
+    g_fsr.reactive_is_compute_read = false;
+    g_fsr.capture_serial = 0;
+    g_fsr.opaque_capture_serial = 0;
+    g_fsr.pre_upscale_capture_serial = 0;
+    g_fsr.capture_source = nullptr;
 }
 
 void destroy_context_locked()
@@ -198,13 +221,23 @@ bool create_motion_pipeline_locked(ID3D12Device* device)
         "cbuffer Camera : register(b0) {\n"
         "  float4 currentRight; float4 currentForward; float4 currentUp;\n"
         "  float4 previousRight; float4 previousForward; float4 previousUp;\n"
-        "  float4 fovTangent; float4 sizeJitter;\n"
+        "  float4 currentPosition; float4 previousPosition;\n"
+        "  float4 fovTangent; float4 sizeJitter; float4 depthPlanes;\n"
         "};\n"
         "RWTexture2D<float2> motion : register(u0);\n"
+        "Texture2D<float> sceneDepth : register(t0);\n"
         "[numthreads(8, 8, 1)]\n"
         "void main(uint3 id : SV_DispatchThreadID) {\n"
         "  uint2 size = (uint2)sizeJitter.xy;\n"
         "  if (id.x >= size.x || id.y >= size.y) return;\n"
+        "  float depth = sceneDepth.Load(int3(id.xy, 0));\n"
+        "  if (depth < 0.0 || depth > 1.0) {\n"
+        "    motion[id.xy] = 0.0; return;\n"
+        "  }\n"
+        "  float denominator = depthPlanes.y -\n"
+        "      depth * (depthPlanes.y - depthPlanes.x);\n"
+        "  if (!(denominator > 0.0)) { motion[id.xy] = 0.0; return; }\n"
+        "  float viewDepth = depthPlanes.x * depthPlanes.y / denominator;\n"
         "  float2 ndc = float2((id.x + 0.5) * 2.0 / size.x - 1.0,\n"
         "                      1.0 - (id.y + 0.5) * 2.0 / size.y);\n"
         "  float2 jitter = float2(2.0 * sizeJitter.z / size.x,\n"
@@ -213,11 +246,15 @@ bool create_motion_pipeline_locked(ID3D12Device* device)
         "  float3 ray = currentForward.xyz +\n"
         "      currentRight.xyz * currentNdc.x * fovTangent.x +\n"
         "      currentUp.xyz * currentNdc.y * fovTangent.y;\n"
-        "  float forward = dot(ray, previousForward.xyz);\n"
+        "  float3 world = currentPosition.xyz + ray * viewDepth;\n"
+        "  float3 previousRelative = world - previousPosition.xyz;\n"
+        "  float forward = dot(previousRelative, previousForward.xyz);\n"
         "  if (forward <= 1e-5) { motion[id.xy] = 0.0; return; }\n"
         "  float2 previousNdc = float2(\n"
-        "      dot(ray, previousRight.xyz) / (forward * fovTangent.z),\n"
-        "      dot(ray, previousUp.xyz) / (forward * fovTangent.w));\n"
+        "      dot(previousRelative, previousRight.xyz) /\n"
+        "          (forward * fovTangent.z),\n"
+        "      dot(previousRelative, previousUp.xyz) /\n"
+        "          (forward * fovTangent.w));\n"
         "  motion[id.xy] = previousNdc - currentNdc;\n"
         "}\n";
 
@@ -248,18 +285,22 @@ bool create_motion_pipeline_locked(ID3D12Device* device)
         return false;
     }
 
-    D3D12_DESCRIPTOR_RANGE range{};
-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    range.NumDescriptors = 1;
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[0].NumDescriptors = 1;
+    ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].OffsetInDescriptorsFromTableStart = 1;
     D3D12_ROOT_PARAMETER parameters[2]{};
     parameters[0].ParameterType =
         D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[0].DescriptorTable.NumDescriptorRanges = 1;
-    parameters[0].DescriptorTable.pDescriptorRanges = &range;
+    parameters[0].DescriptorTable.NumDescriptorRanges = 2;
+    parameters[0].DescriptorTable.pDescriptorRanges = ranges;
     parameters[1].ParameterType =
         D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[1].Constants.ShaderRegister = 0;
-    parameters[1].Constants.Num32BitValues = 32;
+    parameters[1].Constants.Num32BitValues = 44;
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
     root_desc.NumParameters = 2;
     root_desc.pParameters = parameters;
@@ -309,7 +350,7 @@ bool create_motion_pipeline_locked(ID3D12Device* device)
 
     D3D12_DESCRIPTOR_HEAP_DESC heap{};
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap.NumDescriptors = 1;
+    heap.NumDescriptors = 2;
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device->CreateDescriptorHeap(
         &heap,
@@ -344,6 +385,24 @@ bool create_camera_resources_locked(
             output_height,
             DXGI_FORMAT_R8G8B8A8_UNORM,
             &g_fsr.output) ||
+        !create_texture(
+            device,
+            render_width,
+            render_height,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            &g_fsr.opaque_color) ||
+        !create_texture(
+            device,
+            render_width,
+            render_height,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            &g_fsr.pre_upscale_color) ||
+        !create_texture(
+            device,
+            render_width,
+            render_height,
+            DXGI_FORMAT_R8_UNORM,
+            &g_fsr.reactive_mask) ||
         !create_motion_pipeline_locked(device)) {
         destroy_camera_resources_locked();
         return false;
@@ -359,6 +418,169 @@ bool create_camera_resources_locked(
         nullptr,
         &uav,
         handle);
+    return true;
+}
+
+bool texture_matches(
+    ID3D12Resource* texture,
+    uint32_t width,
+    uint32_t height,
+    DXGI_FORMAT format)
+{
+    if (!texture) {
+        return false;
+    }
+    const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           desc.Width == width && desc.Height == height &&
+           desc.DepthOrArraySize == 1 && desc.MipLevels == 1 &&
+           desc.Format == format && desc.SampleDesc.Count == 1;
+}
+
+bool capture_color_locked(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* color,
+    uint32_t width,
+    uint32_t height,
+    bool opaque)
+{
+    if (!g_fsr.context || !command_list ||
+        !texture_matches(
+            color, width, height, DXGI_FORMAT_R8G8B8A8_UNORM) ||
+        width != g_fsr.max_render_width ||
+        height != g_fsr.max_render_height) {
+        set_status("FSR 3.1 scene capture received invalid state or color");
+        return false;
+    }
+    if (!opaque &&
+        (!g_fsr.opaque_capture_serial ||
+         g_fsr.capture_source != color ||
+         g_fsr.pre_upscale_capture_serial ==
+             g_fsr.opaque_capture_serial)) {
+        set_status(
+            "FSR 3.1 pre-upscale capture has no matching opaque color");
+        return false;
+    }
+
+    ID3D12Resource* destination =
+        opaque ? g_fsr.opaque_color : g_fsr.pre_upscale_color;
+    D3D12_RESOURCE_STATES& destination_state =
+        opaque ? g_fsr.opaque_color_state : g_fsr.pre_upscale_color_state;
+    if (!destination) {
+        set_status("FSR 3.1 scene-capture resources are unavailable");
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER before[2]{};
+    before[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    before[0].Transition.pResource = color;
+    before[0].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    before[0].Transition.StateBefore =
+        D3D12_RESOURCE_STATE_RENDER_TARGET;
+    before[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    before[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    before[1].Transition.pResource = destination;
+    before[1].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    before[1].Transition.StateBefore = destination_state;
+    before[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    command_list->ResourceBarrier(2, before);
+    command_list->CopyResource(destination, color);
+
+    before[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    before[0].Transition.StateAfter =
+        D3D12_RESOURCE_STATE_RENDER_TARGET;
+    before[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    before[1].Transition.StateAfter =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    command_list->ResourceBarrier(2, before);
+    destination_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    if (opaque) {
+        if (!++g_fsr.capture_serial) {
+            ++g_fsr.capture_serial;
+        }
+        g_fsr.opaque_capture_serial = g_fsr.capture_serial;
+        g_fsr.pre_upscale_capture_serial = 0;
+        g_fsr.capture_source = color;
+    } else {
+        g_fsr.pre_upscale_capture_serial = g_fsr.opaque_capture_serial;
+    }
+    return true;
+}
+
+bool generate_reactive_locked(
+    ID3D12GraphicsCommandList* command_list,
+    uint32_t width,
+    uint32_t height)
+{
+    if (!g_fsr.context || !command_list || !g_fsr.reactive_mask ||
+        !g_fsr.opaque_color || !g_fsr.pre_upscale_color ||
+        !g_fsr.opaque_capture_serial ||
+        g_fsr.pre_upscale_capture_serial !=
+            g_fsr.opaque_capture_serial) {
+        set_status(
+            "FSR 3.1 reactive-mask dispatch has no current scene captures");
+        return false;
+    }
+
+    if (g_fsr.reactive_is_compute_read) {
+        D3D12_RESOURCE_BARRIER writable{};
+        writable.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        writable.Transition.pResource = g_fsr.reactive_mask;
+        writable.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        writable.Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        writable.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        command_list->ResourceBarrier(1, &writable);
+        g_fsr.reactive_is_compute_read = false;
+    }
+
+    ffxDispatchDescUpscaleGenerateReactiveMask reactive{};
+    reactive.header.type =
+        FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK;
+    reactive.commandList = command_list;
+    reactive.colorOpaqueOnly = ffxApiGetResourceDX12(
+        g_fsr.opaque_color,
+        FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    reactive.colorPreUpscale = ffxApiGetResourceDX12(
+        g_fsr.pre_upscale_color,
+        FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    reactive.outReactive = ffxApiGetResourceDX12(
+        g_fsr.reactive_mask,
+        FFX_API_RESOURCE_STATE_UNORDERED_ACCESS,
+        FFX_API_RESOURCE_USAGE_UAV);
+    reactive.renderSize = {width, height};
+    reactive.scale = 1.0f;
+    reactive.cutoffThreshold = 0.2f;
+    reactive.binaryValue = 0.9f;
+    reactive.flags =
+        FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_TONEMAP |
+        FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_THRESHOLD |
+        FFX_UPSCALE_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX;
+    const ffxReturnCode_t rc =
+        g_fsr.functions.Dispatch(&g_fsr.context, &reactive.header);
+    if (rc != FFX_API_RETURN_OK) {
+        set_status(
+            "FidelityFX reactive-mask dispatch failed (%u)",
+            static_cast<unsigned>(rc));
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER readable{};
+    readable.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    readable.Transition.pResource = g_fsr.reactive_mask;
+    readable.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    readable.Transition.StateBefore =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    readable.Transition.StateAfter =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    command_list->ResourceBarrier(1, &readable);
+    g_fsr.reactive_is_compute_read = true;
     return true;
 }
 
@@ -533,6 +755,13 @@ bool camera_cut(
         -1.0f,
         1.0f);
     return forward_dot < std::cos(1.5f);
+}
+
+bool projection_plane_matches(float left, float right)
+{
+    const float scale =
+        std::max(1.0f, std::max(std::fabs(left), std::fabs(right)));
+    return std::fabs(left - right) <= scale * 1.0e-4f;
 }
 
 int dispatch_locked(const kz3_fsr31_dispatch_desc* desc)
@@ -808,7 +1037,6 @@ extern "C" void kz3_fsr31_note_camera(
         vertical_fov <= 0.0f || vertical_fov >= 3.13f) {
         return;
     }
-
     std::lock_guard<std::mutex> lock(g_camera.mutex);
     kz3_fsr31_camera_state& state = g_camera.state;
     if ((state.flags & KZ3_FSR31_CAMERA_CURRENT_VALID) &&
@@ -846,7 +1074,8 @@ extern "C" void kz3_fsr31_note_camera(
         }
     }
 
-    if (g_camera.plane_flip == guest_flip) {
+    if (g_camera.plane_flip == guest_flip &&
+        !g_camera.planes_ambiguous) {
         next.near_plane = g_camera.near_plane;
         next.far_plane = g_camera.far_plane;
         next.flags |= KZ3_FSR31_CAMERA_PLANES_VALID;
@@ -865,14 +1094,26 @@ extern "C" void kz3_fsr31_note_camera_planes(
         return;
     }
     std::lock_guard<std::mutex> lock(g_camera.mutex);
-    g_camera.plane_flip = guest_flip;
-    g_camera.near_plane = near_plane;
-    g_camera.far_plane = far_plane;
+    if (g_camera.plane_flip != guest_flip) {
+        g_camera.plane_flip = guest_flip;
+        g_camera.near_plane = near_plane;
+        g_camera.far_plane = far_plane;
+        g_camera.planes_ambiguous = false;
+    } else if (!projection_plane_matches(
+                   g_camera.near_plane, near_plane) ||
+               !projection_plane_matches(
+                   g_camera.far_plane, far_plane)) {
+        g_camera.planes_ambiguous = true;
+    }
     if ((g_camera.state.flags & KZ3_FSR31_CAMERA_CURRENT_VALID) &&
         g_camera.state.guest_flip == guest_flip) {
-        g_camera.state.near_plane = near_plane;
-        g_camera.state.far_plane = far_plane;
-        g_camera.state.flags |= KZ3_FSR31_CAMERA_PLANES_VALID;
+        if (g_camera.planes_ambiguous) {
+            g_camera.state.flags &= ~KZ3_FSR31_CAMERA_PLANES_VALID;
+        } else {
+            g_camera.state.near_plane = g_camera.near_plane;
+            g_camera.state.far_plane = g_camera.far_plane;
+            g_camera.state.flags |= KZ3_FSR31_CAMERA_PLANES_VALID;
+        }
     }
 }
 
@@ -890,6 +1131,28 @@ extern "C" int kz3_fsr31_dispatch(const kz3_fsr31_dispatch_desc* desc)
 {
     std::lock_guard<std::mutex> lock(g_fsr.mutex);
     return dispatch_locked(desc);
+}
+
+extern "C" int kz3_fsr31_capture_opaque_color(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* color,
+    uint32_t width,
+    uint32_t height)
+{
+    std::lock_guard<std::mutex> lock(g_fsr.mutex);
+    return capture_color_locked(
+        command_list, color, width, height, true);
+}
+
+extern "C" int kz3_fsr31_capture_pre_upscale_color(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* color,
+    uint32_t width,
+    uint32_t height)
+{
+    std::lock_guard<std::mutex> lock(g_fsr.mutex);
+    return capture_color_locked(
+        command_list, color, width, height, false);
 }
 
 extern "C" ID3D12Resource* kz3_fsr31_dispatch_camera(
@@ -918,9 +1181,32 @@ extern "C" ID3D12Resource* kz3_fsr31_dispatch_camera(
         set_status("FSR 3.1 camera dispatch dimensions do not match its context");
         return nullptr;
     }
+    if (!texture_matches(
+            desc->color,
+            desc->render_width,
+            desc->render_height,
+            DXGI_FORMAT_R8G8B8A8_UNORM) ||
+        !texture_matches(
+            desc->depth,
+            desc->render_width,
+            desc->render_height,
+            DXGI_FORMAT_R32_FLOAT)) {
+        set_status(
+            "FSR 3.1 camera dispatch color or depth format is incompatible");
+        return nullptr;
+    }
 
     const bool has_previous =
         (desc->camera.flags & KZ3_FSR31_CAMERA_PREVIOUS_VALID) != 0;
+    if (!pose_valid(desc->camera.current_pose) ||
+        (has_previous && !pose_valid(desc->camera.previous_pose)) ||
+        !std::isfinite(desc->camera.near_plane) ||
+        !std::isfinite(desc->camera.far_plane) ||
+        !(desc->camera.near_plane > 0.0f) ||
+        !(desc->camera.far_plane > desc->camera.near_plane)) {
+        set_status("FSR 3.1 camera dispatch has an invalid pose or projection");
+        return nullptr;
+    }
     const float* previous_pose =
         has_previous ? desc->camera.previous_pose : desc->camera.current_pose;
     const float previous_horizontal_fov =
@@ -934,7 +1220,9 @@ extern "C" ID3D12Resource* kz3_fsr31_dispatch_camera(
         std::tan(desc->camera.current_vertical_fov * 0.5f),
         std::tan(previous_horizontal_fov * 0.5f),
         std::tan(previous_vertical_fov * 0.5f)};
-    if (!(tangents[0] > 0.0f) || !(tangents[1] > 0.0f) ||
+    if (!std::isfinite(tangents[0]) || !std::isfinite(tangents[1]) ||
+        !std::isfinite(tangents[2]) || !std::isfinite(tangents[3]) ||
+        !(tangents[0] > 0.0f) || !(tangents[1] > 0.0f) ||
         !(tangents[2] > 0.0f) || !(tangents[3] > 0.0f)) {
         set_status("FSR 3.1 camera dispatch has an invalid field of view");
         return nullptr;
@@ -970,14 +1258,31 @@ extern "C" ID3D12Resource* kz3_fsr31_dispatch_camera(
     g_fsr.motion_is_compute_read = false;
     g_fsr.output_is_pixel_read = false;
 
-    float constants[32]{};
+    float constants[44]{};
     memcpy(constants, desc->camera.current_pose, 3 * 4 * sizeof(float));
     memcpy(constants + 12, previous_pose, 3 * 4 * sizeof(float));
-    memcpy(constants + 24, tangents, sizeof(tangents));
-    constants[28] = static_cast<float>(desc->render_width);
-    constants[29] = static_cast<float>(desc->render_height);
-    constants[30] = desc->jitter_x;
-    constants[31] = desc->jitter_y;
+    memcpy(constants + 24, desc->camera.current_pose + 12, 3 * sizeof(float));
+    memcpy(constants + 28, previous_pose + 12, 3 * sizeof(float));
+    memcpy(constants + 32, tangents, sizeof(tangents));
+    constants[36] = static_cast<float>(desc->render_width);
+    constants[37] = static_cast<float>(desc->render_height);
+    constants[38] = desc->jitter_x;
+    constants[39] = desc->jitter_y;
+    constants[40] = desc->camera.near_plane;
+    constants[41] = desc->camera.far_plane;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
+    depth_srv.Format = DXGI_FORMAT_R32_FLOAT;
+    depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depth_srv.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depth_srv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE depth_handle =
+        g_fsr.motion_heap->GetCPUDescriptorHandleForHeapStart();
+    depth_handle.ptr += g_fsr.device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_fsr.device->CreateShaderResourceView(
+        desc->depth, &depth_srv, depth_handle);
 
     ID3D12DescriptorHeap* heaps[] = {g_fsr.motion_heap};
     desc->command_list->SetDescriptorHeaps(1, heaps);
@@ -989,7 +1294,7 @@ extern "C" ID3D12Resource* kz3_fsr31_dispatch_camera(
         g_fsr.motion_heap->GetGPUDescriptorHandleForHeapStart());
     desc->command_list->SetComputeRoot32BitConstants(
         1,
-        32,
+        44,
         constants,
         0);
     desc->command_list->Dispatch(
@@ -1009,11 +1314,29 @@ extern "C" ID3D12Resource* kz3_fsr31_dispatch_camera(
     desc->command_list->ResourceBarrier(1, &motion_ready);
     g_fsr.motion_is_compute_read = true;
 
+    ID3D12Resource* reactive = nullptr;
+    if (desc->use_reactive_mask) {
+        if (!generate_reactive_locked(
+                desc->command_list,
+                desc->render_width,
+                desc->render_height)) {
+            g_fsr.opaque_capture_serial = 0;
+            g_fsr.pre_upscale_capture_serial = 0;
+            g_fsr.capture_source = nullptr;
+            return nullptr;
+        }
+        reactive = g_fsr.reactive_mask;
+    }
+    g_fsr.opaque_capture_serial = 0;
+    g_fsr.pre_upscale_capture_serial = 0;
+    g_fsr.capture_source = nullptr;
+
     kz3_fsr31_dispatch_desc upscale{};
     upscale.command_list = desc->command_list;
     upscale.color = desc->color;
     upscale.depth = desc->depth;
     upscale.motion_vectors = g_fsr.motion_vectors;
+    upscale.reactive = reactive;
     upscale.output = g_fsr.output;
     upscale.render_width = desc->render_width;
     upscale.render_height = desc->render_height;
