@@ -361,6 +361,20 @@ def main():
         write(sd, "dll v2")
         check(fr.place_sdl3(root, os.path.join(root, "build")) is True
               and open(os.path.join(root, "build", "SDL3.dll")).read() == "dll v2", "8 a changed SDL3.dll (same size) is copied again")
+        fx = os.path.join(root, "runtime", "amd_fidelityfx_dx12.dll")
+        check(not fr.place_fidelityfx(root, os.path.join(root, "build")) and
+              not os.path.exists(os.path.join(root, "build", "amd_fidelityfx_dx12.dll")),
+              "8 an old payload without FidelityFX: nothing placed, no error")
+        write(fx, "fsr v1")
+        check(fr.place_fidelityfx(root, os.path.join(root, "build")) and
+              open(os.path.join(root, "build", "amd_fidelityfx_dx12.dll")).read() == "fsr v1",
+              "8 FidelityFX runtime placed in build/")
+        check(not fr.place_fidelityfx(root, os.path.join(root, "build")),
+              "8 FidelityFX runtime already in place: not copied")
+        write(fx, "fsr v2")
+        check(fr.place_fidelityfx(root, os.path.join(root, "build")) and
+              open(os.path.join(root, "build", "amd_fidelityfx_dx12.dll")).read() == "fsr v2",
+              "8 a changed FidelityFX runtime is copied again")
         os.remove(os.path.join(root, "build", "build-stamp.json"))
         calls.clear()
         ui = FakeUI([False])

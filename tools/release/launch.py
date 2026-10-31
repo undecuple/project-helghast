@@ -1341,6 +1341,7 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
     fr.place_lang(root, os.path.dirname(gargv[0]))
     fr.place_fonts(root, os.path.dirname(gargv[0]))     # the notice fonts next to kz3.exe (RSX pass 38)
     fr.place_sdl3(root, os.path.dirname(gargv[0]))      # SDL3.dll next to kz3.exe: native pads (patch 4010)
+    fr.place_fidelityfx(root, os.path.dirname(gargv[0])) # signed FSR 3.1 DX12 runtime, inert unless selected
     os.makedirs(cwd, exist_ok=True)
     os.makedirs(added["PS3_EDAT_CACHE"], exist_ok=True)
     os.makedirs(added["RSX_SHADER_CACHE_DIR"], exist_ok=True)
