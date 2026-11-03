@@ -7,7 +7,9 @@
 For each slot of re/spu/native_gates.tsv (default: all rows whose image is in the lift tree) build
 tools/spu/native_diff_harness.c with the image's lifted spu_recomp.c and port/spu/kz3_native_post.c/kz3_native_dof.c
 and compare the lifted function with the native kernel on synthetic states and on records written by
-KZ3_NATIVE_REC (DIR/s<slot>_*.kz3nj): the whole local store and r0, r1, r80-r127 must be identical. The image's
+KZ3_NATIVE_REC (DIR/s<slot>_*.kz3nj; --records-slot N takes another slot's records, which the harness turns into
+states of the gated function: slot 6 unpack records become every gather row of their tile, pass 135).
+NATIVE_DIFF_CFLAGS adds compiler flags (the tests' negative control: -DKZ3_NATIVE_NEGCTL): the whole local store and r0, r1, r80-r127 must be identical. The image's
 constant pool must hash as the native kernel expects. SKIP (exit 0) without game data. Exit 1 on any difference.
 """
 import argparse, glob, json, os, subprocess, sys, tempfile
@@ -35,6 +37,7 @@ def main():
     ap.add_argument("--trials", type=int, default=400)
     ap.add_argument("--seed", default="0x4B5A33")
     ap.add_argument("--records", default="")
+    ap.add_argument("--records-slot", type=int, default=-1, help="take DIR/s<N>_*.kz3nj records of another slot (the harness derives states from them, e.g. DOF gather rows from the unpack records of slot 6)")
     ap.add_argument("--lift", default=os.environ.get("HARNESS_LIFT", os.path.join(kz3ver.SPU_OUT, "lift")))
     ap.add_argument("--ps3recomp", default=PT)
     ap.add_argument("--keep", action="store_true")
@@ -62,14 +65,15 @@ def main():
                        "-I", os.path.join(pt, "runtime/spu"), "-I", os.path.join(pt, "include"),
                        "-I", os.path.join(pt, "runtime"), "-I", os.path.join(a.lift, name)]
                 subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-msse4.1", "-w", "-fno-strict-aliasing",
-                                "-ffp-contract=off", f"-DHARNESS_REGISTER={name}_spu_recomp_register", *inc,
+                                "-ffp-contract=off", *os.environ.get("NATIVE_DIFF_CFLAGS", "").split(), f"-DHARNESS_REGISTER={name}_spu_recomp_register", *inc,
                                 os.path.join(ROOT, "tools/spu/native_diff_harness.c"),
                                 os.path.join(ROOT, "port/spu/kz3_native_post.c"), os.path.join(ROOT, "port/spu/kz3_native_dof.c"), os.environ.get("NATIVE_DIFF_LP") or os.path.join(ROOT, "port/spu/kz3_native_lp.c"),
                                 os.path.join(pt, "runtime/spu/spu_interp.c"), os.path.join(pt, "runtime/spu/spu_drain.c"),
                                 os.path.join(a.lift, name, "spu_recomp.c"), "-lm", "-o", exe], check=True)
                 built[name] = (exe, img)
             exe, img = built[name]
-            recs = sorted(glob.glob(os.path.join(a.records, f"s{row['slot']:02d}_*.kz3nj"))) if a.records else []
+            rslot = a.records_slot if a.records_slot >= 0 else row["slot"]
+            recs = sorted(glob.glob(os.path.join(a.records, f"s{rslot:02d}_*.kz3nj"))) if a.records else []
             p = subprocess.run([exe, img, str(r["base"]), str(row["slot"]), a.seed, str(a.trials), *recs],
                                capture_output=True, text=True)
             print(f"{name} 0x{row['addr']:X} {row['job']}: {p.stdout.strip() or p.stderr.strip()[-300:]}  (records {len(recs)})")

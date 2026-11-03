@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 [[ -f "$P/runtime/spu/spu_context.h" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
 for pair in "runtime/spu/spu_lifted_job.h:g_kz3_run_ctx_hook(&ctx, 1" "runtime/spu/spurs_policy.c:g_kz3_run_ctx_hook(ctx, 1, 1"\
-            "runtime/spu/spu_channels.c:void (\*g_kz3_run_ctx_hook)" "runtime/spu/spu_workload.c:g_kz3_cur_taskset = j->taskset_ea"\
+            "runtime/spu/spu_workload.c:void (\*g_kz3_run_ctx_hook)" "runtime/spu/spu_workload.c:g_kz3_cur_taskset = j->taskset_ea"\
             "libs/spurs/cellSpurs.c:if (g_kz3_stall_scan) g_kz3_stall_scan"; do
   f="${pair%%:*}"; s="${pair#*:}"
   grep -qF -- "${s//\\/}" "$P/$f" || { echo "FAIL: patch 1081 call site missing in $f ($s)"; exit 1; }

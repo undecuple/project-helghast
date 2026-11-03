@@ -2,7 +2,7 @@
 # Lifted code: work/recomp (tools/lift.sh, not committed). Toolkit: third_party/ps3recomp (pinned).
 cmake_minimum_required(VERSION 3.20)
 project(kz3
-    VERSION 0.1.7
+    VERSION 0.1.8
     LANGUAGES C CXX
     DESCRIPTION "Recompiled PS3 game project (ps3recomp)"
 )
@@ -78,6 +78,26 @@ message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 # different reason. add_subdirectory hands all of that over with the target.
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
                  EXCLUDE_FROM_ALL)
+
+# Shader translator identity (patch 2141, design from the Killzone 2 port's 6047): a hash of the renderer's sources
+# (libs/video), compiled into rsx_live_draw.c as RSX_TRANSLATOR_ID and written into the PSO preload's key file, so a
+# shader cache made by another build (an older version installed underneath) is discarded instead of handing this build
+# the old shaders. Any change to a file there re-runs this configure step (CMAKE_CONFIGURE_DEPENDS).
+file(GLOB _kz3_xl_files LIST_DIRECTORIES false "${PS3RECOMP_DIR}/libs/video/*.c" "${PS3RECOMP_DIR}/libs/video/*.h")
+list(SORT _kz3_xl_files)
+set(_kz3_xl_cat "")
+foreach(_kz3_xl_f IN LISTS _kz3_xl_files)
+    file(SHA256 "${_kz3_xl_f}" _kz3_xl_h)
+    get_filename_component(_kz3_xl_n "${_kz3_xl_f}" NAME)
+    string(APPEND _kz3_xl_cat "${_kz3_xl_n}:${_kz3_xl_h};")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_kz3_xl_f}")
+endforeach()
+string(SHA256 _kz3_xl_id "${_kz3_xl_cat}")
+string(SUBSTRING "${_kz3_xl_id}" 0 16 _kz3_xl_id)
+set_property(SOURCE "${PS3RECOMP_DIR}/libs/video/rsx_live_draw.c" DIRECTORY "${PS3RECOMP_DIR}"
+             APPEND PROPERTY COMPILE_DEFINITIONS "RSX_TRANSLATOR_ID=0x${_kz3_xl_id}ull")
+list(LENGTH _kz3_xl_files _kz3_xl_count)
+message(STATUS "Shader translator id: ${_kz3_xl_id} (${_kz3_xl_count} files in libs/video)")
 
 # ---------------------------------------------------------------------------
 # The HLE NID table

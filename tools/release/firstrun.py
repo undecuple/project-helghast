@@ -89,6 +89,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pathrules  # noqa: E402  (the one path-redaction rule of every log)
 import names  # noqa: E402  (product name, file names, links: tools/release/names.py)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -267,17 +268,37 @@ def root_moved(ctx):
     """Public issue 20 follow-up: was <build>/obj (or the last finished build) made under another install
     folder? obj/CMakeCache.txt and build.ninja hold absolute paths: cmake refuses a cache from another folder and ninja
     would create the old output folders again, so the tree must not be reused. Compares the cache's source and cache
-    folders with this root's, and the stamp's recorded root. -> (moved, old root or "")."""
+    folders with this root's, and the stamp's recorded root. -> (moved, old root or ""). The old root comes from the
+    cache's source folder (<old>/port/kz3), else its build folder (<old>/build/obj), else the stamp's recorded root;
+    "" only when none of them has the expected shape (then paths below the old folder cannot be rebased)."""
     home, cdir = cmake_cache_dirs(ctx.b("obj"))
+    rec = (load_stamp(ctx) or {}).get("root")
+    stamp_old = rec if rec and not same_dir(rec, ctx.root) else ""
     if home or cdir:   # the cache decides while obj/ has one: a cache made here is current, whatever the stamp says
         if home and not same_dir(home, os.path.join(ctx.root, "port", "kz3")):
             ok = _norm(home).endswith(_norm(os.path.join("port", "kz3")))
-            return True, os.path.dirname(os.path.dirname(home)) if ok else ""
-        return (bool(cdir) and not same_dir(cdir, ctx.b("obj"))), ""
-    rec = (load_stamp(ctx) or {}).get("root")
-    if rec and not same_dir(rec, ctx.root):
-        return True, rec
+            return True, (os.path.dirname(os.path.dirname(home)) if ok else stamp_old)
+        if cdir and not same_dir(cdir, ctx.b("obj")):
+            ok = _norm(cdir).endswith(_norm(os.path.join("build", "obj")))
+            return True, (os.path.dirname(os.path.dirname(cdir)) if ok else stamp_old)
+        return False, ""
+    # No cmake cache (obj/ never shipped or emptied): nothing absolute is left to go stale, the built exe is still
+    # valid and a later compile configures afresh. The stamp's old root is only reported by old_root() for the paths.
     return False, ""
+
+
+def _la():
+    import launch   # here, not at the top: launch imports this module
+    return launch
+
+
+def old_root(ctx):
+    """The folder this install was built in when it differs from ctx.root (cache first, else the stamp), or ""."""
+    moved, old = root_moved(ctx)
+    if moved:
+        return old
+    rec = (load_stamp(ctx) or {}).get("root")
+    return rec if rec and not same_dir(rec, ctx.root) else ""
 
 
 def rebase_path(p, old, new):
@@ -289,12 +310,15 @@ def rebase_path(p, old, new):
 def heal_moved_paths(root, build):
     """The recorded paths below the old install folder (an ISO copied to <root>/game/disc, the copied game files, the
     font copy) are rewritten in build/paths.json for the new folder; folders outside the install stay. Idempotent and
-    quiet. -> the old root when the install was moved, else "". The launcher calls it before it decides, firstrun at
-    its start."""
+    quiet. The file is replaced whole (written aside, then swapped in). -> the old root when the install was moved,
+    else "". When the install moved but the old folder cannot be derived (root_moved gives ""), nothing is rewritten:
+    the recorded folders stay as they were and the launcher's decide() names any that are gone (missing-inputs), so
+    the player picks them again. The launcher calls it before it decides, firstrun at its start."""
     ctx = Ctx(root=root, build=build)
     moved, old = root_moved(ctx)
-    if not moved or not old:
-        return "" if not moved else old
+    old = old or old_root(ctx)
+    if not old:
+        return ""
     p = os.path.join(build, "paths.json")
     try:
         with open(p, encoding="utf-8") as f:
@@ -303,13 +327,30 @@ def heal_moved_paths(root, build):
         return old
     ch = False
     for k in ("dump", "iso", "update", "eboot", "font_dir", "font_src"):
-        if isinstance(j.get(k), str) and j[k]:
+        if isinstance(j.get(k), str) and j[k] and _la().is_abs(j[k]):   # a root-relative path needs no rebasing
             n = rebase_path(j[k], old, root)
             ch |= n != j[k]
             j[k] = n
     if ch:
-        with open(p, "w", encoding="utf-8") as f:
+        if os.path.samefile(build, os.path.join(root, "build")):
+            j = _la().paths_rel(j, root)
+        tmp = p + ".tmp"   # written whole, then swapped in: a kill in between leaves the old file, never a cut one
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(j, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    if not moved:   # nothing to rebuild: the stamp now records this folder, so the next start finds no move
+        sp = os.path.join(build, "build-stamp.json")
+        try:
+            with open(sp, encoding="utf-8") as f:
+                st = json.load(f)
+            st["root"] = root
+            with open(sp + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(st, f, indent=2)
+            os.replace(sp + ".tmp", sp)
+        except (OSError, ValueError):
+            pass
     return old
 
 
@@ -826,9 +867,12 @@ def after_record(c):
         c.font_dir = place_ps3_fonts(c)
     except OSError as e:   # a font folder that cannot be read: the fonts are optional, keep the original
         print(f"firmware fonts: not copied ({e.strerror}); kz3.ini points at the original folder", flush=True)
+    j = {"dump": c.dump, "iso": c.iso, "update": c.update, "eboot": c.eboot, "facts": c.facts,
+         "font_dir": c.font_dir, "font_src": c.font_src, "lang": c.lang, "window_size": c.window_size}
+    if os.path.exists(c.build) and os.path.samefile(c.build, os.path.join(c.root, "build")):
+        j = _la().paths_rel(j, c.root)   # paths inside the install are stored relative to it (la.load_json expands them)
     with open(c.b("paths.json"), "w", encoding="utf-8") as f:
-        json.dump({"dump": c.dump, "iso": c.iso, "update": c.update, "eboot": c.eboot, "facts": c.facts,
-                   "font_dir": c.font_dir, "font_src": c.font_src, "lang": c.lang, "window_size": c.window_size}, f, indent=2)
+        json.dump(j, f, indent=2)
 
 
 def eboot_stat(path):
@@ -988,10 +1032,7 @@ def shaders_wanted(root, choice):
     "Warm it while playing" choice: plan 4.16)."""
     if choice in ("on", "off"):
         return choice == "on"
-    import configparser
-    cp = configparser.ConfigParser()
-    cp.read(os.path.join(root, "kz3-install.ini"), encoding="utf-8")
-    return cp.get("shaders", "prepare", fallback="0").strip() == "1"
+    return ini_parser(os.path.join(root, "kz3-install.ini")).get("shaders", "prepare", fallback="0").strip() == "1"
 
 
 ISO_CHECK_WEIGHT = 8    # the check step also copies ~10 GiB out of an ISO: a bigger share of the bar than the plain check
@@ -1121,27 +1162,75 @@ _USERS_RX = re.compile(r"(\b[A-Za-z](?::|_|%3A)" + _SEP + r"Users" + _SEP + r")(
                        r"((?:(?!%5C|%2F)[^\\/\r\n\"'])+)", re.IGNORECASE)
 
 
-def redactor():
-    """Replace the user's home folder in log text with %USERPROFILE% (both slash styles, any case on Windows, and
-    CMake's mangled object-path form), then any other user folder's name with <user>."""
-    homes = {h for h in (os.environ.get("USERPROFILE"), os.path.expanduser("~")) if h and len(h) > 3}
+# The Unix home as a Windows program sees it under Proton/Wine: Z:/home/<name>, Z:\\home\\<name> (any drive letter,
+# doubled backslashes, %2F/%5C/%3A forms, CMake's mangled Z_/home/<name>) and the plain /home/<name>. The name becomes
+# <user> with or without HOME/WINEHOMEDIR being known. A "/home" that is part of a longer path (/mnt/x/home/y) is not one.
+_HOME_RX = re.compile(r"(?<![\w.\-])((?:[A-Za-z](?::|_|%3A)" + _SEP + r"|" + _SEP + r")home" + _SEP + r")"
+                      r"((?:(?!%5C|%2F)[^\\/\r\n\"'])+)", re.IGNORECASE)
+
+
+def _spellings(h):
+    """Every spelling of folder h a log may hold: as set, both slash styles, doubled backslashes (repr, json.dumps),
+    CMake's mangled object-path form and the URL-encoded forms."""
+    h = h.rstrip("\\/")
+    mangled = h.replace(":", "_").replace(" ", "_").replace("\\", "/")
+    back = h.replace("/", "\\")
+    fwd = h.replace("\\", "/")
+    return {h, fwd, back, back.replace("\\", "\\\\"), mangled,
+            urllib.parse.quote(fwd, safe="/:"), urllib.parse.quote(fwd, safe=""),
+            urllib.parse.quote(back, safe=":"), urllib.parse.quote(back, safe="")}
+
+
+def _folder_rx(folders, boundary=False):
+    """One regex for the spellings of all folders (longest first); None without folders. boundary: the folder name
+    ends there (C:\\KZ3 does not match C:\\KZ3-old)."""
     pats = []
-    for h in sorted(homes, key=len, reverse=True):
-        h = h.rstrip("\\/")
-        mangled = h.replace(":", "_").replace(" ", "_").replace("\\", "/")
-        back = h.replace("/", "\\")
-        fwd = h.replace("\\", "/")
-        # doubled backslashes (repr(), json.dumps) and URL-encoded forms (file:// URLs, query strings)
-        for v in {h, fwd, back, back.replace("\\", "\\\\"), mangled,
-                  urllib.parse.quote(fwd, safe="/:"), urllib.parse.quote(fwd, safe=""),
-                  urllib.parse.quote(back, safe=":"), urllib.parse.quote(back, safe="")}:
+    for h in sorted({f for f in folders if f and len(f) > 3}, key=len, reverse=True):
+        for v in sorted(_spellings(h), key=len, reverse=True):
             pats.append(re.escape(v))
-    rx = re.compile("|".join(pats), re.IGNORECASE if os.name == "nt" else 0) if pats else None
+    if not pats:
+        return None
+    return re.compile("(?:" + "|".join(pats) + ")" + (r"(?![\w.\-])" if boundary else ""),
+                      re.IGNORECASE if os.name == "nt" else 0)
+
+
+def redactor(install=None):
+    """The one path rule of every log (tools/release/pathrules.py): the install folder (install=) becomes %INSTALL%,
+    %LOCALAPPDATA% / %APPDATA% keep their names, the user's home becomes %USERPROFILE% (both slash styles, any case
+    on Windows, CMake's mangled form), any other user folder's name becomes <user>, and every other absolute path
+    becomes <path>\\ plus its last component."""
+    wine = (os.environ.get("WINEHOMEDIR") or "")
+    wine = wine[4:] if wine.startswith("\\??\\") else wine   # Wine's own spelling of the Unix home: \\??\\Z:\\home\\name
+    # The Unix homes (~, HOME, Wine's WINEHOMEDIR) are literals only when the generic /home/<name> rule does not cover them.
+    unix = [h for h in (os.path.expanduser("~"), os.environ.get("HOME"), wine) if h and not _HOME_RX.match(h)]
+    homes = [h for h in (os.environ.get("USERPROFILE"), *unix) if h and len(h) > 3]
+    steps = [(_folder_rx([install] if install else [], True), "%INSTALL%"),
+             (_folder_rx([os.environ.get("LOCALAPPDATA")]), "%LOCALAPPDATA%"),
+             (_folder_rx([os.environ.get("APPDATA")]), "%APPDATA%"),
+             (_folder_rx(homes), "%USERPROFILE%")]
     def red(s):
-        if rx is not None:
-            s = rx.sub("%USERPROFILE%", s)
-        return _USERS_RX.sub(lambda m: m.group(1) + "<user>", s)
+        for rx, label in steps:
+            if rx is not None:
+                s = rx.sub(lambda m, label=label: label, s)
+        s = _USERS_RX.sub(lambda m: m.group(1) + "<user>", s)
+        s = _HOME_RX.sub(lambda m: m.group(1) + "<user>", s)
+        return pathrules.redact_paths(s)
     return red
+
+
+def merge_inno_log(src, dest, redact=None, install=None):
+    """Append the installer's own log (src) to the install log (dest) under a header line, user folders redacted by
+    the same rules as the rest of the install log (redactor()). The installer calls this through the bundled Python,
+    which opens its still-running log with shared access. -> True when the text was appended."""
+    red = redact or redactor(install)
+    try:
+        with open(src, encoding="utf-8-sig", errors="replace") as f:
+            t = f.read()
+        with open(dest, "a", encoding="utf-8", newline="\r\n") as f:
+            f.write("\n# --- Inno Setup log ---\n" + red(t))
+        return True
+    except OSError:
+        return False
 
 
 def writable(d):
@@ -1544,23 +1633,94 @@ def port_version(root):
         return "0.0.0-dev"
 
 
+def ini_text(path):
+    """-> (text, codec) of an ini file the player may have edited by hand: UTF-8 (with or without BOM), else the ANSI code
+    page the file is in ("mbcs" on Windows, latin-1 elsewhere: every byte maps, so nothing is replaced and a write back
+    gives the same bytes). A missing or unreadable file -> ("", "utf-8"). One rule for every reader and writer."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return "", "utf-8"
+    try:
+        t = raw.decode("utf-8-sig")
+        return t, ("utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("mbcs" if os.name == "nt" else "latin-1", "replace"), "mbcs" if os.name == "nt" else "latin-1"
+
+
+def ini_parser(path):
+    """A ConfigParser over ini_text(path) that does not raise on what a hand edit can leave: duplicate keys or sections
+    (the last one wins, as the lenient parser does), no interpolation (a '%' in a path), and a file it cannot parse at
+    all reads as empty."""
+    import configparser
+    cp = configparser.ConfigParser(strict=False, interpolation=None)
+    try:
+        cp.read_string(ini_text(path)[0])
+    except configparser.Error:
+        return configparser.ConfigParser(strict=False, interpolation=None)
+    return cp
+
+
+def _ini_set_one(lines, section, key, value):
+    cur, last_in, hit = None, None, False
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("[") and "]" in s:
+            cur = s[1:s.index("]")].strip().lower()
+            if cur == section.lower():
+                last_in = i
+            continue
+        if cur != section.lower():
+            continue
+        if s and s[0] not in ";#":
+            last_in = i
+            if "=" in s and s.split("=", 1)[0].strip().lower() == key.lower():
+                lines[i] = f"{ln.split('=', 1)[0].rstrip()} = {value}"   # every duplicate gets the value: whichever one wins
+                hit = True
+    if hit:
+        return
+    if last_in is not None:
+        lines.insert(last_in + 1, f"{key} = {value}")
+    else:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += [f"[{section}]", f"{key} = {value}"]
+
+
+def ini_set(path, items):
+    """Set [(section, key, value), ...] in an ini file by editing its lines: comments, blank lines, other keys and
+    sections stay as the player left them (duplicate keys of an edited key all get the value). Read and written in the
+    same code page (ini_text); a value the code page cannot hold makes the file UTF-8. Written to a .tmp and swapped in,
+    so a kill leaves the old file. -> path."""
+    text, codec = ini_text(path)
+    eol = "\r\n" if "\r\n" in text or (not text and os.name == "nt") else "\n"
+    lines = text.splitlines()
+    for sec, key, val in items:
+        _ini_set_one(lines, sec, key, val)
+    out = eol.join(lines) + eol
+    try:
+        data = out.encode(codec)
+    except UnicodeEncodeError:
+        data = out.encode("utf-8")
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return path
+
+
 def write_install_ini(root, portable, check_updates, shaders=None):
     """kz3-install.ini, the same keys the Inno script writes ([install] portable, [online] check_updates,
-    [shaders] prepare)."""
-    import configparser
-    cp = configparser.ConfigParser()
-    p = os.path.join(root, "kz3-install.ini")
-    cp.read(p, encoding="utf-8")
-    for sec in ("install", "online", "shaders"):
-        if not cp.has_section(sec):
-            cp.add_section(sec)
-    cp.set("install", "portable", "1" if portable else "0")
-    cp.set("online", "check_updates", "1" if check_updates else "0")
+    [shaders] prepare). A file the player edited keeps its comments and other keys (ini_set)."""
+    items = [("online", "check_updates", "1" if check_updates else "0")]
+    if portable is not None:      # None = the run was not told: the stored portable value (installer's, player's) stays
+        items.insert(0, ("install", "portable", "1" if portable else "0"))
     if shaders is not None:
-        cp.set("shaders", "prepare", "1" if shaders else "0")
-    with open(p, "w", encoding="utf-8") as f:
-        cp.write(f)
-    return p
+        items.append(("shaders", "prepare", "1" if shaders else "0"))
+    return ini_set(os.path.join(root, "kz3-install.ini"), items)
 
 
 def _same_file(a, b):
@@ -1644,9 +1804,7 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
     target = EBOOT_VERS[Ctx(root=root, build=root).ver]["check"]
     prev = {}
     try:
-        with open(os.path.join(os.path.abspath(a.build or os.path.join(root, "build")), "paths.json"),
-                  encoding="utf-8") as f:
-            prev = json.load(f)
+        prev = _la().load_json(os.path.join(os.path.abspath(a.build or os.path.join(root, "build")), "paths.json")) or {}
     except (OSError, ValueError):
         pass
     for k in ("dump", "update", "eboot"):   # a recorded path with [ ] ; is not offered again
@@ -1764,9 +1922,9 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
     shaders = choice != "off" and (choice == "on" or yes(
         "Warm the shader cache now? The game runs minimised and plays its opening and the start of the first level "
         "by itself (about 17 minutes the first time). n warms it while you play: the first minutes stutter", False))
-    write_install_ini(root, a.portable, online, shaders)
+    write_install_ini(root, getattr(a, "portable", None), online, shaders)
     a.shaders = "on" if shaders else "off"
-    say("Saves and settings stay in this folder (portable)." if a.portable else "")
+    say("Saves and settings stay in this folder (portable)." if _is_portable(a, root) else "")
     return yes("Start the build now? (usually 5-30 minutes)", True)
 
 
@@ -1809,10 +1967,18 @@ def _rpcs3_eboot_guide(upd):
     return imp.eboot_guidance(upd) if imp and upd else ""
 
 
+def _is_portable(a, root):
+    """The data mode this run uses: --portable when given, else what portable.txt / kz3-install.ini say (launch.data_mode)."""
+    if getattr(a, "portable", None):
+        return True
+    import launch as la   # here, not at the top: launch imports this module
+    return la.read_ini(root)["portable"]
+
+
 def _save_root(a, root):
     """Where the port keeps saves and settings (the same rule as launch.data_dir)."""
     appdata = os.environ.get("APPDATA", "")
-    return root if getattr(a, "portable", False) or not appdata else os.path.join(appdata, names.DATA_FOLDER)
+    return root if _is_portable(a, root) or not appdata else os.path.join(appdata, names.DATA_FOLDER)
 
 
 def has_fonts(d):
@@ -1923,7 +2089,8 @@ class ConsoleBar:
     def line(self, ln):
         kv = dict(x.split("=", 1) for x in ln.split()[1:] if "=" in x)
         if ln.startswith("LOG "):
-            self.out.write(f"Log: {kv.get('path', '')}\n")
+            # the whole rest of the line: an install path has spaces ("Project Helghast")
+            self.out.write(f"Log: {ln[len('LOG path='):] if ln.startswith('LOG path=') else ''}\n")
         elif ln.startswith("NOTE "):
             self.out.write(("\n" if self.tty and self.last else "") + ln[5:] + "\n")
         elif ln.startswith("REASON "):
@@ -1961,8 +2128,11 @@ class ConsoleBar:
 
 def _ask_cleanup(ctx, ask, out):
     mib = cleanup_size(ctx) / 2**20
-    r = ask(f"Delete the build's intermediate files ({mib:.0f} MiB)? The game keeps working; a later port update or "
-            "\"Verify and rebuild\" then builds from the start (usually 5-30 minutes). [y/N] ").strip().lower()
+    try:
+        r = ask(f"Delete the build's intermediate files ({mib:.0f} MiB)? The game keeps working; a later port update or "
+                "\"Verify and rebuild\" then builds from the start (usually 5-30 minutes). [y/N] ").strip().lower()
+    except EOFError:   # no answer is a no: the build itself succeeded
+        return False
     return r.startswith("y")
 
 
@@ -1993,7 +2163,8 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     ap.add_argument("--rpcs3", default="auto", metavar="DIR|auto|off",
                     help="with --interactive: look in the player's RPCS3 folder (auto = the usual places) for the disc, "
                          "the 1.14 update and saves, and offer them as the answers; off = the plain prompts")
-    ap.add_argument("--portable", action="store_true")
+    ap.add_argument("--portable", action="store_const", const=True, default=None,
+                    help="saves and settings stay in the install folder; without it the stored mode (kz3-install.ini, portable.txt) is kept")
     ap.add_argument("--bar", action="store_true")
     ap.add_argument("--font-dir", default="", help="the PS3 firmware's dev_flash/data/font folder (optional)")
     ap.add_argument("--font-copy", choices=("yes", "no"), default="yes",
@@ -2017,8 +2188,12 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     heal_moved_paths(root, os.path.abspath(a.build or os.path.join(root, "build")))   # before anything reads paths.json
     notes, quit_early = [], False
     if a.interactive and not a.dry_run:
-        if not interactive(a, root, pick_log(a.log_dir or None, a.log_name)[0], notes, ask=ask, out=out):
-            quit_early = True
+        try:
+            if not interactive(a, root, pick_log(a.log_dir or None, a.log_name)[0], notes, ask=ask, out=out):
+                quit_early = True
+        except EOFError:   # stdin ended (a file or pipe fed to run.cmd ran out): stop plainly, not with a traceback
+            print("\nNo more input: stopping before the build. Start it again and answer the questions.", file=out)
+            return 2
     import firstrun_check as fc   # a pick of PS3_GAME, PS3_GAME/USRDIR or the update's USRDIR: the folder above (pass 64)
     a.dump, a.update = fc.resolve_dump(a.dump), fc.resolve_update(a.update)
     is_iso = bool(a.dump) and os.path.isfile(a.dump)      # a decrypted disc ISO instead of a dump folder
@@ -2050,16 +2225,18 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
                  f"({cpu_how}) -> " + ("KZ3_SPU_FMA=OFF (slower SPU code, runs on this CPU)" if ctx.spu_fma is False
                                        else "the default build (KZ3_SPU_FMA=ON)"))
     try:   # the player's choices of the last run (a resume or rebuild passes only the three game paths)
-        with open(ctx.b("paths.json"), encoding="utf-8") as f:
-            p = json.load(f)
+        p = _la().load_json(ctx.b("paths.json"))
+        if p is None:
+            raise OSError("no paths.json")
         for k in ("font_dir", "font_src", "lang", "window_size"):
             if not getattr(ctx, k) and p.get(k) and not (k in ("font_dir", "font_src") and getattr(a, "font_dir_set", False)):
                 setattr(ctx, k, p[k])
     except (OSError, ValueError):
         pass
     try:   # facts of the last check, so --dry-run and resume see the same fingerprint before the check re-runs
-        with open(ctx.b("paths.json"), encoding="utf-8") as f:
-            p = json.load(f)
+        p = _la().load_json(ctx.b("paths.json"))
+        if p is None:
+            raise OSError("no paths.json")
         if (p.get("dump"), p.get("update")) == (ctx.dump, ctx.update) and (not ctx.eboot or ctx.eboot == p.get("eboot")):
             ctx.facts, ctx.eboot = p.get("facts", {}), p.get("eboot", "")
     except (OSError, ValueError):
@@ -2068,7 +2245,7 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     if a.dry_run:
         return dry_run(ctx, steps, log_path, fallback, out)
     rotate(log_path)
-    log = Log(log_path, redactor())
+    log = Log(log_path, redactor(ctx.root))
     r = Runner(ctx, steps, log, out, a.status_file or None)
     r.emit(f"LOG path={log_path}", to_log=False)
     if a.stop_file:

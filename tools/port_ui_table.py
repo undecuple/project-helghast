@@ -25,6 +25,17 @@ LANG_ID = {"en": 1, "es": 4, "es_la": 20, "pt_br": 21, "fr": 3, "de": 5, "it": 6
 # Not in the Fishmonger font at all (173.4); the build turns them into ASCII.
 NORM = {"“": '"', "”": '"', "„": '"', "‘": "'", "’": "'",
         "–": "-", "—": "-", "…": "...", " ": " ", " ": " "}
+# Pixel budget (task 2026-11-02, tester report: ru labels overlapped their values).
+# ASSUMPTION: no game data was mounted, so these are not measured from the Fishmonger/cellFont advances.
+# They come from one 1341x720 screenshot: the select label column is ~275 px and a 20-char Cyrillic
+# label just touches the value, i.e. ~13.75 px per Cyrillic capital (the game upper-cases labels);
+# max_chars 28 is read as 28 average Latin capitals = 275 px, so ~9.8 px per Latin char. CJK cells are
+# full-width (~20 px, ASSUMPTION: cellFont outlines at the same height). Re-measure from the font
+# (the RE notes s.22: FishmongerCR 'A' 536 / em 727) when data is mounted.
+LATIN_PX = 275 / 28
+CHAR_PX = {"ru": 13.75, "ja": 20.0, "ko": 20.0, "zh_tw": 20.0}
+LABEL_MAXC = 28          # width-checked (failing) rows: the select label column
+PENDING = Path(__file__).resolve().parent / "port_ui_width_pending.txt"
 PH = re.compile(r"\{\d\}")
 
 
@@ -52,7 +63,12 @@ def build(src):
 
 
 def check():
-    errs, long_ = [], []
+    errs, long_, wide, wide_warn = [], [], [], []
+    pending = set()
+    if PENDING.exists():
+        pending = {l.split("#")[0].strip() for l in PENDING.read_text(encoding="utf-8").splitlines()
+                   if l.split("#")[0].strip()}
+    hit = set()
     rows = TABLE.read_text(encoding="utf-8").splitlines()
     head = rows[0].split("\t")
     if head != ["key", "max_chars"] + COLS:
@@ -75,18 +91,34 @@ def check():
                 continue
             if sorted(PH.findall(s)) != want:
                 errs.append(f"{key} [{c}]: placeholders {PH.findall(s)} vs en {want}")
+            # printf templates (menu.version_newer): only %s, and as many as en has
+            if s.replace("%s", "").count("%") or s.count("%s") != vals["en"].count("%s"):
+                errs.append(f"{key} [{c}]: % use {s.count('%s')}x %s vs en {vals['en'].count('%s')}, other % not allowed")
             bad = sorted({ch for ch in s if ch in NORM})
             if bad:
                 errs.append(f"{key} [{c}]: characters the game font lacks: {bad!r}")
             if "\r" in s:
                 errs.append(f"{key} [{c}]: carriage return")
+            px = len(s) * CHAR_PX.get(c, LATIN_PX)
+            if px > maxc * LATIN_PX + 0.01:
+                if maxc == LABEL_MAXC:
+                    tag = f"{key}:{c}"
+                    hit.add(tag)
+                    (wide_warn if tag in pending else wide).append(
+                        f"{key} [{c}] ~{px:.0f}px > {maxc * LATIN_PX:.0f}px ({len(s)} chars)")
+                else:
+                    wide_warn.append(f"{key} [{c}] ~{px:.0f}px > {maxc * LATIN_PX:.0f}px (not a checked row)")
             if len(s) > maxc:
                 long_.append(f"{key} [{c}] {len(s)}/{maxc}")
+    errs += [f"over pixel budget: {w}" for w in wide]
+    errs += [f"width_pending entry no longer over budget (remove it): {t}" for t in sorted(pending - hit)]
     print(f"{TABLE.relative_to(ROOT)}: {len(rows) - 1} keys x {len(COLS)} languages, "
-          f"{len(errs)} errors, {len(long_)} cells over max_chars")
+          f"{len(wide_warn)} width warnings, {len(errs)} errors, {len(long_)} cells over max_chars")
     for e in errs:
         print("ERROR", e)
     if "-v" in sys.argv:
+        for w in wide_warn:
+            print("WIDE", w)
         for l in long_:
             print("LONG", l)
     print("RESULT:", "FAIL" if errs else "PASS")

@@ -1,0 +1,131 @@
+KZ3 patch 2141 (RSX pass 134): the PSO preload's key file is tied to the shader translator that wrote it.
+Design and code from the Killzone 2 port (Project Pyrrhus, its patch 6047); both projects are MIT and have the same maintainer.
+
+The preload (patch 2031) records, per PSO key (guest microcode + render state), the hashes of the HLSL the translator
+produced, rebuilds those pipelines from the compiled blobs at the next start, and the walker then uses a preloaded PSO by
+key alone. The key file's header checked only its layout and SHADER_DISK_CACHE_VERSION, so a build updated over an older
+install could run the previous build's translated shaders against its own root signature, constants and bindings. The
+Killzone 2 port showed this under Proton: an exe whose fragment translator writes magenta filled a cache, and the
+unchanged exe on that cache drew a 100 % magenta frame.
+
+Fix: libs/video/rsx_pso_keys_hdr.h (pure C, host test tools/smoke/test_pso_keys_hdr.sh): header version 3 with the
+translator id RSX_TRANSLATOR_ID (the first 16 hex digits of a SHA-256 over the names and hashes of libs/video/*.c and *.h,
+defined for rsx_live_draw.c by port/kz3/CMakeLists.txt at configure time; 0 when a build does not define it). A key file
+from another layout or another translator is deleted together with the pipeline library beside it, with one
+[pso-preload] line; the compiled shader blobs are keyed by their HLSL text and stay. Header layout: 32 bytes,
+id_lo at byte offset 24, id_hi at 28.
+
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -224,6 +224,7 @@
+ /* patch 2048: asynchronous PSO build bookkeeping */
+ #include "rsx_pso_template.h"   /* patch 2071 */
+ #include "rsx_pace.h"           /* patch 2072 */
++#include "rsx_pso_keys_hdr.h"   /* patch 2141: key file header with the translator id */
+ #include "rsx_tex_lru.h"        /* patch 2075 */
+ #include "rsx_gpupass.h"        /* patch 2086 */
+ #include "rsx_d3d12_device.h"   /* patch 2099: WARP fallback */
+@@ -8190,12 +8191,9 @@
+  * turns the preload and the library off (recording stays on, so an A/B run still produces the key file).
+  * Recording is first-build-wins like the in-memory cache: the DSV format of a PSO follows the depth surface bound
+  * at its first build (apply_render_state's g.depth test), which the key does not include, so the record keeps it. */
+-#define LD_PL_MAGIC   0x4C505350u   /* "PSPL" */
+-#define LD_PL_VERSION 2u   /* patch 2042: keys hash only the sampled texture units */
+ #define LD_PL_FLAG_LAYOUT 1u
+ #define LD_PL_FLAG_PACKED 2u
+ #define LD_PL_FLAG_DEPTH  4u
+-typedef struct { u32 magic, version, rec_size, rs_size, cache_version, reserved; } ld_pl_hdr;
+ typedef struct {
+     u64 key, vs_hash, ps_hash;
+     u32 vs_len, ps_len, flags, layout_mask, layout_stride, layout_count;
+@@ -8258,9 +8256,10 @@
+     FILE* f = fopen(g_ld_pl.path, "rb");
+     if (!f) return;
+     ld_pl_hdr h; memset(&h, 0, sizeof h);
+-    int ok = fread(&h, sizeof h, 1, f) == 1 && h.magic == LD_PL_MAGIC && h.version == LD_PL_VERSION &&
+-             h.rec_size == sizeof(ld_pl_rec) && h.rs_size == sizeof(render_state_t) &&
+-             h.cache_version == SHADER_DISK_CACHE_VERSION;
++    const int hc = fread(&h, sizeof h, 1, f) == 1
++        ? ld_pl_hdr_check(&h, (u32)sizeof(ld_pl_rec), (u32)sizeof(render_state_t), SHADER_DISK_CACHE_VERSION, RSX_TRANSLATOR_ID)
++        : LD_PL_HDR_LAYOUT;
++    int ok = hc == LD_PL_HDR_OK;
+     if (ok) {
+         g_ld_pl.cap_recs = 1024;
+         g_ld_pl.recs = (ld_pl_rec*)malloc(g_ld_pl.cap_recs * sizeof(ld_pl_rec));
+@@ -8279,8 +8278,16 @@
+     }
+     fclose(f);
+     if (!ok) {
+-        fprintf(stderr, "[pso-preload] key file '%s' has another layout, starting over\n", g_ld_pl.path);
++        /* patch 2141: the pipeline library beside it holds the same build's pipelines: it goes too */
++        if (hc == LD_PL_HDR_TRANSLATOR)
++            fprintf(stderr, "[pso-preload] key file from another build (shader translator %016llX, this build %016llX): "
++                            "starting over, pipeline library discarded\n",
++                    (unsigned long long)ld_pl_hdr_id(&h), (unsigned long long)RSX_TRANSLATOR_ID);
++        else
++            fprintf(stderr, "[pso-preload] key file '%s' has another layout, starting over, pipeline library discarded\n",
++                    g_ld_pl.path);
+         DeleteFileA(g_ld_pl.path);
++        DeleteFileA(g_ld_pl.lib_path);
+     }
+ }
+ 
+@@ -8302,7 +8309,8 @@
+     if (!f) return;
+     fseek(f, 0, SEEK_END);   /* MSVCRT: an "a" stream reports position 0 until its first write */
+     if (ftell(f) == 0) {
+-        ld_pl_hdr h = { LD_PL_MAGIC, LD_PL_VERSION, (u32)sizeof(ld_pl_rec), (u32)sizeof(render_state_t), SHADER_DISK_CACHE_VERSION, 0 };
++        ld_pl_hdr h = ld_pl_hdr_make((u32)sizeof(ld_pl_rec), (u32)sizeof(render_state_t), SHADER_DISK_CACHE_VERSION,
++                                     RSX_TRANSLATOR_ID);   /* patch 2141 */
+         fwrite(&h, sizeof h, 1, f);
+     }
+     fwrite(&r, sizeof r, 1, f);
+diff -ruN a/libs/video/rsx_pso_keys_hdr.h b/libs/video/rsx_pso_keys_hdr.h
+--- a/libs/video/rsx_pso_keys_hdr.h
++++ b/libs/video/rsx_pso_keys_hdr.h
+@@ -0,0 +1,44 @@
++/* KZ3 patch 2141: the header of the PSO preload's key file (pso_keys.bin, patch 2031) and its check.
++ * Design and code from the Killzone 2 port (Project Pyrrhus, its patch 6047).
++ *
++ * The key file maps a PSO key (guest microcode + render state) to the hashes of the HLSL the translator made for it,
++ * and the preload builds those pipelines from the compiled blobs before the walker asks for them; the walker then
++ * uses a preloaded PSO by key alone. A key file written by another build therefore hands this build the OLD
++ * translator's shaders. So the header carries the translator identity, RSX_TRANSLATOR_ID: a hash of the renderer's
++ * sources made at build time (port/kz3/CMakeLists.txt; 0 when the build does not define it). A file from another
++ * build is discarded with the pipeline library beside it, and the cache is rebuilt from this build's shaders (the
++ * compiled blobs are keyed by their HLSL text and stay valid).
++ * Pure C (host test tools/smoke/test_pso_keys_hdr.sh). */
++#ifndef RSX_PSO_KEYS_HDR_H
++#define RSX_PSO_KEYS_HDR_H
++#include <stdint.h>
++
++#ifndef RSX_TRANSLATOR_ID
++#define RSX_TRANSLATOR_ID 0ull
++#endif
++
++#define LD_PL_MAGIC   0x4C505350u   /* "PSPL" */
++#define LD_PL_VERSION 3u   /* patch 2042: keys hash only the sampled texture units; 2141: translator id in the header */
++
++typedef struct { uint32_t magic, version, rec_size, rs_size, cache_version, reserved, id_lo, id_hi; } ld_pl_hdr;
++
++enum { LD_PL_HDR_OK = 0, LD_PL_HDR_LAYOUT = 1, LD_PL_HDR_TRANSLATOR = 2 };
++
++static inline ld_pl_hdr ld_pl_hdr_make(uint32_t rec_size, uint32_t rs_size, uint32_t cache_version, uint64_t id)
++{
++    ld_pl_hdr h = { LD_PL_MAGIC, LD_PL_VERSION, rec_size, rs_size, cache_version, 0u, (uint32_t)id, (uint32_t)(id >> 32) };
++    return h;
++}
++
++static inline uint64_t ld_pl_hdr_id(const ld_pl_hdr* h) { return ((uint64_t)h->id_hi << 32) | h->id_lo; }
++
++/* LD_PL_HDR_OK, LD_PL_HDR_LAYOUT (another file layout or cache version: unreadable) or LD_PL_HDR_TRANSLATOR (readable,
++ * but written by a build with another translator: its shaders are not this build's). */
++static inline int ld_pl_hdr_check(const ld_pl_hdr* h, uint32_t rec_size, uint32_t rs_size, uint32_t cache_version, uint64_t id)
++{
++    if (h->magic != LD_PL_MAGIC || h->version != LD_PL_VERSION || h->rec_size != rec_size || h->rs_size != rs_size ||
++        h->cache_version != cache_version)
++        return LD_PL_HDR_LAYOUT;
++    return ld_pl_hdr_id(h) == id ? LD_PL_HDR_OK : LD_PL_HDR_TRANSLATOR;
++}
++#endif

@@ -1,6 +1,6 @@
 gcm/fp: honour the fragment program's per-source input precision modifiers (LD_NO_SRC_PREC=1 old).
 
-From Killzone 2's patch 2094 (KZ2 main 61dcf86, notes-for-kz3 2026-10-21), ported to KZ3's tree under a free number;
+From Killzone 2's patch 2094 (Project Pyrrhus, commit 61dcf86, 2026-10-21), ported to KZ3's tree under a free number;
 the decoder change is the same, KZ3 adds the one-time "[fp-prec]" log line.
 
 Cause: DWORD2 (SRC1) bits 19-27 hold a 3-bit input precision modifier per source (19-21 SRC0, 22-24 SRC1, 25-27
@@ -9,7 +9,7 @@ negate. The decompiler ignored the field, so a source the program meant as satur
 reached the arithmetic unclamped. In KZ2 the soft-particle fade (MUL r2.w, r0, |r2| with SRC1 modifier 3) drew every
 smoke puff over distant scenery as saturated white.
 
-KZ3 (pass 116 scan of 99 unique fragment programs dumped from K2/K4 draws, work/rsx/r116/fpscan.py): 89 carry a
+KZ3 (pass 116 scan of 99 unique fragment programs dumped from K2/K4 draws, scan script of pass 116): 89 carry a
 non-zero field; the effective ones (1-4) are on MAD/MUL/ADD/DP3 sources (modifier 4 saturate on 38 instructions,
 3 fixed9 on 5); the most common value, 5 on NRM's SRC0 (268 instructions), is left unchanged as RPCS3 does.
 

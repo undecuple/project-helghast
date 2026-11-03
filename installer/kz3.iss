@@ -37,7 +37,7 @@
 ; site's palette and fonts; our own artwork); native controls, no skin add-on. Texts in the site's voice: short, direct.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.7"
+  #define AppVersion "0.1.8"
 #endif
 #ifndef Payload
   ; ASSUMPTION: where the payload assembly will put the tree
@@ -1873,29 +1873,348 @@ begin
   end;
 end;
 
+{ User-name and path redaction for the merged setup log, the same rules as firstrun.py redactor() (the bundled Python does the
+  merge when it is there; this is the fallback and must cover the same forms, one by one): the user's profile folder
+  as set, with backslashes, with forward slashes, doubled backslashes (JSON, repr), CMake's mangled form
+  (C_/Users/name), and the URL-encoded forms (%5C %2F %3A %20) become %USERPROFILE%; the name in any other
+  <drive>:\Users\<name> (same separator forms) becomes <user>. Letter case does not matter. }
+function ReplaceNoCase(const S, Find, Rep: String): String;
+var
+  Rest, LF: String;
+  P: Integer;
+begin
+  Result := '';
+  Rest := S;
+  LF := Lowercase(Find);
+  if Find = '' then begin
+    Result := S;
+    Exit;
+  end;
+  while True do begin
+    P := Pos(LF, Lowercase(Rest));
+    if P = 0 then Break;
+    Result := Result + Copy(Rest, 1, P - 1) + Rep;
+    Rest := Copy(Rest, P + Length(Find), Length(Rest));
+  end;
+  Result := Result + Rest;
+end;
+
+{ Length of the path separator at S[I]: \, \\, /, %5C or %2F (0 = none) }
+function SepLenAt(const S: String; I: Integer): Integer;
+var
+  T: String;
+begin
+  Result := 0;
+  if I > Length(S) then Exit;
+  T := Uppercase(Copy(S, I, 3));
+  if (T = '%5C') or (T = '%2F') then Result := 3
+  else if (S[I] = '\') and (Copy(S, I, 2) = '\\') then Result := 2
+  else if (S[I] = '\') or (S[I] = '/') then Result := 1;
+end;
+
+{ True when B ends with <letter><: or _ or %3A><separator>, the letter not part of a longer word }
+function DriveBefore(const B: String): Boolean;
+var
+  K, N: Integer;
+  T: String;
+  C: Char;
+begin
+  Result := False;
+  N := Length(B);
+  if (N >= 3) and ((Uppercase(Copy(B, N - 2, 3)) = '%5C') or (Uppercase(Copy(B, N - 2, 3)) = '%2F')) then K := 3
+  else if (N >= 2) and (Copy(B, N - 1, 2) = '\\') then K := 2
+  else if (N >= 1) and ((B[N] = '\') or (B[N] = '/')) then K := 1
+  else Exit;
+  T := Copy(B, 1, N - K);
+  N := Length(T);
+  if (N >= 3) and (Uppercase(Copy(T, N - 2, 3)) = '%3A') then K := 3
+  else if (N >= 1) and ((T[N] = ':') or (T[N] = '_')) then K := 1
+  else Exit;
+  T := Copy(T, 1, N - K);
+  N := Length(T);
+  if N < 1 then Exit;
+  C := T[N];
+  if not (((C >= 'A') and (C <= 'Z')) or ((C >= 'a') and (C <= 'z'))) then Exit;
+  if N > 1 then begin
+    C := T[N - 1];
+    if ((C >= 'A') and (C <= 'Z')) or ((C >= 'a') and (C <= 'z')) or ((C >= '0') and (C <= '9')) or (C = '_') then Exit;
+  end;
+  Result := True;
+end;
+
+{ <drive>:\Users\<name> in any separator form: the name becomes <user> }
+function RedactOtherUsers(const S: String): String;
+var
+  Rest, Before, Mid, After: String;
+  P, SepA, I: Integer;
+  Done: Boolean;
+begin
+  Result := '';
+  Rest := S;
+  while True do begin
+    P := Pos('users', Lowercase(Rest));
+    if P = 0 then Break;
+    Before := Copy(Rest, 1, P - 1);
+    Mid := Copy(Rest, P, 5);
+    After := Copy(Rest, P + 5, Length(Rest));
+    SepA := SepLenAt(After, 1);
+    Done := False;
+    if (SepA > 0) and DriveBefore(Before) then begin
+      I := SepA + 1;
+      while (I <= Length(After)) and (After[I] <> '"') and (After[I] <> '''') and (After[I] <> #13) and (After[I] <> #10)
+            and (SepLenAt(After, I) = 0) do
+        I := I + 1;
+      if (I > SepA + 1) and (Copy(After, SepA + 1, 13) <> '%USERPROFILE%') then begin
+        Result := Result + Before + Mid + Copy(After, 1, SepA) + '<user>';
+        Rest := Copy(After, I, Length(After));
+        Done := True;
+      end;
+    end;
+    if not Done then begin
+      Result := Result + Before + Mid;
+      Rest := After;
+    end;
+  end;
+  Result := Result + Rest;
+end;
+
+{ The path rule of every log (tools/release/pathrules.py is the reference; the same cases are in
+  test_inno_log_redact.py): the install folder becomes %INSTALL%, %LOCALAPPDATA% and %APPDATA% keep their names (the
+  rest of the path stays), and every other absolute path (a drive X:\ or X:/, a UNC path, a Unix path with two or more
+  components) becomes <path>\ plus its last component. The game's own virtual paths (/dev_bdvd, /dev_hdd0, /app_home)
+  and relative paths stay. }
+function IsLetterCh(C: Char): Boolean;
+begin
+  Result := ((C >= 'A') and (C <= 'Z')) or ((C >= 'a') and (C <= 'z'));
+end;
+
+function IsWordCh(C: Char): Boolean;
+begin
+  Result := IsLetterCh(C) or ((C >= '0') and (C <= '9')) or (C = '_');
+end;
+
+{ the folders in the middle of a path stop at a quote, | * ? : a tab or a line end (not at a space) }
+function IsPathStop(C: Char): Boolean;
+begin
+  Result := (C = '"') or (C = #39) or (C = '|') or (C = '*') or (C = '?') or (C = ':') or (C = #9) or (C = #13) or (C = #10);
+end;
+
+function IsFinalStop(C: Char): Boolean;
+begin
+  Result := IsPathStop(C) or (C = ' ') or (C = ',') or (C = ';') or (C = ')');
+end;
+
+{ Replace the folder Find (any case) by Rep when the name ends there (C:\KZ3 is not C:\KZ3-old) }
+function ReplaceFolder(const S, Find, Rep: String): String;
+var
+  Rest, LF: String;
+  P, E: Integer;
+begin
+  Result := '';
+  Rest := S;
+  LF := Lowercase(Find);
+  if Length(Find) < 4 then begin
+    Result := S;
+    Exit;
+  end;
+  while True do begin
+    P := Pos(LF, Lowercase(Rest));
+    if P = 0 then Break;
+    E := P + Length(Find);
+    if (E <= Length(Rest)) and (IsWordCh(Rest[E]) or (Rest[E] = '.') or (Rest[E] = '-')) then
+      Result := Result + Copy(Rest, 1, E - 1)
+    else
+      Result := Result + Copy(Rest, 1, P - 1) + Rep;
+    Rest := Copy(Rest, E, Length(Rest));
+  end;
+  Result := Result + Rest;
+end;
+
+function RedactFolder(const S, Folder, Rep: String): String;
+var
+  H, Back, Fwd, Dbl: String;
+begin
+  Result := S;
+  H := Folder;
+  while (Length(H) > 0) and ((H[Length(H)] = '\') or (H[Length(H)] = '/')) do
+    H := Copy(H, 1, Length(H) - 1);
+  if Length(H) <= 3 then Exit;
+  Back := H;
+  StringChangeEx(Back, '/', '\', True);
+  Fwd := Back;
+  StringChangeEx(Fwd, '\', '/', True);
+  Dbl := Back;
+  StringChangeEx(Dbl, '\', '\\', True);
+  Result := ReplaceFolder(Result, Dbl, Rep);
+  Result := ReplaceFolder(Result, Back, Rep);
+  Result := ReplaceFolder(Result, Fwd, Rep);
+end;
+
+{ Length of the path prefix at S[I] (through the first separator of a drive, through the separator after a UNC server,
+  the slash of a Unix path) and its Kind: 1 drive, 2 UNC, 3 Unix; 0 = no path starts here }
+function PathPrefixAt(const S: String; I: Integer; var Kind: Integer): Integer;
+var
+  N, J: Integer;
+  C: Char;
+  Nm: String;
+begin
+  Result := 0;
+  Kind := 0;
+  N := Length(S);
+  if IsLetterCh(S[I]) then begin
+    if (I > 1) and IsWordCh(S[I - 1]) then Exit;
+    if (I < N) and (S[I + 1] = ':') and (SepLenAt(S, I + 2) > 0) then begin
+      Kind := 1; Result := 2 + SepLenAt(S, I + 2);
+    end else if (Uppercase(Copy(S, I + 1, 3)) = '%3A') and (SepLenAt(S, I + 4) > 0) then begin
+      Kind := 1; Result := 4 + SepLenAt(S, I + 4);
+    end else if (I + 2 <= N) and (S[I + 1] = '_') and (S[I + 2] = '/') then begin
+      Kind := 1; Result := 3;
+    end;
+    Exit;
+  end;
+  if (S[I] = '\') and (I < N) and (S[I + 1] = '\') then begin
+    if I > 1 then begin
+      C := S[I - 1];
+      if IsWordCh(C) or (C = '\') or (C = '/') or (C = '.') or (C = ':') or (C = '%') or (C = '-') then Exit;
+    end;
+    J := I + 2;
+    while (J <= N) and (SepLenAt(S, J) = 0) and (not IsFinalStop(S[J])) do J := J + 1;
+    if (J > I + 2) and (SepLenAt(S, J) > 0) then begin
+      Kind := 2; Result := J - I + SepLenAt(S, J);
+    end;
+    Exit;
+  end;
+  if S[I] = '/' then begin
+    if I > 1 then begin
+      C := S[I - 1];
+      if not ((C = ' ') or (C = #9) or (C = '"') or (C = #39) or (C = '=') or (C = '(') or (C = '[') or (C = ',') or (C = ';')
+              or (C = Chr(123)) or ((C = '/') and (I >= 8) and (Lowercase(Copy(S, I - 7, 7)) = 'file://'))) then Exit;
+    end;
+    Nm := Lowercase(Copy(S, I + 1, 9));
+    if (Copy(Nm, 1, 4) = 'dev_') or (Copy(Nm, 1, 4) = 'app_') or (Copy(Nm, 1, 9) = 'host_root') then Exit;
+    Kind := 3; Result := 1;
+  end;
+end;
+
+function RedactPaths(const S: String): String;
+var
+  I, N, PL, Kind, K, LastEnd, E: Integer;
+begin
+  Result := '';
+  N := Length(S);
+  I := 1;
+  while I <= N do begin
+    PL := PathPrefixAt(S, I, Kind);
+    LastEnd := 0;
+    if PL > 0 then begin
+      { a drive or UNC path may end right after its prefix; a Unix path needs one more separator }
+      if Kind <> 3 then LastEnd := I + PL;
+      K := I + PL;
+      { the folders in the middle: up to the last separator before a stop (a space before a Unix path also stops) }
+      while (K <= N) and (not IsPathStop(S[K])) and (not ((S[K] = ' ') and (K < N) and (S[K + 1] = '/'))) do begin
+        if SepLenAt(S, K) > 0 then begin
+          K := K + SepLenAt(S, K);
+          LastEnd := K;
+        end else
+          K := K + 1;
+      end;
+    end;
+    if LastEnd > 0 then begin
+      E := LastEnd;
+      while (E <= N) and (not IsFinalStop(S[E])) and (SepLenAt(S, E) = 0) do E := E + 1;
+      Result := Result + '<path>\' + Copy(S, LastEnd, E - LastEnd);
+      I := E;
+    end else begin
+      Result := Result + S[I];
+      I := I + 1;
+    end;
+  end;
+end;
+
+function RedactUser(const S, Home: String): String;
+var
+  H, Back, Fwd, Mangled, Dbl, UrlB, UrlB3, UrlF, UrlF2, UrlF3, UrlF4: String;
+begin
+  Result := S;
+  H := Home;
+  while (Length(H) > 0) and ((H[Length(H)] = '\') or (H[Length(H)] = '/')) do
+    H := Copy(H, 1, Length(H) - 1);
+  if Length(H) > 3 then begin
+    Back := H;
+    StringChangeEx(Back, '/', '\', True);
+    Fwd := Back;
+    StringChangeEx(Fwd, '\', '/', True);
+    Mangled := Fwd;
+    StringChangeEx(Mangled, ':', '_', True);
+    StringChangeEx(Mangled, ' ', '_', True);
+    Dbl := Back;
+    StringChangeEx(Dbl, '\', '\\', True);
+    UrlB := Back;
+    StringChangeEx(UrlB, '\', '%5C', True);
+    StringChangeEx(UrlB, ' ', '%20', True);
+    UrlB3 := UrlB;
+    StringChangeEx(UrlB3, ':', '%3A', True);
+    UrlF := Fwd;
+    StringChangeEx(UrlF, ' ', '%20', True);
+    UrlF2 := UrlF;
+    StringChangeEx(UrlF2, '/', '%2F', True);
+    UrlF3 := UrlF;
+    StringChangeEx(UrlF3, ':', '%3A', True);
+    UrlF4 := UrlF2;
+    StringChangeEx(UrlF4, ':', '%3A', True);
+    { the longest spelling first, so a shorter one never cuts it }
+    Result := ReplaceNoCase(Result, UrlB3, '%USERPROFILE%');
+    Result := ReplaceNoCase(Result, UrlB, '%USERPROFILE%');
+    Result := ReplaceNoCase(Result, UrlF4, '%USERPROFILE%');
+    Result := ReplaceNoCase(Result, UrlF3, '%USERPROFILE%');
+    Result := ReplaceNoCase(Result, UrlF2, '%USERPROFILE%');
+    Result := ReplaceNoCase(Result, UrlF, '%USERPROFILE%');
+    Result := ReplaceNoCase(Result, Dbl, '%USERPROFILE%');
+    Result := ReplaceNoCase(Result, Back, '%USERPROFILE%');
+    Result := ReplaceNoCase(Result, Fwd, '%USERPROFILE%');
+    Result := ReplaceNoCase(Result, Mangled, '%USERPROFILE%');
+  end;
+  Result := RedactOtherUsers(Result);
+end;
+
+{ All the steps, in the order of pathrules.py: install folder, AppData folders, the user's home and other users, then
+  every other absolute path }
+function RedactLine(const S, Install, Home: String): String;
+begin
+  Result := RedactFolder(S, Install, '%INSTALL%');
+  Result := RedactFolder(Result, GetEnv('LOCALAPPDATA'), '%LOCALAPPDATA%');
+  Result := RedactFolder(Result, GetEnv('APPDATA'), '%APPDATA%');
+  Result := RedactUser(Result, Home);
+  Result := RedactPaths(Result);
+end;
+
 procedure MergeInnoLog;
 var
   Lines: TArrayOfString;
   I, RC: Integer;
-  Home, Py: String;
+  Home, Py, Lib: String;
 begin
-  { One file per run: Inno's own log appended to firstrun.py's, user folder redacted. }
-  if not LoadStringsFromFile(ExpandConstant('{log}'), Lines) then begin
-    { This never loaded (no merged section in any setup log of earlier versions): Inno still holds
-      its log open for writing and LoadStringsFromFile does not share writes. The bundled Python opens it with
-      read+write sharing and appends it the same way. }
-    Py := ExpandConstant('{app}\toolchain\python\python.exe');
-    if not FileExists(Py) then Exit;
-    Exec(Py, '-I -c "import sys,re,os; h=os.environ.get(''USERPROFILE'',''''); ' +
-      't=open(sys.argv[1],encoding=''utf-8-sig'',errors=''replace'').read(); ' +
-      't=re.sub(re.escape(h),''%USERPROFILE%'',t,flags=re.I) if h else t; ' +
-      'open(sys.argv[2],''a'',encoding=''utf-8'',newline=''\r\n'').write(''\n# --- Inno Setup log ---\n''+t)" "' +
-      ExpandConstant('{log}') + '" "' + InstallLogPath('') + '"', '', SW_HIDE, ewWaitUntilTerminated, RC);
+  { One file per run: Inno's own log appended to firstrun.py's, user names redacted. The bundled Python does it
+    (firstrun.merge_inno_log, the one redactor of every log); it also opens Inno's log while Inno still holds it open
+    for writing, which LoadStringsFromFile does not. Without Python the same rules run here. }
+  Py := ExpandConstant('{app}\toolchain\python\python.exe');
+  Lib := ExpandConstant('{app}\kz3-setup\release');
+  if FileExists(Py) and FileExists(Lib + '\firstrun.py') then begin
+    if Exec(Py, '-I -c "import sys; sys.path.insert(0, sys.argv[3]); import firstrun; ' +
+      'sys.exit(0 if firstrun.merge_inno_log(sys.argv[1], sys.argv[2], None, sys.argv[4]) else 1)" "' +
+      ExpandConstant('{log}') + '" "' + InstallLogPath('') + '" "' + Lib + '" "' + ExpandConstant('{app}') + '"', '', SW_HIDE, ewWaitUntilTerminated, RC)
+      and (RC = 0) then Exit;
+  end;
+  { Inno still has its own log open for writing at ssDone: LoadStringsFromFile fails on it. The Locked variant
+    (Inno Setup 6.7.3 Pascal Script: LoadStringsFromLockedFile) reads it with shared access. }
+  if not LoadStringsFromLockedFile(ExpandConstant('{log}'), Lines) then begin
+    SaveStringToFile(InstallLogPath(''), #13#10 + '# --- Inno Setup log ---' + #13#10 +
+      'The Inno Setup log could not be read, so it is not merged here: ' + ExpandConstant('{log}') + #13#10, True);
     Exit;
   end;
   Home := GetEnv('USERPROFILE');
   for I := 0 to GetArrayLength(Lines) - 1 do
-    if Home <> '' then StringChangeEx(Lines[I], Home, '%USERPROFILE%', True);
+    Lines[I] := RedactLine(Lines[I], ExpandConstant('{app}'), Home);
   SaveStringToFile(InstallLogPath(''), #13#10 + '# --- Inno Setup log ---' + #13#10, True);
   SaveStringsToFile(InstallLogPath(''), Lines, True);
 end;

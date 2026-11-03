@@ -11,6 +11,7 @@
  *   Prints `R <what> equal=<n> differ=<n> declined=<n> lifted_nr=<n>` and the first difference.
  */
 #define main jdh_main
+#include <time.h>
 #include "job_diff_harness.c"
 #undef main
 #include "kz3_native_jobs.h"
@@ -41,6 +42,7 @@ static uint64_t fnv_pool(const uint8_t* ls, uint32_t lo_, uint32_t hi_)
 
 /* Kind-specific synthetic arguments and data on top of setup()'s random LS and registers. */
 static void synth_lp(spu_context* c, const char* kind, int variant);
+static void wbe32(uint8_t* ls, uint32_t a, uint32_t v);
 static void synth(spu_context* c, const char* kind, int variant)
 {
     uint8_t* ls = c->ls;
@@ -62,6 +64,22 @@ static void synth(spu_context* c, const char* kind, int variant)
         if (variant % 3 == 2)
             for (uint32_t i = 0; i < n; i++) ls[a + 4 * i] = (rnd() & 1) ? 0 : (rnd() & 1) ? 0xFF : rnd() & 0xFF;
     }
+    if (!strcmp(kind, "upsample8")) {
+        const uint32_t wn = 8 * (1 + rnd() % (variant % 7 == 0 ? 2 : 24));
+        const uint32_t sp = 16 * (((wn / 2 + 2) * 4 + 15) / 16 + rnd() % 8), dp = 4 * wn + 16 * (rnd() % 4);
+        const uint32_t src = area + sp + 16 + ((rnd() % (span / 4)) & ~15u);
+        const uint32_t dst = area + span / 2 + ((rnd() % (span / 4 - 2 * dp)) & ~15u);
+        c->gpr[3] = spu_splat_u32(dst);
+        c->gpr[4] = spu_splat_u32(src);
+        c->gpr[5] = spu_splat_u32(sp);
+        c->gpr[6] = spu_splat_u32(dp);
+        c->gpr[7] = spu_splat_u32(wn);
+        /* extreme values now and then: every byte 0 or 255 */
+        if (variant % 3 == 1)
+            for (int y = -1; y <= 1; y++)
+                for (uint32_t i = 0; i < 4 * (wn / 2 + 2) + 32; i++)
+                    ls[src + y * (int)sp - 4 + i] = (rnd() & 1) ? 0 : 0xFF;
+    }
     if (!strcmp(kind, "dof_unpack")) {
         const uint32_t n = 4 * (1 + rnd() % (variant % 7 == 0 ? 3 : 150));
         const uint32_t d = area + ((rnd() % (span / 2 - 16 * 700)) & ~15u);
@@ -76,6 +94,90 @@ static void synth(spu_context* c, const char* kind, int variant)
                 ls[s + i] = (rnd() & 1) ? 0 : 0xFF;
                 ls[w + i] = (rnd() & 1) ? 0 : 0xFF;
             }
+    }
+    if (!strcmp(kind, "dof_gather")) {
+        /* r3 dst, r4 scratch (this row's pixel 0), r5 CoC stream, r6 row buffer, r7 pitch (16 Wp; low halfword), r8 n.
+         * Scratch: 14 rows of Wp float4 (6 rows above, 7 below, 6 + 6 pixels of slack), realistic floats (weight 0..2,
+         * colours 0..8, some exact-zero weights) or setup()'s random bits (variant % 3 == 0: full-range patterns through
+         * the helpers). CoC modes: all zero (skip path only), all 255, random, {0, 1, 37, 255}, alternating zero
+         * groups, random with a third of the groups zero. variant % 4 == 3 puts garbage in r7's high halfword. */
+        static const uint32_t wps[] = {40, 128, 256, 64, 20};
+        const uint32_t Wp = wps[variant % 5];
+        const uint32_t n = variant % 7 == 0 ? 4 * (1 + rnd() % 3) : 4 * (1 + rnd() % ((Wp - 12) / 4));
+        const uint32_t scratch = area, src = scratch + 16 * (6 * Wp + 6), rowb = area + 0xE400, strm = area + 0xF800,
+                       dst = area + 0xFC00;
+        if (variant % 3) {
+            for (uint32_t i = 0; i < 14 * Wp; i++)
+                for (int k = 0; k < 4; k++) {
+                    float f = k == 0 ? (float)(rnd() % 20001) / 10000.0f : (float)(rnd() % 80001) / 10000.0f;
+                    if (k == 0 && variant % 11 == 0 && rnd() % 8 == 0) f = 0.0f;
+                    uint32_t v;
+                    memcpy(&v, &f, 4);
+                    wbe32(ls, scratch + 16 * i + 4 * k, v);
+                }
+        }
+        static const uint8_t few[4] = {0, 1, 37, 255};
+        for (uint32_t i = 0; i < n; i++) {
+            const int mode = variant % 6;
+            uint8_t c = (uint8_t)rnd();
+            if (mode == 0) c = 0;
+            else if (mode == 1) c = 255;
+            else if (mode == 3) c = few[rnd() % 4];
+            else if (mode == 4 && (i / 4) % 2 == 0) c = 0;
+            else if (mode == 5 && (i / 4) % 3 == 0) c = 0;
+            ls[strm + 4 * i] = c;
+        }
+        uint32_t pitch = 16 * Wp;
+        if (variant % 4 == 3) pitch |= rnd() << 16;
+        c->gpr[3] = spu_splat_u32(dst);
+        c->gpr[4] = spu_splat_u32(src);
+        c->gpr[5] = spu_splat_u32(strm);
+        c->gpr[6] = spu_splat_u32(rowb);
+        c->gpr[7] = spu_splat_u32(pitch);
+        c->gpr[8] = spu_splat_u32(n);
+    }
+    if (!strcmp(kind, "mb_blur")) {
+        /* r3 dst RGBA8, r4 float4 pixel 0 of the row (interior of a 14-row padded scratch: 6 rows above, 7 below, 6 + 6
+         * pixels of slack), r5 velocity stream (4 B per pixel, one quad of prefetch past the end), r6 pitch (16 Wp; low
+         * halfword), r7 n (pass 136). Floats: realistic (weight 0..17 with some exact zeros, colours 0..17) or setup()'s
+         * random bits (variant % 3 == 0: full-range patterns, NaN/Inf/denormal bits through the helpers). Velocity modes:
+         * zero vector (b1 = b2 = 128), bytes 0/255 only, random, b0 = 0, {0, 127, 128, 255} corners, random.
+         * variant % 4 == 3 puts garbage in r6's high halfword. */
+        static const uint32_t wps[] = {40, 128, 256, 64, 20};
+        const uint32_t Wp = getenv("NATIVE_DIFF_WP") ? (uint32_t)atoi(getenv("NATIVE_DIFF_WP")) : wps[variant % 5];   /* pass 140: a real width for the timing */
+        const uint32_t n = getenv("NATIVE_DIFF_WP") ? Wp - 12 : variant % 7 == 0 ? 4 * (1 + rnd() % 3) : 4 * (1 + rnd() % ((Wp - 12) / 4));
+        const uint32_t scratch = area, src = scratch + 16 * (6 * Wp + 6), vel = getenv("NATIVE_DIFF_WP") ? ((area + 16 * 14 * Wp + 0x40) & ~15u) : area + 0xF800,
+                       dst = getenv("NATIVE_DIFF_WP") ? ((vel + 4 * Wp + 0x80) & ~15u) : area + 0xFC00;
+        if (variant % 3) {
+            for (uint32_t i = 0; i < 14 * Wp; i++)
+                for (int k = 0; k < 4; k++) {
+                    float f = (float)(rnd() % 170001) / 10000.0f;
+                    if (k == 0 && variant % 11 == 0 && rnd() % 8 == 0) f = 0.0f;
+                    uint32_t v;
+                    memcpy(&v, &f, 4);
+                    wbe32(ls, scratch + 16 * i + 4 * k, v);
+                }
+        }
+        static const uint8_t corner[4] = {0, 127, 128, 255};
+        for (uint32_t i = 0; i < n + 4; i++) {
+            const int mode = variant % 6;
+            uint8_t b0 = (uint8_t)rnd(), b1 = (uint8_t)rnd(), b2 = (uint8_t)rnd(), b3 = (uint8_t)rnd();
+            if (mode == 0) b1 = b2 = 128;
+            else if (mode == 1) { b0 = (rnd() & 1) ? 0 : 255; b1 = (rnd() & 1) ? 0 : 255; b2 = (rnd() & 1) ? 0 : 255; }
+            else if (mode == 3) b0 = 0;
+            else if (mode == 4) { b1 = corner[rnd() % 4]; b2 = corner[rnd() % 4]; }
+            ls[vel + 4 * i] = b0;
+            ls[vel + 4 * i + 1] = b1;
+            ls[vel + 4 * i + 2] = b2;
+            ls[vel + 4 * i + 3] = b3;
+        }
+        uint32_t pitch = 16 * Wp;
+        if (variant % 4 == 3) pitch |= rnd() << 16;
+        c->gpr[3] = spu_splat_u32(dst);
+        c->gpr[4] = spu_splat_u32(src);
+        c->gpr[5] = spu_splat_u32(vel);
+        c->gpr[6] = spu_splat_u32(pitch);
+        c->gpr[7] = spu_splat_u32(n);
     }
 }
 
@@ -247,7 +349,7 @@ static int load_record(spu_context* c, const char* path, int slot)
     return ok;
 }
 
-static int g_equal, g_differ, g_declined, g_nr, g_shown;
+static int g_equal, g_differ, g_declined, g_nr, g_shown, g_drecs, g_drows;
 static int g_cov[3][2];   /* lp_light: [point, spot, directional][returned 0, 1] among the compared states */
 
 static void compare(const char* what, spu_context* a, spu_context* b)
@@ -269,6 +371,48 @@ static void compare(const char* what, spu_context* a, spu_context* b)
     if (g_shown++ < 5) printf("DIFF %s ls_off=0x%lX reg=%d pc a=%X b=%X\n", what, off, reg, a->pc, b->pc);
 }
 
+/* DOF gather rows from a slot-6 (unpack) record (pass 135). The record is the driver's state at the unpack call
+ * (0x4C54): r82 = &D, r84 = scratch_int, r85 = dst, r86 = stream, r88 = 16 Wp (pitch), r80 = Wp * bpp. After the
+ * unpack the driver (0x4C90) calls the gather for each row y < H = D1.hw3 with r3 = dst + y W bpp_out,
+ * r4 = scratch_int + y pitch, r5 = stream + y r80, r6 = 0x62C0, r7 = pitch, r8 = W = D1.hw2 (bpp_out = D2.byte13).
+ * The rows run in order on the same local store, as in the job; each row is one compared state. */
+static void derive_gather(const char* path, fn_t fn, const kz3_native_entry* e)
+{
+    fn_t unpack = NULL;
+    for (unsigned i = 0; i < nreg; i++) if (reg[i].addr == 0x5780) unpack = reg[i].fn;
+    if (!unpack || !load_record(&A, path, 6)) { printf("R bad record %s\n", path); g_nr++; return; }
+    A.ls = A.ls_store;
+    if (run_lifted(&A, unpack) != R_RET) { printf("R %s: unpack did not return\n", path); g_nr++; return; }
+    const uint32_t D = A.gpr[82]._u32[0] & SPU_LS_MASK;
+    const uint32_t W = ((uint32_t)A.ls[D + 0x14] << 8) | A.ls[D + 0x15], H = ((uint32_t)A.ls[D + 0x16] << 8) | A.ls[D + 0x17];
+    const uint32_t bpp_out = A.ls[D + 0x2D], dst0 = A.gpr[85]._u32[0], sc0 = A.gpr[84]._u32[0], st0 = A.gpr[86]._u32[0],
+                   pitch = A.gpr[88]._u32[0], sstep = A.gpr[80]._u32[0];
+    g_drecs++;
+    for (uint32_t y = 0; y < H; y++) {
+        char what[200];
+        snprintf(what, sizeof what, "%s row %u/%u W=%u", path, y, H, W);
+        A.gpr[3] = spu_splat_u32(dst0 + y * W * bpp_out);
+        A.gpr[4] = spu_splat_u32(sc0 + y * pitch);
+        A.gpr[5] = spu_splat_u32(st0 + y * sstep);
+        A.gpr[6] = spu_splat_u32(0x62C0);
+        A.gpr[7] = spu_splat_u32(pitch);
+        A.gpr[8] = spu_splat_u32(W);
+        A.gpr[0] = spu_splat_u32(SENTINEL);
+        A.gpr[0]._u32[1] = A.gpr[0]._u32[2] = A.gpr[0]._u32[3] = 0;
+        A.pc = e->addr;
+        memcpy(&B, &A, sizeof A);
+        B.ls = B.ls_store;
+        A.ls = A.ls_store;
+        memcpy(B.ls_store, A.ls_store, SPU_LS_SIZE);
+        if (run_lifted(&A, fn) != R_RET) { printf("R %s: lifted gather did not return\n", what); g_nr++; return; }
+        if (!e->fn(&B)) { g_declined++; continue; }
+        B.pc = B.gpr[0]._u32[0];
+        compare(what, &A, &B);
+        g_drows++;
+    }
+}
+
+static double g_tl, g_tn, g_tpx; static int g_tcalls;
 int main(int argc, char** argv)
 {
     if (argc < 6) { fprintf(stderr, "usage\n"); return 2; }
@@ -311,6 +455,7 @@ int main(int argc, char** argv)
             snprintf(what, sizeof what, "synth#%d", t);
         } else {
             snprintf(what, sizeof what, "%s", argv[6 + t - trials]);
+            if (!strcmp(e->kind, "dof_gather") && strstr(what, "s06_")) { derive_gather(what, fn, e); continue; }
             if (!load_record(&A, argv[6 + t - trials], slot)) { printf("R bad record %s\n", what); g_nr++; continue; }
         }
         if (!strcmp(e->kind, "lp_light") && t >= trials) {
@@ -330,6 +475,34 @@ int main(int argc, char** argv)
             const uint32_t Lp = A.gpr[3]._u32[0] & SPU_LS_MASK;
             lkind = ((uint32_t)A.ls[Lp + 0x3C] << 8) | A.ls[Lp + 0x3D];
         }
+        if (getenv("NATIVE_DIFF_TIME")) {   /* SPU pass 140: min of 5 warm runs each, per pixel (mb_blur) */
+            static spu_context T0, T1;
+            static uint8_t pr[SPU_LS_SIZE];
+            memcpy(pr, A.ls_store, SPU_LS_SIZE);
+            const spu_context sv = A;
+            double bl = 1e18, bn = 1e18;
+            for (int k = 0; k < 5; k++) {
+                memcpy(&T0, &sv, sizeof sv); T0.ls = T0.ls_store; memcpy(T0.ls_store, pr, SPU_LS_SIZE);
+                struct timespec a0, a1;
+                clock_gettime(CLOCK_MONOTONIC, &a0);
+                const int rr = run_lifted(&T0, fn);
+                clock_gettime(CLOCK_MONOTONIC, &a1);
+                if (rr != R_RET) { bl = -1; break; }
+                const double dl = (a1.tv_sec - a0.tv_sec) * 1e9 + (a1.tv_nsec - a0.tv_nsec);
+                if (dl < bl) bl = dl;
+                memcpy(&T1, &sv, sizeof sv); T1.ls = T1.ls_store; memcpy(T1.ls_store, pr, SPU_LS_SIZE);
+                clock_gettime(CLOCK_MONOTONIC, &a0);
+                const int tk = e->fn(&T1);
+                clock_gettime(CLOCK_MONOTONIC, &a1);
+                if (!tk) { bn = -1; break; }
+                const double dn = (a1.tv_sec - a0.tv_sec) * 1e9 + (a1.tv_nsec - a0.tv_nsec);
+                if (dn < bn) bn = dn;
+            }
+            if (bl > 0 && bn > 0) {
+                const double px = sv.gpr[7]._u32[0];
+                g_tl += bl; g_tn += bn; g_tpx += px; g_tcalls++;
+            }
+        }
         const int r = run_lifted(&A, fn);
         if (r != R_RET) { g_nr++; continue; }
         const int took = e->fn(&B);
@@ -344,6 +517,8 @@ int main(int argc, char** argv)
     }
     printf("R slot %d %s %s 0x%X: equal=%d differ=%d declined=%d lifted_nr=%d\n", slot, e->kind, e->image, e->addr,
            g_equal, g_differ, g_declined, g_nr);
+    if (g_tcalls) printf("R time %d calls, %.0f px: lifted %.1f ns/px (%.1f us/call avg), native %.1f ns/px (%.1f us/call avg), native/lifted %.3f\n", g_tcalls, g_tpx, g_tl / g_tpx, g_tl / g_tcalls / 1e3, g_tn / g_tpx, g_tn / g_tcalls / 1e3, g_tn / g_tl);
+    if (g_drecs) printf("R derived from %d slot-6 records: %d gather rows\n", g_drecs, g_drows);
     if (!strcmp(e->kind, "lp_light"))
         printf("R   coverage (returned 0 / 1): point %d / %d, spot %d / %d, directional %d / %d\n", g_cov[0][0], g_cov[0][1], g_cov[1][0], g_cov[1][1], g_cov[2][0], g_cov[2][1]);
     return g_differ ? 1 : 0;

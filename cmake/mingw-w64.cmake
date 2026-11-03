@@ -7,5 +7,6 @@ set(CMAKE_RC_COMPILER  x86_64-w64-mingw32-windres)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)   # find_package must not take host packages (KZ2 public #34)
 # Ship self-contained exes: no libgcc/libstdc++/winpthread DLLs next to the game.
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-static -static-libgcc -static-libstdc++")

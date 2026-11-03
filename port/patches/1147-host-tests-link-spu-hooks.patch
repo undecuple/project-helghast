@@ -1,0 +1,128 @@
+Host tests of the patched tree link again: three upstream tests (tools/test_spu_raw_start.py, test_spu_raw_runcntl_stop.py,
+test_spu_workload_masked.py) failed to link because files they compile reference hooks that live in files these tests do not
+link (found by the Ratchet & Clank port, 2026-11-02). Spu pass 138.
+- spu_fpmode.h: spu_fpmode_init_thread() (header-inline, the same rule as spu_host_fp_init in spu_drain.c, patch 1095); spu_raw.c
+  and spu_workload.c call it, so a test that includes either alone no longer needs spu_drain.c. The SPURS kernels still call
+  spu_host_fp_init.
+- g_kz3_run_ctx_hook (patch 1081) is defined in spu_workload.c, next to the runner that calls it, instead of spu_channels.c.
+- tools/test_spu_raw_runcntl_stop.py links the real runtime/diag/kz3_wait_acct.c (g_kz3_wacct, g_kz3_wtrace, kz3_wacct_*,
+  patches 1032, 1085, 1135), like its other real runtime sources; test_spu_workload_masked.c, which replaces the coherency
+  module with stand-ins, gets stand-ins for the striped lock-line API (spu_ll_mask, spu_ll_lock_mask, spu_ll_unlock_mask,
+  patch 1056) next to the existing spu_lockline_lock/unlock one.
+
+diff --git a/runtime/spu/spu_fpmode.h b/runtime/spu/spu_fpmode.h
+index c7114e36..2ea5fae5 100644
+--- a/runtime/spu/spu_fpmode.h
++++ b/runtime/spu/spu_fpmode.h
+@@ -33,6 +33,17 @@ static inline void spu_fpmode_set_spu(void)
+ #endif
+ }
+ 
++/* The same rule as spu_host_fp_init() in spu_drain.c (which the SPURS kernels call), header-inline for the raw SPU and
++ * workload host threads (spu_raw.c, spu_workload.c): a TU that includes either alone links without spu_drain.c.
++ * Called at thread start only, never hot. */
++#include <stdlib.h>
++static inline void spu_fpmode_init_thread(void)
++{
++    static int s_on = -1;
++    if (s_on < 0) s_on = spu_fpmode_env_on(getenv("KZ3_SPU_FTZ"));
++    if (s_on) spu_fpmode_set_spu();
++}
++
+ static inline unsigned spu_fpmode_get(void)
+ {
+ #ifdef SPU_FPMODE_X86
+diff --git a/runtime/spu/spu_raw.c b/runtime/spu/spu_raw.c
+index e102f46c..728f5192 100644
+--- a/runtime/spu/spu_raw.c
++++ b/runtime/spu/spu_raw.c
+@@ -29,6 +29,7 @@
+ #include "spu_raw.h"
+ #include "spu_context.h"
+ #include "spu_workload.h"
++#include "spu_fpmode.h"   /* spu_fpmode_init_thread (KZ3 patch 1095) */
+ #include "spu_lifted_job.h"
+ #include "../syscalls/lv2_syscall_table.h"
+ #include "../../include/ps3emu/error_codes.h"
+@@ -252,7 +253,7 @@ static inline long raw_cas(volatile long* p, long v, long c)
+ static void raw_spu_run(raw_spu* s)
+ {
+     ps3_thread_name("raw spu");
+-    { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
++    spu_fpmode_init_thread();   /* KZ3 patch 1095: SPU denormals = 0 */
+     spu_context* c = s->ctx;
+ 
+     c->status = SPU_STATUS_RUNNING;
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index c0c0d0cd..c13196b9 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -6,6 +6,7 @@
+  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
+  */
+ #include "spu_workload.h"
++#include "spu_fpmode.h"   /* spu_fpmode_init_thread (KZ3 patch 1095) */
+ #include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
+ #ifdef _WIN32
+ static volatile long long g_ws_sig_wake;   /* when WAIT_SIGNAL waiters were last woken (waitstat) */
+@@ -27,6 +28,10 @@ static volatile long long g_ws_sig_wake;   /* when WAIT_SIGNAL waiters were last
+ #endif
+ #include "ps3emu/thread_name.h"
+ 
++/* KZ3 patch 1081: see spu_channels.c. Defined with the workload runner that calls it (a TU that includes spu_workload.c
++ * alone, like tools/test_spu_workload_masked.py, links without spu_channels.c). */
++void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b) = 0;
++
+ static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
+                                      uint32_t owner_ea);   /* below */
+ #include "ps3emu/timespec_compat.h"   /* KZ3 patch 1112: msvcrt MinGW */
+@@ -1027,7 +1032,7 @@ int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image,
+ SPU_THREAD_LOCAL uint32_t g_kz3_cur_taskset, g_kz3_cur_taskid;
+ static void spu_async_run(spu_async_job* j)
+ {
+-    { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
++    spu_fpmode_init_thread();   /* KZ3 patch 1095: SPU denormals = 0 */
+     g_kz3_cur_taskset = j->taskset_ea; g_kz3_cur_taskid = j->taskid;   /* KZ3 patch 1081 */
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     spu_taskset_bind_thread(j->taskset_ea);   /* KZ3 patch 1066 */
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index e4d142f7..07a8e1de 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -340,8 +340,7 @@ static void spu_honour_stop_request(spu_context* ctx)
+ /* KZ3 patch 1081 (opt-in diagnostic, KZ3_STALL_DIAG=1): called with on=1 before and on=0 after every lifted job/task
+  * run (kind 0, a = image id, b = args EA; spu_lifted_job.h) and every policy-module run (kind 1, a = wid, b = spu_num;
+  * spurs_policy.c), so a run that never returns can be described from another thread. NULL unless
+- * port/spu/kz3_stall_diag.c installs it. Defined here, next to spu_run_with_halt, so every user of the runners links it. */
+-void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b) = 0;
++ * port/spu/kz3_stall_diag.c installs it. Defined in spu_workload.c (spu_lifted_job.h's runner, its main user). */
+ int spu_run_with_halt(void (SPU_ABI *entry)(spu_context*), spu_context* ctx)
+ {
+     const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
+diff --git a/runtime/spu/tests/test_spu_workload_masked.c b/runtime/spu/tests/test_spu_workload_masked.c
+index 81e3cc76..bc72f780 100644
+--- a/runtime/spu/tests/test_spu_workload_masked.c
++++ b/runtime/spu/tests/test_spu_workload_masked.c
+@@ -28,6 +28,10 @@ void spu_coh_watch_add(spu_coh_watch* w, uint32_t ea, void (*wake)(void*), void*
+ void spu_coh_watch_remove(spu_coh_watch* w) { (void)w; }
+ void spu_lockline_lock(void) { }
+ void spu_lockline_unlock(void) { }
++/* The striped lock-line API (KZ3 patch 1056) is part of the coherency module this fixture replaces; one stripe, no lock. */
++uint64_t spu_ll_mask(uint32_t ea, uint32_t len) { (void)ea; (void)len; return 1; }
++void spu_ll_lock_mask(uint64_t m) { (void)m; }
++void spu_ll_unlock_mask(uint64_t m) { (void)m; }
+ void spu_mfc_release(spu_context* c) { (void)c; }
+ int spu_run_spurs_job(spu_lifted_entry_fn e, int id, uint32_t ea, uint32_t sz)
+ { (void)e; (void)id; (void)ea; (void)sz; return -1; }
+diff --git a/tools/test_spu_raw_runcntl_stop.py b/tools/test_spu_raw_runcntl_stop.py
+index 7b13a637..454ff5d0 100755
+--- a/tools/test_spu_raw_runcntl_stop.py
++++ b/tools/test_spu_raw_runcntl_stop.py
+@@ -22,6 +22,7 @@ with tempfile.TemporaryDirectory(prefix='spu-raw-runcntl-stop-') as tmp:
+                     '-I'+str(root/'runtime/platform'),
+                     str(spu/'tests/test_spu_raw_runcntl_stop.c'),
+                     *[str(spu / name) for name in sources],
++                    str(root / 'runtime/diag/kz3_wait_acct.c'),   # g_kz3_wacct, g_kz3_wtrace, kz3_wacct_* (KZ3 patches 1032, 1085, 1135)
+                     str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                     '-o', str(binary)], check=True)
+     subprocess.run([str(binary)], check=True, timeout=30, cwd=tmp, env=env,

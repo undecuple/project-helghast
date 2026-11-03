@@ -247,7 +247,7 @@ diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
   * Sensitivity model from KAMI (isJuhn/KAMI, MIT): radians per count, default 0.003 (about 0.17 degrees per count).
   *
   * Switches (read once; pad_mouse.c):
-- *   KZ3_MOUSE_LOOK=1        on (default off: opt-in until the owner has tried it).
+- *   KZ3_MOUSE_LOOK=1        on (default off: opt-in until it has been tried in play).
 + *   KZ3_MOUSE_LOOK=0        off (default on since patch 2097, project decision 2026-10-21; kz3.ini
 + *                           `mouse_look = 0` does the same, the environment wins). A pad works the same either way:
 + *                           no counts = the game's own look values untouched.

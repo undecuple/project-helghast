@@ -49,7 +49,9 @@ n=0
 for f in runtime/spu/spurs_job.c runtime/spu/spu_channels.c runtime/syscalls/sys_cond.c runtime/syscalls/sys_event.c \
          runtime/syscalls/lv2_register.c runtime/syscalls/sys_semaphore.c runtime/syscalls/sys_fs.c \
          runtime/ppu/ppu_sysprx.cpp runtime/ppu/ppu_loader.cpp; do
-  if [[ $f == *.cpp ]]; then cc=(${CXX:-c++} -std=c++17); else cc=(${CC:-cc} -std=gnu17 -Werror=implicit-function-declaration); fi
+  # CXX/CC may carry flags ("ccache c++", "clang --target=..."): split them into words on purpose
+  if [[ $f == *.cpp ]]; then read -ra cc <<<"${CXX:-c++}"; cc+=(-std=c++17)
+  else read -ra cc <<<"${CC:-cc}"; cc+=(-std=gnu17 -Werror=implicit-function-declaration); fi
   [[ $f == */sys_event.c ]] && cc+=(-include runtime/platform/win32_compat.h)   # its kz3_semdump uses LONG (Windows types)
   if (cd "$T" && "${cc[@]}" -fsyntax-only -w -I"$O" -I include -I runtime -I runtime/spu -I runtime/ppu -I runtime/platform \
         -I runtime/diag -I runtime/syscalls -I runtime/memory -I libs "$f") >"$O/c.log" 2>&1; then n=$((n+1))

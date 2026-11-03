@@ -75,4 +75,4 @@ which inputs passed.
 ## More
 
 - [Building the port](BUILDING.md) lists what the whole build needs.
-- The [README](../README.md#requirements) has the requirements in short.
+- The [README](INSTALL.md#requirements) has the requirements in short.

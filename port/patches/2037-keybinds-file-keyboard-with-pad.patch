@@ -1,4 +1,4 @@
-KZ3 patch 2037: keyboard and mouse buttons from a binding file, alongside an XInput pad (RSX pass 36 hook C;
+KZ3 patch 2037: keyboard and mouse buttons from a binding file, alongside an XInput pad (RSX pass 36;
 configurable keybinds saved to a local config file). cellPad.c's one fixed keyboard table (patch 2034) is
 replaced by keybinds.ini in the player's data folder (the install folder when kz3-install.ini next to the exe or
 one level up says [install] portable = 1, else %APPDATA%\Project Helghast; KZ3_KEYBINDS=<path> overrides): one line

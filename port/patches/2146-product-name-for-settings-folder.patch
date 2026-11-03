@@ -1,0 +1,79 @@
+KZ3 patch 2146: the product name in the settings folder and the settings files' comments comes from
+PS3RECOMP_PRODUCT_NAME (default "Project Helghast", so this port's behaviour is unchanged: same %APPDATA% folder, same
+text in keybinds.ini and display.ini). Patches 2037, 2095, 2103 and 2121 hard-coded the name, so a second port built
+from the same series wrote its settings into this port's folder under this port's name. Ported from the Ratchet &
+Clank port, patch 6010 (same change; there it sits after 4028, here it is numbered before it, so the comment
+"else %APPDATA%\Project Helghast" in cellPad.c, which patch 4028 quotes as context, is left as it is). A port sets the
+name with -DPS3RECOMP_PRODUCT_NAME="\"Name\"" on the runtime. Host test tools/smoke/test_product_name.sh.
+Upstream candidate with the settings-folder patches (2037).
+
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -434,7 +434,7 @@
+     n = GetEnvironmentVariableW(L"APPDATA", appdata, 1024);
+     if (n > 0 && n < 1000) {
+         wchar_t dir[1024];
+-        _snwprintf(dir, 1024, L"%ls\\Project Helghast", appdata); dir[1023] = 0;
++        _snwprintf(dir, 1024, L"%ls\\%hs", appdata, PS3RECOMP_PRODUCT_NAME); dir[1023] = 0;
+         CreateDirectoryW(dir, NULL);                  /* exists already = fine */
+         _snwprintf(s_kb_path, 1024, L"%ls\\keybinds.ini", dir); s_kb_path[1023] = 0;
+         return;
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -51,6 +51,13 @@
+ 
+ typedef struct { const char* name; unsigned short btn; signed char dir; const char* what; } PadKbInput;
+ 
++/* Product name a player reads in the settings folder and the files' comments. Each port sets it
++ * (-DPS3RECOMP_PRODUCT_NAME="\"Name\""); the default keeps Project Helghast's own name. Ported from the
++ * Ratchet & Clank port, patch 6010. */
++#ifndef PS3RECOMP_PRODUCT_NAME
++#define PS3RECOMP_PRODUCT_NAME "Project Helghast"
++#endif
++
+ /* The order is the file's order. `what` is the Standard preset's main use (the RE notes 5.3). */
+ static const PadKbInput pad_kb_inputs[] = {
+     { "up",       PKB_UP,       -1, "d-pad up (zoom mode)" },
+@@ -563,7 +570,7 @@
+     int i;
+ #define PKB_PUT(...) do { int w_ = snprintf(buf + (o < n ? o : n), o < n ? n - o : 0, __VA_ARGS__); \
+                           if (w_ > 0) o += (size_t)w_; } while (0)
+-    PKB_PUT("# Project Helghast key bindings. Written with the defaults on the first start; edit and save, the game\n"
++    PKB_PUT("# " PS3RECOMP_PRODUCT_NAME " key bindings. Written with the defaults on the first start; edit and save, the game\n"
+             "# reads it again within two seconds. Delete this file to get the defaults back.\n"
+             "#\n"
+             "#   <pad input> = <primary key>, <secondary key>      (\"none\" or nothing = unbound)\n"
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -26,6 +26,13 @@
+ 
+ enum { RSX_DM_WINDOWED = 0, RSX_DM_BORDERLESS = 1, RSX_DM_FULLSCREEN = 2 };
+ 
++/* Product name a player reads in the settings folder and the files' comments. Each port sets it
++ * (-DPS3RECOMP_PRODUCT_NAME="\"Name\""); the default keeps Project Helghast's own name. Ported from the
++ * Ratchet & Clank port, patch 6010. */
++#ifndef PS3RECOMP_PRODUCT_NAME
++#define PS3RECOMP_PRODUCT_NAME "Project Helghast"
++#endif
++
+ static inline const char* rsx_dm_name(int m)
+ {
+     return m == RSX_DM_BORDERLESS ? "borderless" : m == RSX_DM_FULLSCREEN ? "fullscreen" : "windowed";
+@@ -361,7 +368,7 @@
+ static inline int rsx_dm_ini_write_ext(char* buf, size_t n, int mode, int scaling, int filter, int vsync, int motion_blur, int fps)
+ {
+     return snprintf(buf, n,
+-                    "# Project Helghast display settings (Options > Display; Alt+Enter toggles the mode).\n"
++                    "# " PS3RECOMP_PRODUCT_NAME " display settings (Options > Display; Alt+Enter toggles the mode).\n"
+                     "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest, vsync = on | off.\n"
+                     "# motion_blur = 0..100 (percent, steps of 10; 100 = the game, on / off of older files still read). fps_limit = 30 | 60 | 120: 30 is the game's own; above 30 can break gameplay timing.\n"
+                     "# KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER, KZ3_MOTION_BLUR, KZ3_FPS_LIMIT override them for one run.\n"
+@@ -386,7 +393,7 @@
+ static inline int rsx_dm_ini_write(char* buf, size_t n, int mode, int scaling, int filter, int vsync)
+ {
+     return snprintf(buf, n,
+-                    "# Project Helghast display settings (Options > Display; Alt+Enter toggles the mode).\n"
++                    "# " PS3RECOMP_PRODUCT_NAME " display settings (Options > Display; Alt+Enter toggles the mode).\n"
+                     "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest, vsync = on | off.\n"
+                     "# KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER override them for one run.\n"
+                     "[display]\nmode = %s\nscaling = %s\nfilter = %s\nvsync = %s\n", rsx_dm_name(mode), rsx_dm_scaling_name(scaling),

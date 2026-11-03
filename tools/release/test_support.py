@@ -84,7 +84,7 @@ def main():
         f = z.read("facts.txt").decode()
         check("1.2.3" in f and "abc123" in f and "1.14" in f and "RTX 4070" in f and "No log was shortened" in f, "5 facts.txt content")
         rr = fr.redactor()("C:\\Users\\Bob\\dump C_/Users/Bob/build/x")
-        check("Bob" not in rr and rr.count("<user>") == 2, f"5b real firstrun redactor: {rr}")
+        check("Bob" not in rr and "Users" not in rr and "<path>" in rr, f"5b real firstrun redactor: {rr}")
         # refused names / extensions
         check(all(sp.refused(x) for x in ("EBOOT.elf", "EBOOT.BIN", "PARAM.SFO", "a.psarc", "x.sav", "a.rap", "kz3.exe", "a.bin")), "6 refusals")
         check(not any(sp.refused(x) for x in ("a.log", "b.ini", "c.txt")), "6 text names pass")

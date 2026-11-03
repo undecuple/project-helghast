@@ -16,7 +16,7 @@ What goes in (the allowlist, RULES below; nothing else is ever copied):
   ps3recomp/      work/ps3recomp-patched (plan item 1: the patched toolkit, tools/ps3recomp-patched.sh) without
                   fw_spu/ (Sony firmware modules and code lifted from them: never shipped), scratch/, docs/, packaging/,
                   .github/
-  licenses/       our LICENSE, ps3recomp's LICENSE, at3_standalone's COPYING.LGPLv2.1
+  licenses/       our LICENSE, ps3recomp's LICENSE, at3_standalone's COPYING.LGPLv2.1, FidelityFX FSR 1's LICENSE.txt
   fonts/          Rajdhani-Medium.ttf and Rajdhani-Bold.ttf (SIL OFL 1.1) from --fonts DIR (default
                   <repo>/work/release/fonts, filled by installer_art.py --fetch-fonts; never committed), each checked
                   against its SHA-256 pinned in installer/art/art.json, and their OFL text as licenses/Rajdhani-OFL.txt.
@@ -71,6 +71,7 @@ RULES = [
     ("tools/release/iso9660.py", "kz3-setup/release/iso9660.py", "file", {}),   # firstrun: a decrypted disc ISO as the game source
     ("tools/release/version_check.py", "kz3-setup/release/version_check.py", "file", {}),
     ("tools/release/crash_report.py", "kz3-setup/release/crash_report.py", "file", {}),
+    ("tools/release/pathrules.py", "kz3-setup/release/pathrules.py", "file", {}),
     ("tools/release/launch.py", "kz3-setup/release/launch.py", "file", {}),
     ("tools/smoke/pso_template.py", "kz3-setup/pso_template.py", "file", {}),   # the launcher's export check
     ("tools/release/lift_fixups.py", "kz3-setup/release/lift_fixups.py", "file", {}),
@@ -111,6 +112,7 @@ RULES = [
     (TOOLKIT + "/LICENSE", "licenses/ps3recomp-LICENSE.txt", "file", {}),
     (TOOLKIT + "/third_party/at3_standalone/COPYING.LGPLv2.1", "licenses/at3_standalone-COPYING.LGPLv2.1.txt",
      "file", {}),
+    (TOOLKIT + "/libs/video/fsr1/LICENSE.txt", "licenses/FidelityFX-FSR1-LICENSE.txt", "file", {}),   # patch 2145 (MIT)
     ("public/README.md", "README.md", "file", {}),
     ("public/NOTICE.md", "NOTICE.md", "file", {}),
     ("installer/run.cmd", "run.cmd", "file", {}),

@@ -209,10 +209,29 @@ def main():
             check(red(f"{home}/Downloads/x") == "%USERPROFILE%/Downloads/x", "8 redacts the home path")
             check(red(home.replace("/", "\\") + "\\x") == "%USERPROFILE%\\x", "8 redacts backslash form")
             check(red("[1/9] Building C object C_/Users/Jane_Doe/AppData/x.c.obj") ==
-                  "[1/9] Building C object C_/Users/<user>/AppData/x.c.obj", "8 redacts CMake's mangled user path")
-            check(red(r"# dump C:\Users\Other Name\Downloads\b") == r"# dump C:\Users\<user>\Downloads\b",
+                  "[1/9] Building C object <path>\\x.c.obj", "8 redacts CMake's mangled user path")
+            check(red(r"# dump C:\Users\Other Name\Downloads\b") == r"# dump <path>\b",
                   "8 redacts another account's folder")
-            check(red("D:/Games/kz3") == "D:/Games/kz3", "8 leaves non-user paths alone")
+            # D:/Games/kz3 etc: every other absolute path keeps only its last component (2026-11-02)
+            check(red("D:/Games/kz3") == "<path>\\kz3", "8 other drive path -> <path>\\last")
+            check(red(r"d:\Games\KZ3\PS3_GAME\USRDIR\EBOOT.BIN") == "<path>\\EBOOT.BIN", "8 mixed-case drive, backslashes")
+            check(red("E:/PS3/BCUS98234") == "<path>\\BCUS98234", "8 forward slashes, other drive")
+            check(red(r"opened D:\Program Files (x86)\My Games\Killzone 3 (US)\a.exe ok") == "opened <path>\\a.exe ok",
+                  "8 folders with spaces and parentheses")
+            check(red(r"\\nas\share\Games\x.bin") == "<path>\\x.bin", "8 UNC path")
+            check(red(r"Z:\mnt\games\KZ3\x.bin") == "<path>\\x.bin", "8 Proton Z: drive")
+            check(red("/mnt/games/Killzone 3/EBOOT.BIN") == "<path>\\EBOOT.BIN", "8 Unix path with a space")
+            check(red("/dev_bdvd/PS3_GAME/x /dev_hdd0/game/y /app_home/z") == "/dev_bdvd/PS3_GAME/x /dev_hdd0/game/y /app_home/z",
+                  "8 virtual PS3 paths stay")
+            check(red("relative/dir/x.txt build\\logs\\y") == "relative/dir/x.txt build\\logs\\y", "8 relative paths stay")
+            inst = os.path.join(tmp, "Games", "KZ3 Port")
+            la, ap = os.path.join(home, "AppData", "Local"), os.path.join(home, "AppData", "Roaming")
+            os.environ["LOCALAPPDATA"], os.environ["APPDATA"] = la, ap
+            r2 = fr.redactor(inst)
+            check(r2(inst) == "%INSTALL%" and r2(inst + "/build/kz3.exe") == "%INSTALL%/build/kz3.exe", "8 install folder -> %INSTALL%, rest kept")
+            check(r2(inst + "-old/x") == "<path>\\x", "8 a longer folder name is not the install")
+            check(r2(la + "/KZ3/shaders") == "%LOCALAPPDATA%/KZ3/shaders" and r2(ap + "\\x") == "%APPDATA%\\x", "8 AppData folders keep their names")
+            del os.environ["LOCALAPPDATA"], os.environ["APPDATA"]
             # escaped and URL-encoded forms (issue #9, reported by @feanor-noldorin; KZ2 5b0cf61)
             bk = home.replace("/", "\\")
             check(red(repr(bk + "\\rpcs3")) == "'%USERPROFILE%\\\\rpcs3'", "8 redacts a repr() path")
@@ -220,8 +239,8 @@ def main():
             check(red(bk.replace("\\", "\\\\") + "\\\\x") == "%USERPROFILE%\\\\x", "8 redacts the doubled form")
             check("Jane" not in red("file:///" + urllib.parse.quote(home.replace("\\", "/"), safe="/:") + "/x"), "8 redacts a URL-encoded path")
             check("Jane" not in red(urllib.parse.quote(bk, safe="")) , "8 redacts a fully percent-encoded path")
-            check(red(json.dumps(r"C:\Users\Other Name\Downloads")) == r'"C:\\Users\\<user>\\Downloads"', "8 other account, JSON-escaped")
-            check(red("C%3A%5CUsers%5COther%20Name%5Cx") == "C%3A%5CUsers%5C<user>%5Cx", "8 other account, URL-encoded")
+            check(red(json.dumps(r"C:\Users\Other Name\Downloads")) == '"<path>\\Downloads"', "8 other account, JSON-escaped")
+            check(red("C%3A%5CUsers%5COther%20Name%5Cx") == "<path>\\x", "8 other account, URL-encoded")
             # the path goes in argv, not in a repr()'d program text: repr doubles Windows backslashes in the logged command line
             say = py("import sys; print(sys.argv[1])") + [os.path.join(home, 'rpcs3', 'dev_hdd0')]
             rc, out = run(tmp, [fr.Step("say", "Say", 1, lambda c: [say])], "--build", os.path.join(tmp, "b8"))
@@ -389,6 +408,17 @@ def main():
         check(lg.startswith("# started") and "# interactive check" in lg and "E1:" in lg and "RESULT ok=1" in lg,
               "12 one log with header, the check and the build")
 
+        def ask_eof(q):
+            raise EOFError
+        o12e = io.StringIO()
+        try:
+            rce = fr.main(["--interactive", "--rpcs3", "off", "--portable", "--root", root12, "--log-dir", dl12,
+                           "--log-name", "kz3-eof.log"], steps=steps, out=o12e, ask=ask_eof)
+        except EOFError:
+            rce = "traceback"
+        check(rce == 2 and "No more input" in o12e.getvalue() and "Traceback" not in o12e.getvalue(),
+              f"12 stdin ended: one-line stop, exit 2 (got {rce!r}: {o12e.getvalue()[-200:]!r})")
+
         a12 = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t12, "b"), portable=False)
         res = iter([(1, "FAIL U0: update folder not found\n"), (0, "OK   D1: fine\n")])
         answers = eof_iter([d12, u12, "", "", "", "y", "y", "", "n"])
@@ -444,13 +474,13 @@ def main():
 
         bar = io.StringIO()
         cb = fr.ConsoleBar(bar, tty=False)
-        for ln in ("LOG path=/x/y.log", "some tool output",
+        for ln in ("LOG path=/x/Project Helghast/y.log", "some tool output",
                    "PROGRESS step=7/8 name=compile done=312 total=1204 elapsed=754 pct=60.3",
                    "RESULT ok=0 step=compile elapsed=800"):
             print(ln, file=cb)
         b = bar.getvalue()
         check("Compiling 312 / 1,204" in b and "12:34" in b and "some tool output" not in b and "issues" in b
-              and "Log: /x/y.log" in b, f"12 console bar: {b!r}")
+              and "Log: /x/Project Helghast/y.log" in b, f"12 console bar: {b!r}")
 
         # 13. the loader gets the EBOOT under the fixed name whatever the player's file is called (pass 53)
         for nm in ("EBOOT-114.elf", "EBOOT (1).elf", "EBOOT.elf"):
@@ -490,7 +520,7 @@ def main():
         want14 = {k.replace("DATA_PS3.PSARC", "data_ps3.psarc"): v for k, v in files14.items()}
         check(got14 == want14, f"14 extracted tree equals the ISO's files: {sorted(got14)}")
         check(open(seen14).read().strip() == dest14, "14 later steps see the extracted folder as the dump")
-        pj = json.load(open(os.path.join(t14, "root", "build", "paths.json")))
+        pj = fr._la().load_json(os.path.join(t14, "root", "build", "paths.json"))   # in-root paths are stored relative
         check(pj["dump"] == dest14 and pj["iso"] == iso14, "14 paths.json records the folder and the ISO")
         pr14 = progress(out14.getvalue())
         pc14 = [float(x["pct"]) for x in pr14]

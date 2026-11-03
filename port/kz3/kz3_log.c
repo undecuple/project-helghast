@@ -5,6 +5,7 @@
 #  define _GNU_SOURCE 1
 #endif
 #include "kz3_log.h"
+#include "kz3_log_redact.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -459,6 +460,32 @@ void kz3_log_set_thread_label(const char* label)
     snprintf(t->label, sizeof t->label, "%s", label);
 }
 
+/* The user's name never reaches the log file, the stdout echo, the ring or the crash report (kz3_log_redact.h).
+ * The rules are built from USERPROFILE on the first line written; later threads wait until they are ready. */
+static kz3_redact_t     g_red;
+static atomic_int       g_red_state;     /* 0 = not built, 1 = building, 2 = ready */
+static const kz3_redact_t* redact_rules(void)
+{
+    int st = atomic_load_explicit(&g_red_state, memory_order_acquire);
+    if (st != 2) {
+        int zero = 0;
+        if (atomic_compare_exchange_strong(&g_red_state, &zero, 1)) {
+            kz3_redact_init(&g_red, getenv("USERPROFILE"));
+            kz3_redact_add_install(&g_red, getenv("KZ3_INSTALL_DIR"));     /* the launcher exports the install folder: %INSTALL% */
+            kz3_redact_add_localappdata(&g_red, getenv("LOCALAPPDATA"));   /* the AppData folders keep their names */
+            kz3_redact_add_appdata(&g_red, getenv("APPDATA"));
+            kz3_redact_add_unix_home(&g_red, getenv("HOME"));        /* the Unix home under Wine/Proton, when /home/<name> does not cover it */
+            const char* wh = getenv("WINEHOMEDIR");                  /* Wine's spelling: \??\Z:\home\name */
+            if (wh && !strncmp(wh, "\\??\\", 4)) wh += 4;
+            kz3_redact_add_unix_home(&g_red, wh);
+            atomic_store_explicit(&g_red_state, 2, memory_order_release);
+        } else {
+            while (atomic_load_explicit(&g_red_state, memory_order_acquire) != 2) { }
+        }
+    }
+    return &g_red;
+}
+
 /* body = "[tag] text" (or an untagged line), without the trailing newline */
 static void emit_body(int level, const char* body, size_t n)
 {
@@ -472,11 +499,9 @@ static void emit_body(int level, const char* body, size_t n)
     if (p > 95) p = 95;
     while (n && (body[n - 1] == '\n' || body[n - 1] == '\r')) n--;
     size_t room = KZ3_LOG_LINE_MAX - 1;
-    size_t b = n;
-    if (b > room) b = room;
-    memcpy(line + p, body, b);
+    size_t b = kz3_redact(redact_rules(), body, n, line + p, room);   /* cut at room, after the replacement */
     size_t len = (size_t)p + b;
-    if (n > room) { memcpy(line + len - 3, "...", 3); }
+    if (b == room && n >= room) { memcpy(line + len - 3, "...", 3); }
     ring_put(line, len);
     line[len] = '\n';
     os_fd fd = cur_fd();
@@ -785,7 +810,18 @@ static void crash_ring_cb(const char* s, size_t n, void* u)
     os_write(fd, s, n); os_write(fd, "\n", 1);
 }
 
-static void wr(os_fd fd, const char* s) { os_write(fd, s, strlen(s)); }
+/* crash report text: redacted per line (a path never spans a line) */
+static void wr(os_fd fd, const char* s)
+{
+    char buf[2048 * 4];
+    while (*s) {
+        size_t n = 0; while (s[n] && s[n] != '\n' && n < 2048) n++;
+        size_t o = kz3_redact(redact_rules(), s, n, buf, sizeof buf);
+        os_write(fd, buf, o);
+        s += n;
+        if (*s == '\n') { os_write(fd, "\n", 1); s++; }
+    }
+}
 
 const char* kz3_log_write_crash(const char* reason, const char* details)
 {

@@ -55,6 +55,7 @@ endif()
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)   # find_package must not take host packages (KZ2 public #34)
 
 # Windows 10 API level, as the nixpkgs mingw-w64 the GCC build uses defaults to: llvm-mingw's _mingw.h defaults
 # _WIN32_WINNT to 0x601 (Windows 7), which hides GetCurrentThreadStackLimits (0x602+) used by

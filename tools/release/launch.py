@@ -55,10 +55,10 @@ changed). Never built or inputs gone = the same questions as a normal start. End
 --print: show the decision, the command, the working folder and the variables it sets, as JSON; starts nothing.
 """
 import argparse
-import configparser
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -67,6 +67,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import crash_report  # noqa: E402  (opt-in crash reports)
 import firstrun as fr  # noqa: E402
+import firstrun_check as fc  # noqa: E402  (the same update checks the first run makes)
 import names  # noqa: E402  (the product name, file names and links: one place, names.py)
 
 TITLE = names.PRODUCT
@@ -80,11 +81,46 @@ GAME_VARS = ("PS3_VFS_ROOT", "KZ3_UPDATE_DIR", "PS3_HDD0_ROOT", "PS3_EDAT_CACHE"
 
 # ------------------------------------------------------------------------------------------------------- reading
 def load_json(path):
+    """The JSON file, or None. build/paths.json comes back with its install-relative paths made absolute (PATHS_KEYS)."""
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            j = json.load(f)
     except (OSError, ValueError):
         return None
+    if os.path.basename(path) == "paths.json" and isinstance(j, dict):
+        j = paths_abs(j, os.path.dirname(os.path.dirname(os.path.abspath(path))))
+    return j
+
+
+PATHS_KEYS = ("dump", "iso", "update", "eboot", "font_dir", "font_src")   # the paths in build/paths.json
+
+
+def is_abs(p):
+    """A drive path (C:\\x, C:/x), a UNC or rooted path (\\\\srv, /x): what kz3_ini_resolve keeps as it is."""
+    return bool(re.match(r"^([A-Za-z]:|[\\/])", p or ""))
+
+
+def paths_rel(j, root):
+    """A copy of paths.json's dict with every path below the install folder written relative to it (forward slashes), so
+    a moved or renamed install keeps them; other paths stay absolute."""
+    out = dict(j)
+    for k in PATHS_KEYS:
+        v = out.get(k)
+        if isinstance(v, str) and v and is_abs(v):
+            rel = fr.path_under(v, root)
+            if rel:
+                out[k] = rel
+    return out
+
+
+def paths_abs(j, root):
+    """paths_rel's inverse: a relative path is taken from the install folder; absolute ones (and old files) stay."""
+    out = dict(j)
+    for k in PATHS_KEYS:
+        v = out.get(k)
+        if isinstance(v, str) and v and not is_abs(v):
+            out[k] = os.path.normpath(os.path.join(root, v))
+    return out
 
 
 PORTABLE_FILE = "portable.txt"
@@ -107,8 +143,7 @@ def data_line(portable, rule):
 
 
 def read_ini(root, flag=None):
-    cp = configparser.ConfigParser()
-    cp.read(os.path.join(root, "kz3-install.ini"), encoding="utf-8")
+    cp = fr.ini_parser(os.path.join(root, "kz3-install.ini"))
     g = lambda s, k, d="": cp.get(s, k, fallback=d).strip()  # noqa: E731
     portable, rule = data_mode(root, flag, g("install", "portable"))
     return {"portable": portable, "rule": rule, "check_updates": g("online", "check_updates", "0") == "1",
@@ -116,14 +151,7 @@ def read_ini(root, flag=None):
 
 
 def write_ini(root, section, key, value):
-    p = os.path.join(root, "kz3-install.ini")
-    cp = configparser.ConfigParser()
-    cp.read(p, encoding="utf-8")
-    if not cp.has_section(section):
-        cp.add_section(section)
-    cp.set(section, key, value)
-    with open(p, "w", encoding="utf-8") as f:
-        cp.write(f)
+    fr.ini_set(os.path.join(root, "kz3-install.ini"), [(section, key, value)])
 
 
 def version_line(root):
@@ -134,13 +162,22 @@ def version_line(root):
     return f"version: {names.VERSION}" + (f" (build stamp: {', '.join(rec)})" if rec else "")
 
 
+def _redact(text, root=None):
+    """firstrun's redactor (the install log and the support bundle use it; the install folder becomes %INSTALL%, other
+    absolute paths <path>\\last): the launcher log gets no user name or folder either."""
+    try:
+        return fr.redactor(root)(text)
+    except (re.error, TypeError, ValueError):   # a broken profile variable must not stop the note
+        return text
+
+
 def note(root, text):
     """One line in <root>/logs/launcher.log (what the launcher decided; pythonw has no console). Never fails."""
     try:
         d = os.path.join(root, "logs")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "launcher.log"), "a", encoding="utf-8") as f:
-            f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {text}\n")
+            f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {_redact(text, root)}\n")
     except OSError:
         pass
 
@@ -152,6 +189,24 @@ def ctx_for(root, paths):
 
 
 # ------------------------------------------------------------------------------------------------------ deciding
+def update_problem(update):
+    """"" when the recorded update folder still holds the update (firstrun_check's update checks U1-U3: PARAM.SFO,
+    USRDIR/EBOOT.BIN and the update's data archive), else one plain sentence that names the fix. A folder that exists
+    but was emptied, or replaced by something else, would otherwise build or start into a game that stops at the menu."""
+    if not update or not os.path.isdir(update):
+        return ""
+    r = fc.Report()
+    try:
+        fc.check_update(r, update)
+    except OSError as e:
+        r.fail("U1", f"unreadable ({e})")
+    fails = [c["message"] for c in r.checks if c["level"] == "FAIL"]
+    if not fails:
+        return ""
+    return (f"The 1.14 update folder {update} no longer holds the update ({fails[0]}). "
+            "Pick the folder of the complete installed update again")
+
+
 def decide(root):
     """-> (action, reason); action is one of first-build, missing-inputs, resume, rebuild, run."""
     build = os.path.join(root, "build")
@@ -162,6 +217,9 @@ def decide(root):
     gone = [paths[k] for k in ("dump", "update", "eboot") if paths.get(k) and not os.path.exists(paths[k])]
     if gone:
         return "missing-inputs", "These game folders or files are not found any more: " + ", ".join(gone)
+    bad = update_problem(paths.get("update"))
+    if bad:
+        return "missing-inputs", bad
     stamp = load_json(os.path.join(build, "build-stamp.json"))
     if not stamp or not os.path.isfile(os.path.join(build, "kz3.exe")):
         return "resume", "The last build did not finish"
@@ -292,6 +350,10 @@ def move_entries(entries, src, dst, hashed=True, copy=None):
         os.makedirs(dst, exist_ok=True)
         for n in todo:
             a, t = os.path.join(src, n), os.path.join(dst, n + ".copying")
+            if os.path.lexists(t):   # left by a copy that was killed: not ours to resume (it may be half written)
+                rm(t)
+                if os.path.lexists(t):
+                    raise OSError(f"{n}.copying is left over from an earlier move and cannot be removed")
             tmps.append(t)
             copy(a, t)
             if _tree(a) != _tree(t) or (hashed and _hashes(a) != _hashes(t)):
@@ -345,16 +407,21 @@ def switch_data(root, to_portable, environ, appdata=None, localappdata=None):
     d_src, d_dst = data_dir(root, cur, environ, appdata), data_dir(root, new, environ, appdata)
     c_src = cache_dir(root, cur, environ, localappdata, appdata)
     c_dst = cache_dir(root, new, environ, localappdata, appdata)
-    if os.path.normcase(d_src) == os.path.normcase(d_dst):
-        return False, "%APPDATA% is not available on this computer."
-    ok, m1 = move_entries(DATA_ENTRIES, d_src, d_dst, hashed=True)
-    if not ok:
-        return False, m1
-    m2 = "unchanged"
-    if os.path.normcase(c_src) != os.path.normcase(c_dst):
-        ok, m2 = move_entries(CACHE_ENTRIES, c_src, c_dst, hashed=False)
+    same_data = os.path.normcase(d_src) == os.path.normcase(d_dst)
+    if same_data and cur != new:
+        return False, "%APPDATA% is not available on this computer."   # both sides resolve to the install folder
+    # Same folder and the same mode: the marker file and kz3-install.ini disagree (portable.txt missing), nothing
+    # to move; only the record below is repaired.
+    m1, m2, cache_moved = "Nothing to move", "unchanged", False
+    if not same_data:
+        ok, m1 = move_entries(DATA_ENTRIES, d_src, d_dst, hashed=True)
         if not ok:
-            m2 = "left where they were and rebuilt later (" + m2 + ")"   # a cache is never worth failing for
+            return False, m1
+        if os.path.normcase(c_src) != os.path.normcase(c_dst):
+            ok, m2 = move_entries(CACHE_ENTRIES, c_src, c_dst, hashed=False)
+            cache_moved = ok
+            if not ok:
+                m2 = "left where they were and rebuilt later (" + m2 + ")"   # a cache is never worth failing for
     had = os.path.isfile(marker)
     try:
         if new and not had:
@@ -370,7 +437,13 @@ def switch_data(root, to_portable, environ, appdata=None, localappdata=None):
                 os.remove(marker)
         except OSError:
             pass
-        move_entries(DATA_ENTRIES, d_dst, d_src, hashed=True)   # the mode did not change: put the saves back
+        # the mode did not change: put the saves back, and the caches if they moved too
+        back_ok = True if same_data else move_entries(DATA_ENTRIES, d_dst, d_src, hashed=True)[0]
+        if cache_moved:
+            back_ok = move_entries(CACHE_ENTRIES, c_dst, c_src, hashed=False)[0] and back_ok
+        if not back_ok:
+            return False, (f"could not record the new setting ({e}) and could not put every file back; your saves are in "
+                           f"{d_dst} or {d_src}: copy them back by hand if the game does not find them")
         return False, f"could not record the new setting ({e}); your files are unchanged"
     return True, f"{m1}. Caches: {m2}"
 
@@ -556,16 +629,78 @@ def game_env(root, paths, portable, environ, appdata=None, localappdata=None, bu
         hdd0 = rpcs3_hdd0(paths["update"])
         if hdd0:   # ASSUMPTION (plan 4.3): trophies + update resolve; cellSaveData keeps ./gamedata (cwd), not this
             added["PS3_HDD0_ROOT"] = hdd0
+    added["KZ3_INSTALL_DIR"] = root   # the game's log names it %INSTALL% (kz3_log_redact.h)
+    if not environ.get("KZ3_KEYBINDS"):   # the game picks keybinds.ini/display.ini itself (patch 2037) and knows only
+        added["KZ3_KEYBINDS"] = os.path.join(cwd, "keybinds.ini")   # kz3-install.ini, not portable.txt/--portable: say where
+    for k, v in hand_paths(root, build).items():   # a path the player edited in kz3.ini is theirs (not rewritten)
+        if k == "data_dir":
+            cwd = v
+        else:
+            added[INI_ENV[k]] = v
     env = dict(environ)
     env.update(added)
     return [os.path.join(root, "build", "kz3.exe"), paths["eboot"]], cwd, env, added
 
 
+INI_ENV = {"vfs_root": "PS3_VFS_ROOT", "cache_root": "KZ3_CACHE_ROOT", "update_dir": "KZ3_UPDATE_DIR",
+           "hdd0_root": "PS3_HDD0_ROOT", "edat_cache": "PS3_EDAT_CACHE", "shader_cache": "RSX_SHADER_CACHE_DIR"}
+INI_PATH_KEYS = tuple(INI_ENV) + ("data_dir",)   # the launcher-written path keys a player may set by hand
+INI_WRITTEN = "ini-written.json"   # build/: what the launcher last wrote for INI_PATH_KEYS (a different value = a hand edit)
+
+
+def ini_root_supported(root):
+    """True when the payload's kz3_ini.h knows the `root` key (a relative kz3.ini value is relative to the install
+    folder; tools/release/ini-root.patch). Older exes resolve relative values from the exe's folder (build\\)."""
+    try:
+        with open(os.path.join(root, "port", "kz3", "kz3_ini.h"), encoding="utf-8", errors="replace") as f:
+            return '"root"' in f.read()
+    except OSError:
+        return False
+
+
+def ini_base(root, build=None):
+    """The folder the game takes relative kz3.ini values from: the install folder when the exe knows `root`, else build\\."""
+    return root if ini_root_supported(root) else (build or os.path.join(root, "build"))
+
+
+def ini_rel(p, root, build=None):
+    """`p` as written to kz3.ini: relative to ini_base when it lies below the install folder, else unchanged."""
+    if not p or not is_abs(p) or fr.path_under(p, root) is None:
+        return p
+    return os.path.relpath(os.path.abspath(p), os.path.abspath(ini_base(root, build))).replace("\\", "/")
+
+
+def hand_paths(root, build=None):
+    """{key: absolute path} for the INI_PATH_KEYS the player edited in build/kz3.ini: a value that differs from the one
+    the launcher last wrote (INI_WRITTEN); with no such record (an older install) only a relative value counts, since
+    older launchers wrote absolute ones. Relative values are taken from the folder the game takes them from (ini_base);
+    a value whose folder (for the writable ones, its parent) does not exist is not used (the launcher's value stays)."""
+    build = build or os.path.join(root, "build")
+    old = read_game_ini(os.path.join(build, GAME_INI))
+    rec = load_json(os.path.join(build, INI_WRITTEN))
+    out = {}
+    for k in INI_PATH_KEYS:
+        v = old.get(k)
+        if not v or (rec[k] if rec is not None and k in rec else None) == v:
+            continue
+        if rec is None and is_abs(v):
+            continue
+        a = os.path.normpath(v if is_abs(v) else os.path.join(ini_base(root, build), v))
+        ok = os.path.isdir(a) if k in ("vfs_root", "update_dir", "hdd0_root") else os.path.isdir(os.path.dirname(a) or a)
+        if ok:
+            out[k] = a
+    return out
+
+
 GAME_INI = "kz3.ini"         # next to build\kz3.exe: the game starts with no launch options (pass 26)
 # (section, key) in file order; the runtime's mapping to environment variables is port/kz3/kz3_ini.h.
-GAME_INI_KEYS = (("game", "eboot"), ("game", "vfs_root"), ("game", "cache_root"), ("game", "update_dir"), ("game", "hdd0_root"),
+GAME_INI_KEYS = (("game", "root"), ("game", "eboot"), ("game", "vfs_root"), ("game", "cache_root"), ("game", "update_dir"), ("game", "hdd0_root"),
                  ("game", "edat_cache"), ("game", "shader_cache"), ("game", "data_dir"), ("game", "font_dir"),
-                 ("game", "lang"), ("display", "window_size"))
+                 ("game", "lang"), ("game", "port_version"), ("game", "newer_version"), ("display", "window_size"))
+# Written on every start for the game to show (port/kz3 reads them; the launcher only writes): port_version is always
+# names.VERSION; newer_version only when the opt-in check finished and found a newer release the player has not
+# dismissed (see newer_version_for), and the line is absent otherwise.
+GAME_INI_OPTIONAL = ("root", "eboot", "newer_version")   # root: only when the exe knows it (ini_root_supported)
 # Player choices: from paths.json when the first run recorded one, else the value already in kz3.ini (hand edits stay).
 GAME_INI_CHOICES = ("font_dir", "lang", "window_size")
 GAME_INI_HEAD = f"""; {names.PRODUCT}: what kz3.exe reads when it is started with no arguments (written by the first-run
@@ -574,20 +709,21 @@ GAME_INI_HEAD = f"""; {names.PRODUCT}: what kz3.exe reads when it is started wit
 ; writable folder for the unpacked archive and the cache; empty = vfs_root), update_dir = KZ3_UPDATE_DIR, hdd0_root = PS3_HDD0_ROOT, edat_cache = PS3_EDAT_CACHE,
 ; shader_cache = RSX_SHADER_CACHE_DIR, font_dir = KZ3_FONT_DIR (your PS3 firmware's dev_flash/data/font folder,
 ; optional), lang = KZ3_LANG (optional; default: the system language), window_size = KZ3_WINDOW_SIZE (WxH or
-; 720p/900p/1080p/1440p/2160p/4k; empty = 1280x720). data_dir is the working folder (saves).
+; 720p/900p/1080p/1440p/2160p/4k; empty = 1280x720). data_dir is the working folder (saves). A path below the install
+; folder is written relative to it (a moved install keeps working); one you edit by hand stays as you wrote it (the
+; folder must exist), relative or absolute. root = the install folder, relative to this file. port_version and
+; newer_version are written by the launcher at every start for the game to show; do not edit them.
 """
 
 
 def read_game_ini(path):
     """kz3.ini as {key: value} (keys lower-case, sections ignored as the runtime does, kz3_ini.h: the first non-empty
-    value of a key counts)."""
+    value of a key counts). Read with the rule every ini reader uses (UTF-8, else the ANSI code page), the same one
+    write_game_ini's output is read back by."""
     out = {}
-    try:
-        with open(path, "rb") as f:
-            raw = f.read()
-    except OSError:
+    text = _ini_text(path)
+    if text is None:
         return out
-    text = raw.decode("utf-8-sig") if raw.startswith(b"\xef\xbb\xbf") else raw.decode("utf-8", "replace")
     for line in text.splitlines():
         s = line.strip()
         if not s or s[0] in ";#[" or "=" not in s:
@@ -600,51 +736,71 @@ def read_game_ini(path):
     return out
 
 
-def game_ini(root, paths, portable, environ, appdata=None, build=None, localappdata=None):
+def newer_version_for(check_updates, found, declined=False):
+    """The newer_version value for kz3.ini: the version found by a finished check (newer_from_result's (latest, url) or
+    None), only when the opt-in check is on, the player has not dismissed that version (newer_from_result) and did not
+    just answer No to its prompt; "" otherwise."""
+    return found[0] if check_updates and found and not declined else ""
+
+
+def game_ini(root, paths, portable, environ, appdata=None, build=None, localappdata=None, newer=""):
     """-> {key: value} for kz3.ini: the same game paths game_env gives as variables, plus the EBOOT, the working
-    folder and the player's choices (paths.json, else what kz3.ini already holds)."""
+    folder, the player's choices (paths.json, else what kz3.ini already holds) and the version block (port_version,
+    newer_version; newer = newer_version_for(...))."""
     _, cwd, _, added = game_env(root, paths, portable, environ, appdata, localappdata, build)
     old = read_game_ini(os.path.join(build or os.path.join(root, "build"), GAME_INI))
+    hand = hand_paths(root, build)
     # Step 9s: an exe with the EBOOT linked in (build-stamp.json eboot_embedded) gets no eboot line; kz3.exe still
     # reads one from an older kz3.ini, and an exe built before 9s keeps needing it.
     stamp = load_json(os.path.join(build or os.path.join(root, "build"), "build-stamp.json")) or {}
     v = {"eboot": "" if stamp.get("eboot_embedded") else paths.get("eboot", ""), "vfs_root": added["PS3_VFS_ROOT"],
          "cache_root": added.get("KZ3_CACHE_ROOT", ""), "update_dir": added.get("KZ3_UPDATE_DIR", ""), "hdd0_root": added.get("PS3_HDD0_ROOT", ""),
-         "edat_cache": added["PS3_EDAT_CACHE"], "shader_cache": added["RSX_SHADER_CACHE_DIR"], "data_dir": cwd}
+         "edat_cache": added["PS3_EDAT_CACHE"], "shader_cache": added["RSX_SHADER_CACHE_DIR"], "data_dir": cwd,
+         "port_version": names.VERSION, "newer_version": newer}
     for k in GAME_INI_CHOICES:
         v[k] = paths.get(k) or old.get(k, "")
+    if paths.get("font_dir"):
+        v["font_dir"] = ini_rel(v["font_dir"], root, build)
+    for k in ("eboot",) + INI_PATH_KEYS:   # in-install paths relative; hand-edited ones as the player wrote them
+        v[k] = old[k] if k in hand else ini_rel(v[k], root, build)
+    if ini_root_supported(root):
+        v["root"] = os.path.relpath(root, build or os.path.join(root, "build")).replace("\\", "/")
+    v["_hand"] = sorted(hand)
     return v
 
 
 def _ini_text(path):
-    """The text of an ini file, or None: UTF-8 (with or without BOM), else the ANSI code page the file is written in."""
-    try:
-        with open(path, "rb") as f:
-            raw = f.read()
-    except OSError:
+    """The text of an ini file, or None when it cannot be read (see firstrun.ini_text for the encoding rule)."""
+    if not os.path.isfile(path):
         return None
-    try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return raw.decode("mbcs" if os.name == "nt" else "latin-1", "replace")
+    return fr.ini_text(path)[0]
 
 
 def extra_game_ini(path):
-    """The lines of kz3.ini the launcher does not own -> [(section, key, line)] in file order: every key=value line
+    """The lines of kz3.ini the launcher does not own -> [(section, key, text)] in file order: every key=value line
     whose key is not one of GAME_INI_KEYS (the runtime ignores sections, so an owned key is dropped wherever it
-    stands: the launcher's value wins). Lines before any [section] get section "". Comments and blank lines are not
-    kept (the file's own header is rewritten on each start)."""
+    stands: the launcher's value wins). Lines before any [section] get section "". The comment lines directly above a
+    kept key stay with it (text is then several lines); the launcher's own header lines, other comments and blank
+    lines are not kept (the header is rewritten on each start)."""
     text = _ini_text(path)
-    out, sec = [], ""
+    out, sec, pending = [], "", []
     owned = {k for _, k in GAME_INI_KEYS}
+    head = {ln.strip() for ln in GAME_INI_HEAD.splitlines()}
     for line in (text or "").splitlines():
         s = line.strip()
         if s.startswith("[") and s.endswith("]"):
             sec = s[1:-1].strip()
-        elif s and s[0] not in ";#" and "=" in s:
+            pending = []
+        elif s and s[0] in ";#":
+            if s not in head:
+                pending.append(s)
+        elif s and "=" in s:
             k = s.split("=", 1)[0].strip()
             if k and k.lower() not in owned:
-                out.append((sec, k, s))
+                out.append((sec, k, "\n".join(pending + [s])))
+            pending = []
+        else:
+            pending = []
     return out
 
 
@@ -654,16 +810,16 @@ def set_game_ini_key(root, key, value, section="game", build=None):
     p = os.path.join(build or os.path.join(root, "build"), GAME_INI)
     extra = extra_game_ini(p)
     line, hit = f"{key} = {value}", False
-    for i, (sec, k, _) in enumerate(extra):
+    for i, (sec, k, old) in enumerate(extra):
         if k.lower() == key.lower():
-            extra[i] = (sec, k, line)
+            extra[i] = (sec, k, "\n".join(old.split("\n")[:-1] + [line]))   # its comment lines stay
             hit = True
     if not hit:
         extra.append((section, key, line))
-    return write_game_ini(root, read_game_ini(p), build=build, extra=extra)
+    return write_game_ini(root, read_game_ini(p), build=build, extra=extra, record=False)
 
 
-def write_game_ini(root, values, build=None, extra=None):
+def write_game_ini(root, values, build=None, extra=None, record=True):
     """Write <root>/build/kz3.ini; -> its path. Every other key=value line already in the file (a setting the player
     added, e.g. discord_presence = 1) is kept, with its section, after the launcher's keys (extra_game_ini; comments
     are not kept). The runtime opens files with the ANSI code page (fopen), so on Windows
@@ -674,8 +830,8 @@ def write_game_ini(root, values, build=None, extra=None):
     lines, sec = [GAME_INI_HEAD.rstrip("\n")], None
     done = set()
     for s, k in GAME_INI_KEYS:
-        if k == "eboot" and not values.get(k):
-            continue   # step 9s: the EBOOT is inside kz3.exe
+        if k in GAME_INI_OPTIONAL and not values.get(k):
+            continue   # eboot (step 9s): inside kz3.exe; newer_version: no newer release to show
         if s != sec:
             if sec is not None:
                 lines += [e[2] for e in extra if e[0].lower() == sec]
@@ -691,12 +847,24 @@ def write_game_ini(root, values, build=None, extra=None):
             lines += ["", f"[{s}]"] + [e[2] for e in extra if e[0] == s]
     text = "\n".join(lines) + "\n"
     try:
-        data = text.encode("mbcs" if os.name == "nt" else "utf-8")
+        # the same rule the reader uses (firstrun.ini_text): the ANSI code page on Windows; elsewhere the file's own
+        # code page (UTF-8 when it is new), so a hand-written ANSI value is not turned into something else
+        codec = fr.ini_text(p)[1]
+        data = text.encode("mbcs" if os.name == "nt" else ("utf-8" if codec == "utf-8-sig" else codec))
     except UnicodeEncodeError:
         data = text.encode("utf-8")
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "wb") as f:
+    tmp = p + ".tmp"   # written whole, then swapped in: a kill in between leaves the old file
+    with open(tmp, "wb") as f:
         f.write(data.replace(b"\n", b"\r\n") if os.name == "nt" else data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+    if record:   # what was written, minus the hand-edited keys (those stay "different" so the next start keeps them)
+        hand = values.get("_hand") or ()
+        rp = os.path.join(os.path.dirname(p), INI_WRITTEN)
+        with open(rp, "w", encoding="utf-8") as f:
+            json.dump({k: values.get(k, "") for k in INI_PATH_KEYS if k not in hand and values.get(k)}, f, indent=1)
     return p
 
 
@@ -727,8 +895,7 @@ def game_argv(root, paths, extra=()):
 def setup_paths(root):
     """The folders the installer wizard resolved (kz3-install.ini [paths]: dump, update, eboot, font_dir), or {}.
     Only a pair of dump and update counts: the wizard writes both whenever it writes any."""
-    cp = configparser.ConfigParser()
-    cp.read(os.path.join(root, "kz3-install.ini"), encoding="utf-8")
+    cp = fr.ini_parser(os.path.join(root, "kz3-install.ini"))
     g = {k: cp.get("paths", k, fallback="").strip() for k in ("dump", "update", "eboot", "font_dir")}
     bad = [k for k, v in g.items() if any(c in v for c in fr.CMAKE_BAD)]
     g = {k: ("" if k in bad else v) for k, v in g.items()}   # a recorded path with [ ] ; is dropped and asked again
@@ -747,7 +914,7 @@ def firstrun_cmd(root, action, paths, portable, python):
             a += ["--eboot", given["eboot"]]
         if given["font_dir"]:
             a += ["--font-dir", given["font_dir"]]
-        return a
+        return a + (["--portable"] if portable else [])
     if action in ("first-build", "missing-inputs") or not paths:
         return a + ["--interactive"] + (["--portable"] if portable else [])
     a += ["--bar", "--dump", paths["dump"]]
@@ -918,7 +1085,7 @@ def support_package(root, ini, environ, out, ui, today):
         out = desk if os.path.isdir(desk) else root
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     try:
-        dest, skipped = support.build(root, data_dir(root, ini["portable"], environ), out, fr.redactor(), stamp)
+        dest, skipped = support.build(root, data_dir(root, ini["portable"], environ), out, fr.redactor(root), stamp)
     except OSError as e:
         ui.info(st.FAILED.format(why=e.strerror or "the folder cannot be written"))
         return 1
@@ -1067,12 +1234,15 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
         if moved:
             note(root, moved)
     nv = newer_from_result(os.path.join(logs, "version-check.txt"), ini["dismissed"])
+    declined = False
     if nv:
         if ui.ask(f"{TITLE} {nv[0]} is out. Open its release page?"):
             if nv[1].startswith("https://"):
                 ui.open_url(nv[1])
         else:
             write_ini(root, "online", "dismissed", nv[0])
+            declined = True
+    newer = newer_version_for(ini["check_updates"], nv, declined)
     if check_due(ini, today):
         os.makedirs(logs, exist_ok=True)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1107,6 +1277,7 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
             ui.info(f"{did_not_finish(rc, 'The build did not finish')}. {log_note(root)}")
             return rc
         ini = read_ini(root, flag)   # --interactive may have written portable/check_updates
+        note(root, data_line(ini["portable"], ini["rule"]))   # the mode the game will use, after the first run decided
         action, reason = decide(root)
         paths = load_json(os.path.join(root, "build", "paths.json")) or {}
         if action != "run":
@@ -1120,7 +1291,7 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
         ui.info(f"{err}.{REPORT}")
         return 1
     gargv = game_argv(root, paths, extra)
-    note(root, f"kz3.ini: {write_game_ini(root, game_ini(root, paths, ini['portable'], environ))}")
+    note(root, f"kz3.ini: {write_game_ini(root, game_ini(root, paths, ini['portable'], environ, newer=newer))}")
     note(root, "game: " + " ".join(gargv) + f" (cwd {cwd}; the game's log is in build\\logs)")
     fr.place_lang(root, os.path.dirname(gargv[0]))
     fr.place_fonts(root, os.path.dirname(gargv[0]))     # the notice fonts next to kz3.exe (RSX pass 38)

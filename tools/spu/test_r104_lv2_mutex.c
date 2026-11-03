@@ -4,6 +4,8 @@
  *   csteal   sys_cond_signal from the mutex owner: at the owner's unlock the mutex goes straight to the woken waiter,
  *            so a third thread's trylock in that gap gets EBUSY (ours woke the waiter and let it re-lock).
  *   munlock  unlock with a thread asleep in lock: lv2 hands the mutex to that thread (FIFO), a barging trylock gets EBUSY.
+ *   sigto    sys_cond_signal_to wakes only the named thread (was a broadcast) and returns EPERM when that thread is not
+ *            waiting on the cond (lv2; idea credit: the Ratchet & Clank port's rebased patch 7007).
  *   mdestroy destroy: EBUSY while owned, EPERM while a cond is bound, OK when idle, then ESRCH.
  * Self-contained (no game data). Prints PASS/FAIL per case; exit 1 on any failure. */
 #include "runtime/platform/win32_compat.h"
@@ -100,6 +102,41 @@ static void t_munlock(int iters)
     printf("%s munlock (%d/%d iterations wrong)\n", bad ? "FAIL" : "PASS", bad, iters); g_fail |= bad != 0;
 }
 
+static _Atomic int woke[8];
+static void* sigto_waiter(void* a)
+{
+    uint32_t tid = (uint32_t)(uintptr_t)a;
+    call(sys_mutex_lock, tid, mid, 0);
+    st++;
+    call(sys_cond_wait, tid, cid, 0);
+    woke[tid] = 1;
+    call(sys_mutex_unlock, tid, mid, 0);
+    return NULL;
+}
+static void t_sigto(void)
+{
+    mid = mk_mutex(0x200, SYS_SYNC_NOT_RECURSIVE);
+    call(sys_cond_create, 1, 0x204, mid); cid = be(0x204);
+    st = 0; memset((void*)woke, 0, sizeof woke);
+    pthread_t t1, t4;
+    pthread_create(&t1, NULL, sigto_waiter, (void*)(uintptr_t)1); while (st < 1) sleep_ms(1); sleep_ms(10);
+    pthread_create(&t4, NULL, sigto_waiter, (void*)(uintptr_t)4); while (st < 2) sleep_ms(1); sleep_ms(10);
+    call(sys_mutex_lock, 2, mid, 0);
+    int32_t r_absent = call(sys_cond_signal_to, 2, cid, 7);   /* thread 7 does not wait */
+    int32_t r_named = call(sys_cond_signal_to, 2, cid, 4);    /* the second waiter, not the oldest */
+    call(sys_mutex_unlock, 2, mid, 0);
+    pthread_join(t4, NULL); sleep_ms(20);
+    int only4 = woke[4] && !woke[1];
+    int32_t r_again = call(sys_cond_signal_to, 2, cid, 4);    /* 4 has left the cond: EPERM again */
+    call(sys_mutex_lock, 2, mid, 0); call(sys_cond_signal, 2, cid, 0); call(sys_mutex_unlock, 2, mid, 0);
+    pthread_join(t1, NULL);
+    call(sys_cond_destroy, 1, cid, 0); call(sys_mutex_destroy, 1, mid, 0);
+    int bad = r_absent != (int32_t)CELL_EPERM || r_named != 0 || !only4 || r_again != (int32_t)CELL_EPERM || !woke[1];
+    printf("%s sigto (absent 0x%08X, named 0x%08X, only the named woke %d, again 0x%08X)\n", bad ? "FAIL" : "PASS",
+           (uint32_t)r_absent, (uint32_t)r_named, only4, (uint32_t)r_again);
+    g_fail |= bad;
+}
+
 static void t_mdestroy(void)
 {
     int bad = 0;
@@ -124,6 +161,7 @@ int main(int argc, char** argv)
     vm_base = calloc(1, 65536);
     setvbuf(stdout, NULL, _IONBF, 0);
     t_mdestroy();
+    t_sigto();
     t_munlock(iters);
     t_csteal(iters);
     return g_fail ? 1 : 0;

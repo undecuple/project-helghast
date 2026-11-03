@@ -1,0 +1,151 @@
+KZ3 patch 1150 (SPU pass 139): a SPURS task dispatched by the taskset exit scan or by spu_taskset_dispatch runs as the task id its
+dispatcher chose, passed as an argument (spu_dispatch_async_ids) instead of through the globals g_ydkj_real_taskset_ea /
+g_ydkj_real_taskid. Credit: the Killzone 2 port, its patch 7004 (same race, found there first).
+Why: cellSpursCreateTask writes those globals outside the taskset scan's lock on its PPU thread; landing between the scan's write
+(spu_taskset_task_exited / spu_taskset_dispatch) and spu_workload_dispatch_async's read, it gave the job another task's id: the job ran
+its image with that task's TaskInfo (argument, context), its exit cleared that task's bits, and its own task stayed enabled and
+running with nothing behind it. spu_async_run's image-22 (YDKJ cri) paths now build their context from the job's ids too. The
+workload-policy and sys_event callers of spu_workload_dispatch_async keep the globals (the last taskset and task the PPU created, what
+they were written for). spu_async_run logs "[taskset] MISMATCH" (first 16, then every power of two) when a job's image is not the ELF
+its task's TaskInfo names (TaskInfo at taskset + 0x80 + 48 * task, the ELF EA's low word at +0x14, flags masked): a scheduler fault.
+SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu/test_r139_task_ids.sh.
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1482,7 +1482,9 @@
+               spu_taskset2_set_exit(taskset_ea, i, 0, 0); }   /* fresh entry for a recycled id */
+             spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
+                                    (uint64_t)context_ea, task_arg, task_lsp);
+-            /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
++            /* Bridge to the image-22 dispatch so build_context uses this taskset+task.
++             * KZ3 patch 1150: only YDKJ's cri paths read these now. This store is outside the taskset scan's lock, so
++             * it must not feed a dispatch: spu_taskset_dispatch passes (taskset_ea, i) itself. */
+             g_ydkj_real_taskset_ea = taskset_ea;
+             g_ydkj_real_taskid     = i;
+ 
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -864,6 +864,8 @@
+                 task, create ? "created:" : "exited:", task, e[15], exit_code);
+ }
+ 
++static int spu_dispatch_async_ids(const uint8_t* image, uint32_t image_size, uint32_t args_ea,
++                                  uint32_t taskset_ea, uint32_t taskid);   /* KZ3 patch 1150 */
+ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task, int32_t exit_code)
+ {
+     extern uint8_t* vm_base;
+@@ -925,7 +927,8 @@
+         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
+         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
+-        spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
++        spu_dispatch_async_ids(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i],
++                               taskset_ea, start_t[i]);   /* KZ3 patch 1150 */
+     }
+     s_ts_held = 0; ts_unlock();
+ }
+@@ -1021,7 +1024,7 @@
+     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+     ts_lock(); s_ts_held = 1;   /* dispatch_async marks the task running (#381): held, CreateTask marked it */
+     g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
+-    int rc = spu_workload_dispatch_async(image, size, ctx);
++    int rc = spu_dispatch_async_ids(image, size, ctx, taskset_ea, t);   /* KZ3 patch 1150 */
+     if (!rc && taskset_ea && t < 128) {           /* not started: let a later scan try */
+         uint8_t* r = ts_running(taskset_ea);
+         if (r) r[t / 8] &= (uint8_t)~(0x80u >> (t & 7));
+@@ -1098,8 +1101,8 @@
+                  * real 0x40009F00 -> policy DMA'd garbage -> null branches. */
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                 extern uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+-                if (g_ydkj_real_taskset_ea)
+-                    spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
++                if (j->taskset_ea)   /* KZ3 patch 1150 (KZ2 7004): this job's ids */
++                    spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
+                 uint32_t inst = g_ydkj_real_spurs_ea ? g_ydkj_real_spurs_ea : 0x40009D00u;
+                 uint8_t* p = ls + 0x1C0;
+                 p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
+@@ -1129,11 +1132,11 @@
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                 extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                 #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
+-                if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
++                if (j->taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {   /* KZ3 patch 1150: this job's ids */
+                     /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
+                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
+                      * so the cri leaf reads valid data instead of my planted guesses. */
+-                    uint64_t elf = spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
++                    uint64_t elf = spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
+                     /* --- Golden-reference context fields for the CRI task, recovered from a
+                      * WORKING RPCS3 SPU-LS snapshot via caner's rpcs3-guest-memory-dumper fork
+                      * (github.com/canersaka/rpcs3-guest-memory-dumper): YDKJ BLUS30569, SPU0
+@@ -1169,7 +1172,7 @@
+                       if ((_e=getenv("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
+                           LSBE32(0x2798,v); LSBE32(0x279C,v); } }
+                     fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
+-                            g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
++                            j->taskset_ea, j->taskid, (unsigned long long)elf);
+                 } else {
+                     LSBE32(0x27C0, 0x100);     /* kernelMgmtAddr -> SPURS kernel ctx @LS 0x100 */
+                     LSBE32(0x27C4, 0xA70);     /* syscallAddr -> HLE PM syscall trampoline (0xA70) */
+@@ -1235,6 +1238,23 @@
+                  * globals, which the next CreateTask clobbers -- the race that made
+                  * both audio tasks run task 1's descriptor). */
+                 if (j->taskset_ea) {
++                    /* KZ3 patch 1150 (KZ2 7004): the task this job runs as must be the one whose TaskInfo names its ELF
++                     * (CSTS_TASKINFO 0x80 + 48 * task, TI_ELF be u64 at +0x10 so its low word at +0x14); otherwise the
++                     * context below is another task's. Counted and logged: a scheduler fault, not a trace. */
++                    if (j->taskid < 128) {
++                        extern uint8_t* vm_base;
++                        const uint8_t* ti = vm_base + j->taskset_ea + 0x80 + 0x30 * j->taskid;
++                        uint32_t te = (((uint32_t)ti[0x14] << 24) | ((uint32_t)ti[0x15] << 16) |
++                                       ((uint32_t)ti[0x16] << 8) | ti[0x17]) & ~0xFu;
++                        if (vm_base + te != j->image) {
++                            static volatile long s_mm;
++                            long k = __atomic_add_fetch(&s_mm, 1, __ATOMIC_RELAXED);
++                            if (k <= 16 || (k & (k - 1)) == 0)
++                                fprintf(stderr, "[taskset] MISMATCH #%ld: image=%d (elf 0x%08X) runs as task %u of "
++                                        "taskset 0x%08X, whose TaskInfo elf is 0x%08X\n", k, j->image_id,
++                                        (uint32_t)(j->image - vm_base), j->taskid, j->taskset_ea, te);
++                        }
++                    }
+                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
+                     fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                             "taskset=0x%08X task=%u\n", j->image_id,
+@@ -1909,9 +1929,28 @@
+     return 0;
+ }
+ 
++/* KZ3 patch 1150 (from the Killzone 2 port's patch 7004): the taskset and task id a dispatched task runs as are passed by the
++ * caller. They used to travel through the globals g_ydkj_real_taskset_ea / g_ydkj_real_taskid, which every dispatcher set
++ * just before calling here and which this function copied into the job. The task-exit scan (spu_taskset_task_exited) and
++ * spu_taskset_dispatch set them under the scan lock, but cellSpursCreateTask also writes them outside that lock on another
++ * PPU thread, so a CreateTask landing between a scan's write and this read handed the scan's job the new task's id: image A's
++ * code ran with task B's TaskInfo (args, context), its exit cleared task B's bits, and task A stayed enabled with nothing
++ * behind it. SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). */
++static int spu_task_ids_global(void)
++{ static int g = -1; if (g < 0) { const char* e = getenv("SPU_TASK_IDS_GLOBAL"); g = (e && e[0] == '1'); } return g; }
++
+ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+                                 uint32_t args_ea)
+ {
++    /* Callers outside a taskset scan (cellSpurs' workload policy dispatch, sys_event's cri path) keep the globals: the last
++     * taskset and task the PPU created, which is what those paths were written for. */
++    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
++    return spu_dispatch_async_ids(image, image_size, args_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid);
++}
++
++static int spu_dispatch_async_ids(const uint8_t* image, uint32_t image_size, uint32_t args_ea,
++                                  uint32_t taskset_ea, uint32_t taskid)
++{
+     if (!image || image_size == 0) return 0;
+ 
+     uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
+@@ -1955,7 +1994,8 @@
+      * set the globals for THIS task). Reading them later in the async thread races
+      * the next CreateTask overwriting the single-slot globals -- with two audio
+      * tasks that made both run task 1's descriptor. */
+-    { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
++    j->taskset_ea = taskset_ea; j->taskid = taskid;   /* KZ3 patch 1150: the caller's ids, not the globals */
++    if (spu_task_ids_global()) { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+       j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+     /* Mark the task running NOW, not when its thread starts: in that gap another
+      * task's exit saw it ready-but-not-running and started it a second time

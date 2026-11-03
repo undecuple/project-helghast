@@ -1,0 +1,125 @@
+KZ3 patch 1143 (SPU pass 128): kz3_kwake (patch 1074) no longer sleeps in an SRW lock + condition variable under
+Wine/Proton. Ported from KZ2 patch 7007 (Killzone 2 port, Project Pyrrhus, SPU pass 20,
+2026-10-29): GE-Proton11-7's RtlWaitOnAddress exits without the futex-queue lock after a timeout when its entry's
+address already reads 0, while RtlWakeAddressAll/Single clear it first and unlink afterwards; reused stack gets
+linked into the bucket and a later wake faults (read of -1 at RtlWakeAddressAll+0xCA). Fix: per-thread auto-reset
+events. Difference from 7007: used only under Wine (ntdll exports wine_get_version); native Windows keeps SRW + CV.
+Also: spu_take_interrupt prints "[spu-irq] b2b=N" every 262144 back-to-back takes (patch 1142 counter).
+Upstream candidate for Wine (the race), nothing sent.
+
+--- a/runtime/spu/spurs_kern_sched.h
++++ b/runtime/spu/spurs_kern_sched.h
+@@ -26,6 +26,7 @@
+ #ifndef SPURS_KERN_SCHED_H
+ #define SPURS_KERN_SCHED_H
+ #include <stdint.h>
++#include <string.h>
+ 
+ #define KZ3_KSEL_NONE      0x20u   /* no workload: the SPU idles (SPURS_SYS_SERVICE_WID in the firmware) */
+ #define KZ3_POLL_READY     1u      /* poll status: readyCount > contention */
+@@ -112,22 +113,85 @@ static inline void kz3_kleave(uint8_t* S, uint32_t wid)
+  * so a wake between the evaluation and the wait is never lost. */
+ #ifdef _WIN32
+ #include <windows.h>
+-typedef struct { SRWLOCK lk; CONDITION_VARIABLE cv; volatile LONG gen; } kz3_kwake;
+-static inline void kz3_kwake_init(kz3_kwake* w) { InitializeSRWLock(&w->lk); InitializeConditionVariable(&w->cv); w->gen = 0; }
++/* KZ3 patch 1143 (from KZ2 patch 7007, Killzone 2 port, SPU pass 20, note of 2026-10-29): under Wine/Proton (GE-Proton
++ * 11) an SRW lock + condition variable wait through ntdll's RtlWaitOnAddress, whose waiter, once its wait has ended (the
++ * 1 ms timeout), leaves without the futex-queue lock when it sees its entry's address already cleared, while the waker
++ * (RtlWakeAddressAll / Single) clears that address before it unlinks the entry and reads the entry's next pointer again
++ * after the clear. When the waiter's stack is reused in that window the waker links garbage into the futex bucket and a
++ * later wake or wait on any address of that bucket faults (read of -1 at RtlWakeAddressAll+0xCA, via
++ * SleepConditionVariableSRW <- spurs_kernel_thread). The idle SPUs time out ~1000 times a second each while signals
++ * come at every module exit: the place where the two meet most.
++ * Under Wine each sleeping thread therefore waits on its own auto-reset event (WaitForSingleObject: fsync/ntsync or the
++ * server, no ntdll futex queue): the waiter publishes that it sleeps, then re-reads the generation; the signal bumps
++ * the generation, then sets the event of every thread that sleeps (all sequentially consistent, so a wake between the
++ * caller's evaluation and the wait is never lost, as before). A set event left over after a timeout ends that thread's
++ * next wait at once (one spurious pass). A thread takes a slot of the kwake on its first wait (a kernel thread serves
++ * one instance); with all KZ3_KWAKE_SLOTS taken it polls (Sleep(ms)).
++ * Difference from KZ2's patch: the event path is used only under Wine (ntdll exports wine_get_version). The race is in
++ * Wine's own RtlWaitOnAddress; Microsoft's SRW/condition variable code is a different implementation that does not
++ * have it, and on native Windows the SRW path costs one wake call per signal instead of one SetEvent per sleeper. */
++#define KZ3_KWAKE_SLOTS 16
++typedef struct {
++    volatile LONG gen, nslot;
++    int events;                              /* 1: per-thread events (Wine), 0: SRW lock + condition variable */
++    volatile LONG sleeping[KZ3_KWAKE_SLOTS];
++    HANDLE ev[KZ3_KWAKE_SLOTS];
++    SRWLOCK lk; CONDITION_VARIABLE cv;
++} kz3_kwake;
++static inline int kz3_is_wine(void)
++{
++    HMODULE nt = GetModuleHandleA("ntdll.dll");
++    return nt && GetProcAddress(nt, "wine_get_version") != NULL;
++}
++static inline void kz3_kwake_init(kz3_kwake* w)
++{
++    memset((void*)w, 0, sizeof *w);
++    InitializeSRWLock(&w->lk); InitializeConditionVariable(&w->cv);
++    w->events = kz3_is_wine();
++}
+ static inline uint32_t kz3_kwake_gen(kz3_kwake* w) { return (uint32_t)__atomic_load_n(&w->gen, __ATOMIC_ACQUIRE); }
+ static inline void kz3_kwake_signal(kz3_kwake* w)
+ {
+-    AcquireSRWLockExclusive(&w->lk); __atomic_add_fetch(&w->gen, 1, __ATOMIC_ACQ_REL); ReleaseSRWLockExclusive(&w->lk);
+-    WakeAllConditionVariable(&w->cv);
++    if (!w->events) {
++        AcquireSRWLockExclusive(&w->lk); __atomic_add_fetch(&w->gen, 1, __ATOMIC_ACQ_REL); ReleaseSRWLockExclusive(&w->lk);
++        WakeAllConditionVariable(&w->cv);
++        return;
++    }
++    __atomic_add_fetch(&w->gen, 1, __ATOMIC_SEQ_CST);
++    LONG n = __atomic_load_n(&w->nslot, __ATOMIC_ACQUIRE);
++    if (n > KZ3_KWAKE_SLOTS) n = KZ3_KWAKE_SLOTS;
++    for (LONG s = 0; s < n; s++)
++        if (__atomic_load_n(&w->sleeping[s], __ATOMIC_SEQ_CST)) SetEvent(w->ev[s]);   /* ev[s] is set before sleeping[s] */
++}
++/* This thread's slot in w (-1: none left). A thread keeps up to 4 (kwake, slot) pairs. */
++static inline int kz3_kwake_slot(kz3_kwake* w)
++{
++    static __thread kz3_kwake* t_w[4];
++    static __thread int t_s[4];
++    for (int i = 0; i < 4; i++) if (t_w[i] == w) return t_s[i];
++    const LONG s = InterlockedIncrement(&w->nslot) - 1;
++    if (s >= KZ3_KWAKE_SLOTS) return -1;
++    w->ev[s] = CreateEventW(NULL, FALSE, FALSE, NULL);   /* auto-reset */
++    if (!w->ev[s]) return -1;
++    for (int i = 0; i < 4; i++) if (!t_w[i]) { t_w[i] = w; t_s[i] = (int)s; break; }
++    return (int)s;
+ }
+ /* Returns 1 when woken (gen moved), 0 on the timeout. */
+ static inline int kz3_kwake_wait(kz3_kwake* w, uint32_t seen, unsigned ms)
+ {
+-    int woke = 1;
+-    AcquireSRWLockExclusive(&w->lk);
+-    if ((uint32_t)w->gen == seen) { SleepConditionVariableSRW(&w->cv, &w->lk, ms, 0); woke = (uint32_t)w->gen != seen; }
+-    ReleaseSRWLockExclusive(&w->lk);
+-    return woke;
++    if (!w->events) {
++        int woke = 1;
++        AcquireSRWLockExclusive(&w->lk);
++        if ((uint32_t)w->gen == seen) { SleepConditionVariableSRW(&w->cv, &w->lk, ms, 0); woke = (uint32_t)w->gen != seen; }
++        ReleaseSRWLockExclusive(&w->lk);
++        return woke;
++    }
++    const int s = kz3_kwake_slot(w);
++    if (s < 0) { if (kz3_kwake_gen(w) == seen) Sleep(ms); return kz3_kwake_gen(w) != seen; }
++    __atomic_store_n(&w->sleeping[s], 1, __ATOMIC_SEQ_CST);
++    if ((uint32_t)__atomic_load_n(&w->gen, __ATOMIC_SEQ_CST) == seen) WaitForSingleObject(w->ev[s], ms);
++    __atomic_store_n(&w->sleeping[s], 0, __ATOMIC_RELEASE);
++    return kz3_kwake_gen(w) != seen;
+ }
+ #else
+ #include <pthread.h>
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -600,7 +600,7 @@ void (SPU_ABI *spu_take_interrupt(spu_context* ctx,
+      * restore between them, SPU pass 121 captures). */
+     if (ctx->irq_saved && (ctx->pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK) &&
+         spu_irq_regs_maybe_restore(ctx))
+-        g_spu_irq_b2b++;
++        if ((++g_spu_irq_b2b & 0x3FFFFu) == 0) fprintf(stderr, "[spu-irq] b2b=%lu\n", g_spu_irq_b2b);   /* patch 1143: count line every 262144 */
+     const uint8_t* v = ctx->ls;      /* vector word at LS 0, big-endian */
+     uint32_t w = ((uint32_t)v[0] << 24) | ((uint32_t)v[1] << 16) |
+                  ((uint32_t)v[2] << 8) | v[3];

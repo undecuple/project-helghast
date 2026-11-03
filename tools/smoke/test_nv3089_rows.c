@@ -10,7 +10,7 @@
 #include <string.h>
 
 #define MEM (1u << 20)
-static uint8_t A[MEM], B[MEM];
+static uint8_t A[MEM], B[MEM], C[MEM];
 static uint32_t rnd(void) { static uint64_t s = 0x9E3779B97F4A7C15ull; s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)s; }
 
 /* cellGcmSys.c nv3089_blit, CPU loop (byte swaps cancel); addresses wrap at 32 bits, masked into the buffer. */
@@ -41,6 +41,7 @@ static int refuse(uint32_t lo, uint64_t n) { (void)lo; (void)n; return 0; }
 int main(void)
 {
     unsigned copied = 0, declined = 0, empty = 0, bad = 0, refused_ok = 0;
+    unsigned copied_x = 0, declined_x = 0, x_gain = 0, x_loss = 0;
     for (int it = 0; it < 20000; it++) {
         for (uint32_t i = 0; i < MEM; i += 4) { uint32_t r = rnd(); memcpy(A + i, &r, 4); }
         memcpy(B, A, MEM);
@@ -62,7 +63,22 @@ int main(void)
         if (!done) { memcpy(B, A, MEM); ref_copy(B, src, in_pitch, u0, v0, dst, dst_pitch, out_x, out_y, out_w, out_h,
                                                  cx0, cx1, cy0, cy1, bpp); declined++; }
         else if (bytes) copied++; else empty++;
+        /* patch 2140: the exact overlap rule on the same case (C starts as A, like B did) */
+        memcpy(C, A, MEM);
+        uint64_t bytes_x = 0;
+        const int done_x = (dst >= MEM / 2 + 0x40000u) ? 0 :
+            nv3089_rows_copy_x(C, src, in_pitch, u0, v0, dst, dst_pitch, out_x, out_y, out_w, out_h, cx0, cx1, cy0,
+                               cy1, bpp, &bytes_x, NULL, 1);
+        if (!done_x) { memcpy(C, A, MEM); ref_copy(C, src, in_pitch, u0, v0, dst, dst_pitch, out_x, out_y, out_w,
+                                                   out_h, cx0, cx1, cy0, cy1, bpp); declined_x++; }
+        else if (bytes_x) { copied_x++; if (!done) x_gain++; }
+        if (done && !done_x) x_loss++;   /* the exact rule must never decline what the range rule copied */
         ref_copy(A, src, in_pitch, u0, v0, dst, dst_pitch, out_x, out_y, out_w, out_h, cx0, cx1, cy0, cy1, bpp);
+        if (memcmp(A, C, MEM)) {
+            if (bad++ < 5) fprintf(stderr, "[test_nv3089_rows] EXACT MISMATCH it=%d bpp=%u %ux%u at %u,%u src=0x%X/%u"
+                                   " dst=0x%X/%u\n", it, bpp, out_w, out_h, out_x, out_y, src, in_pitch, dst,
+                                   dst_pitch);
+        }
         if (memcmp(A, B, MEM)) {
             if (bad++ < 5) fprintf(stderr, "[test_nv3089_rows] MISMATCH it=%d bpp=%u %ux%u at %u,%u src=0x%X/%u dst=0x%X/%u\n",
                                    it, bpp, out_w, out_h, out_x, out_y, src, in_pitch, dst, dst_pitch);
@@ -105,9 +121,29 @@ int main(void)
         }
     }
     bad += spec;
+    /* Patch 2140: the case this exists for, a texture-pool compaction: 1024x1002 pixels (pitch 4096 = one run per
+     * row) from a source 175 KB above the destination; the ranges intersect, the loop is a forward copy. Plus the
+     * smear case (destination 8 bytes above the source in the same row run), which must decline. */
+    {
+        enum { W = 1024, H = 64, P = W * 4 };   /* 256 KB of rows inside the 1 MB buffer (H scaled down) */
+        for (uint32_t i = 0; i < MEM; i += 4) { uint32_t r = rnd(); memcpy(A + i, &r, 4); }
+        memcpy(B, A, MEM);
+        const uint32_t s0 = 0x40000u + 0x2AB00u, d0 = 0x40000u;
+        uint64_t nb = 0;
+        const int old_done = nv3089_rows_copy(B, s0, P, 0, 0, d0, P, 0, 0, W, H, 0, 0xFFFFFFFFu, 0, 0xFFFFFFFFu, 4, &nb, NULL);
+        const int new_done = nv3089_rows_copy_x(B, s0, P, 0, 0, d0, P, 0, 0, W, H, 0, 0xFFFFFFFFu, 0, 0xFFFFFFFFu, 4, &nb, NULL, 1);
+        ref_copy(A, s0, P, 0, 0, d0, P, 0, 0, W, H, 0, 0xFFFFFFFFu, 0, 0xFFFFFFFFu, 4);
+        if (old_done != 0 || new_done != 1 || memcmp(A, B, MEM)) { bad++; fprintf(stderr, "[test_nv3089_rows] POOL old=%d new=%d\n", old_done, new_done); }
+        for (uint32_t i = 0; i < MEM; i += 4) { uint32_t r = rnd(); memcpy(A + i, &r, 4); }
+        memcpy(B, A, MEM);
+        const int smear = nv3089_rows_copy_x(B, 0x10000u, P, 0, 0, 0x10008u, P, 0, 0, W, 4, 0, 0xFFFFFFFFu, 0, 0xFFFFFFFFu, 4, &nb, NULL, 1);
+        if (smear != 0 || memcmp(A, B, MEM)) { bad++; fprintf(stderr, "[test_nv3089_rows] SMEAR copied=%d\n", smear); }
+    }
     printf("[test_nv3089_rows] copied=%u empty=%u declined=%u refused=%u origin-bad=%u bad=%u\n", copied, empty,
            declined, refused_ok, spec, bad);
-    if (bad || copied < 1000) { printf("[test_nv3089_rows] FAIL\n"); return 1; }
+    printf("[test_nv3089_rows] exact overlap rule: copied=%u declined=%u gain=%u loss=%u\n", copied_x, declined_x,
+           x_gain, x_loss);
+    if (bad || copied < 1000 || x_loss || x_gain < 500) { printf("[test_nv3089_rows] FAIL\n"); return 1; }
     printf("[test_nv3089_rows] PASS\n");
     return 0;
 }

@@ -35,7 +35,9 @@ concurrency:
 jobs:
   installer:
     permissions:
-      contents: write   # gh release create/upload on a tag; nothing else is written
+      contents: read    # builds and uploads the artifact only; the publish job below is the one with write
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     runs-on: windows-latest
     timeout-minutes: 60
     env:
@@ -185,16 +187,31 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # Tag pushes only; a dispatch never publishes. A draft pre-release (major 0) titled with the tag. If a release for
-      # the tag already exists the job fails: nothing is edited, re-uploaded or clobbered, and no tag is touched
-      # (--verify-tag refuses to create one).
-      - name: Draft release with SHA256SUMS (tag pushes only)
-        if: github.event_name == 'push' && github.ref_type == 'tag'
+  # Tag pushes only; a dispatch never publishes (the job is skipped). The only job with write access. A draft
+  # pre-release (major 0) titled with the tag. If a release for the tag already exists the job fails: nothing is
+  # edited, re-uploaded or clobbered, and no tag is touched (--verify-tag refuses to create one). The assets are the
+  # installer job's artifact (gh run download of this run needs actions: read).
+  publish:
+    needs: installer
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    permissions:
+      contents: write   # gh release create/upload; nothing else is written
+      actions: read     # gh run download of this run's artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Draft release with SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.installer.outputs.version }}
         run: |
-          cd installer/Output
+          mkdir assets
+          gh run download "$GITHUB_RUN_ID" --name "Project-Helghast-$VERSION" --dir assets
+          cd assets
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "::error::a release for $GITHUB_REF_NAME already exists; refusing to touch it"; exit 1
           fi

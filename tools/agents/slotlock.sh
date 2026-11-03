@@ -47,6 +47,7 @@ slot_proj() {   # slot_proj DIR: the waiter's project: LOCK_PROJECT, else KZ2's 
   if [[ -r "$1/projects.map" ]]; then
     while IFS=$'\t' read -r pat proj; do
       [[ -z "$pat" || "$pat" == \#* ]] && continue
+      # shellcheck disable=SC2053  # $pat is a glob from projects.map on purpose (unquoted = pattern match)
       [[ "$PWD" == $pat ]] && { echo "$proj"; return; }
     done < "$1/projects.map"
   fi

@@ -1,0 +1,103 @@
+KZ3 patch 2140 (RSX pass 132): LD_NV3089_ROWS=2, row copies for NV3089 blits whose source and destination ranges intersect, default on
+(byte-identical to the per-pixel loop; K4: copy time about 5x lower, no frame-rate change shown). LD_NV3089_ROWS=0 restores the per-pixel loop.
+
+The NV3089 guest copy is the whole cost of the blit method in Killzone 3's frozen_shores level: about 90 blits and 78 MB a
+second (4.4 MB a frame), 44 ms of copy against 0.1 ms for everything else in the method ([perf-nv3089]), i.e. the
+per-pixel vm_read32 + vm_write32 loop at 1.8 GB/s. LD_NV3089_ROWS=1 (patch 2080) copies rows with memcpy but declines
+every blit whose source and destination byte ranges merely intersect (a texture-pool compaction copies 1024 x 1002
+pixels to an address 170 KB below the source), so with rows on the copy time only fell from 43.5 to 40 ms a second.
+
+LD_NV3089_ROWS=2 (rsx_nv3089_rows.h nv3089_rows_copy_x with exact_overlap) keeps the 12.4 origin, clip, 4 GB wrap and
+store-hook declines of 2080 and replaces the range test by the loop's real hazard. The pixel loop runs rows and pixels in
+ascending order, so a row is byte-identical to one memmove unless a pixel reads bytes an earlier pixel of the same row
+wrote: delta = destination row start - source row start, 0 < delta < run length, run longer than one pixel. Only such
+blits go to the per-pixel loop; rows still run in ascending order. Default 0 (unset = per-pixel loop, 1 = patch 2080).
+tools/smoke/test_nv3089_rows.sh compares both rules with the per-pixel loop over 20000 random blits (bpp 1/2/4, clips,
+pitches, overlap, wrap): byte-identical, the exact rule never declines what the range rule copied, 2061 more copied.
+Defaults: see the RE notes "Pass 132".
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1211,7 +1211,9 @@ static int nv3089_rows_on(void)
+ {
+     static int on = -1;
+     if (on < 0) { const char* e = getenv("LD_NV3089_ROWS"); if (!e || !e[0]) e = getenv("NV3089_ROWCOPY");
+-                  on = (e && e[0]) ? (e[0] != '0') : 0; }   /* KZ3: default 0, PR #334's is 1 */
++                  on = (e && e[0]) ? (e[0] == '2' ? 2 : e[0] != '0') : 2; }   /* KZ3: default 2 (patch 2140), PR #334's is 1 */
++    /* patch 2140: 2 = rows plus the exact overlap rule (rsx_nv3089_rows.h): a blit whose source and destination
++     * ranges intersect still copies row by row unless a row would smear in the per-pixel loop. */
+     return on;
+ }
+ /* Patch 2080: would vm_write* into [lo, lo+n) only store? (no write watch, no SPU line reservation, no PPU
+@@ -1380,8 +1382,8 @@ static void nv3089_blit_body(void)
+     int rows_done = 0;
+     if (nv3089_rows_on() && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
+         extern u8* vm_base;
+-        rows_done = nv3089_rows_copy(vm_base, src, in_pitch, u0, v0, dst, dst_pitch, out_x, out_y, out_w, out_h,
+-                                     cx0, cx1, cy0, cy1, bpp, &nv_bytes, nv3089_dst_plain);
++        rows_done = nv3089_rows_copy_x(vm_base, src, in_pitch, u0, v0, dst, dst_pitch, out_x, out_y, out_w, out_h,
++                                       cx0, cx1, cy0, cy1, bpp, &nv_bytes, nv3089_dst_plain, nv3089_rows_on() == 2);
+     } else if (copy_t0) {   /* bytes only, for the counter: the same clip arithmetic */
+         const u64 xa = out_x < cx0 ? cx0 : out_x, ya = out_y < cy0 ? cy0 : out_y;
+         const u64 xb = (u64)out_x + out_w > cx1 ? cx1 : (u64)out_x + out_w, yb = (u64)out_y + out_h > cy1 ? cy1 : (u64)out_y + out_h;
+diff --git a/libs/video/rsx_nv3089_rows.h b/libs/video/rsx_nv3089_rows.h
+--- a/libs/video/rsx_nv3089_rows.h
++++ b/libs/video/rsx_nv3089_rows.h
+@@ -19,11 +19,20 @@
+ #include <stdint.h>
+ #include <string.h>
+
+-static inline int nv3089_rows_copy(uint8_t* base, uint32_t src, uint32_t in_pitch, uint32_t u0, uint32_t v0,
+-                                   uint32_t dst, uint32_t dst_pitch, uint32_t out_x, uint32_t out_y,
+-                                   uint32_t out_w, uint32_t out_h, uint32_t cx0, uint32_t cx1, uint32_t cy0,
+-                                   uint32_t cy1, uint32_t bpp, uint64_t* bytes,
+-                                   int (*dst_plain)(uint32_t lo, uint64_t n))
++/* Patch 2140, exact_overlap != 0: the bounding-range overlap test above declines every copy whose source and
++ * destination ranges merely intersect, which is what a title's texture-pool compaction does (a 1024x1002 blit from
++ * 0x4F7BE00 to 0x4F51300, destination 170 KB below the source: the pixel loop is then a plain forward copy). The
++ * per-pixel loop runs rows in ascending order and each row's pixels in ascending order, so row r (destination row
++ * start d, source row start s, run length len, delta = d - s) is byte-identical to one memmove of the row unless a
++ * pixel reads bytes an earlier pixel of the same row has already written: that needs 0 < delta < len with at least
++ * two pixels in the row (delta <= 0 never reads written bytes; delta >= len never overlaps). Rows interact only
++ * through memory, in the same order as the loop. So decline only when some row has 0 < delta < len and len > bpp;
++ * everything else is a row memmove in ascending row order. */
++static inline int nv3089_rows_copy_x(uint8_t* base, uint32_t src, uint32_t in_pitch, uint32_t u0, uint32_t v0,
++                                     uint32_t dst, uint32_t dst_pitch, uint32_t out_x, uint32_t out_y,
++                                     uint32_t out_w, uint32_t out_h, uint32_t cx0, uint32_t cx1, uint32_t cy0,
++                                     uint32_t cy1, uint32_t bpp, uint64_t* bytes,
++                                     int (*dst_plain)(uint32_t lo, uint64_t n), int exact_overlap)
+ {
+     uint64_t xa = out_x, xb = (uint64_t)out_x + out_w, ya = out_y, yb = (uint64_t)out_y + out_h;
+     if (xa < cx0) xa = cx0;
+@@ -38,9 +47,28 @@ static inline int nv3089_rows_copy(uint8_t* base, uint32_t src, uint32_t in_pitc
+     const uint64_t s_lo = src + sy0 * in_pitch + sx0 * bpp, s_hi = s_lo + (yb - ya - 1u) * in_pitch + len;
+     const uint64_t d_lo = dst + ya * dst_pitch + xa * bpp, d_hi = d_lo + (yb - ya - 1u) * dst_pitch + len;
+     if (s_hi > 0x100000000ull || d_hi > 0x100000000ull) return 0;   /* u32 wrap in the per-pixel loop */
+-    if (s_lo < d_hi && d_lo < s_hi) return 0;                        /* overlap: forward order matters */
++    const int overlap = s_lo < d_hi && d_lo < s_hi;
++    if (overlap && !exact_overlap) return 0;                         /* overlap: forward order matters */
++    if (overlap && len > bpp) {   /* exact rule: a row whose destination starts inside its own source run smears */
++        for (uint64_t r = 0; r < yb - ya; r++) {
++            const int64_t delta = (int64_t)(d_lo + r * dst_pitch) - (int64_t)(s_lo + r * in_pitch);
++            if (delta > 0 && (uint64_t)delta < len) return 0;
++        }
++    }
+     if (dst_plain && !dst_plain((uint32_t)d_lo, d_hi - d_lo)) return 0;   /* store hooks would fire: per-pixel */
+-    for (uint64_t r = 0; r < yb - ya; r++)
+-        memcpy(base + d_lo + r * dst_pitch, base + s_lo + r * in_pitch, (size_t)len);
++    for (uint64_t r = 0; r < yb - ya; r++) {
++        if (overlap) memmove(base + d_lo + r * dst_pitch, base + s_lo + r * in_pitch, (size_t)len);
++        else         memcpy(base + d_lo + r * dst_pitch, base + s_lo + r * in_pitch, (size_t)len);
++    }
+     return 1;
+ }
++
++static inline int nv3089_rows_copy(uint8_t* base, uint32_t src, uint32_t in_pitch, uint32_t u0, uint32_t v0,
++                                   uint32_t dst, uint32_t dst_pitch, uint32_t out_x, uint32_t out_y,
++                                   uint32_t out_w, uint32_t out_h, uint32_t cx0, uint32_t cx1, uint32_t cy0,
++                                   uint32_t cy1, uint32_t bpp, uint64_t* bytes,
++                                   int (*dst_plain)(uint32_t lo, uint64_t n))
++{
++    return nv3089_rows_copy_x(base, src, in_pitch, u0, v0, dst, dst_pitch, out_x, out_y, out_w, out_h, cx0, cx1,
++                              cy0, cy1, bpp, bytes, dst_plain, 0);
++}

@@ -1,5 +1,5 @@
 KZ3 patch 2058 (RSX pass 57): no draw is skipped while its PSO builds; keycap uploads change only prompt-cell texels.
-Menu text corruption (main/campaign menu lists blank, capital C missing; stray glyphs
+Menu text corruption (live run 2026-10-14: main/campaign menu lists blank, capital C missing; stray glyphs
 in "For less"): patch 2048 skipped every draw whose PSO was still building. KZ3 renders its text once per glyph
 (stencil-then-cover) into the glyph cache at 0x3A00000 and samples it from there, so a glyph whose draws were
 skipped stayed blank, or kept the glyph that held the slot before. The keycap atlas (0x042A9180, the menu prompt

@@ -1,0 +1,152 @@
+KZ3 patch 2139 (RSX pass 131): two walker CPU cuts, each behind its own switch, both leave every byte the GPU sees unchanged.
+
+1. LD_REFS_FAST (default on, =0 off): the compact vertex fetch's index loop (fetch_batches_hoisted, 930k indices a frame in K4, 2.2 ms a
+   frame "refs" in [perf-vtx]) runs in rsx_vertex_refs_from_indices (rsx_vertex_compact.c): one call per contiguous
+   index run, big-endian load, capacity reserved once, stops before a restart index so the caller records the cut
+   exactly where the per-index loop did. Same refs, same order, same cuts: tools/smoke/test_vtx_refs.sh compares both
+   loops on 4000 random index streams (u16/u32, restart on/off, adjacent/edge restarts, counts 0..2999).
+2. LD_VTX_CACHE_SLOTS=N (power of two, 1024..4194304, default 16384): capacity of the draw-level vertex cache table
+   (ld_vc_entry, two ways per set). K4 evicts ~300 entries a frame at 16384 slots, so keys that return after a turn are
+   gone. The cache validates every hit as before; only the table size changes.
+Defaults: see the RE notes "Pass 131".
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -10544,6 +10544,13 @@
+     dc.verts[dc.n_verts++] = *v;
+ }
+ 
++static int ld_refs_fast(void)   /* patch 2139: default on (identical refs, 0 of 4000 test streams differ); LD_REFS_FAST=0 off */
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_REFS_FAST"); on = e && *e ? atoi(e) != 0 : 1; }
++    return on;
++}
++
+ static void push_compact_ref(u32 vertex_id, u32 base_index)
+ {
+     if (dc.n_refs >= dc.cap_refs) {
+@@ -10794,7 +10801,25 @@
+                 contiguous = guest_ptr(
+                     index_array.location, (u32)start64, (u32)bytes64);
+             }
+-            for (u32 i = 0; i < count && dc.fetch_ok; i++) {
++            u32 fast_i = 0;
++            if (contiguous && ld_refs_fast() && count) {   /* patch 2139: the index loop in rsx_vertex_refs_from_indices */
++                if ((u64)dc.n_refs + count > dc.cap_refs) {
++                    u64 nc = dc.cap_refs ? dc.cap_refs : 4096u;
++                    while (nc < (u64)dc.n_refs + count) nc *= 2u;
++                    rsx_vertex_ref* nr = nc <= 0x7FFFFFFFu ? (rsx_vertex_ref*)realloc(dc.refs, (size_t)nc * sizeof(*nr)) : NULL;
++                    if (!nr) { dc.fetch_ok = 0; break; }
++                    dc.refs = nr; dc.cap_refs = (u32)nc;
++                }
++                while (fast_i < count) {
++                    const u32 got = rsx_vertex_refs_from_indices(dc.refs + dc.n_refs, contiguous + (size_t)fast_i * element_size,
++                        count - fast_i, index_array.is_u32, restart_enabled, restart_value, base_index);
++                    dc.n_refs += got; fast_i += got;
++                    if (fast_i >= count) break;
++                    if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, dc.n_refs)) { dc.fetch_ok = 0; break; }
++                    fast_i++;   /* the restart index itself is not a vertex */
++                }
++            }
++            for (u32 i = fast_i; i < count && dc.fetch_ok; i++) {
+                 const u32 source_offset =
+                     index_array.offset + (first + i) * element_size;
+                 const u8* source = contiguous
+@@ -10945,7 +10970,19 @@
+  * LD_DRAW_DUMP, RSX_A010_GEOM) that read the CPU-side payload of every draw.
+  * -----------------------------------------------------------------------*/
+ #define LD_VTX_CACHE_DEFAULT 0
+-#define LD_VC_SLOTS 16384u
++#define LD_VC_SLOTS_DEFAULT 16384u
++static u32 g_vc_slots;   /* patch 2139: LD_VTX_CACHE_SLOTS (power of two, 1024..4194304) */
++static u32 ld_vc_slots(void)
++{
++    if (!g_vc_slots) {
++        const char* e = getenv("LD_VTX_CACHE_SLOTS");
++        u32 n = e && *e ? (u32)strtoul(e, NULL, 0) : LD_VC_SLOTS_DEFAULT;
++        if (n < 1024u || n > 4194304u || (n & (n - 1u))) n = LD_VC_SLOTS_DEFAULT;
++        g_vc_slots = n;
++        fprintf(stderr, "[vtx-cache] slots=%u (LD_VTX_CACHE_SLOTS=%s)\n", n, e ? e : "unset");
++    }
++    return g_vc_slots;
++}
+ #define LD_VC_KEY_MAX 1200u
+ #define LD_VC_SPANS 17u
+ typedef rsx_vd_span ld_vc_span;   /* patch 2092: the sampled hash moved to ld_vc_entry.sh */
+@@ -11157,12 +11194,12 @@
+     VDP_T0(k_t0);
+     const u32 n = ld_vc_key(prim, layout);
+     if (!n) return NULL;
+-    if (!g_vc) { g_vc = (ld_vc_entry*)calloc(LD_VC_SLOTS, sizeof(ld_vc_entry)); if (!g_vc) return NULL; }
++    if (!g_vc) { g_vc = (ld_vc_entry*)calloc(ld_vc_slots(), sizeof(ld_vc_entry)); if (!g_vc) return NULL; }
+     const u64 h = fnv1a(g_vc_key, n * 4u, 1469598103934665603ull);
+     /* patch 2092: two ways per set (slots i and i^1): the key's own way, else an empty one, else the one looked up
+      * longer ago (pass 49: 124 direct-mapped evictions per frame threw filled entries away) */
+-    ld_vc_entry* w0 = &g_vc[(h ^ (h >> 32)) & (LD_VC_SLOTS - 1u)];
+-    ld_vc_entry* w1 = &g_vc[((h ^ (h >> 32)) & (LD_VC_SLOTS - 1u)) ^ 1u];
++    ld_vc_entry* w0 = &g_vc[(h ^ (h >> 32)) & (g_vc_slots - 1u)];
++    ld_vc_entry* w1 = &g_vc[((h ^ (h >> 32)) & (g_vc_slots - 1u)) ^ 1u];
+ #define LD_VC_SAME(x) ((x)->state && (x)->h == h && (x)->key_n == n && !memcmp((x)->key, g_vc_key, n * 4u))
+     ld_vc_entry* e = LD_VC_SAME(w0) ? w0 : LD_VC_SAME(w1) ? w1 : !w0->state ? w0 : !w1->state ? w1
+                    : ((u32)(g_ld_frames - w0->last) >= (u32)(g_ld_frames - w1->last) ? w0 : w1);
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -429,6 +429,42 @@
+         for (u32 c = 0; c < n; c++) { decode; }                                 \
+     }
+ 
++u32 rsx_vertex_refs_from_indices(rsx_vertex_ref* out, const unsigned char* src, u32 count, int is_u32,
++                                 int restart_en, u32 restart_value, u32 base_index)
++{
++    u32 i = 0;
++    if (is_u32) {
++        if (restart_en) {
++            for (; i < count; i++) {
++                u32 w; memcpy(&w, src + (size_t)i * 4u, 4);
++                w = __builtin_bswap32(w);
++                if (w == restart_value) return i;
++                out[i].vertex_id = w; out[i].base_index = base_index;
++            }
++        } else {
++            for (; i < count; i++) {
++                u32 w; memcpy(&w, src + (size_t)i * 4u, 4);
++                out[i].vertex_id = __builtin_bswap32(w); out[i].base_index = base_index;
++            }
++        }
++    } else {
++        if (restart_en) {
++            for (; i < count; i++) {
++                u16 h; memcpy(&h, src + (size_t)i * 2u, 2);
++                const u32 w = (u32)__builtin_bswap16(h);
++                if (w == restart_value) return i;
++                out[i].vertex_id = w; out[i].base_index = base_index;
++            }
++        } else {
++            for (; i < count; i++) {
++                u16 h; memcpy(&h, src + (size_t)i * 2u, 2);
++                out[i].vertex_id = (u32)__builtin_bswap16(h); out[i].base_index = base_index;
++            }
++        }
++    }
++    return i;
++}
++
+ int rsx_vertex_fetch_many(
+     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+     u8* out)
+--- a/libs/video/rsx_vertex_compact.h
++++ b/libs/video/rsx_vertex_compact.h
+@@ -120,6 +120,13 @@
+  * at out (layout.stride apart), with the same values and the same failure:
+  * 0 when some vertex's enabled ATTR0 cannot be fetched. Walks attribute by
+  * attribute so each vertex type decodes in a loop of its own. */
++/* KZ3 patch 2139: the compact fetch's index loop in one call. Reads `count` big-endian indices (u16 or u32) from
++ * src and writes {index, base_index} to out[0..n); stops BEFORE the first index equal to restart_value when
++ * restart_en (that index is src[n], n < count), else n == count. Returns n. out must hold `count` entries.
++ * Same refs, in the same order, as the per-index loop with push_compact_ref (tools/smoke/test_vtx_refs.sh). */
++u32 rsx_vertex_refs_from_indices(rsx_vertex_ref* out, const unsigned char* src, u32 count, int is_u32,
++                                 int restart_en, u32 restart_value, u32 base_index);
++
+ int rsx_vertex_fetch_many(
+     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+     u8* out);

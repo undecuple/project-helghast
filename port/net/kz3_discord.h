@@ -40,6 +40,7 @@ const char* kd_chapter_name(const char* dir); /* NULL when unknown */
  * that differs from the file's (absent key = 0) was set by the player for this run: *env_forced = 1. -> 0 or 1. */
 int kd_parse_onoff(const char* s);
 int kd_initial(const char* env, const char* ini_text, int* env_forced);
+void kz3_exe_ini_read(char* buf, size_t cap);   /* kz3.ini next to the exe (Windows build), "" when absent */
 /* kz3.ini text with `discord_presence = val`: the key's first line replaced (any section, as kz3_ini_get reads it),
  * else a new line under [game], else a new [game] section at the end; every other byte kept.
  * -> bytes written (no NUL counted), -1 when cap is too small. */

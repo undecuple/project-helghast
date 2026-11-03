@@ -13,7 +13,7 @@ recompilation with a runtime layer, plus native replacements where they matter. 
 | Part | How it runs today |
 |---|---|
 | PPU game code | recompiled ahead of time to C, compiled for x64 |
-| SPU programs and jobs | recompiled ahead of time; SPURS scheduling and DMA are reproduced by the runtime. One job runs as native C by default with the 1.14 update: the light-probe job (`KZ3_NATIVE_JOB_LIGHTPROBES=0` runs the recompiled job instead) |
+| SPU programs and jobs | recompiled ahead of time; SPURS scheduling and DMA are reproduced by the runtime. With the 1.14 update these run as native C by default: the light-probe job, and the upsample and depth-of-field passes of the post-processing jobs (`KZ3_NATIVE_JOB_LIGHTPROBES=0` and `KZ3_NATIVE_JOB_POST=0` run the recompiled code instead) |
 | Graphics | **translated at run time**: the game's RSX command stream is replayed on Direct3D 12, shaders translated from RSX microcode (the same kind of work an emulator's GPU layer does) |
 | Memory | the PS3's big-endian layout, kept as the recompiled code expects it |
 | System libraries (lv2, cell*) | reimplemented on PC APIs (high-level emulation) |
@@ -92,3 +92,16 @@ bug on the unpatched code and its cure on the patched code.
   that changes gameplay is opt-in.
 
 Status, feature by feature: [FEATURES.md](FEATURES.md). What comes next: [ROADMAP.md](ROADMAP.md).
+
+## In short
+
+- **PPU:** ~59,000 functions lifted to C by ps3recomp's lifter; a few are replaced by host code (fiber scheduler,
+  heap, movie skip) through override hooks.
+- **SPU:** all 22 embedded SPU programs and 75 SPURS job modules lifted; SPURS runs on host threads.
+- **Graphics:** the game's RSX command stream is walked and replayed on Direct3D 12 (shaders translated from RSX
+  microcode), including the SPU post-processing chain's read-backs.
+- **Data:** the game's archive is read in place through a case-insensitive virtual file system; the 1.14 update is
+  layered over the disc data as the PS3 does.
+
+Terms: [GLOSSARY.md](GLOSSARY.md).
+General fixes found here are offered to ps3recomp upstream (see [CONTRIBUTING.md](../.github/CONTRIBUTING.md)).

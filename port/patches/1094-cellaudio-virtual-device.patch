@@ -2,7 +2,7 @@ KZ3 patch 1094 (SPU pass 70): KZ3_AUDIO_VDEV=1, a virtual output device with Win
 runs without an audio device. Proton test runs disable the audio drivers, so the cellAudio mix thread paces itself on
 QPC (one block per 5.33 ms) and never meets the device cadence a player's run has: Wine signals the stream event once
 per 10 ms period over a ~22 ms (1056-frame) buffer, the mix thread mixes ~2 blocks per period, the guest's read index
-moves in steps of 2 (the owner's live run: wid 9 and wid 5 kicks at 100/s, not 187.5/s), and a mix thread late by
+moves in steps of 2 (a live run: wid 9 and wid 5 kicks at 100/s, not 187.5/s), and a mix thread late by
 more than the buffer's fill makes the device play silence. The virtual device plays elapsed x 48 kHz on QPC, room =
 buffer - (submitted - played), waits to the next period boundary, counts each underrun ([audio-vdev] every 10 s with
 a wake-lateness histogram, the first 24 as [audio-underrun]) and writes the gap as zero frames into the

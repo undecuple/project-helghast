@@ -1,6 +1,7 @@
 KZ3 patch 1122 (SPU pass 104, upstream candidate): lv2 sync semantics for sys_mutex/sys_cond and the HLE
 sys_lwmutex/sys_lwcond. Idea credit: the Ratchet & Clank port (their patch 7007 and notes:
-lv2 hands the bound mutex to the woken waiter); MUTEX_WATCH idea from upstream PR #474 (erikomis, MIT; idea only, no
+lv2 hands the bound mutex to the woken waiter; sys_cond_signal_to / sys_lwcond_signal_to wake only the named thread and
+return EPERM when it is not waiting, their rebased 7007, SPU pass 138); MUTEX_WATCH idea from upstream PR #474 (erikomis, MIT; idea only, no
 code taken). Semantics per lv2 as RPCS3 models it (read as a reference, no code copied).
 New runtime/syscalls/lv2_sync_core.h: an lv2-style mutex (owner thread id, recursion count, recursive attribute, FIFO
 queue of sleepers under one host lock) with bound condition queues. unlock hands the mutex to the oldest sleeper; a
@@ -13,7 +14,7 @@ destroy is ESRCH, EBUSY while owned or waited on, EPERM while a cond is bound. o
 ppu_sysprx.cpp: sys_lwmutex on the core keyed by the guest EA (the binary semaphore gone): busy trylock is EBUSY
 0x8001000A (was 0x8001000B), the recursive attribute is stored (+0x08 = protocol | recursive) and a non-recursive
 re-lock is EDEADLK, destroy is EBUSY while owned or waited on; sys_lwcond keeps patch 1059's FIFO order (signal =
-oldest, signal_all = all queued, signal_to = named else oldest) with the hand-off, destroy ESRCH/EBUSY, wait without
+oldest, signal_all = all queued, signal_to = only the named thread) with the hand-off, destroy ESRCH/EBUSY, wait without
 the lwmutex EPERM; real on POSIX too (the POSIX wait was a no-op). Kept from the old code: a non-owner lwmutex unlock
 still releases (logged [LWM-XUNLOCK]), over-release is CELL_OK, the [LWM-BLOCK]/[LWM-GOT]/PS3_LWMUTEX_TRACE logs.
 New logs (first 16 each): [LWM-XUNLOCK], [LWC-EPERM], [LWM-DESTROY-BUSY]. runtime/ppu/kz3_lwcond_fifo.h (1059) is no
@@ -26,7 +27,7 @@ with; also runs the toolkit's tests/sync_stress suite). Notes the RE notes Pass 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (lv2 core) over #577 in ppu_sysprx.cpp and over upstream's sys_mutex/sys_cond (#474 MUTEX_WATCH=1 idea already in 1122; upstream MUTEX_WATCH=2 and its destroy EBUSY are covered/lost: ours refuses destroy too). Upstream's HLE fast path (9a3fbffd, `ps3_hle_register_fast`) kept, `sys_lwmutex_lock_fast` rewritten on the lv2 core (trylock under the slot lock; held or queued = full handler). `ppu_thread_note_block` (PS3_PRIO_START, opt-in) not called from the lv2 core waits.
 
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
-index c447919c..a8e9a0f1 100644
+index c447919c..59131249 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
 +++ b/runtime/ppu/ppu_sysprx.cpp
 @@ -97,13 +97,25 @@ static void sys_process_is_stack(ppu_context* ctx)
@@ -434,7 +435,7 @@ index c447919c..a8e9a0f1 100644
      ctx->gpr[3] = 0;
  }
  
-@@ -402,63 +344,64 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
+@@ -402,97 +344,92 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
   * a 64-bit value left that word 0 (and the id store ran past the struct), so
   * the FIOS media thread spun forever holding its lwmutex.
   *
@@ -448,7 +449,7 @@ index c447919c..a8e9a0f1 100644
 -#include "kz3_lwcond_fifo.h"   /* KZ3 patch 1059 */
 -#endif
 + * KZ3 patch 1122: the waiters queue in FIFO order (patch 1059's order: signal = the oldest, signal_all = every waiter
-+ * queued now, signal_to = that thread, else the oldest) under the bound lwmutex's lock (syscalls/lv2_sync_core.h).
++ * queued now, signal_to = only that thread, EPERM if it is not waiting) under the bound lwmutex's lock (syscalls/lv2_sync_core.h).
 + * A signal hands the lwmutex over as lv2 does: the signaller owns it -> the waiter is queued on it and owns it at the
 + * unlock (mode 1); it is free -> the waiter owns it as the signal returns (mode 3); someone else holds it -> queued
 + * for the hand-off. The woken waiter never re-locks the lwmutex itself, so no third thread can take it in a gap.
@@ -501,10 +502,17 @@ index c447919c..a8e9a0f1 100644
 -/* KZ3 patch 1059: signal = the oldest queued waiter, signal_all = every waiter queued now, signal_to = that
 - * thread (else the oldest); nobody waiting = lv2 drops it. The shared counting semaphore this replaces let a
 - * thread woken by signal_all re-wait and take a count meant for another waiter (see kz3_lwcond_fifo.h). */
+-static void lwcond_wake(uint32_t lwcond, int all, uint32_t to_tid)
 +static void sys_lwcond_destroy(ppu_context* ctx)
-+{
+ {
+-#ifdef _WIN32
 +    uint32_t lwcond = (uint32_t)ctx->gpr[3];
-+    struct LwcSlot* sl = lwc_slot(lwcond);
+     struct LwcSlot* sl = lwc_slot(lwcond);
+-    if (!sl || !sl->sem) return;
+-    kz3_lwc_wake(&sl->q, all, to_tid);
+-#else
+-    (void)lwcond; (void)all; (void)to_tid;
+-#endif
 +    struct LwmSlot* ms = sl ? lwm_slot(sl->lwm) : nullptr;
 +    if (!sl || !ms) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005u; return; }   /* ESRCH */
 +    lv2s_lock(&ms->m);
@@ -514,24 +522,28 @@ index c447919c..a8e9a0f1 100644
 +    lv2s_unlock(&ms->m);
 +    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)rc;
 +}
- static void lwcond_wake(uint32_t lwcond, int all, uint32_t to_tid)
- {
--#ifdef _WIN32
-     struct LwcSlot* sl = lwc_slot(lwcond);
--    if (!sl || !sl->sem) return;
--    kz3_lwc_wake(&sl->q, all, to_tid);
--#else
--    (void)lwcond; (void)all; (void)to_tid;
--#endif
++static int lwcond_wake(uint32_t lwcond, int all, uint32_t to_tid)
++{
++    struct LwcSlot* sl = lwc_slot(lwcond);
 +    struct LwmSlot* ms = sl ? lwm_slot(sl->lwm) : nullptr;
-+    if (!ms) return;
++    if (!ms) return 0;
 +    lv2s_lock(&ms->m);
-+    lv2s_cond_signal_locked(&ms->m, &sl->q, all, to_tid);
++    int n = lv2s_cond_signal_locked(&ms->m, &sl->q, all, to_tid);
 +    lv2s_unlock(&ms->m);
++    return n;
  }
  static void sys_lwcond_signal(ppu_context* ctx)     { lwcond_wake((uint32_t)ctx->gpr[3], 0, 0); ctx->gpr[3] = 0; }
  static void sys_lwcond_signal_all(ppu_context* ctx) { lwcond_wake((uint32_t)ctx->gpr[3], 1, 0); ctx->gpr[3] = 0; }
-@@ -468,31 +411,19 @@ static void sys_lwcond_wait(ppu_context* ctx)
+-/* signal_to(lwcond, ppu_thread_id): wakes that thread if it is waiting, else the oldest waiter (patch 1059). */
+-static void sys_lwcond_signal_to(ppu_context* ctx)  { lwcond_wake((uint32_t)ctx->gpr[3], 0, (uint32_t)ctx->gpr[4]); ctx->gpr[3] = 0; }
++/* signal_to(lwcond, ppu_thread_id): wakes only that thread; EPERM (0x80010009) when it is not waiting on the lwcond. */
++static void sys_lwcond_signal_to(ppu_context* ctx)
++{
++    uint32_t tid = (uint32_t)ctx->gpr[4];
++    int n = lwcond_wake((uint32_t)ctx->gpr[3], 0, tid);
++    ctx->gpr[3] = (tid && !n) ? (uint64_t)(int64_t)(int32_t)0x80010009u : 0;
++}
+ static void sys_lwcond_wait(ppu_context* ctx)
  {
      uint32_t lwcond  = (uint32_t)ctx->gpr[3];
      uint64_t timeout_us = ctx->gpr[4];
@@ -574,7 +586,7 @@ index c447919c..a8e9a0f1 100644
  }
  
  /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
-@@ -563,7 +494,19 @@ static void sys_lwmutex_destroy_counted(ppu_context* ctx)
+@@ -563,7 +500,19 @@ static void sys_lwmutex_destroy_counted(ppu_context* ctx)
        if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
          fprintf(stderr, "[LWM] destroy #%lld lwm=0x%08X r4=0x%08X r5=0x%08X\n", _n,
                  (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]); }
@@ -597,10 +609,10 @@ index c447919c..a8e9a0f1 100644
  /* Real preemptive thread create/exit live in the lv2 syscall layer
 diff --git a/runtime/syscalls/lv2_sync_core.h b/runtime/syscalls/lv2_sync_core.h
 new file mode 100644
-index 00000000..d28a8637
+index 00000000..01444577
 --- /dev/null
 +++ b/runtime/syscalls/lv2_sync_core.h
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,302 @@
 +/* lv2-style mutex + condition core shared by sys_mutex/sys_cond (runtime/syscalls) and the HLE sys_lwmutex/sys_lwcond
 + * (runtime/ppu/ppu_sysprx.cpp). KZ3 patch 1122 (upstream candidate). Idea credit: the Ratchet & Clank port
 + * (their patch 7007, lv2 hand-off for sys_mutex/sys_cond); semantics per lv2 as RPCS3 models it (read, no code copied).
@@ -876,20 +888,23 @@ index 00000000..d28a8637
 +    }
 +    return rc;
 +}
-+/* Signal (host lock held): the oldest waiter (all = 0, to_tid = 0), every waiter queued now (all), or the named
-+ * thread if queued, else the oldest (to_tid, KZ3 patch 1059's choice). Returns how many were moved to the mutex. */
++/* Signal (host lock held): the oldest waiter (all = 0, to_tid = 0), every waiter queued now (all), or only the
++ * named thread (to_tid != 0, as lv2's signal_to: nothing else is woken). Returns how many were moved to the mutex;
++ * 0 with to_tid set means the named thread was not waiting (the caller returns EPERM). */
 +static inline int lv2s_cond_signal_locked(lv2s_mutex* m, lv2s_queue* cq, int all, uint32_t to_tid)
 +{
 +    int n = 0;
 +    lv2s_waiter* w = cq->head;
-+    if (to_tid)
++    if (to_tid) {
++        w = NULL;
 +        for (lv2s_waiter* x = cq->head; x; x = x->next) if (x->tid == to_tid) { w = x; break; }
++    }
 +    while (w) {
 +        lv2s_waiter* nx = w->next;
 +        lv2s_q_unlink(cq, w); m->cond_waiters--;
 +        lv2s_want_mutex_locked(m, w);
 +        n++;
-+        if (!all) break;
++        if (!all || to_tid) break;
 +        w = nx;
 +    }
 +    if (n) lv2s_wake_all(m);
@@ -901,7 +916,7 @@ index 00000000..d28a8637
 +#endif
 +#endif
 diff --git a/runtime/syscalls/sys_cond.c b/runtime/syscalls/sys_cond.c
-index 8bdacb48..3896e9fe 100644
+index 8bdacb48..ce486caf 100644
 --- a/runtime/syscalls/sys_cond.c
 +++ b/runtime/syscalls/sys_cond.c
 @@ -12,11 +12,6 @@
@@ -996,7 +1011,7 @@ index 8bdacb48..3896e9fe 100644
      table_unlock();
      return result;
  }
-@@ -141,86 +136,22 @@ int64_t sys_cond_wait(ppu_context* ctx)
+@@ -141,94 +136,31 @@ int64_t sys_cond_wait(ppu_context* ctx)
      if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
  #endif
      if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
@@ -1071,7 +1086,8 @@ index 8bdacb48..3896e9fe 100644
 +    return (int64_t)(int32_t)rc;
  }
  
- static int64_t signal_cond(uint32_t id, int all)
+-static int64_t signal_cond(uint32_t id, int all)
++static int64_t signal_cond(uint32_t id, int all, uint32_t to_tid)
  {
 -    sys_cond_info* c = acquire_cond(id);
 +    sys_mutex_info* m = NULL;
@@ -1088,11 +1104,24 @@ index 8bdacb48..3896e9fe 100644
 -     * Waking an arbitrary host waiter could leave the selected one asleep. */
 -    if (selected) cond_wake(c);
 -    cond_unlock(c);
-+    lv2s_cond_signal_locked(&m->core, &c->q, all, 0);
++    int n = lv2s_cond_signal_locked(&m->core, &c->q, all, to_tid);
 +    lv2s_unlock(&m->core);
++    if (to_tid && !n) return (int32_t)CELL_EPERM;   /* the named thread is not waiting on this cond */
      return CELL_OK;
  }
  
+-int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
+-int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
++int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0, 0); }
++int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1, 0); }
+ 
+-/* Preserve upstream's current broadcast fallback for signal_to. */
+-int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
++/* signal_to(cond, ppu_thread_id): wakes only that thread; EPERM when it is not waiting on the cond (as lv2). */
++int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0, LV2_ARG_U32(ctx, 1)); }
+ 
+ void sys_cond_init(lv2_syscall_table* tbl)
+ {
 diff --git a/runtime/syscalls/sys_cond.h b/runtime/syscalls/sys_cond.h
 index f32f1c24..45e849bd 100644
 --- a/runtime/syscalls/sys_cond.h

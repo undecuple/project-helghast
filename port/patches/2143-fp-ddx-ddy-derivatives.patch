@@ -1,0 +1,116 @@
+KZ3 patch 2143 (RSX pass 133): fragment DDX and DDY (screen-space derivatives) are decompiled instead of dropped.
+Design and code from the Killzone 2 port (its patch 2096); both projects are MIT and have the same owner.
+
+The decompiler had no case for DDX (0x15) or DDY (0x16): it emitted nothing, so the destination register kept 0 and a
+program dividing by fwidth(uv) (Killzone 2's anti-aliased menu panels, which blended away to transparent) got NaN, which
+the export guard turns into 0. Now DDX emits ddx(v) * _rsx_deriv_scale.x and DDY ddy(v) * _rsx_deriv_scale.y; a program
+that uses either gets "static const float2 _rsx_deriv_scale = float2(1.0, 1.0);" in its preamble (other programs' text is
+unchanged). ld_xlate rewrites the scale per pipeline from the sample grid of the target (patch 2088: an antialiased target
+is kept at sample resolution, so a D3D derivative spans one sample where the RSX's spans a pixel). The grid is already
+in every pipeline key, so no key changes. Not ported: the Killzone 2 port's DDY sign flip for a bottom-origin shader
+window (needs its patch 2090, WPOS origin, which this port does not have). ASSUMPTION: DDY follows the window y.
+Host test: tools/smoke/test_fp_deriv.sh. Upstream candidate (DDX/DDY are general NV40 ops).
+
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+--- a/libs/video/rsx_fp_decompiler.c	2026-11-02 15:28:13.107245172 -0600
++++ b/libs/video/rsx_fp_decompiler.c	2026-11-02 15:28:13.115348182 -0600
+@@ -674,6 +674,22 @@
+     return 0;
+ }
+ 
++/* KZ3 patch 2143 (the Killzone 2 port, patch 2096): rewrite the derivative scale a program carrying DDX/DDY declares.
++ * Returns 1 when rewritten, 0 when the program has no derivative, -1 when the text does not fit. */
++int rsx_fp_set_deriv_scale(char* hlsl, u32 hlsl_size, float sx, float sy)
++{
++    if (!hlsl) return 0;
++    char* at = strstr(hlsl, RSX_FP_DERIV_SCALE_DECL);
++    if (!at) return 0;
++    char rep[128];
++    const int rl = snprintf(rep, sizeof rep, "static const float2 _rsx_deriv_scale = float2(%.1f, %.1f);", sx, sy);
++    const size_t kl = sizeof RSX_FP_DERIV_SCALE_DECL - 1, len = strlen(hlsl);
++    if (rl <= 0 || (size_t)rl >= sizeof rep || len - kl + (size_t)rl + 1 > hlsl_size) return -1;
++    memmove(at + rl, at + kl, len - (size_t)(at - hlsl) - kl + 1);
++    memcpy(at, rep, (size_t)rl);
++    return 1;
++}
++
+ static void fp_expand_helper(Out* out)
+ {
+     out_puts(out,
+@@ -828,6 +844,7 @@
+     Out o = { out, out_size, 0, 1 };
+     out[0] = '\0';
+     int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
++    int uses_deriv = 0;  /* patch 2143: DDX or DDY was decoded: the preamble declares _rsx_deriv_scale */
+     out_puts(&o,
+         /* 64 each: the source and destination register fields are 6 bits
+          * (FP_SRC_REG_MASK / FP_OUT_REG_MASK). 48 rejected every program
+@@ -1081,6 +1098,12 @@
+         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
+         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
++        /* patch 2143 (the Killzone 2 port, patch 2096): screen-space derivatives. Unhandled, they wrote nothing, so the
++         * destination kept 0 and a program dividing by fwidth (Killzone 2's anti-aliased menu panels) produced NaN,
++         * which the export guard turns into a transparent 0. _rsx_deriv_scale is (1, 1) in the decompiler's text; the
++         * live draw rewrites it per pipeline for the target's sample grid (rsx_fp_set_deriv_scale). */
++        case OP_DDX: uses_deriv = 1; snprintf(rhs, sizeof(rhs), "(ddx(%s) * _rsx_deriv_scale.x)", a); break;
++        case OP_DDY: uses_deriv = 1; snprintf(rhs, sizeof(rhs), "(ddy(%s) * _rsx_deriv_scale.y)", a); break;
+         /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
+          * builtins): the packed word is a scalar that replicates. */
+         case OP_PK4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(%s))", a); break;
+@@ -1505,6 +1528,7 @@
+      * decompiler skipped, leaving the destination with whatever it held.
+      * Only for a program that uses one, so every other program's text is
+      * unchanged. */
++    if (uses_deriv) out_puts(&p, RSX_FP_DERIV_SCALE_DECL "\n");   /* patch 2143 */
+     if (uses_pack) out_puts(&p,
+         "uint   _rsx_pk4ub(float4 v) { uint4 b = (uint4)round(saturate(v) * 255.0); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }\n"
+         "float4 _rsx_up4ub(float v) { uint u = asuint(v); return float4(u & 255u, (u >> 8) & 255u, (u >> 16) & 255u, (u >> 24) & 255u) / 255.0; }\n"
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+--- a/libs/video/rsx_fp_decompiler.h	2026-11-02 15:28:13.107245172 -0600
++++ b/libs/video/rsx_fp_decompiler.h	2026-11-02 15:28:13.115348182 -0600
+@@ -226,6 +226,11 @@
+  * Returns 1, or -1 without mutation for malformed source/insufficient space.
+  * Apply before alpha-test wrapping; disabled draws should skip this helper. */
+ int rsx_fp_apply_srgb_output(char* hlsl, u32 capacity);
++/* Patch 2143: the declaration a program using DDX/DDY carries, and its per-pipeline rewrite: x scales DDX, y DDY (the
++ * target's samples per pixel). Returns 1 when rewritten, 0 when the program has no derivative, -1 when the text does
++ * not fit. */
++#define RSX_FP_DERIV_SCALE_DECL "static const float2 _rsx_deriv_scale = float2(1.0, 1.0);"
++int rsx_fp_set_deriv_scale(char* hlsl, u32 hlsl_size, float sx, float sy);
+ 
+ /* Gamma metadata is a post-filter/post-remap RGBA lane mask, with formats
+  * validated by rsx_texture_gamma_mask. EXP_TEX overrides gamma per fetch.
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c	2026-11-02 15:28:13.107245172 -0600
++++ b/libs/video/rsx_live_draw.c	2026-11-02 15:28:13.115348182 -0600
+@@ -8682,6 +8682,20 @@
+     }
+     return on;
+ }
++/* patch 2143 (the Killzone 2 port, patch 2096): DDX / DDY in pixels of the RSX's window. An antialiased target is kept at
++ * its sample resolution (patch 2088), so a D3D derivative spans one sample where the RSX's spans one pixel: scale by the
++ * samples per pixel. The sample grid is already in every pipeline key, so no key changes. ASSUMPTION: the sign of DDY
++ * follows the window y as on the RSX; the Killzone 2 panels take |DDX| + |DDY| so their picture does not depend on it,
++ * and this port does not handle the bottom-origin shader window (the Killzone 2 port keys a DDY flip for it). */
++static int ld_deriv_scale_apply(char* hlsl, size_t size, u32 wpos_aa)
++{
++    const u32 ax = wpos_aa & 0xFFu, ay = (wpos_aa >> 8) & 0xFFu;
++    const float sx = ax > 1u ? (float)ax : 1.0f, sy = ay > 1u ? (float)ay : 1.0f;
++    const int r = rsx_fp_set_deriv_scale(hlsl, (u32)size, sx, sy);
++    static u32 logs;
++    if (r > 0 && logs++ < 8) fprintf(stderr, "[fp-deriv] program with DDX/DDY: scale (%.0f, %.0f)\n", sx, sy);
++    return r;
++}
+ static int ld_wpos_aa_apply(char* hlsl, size_t size, u32 wpos_aa)
+ {
+     const u32 ax = wpos_aa & 0xFFu, ay = (wpos_aa >> 8) & 0xFFu;
+@@ -8783,6 +8797,8 @@
+         fi = -1;
+     if (fi > 0 && in->wpos_aa && ld_wpos_aa_apply(ps_hlsl, ps_sz, in->wpos_aa) < 0)   /* patch 2088 */
+         fi = -1;
++    if (fi > 0 && ld_deriv_scale_apply(ps_hlsl, ps_sz, in->wpos_aa) < 0)   /* patch 2143 */
++        fi = -1;
+     if (fi > 0 && srgb_out && rsx_fp_apply_srgb_output(ps_hlsl, ps_sz) < 0) {   /* patch 2055 */
+         static int said; if (!said++) fprintf(stderr, "[srgb-out] apply failed: PSO left linear\n");
+     }

@@ -1,0 +1,61 @@
+diff --git a/port/kz3/kz3_ini.h b/port/kz3/kz3_ini.h
+index 6b73428e..7a3a3d23 100644
+--- a/port/kz3/kz3_ini.h
++++ b/port/kz3/kz3_ini.h
+@@ -28,10 +28,11 @@
+ typedef struct {
+     const char* key;
+     const char* env; /* the environment variable the key stands for; NULL = handled by main.cpp itself */
+-    int path;        /* 1 = a path (relative = relative to the exe's folder) */
++    int path;        /* 1 = a path (relative = relative to `root` when kz3.ini has it, else to the exe's folder) */
+ } kz3_ini_key_t;
+ 
+ static const kz3_ini_key_t kz3_ini_keys[] = {
++    {"root", NULL, 1}, /* the install folder (relative to the exe's folder): base of the relative paths below; NULL env, main.cpp reads it first */
+     {"eboot", NULL, 1},
+     {"data_dir", NULL, 1},
+     {"vfs_root", "PS3_VFS_ROOT", 1},
+diff --git a/port/kz3/main.cpp b/port/kz3/main.cpp
+index cdd8050a..a7b8c719 100644
+--- a/port/kz3/main.cpp
++++ b/port/kz3/main.cpp
+@@ -4379,11 +4379,17 @@ static const char* kz3_boot_inputs(int argc, char** argv)
+     const int have_ini = kz3_ini_read_file(ini, text, sizeof text) >= 0;
+     if (!have_ini) text[0] = 0;
+     KZ3_LOGI("boot", "kz3.ini %s", have_ini ? "read" : "not found (optional)");
++    /* kz3.ini `root` (written by the launcher): the install folder, relative to this file; relative path values are taken
++     * from it, so a moved install keeps working. Absent = the exe's folder, as before. */
++    char base[1100];
++    snprintf(base, sizeof base, "%s", s_exe_dir);
++    if (kz3_ini_get(text, "root", v, sizeof v) && kz3_ini_resolve(s_exe_dir, v, abs, sizeof abs))
++        snprintf(base, sizeof base, "%s", abs);
+     auto ini_to_env = [&](const char* key, const char* env, int path) {
+         if (!env || !kz3_ini_get(text, key, v, sizeof v)) return;
+         const char* e = getenv(env);
+         if (e && *e) { KZ3_LOGI("boot", "kz3.ini %s: %s is set, the environment wins", key, env); return; }
+-        if (path && !kz3_ini_resolve(s_exe_dir, v, abs, sizeof abs)) return;
++        if (path && !kz3_ini_resolve(base, v, abs, sizeof abs)) return;
+         kz3_setenv(env, path ? abs : v);
+         KZ3_LOGI("boot", "kz3.ini %s -> %s=%s", key, env, path ? abs : v);
+     };
+@@ -4404,9 +4410,9 @@ static const char* kz3_boot_inputs(int argc, char** argv)
+         /* kz3.ini's eboot line (installs from before step 9s) only places the VFS root now, when vfs_root is unset. */
+         from = "the exe (built in)";
+         s_eboot_embedded = 1;
+-        if (!(kz3_ini_get(text, "eboot", v, sizeof v) && kz3_ini_resolve(s_exe_dir, v, eboot, sizeof eboot)))
++        if (!(kz3_ini_get(text, "eboot", v, sizeof v) && kz3_ini_resolve(base, v, eboot, sizeof eboot)))
+             snprintf(eboot, sizeof eboot, "%s/PS3_GAME/USRDIR/EBOOT.elf", s_exe_dir);
+-    } else if (kz3_ini_get(text, "eboot", v, sizeof v) && kz3_ini_resolve(s_exe_dir, v, eboot, sizeof eboot)) {
++    } else if (kz3_ini_get(text, "eboot", v, sizeof v) && kz3_ini_resolve(base, v, eboot, sizeof eboot)) {
+         from = "kz3.ini";
+     } else {
+         from = "beside the exe";
+@@ -4427,7 +4433,7 @@ static const char* kz3_boot_inputs(int argc, char** argv)
+                  "in %s, or put kz3.exe next to the PS3_GAME folder of your dump", ini);
+         kz3_log_fatal("boot", "no game files found: set eboot in kz3.ini or use the launcher");
+     }
+-    if (kz3_ini_get(text, "data_dir", v, sizeof v) && kz3_ini_resolve(s_exe_dir, v, abs, sizeof abs)) {
++    if (kz3_ini_get(text, "data_dir", v, sizeof v) && kz3_ini_resolve(base, v, abs, sizeof abs)) {
+ #ifdef _WIN32
+         CreateDirectoryA(abs, NULL);
+         const int rc = _chdir(abs);

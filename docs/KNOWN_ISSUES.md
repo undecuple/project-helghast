@@ -3,10 +3,10 @@
 What is known to be wrong in the port today, as seen in the project's own test sessions. Each entry says what you see,
 where, whether there is a way around it, and its status. "Last seen" is the date of the most recent observation we
 recorded, with the build in use; it is not a promise that the problem is still there on a newer build. The overall
-picture is in the [README status table](../README.md#status); what is planned is in the [roadmap](ROADMAP.md); what a release must meet before it is called playable is in [RELEASE-CRITERIA.md](RELEASE-CRITERIA.md).
+picture is in the [status table](STATUS.md); what is planned is in the [roadmap](ROADMAP.md); what a release must meet before it is called playable is in [RELEASE-CRITERIA.md](RELEASE-CRITERIA.md).
 
 Found something not listed here? Please open an issue with the [bug report form](../.github/ISSUE_TEMPLATE/bug_report.yml)
-(or the performance form for speed and stutter), and see [Contributing](../README.md#contributing). No issues are
+(or the performance form for speed and stutter), and see [Contributing](../.github/CONTRIBUTING.md). No issues are
 linked below yet because none has been filed for these yet. If you hit one of them, please open an issue on GitHub.
 
 | Problem | Where it shows | Workaround | Status |
@@ -20,7 +20,7 @@ linked below yet because none has been filed for these yet. If you hit one of th
 | [Split-screen: views offset, right view can flicker](#split-screen) | local two-player co-op | none | open |
 | [Co-op with one pad and the keyboard](#co-op-pads) | local two-player co-op | use two controllers | keyboard as second controller built, not yet played by hand |
 | [Offline Multiplayer: a second attempt hangs](#offline-multiplayer-second-attempt) | Multiplayer menu, offline | restart the game between attempts | open, cause found, fix pending |
-| [The mouse does nothing in some dialogs](#mouse-dialogs) | confirm dialogs, for example "Exit Killzone 3?" | keyboard or controller | open |
+| [The mouse is not checked in every dialog](#mouse-dialogs) | dialogs other than Exit game, Quit to desktop and Reset to defaults | keyboard or controller | open |
 | [Mouse look judders](#mouse-jumpy) | on foot | `KZ3_MOUSE_LATCH=0` switches the view to the game's own timing | open (hand check pending) |
 | [A black level after skipping the closing movie](#skip-movie) | after the prologue | do not skip the movie | open |
 | [Controller settings page overlapped](#controller-page) | Options, controller page | none | rows on their own page; hand check pending |
@@ -87,8 +87,10 @@ Offline, the first Multiplayer attempt from the menu works as far as the game go
 
 ## Mouse dialogs
 
-The mouse works in the menu lists but does nothing in some dialogs, such as the "Exit Killzone 3?" Yes/No box and the
-co-op controller message. Use the keyboard or a controller there. Last seen: 2026-10-22. Status: open.
+The mouse works in the menu lists. In the confirmation dialogs, hovering an option highlights it in Exit game, Quit to
+desktop and Reset to defaults, and a click picks it in Exit game and Reset to defaults (checked under Proton on the
+1.14 update). A click in Quit to desktop and the mouse in every other dialog have not been checked; if the mouse does
+nothing there, use the keyboard or a controller. Status: open until checked.
 
 ## Mouse jumpy
 

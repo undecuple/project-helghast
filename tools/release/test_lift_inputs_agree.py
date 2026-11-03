@@ -129,8 +129,9 @@ def main():
         paths_tools = {"CMAKE_TOOLCHAIN_FILE", "Python3_EXECUTABLE", "RECOMP_DIR", "KZ3_SPU_DIR", "PS3RECOMP_DIR",
                        "CMAKE_MAKE_PROGRAM", "LLVM_MINGW_ROOT"}
         allowed = {"CMAKE_BUILD_TYPE", "CMAKE_C_FLAGS_RELEASE", "CMAKE_CXX_FLAGS_RELEASE", "KZ3_EMBED_EBOOT", "KZ3_SPU_FMA"}
-        check(dev_names - {"CMAKE_BUILD_TYPE"} <= names and {"RECOMP_DIR", "KZ3_SPU_DIR"} <= names,
-              "installer configure passes every -D the dev route does (build type aside)", str(dev_names - names))
+        launchers = {"CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER"}   # ccache: speed only, no code decided
+        check(dev_names - {"CMAKE_BUILD_TYPE"} - launchers <= names and {"RECOMP_DIR", "KZ3_SPU_DIR"} <= names,
+              "installer configure passes every -D the dev route does (build type aside)", str(dev_names - launchers - names))
         check(names <= paths_tools | allowed, "installer configure adds only the allow-listed -D names",
               str(names - paths_tools - allowed))
         flags = " ".join(fr.cmd_configure(c)[0])

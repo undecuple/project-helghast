@@ -22,7 +22,7 @@
 <p class="what">A Windows x64 port of the 2011 PS3 game, made by static recompilation: the game&#x27;s PowerPC and SPU code is translated to C ahead of time and compiled into a native PC program, so no CPU emulator runs at play time. The GPU is still translated as it runs (RSX to Direct3D 12); native replacements come step by step.</p>
 <p class="headline">Status: <strong>Partly playable</strong></p>
 <p class="note">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>
-<p class="note">v0.1.7 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
+<p class="note">v0.1.8 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
 <p class="btns"><a class="btn" href="#status">See the status</a><a class="btn alt" href="https://github.com/undecuple/project-helghast">Source on GitHub</a></p>
 </div>
 </header>
@@ -79,7 +79,7 @@
 <tr><td>In-level play (walk, aim, fire, cover, pause menu)</td><td>Gamepad gameplay</td><td><span class="st st-part">partial</span><br><span class="small">Playable with a controller at about 16-22 frames/s; audio stutters in levels</span></td></tr>
 <tr><td>Levels 2 to 9</td><td>Flooded Pyrrhus to Escape from Helghan (level ids 201-208), picked with Campaign &gt; Select Chapter</td><td><span class="st st-part">partial</span><br><span class="small">All nine chapters play; level 202 played by hand to its end (2026-10-20), the others not yet; about 16-22 frames/s</span></td></tr>
 <tr><td>Full campaign, start to finish</td><td>9 levels, checkpoints, real-time and video cutscenes</td><td><span class="st st-no">not yet</span><br><span class="small">Not played start to finish in one go</span></td></tr>
-<tr><td>Motion-sensor sections (valves, demolition charges)</td><td>Turned by tilting the SIXAXIS pad; update 1.14 adds an option to use the stick instead</td><td><span class="st st-no">not yet</span><br><span class="small">Fix planned: stick by default when the pad has no gyro</span></td></tr>
+<tr><td>Motion-sensor sections (valves, demolition charges)</td><td>Turned by tilting the SIXAXIS pad; update 1.14 adds an option to use the stick instead</td><td><span class="st st-no">not yet</span><br><span class="small">Stick by default without sensors; not yet tried at the valve section</span></td></tr>
 </tbody></table></div></details>
 <details><summary>Controls</summary>
 <div class="tw"><table>
@@ -88,7 +88,7 @@
 <tr><td>Gamepad (DualShock 3 layout: sticks, face buttons, triggers, d-pad)</td><td>Wired or Bluetooth DualShock 3</td><td><span class="st st-ok">works</span><br><span class="small">XInput pads work directly and PlayStation pads through Steam Input; PlayStation, Switch Pro and Xbox pads without Steam are coded (SDL3, built in; not yet confirmed on real hardware; a DualShock 3 on Windows needs its DsHidMini driver). Keyboard/mouse is port-only (section 2)</span></td></tr>
 <tr><td>Pressure-sensitive buttons</td><td>Analog face buttons and shoulder buttons</td><td><span class="st st-na">not applicable</span><br><span class="small">The game does not use button pressure</span></td></tr>
 <tr><td>Rumble</td><td>Vibration through the pad</td><td><span class="st st-ok">works</span><br><span class="small">Works through Steam Input today; rumble on PlayStation and Switch Pro pads without Steam goes through the built-in SDL3 input (SDL3), unconfirmed on real hardware</span></td></tr>
-<tr><td>SIXAXIS motion input</td><td>Tilt for valves, charges and an optional aim correction</td><td><span class="st st-no">not yet</span><br><span class="small">Built in: the pad&#x27;s own sensors on DualShock 4 and DualSense; not yet confirmed on real hardware. Pads without sensors give rest values</span></td></tr>
+<tr><td>SIXAXIS motion input</td><td>Tilt for valves, charges and an optional aim correction</td><td><span class="st st-no">not yet</span></td></tr>
 <tr><td>Controller options (schemes, inversion, sensitivity)</td><td>Options &gt; Controller</td><td><span class="st st-ok">works</span><br><span class="small">That the changed values reach in-level aiming was not run (see the in-level play row); on 1.14 the list has an extra SimulView row (Co-Op SimulView, Off), so Wireless Controller is the fifth entry</span></td></tr>
 <tr><td>Button prompts (PlayStation glyphs)</td><td>Game&#x27;s own glyphs in hints and menus</td><td><span class="st st-ok">works</span><br><span class="small">Xbox and keyboard glyph sets are port-only (section 2)</span></td></tr>
 </tbody></table></div></details>
@@ -157,7 +157,7 @@
 <thead><tr><th>Feature</th><th>On the PS3</th><th>In the port</th></tr></thead>
 <tbody>
 <tr><td>Update 1.14 content (balance, Motion Sensor option, DLC trophy set, MP map patch sets)</td><td>Cumulative patch installed over the disc</td><td><span class="st st-part">partial</span><br><span class="small">1.14 is the base version</span></td></tr>
-<tr><td>Motion Sensor Function option (1.14)</td><td>Options &gt; Controller &gt; Advanced Settings</td><td><span class="st st-part">partial</span><br><span class="small">Only the menu row is verified: the port&#x27;s no-gyro default (off, stick sections) is not applied, and a LEFT press back to ON was not seen to restore it in the same run (checked under Proton, last frames)</span></td></tr>
+<tr><td>Motion Sensor Function option (1.14)</td><td>Options &gt; Controller &gt; Advanced Settings</td><td><span class="st st-part">partial</span><br><span class="small">The menu row is verified. The port defaults the option to Off for a pad without motion sensors, so the motion sections read the stick (not yet tried at the valve section); a LEFT press back to ON was not seen to restore it in the same run (checked under Proton, last frames)</span></td></tr>
 </tbody></table></div></details>
 <details><summary>Subtitles and languages</summary>
 <div class="tw"><table>
@@ -167,8 +167,8 @@
 <tr><td>Subtitles in movies and cutscenes</td><td>Subtitle cards and in-game subtitles</td><td><span class="st st-ok">works</span><br><span class="small">In-level (in-game) subtitles were not reached; the prenarrative text cards are part of the movie and show with either setting</span></td></tr>
 </tbody></table></div></details>
 <h3>What the port adds</h3>
-<p>38 available now, 27 planned. Changes to gameplay stay optional.</p>
-<details><summary>All 65 features</summary>
+<p>39 available now, 28 planned. Changes to gameplay stay optional.</p>
+<details><summary>All 67 features</summary>
 <div class="tw"><table>
 <thead><tr><th>Feature</th><th>State</th><th>Default</th></tr></thead>
 <tbody>
@@ -210,6 +210,7 @@
 <tr><td>Maximizing the window, or double-clicking its title bar, switches to borderless fullscreen</td><td>available</td><td>default on</td></tr>
 <tr><td>F11 switches between windowed and fullscreen, like Alt+Enter (unless F11 is bound to an action)</td><td>available</td><td>default on</td></tr>
 <tr><td>Window behaviour: close confirmation, remembered placement, background behaviour, maximize and F11</td><td>available</td><td>default on</td></tr>
+<tr><td>Port version in the main menu (bottom right, the game&#x27;s own dim red text); off with KZ3_MENU_VERSION=0</td><td>available</td><td>on</td></tr>
 <tr><td>Internal resolution scale (720p, 1080p, 1440p, 4K, match window)</td><td>planned</td><td>on where it looks right</td></tr>
 <tr><td>Host anti-aliasing (FXAA) in place of SPU MLAA</td><td>planned</td><td>on at scaled resolutions</td></tr>
 <tr><td>Widescreen: 16:10 and 4:3 bars, ultrawide Hor+ field of view</td><td>planned</td><td>bars on; ultrawide opt-in</td></tr>
@@ -237,6 +238,7 @@
 <tr><td>In-game voice chat for multiplayer and the online co-op campaign (microphone and headset on the PC; online only when the player picks it)</td><td>planned</td><td>opt-in</td></tr>
 <tr><td>Motion blur strength (Options &gt; Display &gt; Motion blur, 0-100 %); no clean off yet: skipping the game&#x27;s motion blur pass garbles the picture, so the row is not offered</td><td>planned</td><td>100 (the game&#x27;s own)</td></tr>
 <tr><td>Minimap with enemy markers, using the game&#x27;s own radar where possible</td><td>planned</td><td>-</td></tr>
+<tr><td>FSR 1 upscaler (opt-in, default off)</td><td>planned</td><td>off</td></tr>
 </tbody></table></div></details>
 <p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md">Every feature, with evidence<span aria-hidden="true"> &gt;</span></a></p>
 <p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>
@@ -316,7 +318,7 @@
 </article>
 <article id="about" class="news">
 <h2>About the port</h2>
-<p class="meta">by the project · how it works · 65 port features</p>
+<p class="meta">by the project · how it works · 67 port features</p>
 <div class="nb"><span class="frame pic-about" aria-hidden="true"></span><div class="nt"><p>The port is built on <a href="https://github.com/sp00nznet/ps3recomp">ps3recomp</a> (MIT): the PPU code and the game's SPU programs are lifted to C, the PS3 system libraries the game calls are reimplemented, and the game's RSX command stream is replayed on Direct3D 12. The game's archive is read in place from your dump. It is tested on Windows x64 under Proton; a native Linux build is planned. What comes next: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/ROADMAP.md">the roadmap</a>.</p>
 <p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/HOW-IT-WORKS.md">The technical overview<span aria-hidden="true"> &gt;</span></a></p>
 <p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>
@@ -327,14 +329,14 @@
 <section id="changelog" class="promo term">
 <h2>Changelog</h2>
 <ul class="clog">
-<li><time datetime="2026-10-29">10-29</time><span>The mouse works in the game&#x27;s confirmation dialogs: hovering an option highlights it as the pad does...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>Optional gyro input from a DSU (cemuhook) server on this PC, for motion controls with pads that have...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>Motion Sensor Function now defaults to Off for a pad without motion sensors (an Xbox pad, for example), so...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>The Discord status text and the setting&#x27;s help line now say &quot;Playing Project Helghast&quot;, which is what...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>A moved or renamed install folder (the portable zip unpacked, built, then moved) no longer reuses the build...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>The setup and the portable zip&#x27;s first check refuse an install or build folder whose path contains `[`, `]`...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>The setup finds a portable RPCS3 (an unzipped folder with `rpcs3.exe` beside its `config`) in Downloads...</span></li>
-<li><time datetime="2026-10-29">10-29</time><span>Closing the window asks through the game&#x27;s own exit dialog (in a level the pause menu opens first) instead...</span></li>
+<li><time datetime="2026-11-03">11-03</time><span>The main menu shows the port&#x27;s name and version at the bottom right (&quot;Project Helghast&quot;, then the version)...</span></li>
+<li><time datetime="2026-11-03">11-03</time><span>The upsample and depth-of-field passes of the post-processing SPU jobs run as native code by default with...</span></li>
+<li><time datetime="2026-11-03">11-03</time><span>The renderer&#x27;s vertex-reference step uses a faster path by default (`LD_REFS_FAST=0` switches it off). Its...</span></li>
+<li><time datetime="2026-11-03">11-03</time><span>The renderer runs the game&#x27;s unscaled image copies a row at a time instead of a pixel at a time by default...</span></li>
+<li><time datetime="2026-11-03">11-03</time><span>The launcher log, the setup&#x27;s kept log, the game log and the crash report keep no personal path. Your...</span></li>
+<li><time datetime="2026-11-03">11-03</time><span>The saved pipeline list (`pso_keys.bin`) carries a header that names its layout. A list written by an older...</span></li>
+<li><time datetime="2026-11-03">11-03</time><span>When the update folder is wrong or incomplete, a start without the saved game inputs now says what is wrong...</span></li>
+<li><time datetime="2026-11-03">11-03</time><span>`paths.json` and `kz3.ini` are written in one step, so an interrupted write cannot leave half a file; a...</span></li>
 </ul>
 <p class="small">Newest first; the full list is in <a href="https://github.com/undecuple/project-helghast/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
 </section>
@@ -368,11 +370,11 @@
 </section>
 <section id="install" class="promo">
 <h2>Install</h2>
-<p class="headline"><strong>v0.1.7 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
-<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.7">v0.1.7</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10-30 minutes. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
+<p class="headline"><strong>v0.1.8 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
+<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.8">v0.1.8</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10 minutes on a fast PC, longer on slower ones. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
 <p>You can also build the port from source: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md">building</a>.</p>
 <h3>What goes online</h3>
-<p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on), opt-in crash reports (sent by the launcher after a crash when you opt in, with your names, addresses and folders removed, never a memory dump), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast#what-goes-online">README</a>.</p>
+<p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on), opt-in crash reports (sent by the launcher after a crash when you opt in, with your names, addresses and folders removed, never a memory dump), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/PRIVACY.md">privacy page</a>.</p>
 <p class="small">The original PS3 game's online play is kept running by the PS Rewired community (<a href="https://psrewired.com/servers/23044">their Killzone 3 page</a>). This port is not affiliated with or endorsed by PS Rewired and does not connect to their servers.</p>
 <p class="small">Viewing this website loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit; the repository, installer and game do not.</p>
 <p class="small">Install questions: <a href="https://github.com/undecuple/project-helghast/discussions/categories/q-a">Q&amp;A discussions</a>.</p>
@@ -400,7 +402,7 @@
 <tr><td><strong>RAM</strong></td><td>8 GB</td><td>16 GB</td></tr>
 <tr><td><strong>GPU</strong></td><td>Direct3D 12 (feature level 12_0), 4 GB VRAM</td><td>NVIDIA RTX 2060 or newer, 8 GB VRAM for 1440p/4K</td></tr>
 <tr><td><strong>Disk</strong></td><td>45 GB</td><td>60 GB on an SSD</td></tr>
-<tr><td><strong>First-run build</strong> (installer)</td><td>8 GB RAM, about 2 GB disk for the install and the build (measured 1.7 GB: 0.55 GB installed files + 1.1 GB build folder), plus about 1.5 GB of game data unpacked while playing (measured 1.4 GB after four sessions), roughly 5-30 min depending on cores</td><td>16 GB RAM, 8+ cores (about 6.5 min to build at 16 jobs, measured on a 20-core PC under Proton, 2026-10-12; 7 min for the whole installer run on a 16-core PC under native Windows 11, 2026-10-21; an optional shader warm-up adds about 17 min and is off by default because it does not yet carry over to the next session)</td></tr>
+<tr><td><strong>First-run build</strong> (installer)</td><td>8 GB RAM, about 2 GB disk for the install and the build (measured 1.7 GB: 0.55 GB installed files + 1.1 GB build folder), plus about 1.5 GB of game data unpacked while playing (measured 1.4 GB after four sessions), about 10 minutes on a fast PC, longer on slower ones</td><td>16 GB RAM, 8+ cores (the first build of the portable zip took 567 to 647 s in Proton test runs on our test machine, 2026-10-29; an optional shader warm-up adds about 17 min and is off by default because it does not yet carry over to the next session)</td></tr>
 <tr><td><strong>Controller</strong></td><td>keyboard and mouse</td><td>a gamepad (XInput; DualShock/DualSense through Steam Input)</td></tr>
 </tbody></table></div>
 <p class="small">Details and the reasons behind each figure: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/requirements.md">docs/requirements.md</a>. Hardware figures are provisional until the game runs at full speed. Will it run on your machine? <a href="https://github.com/undecuple/project-helghast/discussions/categories/q-a">Ask in Q&amp;A</a>.</p>

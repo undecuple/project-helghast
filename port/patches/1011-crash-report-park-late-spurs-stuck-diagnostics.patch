@@ -117,11 +117,12 @@ diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
 index 8b2058ee..b7e43d0f 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
-@@ -4007,9 +4007,62 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -4007,9 +4007,70 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
  }
  
  extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 +#ifdef _WIN32
++#include "ps3emu/crash_loc.h"   /* patch 1011 (SPU pass 137): module+offset and thread label */
 +/* KZ3 patch 1011: last-chance crash report. A host access violation the VM's own
 + * handlers do not claim used to end the process with exit code 0xC0000005 and no
 + * output (KZ3 after the intro movie). Print the code, the fault address, the RIP
@@ -141,6 +142,11 @@ index 8b2058ee..b7e43d0f 100644
 +            (unsigned long)er->ExceptionCode, (unsigned long long)((char*)er->ExceptionAddress - mbase),
 +            ppu_prof_resolve_host(er->ExceptionAddress), (unsigned long)GetCurrentThreadId(),
 +            g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
++    { char loc[300], lab[64], ln[400];   /* SPU pass 137: module+offset and the thread name, one line */
++      ps3_crash_where(er->ExceptionAddress, loc, sizeof loc);
++      ps3_crash_thread_label(lab, sizeof lab);
++      ps3_crash_fmt_line(ln, sizeof ln, loc, lab);
++      fprintf(stderr, "%s\n", ln); }
 +    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
 +        fprintf(stderr, "[CRASH] %s of host 0x%llX (vm_base %p, guest 0x%llX)\n",
 +                er->ExceptionInformation[0] == 1 ? "write" : er->ExceptionInformation[0] == 8 ? "execute" : "read",
@@ -161,6 +167,8 @@ index 8b2058ee..b7e43d0f 100644
 +        DWORD64 img = 0; PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &img, NULL);
 +        fprintf(stderr, "[CRASH]   #%-2d rva=0x%llX guest-fn=0x%08X\n", i,
 +                (unsigned long long)((char*)c.Rip - mbase), ppu_prof_resolve_host((void*)c.Rip));
++        { char loc[300]; ps3_crash_where((void*)c.Rip, loc, sizeof loc);   /* SPU pass 137: same module+offset per frame */
++          fprintf(stderr, "[CRASH]   #%-2d at %s\n", i, loc); }
 +        if (!rf) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }
 +        void* hd = NULL; DWORD64 ef = 0;
 +        RtlVirtualUnwind(UNW_FLAG_NHANDLER, img, c.Rip, rf, &c, &hd, &ef, NULL);
@@ -180,6 +188,79 @@ index 8b2058ee..b7e43d0f 100644
      /* HLE logs mix printf (stdout) with probe fprintf (stderr); with a
       * redirected block-buffered stdout and nothing flushing it, printf lines
       * sat in the buffer for minutes and were LOST when the run was killed --
+diff --git a/include/ps3emu/crash_loc.h b/include/ps3emu/crash_loc.h
+new file mode 100644
+--- /dev/null
++++ b/include/ps3emu/crash_loc.h
+@@ -0,0 +1,68 @@
++/*
++ * KZ3 patch 1011 (SPU pass 137): where a crash happened, as text.
++ *   ps3_crash_fmt_loc   pure: "module.exe+0xOFFSET" or "? abs=0xADDR"  (host-testable)
++ *   ps3_crash_fmt_line  pure: [CRASH] rip in <loc> thread "<label>"      (host-testable)
++ *   ps3_crash_where / ps3_crash_thread_label   Windows only: module of an address, thread name
++ * A tester's crash report gave only an absolute RIP and no thread; the module+offset resolves in
++ * a DLL or the exe, the label is what ps3_thread_name set (ppu:<id> <name>, spurs:<n>, spu ...).
++ */
++#ifndef PS3EMU_CRASH_LOC_H
++#define PS3EMU_CRASH_LOC_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++
++/* path NULL or empty: no module (heap / JIT address), print '?' and the absolute address. */
++static inline int ps3_crash_fmt_loc(char* out, size_t n, const char* path, uint64_t offset, uint64_t abs_addr)
++{
++    if (!path || !path[0]) return snprintf(out, n, "? abs=0x%llX", (unsigned long long)abs_addr);
++    const char* b = path;
++    for (const char* p = path; *p; p++) if (*p == '/' || *p == '\\') b = p + 1;
++    return snprintf(out, n, "%s+0x%llX", b, (unsigned long long)offset);
++}
++
++/* label NULL or empty: "-". */
++static inline int ps3_crash_fmt_line(char* out, size_t n, const char* loc, const char* label)
++{
++    return snprintf(out, n, "[CRASH] rip in %s thread \"%s\"", loc, (label && label[0]) ? label : "-");
++}
++
++#ifdef _WIN32
++#include <windows.h>
++
++/* Module basename+offset of an address (GetModuleHandleExA FROM_ADDRESS, refcount unchanged). */
++static inline void ps3_crash_where(const void* addr, char* out, size_t n)
++{
++    HMODULE m = NULL;
++    char path[MAX_PATH];
++    path[0] = 0;
++    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                           (LPCSTR)addr, &m) && m) {
++        DWORD k = GetModuleFileNameA(m, path, (DWORD)sizeof path);
++        if (k == 0 || k >= sizeof path) path[0] = 0;
++    } else {
++        m = NULL;
++    }
++    ps3_crash_fmt_loc(out, n, path, (uint64_t)((const char*)addr - (const char*)m), (uint64_t)(uintptr_t)addr);
++}
++
++/* Name of the calling thread (GetThreadDescription, kernel32 on Windows 10 1607+, resolved at run time
++ * for old MinGW headers); "-" when there is none. ASCII only (other characters become '?'). */
++static inline void ps3_crash_thread_label(char* out, size_t n)
++{
++    typedef HRESULT (WINAPI *get_desc_fn)(HANDLE, PWSTR*);
++    get_desc_fn fn = (get_desc_fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
++    if (n == 0) return;
++    out[0] = '-'; if (n > 1) out[1] = 0;
++    if (!fn) return;
++    PWSTR w = NULL;
++    if (fn(GetCurrentThread(), &w) < 0 || !w) return;
++    size_t i = 0;
++    for (; w[i] && i + 1 < n; i++) out[i] = (w[i] >= 32 && w[i] < 127) ? (char)w[i] : '?';
++    if (i) out[i] = 0;
++    LocalFree(w);
++}
++#endif
++
++#endif /* PS3EMU_CRASH_LOC_H */
 diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
 index de8e84ca..2ff2d9c3 100644
 --- a/runtime/spu/spurs_policy.c

@@ -198,6 +198,19 @@ static void t_fifo()
     call("sys_lwcond_signal", 2, LWC);
     for (auto& t : th) t.join();
     check("fifo", order.size() == 3 && order[0] == 21 && order[1] == 20 && order[2] == 22, "signal_to/signal order wrong", bad);
+    /* signal_to for a thread that is not waiting: EPERM (lv2), and nobody else is woken */
+    {
+        std::atomic<int> w2{0}; std::atomic<int> got{0};
+        std::thread t([&] { call("sys_lwmutex_lock", 30, LWM, 0); w2 = 1; call("sys_lwcond_wait", 30, LWC, 0); got = 1; call("sys_lwmutex_unlock", 30, LWM); });
+        while (!w2.load()) sleep_ms(1);
+        sleep_ms(10);
+        uint32_t r = call("sys_lwcond_signal_to", 2, LWC, 99);
+        sleep_ms(20);
+        check("fifo", r == 0x80010009u && !got.load(), "signal_to of a non-waiting thread must be EPERM and wake nobody", bad);
+        call("sys_lwcond_signal_to", 2, LWC, 30);
+        t.join();
+        check("fifo", got.load() == 1, "signal_to of the waiting thread did not wake it", bad);
+    }
     call("sys_lwcond_destroy", 1, LWC); call("sys_lwmutex_destroy", 1, LWM);
     printf("%s fifo\n", bad ? "FAIL" : "PASS"); g_fail |= bad != 0;
 }

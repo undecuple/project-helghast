@@ -9,3 +9,6 @@ int g_kz3_fma_stats = 0;
 void kz3_spu_xr_note(int op, unsigned m, const uint32_t* a, const uint32_t* b, const uint32_t* c, const uint32_t* r, const void* ra)
 { (void)op; (void)m; (void)a; (void)b; (void)c; (void)r; (void)ra; }
 void kz3_spu_fma_note(const double s[4], int ftz) { (void)s; (void)ftz; }
+/* the toggle's clock (kz3_native_jobs.c, SPU pass 133): host tests have no wait accounting */
+uint64_t kz3_wacct_now(void) { return 0; }
+uint64_t kz3_wacct_base(void) { return 0; }

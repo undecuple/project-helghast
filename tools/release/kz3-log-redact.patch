@@ -1,0 +1,275 @@
+Remove the Windows user name and the Unix home name (Z:/home/<name> under Proton) from the game's own log (log file, stdout echo, ring, crash report).
+Apply from the repo root: git apply tools/release/kz3-log-redact.patch (tools/release/test_game_log_redact.py checks it).
+
+--- a/port/kz3/kz3_log.c
++++ b/port/kz3/kz3_log.c
+@@ -5,6 +5,7 @@
+ #  define _GNU_SOURCE 1
+ #endif
+ #include "kz3_log.h"
++#include "kz3_log_redact.h"
+ 
+ #include <stdatomic.h>
+ #include <stdlib.h>
+@@ -459,6 +460,29 @@
+     snprintf(t->label, sizeof t->label, "%s", label);
+ }
+ 
++/* The user's name never reaches the log file, the stdout echo, the ring or the crash report (kz3_log_redact.h).
++ * The rules are built from USERPROFILE on the first line written; later threads wait until they are ready. */
++static kz3_redact_t     g_red;
++static atomic_int       g_red_state;     /* 0 = not built, 1 = building, 2 = ready */
++static const kz3_redact_t* redact_rules(void)
++{
++    int st = atomic_load_explicit(&g_red_state, memory_order_acquire);
++    if (st != 2) {
++        int zero = 0;
++        if (atomic_compare_exchange_strong(&g_red_state, &zero, 1)) {
++            kz3_redact_init(&g_red, getenv("USERPROFILE"));
++            kz3_redact_add_unix_home(&g_red, getenv("HOME"));        /* the Unix home under Wine/Proton, when /home/<name> does not cover it */
++            const char* wh = getenv("WINEHOMEDIR");                  /* Wine's spelling: \??\Z:\home\name */
++            if (wh && !strncmp(wh, "\\??\\", 4)) wh += 4;
++            kz3_redact_add_unix_home(&g_red, wh);
++            atomic_store_explicit(&g_red_state, 2, memory_order_release);
++        } else {
++            while (atomic_load_explicit(&g_red_state, memory_order_acquire) != 2) { }
++        }
++    }
++    return &g_red;
++}
++
+ /* body = "[tag] text" (or an untagged line), without the trailing newline */
+ static void emit_body(int level, const char* body, size_t n)
+ {
+@@ -472,11 +496,9 @@
+     if (p > 95) p = 95;
+     while (n && (body[n - 1] == '\n' || body[n - 1] == '\r')) n--;
+     size_t room = KZ3_LOG_LINE_MAX - 1;
+-    size_t b = n;
+-    if (b > room) b = room;
+-    memcpy(line + p, body, b);
++    size_t b = kz3_redact(redact_rules(), body, n, line + p, room);   /* cut at room, after the replacement */
+     size_t len = (size_t)p + b;
+-    if (n > room) { memcpy(line + len - 3, "...", 3); }
++    if (b == room && n >= room) { memcpy(line + len - 3, "...", 3); }
+     ring_put(line, len);
+     line[len] = '\n';
+     os_fd fd = cur_fd();
+@@ -785,7 +807,18 @@
+     os_write(fd, s, n); os_write(fd, "\n", 1);
+ }
+ 
+-static void wr(os_fd fd, const char* s) { os_write(fd, s, strlen(s)); }
++/* crash report text: redacted per line (a path never spans a line) */
++static void wr(os_fd fd, const char* s)
++{
++    char buf[2048 * 4];
++    while (*s) {
++        size_t n = 0; while (s[n] && s[n] != '\n' && n < 2048) n++;
++        size_t o = kz3_redact(redact_rules(), s, n, buf, sizeof buf);
++        os_write(fd, buf, o);
++        s += n;
++        if (*s == '\n') { os_write(fd, "\n", 1); s++; }
++    }
++}
+ 
+ const char* kz3_log_write_crash(const char* reason, const char* details)
+ {
+--- a/port/kz3/kz3_log_redact.h
++++ b/port/kz3/kz3_log_redact.h
+@@ -0,0 +1,195 @@
++/* kz3_log_redact: removes the Windows user name from log text before it is written (log file, crash report, ring).
++ * Same rules as the first-run log's redactor (tools/release/firstrun.py redactor()):
++ *  - the user's profile folder (USERPROFILE) in these forms, any letter case: as set, with backslashes, with forward
++ *    slashes, doubled backslashes (repr / JSON), CMake's mangled object-path form (C_/Users/name, ':' and ' ' -> '_'),
++ *    and URL-encoded forms (%5C, %2F, %3A, %20) becomes %USERPROFILE%;
++ *  - the name in any other <drive>:\Users\<name> (same separator forms) becomes <user>;
++ *  - the Unix home seen under Wine/Proton (Z:/home/<name>, Z:\home\<name>, doubled backslashes, %2F/%5C/%3A forms,
++ *    Z_/home/<name>, and the plain /home/<name>) gets <name> replaced by <user>; a /home inside a longer path is left.
++ * Header-only, no allocation, C11. A line that does not hold either is copied byte for byte. */
++#ifndef KZ3_LOG_REDACT_H
++#define KZ3_LOG_REDACT_H
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define KZ3_REDACT_VARIANTS 24
++#define KZ3_REDACT_HOME_MAX 520
++
++typedef struct {
++    char   v[KZ3_REDACT_VARIANTS][KZ3_REDACT_HOME_MAX * 3];
++    size_t len[KZ3_REDACT_VARIANTS];
++    int    n;
++} kz3_redact_t;
++
++static inline char kz3r_lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
++
++static inline int kz3r_match(const char* s, size_t n, const char* lit, size_t ln)
++{
++    if (ln > n) return 0;
++    for (size_t i = 0; i < ln; i++) if (kz3r_lc(s[i]) != kz3r_lc(lit[i])) return 0;
++    return 1;
++}
++
++/* one spelling of the home folder: each char of h goes through the mapping (bs/slash/colon/space replacement text) */
++static inline void kz3r_add(kz3_redact_t* r, const char* h, const char* bs, const char* sl, const char* co, const char* sp)
++{
++    if (r->n >= KZ3_REDACT_VARIANTS) return;
++    char* d = r->v[r->n]; size_t o = 0;
++    for (const char* p = h; *p; p++) {
++        const char* t = NULL; char one[2] = { *p, 0 };
++        if (*p == '\\') t = bs; else if (*p == '/') t = sl; else if (*p == ':') t = co; else if (*p == ' ') t = sp; else t = one;
++        size_t tl = strlen(t);
++        if (o + tl >= sizeof r->v[0]) return;
++        memcpy(d + o, t, tl); o += tl;
++    }
++    for (int i = 0; i < r->n; i++) if (r->len[i] == o && memcmp(r->v[i], d, o) == 0) return;   /* duplicate spelling */
++    d[o] = 0; r->len[r->n] = o; r->n++;
++}
++
++static inline void kz3_redact_add_home(kz3_redact_t* r, const char* home);
++
++/* home = the USERPROFILE value (NULL or short: only the generic Users rule applies). Trailing separators are ignored. */
++static inline void kz3_redact_init(kz3_redact_t* r, const char* home)
++{
++    r->n = 0;
++    kz3_redact_add_home(r, home);
++}
++
++static inline void kz3_redact_add_home(kz3_redact_t* r, const char* home)
++{
++    char h[KZ3_REDACT_HOME_MAX]; size_t l;
++    if (!home) return;
++    l = strlen(home);
++    while (l && (home[l - 1] == '\\' || home[l - 1] == '/')) l--;
++    if (l <= 3 || l >= sizeof h) return;                     /* "C:\" or nothing: too short to be a profile */
++    memcpy(h, home, l); h[l] = 0;
++    /* longest spellings first, so a longer one is never cut short by a shorter prefix */
++    kz3r_add(r, h, "\\\\", "/", ":", " ");                   /* doubled backslashes */
++    kz3r_add(r, h, "%5C", "%2F", "%3A", "%20");
++    kz3r_add(r, h, "%5C", "%2F", ":", "%20");
++    kz3r_add(r, h, "%5C", "/", "%3A", "%20");
++    kz3r_add(r, h, "%5C", "/", ":", "%20");
++    kz3r_add(r, h, "\\", "%2F", "%3A", "%20");
++    kz3r_add(r, h, "/", "%2F", "%3A", "%20");
++    kz3r_add(r, h, "/", "%2F", ":", "%20");
++    kz3r_add(r, h, "/", "/", "%3A", "%20");
++    kz3r_add(r, h, "/", "/", ":", "%20");
++    kz3r_add(r, h, "\\", "\\", ":", "%20");
++    kz3r_add(r, h, "\\", "\\", ":", " ");                    /* as set */
++    kz3r_add(r, h, "\\", "/", ":", " ");
++    kz3r_add(r, h, "/", "/", ":", " ");                      /* forward slashes */
++    kz3r_add(r, h, "/", "/", "_", "_");                      /* CMake's mangled form */
++    kz3r_add(r, h, "\\", "\\", ":", " ");
++    /* the longest spelling must win at one position: order by length, descending */
++    for (int i = 1; i < r->n; i++)
++        for (int j = i; j > 0 && r->len[j] > r->len[j - 1]; j--) {
++            char t[sizeof r->v[0]]; size_t tl = r->len[j];
++            memcpy(t, r->v[j], tl + 1); memcpy(r->v[j], r->v[j - 1], r->len[j - 1] + 1); memcpy(r->v[j - 1], t, tl + 1);
++            r->len[j] = r->len[j - 1]; r->len[j - 1] = tl;
++        }
++}
++
++typedef struct { char* d; size_t cap, o; } kz3r_out;
++static inline void kz3r_put(kz3r_out* w, const char* s, size_t n)
++{
++    if (w->o + n > w->cap) n = w->cap > w->o ? w->cap - w->o : 0;
++    memcpy(w->d + w->o, s, n); w->o += n;
++}
++
++/* length of a separator at s: \ \\ / %5C %2F (0 = none) */
++static inline size_t kz3r_sep(const char* s, size_t n)
++{
++    if (n >= 2 && s[0] == '\\' && s[1] == '\\') return 2;
++    if (n >= 1 && (s[0] == '\\' || s[0] == '/')) return 1;
++    if (n >= 3 && s[0] == '%' && (kz3r_match(s, n, "%5C", 3) || kz3r_match(s, n, "%2F", 3))) return 3;
++    return 0;
++}
++
++/* the drive prefix "C:", "C_" or "C%3A" at s followed by a separator, "Users", a separator: -> length through the
++ * separator after Users, else 0 */
++static inline size_t kz3r_users_prefix(const char* s, size_t n)
++{
++    size_t i = 0, k;
++    if (n < 1 || !(((s[0] | 32) >= 'a') && ((s[0] | 32) <= 'z'))) return 0;
++    i = 1;
++    if (i < n && (s[i] == ':' || s[i] == '_')) i++;
++    else if (kz3r_match(s + i, n - i, "%3A", 3)) i += 3;
++    else return 0;
++    if (!(k = kz3r_sep(s + i, n - i))) return 0;
++    i += k;
++    if (!kz3r_match(s + i, n - i, "Users", 5)) return 0;
++    i += 5;
++    if (!(k = kz3r_sep(s + i, n - i))) return 0;
++    return i + k;
++}
++
++/* "<drive>:<sep>home<sep>" or "<sep>home<sep>" at s -> length through the separator after home, else 0 */
++static inline size_t kz3r_home_prefix(const char* s, size_t n)
++{
++    size_t i = 0, k;
++    if (n >= 2 && (((s[0] | 32) >= 'a') && ((s[0] | 32) <= 'z')) && (s[1] == ':' || s[1] == '_' || kz3r_match(s + 1, n - 1, "%3A", 3))) {
++        i = (s[1] == ':' || s[1] == '_') ? 2 : 4;
++        if (!(k = kz3r_sep(s + i, n - i))) return 0;
++        i += k;
++    } else if ((k = kz3r_sep(s, n))) {
++        i = k;
++    } else {
++        return 0;
++    }
++    if (!kz3r_match(s + i, n - i, "home", 4)) return 0;
++    i += 4;
++    if (!(k = kz3r_sep(s + i, n - i))) return 0;
++    return i + k;
++}
++
++static inline int kz3r_pathchar(char c)
++{
++    return ((c | 32) >= 'a' && (c | 32) <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
++}
++
++/* A Unix home (HOME, Wine's WINEHOMEDIR): added as a literal only when the generic <drive>:/home/<name> and /home/<name>
++ * rule would not already cover it (/root, /var/lib/x). */
++static inline void kz3_redact_add_unix_home(kz3_redact_t* r, const char* home)
++{
++    if (!home) return;
++    if (kz3r_home_prefix(home, strlen(home))) return;
++    kz3_redact_add_home(r, home);
++}
++
++/* Redacts src[0..n) into dst (capacity cap, no terminator written). Returns the length written (cut at cap). */
++static inline size_t kz3_redact(const kz3_redact_t* r, const char* src, size_t n, char* dst, size_t cap)
++{
++    /* pass 1: the home folder; pass 2 (into dst) happens in the same walk through a small second buffer */
++    char* mid = (char*)malloc(n * 4 + 64);
++    kz3r_out w1 = { mid, n * 4 + 64, 0 };
++    if (!mid) { size_t m = n < cap ? n : cap; memcpy(dst, src, m); return m; }
++    for (size_t i = 0; i < n;) {
++        int hit = 0;
++        for (int v = 0; v < r->n && !hit; v++)
++            if (kz3r_match(src + i, n - i, r->v[v], r->len[v])) {
++                kz3r_put(&w1, "%USERPROFILE%", 13); i += r->len[v]; hit = 1;
++            }
++        if (!hit) kz3r_put(&w1, src + i++, 1);
++    }
++    kz3r_out w2 = { dst, cap, 0 };
++    for (size_t i = 0; i < w1.o;) {
++        size_t pl = 0;
++        int word_start = (i == 0) || !(((mid[i - 1] | 32) >= 'a' && (mid[i - 1] | 32) <= 'z') || (mid[i - 1] >= '0' && mid[i - 1] <= '9') || mid[i - 1] == '_');
++        if (word_start && (pl = kz3r_users_prefix(mid + i, w1.o - i)) != 0 &&
++            !kz3r_match(mid + i + pl, w1.o - i - pl, "%USERPROFILE%", 13)) {
++            size_t e = i + pl, k = e;
++            while (k < w1.o && mid[k] != '"' && mid[k] != '\'' && mid[k] != '\r' && mid[k] != '\n' && !kz3r_sep(mid + k, w1.o - k)) k++;
++            if (k > e) { kz3r_put(&w2, mid + i, pl); kz3r_put(&w2, "<user>", 6); i = k; continue; }
++        }
++        if ((i == 0 || !kz3r_pathchar(mid[i - 1])) && (pl = kz3r_home_prefix(mid + i, w1.o - i)) != 0) {
++            size_t e = i + pl, k = e;
++            while (k < w1.o && mid[k] != '"' && mid[k] != '\'' && mid[k] != '\r' && mid[k] != '\n' && !kz3r_sep(mid + k, w1.o - k)) k++;
++            if (k > e) { kz3r_put(&w2, mid + i, pl); kz3r_put(&w2, "<user>", 6); i = k; continue; }
++        }
++        kz3r_put(&w2, mid + i++, 1);
++    }
++    free(mid);
++    return w2.o;
++}
++#endif

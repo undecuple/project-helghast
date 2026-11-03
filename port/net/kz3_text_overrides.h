@@ -253,4 +253,87 @@ static inline int kz3_tx_decide(const Kz3TxTable* t, const char* key, size_t kle
     return KZ3_TX_REPLACE;
 }
 
+/* ---- Net pass 50: the pad's own button names in the game's text --------------------------------------------------
+ * The game names PlayStation buttons in plain words in a few localized strings (no glyph tag, so the glyph-set hook of
+ * patch 4012 never sees them): menu_setting_controller_swapl1l2 / _swapr1r2 ("Swap L1 and L2" in every language, the
+ * L1/R2 tokens stay Latin even in ja/ko/zh/ru), menu_unlock_Frag_Grenade_Description ("Hold down R2 ..."), and
+ * menu_press_start ("PRESS START"). kz3_tx_buttons() rewrites those tokens for the glyph set (PAD_PROMPT_*: 0 PS3,
+ * 1 PS4/PS5, 2 Xbox, 3 keycaps) of the pad in use: Xbox L1 -> LB, L2 -> LT, L3 -> LS, R1 -> RB, R2 -> RT, R3 -> RS,
+ * START -> MENU, SELECT -> VIEW; PS4/PS5 START -> OPTIONS, SELECT -> TOUCHPAD (the labels patch 4012 draws); PS3 and
+ * keycaps leave the text alone (the caller passes the connected pad's set, not keycaps). A token is L or R plus 1..3,
+ * or the capitals START / SELECT, with no ASCII letter or digit on either side ("L1とL2", "R2-Taste" match, "AR2" and
+ * "L10" do not). Language-independent, no table, no original text.
+ */
+enum { KZ3_TX_SET_PS3 = 0, KZ3_TX_SET_PS4 = 1, KZ3_TX_SET_XBOX = 2, KZ3_TX_SET_KBM = 3 };
+
+static inline int kz3_tx_alnum(uint16_t c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
+
+/* Writes the rewritten text to out and returns its length; -1 when nothing changes (or out is too small, or n is
+ * past KZ3_TX_TEXT_MAX), so the caller keeps the game's own string. */
+static inline long kz3_tx_buttons(const uint16_t* in, size_t n, int set, uint16_t* out, size_t cap)
+{
+    if ((set != KZ3_TX_SET_XBOX && set != KZ3_TX_SET_PS4) || n > KZ3_TX_TEXT_MAX || !in) return -1;
+    size_t o = 0;
+    int changed = 0;
+    for (size_t i = 0; i < n;) {
+        const char* rep = NULL;
+        size_t skip = 0;
+        uint16_t c = in[i];
+        if ((i == 0 || !kz3_tx_alnum(in[i - 1])) && (c == 'L' || c == 'R' || c == 'S')) {
+            if ((c == 'L' || c == 'R') && i + 1 < n && in[i + 1] >= '1' && in[i + 1] <= '3' &&
+                (i + 2 >= n || !kz3_tx_alnum(in[i + 2])) && set == KZ3_TX_SET_XBOX) {
+                static const char* const x[2][3] = { { "LB", "LT", "LS" }, { "RB", "RT", "RS" } };
+                rep = x[c == 'R'][in[i + 1] - '1'];
+                skip = 2;
+            } else if (c == 'S') {
+                static const char* const w[2][2] = { { "START", "MENU" }, { "SELECT", "VIEW" } };
+                static const char* const w4[2] = { "OPTIONS", "TOUCHPAD" };
+                for (int k = 0; k < 2; k++) {
+                    size_t wl = strlen(w[k][0]);
+                    if (i + wl > n || (i + wl < n && kz3_tx_alnum(in[i + wl]))) continue;
+                    size_t j = 0;
+                    while (j < wl && in[i + j] == (uint16_t)w[k][0][j]) j++;
+                    if (j == wl) { rep = set == KZ3_TX_SET_XBOX ? w[k][1] : w4[k]; skip = wl; break; }
+                }
+            }
+        }
+        if (rep) {
+            size_t rl = strlen(rep);
+            if (o + rl > cap) return -1;
+            for (size_t k = 0; k < rl; k++) out[o++] = (uint16_t)rep[k];
+            i += skip;
+            changed = 1;
+        } else {
+            if (o + 1 > cap) return -1;
+            out[o++] = in[i++];
+        }
+    }
+    return changed ? (long)o : -1;
+}
+
+/* ---- Net pass 50: the valve and the D-Charge without motion sensors ---------------------------------------------
+ * With the game's Motion Sensor Function Off (the default on a pad without a gyro, network pass 48) the valve
+ * (ValveJoystickController) and the D-Charge rotation read the stick (atan2 of axes 2 and 3 = the look stick,
+ * ASSUMPTION from 0x4D0650's two stick reads), but the game still shows the tutorial texts that tell the player to
+ * turn the controller; its only other variants are the Move ones (*_mc). These replace the four texts when the device in
+ * use has no motion sensors. English only for now (the port_ui table can carry the other languages under the keys
+ * "stick.<key>"; kz3_tr falls back to these). "\n" stays the two characters the game's strings carry.
+ */
+static inline const char* kz3_tx_stick_en(const char* key, size_t klen)
+{
+    static const struct { const char* k; const char* en; } r[] = {
+        { "tutorial_valve",
+          "Hold [ICON group=gamefunction id=GrabLeftHand] or [ICON group=gamefunction id=GrabRightHand] and turn the valve by moving [ICON group=axisfunction id=LookX] around to the left\\nThen release the button, move it back to the right and repeat" },
+        { "tutorial_valve_grab",
+          "Hold [ICON group=gamefunction id=GrabLeftHand] or [ICON group=gamefunction id=GrabRightHand] to grab onto the valve" },
+        { "tutorial_valve_rotate",
+          "Move [ICON group=axisfunction id=LookX] around anti-clockwise and then release [ICON group=gamefunction id=GrabLeftHand] or [ICON group=gamefunction id=GrabRightHand] to turn the valve.\\nGrab and Turn until the valve dial points all the way down." },
+        { "tutorial_dcharge_rotate",
+          "Move [ICON group=axisfunction id=LookX] around to arm the D-Charge" },
+    };
+    for (size_t i = 0; i < sizeof r / sizeof r[0]; i++)
+        if (strlen(r[i].k) == klen && !memcmp(r[i].k, key, klen)) return r[i].en;
+    return NULL;
+}
+
 #endif /* KZ3_TEXT_OVERRIDES_H */

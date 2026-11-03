@@ -24,20 +24,29 @@ while (( $# )); do
 done
 
 D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT
-tests=()
+tests=(); missing=()
 LINUX_ONLY=" "
 case "$(uname -s 2>/dev/null)" in Linux) ;; *)
   [[ -f tools/host-tests-linux.txt ]] && LINUX_ONLY=" $(grep -vE '^\s*(#|$)' tools/host-tests-linux.txt | tr -d '\r' | tr '\n' ' ') ";; esac
-while read -r t; do
-  [[ -z "$t" || "$t" == \#* ]] && continue
-  # A test whose file is not in this tree is skipped when the developer-only tools are absent (a developer-only tool is the
-  # marker); in a full developer checkout a missing test is a failure.
-  if [[ ! -e "$t" && ! -e tools/agents/merge-lane.sh ]]; then
-    (( Q )) || echo "skip $t (private tooling, not exported)"; continue
-  fi
-  if [[ "$LINUX_ONLY" == *" $t "* ]]; then (( Q )) || echo "skip $t (needs a Linux host)"; continue; fi
-  tests+=("$t")
-done < tools/host-tests.txt
+# A test listed in tools/host-tests.txt that is not in the tree is a FAILURE, in the public tree too (an export that
+# drops a listed test must not pass quietly). Tests that exist only in the private tree are listed in
+# tools/host-tests-private.txt instead; the export leaves that list out, and there a missing file is skipped.
+add_list() {   # add_list FILE STRICT(1 = a missing test fails)
+  local t
+  while read -r t; do
+    t="${t%$'\r'}"
+    [[ -z "$t" || "$t" == \#* ]] && continue
+    if [[ ! -e "$t" ]]; then
+      if (( $2 )); then missing+=("$t"); echo "FAIL $t (listed in $1 but not in this tree)"
+      elif (( ! Q )); then echo "skip $t (private list, file not in this tree)"; fi
+      continue
+    fi
+    if [[ "$LINUX_ONLY" == *" $t "* ]]; then (( Q )) || echo "skip $t (needs a Linux host)"; continue; fi
+    tests+=("$t")
+  done < "$1"
+}
+add_list tools/host-tests.txt 1
+[[ -f tools/host-tests-private.txt ]] && add_list tools/host-tests-private.txt 0
 
 n=${#tests[@]}; failed=(); printed=0; running=0
 # Prints the finished tests that come next in list order (a test's .rc file appears when it is done).
@@ -48,7 +57,7 @@ flush() {
     if (( GH )); then echo "::group::$t"; cat "$D/$printed.out"; echo "::endgroup::"; fi
     if (( rc )); then
       failed+=("$t")
-      if (( ! GH )); then echo "FAIL $t"; tail -5 "$D/$printed.out"; fi
+      if (( ! GH )); then echo "FAIL $t"; { grep -E "^(FAIL|not ok|Error|error:)" "$D/$printed.out" | head -10; tail -5 "$D/$printed.out"; }; fi
     elif (( ! Q && ! GH )); then echo "ok   $t"; fi
     printed=$((printed + 1))
   done
@@ -62,5 +71,5 @@ for i in "${!tests[@]}"; do
 done
 while (( running > 0 )); do wait -n; running=$((running - 1)); flush; done
 flush
-echo "host tests: $((n - ${#failed[@]}))/$n pass${failed:+; failed: ${failed[*]}}"
-(( ${#failed[@]} == 0 ))
+echo "host tests: $((n - ${#failed[@]}))/$((n + ${#missing[@]})) pass${failed:+; failed: ${failed[*]}}${missing:+; listed but missing: ${missing[*]}}"
+(( ${#failed[@]} == 0 && ${#missing[@]} == 0 ))

@@ -170,46 +170,7 @@ index 3e009208..0aef6605 100644
      uint32_t pch_ring[8];                     /* last trampoline-hop PCs */
      unsigned pch_n;
      uint32_t recent_pc[256];                  /* last drain steps ([pm-end]); KZ3 patch 1068: 256 (was 32), with
-@@ -572,6 +604,38 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
-  * scalar path with the same per-lane _u32 semantics. */
- #if defined(_MSC_VER)
- #include <stdlib.h>
-+
-+/* KZ3 patch 1099 (SPU pass 73): lifted SPU functions use the System V calling convention on Win64. The Microsoft
-+ * x64 convention makes xmm6-xmm15, rsi and rdi callee-saved, so every lifted function that uses them saved and
-+ * restored up to ten xmm registers on each entry and exit, and direct hops (patch 1096) between lifted functions
-+ * enter and leave one function per SPU transfer (spu_func_0000D100 of the audio mixer job: 10 xmm stores and loads
-+ * and 6 pushes and pops per loop iteration). Under sysv_abi all xmm registers are caller-saved: chains of lifted
-+ * functions save nothing, and a runtime (ms_abi) function that calls into lifted code saves them once. Every
-+ * function-pointer type that holds lifted code (spu_fn, spu_hop_fn, spu_lifted_fn, spu_lifted_entry_fn, tramp_fn,
-+ * ...) and every function stored in one carries SPU_ABI, so caller and callee always agree (C diagnoses a
-+ * mismatched pointer assignment). -DSPU_SYSV_ABI=0 (for every TU) = the default convention. */
-+#if !defined(SPU_SYSV_ABI)
-+#  if defined(_WIN64) && defined(__GNUC__)
-+#    define SPU_SYSV_ABI 1
-+#  else
-+#    define SPU_SYSV_ABI 0
-+#  endif
-+#endif
-+#if SPU_SYSV_ABI && defined(_WIN64)
-+#  define SPU_ABI __attribute__((sysv_abi))
-+#else
-+#  define SPU_ABI
-+#endif
-+/* GCC emits no Win64 unwind data (.pdata/.xdata) for sysv_abi functions, and MinGW's setjmp() records its frame
-+ * so that longjmp unwinds the stack through RtlUnwindEx, which cannot walk a lifted frame without that data (spu
-+ * pass 73: the K2 audio policy module stalled at its first halt longjmp). The SPU runtime's halt and stack-reset
-+ * jumps run no unwind handlers, so they use the frameless form (_setjmp(buf, NULL): longjmp only restores the
-+ * saved registers). */
-+#if SPU_SYSV_ABI && defined(_WIN64) && defined(__MINGW64__)
-+#  define SPU_SETJMP(b) _setjmp((b), NULL)
-+#else
-+#  define SPU_SETJMP(b) setjmp(b)
-+#endif
- #define SPU_BSWAP32(x) _byteswap_ulong(x)
- #define SPU_LS_FAST 1
- #elif defined(__GNUC__) || defined(__clang__)
-@@ -972,7 +1036,7 @@ static inline int spu_channel_has_data(const spu_channel* ch)
+@@ -972,7 +1004,7 @@ static inline int spu_channel_has_data(const spu_channel* ch)
  
  /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
   * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
@@ -218,7 +179,7 @@ index 3e009208..0aef6605 100644
  
  /* Pending cross-function transfer target; NULL when none. Thread-local: each
   * spu_context is pinned to one host thread for its lifetime. */
-@@ -989,7 +1053,7 @@ void spu_indirect_branch(spu_context* ctx);
+@@ -989,7 +1021,7 @@ void spu_indirect_branch(spu_context* ctx);
  /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
  void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
  /* Complete ordered hop; the launch-only ABI above does not tick lockstep. */
@@ -227,7 +188,7 @@ index 3e009208..0aef6605 100644
  extern unsigned g_spu_stack_reset_count; /* read-only outside registration */
  static inline int spu_stack_reset_needed(const spu_context* ctx)
  {
-@@ -1009,7 +1073,7 @@ void spu_task_launch_check_full(spu_context* ctx, void* fn); /* SPURS task-launc
+@@ -1009,7 +1041,7 @@ void spu_task_launch_check_full(spu_context* ctx, void* fn); /* SPURS task-launc
  #define spu_recent_mark(ctx, kind, pcv) \
      ((ctx)->recent_pc[(ctx)->recent_n++ & 255] = ((uint32_t)(kind) << 28) | (((uint32_t)(ctx)->host_depth & 0xFFu) << 20) | \
                                                   ((uint32_t)(pcv) & 0x3FFFFu))
@@ -236,7 +197,7 @@ index 3e009208..0aef6605 100644
  void spu_launch_ls0_end(spu_context* ctx);
  extern int g_spu_launch_diag;              /* 1: always the full hook (diagnostics or KZ3_SPU_FASTCG < 1039) */
  extern uint32_t g_spu_depth_max;           /* spu_depth_guard's limit, 0 until its first call (or always,
-@@ -1026,7 +1090,7 @@ static inline __attribute__((always_inline)) void spu_task_launch_check(spu_cont
+@@ -1026,7 +1058,7 @@ static inline __attribute__((always_inline)) void spu_task_launch_check(spu_cont
      const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
      ctx->recent_pc[ctx->recent_n++ & 255] = pc;
      if (__builtin_expect(g_spu_stack_reset_n != 0, 0) && ctx->host_depth && !ctx->policy_mode)
@@ -245,7 +206,7 @@ index 3e009208..0aef6605 100644
      /* same test as the full hook: a job branching to LS 0 (not on the first step) is complete */
      if (__builtin_expect(ctx->steps++ && pc == 0, 0) && !ctx->policy_mode && ctx->image_id > 0)
          spu_launch_ls0_end(ctx);
-@@ -1060,8 +1124,8 @@ int  spu_tailret_enabled(void);
+@@ -1060,8 +1092,8 @@ int  spu_tailret_enabled(void);
   * decode the guest-planted branch at LS 0 into ctx->pc, and return the
   * dispatcher to run instead of the interrupted transfer. Returns `tf`
   * unchanged (interrupt not taken) if LS 0 holds no branch instruction. */
@@ -256,7 +217,7 @@ index 3e009208..0aef6605 100644
  /* SPU_IRQWAIT_DIAG=1 (spu_drain.c): interrupts enabled with nothing pending to
   * take. A guest that enables interrupts and spins until its handler runs (a
   * job manager waiting on an event) reports what it is waiting on every 2^22
-@@ -1097,7 +1161,7 @@ static inline __attribute__((always_inline)) void spu_drain_call(spu_context* ct
+@@ -1097,7 +1129,7 @@ static inline __attribute__((always_inline)) void spu_drain_call(spu_context* ct
   * checks every condition under which spu_indirect_branch would do anything else and returns its lookup result,
   * or 0 (then the old trampoline path runs). The host stack does not grow (tail calls). KZ3_SPU_HOP=0 = old path;
   * any dispatch diagnostic switch (SPU_TAILRET, SPU_JOBTRACE, SPU_POLLTRACE, ...) also turns it off. */
@@ -265,7 +226,7 @@ index 3e009208..0aef6605 100644
  /* KZ3 patch 1097 (SPU pass 72): a computed hop to ctx->hop_ret_pc (the innermost open bracket's return pc) returns
   * to the host caller with pc = the target and nothing pending. The old path set the resolver trampoline and returned;
   * the bracket's drain then saw "resolver pending, pc == its return pc" and returned before any hook (the first test
-@@ -1174,7 +1238,7 @@ extern uint64_t g_spu_task_pol_bits[16];
+@@ -1174,7 +1206,7 @@ extern uint64_t g_spu_task_pol_bits[16];
  extern int g_spu_task_pol_big;
  #define SPU_IBG_TASKSET_TASK_LO 0x3000u    /* = SPU_TASKSET_TASK_LO (spu_channels.c, static assert there) */
  #define SPU_IBG_JOB_RETURN_LS   0x3FF00u   /* = SPU_JOB_RETURN_LS */
@@ -274,7 +235,7 @@ index 3e009208..0aef6605 100644
  static inline __attribute__((always_inline)) int spu_ib_guess_ok(const spu_context* ctx, uint32_t g, int gid)
  {
      if (g == 0 || g == 0xA00u || g == SPURS_TASKSET_PM_SYSCALL_LS || g == SPU_IBG_JOB_RETURN_LS || g == 0x4A40u ||
-@@ -1291,7 +1355,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+@@ -1291,7 +1323,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
                  g_spu_trampoline_fn = 0;                                   \
                  break;                                                     \
              }                                                              \

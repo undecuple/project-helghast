@@ -46,7 +46,7 @@ def put(root, rel, data=b"x\n"):
 
 
 def fake_repo(root):
-    for rel in ("tools/release/firstrun.py", "tools/release/firstrun_check.py", "tools/release/iso9660.py", "tools/release/version_check.py", "tools/release/crash_report.py",
+    for rel in ("tools/release/firstrun.py", "tools/release/firstrun_check.py", "tools/release/iso9660.py", "tools/release/version_check.py", "tools/release/crash_report.py", "tools/release/pathrules.py",
                 "tools/smoke/pso_template.py", "tools/release/launch.py", "tools/release/lift_fixups.py", "tools/release/shaders.py", "tools/release/names.py", "tools/release/support.py", "tools/release/support_text.py", "tools/release/rpcs3_import.py", "tools/release/rpcs3_text.py", "tools/release/rpcs3_locate.py",
                 "tools/assets/profile_edit.py",
                 "tools/release/eboot_sha256.json", "tools/release/psarc_sha256.json", "tools/release/test_firstrun.py",
@@ -61,7 +61,7 @@ def fake_repo(root):
                 "work/ps3recomp-patched/LICENSE", "work/ps3recomp-patched/CMakeLists.txt",
                 "work/ps3recomp-patched/.kz3-patchset", "work/ps3recomp-patched/tools/ppu_lifter.py",
                 "work/ps3recomp-patched/runtime/a.c", "work/ps3recomp-patched/tests/sync/CMakeLists.txt",
-                "work/ps3recomp-patched/third_party/at3_standalone/COPYING.LGPLv2.1",
+                "work/ps3recomp-patched/third_party/at3_standalone/COPYING.LGPLv2.1", "work/ps3recomp-patched/libs/video/fsr1/LICENSE.txt",
                 "work/ps3recomp-patched/fw_spu/spu_libsre/lifted/x.c", "work/ps3recomp-patched/scratch/junk.cpp",
                 "work/ps3recomp-patched/docs/a.md", "work/recomp/ppu_0001.c", "work/analysis/functions.json",
                 "build/kz3-win/kz3.exe", "Game/PS3_GAME/PARAM.SFO", "docs/in-progress/porting-status.md"):
@@ -129,7 +129,7 @@ def main():
         check(rc == 0 and "scrub clean" in txt, "clean fake tree assembles", txt)
         got = listing(out)
         want = {"kz3-setup/release/firstrun.py", "kz3-setup/release/firstrun_check.py", "kz3-setup/release/iso9660.py",
-                "kz3-setup/release/version_check.py", "kz3-setup/release/crash_report.py", "kz3-setup/release/eboot_sha256.json", "kz3-setup/release/psarc_sha256.json", "kz3-setup/jobmods.py",
+                "kz3-setup/release/version_check.py", "kz3-setup/release/crash_report.py", "kz3-setup/release/pathrules.py", "kz3-setup/release/eboot_sha256.json", "kz3-setup/release/psarc_sha256.json", "kz3-setup/jobmods.py",
                 "kz3-setup/pso_template.py", "kz3-setup/release/launch.py", "kz3-setup/release/lift_fixups.py", "kz3-setup/release/shaders.py", "kz3-setup/release/names.py", "kz3-setup/release/support.py", "kz3-setup/release/support_text.py", "kz3-setup/release/rpcs3_import.py", "kz3-setup/release/rpcs3_text.py", "kz3-setup/release/rpcs3_locate.py",
                 "kz3-setup/assets/profile_edit.py",
                 "kz3-setup/elf_info.py", "kz3-setup/spu/lift_spu.py", "kz3-setup/spu/gen_spu_register.py",
@@ -139,8 +139,8 @@ def main():
                 "cmake/mingw-w64.cmake",
                 "ps3recomp/LICENSE", "ps3recomp/CMakeLists.txt", "ps3recomp/.kz3-patchset",
                 "ps3recomp/tools/ppu_lifter.py", "ps3recomp/runtime/a.c", "ps3recomp/tests/sync/CMakeLists.txt",
-                "ps3recomp/third_party/at3_standalone/COPYING.LGPLv2.1", "licenses/LICENSE.txt",
-                "licenses/ps3recomp-LICENSE.txt", "licenses/at3_standalone-COPYING.LGPLv2.1.txt",
+                "ps3recomp/third_party/at3_standalone/COPYING.LGPLv2.1", "ps3recomp/libs/video/fsr1/LICENSE.txt", "licenses/LICENSE.txt",
+                "licenses/ps3recomp-LICENSE.txt", "licenses/at3_standalone-COPYING.LGPLv2.1.txt", "licenses/FidelityFX-FSR1-LICENSE.txt",
                 "README.md", "NOTICE.md", "run.cmd", "manifest.json", "VERSION.txt",
                 "fonts/Rajdhani-Medium.ttf", "fonts/Rajdhani-Bold.ttf", "licenses/Rajdhani-OFL.txt",
                 "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt"}
@@ -163,7 +163,7 @@ def main():
                 b = f.read()
             ok &= len(b) == e["size"] and hashlib.sha256(b).hexdigest() == e["sha256"]
             tot += e["size"]
-        check(ok and tot == man["total_bytes"], "manifest sizes, SHA-256 and total match the files", man)
+        check(ok and tot == man["total_bytes"], "manifest sizes, SHA-256 and total match the files", json.dumps(man)[-600:])
 
         rc, txt = run(["--repo", repo, "--out", out])
         check(rc != 0 and "not empty" in txt, "existing payload is not overwritten without --replace", txt)

@@ -1,4 +1,4 @@
-KZ3 patch 2061 (RSX pass 62, porting-status step 9q): keyboard binds by key position, not by layout.
+KZ3 patch 2061 (RSX pass 62): keyboard binds by key position, not by layout.
 pad_keybinds.h: a binding code is the US-layout virtual key of a key POSITION; the 49 layout-dependent positions
 (letters, digits, punctuation, the ISO Oem102 key) carry their PC/AT scancode (pad_kb_pos_keys). PadKbLayout
 (pad_kb_layout_build, platform-free: the host passes scancode -> virtual key and scancode -> legend queries) maps
@@ -24,7 +24,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
 +/* Patch 2061: binding codes are key positions (pad_keybinds.h); s_kb_layout turns them into the active layout's
 + * virtual keys. Rebuilt when the foreground thread's layout (HKL) changes: the poll reads it each time, which sees the
 + * same switch WM_INPUTLANGCHANGE announces without a hook in the window procedure. KZ3_KB_LAYOUT=<KLID> (eight hex
-+ * digits, e.g. 0000040C French) loads and uses that layout instead (owners' checks on Windows; ASSUMPTION: Wine's
++ * digits, e.g. 0000040C French) loads and uses that layout instead (checked on Windows; ASSUMPTION: Wine's
 + * MapVirtualKeyEx follows the X keymap and ignores the HKL, so under Proton the switch changes nothing). */
 +static PadKbLayout s_kb_layout;
 +static HKL         s_kb_hkl = NULL;

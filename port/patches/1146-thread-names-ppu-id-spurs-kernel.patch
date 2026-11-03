@@ -1,0 +1,29 @@
+Thread names for crash reports (SPU pass 137): the PPU host thread is named "ppu:<id> <guest name>" (id first, as in the
+kz3 log label ppu:<id>) and the SPURS kernel threads "spurs:<k>" through ps3_thread_name (SetThreadDescription, resolved at run time;
+no-op without it). The crash filter (patch 1011) reads the name back with GetThreadDescription.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index c1d468f..e8ccded 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2478,6 +2478,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+     { extern void spu_host_fp_init(void); spu_host_fp_init(); }   /* KZ3 patch 1095: SPU denormals = 0 */
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
++    ps3_thread_name("spurs:%d", ((struct { struct SpursInst* si; int k; }*)p)->k);   /* KZ3 patch 1146 */
+ #endif
+     struct SpursInst* si = ((struct { struct SpursInst* si; int k; }*)p)->si;
+     const int kt = ((struct { struct SpursInst* si; int k; }*)p)->k;   /* kernel thread index */
+diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
+index 1020379..7c2ea4f 100644
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -179,7 +179,7 @@ static void* ppu_host_thread_proc(void* param)
+ #endif
+ {
+     ppu_thread_info* info = (ppu_thread_info*)param;
+-    ps3_thread_name("ppu %s", info->name);
++    ps3_thread_name("ppu:%llu %s", (unsigned long long)info->ctx.thread_id, info->name);   /* KZ3 patch 1146: id first, as in the log label */
+ 
+ #ifdef _WIN32
+     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the

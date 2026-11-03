@@ -643,6 +643,24 @@ static char s_pd_out[1100];
 static int  s_pd_lang, s_pc_lang, s_pu_lang;   /* network pass 45: language of each patched page */
 static int  s_pd_state;              /* 0 not tried, 1 written, -1 served as main.cpp serves it */
 
+/* The main menu's version block (kz3_menu_version.h): the page main.cpp serves plus the text lines.
+ * KZ3_MENU_VERSION=0 turns the block off; KZ3_PORT_VERSION=<x> and KZ3_NEWER_VERSION=<x> (test switches) win over the
+ * kz3.ini keys port_version / newer_version; no port_version at all leaves the page as it is. */
+#include "kz3_menu_version.h"
+static char s_pv_out[1100];
+static int  s_pv_lang, s_pv_state;
+
+static char* kz3_menu_version_patch_gum(const char* text, size_t len, size_t* pn)
+{
+    static char ini[65536];
+    const char* off = getenv("KZ3_MENU_VERSION");
+    if (off && !strcmp(off, "0")) return NULL;
+    ini[0] = 0;
+    kz3_exe_ini_read(ini, sizeof ini);
+    return kmv_patch_text(text, len, pn, getenv("KZ3_PORT_VERSION"), getenv("KZ3_NEWER_VERSION"), ini,
+                          kz3_tr("menu.version_newer", KMV_NEWER_EN));
+}
+
 static void kz3_prompts_miss_hook(char* path, size_t cap)
 {
     char low[1100];
@@ -657,6 +675,12 @@ static void kz3_prompts_miss_hook(char* path, size_t cap)
         kz3_host_composed_check(KZ3_PROMPTS_GUM_KEY, "the prompts row");   /* net 40: one-place list */
         kz3_pu_patch_serve(path, cap, &s_pu_state, &s_pu_lang, s_pu_out, sizeof s_pu_out, "advancedcontroller.gum",
                            kz3_prompts_patch_gum, "Layout and Prompts row");
+        return;
+    }
+    if (u && !strcmp(u + 7, KZ3_HC_MAINMENU)) {
+        kz3_host_composed_check(KZ3_HC_MAINMENU, "the version block");
+        kz3_pu_patch_serve(path, cap, &s_pv_state, &s_pv_lang, s_pv_out, sizeof s_pv_out, "mainmenu-net.gum",
+                           kz3_menu_version_patch_gum, "version block");
         return;
     }
     if (u && !strcmp(u + 7, KZ3_HC_DISPLAY)) {

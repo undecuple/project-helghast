@@ -138,16 +138,6 @@ if [[ -r "$LOCKS/build-cap" ]] && read -r cap_until cap_jobs < "$LOCKS/build-cap
 fi
 avail_gb=$(( avail_mb / 1024 ))
 echo "build-kz3: $DIR with -j$jobs (${avail_gb} GB available; build slot ${SLOT:-held by the caller}, $in_use of $SLOTS in use)" >&2
-# ccache (in the .#win shell since 2026-10-09): a re-lift or a branch switch regenerates the 2.5-4.4 GB-per-job lifted
-# chunks with mostly the same content; ccache serves those from work/ccache instead of recompiling. CCACHE_BASEDIR
-# makes hits independent of the checkout path. KZ3_CCACHE=0 turns it off.
-if command -v ccache >/dev/null && [[ "${KZ3_CCACHE:-1}" != 0 ]]; then
-  export CCACHE_DIR="$ROOT/work/ccache" CCACHE_BASEDIR="$ROOT" CCACHE_MAXSIZE=40G CCACHE_COMPRESS=1
-  grep -q '^CMAKE_CXX_COMPILER_LAUNCHER:.*=ccache' "$DIR/CMakeCache.txt" 2>/dev/null \
-    || cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache "$DIR" >/dev/null
-elif grep -q '^CMAKE_CXX_COMPILER_LAUNCHER:.*=ccache' "$DIR/CMakeCache.txt" 2>/dev/null; then
-  cmake -UCMAKE_C_COMPILER_LAUNCHER -UCMAKE_CXX_COMPILER_LAUNCHER "$DIR" >/dev/null   # no ccache here: plain compiler
-fi
 # A build dir that does not exist yet is configured here, for the lifts resolved above (2026-10-21: build-kz3.sh stopped at
 # "cmake --build" on a new dir; the 1.14 dir had to be configured by hand with the right -DRECOMP_DIR/-DKZ3_SPU_DIR). The
 # arguments are the documented ones (the testing notes, "KZ3 exe"); other options are cached by cmake.
@@ -159,6 +149,16 @@ if [[ ! -f "$DIR/CMakeCache.txt" ]]; then
         -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython3_EXECUTABLE="$($PY -c 'import sys; print(sys.executable)')" \
         -DRECOMP_DIR="$recomp_l" -DKZ3_SPU_DIR="$spu_l" >/dev/null || exit 4
   cat "$ROOT/work/ps3recomp-patched/.kz3-patchset" > "$DIR/.kz3-toolkit-stamp" 2>/dev/null || true
+fi
+# ccache (in the .#win shell since 2026-10-09): a re-lift or a branch switch regenerates the 2.5-4.4 GB-per-job lifted After the new-dir configure (2026-11-02: before it, the launcher cmake call ran on a missing dir and set -e ended the script).
+# chunks with mostly the same content; ccache serves those from work/ccache instead of recompiling. CCACHE_BASEDIR
+# makes hits independent of the checkout path. KZ3_CCACHE=0 turns it off.
+if command -v ccache >/dev/null && [[ "${KZ3_CCACHE:-1}" != 0 ]]; then
+  export CCACHE_DIR="$ROOT/work/ccache" CCACHE_BASEDIR="$ROOT" CCACHE_MAXSIZE=40G CCACHE_COMPRESS=1
+  grep -q '^CMAKE_CXX_COMPILER_LAUNCHER:.*=ccache' "$DIR/CMakeCache.txt" 2>/dev/null \
+    || cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache "$DIR" >/dev/null
+elif grep -q '^CMAKE_CXX_COMPILER_LAUNCHER:.*=ccache' "$DIR/CMakeCache.txt" 2>/dev/null; then
+  cmake -UCMAKE_C_COMPILER_LAUNCHER -UCMAKE_CXX_COMPILER_LAUNCHER "$DIR" >/dev/null   # no ccache here: plain compiler
 fi
 # Re-configure when the patched toolkit changed (queue 9m, SPU pass 46; KZ2's build-kz2.sh does the same): ps3recomp
 # collects its sources with file(GLOB_RECURSE) without CONFIGURE_DEPENDS, so a patch that adds a source file is never

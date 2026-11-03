@@ -142,11 +142,15 @@ install)
   ;;
 compile)
   PAYLOAD="$1" OUT="$2"; shift 2; mkdir -p "$OUT"
-  cd "$ROOT/installer" || exit 1
-  T0=$SECONDS
-  proton run 'C:\windows\system32\cmd.exe' /v:on /c "C:\\inno\\ISCC.exe /DPayload=$(winpath "$PAYLOAD") /O$(winpath "$OUT") $* kz3.iss > $(winpath "$OUT")\\iscc.txt 2>&1 & echo [exit code !errorlevel!] >> $(winpath "$OUT")\\iscc.txt" \
-    >"$OUT/proton.out" 2>&1
-  echo "compile: $((SECONDS - T0)) s"; tail -25 "$OUT/iscc.txt" | cut -c1-220; ls -la "$OUT"/*.exe 2>/dev/null
+  # shellcheck source=wizard_test/compile_cmd.sh
+  source "$ROOT/tools/release/wizard_test/compile_cmd.sh"
+  T0=$SECONDS; STAMP="$OUT/.compile-start"; : > "$STAMP"; rm -f "$OUT/iscc.txt"
+  CMDF="$C/c.cmd"
+  write_compile_cmd "$CMDF" "$(winpath "$ROOT/installer")" "$(winpath "$PAYLOAD")" "$(winpath "$OUT")" "$@"
+  cp "$CMDF" "$OUT/c.cmd.txt"
+  proton run 'C:\windows\system32\cmd.exe' /c 'C:\c.cmd' >"$OUT/proton.out" 2>&1
+  echo "compile: $((SECONDS - T0)) s"; tail -25 "$OUT/iscc.txt" 2>/dev/null | cut -c1-220; ls -la "$OUT"/*.exe 2>/dev/null
+  compile_verdict "$OUT" "$STAMP" || exit 1
   ;;
 wizard)
   SETUP="$1" SHOTS="$2" FAIL="${3:-}"; mkdir -p "$SHOTS"

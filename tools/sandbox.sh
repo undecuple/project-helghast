@@ -136,7 +136,7 @@ STATIC_SEEN=" "
 for w in "$ROOT/work" "${MAIN:+$MAIN/work}"; do
   for n in extracted move-when-done; do
     [[ -n "$w" && -L "$w/$n" ]] || continue
-    T="$(readlink -f "$w/$n")"
+    T="$(readlink -f "$w/$n" || true)"   # empty while the drive is unmounted: the link stays dangling, no bind
     [[ -n "$STATIC_ROOT" && "$T" == "$STATIC_ROOT/$n" && -d "$T" && "$STATIC_SEEN" != *" $T "* ]] || continue
     args+=(--ro-bind "$T" "$T"); STATIC_SEEN+="$T "
   done

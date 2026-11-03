@@ -1,0 +1,21 @@
+KZ3 patch 1145 (SPU pass 132), credit: J-Stars Victory VS+ port, its patch 0004 (MIT). The HLE fast path (ps3_hle_register_fast: sys_lwmutex_lock/unlock) returns before _TocGuard, the only store of r2 to 0x28(r1). A guest caller that does 'ld r2,40(r1)' after an import reloads a stale slot. The fast path now stores r2 there as the full path does (FLOW_NOSPILL skips it in both). KZ3's lifted code lowers that reload to the literal TOC (TOCFIX), so KZ3 is not exposed; this is defensive and for non-TOCFIX lifts. Host test tools/spu/test_hle_fast_toc.sh (fails before, passes after).
+
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -282,8 +282,15 @@
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+ {
+-    if (const hle_fast_fn f = hle_fast(nid))
++    /* KZ3 patch 1145 (J-Stars port patch 0004): the fast form skips _TocGuard below, the only place that stores r2
++     * to the ABI slot 0x28(r1), yet a guest caller may reload r2 from it after the import (`ld r2,40(r1)`; the glink
++     * stub it believes it called would have stored r2 there). Store it as the slow path does (same FLOW_NOSPILL
++     * switch). A fast form that declines falls through to the full path, which stores it again. */
++    if (const hle_fast_fn f = hle_fast(nid)) {
++        static int _fns = -1; if (_fns < 0) _fns = getenv("FLOW_NOSPILL") ? 1 : 0;
++        if (!_fns) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
+         if (f(ctx)) return;
++    }
+ 
+     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
+      * call it makes. WAITBT_EVERY only samples threads that are blocking on an

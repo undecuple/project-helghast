@@ -1,0 +1,26 @@
+KZ3 patch 4029 (network pass 50): pad_prompt_set_pad(), the glyph set of the pad that is plugged in even while the keys
+were the last input (pad_prompt_set() answers keycaps then). The text layer (port/net/kz3_text_overrides.h,
+kz3_net_hooks.h) names pad buttons in the game's own strings ("Swap L1 and L2", "Hold down R2") by this set:
+Xbox pad LB/LT/RB/RT, PlayStation pad unchanged. No pad connected = the PS3 set (the game's text).
+
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1327,6 +1327,18 @@
+     return pad_prompt_set_for_device(dev);
+ }
+ 
++/* KZ3 patch 4029 (network pass 50): the glyph set of the PAD that is plugged in, for text that names pad buttons
++ * (port/net/kz3_text_overrides.h kz3_tx_buttons: "Swap L1 and L2" -> "Swap LB and LT" on an Xbox pad). Same as
++ * pad_prompt_set(), except that keycaps (PAD_PROMPT_KBM, chosen or Auto) give the connected host pad's set, since a pad
++ * option row is about the pad even while the keys were the last input. No pad connected -> PS3 (the game's own text). */
++int pad_prompt_set_pad(void)
++{
++    int s = pad_prompt_set();
++    if (s != PAD_PROMPT_KBM) return s;
++    PadLastDevice none = { PAD_DEV_NONE, -1 };
++    return pad_prompt_set_for_device(pad_last_device_current(&none, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS, NULL));
++}
++
+ #ifdef _WIN32
+ /* For 2039's keycap prompts: 1 when the prompts are keycaps (pad_prompt_set; was "the last input was a key"). */
+ int pad_kb_last_device_keyboard(void)

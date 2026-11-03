@@ -1,0 +1,271 @@
+KZ3 patch 1148 (SPU pass 139): ps3_evcv, a condition variable for Windows on per-thread events that never waits in ntdll's futex queue
+(runtime/platform/ps3_evcv.h, ps3_evcv.c). Patch 1149 moves the timed waits of the runtime onto it.
+Credit: the Killzone 2 port, patches 6041-6044 (same ps3recomp base, MIT); the design and the code are theirs, ported as it is
+with a host-test switch (PS3_EVCV_SHIM, below).
+
+Why: under Wine/Proton (GE-Proton11-7, read in its ntdll) SleepConditionVariableSRW, SleepConditionVariableCS and WaitOnAddress all wait in
+RtlWaitOnAddress, whose shared futex queue (futex_queues[(addr >> 4) & 255]) has a race: a waiter whose NtWaitForAlertByThreadId returns
+while its entry is still linked (its timeout ran out; or an alert left over from an earlier timed wait of the same thread) leaves without
+the bucket lock when its entry's address already reads 0, while RtlWakeAddressAll / RtlWakeAddressSingle store that 0 first and unlink the
+entry after, re-reading its next pointer. If the waiter's stack is reused in that window, garbage is linked into the bucket and a later
+wait or wake on any address hashed there faults. Patch 1143 moved the SPURS kernel threads' idle wake off it (the place the two meet most);
+patch 1144 counted the other timed waits (pass 129: no fix needed on K4 by those counts). This patch is the general fix those counts
+left optional: every timed wait is a waiter that can time out into that window, and a timeout that meets a wake leaves an alert that
+makes the same thread's next untimed wait return early.
+
+ps3_evcv keeps the Win32 contract (caller's lock released while asleep and held on return; spurious wakes allowed; FALSE + ERROR_TIMEOUT
+on a timeout). One pointer, zero = initial, so it replaces a CONDITION_VARIABLE in place (also spu_context's void* ch_wait_cv slot). Bit 0
+is a spin lock over a FIFO list of waiter nodes on the waiters' stacks; a waker unlinks and marks nodes claimed under it and sets their
+events after the unlock; a waiter that timed out unlinks itself if unclaimed, else waits for the committed set (so no stale set is left on
+a thread's event). The spin lock is held for list operations only (no system call inside; a contended taker yields with SwitchToThread).
+One auto-reset event per thread, closed at thread exit by an FLS callback. A wake with no waiters is a fence and a load.
+PS3_CV_STATS=1: every 10 s, per wait site (exe+offset of the caller), waits / woken / timeouts / late (a wake that met a timeout: the case
+Wine's queue gets wrong) on stderr. Off Windows ps3_evcv is the POSIX shim's CONDITION_VARIABLE with the same calls as before.
+PS3_EVCV_SHIM (host test only): builds the Windows branch on win32_compat.h's POSIX shim (no FLS: thread events live as long as the process).
+Host test tools/spu/test_r139_evcv.sh.
+--- /dev/null
++++ b/runtime/platform/ps3_evcv.h
+@@ -0,0 +1,74 @@
++/*
++ * ps3recomp - a condition variable for Windows that never waits in ntdll's futex queue (KZ3 patch 1148, ported from the
++ * Killzone 2 port, patches 6041-6044)
++ *
++ * Why: under Wine/Proton (seen on GE-Proton11-7) SleepConditionVariableSRW / SleepConditionVariableCS and
++ * WaitOnAddress all wait through ntdll's RtlWaitOnAddress, whose shared futex queue (256 buckets hashed by address)
++ * has a race: a waiter whose NtWaitForAlertByThreadId returns while it is still linked (its timeout ran out, or an
++ * alert left over from an earlier timed wait of the same thread) leaves without the bucket lock when its entry's
++ * address already reads 0, while a waker (RtlWakeAddressAll / RtlWakeAddressSingle) stores that 0 first and unlinks
++ * the entry after, re-reading the entry's next pointer. When the waiter's stack is reused in that window, garbage is
++ * linked into the bucket and a later wait or wake on any address hashed there faults (the Killzone 2 port's 1-in-20 main
++ * menu crash; KZ3 patch 1143 moved the SPURS kernel threads' idle wake off it, this moves the other timed waits).
++ *
++ * ps3_evcv keeps the Win32 condition variable's contract (spurious wakes allowed, the caller's lock released while
++ * asleep and held again on return, FALSE + ERROR_TIMEOUT on a timeout) on one auto-reset event per thread:
++ *   - the waiter links a node {event, claimed} into the cv's list under the cv's own spin lock (bit 0 of the word),
++ *     drops the caller's lock and waits on its event with the timeout;
++ *   - a waker unlinks nodes and marks them claimed under the spin lock, then sets their events after the unlock;
++ *   - a waiter that timed out takes the spin lock: unclaimed, it unlinks itself and returns the timeout; claimed, the
++ *     waker is committed to setting its event, so it waits for that set (no stale set is ever left on an event).
++ * Nothing here calls RtlWaitOnAddress: the spin lock is held for a few list operations only (no system call inside;
++ * a contended taker yields), and the events wait through fsync/ntsync/wineserver. Same size as CONDITION_VARIABLE
++ * (one pointer) and zero is the initial state, so it drops into structs and statics in place of one.
++ *
++ * PS3_CV_STATS=1: every 10 s, per wait site (the caller's return address, as exe+offset), waits / woken / timeouts /
++ * claimed-after-timeout (a wake and a timeout that met: the case Wine's queue gets wrong) on stderr.
++ * Off Windows ps3_evcv is the POSIX shim's CONDITION_VARIABLE (win32_compat.h) with the same calls as before: the code
++ * that waits through that shim on every platform (spu_ch_wait) keeps its old behaviour there; the pthread branches
++ * elsewhere are unchanged.
++ */
++#ifndef PS3_EVCV_H
++#define PS3_EVCV_H
++/* PS3_EVCV_SHIM (host test only, tools/spu/test_r139_evcv.c): build the Windows branch on win32_compat.h's POSIX shim. */
++#if defined(_WIN32) || defined(PS3_EVCV_SHIM)
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include "win32_compat.h"
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct ps3_evcv { volatile ULONG_PTR w; } ps3_evcv;   /* bit 0: spin lock; the rest: first waiting node */
++#define PS3_EVCV_INIT {0}
++#ifdef __cplusplus
++static_assert(sizeof(ps3_evcv) == sizeof(void*), "ps3_evcv fills a CONDITION_VARIABLE's (or spu_context's void*) slot");
++#else
++_Static_assert(sizeof(ps3_evcv) == sizeof(void*), "ps3_evcv fills a CONDITION_VARIABLE's (or spu_context's void*) slot");
++#endif
++
++static inline void ps3_evcv_init(ps3_evcv* cv) { cv->w = 0; }
++/* As SleepConditionVariableSRW (exclusive mode) / SleepConditionVariableCS: TRUE when woken (or spuriously),
++ * FALSE with GetLastError() == ERROR_TIMEOUT after ms milliseconds (INFINITE: no timeout). */
++BOOL ps3_evcv_sleep_srw(ps3_evcv* cv, SRWLOCK* lock, DWORD ms);
++BOOL ps3_evcv_sleep_cs(ps3_evcv* cv, CRITICAL_SECTION* lock, DWORD ms);
++void ps3_evcv_wake_one(ps3_evcv* cv);
++void ps3_evcv_wake_all(ps3_evcv* cv);
++
++#ifdef __cplusplus
++}
++#endif
++#else /* !_WIN32: the POSIX shim's condition variable, unchanged */
++#include "win32_compat.h"
++typedef CONDITION_VARIABLE ps3_evcv;
++#define PS3_EVCV_INIT CONDITION_VARIABLE_INIT
++static inline void ps3_evcv_init(ps3_evcv* cv) { InitializeConditionVariable(cv); }
++static inline BOOL ps3_evcv_sleep_srw(ps3_evcv* cv, SRWLOCK* lock, DWORD ms) { return SleepConditionVariableSRW(cv, lock, ms, 0); }
++static inline BOOL ps3_evcv_sleep_cs(ps3_evcv* cv, CRITICAL_SECTION* lock, DWORD ms) { return SleepConditionVariableCS(cv, lock, ms); }
++static inline void ps3_evcv_wake_one(ps3_evcv* cv) { WakeConditionVariable(cv); }
++static inline void ps3_evcv_wake_all(ps3_evcv* cv) { WakeAllConditionVariable(cv); }
++#endif /* _WIN32 */
++#endif /* PS3_EVCV_H */
+--- /dev/null
++++ b/runtime/platform/ps3_evcv.c
+@@ -0,0 +1,166 @@
++/*
++ * ps3recomp - ps3_evcv: a condition variable on per-thread events, for Windows (KZ3 patch 1148, from the Killzone 2 port's
++ * patch 6041; see ps3_evcv.h for why)
++ */
++#if defined(_WIN32) || defined(PS3_EVCV_SHIM)
++#include "ps3_evcv.h"
++#include <stdio.h>
++#include <stdlib.h>
++#ifndef _WIN32   /* PS3_EVCV_SHIM: what the POSIX shim lacks. No FLS: a thread's event lives as long as the process. */
++#define FLS_OUT_OF_INDEXES ((DWORD)0xFFFFFFFF)
++#define WINAPI
++static inline DWORD FlsAlloc(void (*cb)(void*)) { (void)cb; return FLS_OUT_OF_INDEXES; }
++static inline BOOL FlsSetValue(DWORD i, void* v) { (void)i; (void)v; return TRUE; }
++static inline HANDLE GetModuleHandleW(const void* n) { (void)n; return NULL; }
++#endif
++
++typedef struct ps3_evcv_node {
++    struct ps3_evcv_node* next;
++    HANDLE              ev;        /* the waiting thread's auto-reset event */
++    volatile LONG       claimed;   /* set by a waker under the spin lock: it will set ev after its unlock */
++} __attribute__((aligned(8))) ps3_evcv_node;
++
++/* ---- the spin lock: bit 0 of cv->w; the other bits are the list head ---- */
++static ULONG_PTR cv_lock(ps3_evcv* cv)
++{
++    for (unsigned spins = 0;; spins++) {
++        ULONG_PTR w = __atomic_load_n(&cv->w, __ATOMIC_RELAXED);
++        if (!(w & 1) && __atomic_compare_exchange_n(&cv->w, &w, w | 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
++            return w;
++        if (spins < 64) YieldProcessor();
++        else SwitchToThread();   /* the holder was preempted: let it run (NtYieldExecution, no futex queue) */
++    }
++}
++static void cv_unlock(ps3_evcv* cv, ps3_evcv_node* head)
++{
++    __atomic_store_n(&cv->w, (ULONG_PTR)head, __ATOMIC_RELEASE);
++}
++
++/* ---- one auto-reset event per thread, closed at thread exit (FLS callback) ---- */
++static __thread HANDLE t_ev;
++static volatile LONG s_fls = -1;   /* FLS index, -2 while being made */
++static void WINAPI cv_thread_gone(void* p) { if (p) CloseHandle((HANDLE)p); }
++static HANDLE cv_thread_event(void)
++{
++    if (t_ev) return t_ev;
++    HANDLE e = CreateEventW(NULL, FALSE, FALSE, NULL);
++    if (!e) return NULL;
++    LONG idx = __atomic_load_n(&s_fls, __ATOMIC_ACQUIRE);
++    if (idx == -1 && __sync_bool_compare_and_swap(&s_fls, -1, -2)) {
++        const DWORD i = FlsAlloc(cv_thread_gone);
++        __atomic_store_n(&s_fls, i == FLS_OUT_OF_INDEXES ? -3 : (LONG)i, __ATOMIC_RELEASE);
++    }
++    while ((idx = __atomic_load_n(&s_fls, __ATOMIC_ACQUIRE)) == -2) SwitchToThread();
++    if (idx >= 0) FlsSetValue((DWORD)idx, e);   /* else the handle lives as long as the process */
++    t_ev = e;
++    return e;
++}
++
++/* ---- PS3_CV_STATS ---- */
++#define CV_SITES 48
++static struct { void* volatile site; volatile LONG64 waits, woken, timeouts, late; } s_st[CV_SITES];
++static int s_stats = -1;
++static volatile LONG64 s_st_next;
++static void cv_stat(void* site, int outcome)   /* 0 woken, 1 timeout, 2 claimed after the timeout */
++{
++    if (s_stats < 0) { const char* e = getenv("PS3_CV_STATS"); s_stats = e && *e && *e != '0'; }
++    if (!s_stats) return;
++    int i = (int)(((ULONG_PTR)site >> 2) % CV_SITES);
++    for (int n = 0; n < CV_SITES; n++, i = (i + 1) % CV_SITES) {
++        void* cur = s_st[i].site;
++        if (cur == site) break;
++        if (!cur && __sync_bool_compare_and_swap(&s_st[i].site, NULL, site)) break;
++        if (n == CV_SITES - 1) return;   /* table full */
++    }
++    InterlockedIncrement64(&s_st[i].waits);
++    if (outcome == 1) InterlockedIncrement64(&s_st[i].timeouts);
++    else InterlockedIncrement64(&s_st[i].woken);
++    if (outcome == 2) InterlockedIncrement64(&s_st[i].late);
++    const LONG64 now = (LONG64)GetTickCount64(), due = s_st_next;
++    if (now < due || !__sync_bool_compare_and_swap(&s_st_next, due, now + 10000)) return;
++    if (!due) return;   /* first call: the first report comes 10 s later */
++    const ULONG_PTR base = (ULONG_PTR)GetModuleHandleW(NULL);
++    for (int k = 0; k < CV_SITES; k++) {
++        if (!s_st[k].site) continue;
++        fprintf(stderr, "[ps3_evcv] site exe+0x%llx waits=%lld woken=%lld timeouts=%lld late=%lld\n",
++                (unsigned long long)((ULONG_PTR)s_st[k].site - base), (long long)s_st[k].waits,
++                (long long)s_st[k].woken, (long long)s_st[k].timeouts, (long long)s_st[k].late);
++    }
++    fflush(stderr);
++}
++
++/* Link a node, run unlock(lock), wait, then lock(lock). */
++static BOOL cv_sleep(ps3_evcv* cv, void* lock, void (*unlock)(void*), void (*relock)(void*), DWORD ms, void* site)
++{
++    ps3_evcv_node n = { NULL, cv_thread_event(), 0 };
++    if (!n.ev) {   /* no event (handle exhaustion): a short sleep, reported as a spurious wake */
++        unlock(lock); Sleep(ms < 1 ? ms : 1); relock(lock);
++        return TRUE;
++    }
++    ps3_evcv_node* head = (ps3_evcv_node*)cv_lock(cv);
++    if (!head) head = &n;
++    else { ps3_evcv_node* t = head; while (t->next) t = t->next; t->next = &n; }   /* FIFO: wake_one takes the oldest */
++    cv_unlock(cv, head);
++    unlock(lock);
++    const DWORD r = WaitForSingleObject(n.ev, ms);
++    int outcome = 0;
++    if (r != WAIT_OBJECT_0) {
++        head = (ps3_evcv_node*)cv_lock(cv);
++        if (!__atomic_load_n(&n.claimed, __ATOMIC_RELAXED)) {
++            ps3_evcv_node** pp = &head;
++            while (*pp && *pp != &n) pp = &(*pp)->next;
++            if (*pp) *pp = n.next;
++            cv_unlock(cv, head);
++            relock(lock);
++            if (site) cv_stat(site, 1);
++            SetLastError(ERROR_TIMEOUT);
++            return FALSE;
++        }
++        cv_unlock(cv, head);
++        WaitForSingleObject(n.ev, INFINITE);   /* the waker that claimed n sets it after its unlock */
++        outcome = 2;
++    }
++    relock(lock);
++    if (site) cv_stat(site, outcome);
++    return TRUE;
++}
++
++static void srw_unlock(void* l) { ReleaseSRWLockExclusive((SRWLOCK*)l); }
++static void srw_lock(void* l)   { AcquireSRWLockExclusive((SRWLOCK*)l); }
++static void cs_unlock(void* l)  { LeaveCriticalSection((CRITICAL_SECTION*)l); }
++static void cs_lock(void* l)    { EnterCriticalSection((CRITICAL_SECTION*)l); }
++
++BOOL ps3_evcv_sleep_srw(ps3_evcv* cv, SRWLOCK* lock, DWORD ms)
++{ return cv_sleep(cv, lock, srw_unlock, srw_lock, ms, __builtin_return_address(0)); }
++BOOL ps3_evcv_sleep_cs(ps3_evcv* cv, CRITICAL_SECTION* lock, DWORD ms)
++{ return cv_sleep(cv, lock, cs_unlock, cs_lock, ms, __builtin_return_address(0)); }
++
++void ps3_evcv_wake_one(ps3_evcv* cv)
++{
++    /* Nobody waits and nobody holds the spin lock: nothing to do. The fence orders the caller's predicate store
++     * before this load (x86 lets a load pass an earlier store), as Wine's interlocked increment of the cv word does. */
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    if (!__atomic_load_n(&cv->w, __ATOMIC_RELAXED)) return;
++    ps3_evcv_node* head = (ps3_evcv_node*)cv_lock(cv);
++    ps3_evcv_node* n = head;
++    HANDLE ev = NULL;
++    if (n) { head = n->next; ev = n->ev; __atomic_store_n(&n->claimed, 1, __ATOMIC_RELAXED); }
++    cv_unlock(cv, head);
++    if (ev) SetEvent(ev);   /* n may be gone once this returns; ev lives as long as its thread, which waits on it */
++}
++
++void ps3_evcv_wake_all(ps3_evcv* cv)
++{
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    if (!__atomic_load_n(&cv->w, __ATOMIC_RELAXED)) return;
++    ps3_evcv_node* n = (ps3_evcv_node*)cv_lock(cv);
++    for (ps3_evcv_node* t = n; t; t = t->next) __atomic_store_n(&t->claimed, 1, __ATOMIC_RELAXED);
++    cv_unlock(cv, NULL);
++    while (n) {   /* read next and ev before the set: the node's owner returns once its event is set */
++        ps3_evcv_node* next = n->next;
++        HANDLE ev = n->ev;
++        SetEvent(ev);
++        n = next;
++    }
++}
++#endif /* _WIN32 */

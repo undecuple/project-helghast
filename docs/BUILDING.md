@@ -4,8 +4,8 @@ The port's executable is generated from **your own copy** of the game: the game'
 decrypted EBOOT and compiled on your machine. Nothing of the game is in this repository, and nothing is downloaded.
 
 **Players use the installer** (or the portable zip) from the
-[releases page](https://github.com/undecuple/project-helghast/releases); the README's
-[Windows quick start](../README.md#windows-quick-start) walks through it. The installer builds natively on Windows
+[releases page](https://github.com/undecuple/project-helghast/releases); the
+[Windows quick start](INSTALL.md#windows-quick-start) walks through it. The installer builds natively on Windows
 with its bundled toolchain (compiler, CMake, Ninja, Python): no WSL2, no Nix. Who checked it: the maintainers ran it
 on native Windows 11 (2026-10-21; the installer's build took 422 s, then the game ran to the menus) and a player
 built and ran the port with it on native Windows 11 (issue #10). On Windows 10 the maintainers checked, in a test VM
@@ -14,7 +14,7 @@ on Windows' software renderer (2026-10-22); a full first-run build on Windows 10
 
 There are two ways to get a build:
 
-- **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.7<!-- /version --> pre-release.** It checks your disc dump and
+- **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.8<!-- /version --> pre-release.** It checks your disc dump and
   the 1.14 update, then lifts and compiles the game's code on your machine with a bundled compiler, behind one
   progress bar, with a full install log.
 - **A developer build from source with Nix**, described below: on Linux (how the port is developed and tested
@@ -226,3 +226,49 @@ use WSL2 for them. Graphics tests that need Direct3D 12 are built by `tools/smok
 `tools/proton-test.sh`.
 
 An index of the scripts and folders in `tools/` is in [tools/README.md](../tools/README.md).
+
+## Building from source: the short version
+
+Players use the setup above. This section is for contributors. The port is built on [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT), pinned as a submodule at v0.18.0 (commit 4e8f3ca), with the
+patches in [port/patches/](../port/patches/) applied on top. The toolchain is a Nix flake (MinGW-w64 cross build on
+Linux); Windows builds are tested mostly under Proton, plus first runs on native Windows 11 and Windows 10.
+
+```sh
+git clone --recursive https://github.com/undecuple/project-helghast
+nix develop .#re   --command tools/sandbox.sh -- tools/lift.sh                 # recompile the PPU code
+nix develop .#re   --command tools/sandbox.sh -- tools/spu/lift_spu.sh         # recompile the SPU code
+nix develop .#win  --command tools/sandbox.sh -- tools/build-kz3.sh build/kz3-win
+```
+
+Full steps (game files, SPU inventory, configure, staging, running under Proton, tests without the game):
+this page.
+
+`kz3.exe` needs no launch options: next to the `PS3_GAME` folder of your dump (the staged layout) it starts as it
+is, from a double-click or a plain Steam shortcut; elsewhere it reads `kz3.ini` beside it, which names the
+decrypted EBOOT and the other folders ([Running](#running)).
+
+## Repository layout
+
+| Entry | What it is |
+|---|---|
+| `README.md` | The front page: what you need, how to get it, known problems. |
+| `LICENSE` | The licence; GitHub reads it from the root. |
+| `CHANGELOG.md` | What each release contains, newest first. |
+| `NOTICE.md` | Short credits list; the licence texts are in `licenses/`. |
+| `licenses/` | Full licence texts of what the installer and portable zip ship (see its README). |
+| `CITATION.cff` | Citation data; GitHub reads it from the root for the "Cite this repository" button. |
+| `AGENTS.md` | Orientation for automated coding assistants working in the repository. |
+| `flake.nix`, `flake.lock` | The Nix development shells and their pinned inputs; Nix reads the flake from the root. |
+| `ruff.toml` | Python lint settings; ruff looks for it in the root. |
+| `.clang-format`, `.editorconfig`, `.gitattributes`, `.gitignore`, `.gitleaks.toml`, `.gitmodules` | Tool configuration (formatting, line endings, ignored files, secret scan, the submodule list); each tool reads its file from the root. |
+| `.recomp.json` | Machine-readable project card (game, region, status) for recompilation-project directories. |
+| `.github/` | CI, release and website workflows, issue templates, contributing and security notes, funding link. |
+| `assets/` | Banner and social-preview images. |
+| `cmake/` | CMake toolchain files for the MinGW-w64 and llvm-mingw builds. |
+| `docs/` | Status, installing, what goes online, building, how it works, AI use, known issues, features, roadmap, glossary and screenshots. |
+| `installer/` | Inno Setup script and art for the Windows installer, and `pso-template.bin`, a shader warm-up list that holds pipeline-state hashes and numeric render state only (no shader text, no game code). |
+| `port/` | The port's own code: the game glue (`kz3`), networking, patches for ps3recomp, SPU and file-system code. |
+| `re/` | Data tables the lift tools read (override and seed lists). |
+| `site/` | Source of the project web page. |
+| `tools/` | Lift, build, stage, test and release scripts; see [tools/README.md](../tools/README.md). |
+| `third_party/ps3recomp` | The ps3recomp submodule (MIT), pinned; fetched with `git submodule update --init`. |

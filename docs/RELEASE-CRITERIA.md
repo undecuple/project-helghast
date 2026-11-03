@@ -44,5 +44,5 @@ measured against.
 10. **No emulator tells:** release builds expose none of the runtime's debug UI, hotkeys, overlays or diagnostic
     switches by default; only the port's own settings, styled like the game.
 
-The numbers here are targets for 1.0.0, not a statement about today: see the README's [Status](../README.md#status)
+The numbers here are targets for 1.0.0, not a statement about today: see the [status page](STATUS.md)
 table for what works now.

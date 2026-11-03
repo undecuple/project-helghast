@@ -28,10 +28,11 @@
 typedef struct {
     const char* key;
     const char* env; /* the environment variable the key stands for; NULL = handled by main.cpp itself */
-    int path;        /* 1 = a path (relative = relative to the exe's folder) */
+    int path;        /* 1 = a path (relative = relative to `root` when kz3.ini has it, else to the exe's folder) */
 } kz3_ini_key_t;
 
 static const kz3_ini_key_t kz3_ini_keys[] = {
+    {"root", NULL, 1}, /* the install folder (relative to the exe's folder): base of the relative paths below; NULL env, main.cpp reads it first */
     {"eboot", NULL, 1},
     {"data_dir", NULL, 1},
     {"vfs_root", "PS3_VFS_ROOT", 1},

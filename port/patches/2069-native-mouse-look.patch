@@ -193,7 +193,7 @@ index 0000000..b1648ea
 + * Sensitivity model from KAMI (isJuhn/KAMI, MIT): radians per count, default 0.003 (about 0.17 degrees per count).
 + *
 + * Switches (read once; pad_mouse.c):
-+ *   KZ3_MOUSE_LOOK=1        on (default off: opt-in until the owner has tried it).
++ *   KZ3_MOUSE_LOOK=1        on (default off: opt-in until it has been tried in play).
 + *   KZ3_MOUSE_SENS=<f>      radians per count (0.003).
 + *   KZ3_MOUSE_ZOOM_SENS=<f> extra factor while zoomed (1.0; the weapon's own factor already applies).
 + *   KZ3_MOUSE_INVERT=1      inverted Y.

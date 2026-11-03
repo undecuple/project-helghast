@@ -20,6 +20,13 @@ cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang") or shuti
 if not cmake or not cc:
     print("SKIP: cmake or a C compiler not on PATH")
     sys.exit(0)
+try:   # a sandbox shim on PATH can exist without the real cmake behind it (it then exits 127)
+    _probe = subprocess.run([cmake, "--version"], capture_output=True, text=True).returncode
+except OSError:
+    _probe = 127
+if _probe:
+    print(f"SKIP: {cmake} does not run (cmake --version exits {_probe}; no real cmake in this shell)")
+    sys.exit(0)
 
 
 def configure(base, name):

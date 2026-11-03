@@ -1,5 +1,8 @@
 /* kz3_discord: see kz3_discord.h. Sends to the local Discord app only: the activity text below, the process id
  * and the application id. No account data, no network call of ours. */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE   /* readlink() below under -std=c11 */
+#endif
 #include "kz3_discord.h"
 #define KZ3_TR_IMPLEMENTATION   /* network pass 45: the port UI text table lives in this always-linked file */
 #include "kz3_tr.h"
@@ -369,8 +372,44 @@ char* kd_patch_display_gum(const char* in, size_t n, size_t* out_n)
     return o;
 }
 
+#ifndef _WIN32
+#include <unistd.h>
+/* kz3.ini next to the executable (non-Windows hosts: the directory of /proc/self/exe, else the working directory). */
+void kz3_exe_ini_read(char* buf, size_t cap)
+{
+    char exe[1024], path[1100];
+    ssize_t m = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    char* sl;
+    buf[0] = 0;
+    if (m <= 0) exe[0] = 0; else exe[m] = 0;
+    sl = strrchr(exe, '/');
+    if (sl) *sl = 0;
+    snprintf(path, sizeof path, "%s/kz3.ini", sl ? exe : ".");
+    FILE* f = fopen(path, "rb");
+    if (f) { size_t n = fread(buf, 1, cap - 1, f); buf[n] = 0; fclose(f); }
+}
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
+
+/* kz3.ini next to the exe into buf (NUL-terminated; empty when absent): the main-menu version block reads it. */
+void kz3_exe_ini_read(char* buf, size_t cap)
+{
+    char exe[1024], path[1100];
+    DWORD m = GetModuleFileNameA(NULL, exe, sizeof exe);
+    char* sl;
+    char* s2;
+    buf[0] = 0;
+    if (m == 0 || m >= sizeof exe) exe[0] = 0;
+    sl = strrchr(exe, '\\');
+    s2 = strrchr(exe, '/');
+    if (s2 > sl) sl = s2;
+    if (sl) *sl = 0;
+    snprintf(path, sizeof path, "%s/kz3.ini", sl ? exe : ".");
+    FILE* f = fopen(path, "rb");
+    if (f) { size_t n = fread(buf, 1, cap - 1, f); buf[n] = 0; fclose(f); }
+}
 
 static struct {
     CRITICAL_SECTION cs;

@@ -39,10 +39,12 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 try:
     import names
+    import pathrules   # the one path rule of every log
 except ImportError:   # imported from another folder (tests add HERE to sys.path first)
     import sys
     sys.path.insert(0, HERE)
     import names
+    import pathrules
 
 INI = "kz3-install.ini"
 STATE = "crash-sent.json"          # in <root>/logs (the launcher's own folder; the uninstaller removes it)
@@ -173,6 +175,7 @@ def scrubber(paths=None, users=(), hosts=(), online_ids=()):
         s = _URL_RX.sub(lambda m: m.group(1) + "<host>", s)
         s = _PATH_USER_RX.sub(lambda m: m.group(1) + "<user>", s)
         s = _UNC_RX.sub(lambda m: m.group(1) + "<host>", s)
+        s = pathrules.redact_paths(s)   # every other absolute path: <path>\\last component
         s = _MAC_RX.sub("<mac>", s)
         s = _IPV6_RX.sub(_ipv6, s)
         s = _IPV4_RX.sub(_ipv4, s)
@@ -212,12 +215,15 @@ def machine_scrubber(root, environ, data_dir=None):
     paths = {}
     pj = _load_json(os.path.join(root, "build", "paths.json")) or {}
     for key, ph in (("dump", "<dump>"), ("update", "<update>")):
-        if pj.get(key):
-            paths[ph] = pj[key]
-    paths["<install>"] = root
+        if pj.get(key):   # paths inside the install are stored relative to it (launch.paths_rel)
+            paths[ph] = pj[key] if re.match(r"^([A-Za-z]:|[\\/])", pj[key]) else os.path.normpath(os.path.join(root, pj[key]))
+    paths["%INSTALL%"] = root
+    for k in ("LOCALAPPDATA", "APPDATA"):   # keep their names (the rest of the path stays)
+        if environ.get(k) and len(environ[k]) > 3:
+            paths["%" + k + "%"] = environ[k]
     for k in ("USERPROFILE", "HOME"):
         if environ.get(k) and len(environ[k]) > 3 and "<home>" not in paths.values():
-            paths.setdefault("<home>", environ[k])
+            paths.setdefault("%USERPROFILE%", environ[k])
     users = {environ.get(k, "") for k in ("USERNAME", "USER", "LOGNAME")}
     hosts = {environ.get(k, "") for k in ("COMPUTERNAME", "HOSTNAME", "USERDOMAIN")}
     try:

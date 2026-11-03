@@ -29,6 +29,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import firstrun as fr  # noqa: E402
 import launch as la  # noqa: E402
+import test_firstrun_check as tfc  # noqa: E402  (fixture: a complete update folder)
 
 FAILS = []
 
@@ -67,6 +68,10 @@ def make_tree(tmp):
     eboot = os.path.join(update, "USRDIR", "EBOOT.elf")
     write(os.path.join(dump, "PS3_GAME", "PARAM.SFO"))
     write(eboot, "fake elf")
+    tfc.write_sfo(os.path.join(update, "PARAM.SFO"), {"APP_VER": "01.14", "CATEGORY": "GD", "TITLE": "Synthetic",
+                                                       "TITLE_ID": "BCUS98234"})
+    write(os.path.join(update, "USRDIR", "EBOOT.BIN"))
+    tfc.add_update_edat(update)
     write(os.path.join(root, "port", "spu", "ppu_overrides.txt"), "a\n")
     write(os.path.join(root, "VERSION.txt"), "0.1.0")
     os.makedirs(os.path.join(root, "ps3recomp", "tools"))
@@ -145,10 +150,10 @@ def main():
         p = printed(root, environ=env)
         check(p["argv"] == [os.path.join(root, "build", "kz3.exe")], f"5 argv: kz3.exe alone {p.get('argv')}")
         gi = p["ini"]
-        check(gi["eboot"] == eboot and gi["vfs_root"] == os.path.join(root, "vfs") and gi["hdd0_root"] == hdd0
-              and gi["data_dir"] == p["cwd"] and gi["update_dir"] == os.path.join(update, "USRDIR"), f"5 ini {gi}")
+        check(gi["eboot"] == eboot and gi["vfs_root"] == "../vfs" and gi["hdd0_root"] == hdd0
+              and gi["data_dir"] == la.ini_rel(p["cwd"], root) and gi["update_dir"] == os.path.join(update, "USRDIR"), f"5 ini {gi}")
         ini0 = la.read_game_ini(os.path.join(root, "build", "kz3.ini"))   # written by after_stamp (firstrun)
-        check(ini0.get("eboot") == eboot and ini0.get("vfs_root") == os.path.join(root, "vfs"), f"5 stamp ini {ini0}")
+        check(ini0.get("eboot") == eboot and ini0.get("vfs_root") == "../vfs", f"5 stamp ini {ini0}")
         check(p["cwd"] == os.path.join(env["APPDATA"], "Project Helghast"), f"5 cwd appdata {p.get('cwd')}")
         e = p["env"]
         check(e.get("PS3_VFS_ROOT") == os.path.join(root, "vfs") and e.get("KZ3_UPDATE_DIR") == os.path.join(update, "USRDIR")
@@ -207,7 +212,7 @@ def main():
               and calls[0][1]["cwd"] == root and "PS3_VFS_ROOT" not in calls[0][1]["env"]
               and calls[0][1]["env"]["PATH"] == "/bin", f"8 run game: kz3.exe alone, plain env {calls[:1]}")
         gi = la.read_game_ini(os.path.join(root, "build", "kz3.ini"))
-        check(gi.get("vfs_root") == os.path.join(root, "vfs") and gi.get("data_dir") == root
+        check(gi.get("vfs_root") == "../vfs" and gi.get("data_dir") == ".."
               and gi.get("window_size") == "1080p", f"8 kz3.ini rewritten (portable data_dir, hand edit kept) {gi}")
         calls.clear()
         rc = la.main(["--root", root, "-x"], ui=FakeUI([]), run=run, environ=env)
@@ -312,11 +317,11 @@ def main():
         stamp(c8)
         check(json.load(open(st)).get("cache_root") is True and la.link_free(root), "8c stamp records cache_root")
         gi8 = la.game_ini(root, {"dump": dump, "update": update, "eboot": eboot}, False, env)
-        check(gi8["vfs_root"] == dump and gi8["cache_root"] == os.path.join(root, "vfs"), f"8c ini: dump read, vfs written {gi8}")
+        check(gi8["vfs_root"] == dump and gi8["cache_root"] == "../vfs", f"8c ini: dump read, vfs written {gi8}")
         e8 = la.game_env(root, {"dump": dump, "update": update, "eboot": eboot}, False, env)[3]
         check(e8["PS3_VFS_ROOT"] == dump and e8["KZ3_CACHE_ROOT"] == os.path.join(root, "vfs"), f"8c env {e8}")
         ini8 = la.read_game_ini(os.path.join(root, "build", "kz3.ini"))
-        check(ini8.get("vfs_root") == dump and ini8.get("cache_root") == os.path.join(root, "vfs"), f"8c written kz3.ini {ini8}")
+        check(ini8.get("vfs_root") == dump and ini8.get("cache_root") == "../vfs", f"8c written kz3.ini {ini8}")
         # no link made, an older start's link is dropped, its target and a real PS3_GAME folder stay
         vl8 = os.path.join(root, "vfs", "PS3_GAME")
         if os.path.lexists(vl8):

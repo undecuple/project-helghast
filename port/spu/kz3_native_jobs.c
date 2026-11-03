@@ -9,6 +9,7 @@
  * the equality result plus a 3-pair turn/walk A/B. Empty this round: no job is replaced yet. */
 #include "kz3_jobhook.h"
 #include "kz3_native_jobs.h"
+#include "kz3_native_toggle.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,11 +30,11 @@ const struct kz3_native_job kz3_native_jobs[] = {
 /* ---- per-function native gates (SPU pass 122, D88-; KZ2's gate design, credited in kz3_native_jobs.h) ----
  * The lifted functions listed in re/spu/native_gates.tsv start with
  *   if (g_kz3_native_gate[slot] && g_kz3_native_gate[slot](ctx)) SPU_RET(ctx);
- * g_kz3_native_gate is defined here, once. A slot is filled when its entry is on (a switch =1, or no switch set and the entry default-on: only the Gfx.LightProbes
- * entries of the 1.14 job, SPU pass 127; every switch =0 turns an entry off), by the
+ * g_kz3_native_gate is defined here, once. A slot is filled when its entry is on (a switch =1, or no switch set and the entry default-on: the Gfx.LightProbes
+ * entries of the 1.14 job (SPU pass 127) and the 1.14 Gfx.Post slots 0, 4, 6, 18 (spu rounds 133, 140: Upsample and DepthOfField blend, DOF unpack, Upsample row kernel); every switch =0 turns an entry off), by the
  * trampoline that runs the call through kz3_native_run (count, debug gate, constant pool, kernel). Switches:
- * KZ3_NATIVE_JOB_POST=1 (every Gfx.Post gate), KZ3_NATIVE_JOB_POSTMIX=1 (blend), KZ3_NATIVE_JOB_DOF=1,
- * KZ3_NATIVE_JOB_UPSAMPLE=1, KZ3_NATIVE_JOB_MOTIONBLUR=1,
+ * KZ3_NATIVE_JOB_POST=1/0 (every Gfx.Post gate; default on for slots 0, 4, 6 of the 1.14 job), KZ3_NATIVE_JOB_POSTMIX=1/0 (blend), KZ3_NATIVE_JOB_DOF=1/0,
+ * KZ3_NATIVE_JOB_UPSAMPLE=1/0 (row kernel, slot 18 default on), KZ3_NATIVE_JOB_MOTIONBLUR=1,
  * KZ3_NATIVE_JOB_LIGHTPROBES=1/0 (all Gfx.LightProbes kernels; default on for 1.14, off for the 1.00 twins; _LP_KD / _LP_BAKE / _LP_BLEND / _LP_ATTEN / _LP_LIGHT one each). KZ3_NATIVE_REC=DIR records real gate inputs instead
  * (KZ3_NATIVE_REC_N per slot, default 24; KZ3_NATIVE_REC_EVERY calls between records, default 61;
  * KZ3_NATIVE_REC_AFTER seconds before the first, default 120); the lifted body then runs. Records hold game data:
@@ -77,7 +78,8 @@ void kz3_native_win_hit(int slot)
     const unsigned w = win_now();
     __atomic_fetch_add(&s_win_calls[slot][w], 1, __ATOMIC_RELAXED);
     /* the first call in a new window prints every slot's series (the process is usually ended without atexit) */
-    if (__builtin_expect((int)w != s_last_win, 0) && __atomic_exchange_n(&s_last_win, (int)w, __ATOMIC_RELAXED) != (int)w)
+    if (__builtin_expect((int)w != s_last_win, 0) &&
+        __atomic_exchange_n(&s_last_win, (int)w, __ATOMIC_RELAXED) != (int)w)
         kz3_native_exit_print();
 }
 
@@ -163,29 +165,79 @@ static int rec(spu_context* ctx, int slot)
         if (n == 0) fprintf(stderr, "[native] record: cannot write %s\n", path);
         return 0;
     }
-    uint32_t hdr[4] = { (uint32_t)slot, s_ent[slot] ? s_ent[slot]->addr : 0u, (uint32_t)ctx->image_id, 0u };
+    uint32_t hdr[4] = {(uint32_t)slot, s_ent[slot] ? s_ent[slot]->addr : 0u, (uint32_t)ctx->image_id, 0u};
     fwrite(KZ3_NJ_MAGIC, 1, 8, f);
     fwrite(hdr, 4, 4, f);
     fwrite(ctx->gpr, 16, 128, f);
     fwrite(ctx->ls, 1, SPU_LS_SIZE, f);
     fclose(f);
     fprintf(stderr, "[native] recorded slot %d #%ld (call %ld) -> %s\n", slot, n, c, path);
-    return 0;   /* the lifted body runs */
+    return 0; /* the lifted body runs */
 }
 
-#define T1(a, b) static int gate_##a##b(spu_context* c) { return kz3_native_run(c, s_ent[8 * a + b]); } \
-                 static int rec_##a##b(spu_context* c) { return rec(c, 8 * a + b); }
+#define T1(a, b)                                                                                                       \
+    static int gate_##a##b(spu_context* c)                                                                             \
+    {                                                                                                                  \
+        return kz3_native_run(c, s_ent[8 * a + b]);                                                                    \
+    }                                                                                                                  \
+    static int rec_##a##b(spu_context* c)                                                                              \
+    {                                                                                                                  \
+        return rec(c, 8 * a + b);                                                                                      \
+    }
 #define T8(a) T1(a, 0) T1(a, 1) T1(a, 2) T1(a, 3) T1(a, 4) T1(a, 5) T1(a, 6) T1(a, 7)
-T8(0) T8(1) T8(2) T8(3) T8(4) T8(5) T8(6) T8(7)
+T8(0)
+T8(1) T8(2) T8(3) T8(4) T8(5) T8(6) T8(7)
 #define P8(f, a) f##a##0, f##a##1, f##a##2, f##a##3, f##a##4, f##a##5, f##a##6, f##a##7
-static int (*const s_gate_fn[64])(spu_context*) = { P8(gate_, 0), P8(gate_, 1), P8(gate_, 2), P8(gate_, 3),
-                                                     P8(gate_, 4), P8(gate_, 5), P8(gate_, 6), P8(gate_, 7) };
-static int (*const s_rec_fn[64])(spu_context*) = { P8(rec_, 0), P8(rec_, 1), P8(rec_, 2), P8(rec_, 3),
-                                                    P8(rec_, 4), P8(rec_, 5), P8(rec_, 6), P8(rec_, 7) };
+    /* Same-run toggle (SPU pass 133, KZ3_NATIVE_TOGGLE; kz3_native_toggle.h): a toggled slot's gate runs the native
+ * kernel in the odd phases and returns 0 (the lifted body) in the even ones. Installed only when the toggle is set. */
+    extern uint64_t kz3_wacct_now(void); /* runtime/diag, patch 1032: ns */
+extern uint64_t kz3_wacct_base(void);    /* patch 1085: KZ3_PROF time zero, ns */
+static unsigned char s_tog[64];
+static unsigned long long s_tog_period;
+static volatile long s_tog_phase = -1;
+static volatile long s_tog_lifted[64], s_tog_native[64], s_tog_end_l[64], s_tog_end_n[64];
+
+static int tog_native(int slot)
+{
+    const long ph = kz3_native_toggle_phase(kz3_wacct_now() - kz3_wacct_base(), s_tog_period);
+    long old = s_tog_phase;
+    if (__builtin_expect(ph != old, 0) &&
+        __atomic_compare_exchange_n(&s_tog_phase, &old, ph, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        char b[600];
+        size_t n = (size_t)snprintf(
+            b, sizeof b, "[native-toggle] t=%.3fs phase=%ld %s (ended phase %ld calls lifted/native:",
+            (double)(kz3_wacct_now() - kz3_wacct_base()) / 1e9, ph, (ph & 1) ? "native" : "lifted", ph - 1);
+        for (int s = 0; s < 64 && n + 40 < sizeof b; s++) {
+            const long l = s_tog_lifted[s] - s_tog_end_l[s], c = s_tog_native[s] - s_tog_end_n[s];
+            s_tog_end_l[s] = s_tog_lifted[s];
+            s_tog_end_n[s] = s_tog_native[s];
+            if (l || c) n += (size_t)snprintf(b + n, sizeof b - n, " s%d=%ld/%ld", s, l, c);
+        }
+        fprintf(stderr, "%s)\n", b);
+    }
+    const int nat = (int)(ph & 1);
+    __atomic_fetch_add(nat ? &s_tog_native[slot] : &s_tog_lifted[slot], 1, __ATOMIC_RELAXED);
+    return nat;
+}
+
+#define TG1(a, b)                                                                                                      \
+    static int tog_##a##b(spu_context* c)                                                                              \
+    {                                                                                                                  \
+        return tog_native(8 * a + b) && kz3_native_run(c, s_ent[8 * a + b]);                                           \
+    }
+#define TG8(a) TG1(a, 0) TG1(a, 1) TG1(a, 2) TG1(a, 3) TG1(a, 4) TG1(a, 5) TG1(a, 6) TG1(a, 7)
+TG8(0)
+TG8(1) TG8(2) TG8(3) TG8(4) TG8(5) TG8(6) TG8(7) static int (*const s_tog_fn[64])(spu_context*) = {
+    P8(tog_, 0), P8(tog_, 1), P8(tog_, 2), P8(tog_, 3), P8(tog_, 4), P8(tog_, 5), P8(tog_, 6), P8(tog_, 7)};
+
+static int (*const s_gate_fn[64])(spu_context*) = {P8(gate_, 0), P8(gate_, 1), P8(gate_, 2), P8(gate_, 3),
+                                                   P8(gate_, 4), P8(gate_, 5), P8(gate_, 6), P8(gate_, 7)};
+static int (*const s_rec_fn[64])(spu_context*) = {P8(rec_, 0), P8(rec_, 1), P8(rec_, 2), P8(rec_, 3),
+                                                  P8(rec_, 4), P8(rec_, 5), P8(rec_, 6), P8(rec_, 7)};
 
 /* Which switch decides an entry (SPU pass 127). The entry's flags are '|'-separated, general first, the single kernel
  * last; the last one that is set (not empty) decides: "1" on, "0" off, so KZ3_NATIVE_JOB_LP_KD=1 beats
- * KZ3_NATIVE_JOB_LIGHTPROBES=0. A Gfx.Post job also honours KZ3_NATIVE_JOB_POST=1 (before its own flags). Nothing set:
+ * KZ3_NATIVE_JOB_LIGHTPROBES=0. A Gfx.Post job also honours KZ3_NATIVE_JOB_POST=1/0 (before its own flags). Nothing set:
  * the entry's def_on (re/spu/native_gates.tsv column "default"). Returns 1 on, 0 off; *by names the switch or is
  * "default". */
 static int native_decide(const kz3_native_entry* e, const char** by)
@@ -227,7 +279,11 @@ static void gate_add(const kz3_native_entry* t, unsigned n)
             continue;
         }
         const char* by;
-        if (native_decide(e, &by)) {
+        if (s_tog_period && s_tog[e->slot]) {
+            g_kz3_native_gate[e->slot] = s_tog_fn[e->slot];
+            fprintf(stderr, "[native] %s %s 0x%05X %s toggled (slot %d, KZ3_NATIVE_TOGGLE)\n", e->job, e->image,
+                    e->addr, e->kind, e->slot);
+        } else if (native_decide(e, &by)) {
             g_kz3_native_gate[e->slot] = s_gate_fn[e->slot];
             fprintf(stderr, "[native] %s %s 0x%05X %s native (slot %d, %s%s)\n", e->job, e->image, e->addr, e->kind,
                     e->slot, by, strcmp(by, "default") ? "=1" : "");
@@ -251,6 +307,19 @@ __attribute__((constructor)) static void kz3_native_gates_init(void)
         s_rec_after = (double)env_long("KZ3_NATIVE_REC_AFTER", 120);
         fprintf(stderr, "[native] recording gate inputs to %s (%ld per slot, every %ld calls, after %.0f s)\n", d,
                 s_rec_n, s_rec_every, s_rec_after);
+    }
+    const char* tg = getenv("KZ3_NATIVE_TOGGLE");
+    if (tg && *tg && !d) {
+        const int n = kz3_native_toggle_parse(tg, s_tog, 64);
+        if (n < 0)
+            fprintf(stderr, "[native-toggle] KZ3_NATIVE_TOGGLE=%s is malformed: off\n", tg);
+        else {
+            s_tog_period = kz3_native_toggle_period_ns(getenv("KZ3_NATIVE_TOGGLE_PERIOD"));
+            fprintf(
+                stderr,
+                "[native-toggle] on: %d slots, period %llu ms (needs KZ3_WAIT_ACCT; even phases lifted, odd native)\n",
+                n, s_tog_period / 1000000ull);
+        }
     }
     gate_add(kz3_native_post, kz3_native_post_n);
     gate_add(kz3_native_dof, kz3_native_dof_n);

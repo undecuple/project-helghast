@@ -3,6 +3,27 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
+## [0.1.8] - 2026-11-03 (pre-release)
+
+### Added
+- The main menu shows the port's name and version at the bottom right ("Project Helghast", then the version) in the game's own dim red text. When the launcher's optional new-version check has found a newer release, a second line says so in the game's language (18 languages, machine-translated; corrections are welcome). The launcher writes `port_version` and `newer_version` into `kz3.ini`; `KZ3_MENU_VERSION=0` hides the block. The game makes no network connection for it. Checked under Proton at 1280x720 with a translated line; host tests cover the text table.
+- Game text that names PlayStation buttons (the Swap L1/L2 rows, "Hold down R2", START) follows the connected pad's glyph set, so an Xbox pad reads the Xbox names (`KZ3_TEXT_BUTTONS=0` turns this off). The motion tutorials show a stick text when the pad has no gyro. Checked with host tests and screenshots of the Advanced controls page under Proton with an Xbox and a PlayStation layout.
+
+### Changed
+- The upsample and depth-of-field passes of the post-processing SPU jobs run as native code by default with the 1.14 update (`KZ3_NATIVE_JOB_POST=0` runs the recompiled job instead). In a same-run toggle test on Frozen Shores a call took about 26-28 % less time (upsample) and 16-18 % less (depth of field), with identical output; no frame-rate change is claimed, because that scene is limited elsewhere.
+- The renderer's vertex-reference step uses a faster path by default (`LD_REFS_FAST=0` switches it off). Its output was identical over 4000 vertex streams and the step fell from about 2.7 to 0.54 ms per frame. In scripted runs under Proton (three alternated pairs) the frame rate rose in two pairs and the slowest 1 % of frames and the frame-time spread were better in all three; hand play is not measured.
+- The renderer runs the game's unscaled image copies a row at a time instead of a pixel at a time by default, also when a copy's source and destination overlap (`LD_NV3089_ROWS=0` restores the old loop), with output identical to the old copy on 20,000 random test copies. In scripted Frozen Shores runs under Proton (three alternated pairs) the time spent in these copies fell to about a fifth; no frame-rate change is claimed.
+- The launcher log, the setup's kept log, the game log and the crash report keep no personal path. Your install folder shows as `%INSTALL%` (the rest of the path stays), your profile folder as `%USERPROFILE%`, and the `%APPDATA%` and `%LOCALAPPDATA%` folders keep those names. Every other absolute path (any drive such as `D:\` or `E:/`, a network share, or a Linux path such as `/mnt/...` or Proton's `Z:\home\...`) shows as `<path>\` plus only its last name, for example `<path>\EBOOT.BIN`. Relative paths and the game's own `/dev_bdvd/...` style paths are left alone. The setup's fallback (used when the bundled Python is missing) follows the same rule; it is covered by a source check, not yet run on Windows. The rule is covered by host tests.
+- The saved pipeline list (`pso_keys.bin`) carries a header that names its layout. A list written by an older version is set aside and built again, so the first visit to each level after updating has some extra stutter once.
+
+### Fixed
+- When the update folder is wrong or incomplete, a start without the saved game inputs now says what is wrong with it (the same message the setup gives), instead of a general "inputs missing" line.
+- `paths.json` and `kz3.ini` are written in one step, so an interrupted write cannot leave half a file; a hand-edited `kz3.ini` (repeated keys, comments, a non-UTF-8 byte) is read without an error and its other keys are kept. A `.copying` leftover of an interrupted move of your data or caches is cleaned on the next start.
+- Switching between the install folder and the Windows user data folder no longer reports "%APPDATA% is not available" when only the `portable.txt` marker is missing, and if recording the new choice fails after the files moved, they are moved back and the message says so.
+- `run.cmd` works in a folder whose path contains parentheses or spaces (checked with cmd.exe on Windows).
+- A game-folder link that Windows only half made no longer leaves an empty folder behind: the next start clears it and tries again, and the message for Windows error 1392 names the possible causes (no junction support on that drive, or damage) and the safe step (an install folder on an NTFS drive such as C:).
+- The first check's console line shows a log path that contains spaces in full, and the first check ends with one line, not a traceback, when its input ends early.
+
 ## [0.1.7] - 2026-10-29 (pre-release)
 
 ### Added

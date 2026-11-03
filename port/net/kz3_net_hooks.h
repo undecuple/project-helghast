@@ -40,12 +40,14 @@
 #define KZ3_NET_GUEST_PTR_OK(p) ((uint32_t)(p) >= 0x10000u && (uint32_t)(p) < 0xF0000000u)
 #endif
 #include "kz3_gum_diag.h"   /* pass 29: who raises GUM error 20000 */
+#include "kz3_menu_req.h"   /* pass 53: one log line per level start request */
 #include "kz3_fios_stamp.h"  /* pass 41: the FIOS disk cache follows the served disc contents (patch 4024) */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 int pad_prompt_motion(void);   /* cellPad.c (patch 4011): the device in use has motion sensors */
+int pad_prompt_set_pad(void);  /* cellPad.c (patch 4029): glyph set of the connected pad (PAD_PROMPT_*; keycaps -> the pad's) */
 #ifdef __cplusplus
 }
 #endif
@@ -80,6 +82,7 @@ static const Kz3TxTable* kz3_net_tx_table(void)
     if (!__atomic_compare_exchange_n(&s_kz3_tx_state, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return NULL;
     kz3_prompts_ui_install(kz3_net_kb_bridge_known());
     kz3_gum_diag_install();
+    kz3_menu_req_install();
     const char* e = getenv("KZ3_TEXT_OVERRIDES");
     if (e && !strcmp(e, "0")) {
         KZ3_NET_PRINTF("[text] overrides off (KZ3_TEXT_OVERRIDES=0)\n");
@@ -130,6 +133,19 @@ static void kz3_net_call(ppu_context* ctx, void (*fn)(ppu_context*), uint32_t f,
     ctx->lr = lr;
 }
 
+/* Net pass 50: the glyph set the pad's button names follow (patch 4029; KZ3_TEXT_BUTTONS=0 turns the button names
+ * and the stick tutorials off, KZ3_TEXT_OVERRIDES=0 only the table). */
+static int kz3_net_buttons_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KZ3_TEXT_BUTTONS"); on = !(e && !strcmp(e, "0")); }
+    return on;
+}
+static int kz3_net_button_set(void)
+{
+    return kz3_net_buttons_on() ? pad_prompt_set_pad() : 0;
+}
+
 /* After the game's lookup (r3 = its result): the region label, else the text overrides. */
 static void kz3_net_localizer_post(ppu_context* ctx, uint64_t this_, uint32_t key, uint32_t out, uint64_t sp, uint64_t toc,
                                    uint64_t lr, void (*lookup)(ppu_context*), void (*assign)(ppu_context*))
@@ -156,7 +172,10 @@ static void kz3_net_localizer_post(ppu_context* ctx, uint64_t this_, uint32_t ke
     }
     if ((uint32_t)ctx->gpr[3] != 1) return;              /* not found: the game's own fallback */
     const Kz3TxTable* t = kz3_net_tx_table();
-    if (!t || !kz3_tx_has_key(t, k, n)) return;
+    int in_tbl = t && kz3_tx_has_key(t, k, n);
+    int bset = kz3_net_button_set();                          /* 2 Xbox, 1 PS4/PS5, else the game's PS3 words stay */
+    const char* stick = (kz3_net_buttons_on() && !pad_prompt_motion()) ? kz3_tx_stick_en(k, n) : NULL;
+    if (!in_tbl && !stick && bset != KZ3_TX_SET_XBOX && bset != KZ3_TX_SET_PS4) return;
     uint32_t q = vm_read32(out);
     if (!KZ3_NET_GUEST_PTR_OK(q)) return;
     uint32_t len = vm_read32(q + 8);
@@ -168,21 +187,56 @@ static void kz3_net_localizer_post(ppu_context* ctx, uint64_t this_, uint32_t ke
         if (!c) break;
         orig[m] = c;
     }
-    const uint16_t* rep;
-    size_t rn;
-    int act = kz3_tx_decide(t, k, n, orig, m, pad_prompt_motion(), &rep, &rn);
+    uint16_t cur[KZ3_TX_TEXT_MAX], tmp[KZ3_TX_TEXT_MAX];
+    const uint16_t* rep = orig;                               /* the text to show; changes below */
+    size_t rn = m;
     uint32_t f = (uint32_t)((sp - 0x900) & ~(uint64_t)0xF);   /* hdr at f+0x110, up to 0x400 bytes of text */
-    if (act == KZ3_TX_OTHER_KEY) {
-        uint32_t obj = kz3_net_put_string(f, KZ3_TX_MOTION_ALT_KEY, sizeof KZ3_TX_MOTION_ALT_KEY - 1, 0);
-        ctx->gpr[3] = this_;
-        ctx->gpr[4] = obj;
-        ctx->gpr[5] = out;
-        kz3_net_call(ctx, lookup, f, sp, toc, lr);         /* r3 = that lookup's result */
-        static int said_alt;
-        if (said_alt++ < 4) { KZ3_NET_PRINTF("[text] %s: no motion sensors, %s shown instead\n", k, KZ3_TX_MOTION_ALT_KEY); fflush(stdout); }
-        return;
+    if (in_tbl) {
+        const uint16_t* trep;
+        size_t tn;
+        int act = kz3_tx_decide(t, k, n, orig, m, pad_prompt_motion(), &trep, &tn);
+        if (act == KZ3_TX_OTHER_KEY) {
+            uint32_t obj = kz3_net_put_string(f, KZ3_TX_MOTION_ALT_KEY, sizeof KZ3_TX_MOTION_ALT_KEY - 1, 0);
+            ctx->gpr[3] = this_;
+            ctx->gpr[4] = obj;
+            ctx->gpr[5] = out;
+            kz3_net_call(ctx, lookup, f, sp, toc, lr);         /* r3 = that lookup's result */
+            static int said_alt;
+            if (said_alt++ < 4) { KZ3_NET_PRINTF("[text] %s: no motion sensors, %s shown instead\n", k, KZ3_TX_MOTION_ALT_KEY); fflush(stdout); }
+            return;
+        }
+        if (act == KZ3_TX_REPLACE && tn > 0 && tn <= KZ3_TX_TEXT_MAX) { rep = trep; rn = tn; }
     }
-    if (act != KZ3_TX_REPLACE || rn == 0 || rn > KZ3_TX_TEXT_MAX) return;
+    if (stick) {                                              /* network pass 50: the stick variant of a motion tutorial */
+        char en[1200];
+        char trk[KZ3_TX_KEY_MAX + 8];
+        snprintf(trk, sizeof trk, "stick.%s", k);
+        const char* txt = kz3_tr(trk, stick);
+        size_t ti = 0;
+        for (const char* sp8 = txt; *sp8 && ti + 2 < sizeof en; sp8++) {   /* a real newline from the table = the game's "\n" */
+            if (*sp8 == '\n') { en[ti++] = '\\'; en[ti++] = 'n'; } else en[ti++] = *sp8;
+        }
+        long su = kz3_tx_utf8_to_utf16(en, ti, tmp, KZ3_TX_TEXT_MAX);
+        if (su > 0) {
+            memcpy(cur, tmp, (size_t)su * sizeof cur[0]);
+            rep = cur;
+            rn = (size_t)su;
+            static int said_stick;
+            if (said_stick++ < 4) { KZ3_NET_PRINTF("[text] %s: no motion sensors, stick variant shown\n", k); fflush(stdout); }
+        }
+    }
+    if (bset == KZ3_TX_SET_XBOX || bset == KZ3_TX_SET_PS4) {  /* network pass 50: the pad's own button names */
+        long bn = kz3_tx_buttons(rep, rn, bset, tmp, KZ3_TX_TEXT_MAX);
+        if (bn > 0) {
+            memcpy(cur, tmp, (size_t)bn * sizeof cur[0]);
+            rep = cur;
+            rn = (size_t)bn;
+            static int said_btn;
+            if (said_btn++ < 8) { KZ3_NET_PRINTF("[text] %s: button names of the %s set\n", k, bset == KZ3_TX_SET_XBOX ? "Xbox" : "PS4/PS5"); fflush(stdout); }
+        }
+    }
+    if (rep == orig || rn == 0 || rn > KZ3_TX_TEXT_MAX) return;
+    if (rn == m && !memcmp(rep, orig, rn * sizeof orig[0])) return;
     uint32_t obj = kz3_net_put_string(f, NULL, rn, 'x');
     ctx->gpr[3] = out;
     ctx->gpr[4] = obj;

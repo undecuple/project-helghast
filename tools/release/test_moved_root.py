@@ -15,6 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import firstrun as fr   # noqa: E402
 import launch as la     # noqa: E402
+import test_firstrun_check as tfc   # noqa: E402  (fixture: a complete update folder)
 
 FAILS = []
 
@@ -98,22 +99,27 @@ def main():
         # decide() sees a move; paths below the old folder follow it
         C = os.path.join(tmp, "C")
         iso_dir = os.path.join(C, "game", "disc")
+        upd = tfc.make_update(os.path.join(tmp, "u"))
         os.makedirs(os.path.join(C, "build", "obj"))
         os.makedirs(iso_dir)
         eb = os.path.join(tmp, "EBOOT.elf")
         open(eb, "wb").write(b"x")
-        ctx0 = fr.Ctx(root=C, build=os.path.join(C, "build"), dump=iso_dir, update=dump, eboot=eb)
-        json.dump({"dump": iso_dir, "update": dump, "eboot": eb, "facts": {}}, open(os.path.join(C, "build", "paths.json"), "w"))
+        ctx0 = fr.Ctx(root=C, build=os.path.join(C, "build"), dump=iso_dir, update=upd, eboot=eb)
+        json.dump({"dump": iso_dir, "update": upd, "eboot": eb, "facts": {}}, open(os.path.join(C, "build", "paths.json"), "w"))
         json.dump({"parts": ctx0.parts(), "eboot_stat": fr.eboot_stat(eb), "root": C}, open(os.path.join(C, "build", "build-stamp.json"), "w"))
         open(os.path.join(C, "build", "kz3.exe"), "wb").write(b"x")
         check(la.decide(C)[0] == "run", f"4 decide: run in the folder it was built in: {la.decide(C)}")
         D = os.path.join(tmp, "D")
         shutil.move(C, D)
         act, why = la.decide(D)
-        pj = json.load(open(os.path.join(D, "build", "paths.json")))
-        check(act == "rebuild" and "moved or renamed" in why, f"4 decide: rebuild after the move: {act} {why}")
-        check(pj["dump"] == os.path.join(D, "game", "disc") and pj["update"] == dump, f"4 paths.json follows: {pj['dump']}")
-        check(fr.Ctx(root=D, build=os.path.join(D, "build"), dump=pj["dump"], update=dump, eboot=eb).parts()["base"]
+        pj = la.load_json(os.path.join(D, "build", "paths.json"))   # in-root paths are stored relative
+        check(act == "run", f"4 decide: no cmake cache, so nothing absolute is stale: run, no rebuild: {act} {why}")
+        os.makedirs(os.path.join(D, "build", "obj"), exist_ok=True)
+        open(os.path.join(D, "build", "obj", "CMakeCache.txt"), "w").write(f"CMAKE_HOME_DIRECTORY:INTERNAL={C}/port/kz3\n")
+        act, why = la.decide(D)
+        check(act == "rebuild" and "moved or renamed" in why, f"4 decide: rebuild when obj/ holds a cache from the old folder: {act} {why}")
+        check(pj["dump"] == os.path.join(D, "game", "disc") and pj["update"] == upd, f"4 paths.json follows: {pj['dump']}")
+        check(fr.Ctx(root=D, build=os.path.join(D, "build"), dump=pj["dump"], update=upd, eboot=eb).parts()["base"]
               == ctx0.parts()["base"], "4 the fingerprint of an in-root dump survives the move")
 
         # a recorded path with [ ] ; is not offered again
