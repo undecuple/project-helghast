@@ -207,11 +207,14 @@ jobs:
       - name: Draft release with SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}   # gh runs outside the checkout below
           VERSION: ${{ needs.installer.outputs.version }}
         run: |
-          mkdir assets
-          gh run download "$GITHUB_RUN_ID" --name "Project-Helghast-$VERSION" --dir assets
-          cd assets
+          # outside the checkout: the repo has its own assets/ folder (README art)
+          out="$RUNNER_TEMP/release-assets"
+          mkdir "$out"
+          gh run download "$GITHUB_RUN_ID" --name "Project-Helghast-$VERSION" --dir "$out"
+          cd "$out"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "::error::a release for $GITHUB_REF_NAME already exists; refusing to touch it"; exit 1
           fi
