@@ -130,10 +130,10 @@ def main():
         if "crash" in n:
             crash = open(os.path.join(ld, n), errors="replace").read()
     bad = 0
-    for line, secret in CASES:
+    for line, user in CASES:   # made-up user names
         # the home-folder case needs USERPROFILE (D:\Profiles\Qux Name); the rest hold with any
-        ok = secret not in log
-        print(("[PASS] " if ok else "[FAIL] ") + f"log has no {secret!r} from {line!r}")
+        ok = user not in log
+        print(("[PASS] " if ok else "[FAIL] ") + f"log has no {user!r} from {line!r}")
         bad += not ok
     for k in KEEP:
         ok = k in log
@@ -143,9 +143,9 @@ def main():
         ok = "path " + want + " end" in log
         print(("[PASS] " if ok else "[FAIL] ") + f"{line!r} -> {want!r}")
         bad += not ok
-    for secret in ("Zed", "bob", "Qux", "Alice"):
-        ok = secret not in crash and bool(crash)
-        print(("[PASS] " if ok else "[FAIL] ") + f"crash report has no {secret!r}")
+    for user in ("Zed", "bob", "Qux", "Alice"):   # made-up user names from the test paths
+        ok = user not in crash and bool(crash)
+        print(("[PASS] " if ok else "[FAIL] ") + f"crash report has no {user!r}")
         bad += not ok
     ok = "%USERPROFILE%" in log
     print(("[PASS] " if ok else "[FAIL] ") + "the profile folder is named %USERPROFILE%")

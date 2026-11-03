@@ -235,7 +235,8 @@ def path_under(p, root):
     if a == b:
         return ""
     if a.startswith(b.rstrip(os.sep) + os.sep):
-        return a[len(b.rstrip(os.sep)) + 1:].replace(os.sep, "/")
+        # compare case-folded, return the original case (normcase lowercases on Windows; same length)
+        return os.path.normpath(os.path.abspath(p))[len(b.rstrip(os.sep)) + 1:].replace(os.sep, "/")
     return None
 
 

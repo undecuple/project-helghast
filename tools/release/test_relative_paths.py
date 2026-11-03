@@ -100,6 +100,13 @@ def main():
         # ---- 3 paths.json relative, a moved install needs no rebuild
         j = la.paths_rel({"dump": dump, "update": upd, "eboot": eb, "facts": {}}, R)
         check(j["dump"] == "game/disc" and j["eboot"] == "game/EBOOT.elf" and j["update"] == upd, f"3 paths_rel {j}")
+        real_normcase = os.path.normcase   # Windows' normcase lowercases: the relative path keeps its case anyway
+        os.path.normcase = str.lower
+        try:
+            jc = la.paths_rel({"eboot": eb}, R)
+        finally:
+            os.path.normcase = real_normcase
+        check(jc["eboot"] == "game/EBOOT.elf", f"3 paths_rel keeps the case under a case-folding normcase {jc}")
         write(os.path.join(R, "build", "paths.json"), json.dumps(j))
         ctx0 = fr.Ctx(root=R, build=os.path.join(R, "build"), dump=dump, update=upd, eboot=eb)
         write(os.path.join(R, "build", "build-stamp.json"),

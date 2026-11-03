@@ -46,7 +46,7 @@ def main():
         os.makedirs(r2)
         fr.write_install_ini(r2, True, False)
         write(os.path.join(r2, la.PORTABLE_FILE), "")
-        ok, m = la.switch_data(r2, False, {})
+        ok, m = la.switch_data(r2, False, {}, appdata="", localappdata="")   # Windows has the known folder whatever the env says
         check(not ok and "not available" in m, f"S1 control: no APPDATA at all keeps the message: {m!r}")
 
         # S2: data and caches moved, then the mode cannot be recorded
