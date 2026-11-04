@@ -56,6 +56,7 @@ def fake_repo(root):
                 "re/data/spu_coverage_seeds.tsv", "re/data/overrides/ppu_overrides-114.txt", "re/data/overrides/ppu_lift_fixups-114.txt", "re/data/other_114.tsv", "re/data/campaign_levels.tsv", "port/kz3/CMakeLists.txt", "port/kz3/main.cpp",
                 "port/spu/ppu_overrides.txt", "port/text/port_ui.tsv", "port/vfs/kz3_overlay.c", "port/vfs/test_vfs_overlay.c",
                 "port/net/kz3_net.c", "port/net/test_kz3_net.c",
+                "third_party/fidelityfx-sdk/LICENSE.md", "third_party/fidelityfx-sdk/README.md",
                 "port/kz3/__pycache__/x.pyc", "cmake/mingw-w64.cmake", "cmake/notes.txt",
                 "public/LICENSE", "public/README.md", "public/NOTICE.md", "installer/run.cmd",
                 "work/ps3recomp-patched/LICENSE", "work/ps3recomp-patched/CMakeLists.txt",
@@ -78,6 +79,11 @@ def fake_repo(root):
     put(root, "work/release/fonts/OFL-rajdhani.txt", "SIL OPEN FONT LICENSE Version 1.1\n")
     put(root, "work/release/sdl3/SDL3.dll", fake_dll(3 << 20))   # over the 2 MiB binary cap on purpose
     put(root, "work/release/sdl3/LICENSE.txt", "Copyright (C) 1997-2026 Sam Lantinga\n")
+    ffx = fake_dll(4096)
+    ap.FIDELITYFX_DLL_BYTES = len(ffx)
+    ap.FIDELITYFX_DLL_SHA256 = hashlib.sha256(ffx).hexdigest()
+    put(root, "work/release/fidelityfx/amd_fidelityfx_dx12.dll", ffx)
+    put(root, "work/release/fidelityfx/LICENSE.txt", "Copyright (C) 2024 Advanced Micro Devices, Inc.\nMIT\n")
     put(root, "installer/art/art.json", json.dumps({"format": 1, "fonts_sha256": pins}))
 
 
@@ -136,6 +142,7 @@ def main():
                 "kz3-setup/spu/kz3ver.py", "re/data/spu_map_114.tsv", "re/data/spu_seeds_114.tsv",
                 "re/data/spu_coverage_seeds.tsv", "re/data/overrides/ppu_overrides-114.txt", "re/data/overrides/ppu_lift_fixups-114.txt", "re/data/campaign_levels.tsv", "port/kz3/CMakeLists.txt",
                 "port/kz3/main.cpp", "port/spu/ppu_overrides.txt", "lang/port_ui.tsv", "port/vfs/kz3_overlay.c", "port/net/kz3_net.c",
+                "third_party/fidelityfx-sdk/LICENSE.md", "third_party/fidelityfx-sdk/README.md",
                 "cmake/mingw-w64.cmake",
                 "ps3recomp/LICENSE", "ps3recomp/CMakeLists.txt", "ps3recomp/.kz3-patchset",
                 "ps3recomp/tools/ppu_lifter.py", "ps3recomp/runtime/a.c", "ps3recomp/tests/sync/CMakeLists.txt",
@@ -143,7 +150,8 @@ def main():
                 "licenses/ps3recomp-LICENSE.txt", "licenses/at3_standalone-COPYING.LGPLv2.1.txt", "licenses/FidelityFX-FSR1-LICENSE.txt",
                 "README.md", "NOTICE.md", "run.cmd", "manifest.json", "VERSION.txt",
                 "fonts/Rajdhani-Medium.ttf", "fonts/Rajdhani-Bold.ttf", "licenses/Rajdhani-OFL.txt",
-                "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt"}
+                "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt",
+                "runtime/amd_fidelityfx_dx12.dll", "licenses/AMD-FidelityFX-SDK-LICENSE.txt"}
         check(got == want, "payload holds exactly the allowlisted files",
               f"extra {sorted(got - want)} missing {sorted(want - got)}")
         # profile_edit.py finds its level table where it looks for it in the repo (parents[2]/re/data)
@@ -292,6 +300,32 @@ def main():
         put(repo, "work/release/sdl3/LICENSE.txt", "Copyright (C) 1997-2026 Sam Lantinga\n")
         rc, txt = run(["--repo", repo, "--dry-run"])
         check(rc == 0, "SDL3.dll + licence restored: payload assembles again", txt)
+
+        # FidelityFX: exact pinned SDK v1.1.4 DLL hash, AMD64 PE and its licence are inseparable.
+        xdir = os.path.join(repo, "work", "release", "fidelityfx")
+        xd = os.path.join(xdir, "amd_fidelityfx_dx12.dll")
+        with open(xd, "rb") as f:
+            xgood = f.read()
+        os.remove(xd)
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 1 and "MISSING" in txt and "stage_fidelityfx.py" in txt,
+              "a payload without the FidelityFX DLL is refused with the fix", txt)
+        put(repo, "work/release/fidelityfx/amd_fidelityfx_dx12.dll", fake_dll(4096, machine=0x14c))
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 1 and "SCRUB FAIL runtime/amd_fidelityfx_dx12.dll" in txt and "AMD64" in txt,
+              "a 32-bit FidelityFX DLL is refused", txt)
+        with open(xd, "wb") as f:
+            f.write(xgood[:-1] + bytes([xgood[-1] ^ 1]))
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 1 and "SHA-256 differs" in txt, "a changed FidelityFX DLL is refused", txt)
+        with open(xd, "wb") as f:
+            f.write(xgood)
+        os.remove(os.path.join(xdir, "LICENSE.txt"))
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 1 and "LICENSE.txt" in txt, "FidelityFX without its licence is refused", txt)
+        put(repo, "work/release/fidelityfx/LICENSE.txt", "Copyright (C) 2024 Advanced Micro Devices, Inc.\nMIT\n")
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 0, "FidelityFX DLL + licence restored: payload assembles again", txt)
 
         put(repo, "port/kz3/notes.txt", "see %USERPROFILE%\\logs and C:\\Users\\<name>\\x, /home/ is fine\n")
         rc, txt = run(["--repo", repo, "--dry-run"])

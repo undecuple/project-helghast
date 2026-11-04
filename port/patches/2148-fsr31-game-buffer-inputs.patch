@@ -1,0 +1,306 @@
+KZ3 patch 2148 (ENHANCEMENT, experimental): feed FSR from the deferred scene rather than the depthless scanout.
+
+A metadata-only gameplay capture established that the four-target full-resolution deferred pass owns the usable
+depth, while the alternating display surfaces receive a later depthless composition. Select that MRT pass
+structurally, apply the same temporal jitter to it and depth-tested scene draws, and carry its current-frame depth
+to presentation. No unidentified MRT is treated as velocity.
+
+The PPU flip clock and the live renderer's frame counter are not lockstep. Snapshot the latest coherent camera when
+the primary deferred draw is processed and reuse that exact snapshot for both jitter and presentation instead of
+comparing unrelated counters.
+
+The validated scene target is first filled from the deferred-lighting target and then receives blended forward
+draws before its existing local-to-main post-chain copy. Capture that target after the opaque resolve and again
+immediately before the copy. Strict frame, target, resource, dimensions, and FSR-context keys decide whether the
+port-owned adapter may generate a reactive mask from the pair. Missing or mismatched captures leave the mask
+optional; an expected adapter dispatch failure still follows the existing explicit Bilinear fallback.
+
+The selection and matching rules live in port/kz3/fsr31_inputs.h and are covered by
+tools/smoke/test_fsr31_inputs.c. This patch contains no game code or assets.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 51a628b..259db57 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -102,6 +102,7 @@ void rsx_live_draw_shutdown(void) {}
+ #include "rsx_fp_decompiler.h"
+ #if defined(KZ3_FSR31)
+ #include "fsr31.h"
++#include "fsr31_inputs.h"
+ #endif
+ static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_surf = 0;
+ /* Set once PS1 VRAM actually holds a drawn frame (see the PS1_PC heartbeat).
+@@ -13798,13 +13799,18 @@ u64 rsx_live_draw_debug_chunk_submits(void) { return g_ld_chunk_submits; }
+ #include "rsx_hud169.h"
+ static int ld_h169_factors(float* kx, float* ky);   /* after ld_dm_scaling_now */
+ #if defined(KZ3_FSR31)
+-static u32 g_fsr31_zslot[MAX_SURFACES], g_fsr31_zframe[MAX_SURFACES];
++static u32 g_fsr31_zslot, g_fsr31_zframe = UINT32_MAX;
+ static float g_fsr31_jitter_x, g_fsr31_jitter_y;
+ static u32 g_fsr31_jitter_frame = UINT32_MAX;
++static kz3_fsr31_camera_state g_fsr31_camera;
++static u32 g_fsr31_camera_frame = UINT32_MAX;
+ static u32 g_fsr31_context_w, g_fsr31_context_h, g_fsr31_context_generation;
+ static u32 g_fsr31_last_dispatch_frame = UINT32_MAX;
+ static u32 g_fsr31_last_dispatch_target = UINT32_MAX;
+ static u32 g_fsr31_last_dispatch_context_generation;
++static kz3_fsr31_capture_key g_fsr31_opaque_capture;
++static u32 g_fsr31_reactive_frame = UINT32_MAX;
++static u32 g_fsr31_reactive_context_generation;
+ static int ld_fsr31_draw_jitter(u32 frame, float* x, float* y);
+ #endif
+ static u32 g_h169_frame = 0xFFFFFFFFu;
+@@ -14923,13 +14929,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+      * full-size render target sampled) is squeezed into the centred 16:9 box; the RE notes "Pass 162" s.4. */
+     float h_kx = 1.0f, h_ky = 1.0f;
+     int h169 = 0;
++#if defined(KZ3_FSR31)
++    int fsr31_capture_opaque = 0;
++#endif
+     {
+         const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
+                          fabsf(vp.scale[1]) == Hv * 0.5f && vp.translate[1] == Hv * 0.5f;
+         const int is169 = (u32)Wv * 9u == (u32)Hv * 16u;
+         const int display = target < g.n_surfaces && ld_h169_is_display(target);
+-        const int depth_3d = current_zslot && full && is169 && !g_h169_rt_sampled &&
+-                             (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u);
+         if (g_h169_frame != g_ld_frames) { g_h169_frame = g_ld_frames; g_h169_depth_seen = 0; g_h169_disp_seen = 0; }
+         if (display) {
+             const int first = !g_h169_disp_seen;
+@@ -14949,17 +14956,41 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             }
+         }
+ #if defined(KZ3_FSR31)
+-        if (display && depth_3d && target < MAX_SURFACES) {
+-            g_fsr31_zslot[target] = current_zslot;
+-            g_fsr31_zframe[target] = g_ld_frames;
+-        }
+-        if (display && depth_3d) {
++        const int depth_test =
++            (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0;
++        kz3_fsr31_draw_info fsr31_draw = {
++            g_ld_frames,
++            g.surfaces[target].offset,
++            g.surfaces[target].w,
++            g.surfaces[target].h,
++            n_mrt,
++            current_zslot,
++            g_h169_rt_off,
++            g.surfaces[target].location == 0u,
++            full,
++            depth_test,
++            (rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u) != 0,
++            g_h169_rt_sampled
++        };
++        if (kz3_fsr31_is_deferred_primary(
++                &fsr31_draw, g.width, g.height)) {
++            g_fsr31_zslot = current_zslot;
++            g_fsr31_zframe = g_ld_frames;
++        }
++        if (kz3_fsr31_should_jitter(
++                &fsr31_draw,
++                g.width,
++                g.height,
++                g_fsr31_zframe,
++                g_fsr31_zslot)) {
+             float jx, jy;
+             if (ld_fsr31_draw_jitter(g_ld_frames, &jx, &jy)) {
+                 xf[4] += 2.0f * jx / Wv;
+                 xf[5] -= 2.0f * jy / Hv;
+             }
+         }
++        fsr31_capture_opaque = kz3_fsr31_is_opaque_resolve(
++            &fsr31_draw, g.width, g.height);
+ #endif
+         {   /* patch 2118 diagnostics: KZ3_HUD_169_LOG=2 KZ3_HUD_169_LOGF=<frame>: every draw of 3 frames, any target */
+             static int dl = -2; static u32 df = 0;
+@@ -15147,6 +15178,34 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
+     }
+     ld_oq_after_draw(oq_pred);
++#if defined(KZ3_FSR31)
++    if (oq_pred >= 0 && fsr31_capture_opaque && g_fsr31_context_w &&
++        (g_fsr31_opaque_capture.frame != g_ld_frames ||
++         g_fsr31_opaque_capture.context_generation !=
++             g_fsr31_context_generation ||
++         g_fsr31_opaque_capture.resource !=
++             (uintptr_t)g.surfaces[target].tex) &&
++        kz3_fsr31_capture_opaque_color(
++            g.list,
++            g.surfaces[target].tex,
++            g.surfaces[target].w,
++            g.surfaces[target].h)) {
++        static u32 capture_logs;
++        g_fsr31_opaque_capture.frame = g_ld_frames;
++        g_fsr31_opaque_capture.context_generation =
++            g_fsr31_context_generation;
++        g_fsr31_opaque_capture.target = target;
++        g_fsr31_opaque_capture.width = g.surfaces[target].w;
++        g_fsr31_opaque_capture.height = g.surfaces[target].h;
++        g_fsr31_opaque_capture.resource =
++            (uintptr_t)g.surfaces[target].tex;
++        if (capture_logs++ < 4)
++            fprintf(stderr,
++                    "[fsr31] frame %u: captured opaque scene "
++                    "surface 0x%08X\n",
++                    g_ld_frames, g.surfaces[target].offset);
++    }
++#endif
+     if (g_gt.on > 0) ld_gt_draw(target, n_mrt, mrt, current_zslot, n_tri, sf.clip_w * sf.clip_h, (u32)__builtin_popcount(texture_mask));   /* patch 2052 */
+     LDW_ADD(RSX_PERF_W_D_REC_T, rec_t0);
+     LDW_T0(post_t0);   /* patch 2045 */
+@@ -16014,6 +16073,7 @@ static int ld_fsr31_draw_jitter(u32 frame, float* x, float* y)
+     if (g_dm_filter != RSX_DM_FSR31) return 0;
+     if (g_fsr31_jitter_frame != frame) {
+         g_fsr31_jitter_frame = frame;
++        g_fsr31_camera_frame = UINT32_MAX;
+         g_fsr31_jitter_x = g_fsr31_jitter_y = 0.0f;
+         kz3_fsr31_camera_state camera;
+         const rsx_dm_rect output = rsx_dm_rect_for(
+@@ -16023,7 +16083,6 @@ static int ld_fsr31_draw_jitter(u32 frame, float* x, float* y)
+         u32 output_w, output_h;
+         ld_fsr31_output_size((u32)output.w, (u32)output.h, &output_w, &output_h);
+         if (!kz3_fsr31_get_camera(&camera) ||
+-            camera.guest_flip != frame ||
+             !(camera.flags & KZ3_FSR31_CAMERA_PLANES_VALID) ||
+             (camera.flags & KZ3_FSR31_CAMERA_MULTIPLE_VIEWS) ||
+             output_w < g.width || output_h < g.height ||
+@@ -16034,6 +16093,8 @@ static int ld_fsr31_draw_jitter(u32 frame, float* x, float* y)
+                 &g_fsr31_jitter_x, &g_fsr31_jitter_y)) {
+             return 0;
+         }
++        g_fsr31_camera = camera;
++        g_fsr31_camera_frame = frame;
+     }
+     *x = g_fsr31_jitter_x;
+     *y = g_fsr31_jitter_y;
+@@ -18026,7 +18087,45 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+         /* Patch 2023: a copy of a whole frame-sized colour surface is the
+          * scene leaving for the SPU post chain (KZ3: local 0x1300000 -> main
+          * 0x1310400, where SPU MLAA ran); the host AA pass runs on it first. */
+-        if (r0 <= s0 && r1 >= s1) ld_host_aa(i);
++        if (r0 <= s0 && r1 >= s1) {
++#if defined(KZ3_FSR31)
++            if (g_dm_filter == RSX_DM_FSR31 &&
++                (g_fsr31_reactive_frame != g_ld_frames ||
++                 g_fsr31_reactive_context_generation !=
++                     g_fsr31_context_generation) &&
++                kz3_fsr31_is_scene_target(
++                    sf->offset,
++                    sf->w,
++                    sf->h,
++                    sf->location == 0u,
++                    g.width,
++                    g.height)) {
++                const kz3_fsr31_capture_key pre_upscale = {
++                    g_ld_frames,
++                    g_fsr31_context_generation,
++                    i,
++                    sf->w,
++                    sf->h,
++                    (uintptr_t)sf->tex
++                };
++                if (kz3_fsr31_capture_pair_matches(
++                        &g_fsr31_opaque_capture, &pre_upscale) &&
++                    kz3_fsr31_capture_pre_upscale_color(
++                        g.list, sf->tex, sf->w, sf->h)) {
++                    static u32 capture_logs;
++                    g_fsr31_reactive_frame = g_ld_frames;
++                    g_fsr31_reactive_context_generation =
++                        g_fsr31_context_generation;
++                    if (capture_logs++ < 4)
++                        fprintf(stderr,
++                                "[fsr31] frame %u: captured "
++                                "opaque-plus-translucent scene\n",
++                                g_ld_frames);
++                }
++            }
++#endif
++            ld_host_aa(i);
++        }
+     }
+     LDW_T0(wb_t0);
+     ld_wb_cap_note(n, 0);
+@@ -18240,19 +18339,18 @@ static ID3D12Resource* ld_fsr31_present(
+         detail = "the scanout color is not the primary RGBA8 render image";
+         goto bypass;
+     }
+-    if (target >= MAX_SURFACES ||
+-        g_fsr31_zframe[target] != g_ld_frames ||
+-        !g_fsr31_zslot[target] ||
+-        g_fsr31_zslot[target] > g.n_zdepths) {
++    if (g_fsr31_zframe != g_ld_frames ||
++        !g_fsr31_zslot ||
++        g_fsr31_zslot > g.n_zdepths) {
+         reason = FSR_BYPASS_DEPTH;
+-        detail = "no matching primary depth pass was recorded";
++        detail = "no current full-resolution deferred depth pass was recorded";
+         goto bypass;
+     }
+ 
+     {
+-        zdepth_t* depth = &g.zdepths[g_fsr31_zslot[target] - 1u];
+-        kz3_fsr31_camera_state camera;
+-        if (!zdepth_snapshot(g_fsr31_zslot[target]) ||
++        zdepth_t* depth = &g.zdepths[g_fsr31_zslot - 1u];
++        kz3_fsr31_camera_state camera = g_fsr31_camera;
++        if (!zdepth_snapshot(g_fsr31_zslot) ||
+             !depth->snapshot || !depth->snapshot_valid ||
+             depth->snapshot_w != surface->w ||
+             depth->snapshot_h != surface->h) {
+@@ -18260,8 +18358,7 @@ static ID3D12Resource* ld_fsr31_present(
+             detail = "the primary depth snapshot is unavailable or mismatched";
+             goto bypass;
+         }
+-        if (!kz3_fsr31_get_camera(&camera) ||
+-            camera.guest_flip != g_ld_frames ||
++        if (g_fsr31_camera_frame != g_ld_frames ||
+             !(camera.flags & KZ3_FSR31_CAMERA_PLANES_VALID) ||
+             (camera.flags & KZ3_FSR31_CAMERA_MULTIPLE_VIEWS)) {
+             reason = FSR_BYPASS_CAMERA;
+@@ -18326,6 +18423,10 @@ static ID3D12Resource* ld_fsr31_present(
+         dispatch.sharpness =
+             (float)InterlockedCompareExchange(
+                 &g_fsr31_sharpness, 0, 0) / 1000.0f;
++        dispatch.use_reactive_mask =
++            g_fsr31_reactive_frame == g_ld_frames &&
++            g_fsr31_reactive_context_generation ==
++                g_fsr31_context_generation;
+         dispatch.reset =
+             timing_reset ||
+             g_fsr31_last_dispatch_frame == UINT32_MAX ||
+@@ -18362,9 +18463,11 @@ static ID3D12Resource* ld_fsr31_present(
+         if (success_logs++ < 4)
+             fprintf(stderr,
+                     "[fsr31] frame %u: FSR 3.1.4 %ux%u -> %ux%u, "
+-                    "camera-only motion, jitter %.4f/%.4f, reset=%u\n",
++                    "depth-aware camera motion, reactive=%s, "
++                    "jitter %.4f/%.4f, reset=%u\n",
+                     g_ld_frames, surface->w, surface->h,
+                     *output_width, *output_height,
++                    dispatch.use_reactive_mask ? "generated" : "none",
+                     dispatch.jitter_x, dispatch.jitter_y,
+                     dispatch.reset ||
+                         (camera.flags & KZ3_FSR31_CAMERA_RESET));
+@@ -19637,6 +19740,10 @@ void rsx_live_draw_shutdown(void)
+         g_fsr31_context_generation++;
+         g_fsr31_last_dispatch_frame = UINT32_MAX;
+         g_fsr31_jitter_frame = UINT32_MAX;
++        g_fsr31_camera_frame = UINT32_MAX;
++        g_fsr31_zframe = UINT32_MAX;
++        g_fsr31_reactive_frame = UINT32_MAX;
++        memset(&g_fsr31_opaque_capture, 0, sizeof g_fsr31_opaque_capture);
+ #endif
+         return;
+     }
+@@ -19651,6 +19758,10 @@ void rsx_live_draw_shutdown(void)
+     g_fsr31_context_generation++;
+     g_fsr31_last_dispatch_frame = UINT32_MAX;
+     g_fsr31_jitter_frame = UINT32_MAX;
++    g_fsr31_camera_frame = UINT32_MAX;
++    g_fsr31_zframe = UINT32_MAX;
++    g_fsr31_reactive_frame = UINT32_MAX;
++    memset(&g_fsr31_opaque_capture, 0, sizeof g_fsr31_opaque_capture);
+ #endif
+ #if defined(YZ_PERF_PROFILE)
+     fprintf(stderr,
