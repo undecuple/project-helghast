@@ -25,5 +25,9 @@ a="$(grep -m1 'RESULT tshash' "$O/task_pool_0.out")"; b="$(grep -m1 'RESULT tsha
 [[ -n "$a" && "$a" == "$b" ]] && echo "taskset bytes equal (off == on)" || { echo "FAIL: taskset bytes differ: [$a] [$b]"; rc=1; }
 t0="$(grep -m1 -o 'threads=[0-9]*' "$O/task_pool_0.out")"; t1="$(grep -m1 -o 'threads=[0-9]*' "$O/task_pool_1.out")"
 echo "distinct task threads after 50 serialized + 32 burst jobs: off ${t0#threads=}, on ${t1#threads=}"
-[[ "${t1#threads=}" -lt "${t0#threads=}" ]] || { echo "FAIL: the pool did not reuse threads"; rc=1; }
+# Judge reuse by the pool's own counters, not distinct OS thread ids (a runner may recycle ids with the pool off too).
+r0="$(grep -m1 -o 'reused=[0-9]*' "$O/task_pool_0.out")"; r1="$(grep -m1 -o 'reused=[0-9]*' "$O/task_pool_1.out")"
+c1="$(grep -m1 -o 'created=[0-9]*' "$O/task_pool_1.out")"
+echo "pool counters: off ${r0:-reused=?}, on ${r1:-reused=?} ${c1:-created=?}"
+[[ "${r0#reused=}" == 0 && "${r1#reused=}" -gt 0 && "${c1#created=}" -lt 82 ]] || { echo "FAIL: the pool did not reuse threads"; rc=1; }
 [[ $rc == 0 ]] && echo "ALL OK" || echo "FAILED"; exit $rc
