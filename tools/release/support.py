@@ -29,8 +29,8 @@ import support_text as T  # noqa: E402
 CAP = 20 << 20                   # bytes of text in the zip (uncompressed)
 KEEP_RUNS = 3
 OK_EXT = (".log", ".txt", ".ini")
-# kz3-install.ini [crash] dsn: the crash-report address never goes into a package (players attach them to public
-# issues); the package says only whether one is set.
+# kz3-install.ini [crash] dsn: an install made before crash reports were removed may still carry one; it never goes
+# into a package (players attach them to public issues).
 DSN_RX = re.compile(r"(?im)^(\s*dsn\s*[=:][ \t]*)(.*)$")
 # game-data names, repeated from assemble_payload.DENY_NAMES (importing it pulls in the whole payload builder)
 DENY_NAMES = ("eboot.*", "eboot*.bin", "param.sfo", "*.psarc", "*.elf", "*.self", "*.sprx", "*.prx", "*.edat",

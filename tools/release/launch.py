@@ -34,12 +34,6 @@ Version check (opt-in, kz3-install.ini [online] check_updates=1): at most once a
 background (no window, 8 s timeout) and leaves its line in <root>/logs/version-check.txt; the next start shows
 "a new version is out" once per version (a "No" is remembered in [online] dismissed).
 
-Crash reports (opt-in, kz3-install.ini [crash] report=1 and a dsn the build carries; crash_report.py): at start (in
-the background while the game runs) and after the game exits, the newest game crash file not handled yet is sent as
-one scrubbed event (at most one per session); after the game, a dialog says whether it was sent. --crash-reports
-("Crash reports on or off", Start menu) shows the state and switches it; without a dsn it says "not available in this
-build". Nothing else goes online.
-
 Discord status (opt-in, discord_presence = 1 in kz3.ini): --discord-status ("Discord status on or off", Start menu)
 shows the state and switches it. kz3.ini keeps every key the player added (write_game_ini).
 
@@ -61,11 +55,9 @@ import os
 import re
 import subprocess
 import sys
-import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import crash_report  # noqa: E402  (opt-in crash reports)
 import firstrun as fr  # noqa: E402
 import firstrun_check as fc  # noqa: E402  (the same update checks the first run makes)
 import names  # noqa: E402  (the product name, file names and links: one place, names.py)
@@ -1099,31 +1091,6 @@ def support_package(root, ini, environ, out, ui, today):
     return 0
 
 
-def crash_check(session, root):
-    """session.check() that never raises (a crash report is never worth a launcher failure)."""
-    try:
-        return session.check()
-    except Exception as e:  # noqa: BLE001
-        note(root, f"crash report: skipped ({type(e).__name__}: {e})")
-        return None
-
-
-def crash_toggle(root, ui):
-    """--crash-reports: say whether crash reports are on and offer to switch (writes [crash] report=1|0). Turning
-    them on records the crash files already there so they are never sent."""
-    available, on, text = crash_report.toggle_text(root)
-    if not available:
-        ui.info(text)
-        return 0
-    if ui.ask(text):
-        if not on:
-            crash_report.Session(root, log=lambda t: note(root, t)).mark_existing()
-        crash_report.set_report(root, not on)
-        note(root, f"crash reports: {'off' if on else 'on'}")
-        ui.info(f"Crash reports are {'off' if on else 'on'}.")
-    return 0
-
-
 DISCORD_KEY = "discord_presence"
 
 
@@ -1158,8 +1125,7 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
     ap.add_argument("--appdata", action="store_true", help="this run only: data in %%APPDATA%% (changes no file)")
     ap.add_argument("--support-package", action="store_true",
                     help='"Make a support package": one zip of logs and settings (user names removed) for a bug report')
-    ap.add_argument("--crash-reports", action="store_true",
-                    help='"Crash reports on or off": show whether crash reports are sent and switch them')
+    ap.add_argument("--crash-reports", action="store_true", help=argparse.SUPPRESS)  # removed; old shortcuts still start
     ap.add_argument("--discord-status", action="store_true",
                     help='"Discord status on or off": show whether the Discord status is on and switch it')
     ap.add_argument("--out", default="", help="with --support-package: the folder for the zip (default: the Desktop)")
@@ -1184,7 +1150,7 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
         return 0
 
     if a.crash_reports:
-        return crash_toggle(root, ui)
+        return 0   # the option is gone; an old Start-menu entry just does nothing
     if a.discord_status:
         return discord_toggle(root, ui)
     if a.support_package:
@@ -1306,14 +1272,7 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
     out = tenv.get("LD_PSO_TEMPLATE_OUT") or environ.get("LD_PSO_TEMPLATE_OUT", "")
     if a.export_template and out and os.path.isfile(out):
         os.remove(out)   # an export left by an earlier run must not pass as this run's result
-    crash = crash_report.Session(root, environ, data_dir(root, ini["portable"], environ), lambda t: note(root, t))
-    before = threading.Thread(target=crash_check, args=(crash, root), daemon=True)
-    before.start()   # a crash from a run the launcher did not see end: sent while the game runs
     rc = run(gargv, cwd=cwd, env={**environ, **tenv})
-    before.join(crash_report.TIMEOUT + 5)
-    msg = crash_report.notice(crash_check(crash, root))
-    if msg:
-        ui.info(msg)
     if a.export_template:
         tool = os.path.join(root, TEMPLATE_TOOL)
         if rc == 0 and out and os.path.isfile(out) and run([console_python(), tool, "check", out]) == 0:

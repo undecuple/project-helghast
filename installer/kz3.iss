@@ -31,8 +31,9 @@
 ; Setup types: Recommended asks only for the dump and the update (install folder aside); the EBOOT
 ; page shows only when <update>\USRDIR\EBOOT.elf is missing, the fonts come from RPCS3's folder beside the update
 ; when it has them, the tasks keep their defaults. Advanced adds the tasks page, the EBOOT and fonts pages and the
-; "Advanced options" page (copy the game files, crash reports, font copy, FMA, window size, language). Silent:
-; /TYPE=advanced /COPYDATA=1 /CRASHREPORTS=1 /FONTCOPY=0 /FMA=auto|on|off /LOWMEM=auto|on|off /WINDOW=<size> /LANG=<code>.
+; "Advanced options" page (copy the game files, font copy, FMA, window size, language). Silent:
+; /TYPE=advanced /COPYDATA=1 /FONTCOPY=0 /FMA=auto|on|off /LOWMEM=auto|on|off /WINDOW=<size> /LANG=<code>.
+; (/CRASHREPORTS=1 of older scripted installs is ignored: Inno skips parameters nothing reads.)
 ; Look: wizard images and icons from installer\art\ (tools/release/installer_art.py, the
 ; site's palette and fonts; our own artwork); native controls, no skin add-on. Texts in the site's voice: short, direct.
 
@@ -47,12 +48,6 @@
   ; Rajdhani Bold for the headings: fetched and hash-checked against installer/art/art.json
   ; by tools/release/installer_art.py --fetch-fonts (SIL OFL 1.1); never committed
   #define FontDir "..\work\release\fonts"
-#endif
-; Crash reports (opt-in, Advanced page): the address they go to comes from the build
-; environment (the release workflow's KZ3_SENTRY_DSN secret), never from the repository. Empty = this setup cannot
-; send any, and the box is greyed out. Nothing sends yet: the runtime side (sentry-native) is a later step.
-#ifndef CrashDSN
-  #define CrashDSN GetEnv("KZ3_SENTRY_DSN")
 #endif
 #if VER < EncodeVer(6,6,0)
   #error Inno Setup 6.6.0 or later is needed (WizardStyle dark; tested with 6.7.3)
@@ -269,11 +264,6 @@ Filename: "{app}\kz3-install.ini"; Section: "online"; Key: "check_updates"; Stri
 ; firstrun.py --shaders auto reads it; also after a launcher rebuild
 Filename: "{app}\kz3-install.ini"; Section: "shaders"; Key: "prepare"; String: "1"; Tasks: shadersnow
 Filename: "{app}\kz3-install.ini"; Section: "shaders"; Key: "prepare"; String: "0"; Tasks: not shadersnow
-; Crash reports (Advanced page, opt-in): the switch (report=1 only when ticked)
-Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "report"; String: "1"; Check: CrashOn
-Filename: "{app}\kz3-install.ini"; Section: "crash"; Key: "report"; String: "0"; Check: not CrashOn
-; The build's address (crash dsn) is written from [Code] (CurStepChanged, WriteCrashDsn), not here: Inno's setup log
-; prints every [INI] value, and players attach that log to public bug reports.
 
 [Icons]
 Name: "{group}\{#AppDirName}"; Filename: "{app}\{#LauncherExe}"; WorkingDir: "{app}"
@@ -286,7 +276,6 @@ Name: "{group}\Move saves and settings"; Filename: "{app}\{#LauncherExe}"; Param
 ; Runs the game with LD_PSO_TEMPLATE_OUT in the saves folder; the file holds only hashes and render-state numbers
 Name: "{group}\Export pipeline template"; Filename: "{app}\{#LauncherExe}"; Parameters: "--export-template"; WorkingDir: "{app}"
 ; One zip of logs and settings (user names removed) for a bug report; text in tools/release/support_text.py
-Name: "{group}\Crash reports on or off"; Filename: "{app}\{#LauncherExe}"; Parameters: "--crash-reports"; WorkingDir: "{app}"
 Name: "{group}\Discord status on or off"; Filename: "{app}\{#LauncherExe}"; Parameters: "--discord-status"; WorkingDir: "{app}"
 Name: "{group}\Make a support package"; Filename: "{app}\{#LauncherExe}"; Parameters: "--support-package"; WorkingDir: "{app}"
 Name: "{group}\Project page"; Filename: "{#SiteURL}"
@@ -347,7 +336,7 @@ var
   FontPage: TInputQueryWizardPage;
   TypePage: TInputOptionWizardPage;
   AdvPage: TWizardPage;
-  CopyDataChk, CrashChk, FontCopyChk: TNewCheckBox;
+  CopyDataChk, FontCopyChk: TNewCheckBox;
   FmaCombo, MemCombo, WinCombo, LangCombo: TNewComboBox;
   EbootPage: TInputFileWizardPage;
   BuildOK, BuildStopped: Boolean;
@@ -1093,12 +1082,6 @@ begin
   FontCopyChk := NewCheck(AdvPage, Y, 'Copy the PS3 fonts into the install (else read from their folder)');
   FontCopyChk.Checked := True;
   Y := Y + ScaleY(24);
-  CrashChk := NewCheck(AdvPage, Y, 'Send crash reports to the project (stack trace and a scrubbed log, no memory)');
-#if CrashDSN == ""
-  CrashChk.Enabled := False;
-  CrashChk.Caption := 'Send crash reports to the project (not available in this build)';
-#endif
-  Y := Y + ScaleY(32);
   FmaCombo := NewCombo(AdvPage, Y, 'CPU code (FMA3):', ['auto: test this CPU', 'on: AVX + FMA3 (faster)',
     'off: any 64-bit CPU']);
   Y := Y + ScaleY(28);
@@ -1118,8 +1101,7 @@ begin
     WordWrap := True;
     Width := AdvPage.SurfaceWidth;
     Height := ScaleY(32);
-    Caption := 'Crash reports are off unless ticked, and can be turned off later. Shader warm-up and the build ' +
-      'cleanup are on the previous page.';
+    Caption := 'Shader warm-up and the build cleanup are on the previous page.';
   end;
 end;
 
@@ -1153,7 +1135,6 @@ begin
   if T = '' then T := GetPreviousData('SetupType', '');   { an install over an earlier one: its type }
   if T = 'advanced' then TypePage.SelectedValueIndex := 1 else TypePage.SelectedValueIndex := 0;
   CopyDataChk.Checked := ExpandConstant('{param:COPYDATA|0}') = '1';
-  CrashChk.Checked := CrashChk.Enabled and (ExpandConstant('{param:CRASHREPORTS|0}') = '1');
   FontCopyChk.Checked := ExpandConstant('{param:FONTCOPY|1}') <> '0';
   SelectByValue(FmaCombo, Lowercase(ExpandConstant('{param:FMA|}')));
   SelectByValue(MemCombo, Lowercase(ExpandConstant('{param:LOWMEM|}')));
@@ -1170,11 +1151,6 @@ end;
 function CopyDumpFolder: Boolean;
 begin
   Result := CopyGameData and not IsIsoPick(DumpPage.Values[0]);
-end;
-
-function CrashOn: Boolean;
-begin
-  Result := IsAdvanced and CrashChk.Enabled and CrashChk.Checked;
 end;
 
 function DumpSrc(Param: String): String;
@@ -1322,7 +1298,7 @@ begin
   TypePage := CreateInputOptionPage(wpWelcome, 'Setup type', 'How much do you want to choose?',
     'Recommended asks only for your game files and uses the defaults. Advanced shows every option.', True, False);
   TypePage.Add('&Recommended: your disc dump and the 1.14 update, nothing else');
-  TypePage.Add('&Advanced: copy the game files into the install, crash reports, fonts, CPU, window, language, ' +
+  TypePage.Add('&Advanced: copy the game files into the install, fonts, CPU, window, language, ' +
     'shaders, cleanup');
   DumpPage := CreateInputDirPage(wpSelectTasks, 'Your disc dump',
     'Killzone 3, US disc (BCUS98234; the EU BCES01007, Asian BCAS25008 and Japanese BCJS30066 discs are untested), decrypted.',
@@ -1451,8 +1427,6 @@ begin
     Result := Result + NewLine + NewLine + 'Advanced options:' + NewLine + Space + 'CPU code: ' +
       FmaCombo.Items[FmaCombo.ItemIndex] + NewLine + Space + 'Build memory: ' + MemCombo.Items[MemCombo.ItemIndex] + NewLine + Space + 'Window: ' + WinCombo.Items[WinCombo.ItemIndex] + NewLine +
       Space + 'Language: ' + LangCombo.Items[LangCombo.ItemIndex];
-    if CrashOn then Result := Result + NewLine + Space + 'Crash reports: on'
-    else Result := Result + NewLine + Space + 'Crash reports: off';
   end;
   if MemoGroupInfo <> '' then Result := Result + NewLine + NewLine + MemoGroupInfo;
   { The group labels' leading line break (UI review 20) comes after Inno's indent: move the indent past it }
@@ -2219,14 +2193,6 @@ begin
   SaveStringsToFile(InstallLogPath(''), Lines, True);
 end;
 
-{ The build's crash-report address, always written (the launcher's "Crash reports on or off" can turn reports on
-  later; empty in a build without one, and then nothing can be turned on; report=1 is the only switch that sends).
-  Written here, not in [INI], so the setup log never shows it: Inno logs each [INI] value. }
-procedure WriteCrashDsn;
-begin
-  SetIniString('crash', 'dsn', '{#CrashDSN}', ExpandConstant('{app}\kz3-install.ini'));
-end;
-
 { The folders the wizard resolved, written whether or not Build now is ticked: the launcher first start
   (a build left for later, or one that stopped at a FAIL) checks these first instead of asking again in a console.
   From [Code], not [INI], so the setup log does not carry them. Not written in a silent install without folders. }
@@ -2244,7 +2210,6 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if CurStep = ssPostInstall then WriteCrashDsn;
   if CurStep = ssPostInstall then WritePaths;
   if (CurStep = ssPostInstall) and WizardIsTaskSelected('buildnow') then begin
     if SilentNoBuild then Log('silent install: build skipped (no game folders); the first start of {#AppDirName} builds')

@@ -116,7 +116,6 @@ tools/smoke/test_mouse_act.sh
 tools/net/test_discord.sh
 port/vfs/test_native_rekey.sh
 tools/smoke/test_cam_interp.sh
-tools/release/test_crash_report.py
 port/vfs/test_splitfile.sh
 tools/spu/test_r115_logroute.sh
 tools/upstream/test_sys_fs_flags.sh

@@ -156,12 +156,8 @@ jobs:
 
       - name: Build the installer
         shell: pwsh
-        # Crash reports (opt-in, the installer's Advanced page): kz3.iss reads the address from this secret at compile
-        # time; it is never in the repository. Unset = the setup's crash-report box is greyed out.
         env:
-          # Tag builds only: a manual dispatch from a branch gets no DSN.
           VERSION: ${{ steps.ver.outputs.version }}
-          KZ3_SENTRY_DSN: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.KZ3_SENTRY_DSN || '' }}
         run: |
           & $env:ISCC "/DAppVersion=$env:VERSION" "/DPayload=$PWD\build\release-payload" installer\kz3.iss
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

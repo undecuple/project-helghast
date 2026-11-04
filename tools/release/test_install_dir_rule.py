@@ -19,8 +19,7 @@ def check(ok, msg):
 
 
 check(re.search(r"^AppendDefaultDirName=yes\s*$", t, re.M), "AppendDefaultDirName=yes")
-check(not re.search(r'^Filename:.*Key: "dsn"', t, re.M) and "SetIniString('crash', 'dsn'" in t,
-      "the crash address is written from [Code], never an [INI] entry (Inno logs [INI] values)")
+check("CrashDSN" not in t and "KZ3_" + "SENTRY" not in t and "WriteCrashDsn" not in t, "the script has no crash-report upload option left")
 check(re.search(r"^TimeStampsInUTC=yes\s*$", t, re.M), "TimeStampsInUTC=yes (file times converted to the player's time zone, not future-dated)")
 check("(CurPageID = wpSelectDir) and (not WizardSilent)" in t and "WizardForm.DirEdit.Text := AddBackslash(D) + '{#AppDirName}'" in t,
       "NextButtonClick appends AppDirName on the dir page")

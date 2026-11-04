@@ -3,6 +3,11 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
+## [Unreleased]
+
+### Removed
+- The opt-in crash report upload (installer Advanced page option and the "Crash reports on or off" Start-menu entry). Nothing is sent after a crash any more; the game's own crash files and minidump stay on your PC.
+
 ## [0.1.8] - 2026-11-03 (pre-release)
 
 ### Added

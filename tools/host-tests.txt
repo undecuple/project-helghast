@@ -146,7 +146,6 @@ tools/release/test_lift_inputs_agree.py
 tools/release/test_install_update_page.py
 tools/release/test_clock_check.py
 tools/release/test_iso9660.py
-tools/release/test_crash_report.py
 tools/release/test_bump_version.py
 tools/release/test_release_notes.py
 tools/release/test_recomp_card.py
