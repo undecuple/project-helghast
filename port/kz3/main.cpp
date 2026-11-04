@@ -59,6 +59,9 @@
 #include "kz3_embed.h" /* the player's EBOOT.elf linked into kz3.exe (release step 9s) */
 #include "kz3_log.h"   /* file log, levels, crash files (also force-included with the stdio redirect) */
 #include "kz3_vfs_root.h" /* the game root from the EBOOT path (disc layout, else PS3_GAME above it, else ".") */
+#if defined(KZ3_XESS)
+#include "xess.h"
+#endif
 #ifdef _WIN32
 /* RSX pass 125 (public issue #13 on the KZ2 port, same code): hybrid laptops run an exe on the integrated GPU unless it
  * exports these two symbols (NVIDIA Optimus and AMD PowerXpress read them from the exe, not from a DLL). The DXGI
@@ -2788,6 +2791,13 @@ static void kz3_fov_view_note(uint32_t view, double A0, double A1)   /* at the w
     v.vw = A1 > 0 ? (float)(2.0 * atan(tan(s_fov_half) / A1)) : 0.f;
     v.applied = s_fov_applied;
 }
+#if defined(KZ3_XESS)
+/* ENHANCEMENT: the camera for XeSS-SR, held from the writer until vf22 has the vertical field of view (docs/XESS.md).
+ * ASSUMPTION: the pose at src is 4 rows of right, forward, up and position (see xess_motion.h). */
+static uint32_t s_xess_camera_view, s_xess_camera_flip;
+static float s_xess_camera_pose[16], s_xess_camera_hfov;
+static int s_xess_camera_pending;
+#endif
 static void kz3_cam_fov(ppu_context* ctx)
 {
     const uint32_t src = (uint32_t)ctx->gpr[29];
@@ -2838,13 +2848,30 @@ static void kz3_cam_fov(ppu_context* ctx)
     if (src_ok) for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) cam0[i][j] = kz3_bef(src + 0x10 * i + 4 * j);
     if (src_ok && (s_log == 1 || kz3_latch_on())) kz3_cam_latch(ctx, src);   /* RSX pass 105: before the pose copy */
     if (src_ok) kz3_arms_follow(src, cam0, s_log == 1);   /* RSX pass 122 */
+#if defined(KZ3_XESS)
+    if (src_ok) {
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                s_xess_camera_pose[i * 4 + j] =
+                    kz3_bef(src + 0x10 * i + 4 * j);
+        s_xess_camera_view = (uint32_t)ctx->gpr[31];
+        s_xess_camera_flip = cellGcm_flip_request_count();
+        const double view_ratio = rsx_display_view_ratio();
+        const double horizontal_half = view_ratio > 1.0 ?
+            atan(tan(s_fov_half2) * view_ratio) : s_fov_half2;
+        s_xess_camera_hfov = (float)(2.0 * horizontal_half);
+        s_xess_camera_pending = 1;
+    }
+#endif
     static float s_hz[32][2];
     static int s_nhz;
     int k = 0;
     while (k < s_nhz && !(fabsf(s_hz[k][0] - h) < 0.01f && fabsf(s_hz[k][1] - z) < 0.001f)) k++;
     if (k == s_nhz && s_nhz < 32) {
         s_hz[s_nhz][0] = h; s_hz[s_nhz][1] = z; s_nhz++;
-        printf("[fov] camera src=0x%08X hfov=%.3f zoom=%.4f half=%.5f c4=%.3f (0.5*h*pi/180/z=%.5f) flip=%u\n", src, h, z, half, c4,
+        printf("[fov] camera src=0x%08X view=0x%08X hfov=%.3f zoom=%.4f half=%.5f c4=%.3f "
+               "(0.5*h*pi/180/z=%.5f) flip=%u\n",
+               src, (uint32_t)ctx->gpr[31], h, z, half, c4,
                z != 0.f ? 0.5 * h * 0.017453292519943295 / z : 0.0, cellGcm_flip_request_count());
         fflush(stdout);
     }
@@ -2890,6 +2917,23 @@ static void kz3_vf22_aspect(ppu_context* ctx)   /* GameViewGame::vf22 @0x007E590
         const double A0 = ctx->fpr[1];
         if (s_fov_applied) ctx->fpr[1] = (double)(float)(ctx->fpr[1] * s_fov_k);   /* RSX pass 103 */
         kz3_fov_view_note((uint32_t)ctx->gpr[31], A0, ctx->fpr[1]);   /* RSX pass 121 */
+#if defined(KZ3_XESS)
+        if (s_xess_camera_pending &&
+            s_xess_camera_view == (uint32_t)ctx->gpr[31]) {
+            for (const Kz3FovView& fv : s_fov_views) {
+                if (fv.view == s_xess_camera_view && fv.vw > 0.0f) {
+                    kz3_xess_note_camera(
+                        s_xess_camera_flip,
+                        s_xess_camera_view,
+                        s_xess_camera_pose,
+                        s_xess_camera_hfov,
+                        fv.vw);
+                    break;
+                }
+            }
+            s_xess_camera_pending = 0;
+        }
+#endif
     }
 }
 
@@ -2906,13 +2950,25 @@ static void kz3_vf22_aspect(ppu_context* ctx)   /* GameViewGame::vf22 @0x007E590
  * KZ3_HUD_PROJ=0 turns it off for one run (A/B); KZ3_HUD_PROJ_LOG=1 prints the frustum once a second. */
 #include "rsx_hud169.h"
 extern "C" int rsx_live_draw_hud169_factors(float* kx, float* ky);   /* rsx_live_draw.c (patch 2113) */
-struct Kz3HudProjVer { uint32_t vf17, lr; };
-static constexpr Kz3HudProjVer kHudProj100 = {0x0031E120u, 0x007EA52Cu}, kHudProj114 = {0x00329D80u, 0x0080BDECu};
+/* scene_lr (ENHANCEMENT, XeSS-SR): the caller of Camera::vf17 that builds the primary scene projection. 1.14 was seen at
+ * run time with near 0.2 and far 2048. ASSUMPTION: the 1.00 value is mapped from 1.14 and has never run. */
+struct Kz3HudProjVer { uint32_t vf17, lr, scene_lr; };
+static constexpr Kz3HudProjVer kHudProj100 = {
+                                    0x0031E120u,   /* @0x0031E120 Camera::vf17 */
+                                    0x007EA52Cu,
+                                    0x007F0A98u},
+                                kHudProj114 = {
+                                    0x00329D80u,   /* @0x00329D80 Camera::vf17 */
+                                    0x0080BDECu,
+                                    0x008123B8u};
 static void (*s_cvf17_orig)(ppu_context*);
 static uint32_t s_hudp_lr;
+#if defined(KZ3_XESS)
+static uint32_t s_xess_projection_lr;
+#endif
 static int s_hudp_on = 1, s_hudp_log;
-/* RSX pass 119 probe (KZ3_VF17_LOG=1): every distinct Camera::vf17 caller (lr) once, then counts every 10 s: which code
- * builds a projection from the Camera, for the Field of view question (which frustum the helmet visor overlay uses). */
+/* RSX pass 119 probe (KZ3_VF17_LOG=1): every distinct Camera::vf17 caller and its first returned projection, then
+ * counts every 10 s; default off. */
 static int s_vf17_log = -1;
 static void kz3_vf17_lr_note(uint32_t lr, uint32_t cam)
 {
@@ -2936,6 +2992,34 @@ static void kz3_cam_vf17_hud(ppu_context* ctx)   /* Camera::vf17 0x00329D80 (1.0
     if (s_vf17_log < 0) { const char* e = getenv("KZ3_VF17_LOG"); s_vf17_log = e && e[0] == '1'; }
     if (s_vf17_log) kz3_vf17_lr_note(lr, (uint32_t)ctx->gpr[4]);
     s_cvf17_orig(ctx);
+    if (s_vf17_log && out >= 0x10000u && out < 0xF0000000u) {
+        static uint32_t callers[32];
+        static int ncallers;
+        int i = 0;
+        while (i < ncallers && callers[i] != lr) i++;
+        if (i == ncallers && ncallers < 32) {
+            callers[ncallers++] = lr;
+            printf(
+                "[vf17] result lr=0x%08X out=0x%08X "
+                "f0..8=%.6f %.6f %.6f\n",
+                lr,
+                out,
+                kz3_bef(out),
+                kz3_bef(out + 4),
+                kz3_bef(out + 8));
+            fflush(stdout);
+        }
+    }
+#if defined(KZ3_XESS)
+    /* ASSUMPTION: words 1 and 2 of the vf17 result are near and far, read from the observed values, not the code. */
+    if (lr == s_xess_projection_lr &&
+        out >= 0x10000u && out < 0xF0000000u) {
+        kz3_xess_note_camera_planes(
+            cellGcm_flip_request_count(),
+            kz3_bef(out + 4),
+            kz3_bef(out + 8));
+    }
+#endif
     if (lr != s_hudp_lr || out < 0x10000u || out >= 0xF0000000u) return;
     float kx = 1.0f, ky = 1.0f;
     const int sq = rsx_live_draw_hud169_factors(&kx, &ky);
@@ -2968,6 +3052,15 @@ static void kz3_hud_proj_init(void)
         return;
     }
     s_hudp_lr = v->lr;
+#if defined(KZ3_XESS)
+    /* A return address follows a call, direct (bl) or through the vtable (bctrl). A wrong scene_lr only means no planes
+     * and the Bilinear fallback, but it should say so. */
+    const uint32_t scene_call = kz3_be32(v->scene_lr - 4);
+    if ((scene_call & 0xFFE0FFFFu) == 0x4E800421u || (scene_call & 0xFC000003u) == 0x48000001u)
+        s_xess_projection_lr = v->scene_lr;
+    else
+        printf("[xess] scene projection hook NOT set: no call before lr 0x%08X; XeSS-SR will fall back\n", v->scene_lr);
+#endif
     ppu_register_function(v->vf17, kz3_cam_vf17_hud);
     printf("[hudproj] HUD world projection hook on Camera::vf17 0x%08X at lr 0x%08X (%s): %s\n", v->vf17, v->lr,
            v == &kHudProj114 ? "1.14" : "1.00", s_hudp_on ? "box frustum while the 2D layer is squeezed" : "off (KZ3_HUD_PROJ=0)");
