@@ -30,6 +30,23 @@ Get the installer or the portable zip from the [releases page](https://github.co
 `kz3.exe` started directly skips the launcher's work: it does not apply the data-location rules (saves, settings and
 caches would land in the wrong folder) or your launch settings, and it does not check that your install is current.
 
+## Portable zip quick start
+
+1. **Have your three inputs ready** (step 1 above).
+2. **Unpack the whole zip** to a local folder (not OneDrive). Keep its folders: `run.cmd` needs the `toolchain` and `kz3-setup` folders beside it. The zip holds one folder, `Project Helghast`.
+3. **Run `run.cmd`** in that folder (double-click it). It asks for the disc dump, the 1.14 update folder and the decrypted EBOOT, checks them, and offers the optional choices (the PS3 fonts, the version check, the shader warm-up).
+4. **Let it build.** It lifts and compiles the game's code behind one progress bar in that window, in about 10 minutes on a fast PC. It ends with "Done in ...: the port is built." The log, `Project-Helghast-firstrun.log`, is written next to `run.cmd`.
+5. **If the build stops**, run `run.cmd` again: it resumes at the first step that did not finish.
+6. **Start the game with `Project Helghast.exe`** in the same folder, now and every time after.
+
+Saves and settings stay in that folder. Nothing goes online unless you turn the version check on ([PRIVACY.md](PRIVACY.md)).
+
+## Which file starts the game
+
+- **Setup install:** `Project Helghast.exe`, or the desktop and Start-menu shortcuts that point to it. The installed folder has no `run.cmd`: the setup does its work.
+- **Portable zip:** `run.cmd` the first time, because it asks for your files and builds the game. After the build, `Project Helghast.exe` in the same folder starts the game. `run.cmd` is not the way to play.
+- In both cases never start `kz3.exe` directly (see above).
+
 ## Requirements
 
 See [requirements.md](requirements.md) (and [Getting your files ready](GETTING-FILES.md) for what each folder must hold): the US disc (BCUS98234) as a decrypted dump, a folder (PS3_GAME) or an ISO file (the EU disc BCES01007, the Asian disc BCAS25008 and the Japanese disc BCJS30066 are accepted as untested regions; other releases are not supported yet; a 1.14 update from any of the four regions can go with your disc, see [requirements.md](requirements.md)). A dump whose data_ps3.psarc is cut into .66600, .66601, ... parts (a FAT32 drive) works as it is. The setup checks the disc archive against the known one (our copy's); about half a minute, the 1.14 update,

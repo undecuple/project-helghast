@@ -48,7 +48,7 @@ What each must contain: [docs/GETTING-FILES.md](docs/GETTING-FILES.md); regions,
 1. Download the Windows installer (recommended) or the portable zip from <!-- version -->[v0.1.8](https://github.com/undecuple/project-helghast/releases/tag/v0.1.8)<!-- /version --> on the [releases page](https://github.com/undecuple/project-helghast/releases) (a pre-release) and check it against `SHA256SUMS`.
 2. Run it and point it at your disc dump, the 1.14 update and the decrypted EBOOT.
 3. It lifts and compiles the game's code on your machine (about 10 minutes on a fast PC); no game code, assets or keys are shipped or downloaded.
-4. Start the game from the launcher (`Project Helghast.exe` or the shortcuts), never `kz3.exe` directly.
+4. Start the game with `Project Helghast.exe` or its shortcuts. With the portable zip, run `run.cmd` once first: it does steps 2 and 3. Never start `kz3.exe` directly.
 
 Do not install into a OneDrive folder. Saves and settings: [docs/INSTALL.md](docs/INSTALL.md). Changes per version: [CHANGELOG.md](CHANGELOG.md). Nothing goes online unless you turn it on: [docs/PRIVACY.md](docs/PRIVACY.md).
 
