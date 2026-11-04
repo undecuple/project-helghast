@@ -138,6 +138,7 @@ tools/smoke/test_cam_interp.sh
 tools/release/test_licenses_match.py
 tools/release/test_uninstall_covers.py
 tools/release/test_game_ini_keep.py
+tools/release/test_default_ini.py
 tools/release/test_install_dir_rule.py
 tools/release/test_install_dump_page.py
 tools/release/test_install_eboot_page.py
@@ -184,3 +185,10 @@ tools/smoke/test_upscale.sh
 tools/smoke/test_product_name.sh
 tools/spu/test_r139_evcv.sh
 tools/spu/test_r139_task_ids.sh
+tools/smoke/test_gcm_r137.sh
+tools/spu/test_r143_candidates.sh
+tools/smoke/test_ld_cb_reuse.sh
+tools/smoke/test_gcm_fast_methods.sh
+tools/smoke/test_menu_cols.sh
+tools/spu/test_evq_lat.sh
+tools/spu/test_task_pool.sh

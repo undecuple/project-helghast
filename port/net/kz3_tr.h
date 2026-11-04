@@ -49,6 +49,9 @@ size_t kz3_trf(char* out, size_t cap, const char* key, const char* en, const cha
 /* Expand the markers of tmpl (n bytes); malloc'd NUL-terminated result in *out, returns its length; on failure (no
  * memory) *out = NULL and 0. Text outside markers is copied unchanged; a malformed marker is copied as it is. */
 size_t kz3_tr_render(const char* tmpl, size_t n, char** out);
+/* Net pass 54 (kz3_fios_stamp.h sets them): the language kz3_tr_render renders in, and a note of the game's language. */
+extern int (*kz3_tr_render_lang_hook)(int cur);
+extern void (*kz3_tr_note_lang_hook)(int cur);
 
 int  kz3_tr_lang(void);                 /* the language in force (1 = English when nothing reported) */
 void kz3_tr_note_lang(int id);          /* report the game's language id (any thread) */
@@ -308,8 +311,13 @@ void kz3_tr_stats(unsigned* file_rows, unsigned* embedded_rows, const char** fil
     if (file_path) *file_path = s_tr_path;
 }
 
+int (*kz3_tr_render_lang_hook)(int cur) = NULL;
+void (*kz3_tr_note_lang_hook)(int cur) = NULL;
+static __thread int s_tr_render_lang;   /* > 0 while kz3_tr_render runs on this thread: the pinned page language */
+
 int kz3_tr_lang(void)
 {
+    if (s_tr_render_lang > 0) return s_tr_render_lang;
     if (s_tr_lang_env < 0) {
         const char* e = getenv("KZ3_TR_LANG");
         int v = 0;
@@ -326,6 +334,7 @@ void kz3_tr_note_lang(int id)
     if (id <= 0 || id > KZ3_TR_MAX_ID) return;
     int old = __atomic_exchange_n(&s_tr_lang_reported, id, __ATOMIC_ACQ_REL);
     if (old != id) fprintf(stderr, "[tr] game language %d (was %d)\n", id, old);
+    if (kz3_tr_note_lang_hook) kz3_tr_note_lang_hook(kz3_tr_lang());
 }
 
 int kz3_tr_ext_cmd(const char* cmd, char* out, size_t n)
@@ -485,7 +494,19 @@ static void kz3_tr_put_text(Kz3TrBuf* b, const char* s, size_t k, int mode)
     }
 }
 
+static size_t kz3_tr_render_impl(const char* tmpl, size_t n, char** out);
+
+/* Net pass 54: pages are disc files served through FIOS's disk cache; the hook pins their language to the one the
+ * cache holds (kz3_fios_stamp.h). The pin applies to this thread's render only (the overlay text follows the game). */
 size_t kz3_tr_render(const char* tmpl, size_t n, char** out)
+{
+    s_tr_render_lang = kz3_tr_render_lang_hook ? kz3_tr_render_lang_hook(kz3_tr_lang()) : 0;
+    size_t r = kz3_tr_render_impl(tmpl, n, out);
+    s_tr_render_lang = 0;
+    return r;
+}
+
+static size_t kz3_tr_render_impl(const char* tmpl, size_t n, char** out)
 {
     Kz3TrBuf b = { 0, 0, 0, 0 };
     size_t i = 0;

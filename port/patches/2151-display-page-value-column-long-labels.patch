@@ -1,0 +1,83 @@
+KZ3 patch 2151 (rsx rounds 140-142): value column of Options > Display against long labels (ru, es, fr, ja ... overran it).
+
+Adds libs/video/rsx_menu_cols.h: rsx_mc_lookup(lang, &width, &option) and rsx_mc_apply(page, ...), which adds width/optionwidth to
+every select without a width (the label column is min(width, 478) - optionwidth: r140 runs showed a row's value box ends at
+list x + ~478 whatever the width, so at the 500 cap only the box decides) and a width to the options list, for the languages
+whose widest label (game rows, port rows, measured from the PS3 firmware fonts by tools/menu_layout.py) overruns the PEDS label
+column. Pass 142: one value box per language for the whole page, as the game's own pages have (pass 141's per-row boxes
+are gone); rows that do not fit carry short labels / values in port/text/port_ui.tsv (tools/menu_layout.py measure lists
+what is still too long). English and fitting languages are unchanged. Host test tools/smoke/test_menu_cols.sh.
+
+diff --git a/libs/video/rsx_menu_cols.h b/libs/video/rsx_menu_cols.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_menu_cols.h
+@@ -0,0 +1,68 @@
++/* KZ3 patch 2151: value column of the Options > Display page against long labels (tools/menu_layout.py).
++ * The page's select rows carry no width, so the PEDS style gives them a label column of ~265 px (GUM space); a longer label
++ * runs into the value. rsx_mc_apply adds width="W" optionwidth="O" to every select that has no width and a width to the
++ * options list, for the languages in the table.
++ * Layout model (r140 runs, 2026-11-04): a row's value box ends at list x + min(W, ~478) whatever W is, so the label column is
++ * min(W, 478) - O; at the 500 cap only O decides. Pass 142: ONE value box O per language for every row, as the game's own
++ * pages have (pass 141's per-row boxes made the column ragged); rows whose label or value does not fit carry a short
++ * label / short value in port/text/port_ui.tsv instead. The table is the output of `tools/menu_layout.py measure` (labels
++ * measured from the PS3 firmware fonts). */
++#ifndef RSX_MENU_COLS_H
++#define RSX_MENU_COLS_H
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++typedef struct { int lang, width, option; } rsx_mc_row;
++static const rsx_mc_row rsx_mc_display[] = {   /* game language id, row width, the page's one value box (GUM px) */
++    {4, 500, 195}, {20, 500, 195}, {3, 500, 200}, {5, 500, 195}, {6, 500, 195}, {8, 500, 190}, {11, 500, 215},
++    {12, 500, 190}, {15, 500, 195}, {16, 500, 195}, {17, 500, 225}, {22, 500, 175},
++};
++#define RSX_MC_LIST_EXTRA 32   /* the list is wider than its rows by this much on r139-ru-1280c.png (ASSUMPTION) */
++
++/* 1 and the row's width/optionwidth when `lang` needs a wider Display page, else 0 (English and the fitting languages keep the game's look). */
++static inline int rsx_mc_lookup(int lang, int* width, int* option)
++{
++    size_t i;
++    for (i = 0; i < sizeof rsx_mc_display / sizeof rsx_mc_display[0]; i++)
++        if (rsx_mc_display[i].lang == lang) { *width = rsx_mc_display[i].width; *option = rsx_mc_display[i].option; return 1; }
++    return 0;
++}
++
++/* The page with the attributes added (malloc'd, NUL-terminated), or NULL when nothing was added. */
++static inline char* rsx_mc_apply(const char* in, size_t n, size_t* out_n, int width, int option)
++{
++    char add[64], ladd[32];
++    size_t nla = (size_t)snprintf(ladd, sizeof ladd, " width=\"%d\"", width + RSX_MC_LIST_EXTRA);
++    char* out = (char*)malloc(n + 64 * (n / 8 + 1) + 1);
++    size_t i = 0, o = 0, k;
++    int added = 0;
++    if (!out) return NULL;
++    while (i < n) {
++        int sel = !strncmp(in + i, "<select", 7) && i + 7 < n && (in[i + 7] == ' ' || in[i + 7] == '\n' || in[i + 7] == '\t');
++        int lst = !strncmp(in + i, "<list id=\"lst_options\"", 22);
++        if (sel || lst) {
++            size_t e = i;
++            while (e < n && in[e] != '>') e++;
++            {   /* is there a width in this tag? */
++                size_t t, has = 0, na;
++                for (t = i; t + 7 <= e; t++) if (!strncmp(in + t, " width=", 7)) { has = 1; break; }
++                na = (size_t)snprintf(add, sizeof add, " width=\"%d\" optionwidth=\"%d\"", width, option);
++                k = sel ? 7 : 22;
++                memcpy(out + o, in + i, k); o += k;
++                if (!has) {
++                    memcpy(out + o, sel ? add : ladd, sel ? na : nla); o += sel ? na : nla;
++                    added++;
++                }
++                i += k;
++                continue;
++            }
++        }
++        out[o++] = in[i++];
++    }
++    out[o] = 0;
++    if (!added) { free(out); return NULL; }
++    *out_n = o;
++    return out;
++}
++#endif

@@ -1,0 +1,120 @@
+KZ3 patch 1155 (SPU pass 145, diagnostic, needs KZ3_WAITSTAT=1): splits every untimed sys_event_queue_receive into the REAL WAIT (sleep start -> the
+sender's push stamp q->ws_wake: the sender was late) and the WAKE LATENCY (push stamp -> the receiver runs again: the host's wake path), per queue id and
+guest lr of the receive wrapper. "[evq-lat] q=N lr=0xL calls=.. slept=.. wait_us mean/p50/p90=.. lat_us mean/p50/p90=.." every 10 s on stderr.
+Walker-plan step 8c: pass 131 measured 0.22 ms per receive x ~300/s on ppu-main (frametrace of spu130-a2: 5343 receives in 20 s, median 102 us, p90 668 us,
+max 2.8 ms: a spread far wider than one wake path, so mostly sender lateness; this table settles it per queue). Off (default) = no clock reads,
+no prints. Helper header runtime/platform/kz3_evq_lat.h; host test tools/spu/test_evq_lat.sh.
+
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -4,6 +4,7 @@
+ 
+ #include "sys_event.h"
+ #include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
++#include "../platform/kz3_evq_lat.h"   /* KZ3 patch 1155 */
+ #ifdef _WIN32
+ #include "../platform/ps3_evcv.h"   /* KZ3 patch 1148 */
+ #endif
+@@ -602,9 +603,18 @@
+         }
+     }
+     if (timeout_us == 0) {
++        const long long t_sleep = q->count == 0 ? kz3_ws_now_ns() : 0;   /* KZ3 patch 1155: 0 unless KZ3_WAITSTAT=1 */
++        int slept_evq = 0;
+         while (q->count == 0 && q->active && !q->cancelled) {
++            slept_evq = 1;
+             ps3_evcv_sleep_cs(&q->not_empty, &q->lock, INFINITE);
+         }
++        if (t_sleep || (kz3_waitstat_on() && !slept_evq)) {   /* KZ3 patch 1155: real wait vs wake latency */
++            const long long t_run = kz3_ws_now_ns(), t_push = q->ws_wake;
++            if (slept_evq && t_push >= t_sleep) kz3_evq_lat_note(queue_id, (uint32_t)ctx->lr, 1, t_push - t_sleep, t_run - t_push);
++            else kz3_evq_lat_note(queue_id, (uint32_t)ctx->lr, 0, 0, 0);
++            kz3_evq_lat_tick(t_run, stderr);
++        }
+         if (q->count == 0 && q->cancelled) {
+             LeaveCriticalSection(&q->lock);
+             return (int64_t)(int32_t)CELL_ECANCELED;
+--- /dev/null
++++ b/runtime/platform/kz3_evq_lat.h
+@@ -0,0 +1,81 @@
++/* KZ3 patch 1155 (SPU pass 145): where the time of an untimed sys_event_queue_receive goes, split into
++ *   real wait   = time from going to sleep until the sender's push (the sender was late), and
++ *   wake latency = time from that push until the receiver is running again (the host's wake path: event set,
++ *                  scheduler, critical-section re-entry).
++ * One row per (queue id, guest lr of the receive wrapper). Needs KZ3_WAITSTAT=1 (the push stamps q->ws_wake only then).
++ * A line "[evq-lat] q=N lr=0xL calls=C slept=S wait_us mean/p50/p90=... lat_us mean/p50/p90=..." every 10 s (percentiles are the upper
++ * edge of a power-of-two microsecond bucket). Lock-free: relaxed atomic adds; a row is claimed by a compare-and-swap on its key. */
++#ifndef KZ3_EVQ_LAT_H
++#define KZ3_EVQ_LAT_H
++#include <stdint.h>
++#include <stdio.h>
++#define KZ3_EVQ_LAT_ROWS 32
++#define KZ3_EVQ_LAT_B 24
++typedef struct {
++    uint64_t key;                                   /* (queue id << 32) | lr, 0 = free */
++    uint64_t calls, slept, wait_ns, lat_ns;
++    uint64_t wait_b[KZ3_EVQ_LAT_B], lat_b[KZ3_EVQ_LAT_B];   /* bucket = bit length of the microseconds */
++} kz3_evq_lat_row;
++static kz3_evq_lat_row kz3_evq_lat_rows[KZ3_EVQ_LAT_ROWS];
++static inline unsigned kz3_evq_lat_bucket(long long ns)
++{
++    unsigned long long us = ns <= 0 ? 0ull : (unsigned long long)ns / 1000ull;
++    unsigned b = 0; while (us) { b++; us >>= 1; }
++    return b < KZ3_EVQ_LAT_B ? b : KZ3_EVQ_LAT_B - 1;
++}
++static inline kz3_evq_lat_row* kz3_evq_lat_row_for(uint32_t q, uint32_t lr)
++{
++    const uint64_t key = ((uint64_t)q << 32) | lr | 1ull << 63;   /* never 0 */
++    for (unsigned i = 0; i < KZ3_EVQ_LAT_ROWS; i++) {
++        uint64_t k = __atomic_load_n(&kz3_evq_lat_rows[i].key, __ATOMIC_ACQUIRE);
++        if (k == key) return &kz3_evq_lat_rows[i];
++        if (k == 0) {
++            uint64_t z = 0;
++            if (__atomic_compare_exchange_n(&kz3_evq_lat_rows[i].key, &z, key, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || z == key)
++                return &kz3_evq_lat_rows[i];
++        }
++    }
++    return 0;   /* table full: the call is not counted */
++}
++/* slept = 0: the event was already queued. Otherwise wait_ns = push stamp - sleep start, lat_ns = return - push stamp. */
++static inline void kz3_evq_lat_note(uint32_t q, uint32_t lr, int slept, long long wait_ns, long long lat_ns)
++{
++    kz3_evq_lat_row* r = kz3_evq_lat_row_for(q, lr);
++    if (!r) return;
++    __atomic_add_fetch(&r->calls, 1, __ATOMIC_RELAXED);
++    if (!slept) return;
++    __atomic_add_fetch(&r->slept, 1, __ATOMIC_RELAXED);
++    __atomic_add_fetch(&r->wait_ns, wait_ns > 0 ? (uint64_t)wait_ns : 0, __ATOMIC_RELAXED);
++    __atomic_add_fetch(&r->lat_ns, lat_ns > 0 ? (uint64_t)lat_ns : 0, __ATOMIC_RELAXED);
++    __atomic_add_fetch(&r->wait_b[kz3_evq_lat_bucket(wait_ns)], 1, __ATOMIC_RELAXED);
++    __atomic_add_fetch(&r->lat_b[kz3_evq_lat_bucket(lat_ns)], 1, __ATOMIC_RELAXED);
++}
++static inline unsigned long long kz3_evq_lat_pct_us(const uint64_t* b, uint64_t n, unsigned pct)   /* upper edge, us */
++{
++    if (!n) return 0;
++    uint64_t want = (n * pct + 99) / 100, c = 0;
++    for (unsigned i = 0; i < KZ3_EVQ_LAT_B; i++) { c += b[i]; if (c >= want) return i ? 1ull << i : 1ull; }
++    return 1ull << (KZ3_EVQ_LAT_B - 1);
++}
++static inline void kz3_evq_lat_report(FILE* f)
++{
++    for (unsigned i = 0; i < KZ3_EVQ_LAT_ROWS; i++) {
++        kz3_evq_lat_row* r = &kz3_evq_lat_rows[i];
++        if (!__atomic_load_n(&r->key, __ATOMIC_ACQUIRE)) break;
++        const uint64_t s = __atomic_load_n(&r->slept, __ATOMIC_RELAXED);
++        fprintf(f, "[evq-lat] q=%u lr=0x%08X calls=%llu slept=%llu wait_us mean/p50/p90=%llu/%llu/%llu lat_us mean/p50/p90=%llu/%llu/%llu\n",
++                (unsigned)((r->key >> 32) & 0x7FFFFFFFu), (unsigned)r->key, (unsigned long long)r->calls, (unsigned long long)s,
++                (unsigned long long)(s ? r->wait_ns / 1000 / s : 0), kz3_evq_lat_pct_us(r->wait_b, s, 50), kz3_evq_lat_pct_us(r->wait_b, s, 90),
++                (unsigned long long)(s ? r->lat_ns / 1000 / s : 0), kz3_evq_lat_pct_us(r->lat_b, s, 50), kz3_evq_lat_pct_us(r->lat_b, s, 90));
++    }
++}
++/* Print the table at most every 10 s; `now_ns` from kz3_ws_now_ns(). */
++static inline void kz3_evq_lat_tick(long long now_ns, FILE* f)
++{
++    static long long next;
++    long long n = __atomic_load_n(&next, __ATOMIC_RELAXED);
++    if (!n) { __atomic_store_n(&next, now_ns + 10000000000ll, __ATOMIC_RELAXED); return; }
++    if (now_ns >= n && __atomic_compare_exchange_n(&next, &n, now_ns + 10000000000ll, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
++        kz3_evq_lat_report(f);
++}
++#endif

@@ -314,6 +314,15 @@ static void test_gum(void)
               "2107: fps_limit 45 refused, 60 read");
         CHECK(rsx_dm_fps_vblank_ms(30) == 16 && rsx_dm_fps_vblank_ms(60) == 8 && rsx_dm_fps_vblank_ms(120) == 4,
               "2107: guest vblank 16 ms (30, as before), 8 ms (60), 4 ms (120)");
+        {   /* RSX pass 136: the log line main.cpp prints at start and on every row change */
+            char pl[96];
+            int k30 = rsx_dm_fps_pace_line(pl, sizeof pl, 30);
+            CHECK(k30 > 0 && !strcmp(pl, "[pace] fps limit 30 (vblank tick 16 ms)"), "RSX pass 136: pace line for 30: '%s'", pl);
+            rsx_dm_fps_pace_line(pl, sizeof pl, 60);
+            CHECK(!strcmp(pl, "[pace] fps limit 60 (vblank tick 8 ms)"), "RSX pass 136: pace line for 60: '%s'", pl);
+            rsx_dm_fps_pace_line(pl, sizeof pl, 120);
+            CHECK(!strcmp(pl, "[pace] fps limit 120 (vblank tick 4 ms)"), "RSX pass 136: pace line for 120: '%s'", pl);
+        }
     }
     /* patch 2109 (RSX pass 103): Field of view row (only with the camera hook) and the display.ini fov key */
     out = rsx_dm_patch_gum(page, sizeof page - 1, &n);
@@ -453,7 +462,7 @@ static void test_gum(void)
         CHECK(strstr(out, "class=\"PEDS\" height=\"400\" onchange=\"script(settingscript,KZ3Tooltip)\">") != NULL,
               "2110: the list's onchange fills the tooltip");
         CHECK(le && tip && tip > le && tip < strstr(out, "</panel>"), "2110: tooltip panel right after the list, in the page panel");
-        CHECK(strstr(out, "function KZ3Tooltip(e)") && strstr(out, "slc_kz3_fps = \"Killzone 3 was made for 30") &&
+        CHECK(strstr(out, "function KZ3Tooltip(e)") && strstr(out, "slc_kz3_fps = \"Used in missions. Menus and videos stay at 30. Above 30") &&
               strstr(out, "slc_kz3_fov = ") && strstr(out, "slc_kz3_mblur = ") && strstr(out, "slc_kz3_display = ") &&
               strstr(out, "slc_kz3_scaling = ") && strstr(out, "slc_kz3_filter = ") && strstr(out, "slc_kz3_vsync = "),
               "2110: a tooltip for every port row");

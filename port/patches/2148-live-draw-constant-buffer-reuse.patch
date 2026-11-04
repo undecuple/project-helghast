@@ -1,0 +1,251 @@
+KZ3 patch 2148 (RSX pass 138): LD_CB_REUSE, reuse the previous draw's vertex constant-buffer slot. Default off.
+
+Every live draw copies the 512 transform constants plus an 8-float tail (viewport transform) into a slot of the constant
+ring (8 KB of write-combined memory per draw). With LD_CB_REUSE=1 a draw whose constants are unchanged since the draw that
+filled the previous slot, and whose tail bytes are equal, points its root CBV at that slot and skips the copy; the ring
+does not advance for it. "Unchanged" is a generation counter (rsx_dispatch.const_gen) bumped by every writer of the
+stored constants when a value changes: the transform-constant upload in rsx_dispatch.c, the constant seed, and the camera
+repair in rsx_live_draw.c. The previous slot must also lie below the ring's write position, and every ring reset
+invalidates it. The decision is in rsx_cb_reuse.h (pure functions) and is tested by tools/smoke/test_ld_cb_reuse.sh.
+
+With RSX_PERF=1 the [perf-walk] line ends with "| cbv copy N reuse M": draws that copied vs reused the slot.
+
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2466,7 +2466,7 @@
+                 fprintf(stderr,
+                     "[perf-walk] t=%.0fs draw %.1fms (vtx %.1f, pso %.1f new %lld/%.1fms, const %.1f, tex %.1f new %lld/%.1fms)"
+                     " clear %.1f | submit %.1fms chunks %lld | gpuwait rb %.1fms other %.1fms"
+-                    " | wb nv0039 %lld/%.1fms sync %lld/%.1fms store %.1fms | m2mf %.1fms | tex-hash %.1fms | pso: pre %.1f units %.1f key %.1f find %.1f memo-hits %lld\n",
++                    " | wb nv0039 %lld/%.1fms sync %lld/%.1fms store %.1fms | m2mf %.1fms | tex-hash %.1fms | pso: pre %.1f units %.1f key %.1f find %.1f memo-hits %lld | cbv copy %lld reuse %lld\n",
+                     tnow, d[RSX_PERF_W_DRAW_T] * tk, d[RSX_PERF_W_VTX_T] * tk, d[RSX_PERF_W_PSO_T] * tk,
+                     d[RSX_PERF_W_PSO_NEW_N], d[RSX_PERF_W_PSO_NEW_T] * tk, d[RSX_PERF_W_CONST_T] * tk,
+                     d[RSX_PERF_W_TEX_T] * tk, d[RSX_PERF_W_TEX_NEW_N], d[RSX_PERF_W_TEX_NEW_T] * tk,
+@@ -2476,7 +2476,8 @@
+                     d[RSX_PERF_W_WB_SYNC_N], d[RSX_PERF_W_WB_SYNC_T] * tk, d[RSX_PERF_W_WB_STORE_T] * tk,
+                     d[RSX_PERF_W_M2MF_T] * tk, d[RSX_PERF_W_TEX_HASH_T] * tk,
+                     d[RSX_PERF_W_PSO_PRE_T] * tk, d[RSX_PERF_W_PSO_UNITS_T] * tk, d[RSX_PERF_W_PSO_KEY_T] * tk,
+-                    d[RSX_PERF_W_PSO_FIND_T] * tk, d[RSX_PERF_W_PSO_MEMO_N]);
++                    d[RSX_PERF_W_PSO_FIND_T] * tk, d[RSX_PERF_W_PSO_MEMO_N],
++                    d[RSX_PERF_W_CB_COPY_N], d[RSX_PERF_W_CB_REUSE_N]);
+             if (d[RSX_PERF_W_ON])   /* patch 2045: the rest of the walk and the draw's split, ms in the last period */
+                 fprintf(stderr,
+                     "[perf-walk2] t=%.0fs meth %.1fms cmds %lld | draw: pre %.1f surf %.1f texloop %.1f desc %.1f (srvtbl %.1f hits %lld, smptbl %.1f)"
+diff --git a/libs/video/rsx_cb_reuse.h b/libs/video/rsx_cb_reuse.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_cb_reuse.h
+@@ -0,0 +1,47 @@
++/* rsx_cb_reuse.h - reuse of the previous draw's vertex constant-buffer view (LD_CB_REUSE).
++ *
++ * Every live draw copies the 512 transform constants plus an 8-float tail (viewport transform) into a slot of the
++ * constant ring. When no constant changed since the draw that filled the previous slot and the tail is equal, the slot
++ * already holds exactly the bytes the shader would read, so the draw can point its root CBV at that slot and skip the
++ * copy. "No constant changed" is a generation counter that the transform-constant writers bump when a stored value
++ * changes (rsx_dispatch.c, the camera repair in rsx_live_draw.c), never a guess about a dirty range.
++ *
++ * Pure functions, no D3D12: used by rsx_live_draw.c and by the host test tools/smoke/test_ld_cb_reuse.sh.
++ */
++#ifndef RSX_CB_REUSE_H
++#define RSX_CB_REUSE_H
++
++#include <string.h>
++#include <stdint.h>
++
++#define LD_CBR_TAIL_MAX 64u
++
++typedef struct ld_cbr {
++    int      valid;
++    uint32_t off;                       /* ring offset of the slot filled by the last copying draw */
++    uint32_t gen;                       /* constant generation that slot holds */
++    uint32_t tail_n;
++    uint8_t  tail[LD_CBR_TAIL_MAX];
++} ld_cbr;
++
++static inline void ld_cbr_invalidate(ld_cbr* r) { r->valid = 0; }
++
++/* 1 = the slot at r->off still holds this draw's constants. cb_used is the ring offset this draw would write to:
++ * the old slot must lie fully below it (a ring wrap resets cb_used to 0 and so fails the test even if the caller
++ * forgot to invalidate). */
++static inline int ld_cbr_can_reuse(const ld_cbr* r, uint32_t cb_used, uint32_t block, uint32_t gen,
++                                   const void* tail, uint32_t tail_n)
++{
++    return r->valid && r->gen == gen && r->tail_n == tail_n && tail_n <= LD_CBR_TAIL_MAX &&
++           r->off + block <= cb_used && memcmp(r->tail, tail, tail_n) == 0;
++}
++
++/* Record the slot the draw has just filled. */
++static inline void ld_cbr_filled(ld_cbr* r, uint32_t off, uint32_t gen, const void* tail, uint32_t tail_n)
++{
++    if (tail_n > LD_CBR_TAIL_MAX) { r->valid = 0; return; }
++    r->valid = 1; r->off = off; r->gen = gen; r->tail_n = tail_n;
++    memcpy(r->tail, tail, tail_n);
++}
++
++#endif
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -251,6 +251,7 @@
+     if (count > max_words)
+         count = max_words;
+     memcpy(rsx->constants, words, count * sizeof(u32));
++    rsx->const_gen++;   /* patch 2148 */
+ }
+ 
+ /* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
+@@ -379,8 +380,10 @@
+     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
+         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
+         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
+-        if (slot < RSX_DSP_NUM_CONSTANTS)
++        if (slot < RSX_DSP_NUM_CONSTANTS && rsx->constants[slot][word & 3] != arg) {
+             rsx->constants[slot][word & 3] = arg;
++            rsx->const_gen++;   /* patch 2148 */
++        }
+         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
+          * slot range (first 400) -- what a shader's constants really were. */
+         { static int lo = -2, hi = 0, n = 0;
+diff --git a/libs/video/rsx_dispatch.h b/libs/video/rsx_dispatch.h
+--- a/libs/video/rsx_dispatch.h
++++ b/libs/video/rsx_dispatch.h
+@@ -126,6 +126,7 @@
+     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
+     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */
+     u32 constants[RSX_DSP_NUM_CONSTANTS][4]; /* vec4 f32 bit patterns       */
++    u32 const_gen;                    /* bumped whenever a stored constant changes (patch 2148) */
+ 
+     rsx_dispatch_sink sink;
+ 
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "rsx_live_draw.h"
++#include "rsx_cb_reuse.h"
+ #include "ps3emu/yz_runtime_config.h"
+ #include "ps3emu/yz_frontier_trace.h"
+ #include "ps3emu/log_first.h"
+@@ -597,6 +598,16 @@
+ 
+ static ld_state g;
+ 
++/* Patch 2148: LD_CB_REUSE=1 points a draw at the previous draw's constant-buffer slot when no transform constant was
++ * written since and the xf tail is equal (rsx_cb_reuse.h). Default off. */
++static ld_cbr g_ld_cbr;
++static int ld_cb_reuse(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_CB_REUSE"); on = e && *e ? atoi(e) != 0 : 0; }
++    return on;
++}
++
+ #define LD_VERTEX_HOIST_FETCH       (1u << 0)
+ #define LD_VERTEX_MASK_SIGNATURE    (1u << 1)
+ #define LD_VERTEX_COMPACT_PAYLOAD   (1u << 2)
+@@ -3127,7 +3138,7 @@
+           ld_fx_add(LD_FX_LIST, fx); }
+         ld_fx_frame_end();
+         g.upload_used = 0;
+-        g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
++        g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+         g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */ g.smp_ring_used = 0;
+         ld_rb_drain();   /* patch 2027: frame N-1 is done */
+         return;
+@@ -12141,7 +12152,7 @@
+ {
+     g.vb_used = 0;
+     g.ib_used = 0;
+-    g.cb_used = 0;
++    g.cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+     g.ps_cb_used = 0;
+     g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */
+     g.smp_ring_used = 0;
+@@ -14056,6 +14067,7 @@
+             for (u32 i = 0; i < 16; i++)
+                 g.rsx.constants[108 + i / 4][i % 4] =
+                     g_ld_a010_camera_bits[i];
++            g.rsx.const_gen++;   /* patch 2148 */
+             static u64 repairs = 0;
+             repairs++;
+             if (repairs <= 16 || (repairs & (repairs - 1)) == 0) {
+@@ -14165,7 +14177,7 @@
+         ld_flush(LD_FLUSH_VERTEX_RING);
+         g.vb_used = 0;
+         g.ib_used = 0;
+-        g.cb_used = 0;
++        g.cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+         g.ps_cb_used = 0;
+         g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */
+         g.smp_ring_used = 0;
+@@ -14239,7 +14251,7 @@
+         ld_flush(LD_FLUSH_VERTEX_CONSTANT_RING);
+         if (!g.ready)
+             return;
+-        g.cb_used = 0;
++        g.cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+         vertex_cb_plan = rsx_vertex_constant_ring_plan(
+             g.cb_used, CB_RING_BYTES, CB_BLOCK_ALIGNED,
+             &vertex_cb_offset);
+@@ -15052,16 +15064,24 @@
+         if (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) g_h169_depth_seen = 1;
+         if (h169) rsx_h169_xf(xf, h_kx, h_ky);
+     }
+-    u8* cbdst = g.cb_mapped + g.cb_used;
++    u32 cb_slot = g.cb_used;   /* ring offset this draw's root CBV points at */
++    int cb_reused = 0;
+     LDW_T0(vcb_t0);
+-    memcpy(cbdst, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16);
+-    memcpy(cbdst + 512 * 16, xf, sizeof(xf));
++    if (ld_cb_reuse() && ld_cbr_can_reuse(&g_ld_cbr, g.cb_used, CB_BLOCK_ALIGNED, g.rsx.const_gen, xf, sizeof(xf))) {
++        cb_slot = g_ld_cbr.off; cb_reused = 1;   /* patch 2148: the slot already holds these bytes */
++    } else {
++        u8* cbdst = g.cb_mapped + g.cb_used;
++        memcpy(cbdst, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16);
++        memcpy(cbdst + 512 * 16, xf, sizeof(xf));
++        ld_cbr_filled(&g_ld_cbr, g.cb_used, g.rsx.const_gen, xf, sizeof(xf));
++    }
+     LDW_ADD(RSX_PERF_W_CONST_T, vcb_t0);
++    if (rsx_perf_walk_on()) rsx_perf_add(cb_reused ? RSX_PERF_W_CB_REUSE_N : RSX_PERF_W_CB_COPY_N, 1);
+ 
+     if (!sm_on || g_ld_sm.pso != pso) { g.list->lpVtbl->SetPipelineState(g.list, pso); g_ld_sm.pso = pso; }
+     if (!sm_on || !g_ld_sm.rootsig) { g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x); g_ld_sm.rootsig = 1; }
+     g.list->lpVtbl->SetGraphicsRootConstantBufferView(
+-        g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used);
++        g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + cb_slot);
+     if (ld_fp_constants_buffered())
+         g.list->lpVtbl->SetGraphicsRootConstantBufferView(
+             g.list, 4,
+@@ -15072,7 +15092,7 @@
+     if (vtex_mask)
+         g.list->lpVtbl->SetGraphicsRootDescriptorTable(
+             g.list, 3, vtex_table);
+-    g.cb_used += CB_BLOCK_ALIGNED;
++    if (!cb_reused) g.cb_used += CB_BLOCK_ALIGNED;
+ 
+     D3D12_VIEWPORT dvp = {0, 0, W, H, 0.0f, 1.0f};
+     D3D12_RECT sc = {
+@@ -19310,7 +19330,7 @@
+ #endif
+ 
+     /* new frame: reset per-frame ring cursors */
+-    g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
++    g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+     g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */ g.smp_ring_used = 0;
+ #if !defined(YZ_PERF_CLEAN)
+     g_ld_frame_vertex_constant_ring_recycles = 0;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -258,6 +258,7 @@
+     RSX_PERF_W_D_BAR_T, RSX_PERF_W_D_BAR_N, RSX_PERF_W_D_OMRT_T, RSX_PERF_W_D_SM_HIT_N,
+     RSX_PERF_W_TEX_UP_T,   /* the upload half (barriers + CopyTextureRegion) of TEX_NEW_T */
+     RSX_PERF_W_D_UNIT_SKIP_N,   /* enabled units not bound: the FP never samples them */
++    RSX_PERF_W_CB_COPY_N, RSX_PERF_W_CB_REUSE_N,   /* patch 2148: draws that copied the vertex constants / reused the previous slot */
+     RSX_PERF_W_WRAP_SRV, RSX_PERF_W_WRAP_SMP,   /* patch 2147: descriptor-ring wraps by ring (SRV table ring, sampler ring) */
+     RSX_PERF_W_FLUSH_N0, RSX_PERF_W_FLUSH_N_END = RSX_PERF_W_FLUSH_N0 + 11,   /* ld_flush by reason (11 reasons) */
+     RSX_PERF_W_FLUSH_T0, RSX_PERF_W_FLUSH_T_END = RSX_PERF_W_FLUSH_T0 + 11,

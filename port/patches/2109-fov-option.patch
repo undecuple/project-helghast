@@ -1,7 +1,7 @@
 diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
 --- a/libs/video/rsx_display_mode.h
 +++ b/libs/video/rsx_display_mode.h
-@@ -291,6 +291,35 @@
+@@ -291,9 +291,38 @@
   * frame waits on it), so the vblank rate sets the cap: 16 ms (62.5 Hz, the port's tick before 2107) = 30, 8 = 60, 4 = 120. */
  static inline unsigned rsx_dm_fps_vblank_ms(int fps) { return fps == RSX_DM_FPS_120 ? 4u : fps == RSX_DM_FPS_60 ? 8u : 16u; }
  
@@ -34,6 +34,9 @@ diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
 +    return rsx_dm_ini_value(t, "fov", v, sizeof v) ? rsx_dm_parse_fov(v) : -1;
 +}
 +
+ /* One log line for the limit in force (main.cpp prints it at start and at every change): "[pace] fps limit 60 (vblank tick 8 ms)". */
+ static inline int rsx_dm_fps_pace_line(char* buf, size_t n, int fps) { return snprintf(buf, n, "[pace] fps limit %s (vblank tick %u ms)", rsx_dm_fps_name(fps), rsx_dm_fps_vblank_ms(fps)); }
+ 
  static inline int rsx_dm_ini_write_ext(char* buf, size_t n, int mode, int scaling, int filter, int vsync, int motion_blur, int fps)
  {
      return snprintf(buf, n,

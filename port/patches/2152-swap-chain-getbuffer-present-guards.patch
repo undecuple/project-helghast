@@ -1,0 +1,72 @@
+Patch 2152: the present paths guard against a back buffer that GetBuffer could not return (RSX pass 143).
+
+From Killzone 2 port patch 6055 (Project Pyrrhus, same author, MIT). Patch 2133 checks GetBuffer's result in
+ld_dm_get_buffers, so a failed call leaves g.backbuf[i] NULL and no RTV, but the three present paths (the scaled blit,
+the game's flip copy, the movie copy) still recorded barriers and copies on that NULL resource. They now skip them (the
+frame is not shown), and the failure sets g_dm_force_resize, so the next present resizes again and a transient failure
+recovers. The log line is capped at 16 (patch 2133 printed it every time).
+
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -15893,11 +15893,16 @@
+ static void ld_dm_get_buffers(void)
+ {
+     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {
+-        /* patch 2133: GetBuffer's result is checked (a null back buffer got a null RTV and crashed later draws) */
++        /* patch 2133: GetBuffer's result is checked (a null back buffer got a null RTV and crashed later draws);
++         * patch 2152: the presents skip a NULL back buffer and the next present retries the resize */
+         const HRESULT gb = g.swap->lpVtbl->GetBuffer(g.swap, i, &IID_ID3D12Resource, (void**)&g.backbuf[i]);
+         if (FAILED(gb) || !g.backbuf[i]) {
++            static unsigned nlog;
+             g.backbuf[i] = NULL;
+-            fprintf(stderr, "[display] GetBuffer(%u) after ResizeBuffers failed hr=0x%08lX\n", i, (unsigned long)gb);
++            g_dm_force_resize = 1;
++            if (nlog++ < 16)
++                fprintf(stderr, "[display] GetBuffer(%u) after ResizeBuffers failed hr=0x%08lX: resize retried at the next present\n",
++                        i, (unsigned long)gb);
+             continue;
+         }
+         LD_SM_INVALIDATE(), g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.backbuf[i], NULL, rtv_handle(i));
+@@ -16087,6 +16093,7 @@
+     D3D12_RESOURCE_DESC sd;
+     src->lpVtbl->GetDesc(src, &sd);
+     ID3D12Resource* bb = g.backbuf[bbi];
++    if (!bb) return 0;   /* patch 2152: no back buffer (GetBuffer failed) */
+     const rsx_dm_rect r = rsx_dm_rect_for((int)sd.Width, (int)sd.Height, (int)g_dm_bb_w, (int)g_dm_bb_h, ld_dm_scaling_now(),
+                                           g_dm_filter);
+     int dm_filter = g_dm_filter;
+@@ -17057,7 +17064,7 @@
+     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+-    if (!dm_tex) g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);   /* patch 2095: dm_tex stays COPY_DEST */
++    if (!dm_tex && bb) g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);   /* patch 2095: dm_tex stays COPY_DEST; 2152: bb */
+
+     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+     dst.pResource = bb; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
+@@ -17069,12 +17076,12 @@
+     src.PlacedFootprint.Footprint.Height = h;
+     src.PlacedFootprint.Footprint.Depth = 1;
+     src.PlacedFootprint.Footprint.RowPitch = pitch;
+-    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
++    if (bb) g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);   /* patch 2152 */
+
+     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+-    if (!dm_tex) g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+-    else if (!ld_dm_blit(dm_tex, D3D12_RESOURCE_STATE_COPY_DEST, bbi)) {   /* patch 2095 */
++    if (!dm_tex) { if (bb) g.list->lpVtbl->ResourceBarrier(g.list, 1, &b); }   /* patch 2152: bb */
++    else if (!ld_dm_blit(dm_tex, D3D12_RESOURCE_STATE_COPY_DEST, bbi) && g.backbuf[bbi]) {   /* patch 2095; 2152 */
+         b.Transition.pResource = g.backbuf[bbi];         /* no scale pass: an empty (black) frame, not a stale one */
+         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+         b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+@@ -18406,7 +18413,7 @@
+     const int dm_scaled = (g_dm_bb_w != g.width || g_dm_bb_h != g.height) &&
+         ld_dm_blit(gm_copy ? gm_copy : srcimg,
+                    gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET, bbi);
+-    if (!dm_scaled) {
++    if (!dm_scaled && bb) {   /* patch 2152: bb NULL = GetBuffer failed: nothing copied, the resize is retried */
+
+     D3D12_RESOURCE_BARRIER bar[2] = {0};
+     bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

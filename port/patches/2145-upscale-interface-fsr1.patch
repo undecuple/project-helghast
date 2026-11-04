@@ -14,6 +14,8 @@ FidelityFX FSR 1: https://github.com/GPUOpen-Effects/FidelityFX-FSR commit a21ff
 MIT, Copyright (c) 2021 Advanced Micro Devices, Inc.
 Not run under Proton or on a GPU (game data offline): host tests and the Windows compile only (tools/smoke/test_upscale.sh).
 Adding files under libs/video changes the shader translator id (patch 2141): the PSO preload cache is rebuilt once.
+The intermediate texture is re-made whenever it is missing or its size differs from the output size, also with a caller-provided
+output (from the Killzone 2 port's patch 6052; otherwise its size goes stale after a resolution change).
 Upstream candidate (the interface and FSR 1 backend are generic).
 
 
@@ -8250,7 +8252,7 @@ new file mode 100644
 index 00000000..4185c968
 --- /dev/null
 +++ b/libs/video/rsx_upscale_d3d12.c
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,269 @@
 +/* rsx_upscale_d3d12.c -- the FSR 1 backend of rsx_upscale.h as two D3D12 compute passes (KZ3 patch 2145).
 + * EASU (edge-adaptive upscale) reads the input colour and writes an output-size texture; RCAS (sharpen) reads that and
 + * writes the second texture, which is the result. Both are AMD's FidelityFX FSR 1 code (MIT, see fsr1/) compiled with
@@ -8466,11 +8468,13 @@ index 00000000..4185c968
 +        }
 +        out = f->tex[1];
 +    }
-+    ID3D12Resource* mid = f->tex[0];
-+    if (!mid) {                                   /* caller-provided output: the intermediate still needs a target */
-+        if (f->tw != ow || f->th != oh) { up_release_tex(f, retire, user); if (!up_make_tex(f, ow, oh)) return 0; }
-+        mid = f->tex[0];
++    /* Caller-provided output: the intermediate still needs a target of the output size, also when the textures exist at
++     * another size (e.g. made by an at-present evaluation before a window resize). From the Killzone 2 port's patch 6052. */
++    if (!f->tex[0] || f->tw != ow || f->th != oh) {
++        up_release_tex(f, retire, user);
++        if (!up_make_tex(f, ow, oh)) return 0;
 +    }
++    ID3D12Resource* mid = f->tex[0];
 +    D3D12_RESOURCE_DESC id;
 +    in->lpVtbl->GetDesc(in, &id);
 +    const DXGI_FORMAT ifmt = e->input.format ? (DXGI_FORMAT)e->input.format : id.Format;

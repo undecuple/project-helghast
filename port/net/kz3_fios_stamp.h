@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include "kz3_tr.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -129,6 +130,82 @@ static int kz3_fs_stamp_is_cache(const char* p)
     return !strcmp(p + n - 15, "/fios/cache.idx") || !strcmp(p + n - 15, "/fios/cache.dat");
 }
 
+/* Net pass 54: the language the rewritten pages are served in. The pages the port rewrites (kz3_tr_render) change
+ * size and bytes with the game language. FIOS fails the read of a cached file whose size changed (GUM error 20000) and
+ * serves the cached bytes when the size is the same, so a page must never be served in another language than the one
+ * the cache holds. The game language is only known after FIOS opened its cache (GetLanguage runs later), and the
+ * player can change it in the game's menu at any time with the cache open, so the stamp alone cannot decide.
+ * kz3_cache_lang.txt next to the cache: "built N" = the language of the pages the cache holds, "want N" = the
+ * language the game asked for last. Pages are rendered in the built language (pinned at the first page of a new cache);
+ * a different wanted language is written down and the NEXT start removes the cache before FIOS opens it
+ * (kz3_fs_lang_preopen) and builds it again in that language. Until then the pages stay in the built language: the
+ * menu works, the page text is not yet translated (the port's own overlay text follows the language at once). */
+#define KZ3_FS_LANG_FILE "kz3_cache_lang.txt"
+static char s_fs_dir[1000];            /* host dir of the cache once FIOS opened it ("" = not yet) */
+static int s_fs_built, s_fs_want;      /* 0 = unknown */
+
+static void kz3_fs_lang_write(void)
+{
+    char p[1100];
+    if (!s_fs_dir[0]) return;
+    snprintf(p, sizeof p, "%s" KZ3_FS_LANG_FILE, s_fs_dir);
+    FILE* f = fopen(p, "wb");
+    if (!f) return;
+    fprintf(f, "built %d\nwant %d\n", s_fs_built, s_fs_want);
+    fclose(f);
+}
+
+/* Preopen, after the stamp check: cache = a cache is still there. Reads the file, drops a cache built in another
+ * language than the one wanted, remembers the dir and the pin. */
+static void kz3_fs_lang_preopen(const char* dir, int cache, const char* idx, const char* dat)
+{
+    char p[1100];
+    int b = 0, w = 0;
+    snprintf(s_fs_dir, sizeof s_fs_dir, "%s", dir);
+    snprintf(p, sizeof p, "%s" KZ3_FS_LANG_FILE, dir);
+    FILE* f = fopen(p, "rb");
+    if (f) { if (fscanf(f, "built %d\nwant %d", &b, &w) < 1) b = w = 0; fclose(f); }
+    const char* e = getenv("KZ3_TR_LANG");              /* a forced language is known now */
+    if (e && *e) { int v = (!strcmp(e, "0") || !strcmp(e, "off")) ? 1 : kz3_tr_lang_from_name(e); if (v > 0) w = v; }
+    if (!cache) b = 0;                                  /* no cache (or removed by the stamp check): nothing is built */
+    else if (b > 0 && w > 0 && w != b) {
+        const int ri = remove(idx), rd = remove(dat);
+        KZ3_NET_PRINTF("[fios] disk cache built in language %d, game wants %d: removed (cache.idx %s, cache.dat %s)\n",
+                       b, w, ri == 0 ? "removed" : "absent", rd == 0 ? "removed" : "absent");
+        fflush(stdout);
+        b = 0;
+    } else if (b == 0) {
+        /* a cache from before this check (built language unknown). ASSUMPTION: remove it once; a new cache is cheap. */
+        remove(idx); remove(dat);
+        KZ3_NET_PRINTF("[fios] disk cache without a built language: removed once\n");
+        fflush(stdout);
+    }
+    if (s_fs_built > 0) b = s_fs_built;                 /* a page was rendered before the cache opened (new cache) */
+    if (s_fs_want > 0) w = s_fs_want;
+    s_fs_built = b; s_fs_want = w;
+    kz3_fs_lang_write();
+}
+
+/* kz3_tr_render's language hook: cur = the language in force. Returns the language to render in. */
+static int kz3_fs_page_lang(int cur)
+{
+    if (s_fs_built <= 0) { s_fs_built = cur; if (s_fs_want <= 0) s_fs_want = cur; kz3_fs_lang_write(); }
+    return s_fs_built;
+}
+
+/* kz3_tr_note_lang's hook: the game's language now (after any override). */
+static void kz3_fs_note_lang(int cur)
+{
+    if (cur == s_fs_want) return;
+    s_fs_want = cur;
+    kz3_fs_lang_write();
+    if (s_fs_built > 0 && cur != s_fs_built) {
+        KZ3_NET_PRINTF("[fios] game language %d, cache pages built in %d: pages stay in %d until the next start\n",
+                       cur, s_fs_built, s_fs_built);
+        fflush(stdout);
+    }
+}
+
 /* Patch 4024's pre-open hook. On the process's first open of the cache: compare stamps, remove a stale cache. */
 static void kz3_fs_stamp_preopen(const char* gpath, const char* hpath)
 {
@@ -157,7 +234,7 @@ static void kz3_fs_stamp_preopen(const char* gpath, const char* hpath)
     have[hl] = 0;
     struct stat st;
     const int cache = stat(idx, &st) == 0 || stat(dat, &st) == 0;
-    if (!strcmp(have, want)) return;                  /* the cache was built by what serves the disc now */
+    if (!strcmp(have, want)) { kz3_fs_lang_preopen(dir, cache, idx, dat); return; }   /* built by what serves the disc now */
     if (cache) {
         const int ri = remove(idx), rd = remove(dat);
         KZ3_NET_PRINTF("[fios] disk cache built by %s: removed (cache.idx %s, cache.dat %s), FIOS builds a new one\n",
@@ -170,6 +247,7 @@ static void kz3_fs_stamp_preopen(const char* gpath, const char* hpath)
     FILE* o = fopen(stp, "wb");
     if (o) { fwrite(want, 1, strlen(want), o); fclose(o); }
     else { KZ3_NET_PRINTF("[fios] stamp NOT written (%s)\n", stp); fflush(stdout); }
+    kz3_fs_lang_preopen(dir, 0, idx, dat);            /* a cache removed above (or none) has no built language */
 }
 
 /* Install at load time: FIOS opens its cache about 170 ms after start, long before the first Localizer lookup that
@@ -179,6 +257,11 @@ extern "C" void (*g_ps3_fs_preopen_hook)(const char*, const char*);   /* patch 4
 #else
 extern void (*g_ps3_fs_preopen_hook)(const char*, const char*);
 #endif
-__attribute__((constructor)) static void kz3_fs_stamp_install(void) { g_ps3_fs_preopen_hook = kz3_fs_stamp_preopen; }
+__attribute__((constructor)) static void kz3_fs_stamp_install(void)
+{
+    g_ps3_fs_preopen_hook = kz3_fs_stamp_preopen;
+    kz3_tr_render_lang_hook = kz3_fs_page_lang;
+    kz3_tr_note_lang_hook = kz3_fs_note_lang;
+}
 
 #endif /* KZ3_FIOS_STAMP_H */

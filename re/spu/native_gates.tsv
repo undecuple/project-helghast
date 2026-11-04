@@ -1,5 +1,5 @@
 # Native gates (SPU pass 122; KZ2's native_gates.tsv design): lifted SPU functions that hand over to a native host
-# implementation (port/spu/kz3_native_post.c, kz3_native_dof.c) when their env flag is set (column default = 1: native unless the flag is 0; SPU pass 127: the 1.14 Gfx.LightProbes rows; SPU pass 133: the 1.14 Gfx.Post Upsample blend and DepthOfField blend + unpack, slots 4, 0, 6; the C table kz3_native_lp.c carries the same value, tools/spu/test_r127_native_default.sh checks both). tools/spu/lift_spu.py
+# implementation (port/spu/kz3_native_post.c, kz3_native_dof.c) when their env flag is set (column default = 1: native unless the flag is 0; SPU pass 127: the 1.14 Gfx.LightProbes rows; SPU pass 142: the 1.14 Anim.Skinning slot 24; SPU pass 133: the 1.14 Gfx.Post Upsample blend and DepthOfField blend + unpack, slots 4, 0, 6; the C table kz3_native_lp.c carries the same value, tools/spu/test_r127_native_default.sh checks both). tools/spu/lift_spu.py
 # native_gates() inserts the gate as the first statement of each listed function; the slot indexes
 # g_kz3_native_gate[] (defined once in port/spu/kz3_native_jobs.c). A gate returns 1 when it ran the whole subroutine
 # (the lifted body is skipped, the function returns to its link as `bi $r0`), 0 to run the lifted body. Rows are keyed
@@ -29,3 +29,5 @@ job_011f9c80	0x51F0	20	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOFGATHER	DOF gather
 job_0117d880	0x51F0	21	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOFGATHER	DOF gather (1.00 twin)	0
 job_011f7d00	0x5460	22	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_MOTIONBLUR	MotionBlur blur row: 12 velocity-scaled taps per pixel (trapezoid weights, fa order of the SPU), weight normalise, times b0/256, to RGBA8 (pass 136; the prologue 0x5460 hops into the hot loop 0x5700)	0
 job_0117b900	0x5460	23	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_MOTIONBLUR	MotionBlur blur row (1.00 twin)	0
+job_01242c80	0x5670	24	Anim.Skinning	KZ3_NATIVE_JOB_SKIN	3-bone vertex skinning (prologue 0x5670 + software-pipelined loop 0x5868): two palettes, position + motion vector (half) + normal (half) + two 11:11:10 vectors, 32 bytes per vertex (pass 141)	1
+job_011c5b00	0x5670	25	Anim.Skinning	KZ3_NATIVE_JOB_SKIN	3-bone vertex skinning (1.00 twin)	0

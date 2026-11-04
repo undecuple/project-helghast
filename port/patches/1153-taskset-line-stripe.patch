@@ -1,0 +1,63 @@
+KZ3 patch 1153 (SPU pass 143, candidate, default off): the taskset exit-code and signalled-bit helpers take their own line's stripe, not every stripe (KZ3_LL_TASKSET_STRIPE=1; default off).
+spu_taskset2_set_exit (16 bytes) and spu_signalled_update (one word) each touch one line but took the whole lock-line lock.
+With the switch on they take spu_ll_mask(ea, len); the notify inside still runs under the stripe of the line it kills.
+Off, the mask is all stripes: identical to before. Same intent as the caller changes in
+https://github.com/sp00nznet/ps3recomp/pull/673 ("spu: cut lock-line contention cost in SPURS atomic storms"), credit to its author.
+spu_taskset_task_exited (a 6 KB range) and the watch add/remove (the watch list is guarded by the whole lock) are unchanged.
+
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -805,6 +805,17 @@
+     for (int i = 0; i < s_n_ts2; i++) if (s_ts2[i] == ea) return 1;
+     return 0;
+ }
++/* KZ3_LL_TASKSET_STRIPE=1 (candidate, default off): the taskset's single-line read-modify-write helpers take
++ * only their line's stripe instead of every stripe. Same idea as sp00nznet/ps3recomp#673, which moves these
++ * callers to its per-line lock. The notify inside still runs under the stripe of the line it kills, as
++ * the registry walk expects. */
++static uint64_t ts_ll_mask(uint32_t ea, uint32_t len)
++{
++    static int v = -1;
++    extern uint64_t spu_ll_mask(uint32_t, uint32_t);
++    if (v < 0) { const char* e = getenv("KZ3_LL_TASKSET_STRIPE"); v = (e && *e && *e != '0') ? 1 : 0; }
++    return v ? spu_ll_mask(ea, len) : ~0ull;
++}
+ void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint32_t code)
+ {
+     extern uint8_t* vm_base;
+@@ -813,14 +824,16 @@
+     extern void spu_coh_notify_write(uint32_t);
+     const uint32_t ea = taskset_ea + 0x1980 + 16u * task;
+     uint8_t* e = vm_base + ea;
+-    spu_lockline_lock();   /* a joining SPU may hold a reservation on this line */
++    extern void spu_ll_lock_mask(uint64_t); extern void spu_ll_unlock_mask(uint64_t);
++    const uint64_t llm = ts_ll_mask(ea, 16);
++    spu_ll_lock_mask(llm);   /* a joining SPU may hold a reservation on this line */
+     memset(e, 0, 16);
+     if (exited) {
+         e[8] = (uint8_t)(code >> 24); e[9] = (uint8_t)(code >> 16); e[10] = (uint8_t)(code >> 8); e[11] = (uint8_t)code;
+         e[15] = 2;   /* exited, not yet joined; byte 14 must stay 0 or the join reports ESRCH */
+     }
+     spu_coh_notify_write(ea);
+-    spu_lockline_unlock();
++    spu_ll_unlock_mask(llm);
+ }
+ 
+ /* CellSpursTaskset2 (size 0x2900 at +0x1890): task_exit_code[128] at +0x1980, 16 bytes per task. Read
+@@ -1705,12 +1718,14 @@
+     const uint32_t word = taskset_ea + CSTS_SIGNALLED + (taskId / 32u) * 4u;
+     const uint32_t mask = (1u << 31) >> (taskId % 32u);
+     uint8_t* p = vm_base + word;
+-    spu_lockline_lock();
++    extern void spu_ll_lock_mask(uint64_t); extern void spu_ll_unlock_mask(uint64_t);
++    const uint64_t llm = ts_ll_mask(word, 4);
++    spu_ll_lock_mask(llm);
+     uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+     v = set ? (v | mask) : (v & ~mask);
+     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+     spu_coh_notify_write(word);
+-    spu_lockline_unlock();
++    spu_ll_unlock_mask(llm);
+ }
+ 
+ /* Wake WAIT_SIGNAL sleepers when the signalled line is written, including by

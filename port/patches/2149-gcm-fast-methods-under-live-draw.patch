@@ -1,0 +1,95 @@
+KZ3 patch 2149 (RSX pass 138): GCM_FAST_METHODS, method-loop fast path under live draw. Default off.
+
+gcm_word_diag() is split into gcm_word_diag_only() (the GCM_* diagnostic switches, which keep the per-word path) and
+gcm_word_live() (live draw / draw engine). Before, any live consumer forced the per-word loop with a gcm_io2ea() translation
+and a dozen checks per data word, so the contiguous-page run path never ran in this port. With GCM_FAST_METHODS=1 and no
+diagnostic switch, a method header whose data words lie in one 1 MB IO page (subchannel 0, or 1 outside the NV0039 methods,
+method != 0, not a sampled RSX_PERF_X command) translates once and loops over the words: live feed, draw engine, driver
+methods (0xEB00/0xEB04, 0xE920/0xE924), then gcm_3d_method, per word and in the order of the per-word loop. Other commands
+take the old loop. Host test: tools/smoke/test_gcm_fast_methods.sh (synthetic ring with increment and non-increment
+headers, identical call streams with the switch off and on).
+
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2823,13 +2823,32 @@
+  * drain: the walker hands every data word through these checks, a million a
+  * second in God of War HD gameplay, and it used to test each switch on its
+  * own for every word. */
+-static int gcm_word_diag(void)
++/* Patch 2149 splits it in two: the diagnostic switches (they log or count per word and keep the per-word path) and the
++ * live consumers (live draw, draw engine: they take every word, but need no per-word checks). */
++static int gcm_word_diag_only(void)
+ {
+     static int on = -1;
+     if (on < 0)
+         on = (getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") || getenv("GCM_WORD_STATS") ||
+-              getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") || getenv("RSX_LIVE_FEED_DBG") ||
+-              rsx_live_draw_enabled() || rsx_draw_engine_enabled()) ? 1 : 0;
++              getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") || getenv("RSX_LIVE_FEED_DBG")) ? 1 : 0;
++    return on;
++}
++static int gcm_word_live(void)
++{
++    static int on = -1;
++    if (on < 0) on = (rsx_live_draw_enabled() || rsx_draw_engine_enabled()) ? 1 : 0;
++    return on;
++}
++static int gcm_word_diag(void)
++{
++    return gcm_word_diag_only() || gcm_word_live();
++}
++/* GCM_FAST_METHODS=1 (default off): a method header whose data words lie in one 1 MB IO page is walked with one address
++ * translation and a plain word loop, also under live draw, as long as no diagnostic switch is set. */
++static int gcm_fast_methods(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("GCM_FAST_METHODS"); on = e && *e ? atoi(e) != 0 : 0; }
+     return on;
+ }
+ 
+@@ -2912,6 +2931,7 @@
+     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
+     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
+     const int wdiag = gcm_word_diag();
++    const int fastm = gcm_fast_methods() && !gcm_word_diag_only();   /* patch 2149 */
+     /* rsx_state feeds only the legacy vtable backend. With the draw engine
+      * up and no vtable registered, the state it builds is never read, and the
+      * only methods worth handing it are the ones with effects outside it
+@@ -3487,6 +3507,35 @@
+              * so the loop's own cost outside both is measured without a timer pair on every word. */
+             static unsigned s_x_cmd;
+             const long long xs = (meth_t0 && rsx_perf_x_on() && ((++s_x_cmd & 31u) == 0)) ? rsx_perf_now() : 0;
++            /* Patch 2149 (GCM_FAST_METHODS=1): the same words, in the same order and through the same calls as the loop
++             * below (live feed, draw engine, driver methods, 3D dispatch), with the per-word translation and the
++             * diagnostic checks left out. Same page and subchannel preconditions as the run path above; a command
++             * that does not meet them, or the sampled RSX_PERF_X commands, take the loop below. */
++            if (fastm && !xs && count && method != 0 &&
++                (subch == 0 || (subch == 1 && !s1_2d && !gcm_subch1_nv0039_run(method, type == 0, count))) &&
++                ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
++                const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
++                if (dea) {
++                    static int f_live = -1, f_eng = -1;
++                    if (f_live < 0) { f_live = rsx_live_draw_enabled(); f_eng = rsx_draw_engine_enabled(); }
++                    for (u32 i = 0; i < count; i++) {
++                        const u32 m = (type == 0) ? method + i * 4 : method;
++                        const u32 v = vm_read32(dea + i * 4);
++                        const u32 mfull = (subch << 13) | m;
++                        if (f_live) { rsx_live_draw_method(mfull, v); s_rsx_perf_methods++; }
++                        if (f_eng) rsx_draw_engine_method(mfull, v);
++                        if (mfull == 0xEB00u || mfull == 0xEB04u)
++                            cellGcmQueueUserCommand(v);
++                        else if (mfull == 0xE920u || mfull == 0xE924u)
++                            cellGcmSetFlipCommand(v & 7u);
++                        else
++                            gcm_3d_method(&s_state, m, v, legacy_state_live);
++                    }
++                    if (meth_t0) { rsx_perf_add(RSX_PERF_W_METH_T, rsx_perf_now() - meth_t0); rsx_perf_add(RSX_PERF_W_METH_CMD_N, 1); }
++                    s_fifo_getoff += 4 + count * 4;
++                    continue;
++                }
++            }
+             for (u32 i = 0; i < count; i++) {
+                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                 if (!dea) break;

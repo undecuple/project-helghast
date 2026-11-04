@@ -1,0 +1,143 @@
+KZ3 patch 1154 (SPU pass 145, candidate, default off): task thread pool, KZ3_SPU_TASK_POOL=1.
+Every cellSpursCreateTask (spu_dispatch_async_ids) created a host thread with a 256 MB stack reservation and the thread ended with its job.
+Creating the thread is the largest cost of a create on the PPU: measured on Linux (tools/spu/test_task_pool.sh, 400 creates in batches of 8)
+34.5 us per create, of which the bookkeeping (take_slot, running mark, task_info, exit entry) is a few us; under Wine a thread start is several
+wineserver round trips (KZ3 main thread: 0.14 ms per CreateTask/CreateTask2 call, ~390 calls/s, walker-plan step 8b).
+With the switch on a task thread parks when its job is over (condition variable, no timeout) and the next job is handed to the most recently
+parked one; a thread is created only when none is parked, so the thread count is the peak number of concurrent tasks. Job function, the
+per-job setup inside spu_async_run (fpmode, ids, taskset binding, patch 1072 record) and the stack-range cleanup after each job are unchanged.
+Caveat: thread-local statistics and the YDKJ cri EXIT counter (image 22) are per thread, not per job; titles running image 22 leave it off.
+Off (default) = the old code path: one thread per job. Host test: tools/spu/test_task_pool.sh (taskset bytes equal off/on, 16 concurrent jobs,
+thread reuse, creates per second). Upstream-shaped (general ps3recomp runtime).
+
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -1431,6 +1431,100 @@
+     free(j);
+ }
+ 
++/* KZ3 patch 1154: task thread pool (KZ3_SPU_TASK_POOL=1, default off). Every cellSpursCreateTask started a host thread
++ * (256 MB stack reservation, detached) and the thread ended with its task. Creating a thread is the largest part of
++ * the PPU's cost of a create (the bookkeeping around it is a few microseconds; about 15-35 us per thread on Linux,
++ * more under Wine, where a thread start is several wineserver round trips), and the KZ3 main thread creates ~390
++ * tasks a second. With the pool a task thread, when its job is over, parks and the next job is handed to it: same
++ * job function, same stack-range cleanup after each job, same per-job thread setup (fpmode, ids, taskset binding,
++ * KZ3 patch 1072 record) done inside spu_async_run. What a parked thread keeps is its thread-local counters that
++ * are statistics only, plus the YDKJ cri EXIT count (spu_channels.c, image 22), which is per thread, not per job:
++ * a title that runs image 22 leaves the switch off. Threads are created only when none is parked, so their number
++ * is the peak number of concurrent tasks; nothing times out or is capped. */
++static int spu_task_pool_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_SPU_TASK_POOL"); v = (e && *e && *e != '0') ? 1 : 0; }
++    return v;
++}
++typedef struct spu_pool_worker {
++    struct spu_pool_worker* next;
++    spu_async_job* job;
++#ifdef _WIN32
++    ps3_evcv cv;   /* patch 1148: never ntdll's futex queue */
++#else
++    pthread_cond_t cv;
++#endif
++} spu_pool_worker;
++#ifdef _WIN32
++static SRWLOCK s_pool_lock = SRWLOCK_INIT;
++#define POOL_LOCK()   AcquireSRWLockExclusive(&s_pool_lock)
++#define POOL_UNLOCK() ReleaseSRWLockExclusive(&s_pool_lock)
++#else
++static pthread_mutex_t s_pool_lock = PTHREAD_MUTEX_INITIALIZER;
++#define POOL_LOCK()   pthread_mutex_lock(&s_pool_lock)
++#define POOL_UNLOCK() pthread_mutex_unlock(&s_pool_lock)
++#endif
++static spu_pool_worker* s_pool_idle;          /* parked workers, most recently parked first */
++unsigned long g_spu_pool_reused, g_spu_pool_created;   /* statistics (host test, [spu-pool]) */
++
++/* Hand the job to a parked worker. 0 when none is parked (the caller creates a thread). */
++static int spu_pool_handoff(spu_async_job* j)
++{
++    POOL_LOCK();
++    spu_pool_worker* w = s_pool_idle;
++    if (w) { s_pool_idle = w->next; w->job = j; __atomic_fetch_add(&g_spu_pool_reused, 1, __ATOMIC_RELAXED); }
++    POOL_UNLOCK();
++    if (!w) return 0;
++#ifdef _WIN32
++    ps3_evcv_wake_one(&w->cv);
++#else
++    pthread_cond_signal(&w->cv);
++#endif
++    return 1;
++}
++/* A worker whose job is over parks here until it is handed the next one. */
++static spu_async_job* spu_pool_park(spu_pool_worker* w)
++{
++    POOL_LOCK();
++    w->job = NULL; w->next = s_pool_idle; s_pool_idle = w;
++    while (!w->job) {
++#ifdef _WIN32
++        ps3_evcv_sleep_srw(&w->cv, &s_pool_lock, INFINITE);
++#else
++        pthread_cond_wait(&w->cv, &s_pool_lock);
++#endif
++    }
++    spu_async_job* j = w->job;
++    POOL_UNLOCK();
++    return j;
++}
++
++/* One job on the calling task thread, and what the thread leaves behind. */
++static void spu_async_thread_job(spu_async_job* j)
++{
++    spu_async_run(j);
++#ifdef _WIN32
++    /* Nothing on this stack may stay in the lock-line reserver set. */
++    { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
++      extern void spu_coh_forget_range(uintptr_t, uintptr_t);
++      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
++      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
++#endif
++}
++static void spu_async_thread_main(spu_async_job* j)
++{
++    if (!spu_task_pool_on()) { spu_async_thread_job(j); return; }
++    spu_pool_worker w;
++    memset(&w, 0, sizeof w);
++#ifdef _WIN32
++    ps3_evcv_init(&w.cv);
++#else
++    pthread_cond_init(&w.cv, NULL);
++#endif
++    for (;;) { spu_async_thread_job(j); j = spu_pool_park(&w); }
++}
++
+ #ifdef _WIN32
+ static DWORD WINAPI spu_async_thread(LPVOID p) {
+     ps3_thread_name("spu job");
+@@ -1439,16 +1533,11 @@
+      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
+      * instead of killing the process silently with 0x80000001. */
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+-    spu_async_run((spu_async_job*)p);
+-    /* Nothing on this stack may stay in the lock-line reserver set. */
+-    { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
+-      extern void spu_coh_forget_range(uintptr_t, uintptr_t);
+-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
+-      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
++    spu_async_thread_main((spu_async_job*)p);
+     return 0;
+ }
+ #else
+-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
++static void* spu_async_thread(void* p) { spu_async_thread_main((spu_async_job*)p); return NULL; }
+ #endif
+ 
+ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+@@ -2059,6 +2148,8 @@
+                 fprintf(stderr, "\n");
+             } } }
+ 
++    if (spu_task_pool_on() && spu_pool_handoff(j)) return 1;   /* KZ3 patch 1154 */
++    __atomic_fetch_add(&g_spu_pool_created, 1, __ATOMIC_RELAXED);
+ #ifdef _WIN32
+     /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
+      * chains are deep host call chains with fat lifted frames -- a 1MB stack

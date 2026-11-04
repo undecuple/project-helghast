@@ -1,7 +1,7 @@
 diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
 --- a/libs/video/rsx_display_mode.h
 +++ b/libs/video/rsx_display_mode.h
-@@ -264,6 +264,45 @@
+@@ -264,6 +264,48 @@
      return rsx_dm_ini_value(t, "vsync", v, sizeof v) ? rsx_dm_parse_vsync(v) : -1;
  }
  
@@ -32,6 +32,9 @@ diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
 + * frame waits on it), so the vblank rate sets the cap: 16 ms (62.5 Hz, the port's tick before 2107) = 30, 8 = 60, 4 = 120. */
 +static inline unsigned rsx_dm_fps_vblank_ms(int fps) { return fps == RSX_DM_FPS_120 ? 4u : fps == RSX_DM_FPS_60 ? 8u : 16u; }
 +
++/* One log line for the limit in force (main.cpp prints it at start and at every change): "[pace] fps limit 60 (vblank tick 8 ms)". */
++static inline int rsx_dm_fps_pace_line(char* buf, size_t n, int fps) { return snprintf(buf, n, "[pace] fps limit %s (vblank tick %u ms)", rsx_dm_fps_name(fps), rsx_dm_fps_vblank_ms(fps)); }
++
 +static inline int rsx_dm_ini_write_ext(char* buf, size_t n, int mode, int scaling, int filter, int vsync, int motion_blur, int fps)
 +{
 +    return snprintf(buf, n,
@@ -47,7 +50,7 @@ diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
  static inline int rsx_dm_ini_write(char* buf, size_t n, int mode, int scaling, int filter, int vsync)
  {
      return snprintf(buf, n,
-@@ -289,7 +328,8 @@
+@@ -289,7 +331,8 @@
  /* The page with the row and the functions added (malloc'd, NUL-terminated, *out_n bytes), or NULL when an anchor is
   * missing (the Brightness listitem, the settingscript CDATA end), the script already has an OnPageOn, or the row is
   * already there: the page is then served unchanged. */
@@ -57,7 +60,7 @@ diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
  {
      static const char rsx_dm_gum_row[] =
          "<select id=\"slc_kz3_display\" label=\"Display mode\" onchange=\"script(settingscript,KZ3ChangeDisplay)\"\n"
-@@ -312,7 +352,37 @@
+@@ -312,7 +355,37 @@
          "\t\t\t\tdefault-value=\"on\">\n"
          "\t\t\t\t<selectitem value=\"on\">On</selectitem>\n"
          "\t\t\t\t<selectitem value=\"off\">Off</selectitem>\n"
@@ -95,7 +98,7 @@ diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
  
      static const char rsx_dm_gum_lua[] =
          "\n\t\tgKz3Dm = 0\n\t\tfunction KZ3DisplayCmd(c)\n"
-@@ -323,7 +393,32 @@
+@@ -323,7 +396,32 @@
          "\t\t\tgRoot:GetTag(\"slc_kz3_display\"):SetValue(KZ3DisplayCmd(\"display\"))\n"
          "\t\t\tgRoot:GetTag(\"slc_kz3_scaling\"):SetValue(KZ3DisplayCmd(\"scaling\"))\n"
          "\t\t\tgRoot:GetTag(\"slc_kz3_filter\"):SetValue(KZ3DisplayCmd(\"filter\"))\n"
@@ -129,7 +132,7 @@ diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
          "\t\tend\n\n"
          "\t\tfunction KZ3ChangeDisplay(e)\n"
          "\t\t\te:SetHandled(true)\n"
-@@ -344,24 +439,34 @@
+@@ -344,24 +442,34 @@
      const char* row = rsx_dm_find(in, n, 0, "<listitem id=\"lst_gamma_screen\"");
      const char* scr = rsx_dm_find(in, n, 0, "<script id=\"settingscript\">");
      const char* cd = scr ? rsx_dm_find(in, n, (size_t)(scr - in), "]]>") : NULL;

@@ -1,0 +1,54 @@
+KZ3 patch 1151 (SPU pass 143, candidate, default off): prefetch the next reservation holders' lines in the two notifier walks (KZ3_COH_PREFETCH=1; default off).
+Every notifier walks the whole holder registry with the line's stripe held and reads each holder's resv_valid/resv_ea;
+this prefetches the line SPU_COH_PF (4) slots ahead so the misses overlap. The walk and its result are unchanged.
+The holder registry here is already a contiguous chunked array (patch 1056), so only the prefetch is taken from
+https://github.com/sp00nznet/ps3recomp/pull/672 ("spu_coherency: holder list as a contiguous array, prefetched"), credit to its author.
+
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -280,6 +280,25 @@
+     for (spu_coh_chunk* ch = &s_coh_head; ch; ch = __atomic_load_n(&ch->next, __ATOMIC_ACQUIRE)) \
+         for (int i = 0; i < SPU_COH_CHUNK; i++)
+ 
++/* KZ3_COH_PREFETCH=1: the notifier walks touch every holder's resv_valid/resv_ea with the stripe held, one
++ * cache miss per holder; prefetch the line SPU_COH_PF slots ahead so the misses overlap (idea and
++ * measurement: sp00nznet/ps3recomp#672, which does the same on its list-turned-array registry). Off by
++ * default; the walk and its result are identical either way. */
++#define SPU_COH_PF 4
++static inline int spu_coh_prefetch_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_COH_PREFETCH"); v = (e && *e && *e != '0') ? 1 : 0; }
++    return v;
++}
++static inline void spu_coh_prefetch_ahead(spu_coh_chunk* ch, int i)
++{
++    if (i + SPU_COH_PF < SPU_COH_CHUNK) {
++        spu_context* n = __atomic_load_n(&ch->slot[i + SPU_COH_PF], __ATOMIC_RELAXED);
++        if (n) __builtin_prefetch(&n->resv_valid);
++    }
++}
++
+ /* Registry capacity in slots (tests; grows by SPU_COH_CHUNK). */
+ unsigned spu_coh_capacity(void)
+ {
+@@ -638,7 +657,9 @@
+     uint32_t line = ea & ~127u;
+     ppu_resv_break_line(ea);   /* upstream #381: line-granule PPU reservations */
+     spu_coh_wake_watches(line);   /* upstream v0.18.0 */
++    const int pf = spu_coh_prefetch_on();
+     SPU_COH_FOR_EACH(ch, i) {
++        if (pf) spu_coh_prefetch_ahead(ch, i);
+         spu_context* c = __atomic_load_n(&ch->slot[i], __ATOMIC_ACQUIRE);
+         if (!c || (const void*)c == self) continue;
+         if (spu_resv_kill(c, line)) {           /* patch 1056: CAS under the line's stripe */
+@@ -655,7 +676,9 @@
+     uint32_t line = ea & ~127u;
+     ppu_resv_break_line(ea);   /* upstream #381: line-granule PPU reservations */
+     spu_coh_wake_watches(line);   /* upstream v0.18.0 */
++    const int pf = spu_coh_prefetch_on();
+     SPU_COH_FOR_EACH(ch, i) {
++        if (pf) spu_coh_prefetch_ahead(ch, i);
+         spu_context* c = __atomic_load_n(&ch->slot[i], __ATOMIC_ACQUIRE);
+         if (!c) continue;
+         if (spu_resv_kill(c, line)) {           /* patch 1056: CAS, reservation lost, PUTLLC must fail */

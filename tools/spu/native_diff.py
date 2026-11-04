@@ -67,7 +67,7 @@ def main():
                 subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-msse4.1", "-w", "-fno-strict-aliasing",
                                 "-ffp-contract=off", *os.environ.get("NATIVE_DIFF_CFLAGS", "").split(), f"-DHARNESS_REGISTER={name}_spu_recomp_register", *inc,
                                 os.path.join(ROOT, "tools/spu/native_diff_harness.c"),
-                                os.path.join(ROOT, "port/spu/kz3_native_post.c"), os.path.join(ROOT, "port/spu/kz3_native_dof.c"), os.environ.get("NATIVE_DIFF_LP") or os.path.join(ROOT, "port/spu/kz3_native_lp.c"),
+                                os.path.join(ROOT, "port/spu/kz3_native_post.c"), os.path.join(ROOT, "port/spu/kz3_native_dof.c"), os.environ.get("NATIVE_DIFF_LP") or os.path.join(ROOT, "port/spu/kz3_native_lp.c"), os.path.join(ROOT, "port/spu/kz3_native_skin.c"),
                                 os.path.join(pt, "runtime/spu/spu_interp.c"), os.path.join(pt, "runtime/spu/spu_drain.c"),
                                 os.path.join(a.lift, name, "spu_recomp.c"), "-lm", "-o", exe], check=True)
                 built[name] = (exe, img)

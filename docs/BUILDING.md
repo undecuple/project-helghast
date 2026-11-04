@@ -210,6 +210,8 @@ filter = bilinear
 vsync = on
 ```
 
+The launcher creates this file with every display key at its default (also `motion_blur`, `fps_limit`, `fov`, `hud_169`, `bloom`, `unfocused`, `maximize`) when it is missing, and never changes an existing one. It also creates `online.ini` with every key commented out: the game stays offline until you set a server.
+
 `KZ3_DISPLAY=windowed|borderless|fullscreen` sets the mode for one run without saving it. `KZ3_ASPECT=16:9` (or
 `off`) keeps the PS3's 16:9 view in gameplay instead of following the window's shape.
 

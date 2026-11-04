@@ -708,6 +708,80 @@ GAME_INI_HEAD = f"""; {names.PRODUCT}: what kz3.exe reads when it is started wit
 """
 
 
+# Default settings files (release pass 92, after KZ2 0.1.9): display.ini and online.ini are written into the data
+# folder at a start when they are missing, never over an existing file (keybinds.ini is written by the game itself
+# with its defaults; kz3.ini by this launcher). display.ini holds every key the game reads at its default value
+# (port/kz3/main.cpp: s_dm_saved, s_mb_saved, s_fps_saved, s_bloom_saved, s_fov_saved, s_h169_saved, s_unf_saved,
+# s_maxbl_saved; the saved window position is left out: none is saved yet). test_default_ini.py compares the values with
+# those initialisers. online.ini has no setting that is on by default (the game is offline until a server is set), so
+# its keys (port/net/kz3_net.h) are all comments and the file changes nothing.
+DISPLAY_INI = "display.ini"
+DISPLAY_INI_TEXT = """; Display settings. Created with the defaults when this file was missing; the launcher never overwrites it.
+; The game reads it at start and rewrites it when you change a display option (Options > Display, Alt+Enter).
+; KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER, KZ3_FPS_LIMIT, KZ3_FOV, KZ3_BLOOM, KZ3_HUD_169 and KZ3_UNFOCUSED win for one run.
+
+[display]
+; mode = windowed | borderless | fullscreen
+mode = windowed
+; scaling = fit | stretch. stretch: the picture fills the window; fit keeps its shape, with bars.
+scaling = stretch
+; filter = bilinear | nearest
+filter = bilinear
+; vsync = on | off. off shows each frame as soon as it is ready, which can tear.
+vsync = on
+; motion_blur = 0..100 (percent). 100 is the game's own look; the value is kept but does not act.
+motion_blur = 100
+; fps_limit = 30 | 60 | 120. 30 is the game's own; above 30 can break gameplay timing.
+fps_limit = 30
+; fov = default | 70..110. First-person horizontal field of view in degrees at 16:9 (campaign only). default: the game's own.
+fov = default
+; hud_169 = on | off. HUD, menus, subtitles and movies kept 16:9 and centred when the window is wider.
+hud_169 = on
+; bloom = 0..100 (percent, steps of 10). 100 is the game's own glow around bright areas; 0 is off.
+bloom = 100
+; unfocused = keep | mute | pause. While the window is in the background: keep running, silence the sound, or pause.
+unfocused = keep
+; maximize = borderless | window. The maximize button switches to Borderless, or maximizes the window keeping its shape.
+maximize = borderless
+"""
+ONLINE_INI = "online.ini"
+ONLINE_INI_TEXT = """; Online settings. Created with every key commented out when this file was missing; the launcher never overwrites
+; it. The game stays offline until you name a server. Nothing goes online unless you turn online play on and set host.
+; host = the server's host name or IPv4 address (default: none)
+; ports = the server's ports (default: the usual Medius ports; only change when your server says so)
+; region = the label shown on the region list (default: the game's own)
+; online_id = your online id on that server (default: none)
+; ticket_file = a ticket file you were given, absolute or relative to this file (default: none)
+; server = the name of the [server NAME] section to use (default: the top-level host, else the first section)
+"""
+
+
+def ensure_default_ini(folder, name, text):
+    """Write <folder>/<name> with `text` when it is not there (never touches an existing file, even an empty one or a
+    folder of that name; exclusive create, so a file made meanwhile survives). -> "" or the reason it could not be
+    written; never raises (a missing settings file is never a reason to stop the start)."""
+    path = os.path.join(folder, name)
+    try:
+        if os.path.lexists(path):
+            return ""
+        os.makedirs(folder, exist_ok=True)
+        try:
+            f = open(path, "x", encoding="ascii", newline="\r\n")
+        except FileExistsError:   # made meanwhile: theirs stays
+            return ""
+        with f:
+            f.write(text)
+        return ""
+    except (OSError, ValueError) as e:
+        return f"could not write {path} ({e})"
+
+
+def ensure_default_inis(folder):
+    """display.ini and online.ini defaults -> a list of problems (empty when all is well)."""
+    return [r for r in (ensure_default_ini(folder, DISPLAY_INI, DISPLAY_INI_TEXT),
+                        ensure_default_ini(folder, ONLINE_INI, ONLINE_INI_TEXT)) if r]
+
+
 def read_game_ini(path):
     """kz3.ini as {key: value} (keys lower-case, sections ignored as the runtime does, kz3_ini.h: the first non-empty
     value of a key counts). Read with the rule every ini reader uses (UTF-8, else the ANSI code page), the same one
@@ -1258,6 +1332,7 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
         return 1
     gargv = game_argv(root, paths, extra)
     note(root, f"kz3.ini: {write_game_ini(root, game_ini(root, paths, ini['portable'], environ, newer=newer))}")
+    note(root, "default settings files: " + ("; ".join(ensure_default_inis(cwd)) or "ok"))
     note(root, "game: " + " ".join(gargv) + f" (cwd {cwd}; the game's log is in build\\logs)")
     fr.place_lang(root, os.path.dirname(gargv[0]))
     fr.place_fonts(root, os.path.dirname(gargv[0]))     # the notice fonts next to kz3.exe (RSX pass 38)

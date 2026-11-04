@@ -32,8 +32,10 @@ NORM = {"“": '"', "”": '"', "„": '"', "‘": "'", "’": "'",
 # max_chars 28 is read as 28 average Latin capitals = 275 px, so ~9.8 px per Latin char. CJK cells are
 # full-width (~20 px, ASSUMPTION: cellFont outlines at the same height). Re-measure from the font
 # (the RE notes s.22: FishmongerCR 'A' 536 / em 727) when data is mounted.
+# 2026-11-03 tester video (ru, Options > Display, 1080p): 17 Cyrillic capitals fit the label column, 18 touch the
+# value and 19-20 overlap it, so ru is 275 / 17 px per char (was 13.75 from "20 chars just touch").
 LATIN_PX = 275 / 28
-CHAR_PX = {"ru": 13.75, "ja": 20.0, "ko": 20.0, "zh_tw": 20.0}
+CHAR_PX = {"ru": 275 / 17, "ja": 20.0, "ko": 20.0, "zh_tw": 20.0}
 LABEL_MAXC = 28          # width-checked (failing) rows: the select label column
 PENDING = Path(__file__).resolve().parent / "port_ui_width_pending.txt"
 PH = re.compile(r"\{\d\}")
@@ -87,7 +89,10 @@ def check():
         if not vals["en"]:
             errs.append(f"{key}: empty en")
         for c, s in vals.items():
-            if not s or s.startswith("@game:"):
+            if not s:   # an empty cell shows English in that language (2026-11-03: 11 keys had none in 18 languages)
+                errs.append(f"{key} [{c}]: empty (no translation)")
+                continue
+            if s.startswith("@game:"):
                 continue
             if sorted(PH.findall(s)) != want:
                 errs.append(f"{key} [{c}]: placeholders {PH.findall(s)} vs en {want}")

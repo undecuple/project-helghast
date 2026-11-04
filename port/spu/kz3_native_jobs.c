@@ -31,10 +31,10 @@ const struct kz3_native_job kz3_native_jobs[] = {
  * The lifted functions listed in re/spu/native_gates.tsv start with
  *   if (g_kz3_native_gate[slot] && g_kz3_native_gate[slot](ctx)) SPU_RET(ctx);
  * g_kz3_native_gate is defined here, once. A slot is filled when its entry is on (a switch =1, or no switch set and the entry default-on: the Gfx.LightProbes
- * entries of the 1.14 job (SPU pass 127) and the 1.14 Gfx.Post slots 0, 4, 6, 18 (spu rounds 133, 140: Upsample and DepthOfField blend, DOF unpack, Upsample row kernel); every switch =0 turns an entry off), by the
+ * entries of the 1.14 job (SPU pass 127) and the 1.14 Gfx.Post slots 0, 4, 6, 18 (spu rounds 133, 140: Upsample and DepthOfField blend, DOF unpack, Upsample row kernel; SPU pass 142: the 1.14 Anim.Skinning slot 24); every switch =0 turns an entry off), by the
  * trampoline that runs the call through kz3_native_run (count, debug gate, constant pool, kernel). Switches:
  * KZ3_NATIVE_JOB_POST=1/0 (every Gfx.Post gate; default on for slots 0, 4, 6 of the 1.14 job), KZ3_NATIVE_JOB_POSTMIX=1/0 (blend), KZ3_NATIVE_JOB_DOF=1/0,
- * KZ3_NATIVE_JOB_UPSAMPLE=1/0 (row kernel, slot 18 default on), KZ3_NATIVE_JOB_MOTIONBLUR=1,
+ * KZ3_NATIVE_JOB_UPSAMPLE=1/0 (row kernel, slot 18 default on), KZ3_NATIVE_JOB_MOTIONBLUR=1, KZ3_NATIVE_JOB_SKIN=1/0 (slot 24 default on, the 1.00 twin 25 off),
  * KZ3_NATIVE_JOB_LIGHTPROBES=1/0 (all Gfx.LightProbes kernels; default on for 1.14, off for the 1.00 twins; _LP_KD / _LP_BAKE / _LP_BLEND / _LP_ATTEN / _LP_LIGHT one each). KZ3_NATIVE_REC=DIR records real gate inputs instead
  * (KZ3_NATIVE_REC_N per slot, default 24; KZ3_NATIVE_REC_EVERY calls between records, default 61;
  * KZ3_NATIVE_REC_AFTER seconds before the first, default 120); the lifted body then runs. Records hold game data:
@@ -111,6 +111,8 @@ const kz3_native_entry* kz3_native_find(int slot)
         if (kz3_native_dof[i].slot == slot) return &kz3_native_dof[i];
     for (unsigned i = 0; i < kz3_native_lp_n; i++)
         if (kz3_native_lp[i].slot == slot) return &kz3_native_lp[i];
+    for (unsigned i = 0; i < kz3_native_skin_n; i++)
+        if (kz3_native_skin[i].slot == slot) return &kz3_native_skin[i];
     return NULL;
 }
 
@@ -324,4 +326,5 @@ __attribute__((constructor)) static void kz3_native_gates_init(void)
     gate_add(kz3_native_post, kz3_native_post_n);
     gate_add(kz3_native_dof, kz3_native_dof_n);
     gate_add(kz3_native_lp, kz3_native_lp_n);
+    gate_add(kz3_native_skin, kz3_native_skin_n);
 }

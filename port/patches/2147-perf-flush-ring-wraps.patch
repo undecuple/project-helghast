@@ -1,0 +1,95 @@
+KZ3 patch 2147 (RSX pass 137): descriptor-ring wrap counts in the [perf-flush] line. No behaviour change.
+
+With RSX_PERF=1 the per-second [perf-flush] line (patch 2045) ends with
+  | wraps srv S smp M up U vtx V cb C pscb P
+Every wrap of a transient ring submits the list and waits for the whole queue, so U/V/C/P are the upring/vring/cbring/pscbring
+flush counts of the period and the descriptor-ring flushes are split by the ring that forced them: srv = the SRV table ring was
+full, smp = only the sampler ring was full. The line is built by gcm_perf_flush_line (host test tools/smoke/test_gcm_r137.sh).
+Counted only when RSX_PERF is on (rsx_perf_walk_on); nothing is added to the draw path otherwise.
+
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -192,6 +192,8 @@
+     if (rsx_draw_engine_enabled()) rsx_draw_engine_method(m, v);
+ }
+
++static void gcm_perf_flush_line(char* fl, size_t n, double tnow, const long long* d, double tk);   /* patch 2147 */
++
+ /* Configuration */
+ static CellGcmConfig s_config;
+ /* Offset pages (1MB) known to be LOCAL-memory-derived (set by
+@@ -2492,15 +2494,8 @@
+                         d[RSX_PERF_W_NV3089_GPU_T] * tk, d[RSX_PERF_W_NV3089_COPY_T] * tk, d[RSX_PERF_W_NV3089_ROWS_N],
+                         (double)d[RSX_PERF_W_NV3089_BYTES] / 1048576.0);
+             if (d[RSX_PERF_W_ON]) {   /* patch 2045: flushes by reason (n/ms) and the texture upload half */
+-                static const char* const rn[12] = { "present", "ref", "vring", "cbring", "retire", "movie",
+-                                                    "mpresent", "readback", "pscbring", "descring", "shutdown",
+-                                                    "upring" };   /* patch 2142 */
+-                char fl[512]; int fo = snprintf(fl, sizeof fl, "[perf-flush] t=%.0fs tex-up %.1fms |", tnow,
+-                                                d[RSX_PERF_W_TEX_UP_T] * tk);
+-                for (int r = 0; r < 12 && fo < (int)sizeof fl - 40; r++)
+-                    if (d[RSX_PERF_W_FLUSH_N0 + r])
+-                        fo += snprintf(fl + fo, sizeof fl - (size_t)fo, " %s %lld/%.1fms", rn[r],
+-                                       d[RSX_PERF_W_FLUSH_N0 + r], d[RSX_PERF_W_FLUSH_T0 + r] * tk);
++                char fl[512];
++                gcm_perf_flush_line(fl, sizeof fl, tnow, d, tk);
+                 fprintf(stderr, "%s\n", fl);
+             }
+             if (d[RSX_PERF_W_ON])   /* patch 2033: the vertex-fetch split, ms in the last period */
+@@ -2795,6 +2790,26 @@
+     }
+ }
+
++/* The [perf-flush] line (patch 2045): flushes by reason (n/ms) and the texture upload half; patch 2147 appends the
++ * ring wraps of the period: every wrap of a transient ring submits and waits for the whole queue, so the counts
++ * are the flush counts of vring/cbring/pscbring/upring and descring split by ring (srv table ring, sampler ring).
++ * d = the period's counters, tk = ticks to ms. Never writes past n. */
++static void gcm_perf_flush_line(char* fl, size_t n, double tnow, const long long* d, double tk)
++{
++    static const char* const rn[12] = { "present", "ref", "vring", "cbring", "retire", "movie",
++                                        "mpresent", "readback", "pscbring", "descring", "shutdown",
++                                        "upring" };   /* patch 2142 */
++    int fo = snprintf(fl, n, "[perf-flush] t=%.0fs tex-up %.1fms |", tnow, d[RSX_PERF_W_TEX_UP_T] * tk);
++    for (int r = 0; r < 12 && fo >= 0 && (size_t)fo < n - 40; r++)
++        if (d[RSX_PERF_W_FLUSH_N0 + r])
++            fo += snprintf(fl + fo, n - (size_t)fo, " %s %lld/%.1fms", rn[r],
++                           d[RSX_PERF_W_FLUSH_N0 + r], d[RSX_PERF_W_FLUSH_T0 + r] * tk);
++    if (fo >= 0 && (size_t)fo < n)
++        snprintf(fl + fo, n - (size_t)fo, " | wraps srv %lld smp %lld up %lld vtx %lld cb %lld pscb %lld",
++                 d[RSX_PERF_W_WRAP_SRV], d[RSX_PERF_W_WRAP_SMP], d[RSX_PERF_W_FLUSH_N0 + 11],
++                 d[RSX_PERF_W_FLUSH_N0 + 2], d[RSX_PERF_W_FLUSH_N0 + 3], d[RSX_PERF_W_FLUSH_N0 + 8]);
++}
++
+ /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
+ static int gcm_get_eq_put(void)
+ {
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -14867,8 +14867,11 @@
+     LDW_ADD(RSX_PERF_W_D_TEXLOOP_T, texloop_t0);
+     LDW_T0(desc_t0);   /* patch 2045 */
+     const u32 required_srv_tables = 1u + (vtex_mask != 0);
+-    if (g.srv_ring_used + required_srv_tables > SRV_RING_TABLES ||
+-        sampler_table_needs_flush(smp_slots)) {
++    const int srv_ring_full = g.srv_ring_used + required_srv_tables > SRV_RING_TABLES;
++    const int smp_ring_full = !srv_ring_full && sampler_table_needs_flush(smp_slots);
++    if (srv_ring_full || smp_ring_full) {
++        /* patch 2147: which ring forced the wrap (the sampler one is counted when the SRV ring was not full) */
++        if (rsx_perf_walk_on()) rsx_perf_add(srv_ring_full ? RSX_PERF_W_WRAP_SRV : RSX_PERF_W_WRAP_SMP, 1);
+         /* Every descriptor referenced by the old command list is consumed
+          * before recycling its shader-visible heap entries. Texture upload
+          * commands recorded while resolving slots are also completed here;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -258,6 +258,7 @@
+     RSX_PERF_W_D_BAR_T, RSX_PERF_W_D_BAR_N, RSX_PERF_W_D_OMRT_T, RSX_PERF_W_D_SM_HIT_N,
+     RSX_PERF_W_TEX_UP_T,   /* the upload half (barriers + CopyTextureRegion) of TEX_NEW_T */
+     RSX_PERF_W_D_UNIT_SKIP_N,   /* enabled units not bound: the FP never samples them */
++    RSX_PERF_W_WRAP_SRV, RSX_PERF_W_WRAP_SMP,   /* patch 2147: descriptor-ring wraps by ring (SRV table ring, sampler ring) */
+     RSX_PERF_W_FLUSH_N0, RSX_PERF_W_FLUSH_N_END = RSX_PERF_W_FLUSH_N0 + 11,   /* ld_flush by reason (11 reasons) */
+     RSX_PERF_W_FLUSH_T0, RSX_PERF_W_FLUSH_T_END = RSX_PERF_W_FLUSH_T0 + 11,
+     /* patch 2080: NV3089 blits: count, whole-method ticks, GPU mirror ticks, guest copy ticks, row-copied blits,

@@ -1,0 +1,23 @@
+EDAT reader: the message for content without a key is one short line, "DLC skipped: no licence key supplied".
+
+From Killzone 2 port patch 5005 (Project Pyrrhus, same author, MIT). The old four lines told the player where to put a key
+file and how such a key is derived from a console licence; the game's log is attached to public issues, and the port does
+not ask players for keys. The behaviour is unchanged (the file is not opened, -6).
+
+--- a/libs/filesystem/edat.c
++++ b/libs/filesystem/edat.c
+@@ -546,12 +546,8 @@
+             fclose(in); return -6;
+         }
+         if (!have_key) {
+-            fprintf(stderr,
+-                "[edat] license type %u needs a RIF key and none was supplied.\n"
+-                "[edat]   set PS3_RIF_KEY=<32 hex chars>, or put the 16 raw bytes in\n"
+-                "[edat]   %s.rifkey -- it is derived from your own .rap for this\n"
+-                "[edat]   content id, which this runtime deliberately cannot do for you.\n",
+-                license, in_path);
++            /* A player sees this line for every installed DLC file: say what happened, not how a key is made. */
++            fprintf(stderr, "[edat] DLC skipped: no licence key supplied\n");
+             fclose(in); return -6;
+         }
+     }

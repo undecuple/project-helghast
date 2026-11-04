@@ -1,0 +1,65 @@
+KZ3 patch 1152 (SPU pass 143, candidate, default off): PUTLLCs that cannot succeed fail without the line stripe, and the shared PUTLLC counter is not bumped (KZ3_PUTLLC_FAST=1; default off).
+A PUTLLC with no live reservation on its line, or whose line already differs from the GETLLAR snapshot, fails the way
+hardware does, without taking the stripe. A match still takes the stripe and re-verifies, so a success is never decided
+unlocked; a torn read can only fail a PUTLLC the guest retries. The g_spu_putllc_count increment (one shared cache line
+written by every PUTLLC on every thread; its only reader discards it) is skipped in this mode.
+Ideas from https://github.com/sp00nznet/ps3recomp/pull/673 ("spu: cut lock-line contention cost in SPURS atomic storms":
+the PUTLLC pre-check, the memcmp screen and the counter), credit to its author; our striped lock and the per-context MFC engine cache already cover its other commits.
+
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -635,6 +635,13 @@
+ /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
+  * the delta across one policy run to find the run that performed a claim. */
+ volatile unsigned g_spu_putllc_count = 0;
++/* KZ3_PUTLLC_FAST=1: see MFC_PUTLLC_CMD below (candidate, default off). */
++static int spu_putllc_fast(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_PUTLLC_FAST"); v = (e && *e && *e != '0') ? 1 : 0; }
++    return v;
++}
+ /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
+  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
+ volatile unsigned g_spu_putllc_sync_hit = 0;
+@@ -956,7 +963,15 @@
+         return 1;
+ 
+     case MFC_PUTLLC_CMD:
+-        g_spu_putllc_count++;   /* run-scoped delta read by the PM flow trace */
++        /* KZ3_PUTLLC_FAST=1 (candidate, default off): the shared g_spu_putllc_count is not counted
++         * (its only reader, spurs_policy.c, discards it), and a PUTLLC that cannot succeed fails
++         * without taking the line's stripe, like hardware: no live reservation on this line, or the
++         * line already differs from the snapshot. Both are final: a differing line means a writer
++         * committed first, and a torn read can only fail a PUTLLC the guest then retries. A match
++         * still takes the stripe and re-verifies below, so a success is never decided unlocked.
++         * Idea from sp00nznet/ps3recomp#673 (PUTLLC pre-check, memcmp screen, uncounted storm
++         * path); see that PR for its measurements. */
++        if (!spu_putllc_fast()) g_spu_putllc_count++; /* run-scoped delta read by the PM flow trace */
+         { extern uint32_t g_barrier_sync_watch;
+           uint32_t b = g_barrier_sync_watch;
+           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
+@@ -964,8 +979,12 @@
+          * line's stripe first; then this line's stripe only. */
+         if (ctx->resv_valid && ((ctx->resv_ea ^ ea) & ~127u)) spu_resv_drop(ctx);
+         const uint64_t llm = spu_ll_mask(ea, MFC_ATOMIC_LINE);
+-        spu_ll_lock_mask(llm);
+-        if (ctx->resv_valid && ctx->resv_ea == ea &&
++        const int no_lock = spu_putllc_fast() &&
++            (__atomic_load_n(&ctx->resv_valid, __ATOMIC_ACQUIRE) != 1 ||
++             __atomic_load_n(&ctx->resv_ea, __ATOMIC_RELAXED) != ea ||
++             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) != 0);
++        if (!no_lock) spu_ll_lock_mask(llm);
++        if (!no_lock && ctx->resv_valid && ctx->resv_ea == ea &&
+             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
+               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
+@@ -1064,7 +1083,7 @@
+                       ctx->atomic_stat ? "FAIL" : "OK",
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+         ctx->resv_valid = 0;                           /* reservation consumed */
+-        spu_ll_unlock_mask(llm);                       /* patch 1056 */
++        if (!no_lock) spu_ll_unlock_mask(llm);         /* patch 1056 */
+         if (ctx->atomic_stat == 0) {
+             spu_taskset_line_committed(ea & ~127u);
+             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);

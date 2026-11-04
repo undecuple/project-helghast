@@ -32,8 +32,8 @@ res_live() {
   [[ -n "$e" ]] || e=$(( $(stat -c %Y "$RES" 2>/dev/null || echo 0) + 7200 ))
   (( $(date +%s) < e ))
 }
-if [[ "$NAME" == gpu && "${KZ3_GPU_PRIO:-0}" != 1 ]] && res_live; then
-  echo "lock.sh: GPU reserved by the maintainer ($(head -1 "$RES")); waiting" >&2
+if [[ ( "$NAME" == gpu || "$NAME" == build ) && "${KZ3_GPU_PRIO:-0}" != 1 ]] && res_live; then   # a reservation also holds builds
+  echo "lock.sh: $NAME held by the maintainer's GPU reservation ($(head -1 "$RES")); waiting" >&2
   while res_live; do sleep "${KZ3_RES_POLL_S:-10}"; done
   [[ -f "$RES" ]] && echo "lock.sh: the GPU reservation expired; going ahead" >&2
 fi

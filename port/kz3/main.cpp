@@ -698,6 +698,7 @@ static void kz3_keycaps_register(void);   /* below, with the notice fonts */
  * (fit|stretch) / Scaling filter (bilinear|nearest) rows. KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER win for
  * one run, and then nothing is saved (rsx_null_backend.c). */
 #include "rsx_display_mode.h"
+#include "rsx_menu_cols.h"   /* patch 2151 */
 #ifdef _WIN32
 extern "C" int  pad_kb_sibling_path(const wchar_t* name, wchar_t* out, size_t n);   /* cellPad.c (patch 2095) */
 extern "C" void rsx_display_configure(int saved_mode, int saved_scaling, int saved_filter,
@@ -733,6 +734,15 @@ static int s_unf_saved = RSX_UNF_KEEP;
  * values the rows hold are s_mb_* / s_bloom_*; KZ3_MOTION_BLUR on|off|0..100 and KZ3_BLOOM 0..100 win for one run). */
 static volatile LONG s_mb_eff = 100, s_fps_eff = RSX_DM_FPS_30, s_bloom_eff = 100;
 static int s_mb_saved = 100, s_fps_saved = RSX_DM_FPS_30, s_bloom_saved = 100;
+/* Patch 2107: "[pace] fps limit N (vblank tick M ms)" (rsx_dm_fps_pace_line), once at start and on every row change or
+ * KZ3_FPS_LIMIT override; the menus and movies stay at the game's 30 (its own Bink background wait), so the line is how a log
+ * shows which limit was in force for the levels. */
+static void kz3_log_fps_limit(void)
+{
+    char l[96];
+    rsx_dm_fps_pace_line(l, sizeof l, (int)s_fps_eff);
+    printf("%s\n", l);
+}
 /* Test aid (patch 2121): KZ3_BLOOM_SEQ / KZ3_MOTION_BLUR_SEQ = "T:V,T:V,..." switch the strength to V (0..100) from T seconds
  * after the process start (the pad script's clock), so one run, with the game paused, shows one frozen frame at several
  * strengths. Only read when set; the rows and the ini are not touched. */
@@ -879,6 +889,7 @@ static void kz3_display_load(void)
     printf("[display] motion blur %s%s, bloom %d%s, fps limit %s%s\n", mbe >= 0 ? (mbe ? "on" : "OFF (diagnostic: garbles the picture)") : "always on (no row)", mbe >= 0 ? " (KZ3_MOTION_BLUR)" : "",
            (int)s_bloom_eff, ble >= 0 ? " (KZ3_BLOOM)" : "",
            rsx_dm_fps_name((int)s_fps_eff), fpe > 0 ? " (KZ3_FPS_LIMIT)" : "");
+    kz3_log_fps_limit();   /* [pace] line: the limit in force at start (KZ3_FPS_LIMIT included) */
     rsx_live_draw_set_hud169(s_h169_saved);   /* patch 2113; KZ3_HUD_169 wins for one run (rsx_live_draw.c) */
     {   /* patch 2126 */
         e = getenv("KZ3_UNFOCUSED");
@@ -1505,6 +1516,7 @@ static void kz3_kb_set(ppu_context* ctx)
                 InterlockedExchange(&s_fps_eff, v);
                 s_fps_saved = v;
                 kz3_display_save_extra();
+                kz3_log_fps_limit();   /* one line per row change */
             }
             snprintf(s_kb_reply, sizeof s_kb_reply, "%s", rsx_dm_fps_name((int)s_fps_eff));
             s_kb_pending = 1;
@@ -2138,6 +2150,13 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
                                                                 (s_mb_override ? RSX_DM_GUM_MBLUR : 0u) |   /* 2107 */
                                                                 (s_bloom_override ? RSX_DM_GUM_BLOOM : 0u) |   /* 2121 */
                                                                 (s_fov_ok ? RSX_DM_GUM_FOV : 0u));          /* 2109 */
+                /* patch 2151 (rsx_menu_cols.h): a label column wide enough for the language's longest Display label */
+                int mw = 0, mo = 0;
+                if (pg && rsx_mc_lookup(kz3_tr_lang(), &mw, &mo)) {
+                    size_t cn = 0;
+                    char* cg = rsx_mc_apply(pg, pn, &cn, mw, mo);
+                    if (cg) { free(pg); pg = cg; pn = cn; printf("[kb-page] %s: label column %d/%d for language %d\n", key.c_str(), mw, mo, kz3_tr_lang()); }
+                }
                 if (pg) { patched.assign(pg, pn); free(pg); added = 1; }
             } else
                 patched = text.empty() ? text : link == 5 ? kz3_exit_rows(text, &added)

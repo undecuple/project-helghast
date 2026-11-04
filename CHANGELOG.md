@@ -5,6 +5,21 @@ project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEA
 
 ## [Unreleased]
 
+### Added
+- The launcher creates `display.ini` (every display setting at its default) and `online.ini` (every key commented out, the game stays offline) in the settings folder at the first start when they are missing; an existing file is never changed.
+
+### Changed
+- The 3-bone vertex skinning of the animation SPU job runs as native code by default with the 1.14 update (`KZ3_NATIVE_JOB_SKIN=0` runs the original job code). Its output matched the original job bit for bit on recorded jobs, and in a toggled test in Frozen Shores each call took about a quarter less time.
+- The Options > Display page keeps labels and values apart in languages with long labels: the value column is placed per language and stays one straight column, and a few rows added by the port use shorter labels. Checked on screen in Spanish, German, French, Italian and Russian; the other languages by measuring the text.
+- The frame rate limit's tooltip on the Options > Display page now says the limit applies in missions, while menus and videos stay at 30.
+- The log names the frame rate limit in force and its pacing tick (`[pace]` line) at the start and whenever the limit changes.
+
+### Fixed
+- After a language change, the menu pages the port rewrites (the Options pages) are no longer read back from the disk cache in the previous language, where they could show old text or fail to open.
+- If the graphics driver cannot hand over the window's image for a frame, that frame is skipped and the window is resized again at the next one, instead of drawing into nothing.
+- A DLC package without its licence key is skipped with one short line in the log.
+- With FSR 1 upscaling on (`RSX_UPSCALE=fsr1`), a change of window size or resolution no longer leaves the upscaler working at the old size (from the Killzone 2 port).
+
 ### Removed
 - The opt-in crash report upload (installer Advanced page option and the "Crash reports on or off" Start-menu entry). Nothing is sent after a crash any more; the game's own crash files and minidump stay on your PC.
 

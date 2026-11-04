@@ -11,6 +11,7 @@
  *   Prints `R <what> equal=<n> differ=<n> declined=<n> lifted_nr=<n>` and the first difference.
  */
 #define main jdh_main
+#include <math.h>
 #include <time.h>
 #include "job_diff_harness.c"
 #undef main
@@ -26,6 +27,8 @@ static const kz3_native_entry* find_entry(int slot)
         if (kz3_native_dof[i].slot == slot) return &kz3_native_dof[i];
     for (unsigned i = 0; i < kz3_native_lp_n; i++)
         if (kz3_native_lp[i].slot == slot) return &kz3_native_lp[i];
+    for (unsigned i = 0; i < kz3_native_skin_n; i++)
+        if (kz3_native_skin[i].slot == slot) return &kz3_native_skin[i];
     return NULL;
 }
 
@@ -135,6 +138,67 @@ static void synth(spu_context* c, const char* kind, int variant)
         c->gpr[6] = spu_splat_u32(rowb);
         c->gpr[7] = spu_splat_u32(pitch);
         c->gpr[8] = spu_splat_u32(n);
+    }
+    if (!strcmp(kind, "skin")) {
+        /* pass 141: r3 out (32 B per vertex), r4/r5 float4 streams, r6 record base (unaligned, records at r6 + 6 +
+         * k r10), r7/r8 bone palettes (64 B per bone), r9 n, r10 stride. variant % 4 == 0 keeps setup()'s random bits
+         * (NaN/Inf/denormal patterns through the helpers), else realistic data: rotations-ish 3x3 in [-1, 1],
+         * translations in [-50, 50], positions [-2, 2], normals [-1, 1], weights with b0 + b1 <= 255 (some 255/0),
+         * palette 2 = palette 1 (motion 0), a small offset (half under/normal range) or a large one (half clamp).
+         * variant % 7 == 3: another stride; % 9 == 0: n 1..4; NATIVE_DIFF_N=<n> fixes n and realistic data (timing at a real size);
+         * % 23 == 11: out over stream B (the kernel declines, the lifted code runs). */
+        const uint32_t n = getenv("NATIVE_DIFF_N") ? (uint32_t)atoi(getenv("NATIVE_DIFF_N")) : variant % 9 == 0 ? 1 + rnd() % 4 : 1 + rnd() % 256;
+        static const uint32_t strides[] = {16, 24, 32, 20};
+        const uint32_t st = variant % 7 == 3 ? strides[rnd() % 4] : 20, nb = 1 + rnd() % 256;
+        const uint32_t out = area, sa = area + 0x4000, sb = area + 0x6000, recb = area + 0x8000 + (rnd() & 15),
+                       p1 = area + 0xC000, p2 = area + 0x10000;
+        const int real = getenv("NATIVE_DIFF_N") || variant % 4; /* timing: realistic data only */
+        if (real) {
+            const int pm = variant % 3; /* palette 2: 0 same, 1 small offset, 2 large */
+            /* variant % 5 == 4: bones and streams scaled by 2^-0..2^-33 each (around the kernel's exponent bound) */
+            const float sM = variant % 5 == 4 ? ldexpf(1.0f, -(int)(rnd() % 34)) : 1.0f, sA = variant % 5 == 4 ? ldexpf(1.0f, -(int)(rnd() % 34)) : 1.0f;
+            for (uint32_t b = 0; b < nb; b++)
+                for (int r = 0; r < 4; r++)
+                    for (int c = 0; c < 4; c++) {
+                        float f = sM * (r < 3 ? ((float)(rnd() % 20001) / 10000.0f - 1.0f) : c < 3 ? ((float)(rnd() % 100001) / 1000.0f - 50.0f) : 1.0f);
+                        if (r < 3 && c == 3) f = 0.0f;
+                        uint32_t v;
+                        memcpy(&v, &f, 4);
+                        wbe32(ls, p1 + 64 * b + 16 * r + 4 * c, v);
+                        float g = f;
+                        if (pm == 1) g = f + (float)((int)(rnd() % 2001) - 1000) * 1e-7f;
+                        if (pm == 2 && r == 3 && c < 3) g = f + (float)((int)(rnd() % 2001) - 1000) * 100.0f;
+                        memcpy(&v, &g, 4);
+                        wbe32(ls, p2 + 64 * b + 16 * r + 4 * c, v);
+                    }
+            for (uint32_t k = 0; k < n + 1; k++)
+                for (int c = 0; c < 4; c++) {
+                    float a = sA * (c < 3 ? (float)(rnd() % 40001) / 10000.0f - 2.0f : 1.0f), b = sA * (c < 3 ? (float)(rnd() % 20001) / 10000.0f - 1.0f : 0.0f);
+                    uint32_t v;
+                    memcpy(&v, &a, 4);
+                    wbe32(ls, sa + 16 * k + 4 * c, v);
+                    memcpy(&v, &b, 4);
+                    wbe32(ls, sb + 16 * k + 4 * c, v);
+                }
+        }
+        for (uint32_t k = 0; k < n + 1; k++) {
+            uint8_t* q = ls + recb + 6 + k * st;
+            if (real) {
+                const uint32_t m = rnd() % 8;
+                q[0] = m == 0 ? 255 : (uint8_t)rnd();
+                q[1] = m == 0 ? 0 : (uint8_t)(rnd() % (256 - q[0]));
+            }
+            for (int b = 5; b < 8; b++) q[b] = (uint8_t)(rnd() % nb);
+        }
+        c->gpr[3] = spu_splat_u32(variant % 23 == 11 ? sb : out);
+        c->gpr[4] = spu_splat_u32(sa);
+        c->gpr[5] = spu_splat_u32(sb);
+        c->gpr[6] = spu_splat_u32(recb);
+        c->gpr[7] = spu_splat_u32(p1);
+        c->gpr[8] = spu_splat_u32(p2);
+        c->gpr[9] = spu_splat_u32(n);
+        c->gpr[10] = spu_splat_u32(st);
+        return;
     }
     if (!strcmp(kind, "mb_blur")) {
         /* r3 dst RGBA8, r4 float4 pixel 0 of the row (interior of a 14-row padded scratch: 6 rows above, 7 below, 6 + 6
@@ -499,7 +563,7 @@ int main(int argc, char** argv)
                 if (dn < bn) bn = dn;
             }
             if (bl > 0 && bn > 0) {
-                const double px = sv.gpr[7]._u32[0];
+                const double px = !strcmp(e->kind, "skin") ? sv.gpr[9]._u32[0] : sv.gpr[7]._u32[0];   /* per vertex (skin) or pixel */
                 g_tl += bl; g_tn += bn; g_tpx += px; g_tcalls++;
             }
         }
