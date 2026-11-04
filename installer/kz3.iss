@@ -38,7 +38,7 @@
 ; site's palette and fonts; our own artwork); native controls, no skin add-on. Texts in the site's voice: short, direct.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.8"
+  #define AppVersion "0.1.9"
 #endif
 #ifndef Payload
   ; ASSUMPTION: where the payload assembly will put the tree

@@ -3,7 +3,7 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
-## [Unreleased]
+## [0.1.9] - 2026-11-04 (pre-release)
 
 ### Added
 - The launcher creates `display.ini` (every display setting at its default) and `online.ini` (every key commented out, the game stays offline) in the settings folder at the first start when they are missing; an existing file is never changed.

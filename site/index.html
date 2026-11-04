@@ -22,7 +22,7 @@
 <p class="what">A Windows x64 port of the 2011 PS3 game, made by static recompilation: the game&#x27;s PowerPC and SPU code is translated to C ahead of time and compiled into a native PC program, so no CPU emulator runs at play time. The GPU is still translated as it runs (RSX to Direct3D 12); native replacements come step by step.</p>
 <p class="headline">Status: <strong>Partly playable</strong></p>
 <p class="note">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>
-<p class="note">v0.1.8 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
+<p class="note">v0.1.9 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
 <p class="btns"><a class="btn" href="#status">See the status</a><a class="btn alt" href="https://github.com/undecuple/project-helghast">Source on GitHub</a></p>
 </div>
 </header>
@@ -328,14 +328,14 @@
 <section id="changelog" class="promo term">
 <h2>Changelog</h2>
 <ul class="clog">
-<li><time datetime="2026-11-03">11-03</time><span>The main menu shows the port&#x27;s name and version at the bottom right (&quot;Project Helghast&quot;, then the version)...</span></li>
-<li><time datetime="2026-11-03">11-03</time><span>The upsample and depth-of-field passes of the post-processing SPU jobs run as native code by default with...</span></li>
-<li><time datetime="2026-11-03">11-03</time><span>The renderer&#x27;s vertex-reference step uses a faster path by default (`LD_REFS_FAST=0` switches it off). Its...</span></li>
-<li><time datetime="2026-11-03">11-03</time><span>The renderer runs the game&#x27;s unscaled image copies a row at a time instead of a pixel at a time by default...</span></li>
-<li><time datetime="2026-11-03">11-03</time><span>The launcher log, the setup&#x27;s kept log, the game log and the crash report keep no personal path. Your...</span></li>
-<li><time datetime="2026-11-03">11-03</time><span>The saved pipeline list (`pso_keys.bin`) carries a header that names its layout. A list written by an older...</span></li>
-<li><time datetime="2026-11-03">11-03</time><span>When the update folder is wrong or incomplete, a start without the saved game inputs now says what is wrong...</span></li>
-<li><time datetime="2026-11-03">11-03</time><span>`paths.json` and `kz3.ini` are written in one step, so an interrupted write cannot leave half a file; a...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The launcher creates `display.ini` (every display setting at its default) and `online.ini` (every key...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The 3-bone vertex skinning of the animation SPU job runs as native code by default with the 1.14 update...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The Options &gt; Display page keeps labels and values apart in languages with long labels: the value column is...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The frame rate limit&#x27;s tooltip on the Options &gt; Display page now says the limit applies in missions, while...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The log names the frame rate limit in force and its pacing tick (`[pace]` line) at the start and whenever...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>After a language change, the menu pages the port rewrites (the Options pages) are no longer read back from...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>If the graphics driver cannot hand over the window&#x27;s image for a frame, that frame is skipped and the window...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>A DLC package without its licence key is skipped with one short line in the log.</span></li>
 </ul>
 <p class="small">Newest first; the full list is in <a href="https://github.com/undecuple/project-helghast/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
 </section>
@@ -369,8 +369,8 @@
 </section>
 <section id="install" class="promo">
 <h2>Install</h2>
-<p class="headline"><strong>v0.1.8 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
-<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.8">v0.1.8</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10 minutes on a fast PC, longer on slower ones. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
+<p class="headline"><strong>v0.1.9 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
+<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.9">v0.1.9</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10 minutes on a fast PC, longer on slower ones. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
 <p>You can also build the port from source: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md">building</a>.</p>
 <h3>What goes online</h3>
 <p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/PRIVACY.md">privacy page</a>.</p>

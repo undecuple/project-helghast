@@ -13,7 +13,7 @@
 
 A native PC port of Killzone 3, made by static recompilation on ps3recomp; you need your own US disc (BCUS98234) dump and the 1.14 update. It is not an emulator and not a rewrite ([how it works](docs/HOW-IT-WORKS.md)).
 
-**Status: partly playable.** Version <!-- version -->0.1.8<!-- /version -->, a pre-release: levels load and play at about 16-22 frames/s (target 30) with known bugs, and the campaign has not been played start to finish. Details: [docs/STATUS.md](docs/STATUS.md); what a release must meet to be called playable: [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
+**Status: partly playable.** Version <!-- version -->0.1.9<!-- /version -->, a pre-release: levels load and play at about 16-22 frames/s (target 30) with known bugs, and the campaign has not been played start to finish. Details: [docs/STATUS.md](docs/STATUS.md); what a release must meet to be called playable: [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 [Download](#download-and-install) · [Compatibility](#compatibility) · [Building](#building) · [Known issues](#settings-and-known-issues) · [Reporting bugs](#reporting-bugs)
 
@@ -45,7 +45,7 @@ A native PC port of Killzone 3, made by static recompilation on ps3recomp; you n
 What each must contain: [docs/GETTING-FILES.md](docs/GETTING-FILES.md); regions, hardware and the rest: [docs/requirements.md](docs/requirements.md). This project ships none of them and gives no decryption steps.
 
 **Steps**
-1. Download the Windows installer (recommended) or the portable zip from <!-- version -->[v0.1.8](https://github.com/undecuple/project-helghast/releases/tag/v0.1.8)<!-- /version --> on the [releases page](https://github.com/undecuple/project-helghast/releases) (a pre-release) and check it against `SHA256SUMS`.
+1. Download the Windows installer (recommended) or the portable zip from <!-- version -->[v0.1.9](https://github.com/undecuple/project-helghast/releases/tag/v0.1.9)<!-- /version --> on the [releases page](https://github.com/undecuple/project-helghast/releases) (a pre-release) and check it against `SHA256SUMS`.
 2. Run it and point it at your disc dump, the 1.14 update and the decrypted EBOOT.
 3. It lifts and compiles the game's code on your machine (about 10 minutes on a fast PC); no game code, assets or keys are shipped or downloaded.
 4. Start the game with `Project Helghast.exe` or its shortcuts. With the portable zip, run `run.cmd` once first: it does steps 2 and 3. Never start `kz3.exe` directly.
