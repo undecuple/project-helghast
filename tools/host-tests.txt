@@ -105,6 +105,7 @@ tools/spu/test_spu_lscold.sh
 tools/spu/test_spu_shufh.sh
 tools/smoke/test_tex_lru.sh
 tools/release/test_stage_sdl3.py
+tools/release/test_stage_xess.py
 tools/spu/test_lr_lastcheck.sh
 tools/spu/test_lang_layer.py
 tools/spu/test_r88_pr_tests.sh

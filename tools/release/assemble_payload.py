@@ -3,8 +3,8 @@
 a scrub and a manifest. Standard library only, Python 3.8+.
 
     assemble_payload.py --out DIR [--repo DIR] [--replace] [--version X.Y.Z] [--launcher EXE] [--toolchain CACHE]
-                        [--fonts DIR]
-    assemble_payload.py --dry-run [--repo DIR] [--toolchain CACHE] [--fonts DIR]
+                        [--fonts DIR] [--sdl3 DIR] [--xess DIR]
+    assemble_payload.py --dry-run [--repo DIR] [--toolchain CACHE] [--fonts DIR] [--sdl3 DIR] [--xess DIR]
 
 What goes in (the allowlist, RULES below; nothing else is ever copied):
   kz3-setup/      tools/release/{firstrun,firstrun_check,iso9660,version_check,crash_report,launch,lift_fixups,names}.py, eboot_sha256.json, psarc_sha256.json and the lift tools
@@ -22,6 +22,8 @@ What goes in (the allowlist, RULES below; nothing else is ever copied):
                   against its SHA-256 pinned in installer/art/art.json, and their OFL text as licenses/Rajdhani-OFL.txt.
                   firstrun.py and the launcher copy them to build/fonts/, next to kz3.exe: the runtime's error notice
                   loads them privately from <exe dir>/fonts (RSX pass 38). Missing or changed fonts refuse the payload.
+  runtime/        SDL3.dll and Intel's unmodified libxess.dll from their validated staging folders. The XeSS runtime,
+                  Intel licence, and third-party notices must match the pinned SDK 3.0.2 files exactly.
   Project Helghast.exe  with --launcher EXE: the launcher built by tools/release/build_launcher.sh (pass 4)
   README.md, NOTICE.md (from public/), run.cmd (installer/run.cmd, the portable zip's entry; the Inno script
                   excludes it)
@@ -122,6 +124,17 @@ FONT_LICENSE = ("OFL-rajdhani.txt", "licenses/Rajdhani-OFL.txt")   # installer_a
 SDL3_DEST = ("runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt")   # payload names: the DLL (firstrun.place_sdl3 copies it next to
 SDL3_SRC = ("SDL3.dll", "LICENSE.txt")                          # kz3.exe) and SDL's zlib licence; names inside --sdl3 DIR
 SDL3_MAX_BYTES = 16 << 20                                       # a DLL is exempt from the 2 MiB binary cap, not from this one
+XESS_DEST = (
+    "runtime/libxess.dll",
+    "licenses/Intel-XeSS-LICENSE.txt",
+    "licenses/Intel-XeSS-THIRD-PARTY-NOTICES.txt",
+)
+XESS_SRC = ("libxess.dll", "LICENSE.txt", "third-party-programs.txt")
+XESS_PINS = {
+    XESS_DEST[0]: (77795704, "251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7"),
+    XESS_DEST[1]: (4194, "784be42c39a4a4d03cf85d88e15e59d75828fca773ce45b8dbfffbd7eaf208df"),
+    XESS_DEST[2]: (35788, "e8d8899dbfc4de0e8ca25560be9358e03c1405d7c956d20a1838c3c709b9b51c"),
+}
 LAUNCHER = rnames.LAUNCHER_EXE   # --launcher: built from installer/launcher/launcher.c (pass 4), scrubbed like the rest
 TEMPLATE_SRC = "installer/pso-template.bin"   # optional release input: the shared pipeline template (RSX pass 67)
 TEMPLATE_DEST = "pso-template.bin"            # payload root; the launcher sets LD_PSO_TEMPLATE to it when present
@@ -137,8 +150,12 @@ def is_template(rel):
     return rel == TEMPLATE_DEST
 
 
-def is_sdl3(rel):
-    return rel == SDL3_DEST[0]
+def runtime_dll_limits(rel):
+    if rel == SDL3_DEST[0]:
+        return "SDL3", SDL3_MAX_BYTES, ""
+    if rel == XESS_DEST[0]:
+        return "Intel XeSS", XESS_PINS[rel][0], XESS_PINS[rel][1]
+    return None
 
 
 def pe_x64_problem(path):
@@ -158,11 +175,29 @@ def pe_x64_problem(path):
 
 
 def scrub_ship(path, rel):
-    """-> problems for one payload file: the template and SDL3.dll get their own gates, everything else scrub_file."""
-    if is_sdl3(rel):
+    """Return problems for one payload file. Runtime binaries and the template have component-specific gates."""
+    dll = runtime_dll_limits(rel)
+    if dll:
+        name, size_limit, exact_hash = dll
         size = os.path.getsize(path)
         bad = pe_x64_problem(path)
-        return ([bad] if bad else []) + ([f"{size} bytes exceeds the SDL3 cap {SDL3_MAX_BYTES}"] if size > SDL3_MAX_BYTES else [])
+        problems = [bad] if bad else []
+        if exact_hash:
+            if size != size_limit:
+                problems.append(f"{size} bytes, expected {size_limit} for the pinned {name} runtime")
+            if sha256(path) != exact_hash:
+                problems.append(f"SHA-256 differs from the pinned {name} runtime ({exact_hash})")
+        elif size > size_limit:
+            problems.append(f"{size} bytes exceeds the {name} cap {size_limit}")
+        return problems
+    if rel in XESS_PINS:
+        size, digest = XESS_PINS[rel]
+        problems = []
+        if os.path.getsize(path) != size:
+            problems.append(f"{os.path.getsize(path)} bytes, expected {size} for the pinned Intel XeSS SDK file")
+        if sha256(path) != digest:
+            problems.append(f"SHA-256 differs from the pinned Intel XeSS SDK file ({digest})")
+        return problems
     if is_template(rel):
         size = os.path.getsize(path)
         return [f"{size} bytes exceeds the template cap {TEMPLATE_MAX_BYTES}"] if size > TEMPLATE_MAX_BYTES else []
@@ -325,6 +360,18 @@ def collect_sdl3(sdl3_dir):
             files.append((dest, p))
         else:
             bad.append(f"{p} (SDL3 for the pads; run tools/release/stage_sdl3.py in `nix develop .#win`)")
+    return files, bad
+
+
+def collect_xess(xess_dir):
+    """Return the pinned XeSS-SR runtime, Intel licence, and required third-party notices."""
+    files, bad = [], []
+    for want, dest in zip(XESS_SRC, XESS_DEST):
+        p = os.path.join(xess_dir, want)
+        if os.path.isfile(p) and not os.path.islink(p):
+            files.append((dest, p))
+        else:
+            bad.append(f"{p} (XeSS-SR; run tools/release/stage_xess.py)")
     return files, bad
 
 
@@ -502,13 +549,16 @@ def main(argv=None, out=sys.stdout):
     ap.add_argument("--toolchain-manifest", default="", help=argparse.SUPPRESS)
     ap.add_argument("--template", default="", help=f"the shared pipeline template (default {TEMPLATE_SRC} when present)")
     ap.add_argument("--sdl3", default="", help="stage_sdl3.py's folder, SDL3.dll + LICENSE.txt (default work/release/sdl3)")
+    ap.add_argument("--xess", default="", help="stage_xess.py's folder (default work/release/xess)")
     ap.add_argument("--fonts", default="", help="installer_art.py --fetch-fonts' folder (default work/release/fonts)")
     a = ap.parse_args(argv)
     repo = os.path.abspath(a.repo)
     files, missing = collect(repo)
     ffiles, fmissing = collect_fonts(repo, os.path.abspath(a.fonts or os.path.join(repo, "work", "release", "fonts")))
     sfiles, smissing = collect_sdl3(os.path.abspath(a.sdl3 or os.path.join(repo, "work", "release", "sdl3")))
-    files, missing = sorted(files + ffiles + sfiles), missing + fmissing + smissing
+    xfiles, xmissing = collect_xess(
+        os.path.abspath(a.xess or os.path.join(repo, "work", "release", "xess")))
+    files, missing = sorted(files + ffiles + sfiles + xfiles), missing + fmissing + smissing + xmissing
     if a.launcher:
         if os.path.isfile(a.launcher):
             files = sorted(files + [(LAUNCHER, os.path.abspath(a.launcher))])

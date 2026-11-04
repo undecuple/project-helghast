@@ -66,6 +66,23 @@ def payload(tmp):
     pe[:2], pe[60:64] = b"MZ", (64).to_bytes(4, "little")      # a minimal 64-bit PE DLL header (assemble_payload.pe_x64_problem)
     put(root, "runtime/SDL3.dll", bytes(pe) + bytes(3 << 20))  # a real SDL3.dll is ~5 MB: over the 2 MiB binary cap
     put(root, "licenses/SDL3-LICENSE.txt", "Copyright (C) 1997-2026 Sam Lantinga\n")
+    xess = bytes(pe) + bytes(4096)
+    xess_license = b"Intel XeSS software license\n"
+    xess_notices = b"Intel XeSS third-party programs\n"
+    put(root, "runtime/libxess.dll", xess)
+    put(root, "licenses/Intel-XeSS-LICENSE.txt", xess_license)
+    put(root, "licenses/Intel-XeSS-THIRD-PARTY-NOTICES.txt", xess_notices)
+    pz.ap_mod.XESS_PINS = {
+        pz.ap_mod.XESS_DEST[0]: (len(xess), hashlib.sha256(xess).hexdigest()),
+        pz.ap_mod.XESS_DEST[1]: (
+            len(xess_license),
+            hashlib.sha256(xess_license).hexdigest(),
+        ),
+        pz.ap_mod.XESS_DEST[2]: (
+            len(xess_notices),
+            hashlib.sha256(xess_notices).hexdigest(),
+        ),
+    }
     manifest(root)
     return root
 
@@ -92,10 +109,20 @@ def main():
             names = [i.filename for i in infos]
             same = all(z.read(f"Project Helghast/{rel}") == open(p, "rb").read() for rel, p in pz.walk(root))
         check(names == sorted(names) and all(n.startswith("Project Helghast/") for n in names)
-              and len(names) == 13 and "Project Helghast/manifest.json" in names, "sorted entries under the top folder",
+              and len(names) == 16 and "Project Helghast/manifest.json" in names, "sorted entries under the top folder",
               names)
         check({"Project Helghast/runtime/SDL3.dll", "Project Helghast/licenses/SDL3-LICENSE.txt"} <= set(names),
               "SDL3.dll and its licence are in the zip", names)
+        check(
+            {
+                "Project Helghast/runtime/libxess.dll",
+                "Project Helghast/licenses/Intel-XeSS-LICENSE.txt",
+                "Project Helghast/licenses/Intel-XeSS-THIRD-PARTY-NOTICES.txt",
+            }
+            <= set(names),
+            "XeSS runtime, licence, and notices are in the zip",
+            names,
+        )
         check("Project Helghast/lang/port_ui.tsv" in names, "the port UI text table is in the zip", names)
         check({"Project Helghast/fonts/Rajdhani-Medium.ttf", "Project Helghast/fonts/Rajdhani-Bold.ttf",
                "Project Helghast/licenses/Rajdhani-OFL.txt"} <= set(names), "the notice fonts and their OFL text are in the zip",
@@ -131,6 +158,12 @@ def main():
                 "licenses/Rajdhani-OFL.txt: missing", remanifest=True)
         refused("no SDL3.dll", lambda r: os.remove(os.path.join(r, "runtime", "SDL3.dll")),
                 "runtime/SDL3.dll: missing", remanifest=True)
+        refused(
+            "no XeSS runtime",
+            lambda r: os.remove(os.path.join(r, "runtime", "libxess.dll")),
+            "runtime/libxess.dll: missing",
+            remanifest=True,
+        )
         refused("game name", lambda r: put(r, "port/EBOOT.BIN", "x\n"), "game-data name", remanifest=True)
         refused("ELF magic", lambda r: put(r, "port/blob.bin", b"\x7fELF" + bytes(10)), "ELF binary",
                 remanifest=True)

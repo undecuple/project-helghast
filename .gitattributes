@@ -3,3 +3,6 @@
 *.png binary
 *.patch -text linguist-generated=true
 re/data/*.tsv linguist-generated=true
+# Intel's licence texts are kept byte-identical to the XeSS SDK 3.0.2 files (CRLF), which assemble_payload.py pins.
+licenses/Intel-XeSS-LICENSE.txt -text -whitespace
+licenses/Intel-XeSS-THIRD-PARTY-NOTICES.txt -text -whitespace
