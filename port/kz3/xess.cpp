@@ -1302,6 +1302,7 @@ extern "C" void kz3_xess_note_camera(
             "(the reprojection expects +1)\n",
             static_cast<double>(kz3_xess_pose_handedness(pose)));
     }
+    const uint64_t filled_before = g_camera.bridge.filled_flips;
     kz3_xess_bridge_note_camera(
         &g_camera.bridge,
         guest_flip,
@@ -1309,6 +1310,16 @@ extern "C" void kz3_xess_note_camera(
         pose,
         horizontal_fov,
         vertical_fov);
+    const uint64_t filled = g_camera.bridge.filled_flips;
+    if (filled != filled_before && (filled <= 4u || filled % 100u == 0u)) {
+        fprintf(
+            stderr,
+            "[xess] guest flip %llu: no camera was published for flip %llu; "
+            "it is held at the previous camera (%llu so far)\n",
+            static_cast<unsigned long long>(guest_flip),
+            static_cast<unsigned long long>(guest_flip - 1u),
+            static_cast<unsigned long long>(filled));
+    }
 }
 
 extern "C" void kz3_xess_note_camera_planes(

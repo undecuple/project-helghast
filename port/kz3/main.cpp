@@ -3011,11 +3011,14 @@ static void kz3_cam_vf17_hud(ppu_context* ctx)   /* Camera::vf17 0x00329D80 (1.0
         }
     }
 #if defined(KZ3_XESS)
-    /* ASSUMPTION: words 1 and 2 of the vf17 result are near and far, read from the observed values, not the code. */
+    /* ASSUMPTION: words 1 and 2 of the vf17 result are near and far, read from the observed values, not the code.
+     * Filed under the flip read at this frame's camera hook (kz3_cam_fov runs first), not a fresh read of the counter:
+     * another thread advances it, and a tick in between filed camera and planes under different flips, so that frame's
+     * camera was never published (seen in gameplay as a history reset about twice a second). */
     if (lr == s_xess_projection_lr &&
         out >= 0x10000u && out < 0xF0000000u) {
         kz3_xess_note_camera_planes(
-            cellGcm_flip_request_count(),
+            s_xess_camera_flip,
             kz3_bef(out + 4),
             kz3_bef(out + 8));
     }

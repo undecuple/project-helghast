@@ -45,6 +45,7 @@ typedef struct kz3_xess_camera_bridge {
     float far_plane;
     int have_planes;
     int planes_ambiguous;
+    uint64_t filled_flips;   /* single flips with no published camera, held at the previous one (see note_camera) */
 } kz3_xess_camera_bridge;
 
 /* ASSUMPTION: experimental adapter policy, not constants recovered from the game. */
@@ -163,10 +164,29 @@ static inline void kz3_xess_bridge_note_camera(
     next.flags = KZ3_XESS_CAMERA_CURRENT_VALID | KZ3_XESS_CAMERA_RESET;
 
     const kz3_xess_camera_state* state = &bridge->state;
-    if ((state->flags & KZ3_XESS_CAMERA_CURRENT_VALID) &&
-        state->guest_flip + 1u == guest_flip &&
+    const int continuous =
+        (state->flags & KZ3_XESS_CAMERA_CURRENT_VALID) &&
         state->view_id == view_id &&
-        !(state->flags & KZ3_XESS_CAMERA_MULTIPLE_VIEWS)) {
+        !(state->flags & KZ3_XESS_CAMERA_MULTIPLE_VIEWS);
+    /* The guest flip is the flip-request counter read at the camera hook, and another thread advances it: now and then
+     * it moves twice between two camera updates, so one flip never gets a camera. The renderer would then miss that
+     * flip, take a later camera, and reset history for it and the next frame (a visible shudder about twice a second
+     * in gameplay, paused or not). Fill that one flip as a hold of the previous camera (no motion) and continue from it,
+     * so the renderer sees an unbroken sequence. ASSUMPTION: the camera did not move in the unpublished flip; any real
+     * motion lands in the next flip's delta. A larger gap still resets. */
+    if (continuous && state->guest_flip + 2u == guest_flip) {
+        kz3_xess_camera_state hold = *state;
+        hold.guest_flip = guest_flip - 1u;
+        memcpy(hold.previous_pose, hold.current_pose, sizeof(hold.previous_pose));
+        hold.previous_horizontal_fov = hold.current_horizontal_fov;
+        hold.previous_vertical_fov = hold.current_vertical_fov;
+        hold.flags |= KZ3_XESS_CAMERA_PREVIOUS_VALID;
+        hold.flags &= ~(uint32_t)KZ3_XESS_CAMERA_RESET;
+        bridge->ring[hold.guest_flip % KZ3_XESS_CAMERA_RING] = hold;
+        bridge->filled_flips++;
+    }
+    if (continuous &&
+        (state->guest_flip + 1u == guest_flip || state->guest_flip + 2u == guest_flip)) {
         memcpy(
             next.previous_pose,
             state->current_pose,

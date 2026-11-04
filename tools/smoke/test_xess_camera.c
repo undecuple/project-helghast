@@ -80,6 +80,50 @@ static void test_publication(void)
     check("an older flip is ignored", bridge.state.current_pose[12] == 1.0f);
 }
 
+/* The flip counter is advanced by another thread, so it can move twice between two camera updates. Seen in gameplay:
+ * cameras for ..., 1510, 1512, ... and nothing for 1511. The renderer asks for 1511 and must find a coherent state. */
+static void test_single_skipped_flip(void)
+{
+    kz3_xess_camera_bridge bridge;
+    kz3_xess_camera_state found;
+    memset(&bridge, 0, sizeof(bridge));
+
+    note(&bridge, 1510, 1, 0.0f);
+    kz3_xess_bridge_note_planes(&bridge, 1510, 0.2f, 2048.0f);
+    note(&bridge, 1512, 1, 0.5f);
+    kz3_xess_bridge_note_planes(&bridge, 1512, 0.2f, 2048.0f);
+    check(
+        "a single skipped flip is filled as a hold of the previous camera",
+        kz3_xess_bridge_find(&bridge, 1511, &found) &&
+            found.guest_flip == 1511 &&
+            (found.flags & KZ3_XESS_CAMERA_PREVIOUS_VALID) &&
+            (found.flags & KZ3_XESS_CAMERA_PLANES_VALID) &&
+            !(found.flags & KZ3_XESS_CAMERA_RESET) &&
+            found.current_pose[12] == 0.0f && found.previous_pose[12] == 0.0f &&
+            bridge.filled_flips == 1);
+    check(
+        "the flip after it continues from the held camera without a reset",
+        kz3_xess_bridge_find(&bridge, 1512, &found) &&
+            (found.flags & KZ3_XESS_CAMERA_PREVIOUS_VALID) &&
+            !(found.flags & KZ3_XESS_CAMERA_RESET) &&
+            found.previous_pose[12] == 0.0f && found.current_pose[12] == 0.5f);
+
+    note(&bridge, 1515, 1, 1.0f);
+    kz3_xess_bridge_note_planes(&bridge, 1515, 0.2f, 2048.0f);
+    check(
+        "two skipped flips are not filled and reset",
+        !kz3_xess_bridge_find(&bridge, 1514, &found) &&
+            (bridge.state.flags & KZ3_XESS_CAMERA_RESET) && bridge.filled_flips == 1);
+
+    note(&bridge, 1516, 2, 1.0f);
+    kz3_xess_bridge_note_planes(&bridge, 1516, 0.2f, 2048.0f);
+    note(&bridge, 1518, 1, 1.0f);
+    kz3_xess_bridge_note_planes(&bridge, 1518, 0.2f, 2048.0f);
+    check(
+        "a skipped flip across a view change is not filled",
+        !kz3_xess_bridge_find(&bridge, 1517, &found) && bridge.filled_flips == 1);
+}
+
 static void test_resets(void)
 {
     kz3_xess_camera_bridge bridge;
@@ -252,6 +296,7 @@ static void test_pose(void)
 int main(void)
 {
     test_publication();
+    test_single_skipped_flip();
     test_resets();
     test_ring();
     test_pairing();

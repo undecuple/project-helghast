@@ -173,6 +173,15 @@ used. `[xess] camera pairing` log lines show the numbers, including `misses`, th
 show a constant extra lag,
 `KZ3_XESS_CAMERA_LAG` steps back by that many flips.
 
+The guest flip is the flip-request counter read at the camera hook, and another thread advances it. The projection
+planes are therefore filed under the flip read at the camera hook, not a fresh read: a tick in between used to file
+camera and planes under different flips, so that frame's camera was never published. The counter can also move twice
+between two camera updates, leaving one flip with no camera; the bridge fills that single flip as a hold of the
+previous camera (no motion) and the next flip continues from it, so the renderer sees an unbroken sequence
+(`[xess] ... held at the previous camera` in the log). A gap of two or more flips still resets history. Before this,
+both cases made the renderer take a later camera and reset history about twice a second, which showed as a shudder
+in gameplay and on the pause screen.
+
 Each dispatch then checks that the camera moved on by exactly one flip since the last dispatch. The same flip again
 means nothing moved, so the frame gets zero camera motion instead of repeating the old delta (`repeats` in the log). A
 skipped flip resets history (`jumps`).
@@ -375,10 +384,15 @@ On this series (v0.1.8 plus patches 2147 and 2148), on Windows with an NVIDIA RT
 applies to the pinned ps3recomp, the XeSS host tests above pass, and `tools/smoke/test_xess.ps1` (dispatch, mask and
 motion readback, re-init, temporal conventions, missing- and wrong-runtime fallback) passes.
 
-Gameplay was observed on earlier builds of the same code, natively on Windows with the hardware D3D12 path on an
-NVIDIA RTX 5070, a 1280x720 game image, a 1920x1080 Fit output and `KZ3_DISPLAY_FILTER=xess`. Those builds also
-carried unrelated, unsubmitted renderer experiments, so the figures below describe the XeSS path, not this exact
-series; a gameplay run of this series is still to be done. On 2026-10-31 the log showed:
+Gameplay on this series, 2026-11-03: a first-run build (game 1.14, bundled clang) run natively on Windows with the
+hardware D3D12 path on an NVIDIA RTX 5070, a 1280x720 game image, a 1920x1080 Fit output, `KZ3_DISPLAY_FILTER=xess`
+and `KZ3_XESS_EXECUTE_JITTER_LAG=1`. Before the camera-pairing fix above, the log showed about 250 pairing misses and
+252 history resets in 3,600 dispatches, seen as a shudder about once a second, paused or not. With it: 0 misses, 0
+jumps, 1 reset (level start) in 3,600 dispatches, over 300 single skipped flips held, no fallback after the
+pre-scene frame, and the shudder gone. A finer whole-scene jitter remains, less visible than before.
+
+Earlier builds of the same code, which also carried unrelated, unsubmitted renderer experiments, were run in the same
+configuration without the lag. On 2026-10-31 the log showed:
 
 - XeSS-SR API 2.0.2 dispatching 1280x720 to 1920x1080, with the camera basis at the required handedness, `+1.000`;
 - normal dispatch with `responsive=generated`, `hud=masked` and mip bias `-0.586`;
