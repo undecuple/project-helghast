@@ -204,14 +204,17 @@ Alt+Enter writes it, and you can edit it while the game is closed:
 mode = windowed
 ; stretch (default): the picture fills the window; fit: the picture keeps its shape, with bars
 scaling = stretch
-; bilinear (default) or nearest
+; bilinear (default), nearest or xess (experimental XeSS-SR; larger same-aspect outputs only)
 filter = bilinear
 ; on (default) or off: off shows each frame as soon as it is ready, which can tear (Options > Display > VSync)
 vsync = on
 ```
 
-`KZ3_DISPLAY=windowed|borderless|fullscreen` sets the mode for one run without saving it. `KZ3_ASPECT=16:9` (or
-`off`) keeps the PS3's 16:9 view in gameplay instead of following the window's shape.
+`KZ3_DISPLAY=windowed|borderless|fullscreen` sets the mode for one run without saving it.
+`KZ3_DISPLAY_FILTER=bilinear|nearest|xess` similarly overrides the scaling filter. XeSS-SR is opt-in, uses the
+unmodified Intel runtime shipped beside the executable, and falls back to Bilinear if the output or temporal inputs
+are unsupported. Its architecture and current limitations are documented in [XESS.md](XESS.md).
+`KZ3_ASPECT=16:9` (or `off`) keeps the PS3's 16:9 view in gameplay instead of following the window's shape.
 
 ## Tests without the game
 

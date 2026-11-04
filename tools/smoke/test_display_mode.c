@@ -137,9 +137,20 @@ static void test_scaling(void)
     CHECK(RSX_DM_SCALING_DEFAULT == RSX_DM_STRETCH, "image scaling defaults to Stretch, Fit stays selectable");
     CHECK(rsx_dm_parse_scaling("fit") == RSX_DM_FIT && rsx_dm_parse_scaling(" Stretch ") == RSX_DM_STRETCH &&
               rsx_dm_parse_scaling("fill") < 0 && rsx_dm_parse_filter("bilinear") == RSX_DM_BILINEAR &&
-              rsx_dm_parse_filter("NEAREST") == RSX_DM_NEAREST && rsx_dm_parse_filter("fsr") < 0 &&
+              rsx_dm_parse_filter("NEAREST") == RSX_DM_NEAREST &&
+              rsx_dm_parse_filter("xess") == RSX_DM_XESS &&
+              rsx_dm_parse_filter("XeSS-SR") == RSX_DM_XESS &&
+              rsx_dm_parse_filter("fsr") < 0 &&
               rsx_dm_parse_scaling(NULL) < 0,
           "scaling/filter names");
+    CHECK(rsx_dm_spatial_upscaler_allowed(RSX_DM_BILINEAR) &&
+              rsx_dm_spatial_upscaler_allowed(RSX_DM_NEAREST) &&
+              !rsx_dm_spatial_upscaler_allowed(RSX_DM_XESS),
+          "XeSS selection bypasses spatial upscalers, including on fallback");
+    CHECK(rsx_dm_sample_filter(RSX_DM_BILINEAR) == RSX_DM_BILINEAR &&
+              rsx_dm_sample_filter(RSX_DM_NEAREST) == RSX_DM_NEAREST &&
+              rsx_dm_sample_filter(RSX_DM_XESS) == RSX_DM_BILINEAR,
+          "XeSS presentation uses the bilinear sampler without indexing past the two display pipelines");
     CHECK(rect_is(rsx_dm_rect_for(1280, 720, 1920, 1200, RSX_DM_STRETCH, RSX_DM_BILINEAR), 0, 0, 1920, 1200),
           "stretch: whole client");
     CHECK(rect_is(rsx_dm_rect_for(1280, 720, 1920, 1200, RSX_DM_FIT, RSX_DM_BILINEAR), 0, 60, 1920, 1080),
@@ -154,6 +165,8 @@ static void test_scaling(void)
           "nearest below 1x: plain fit");
     CHECK(rect_is(rsx_dm_rect_for(1280, 720, 1920, 1080, RSX_DM_STRETCH, RSX_DM_NEAREST), 0, 0, 1920, 1080),
           "stretch + nearest: whole client");
+    CHECK(rect_is(rsx_dm_rect_for(1280, 720, 1920, 1080, RSX_DM_STRETCH, RSX_DM_XESS), 0, 0, 1920, 1080),
+          "stretch + XeSS-SR: temporal output covers the client");
     {
         rsx_dm_rect r = rsx_dm_rect_for(1280, 720, 1600, 1200, RSX_DM_STRETCH, RSX_DM_BILINEAR);
         int gx, gy;
@@ -210,6 +223,7 @@ static void test_ini(void)
     CHECK(m == 3, "all three modes round-trip (with scaling and filter)");
     CHECK(rsx_dm_ini_scaling(buf) >= 0 && rsx_dm_ini_scaling("[display]\nmode = borderless\n") < 0 &&
               rsx_dm_ini_filter("[display]\nfilter = Point\n") == RSX_DM_NEAREST &&
+              rsx_dm_ini_filter("[display]\nfilter = xess\n") == RSX_DM_XESS &&
               rsx_dm_ini_scaling("[display]\nscaling=Stretch\r\n") == RSX_DM_STRETCH,
           "scaling/filter keys: missing = none, aliases, case");
     CHECK(n > 0 && rsx_dm_ini_vsync(buf) >= 0, "vsync key written");
@@ -265,9 +279,18 @@ static void test_gum(void)
               "three values, bridge command, length");
         CHECK(strstr(out, "slc_kz3_scaling") && strstr(out, "slc_kz3_filter") && strstr(out, "slc_kz3_filter") < gam &&
                   strstr(out, "Stretch</selectitem>") && strstr(out, "Nearest</selectitem>") &&
-                  strstr(out, "\"scaling \"..e") && strstr(out, "\"filter \"..e") &&
+                  strstr(out, "XeSS-SR (experimental)</selectitem>") &&
+                  strstr(out, "\"scaling \"..e") &&
+                  strstr(out, "\"filter \"..gKz3FilterWant") &&
                   strstr(out, "KZ3DisplayCmd(\"filter\")"),
               "Image scaling and Scaling filter rows with their functions");
+        CHECK(strstr(out, "<dialog id=\"dlg_kz3_xess\"") &&
+                  strstr(out, "default-focus=\"dlg_kz3_xess_no\"") &&
+                  strstr(out, "dialog(dlg_kz3_xess, settingscript, OnKZ3XessClose)") &&
+                  strstr(out, "function OnKZ3XessClose") &&
+                  strstr(out, "KZ3DisplayCmd(\"filter xess\")") &&
+                  !strstr(out, "sharpness"),
+              "XeSS-SR confirmation is explicit and no unsupported sharpness setting is offered");
         CHECK(strstr(out, "slc_kz3_vsync") && strstr(out, "slc_kz3_vsync") < gam && strstr(out, "slc_kz3_vsync") > strstr(out, "slc_kz3_filter") &&
                   strstr(out, "label=\"VSync\"") && strstr(out, ">On</selectitem>") && strstr(out, ">Off</selectitem>") &&
                   strstr(out, "\"vsync \"..e") && strstr(out, "KZ3DisplayCmd(\"vsync\")") && strstr(out, "function KZ3ChangeVSync"),

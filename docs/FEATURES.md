@@ -12,7 +12,7 @@ What the PS3 version of Killzone 3 does and how far the port reproduces it (sect
 | declined | will not be done | 0 |
 | not applicable | has no equivalent on PC | 2 |
 
-Port-only features: 39 available now, 28 planned.
+Port-only features: 40 available now, 28 planned.
 
 **Estimated parity with the PS3 version: 65 %** (an estimate: works counts 1, partial 1/2, not yet verified 1/4, not yet 0; declined and not-applicable features are left out).
 
@@ -144,6 +144,7 @@ Non-original features are opt-in where they change gameplay; display and input i
 | Asynchronous shader builds | available | off (opt-in) | LD_PSO_ASYNC=1, LD_PSO_ASYNC_THREADS=<n> (default 3). The renderer does not stall while a missing shader is built; opt-in until it is measured on more runs. The shipped pipeline list (next row) is on by default and does not need this switch |
 | Shipped pipeline list: shaders build in the background while a level loads | available | on | LD_PSO_TEMPLATE=0 turns it off. Measured on chapter 4 (2026-10-16): the busy first minute of a first visit runs at about 16.5 frames/s with little stutter, and a cold start builds 8-26 pipelines on the render thread (under 1.3 s). A file of hashes and render state only, no game code; it covers the 8 chapters it was recorded on, and the shader cache carries over between sessions |
 | Window modes and scaling (windowed, borderless, fullscreen, Alt+Enter, resizable, DPI aware) | available | on | Three modes (windowed, borderless, exclusive fullscreen as a setting), Alt+Enter, resizable window, Fit/Stretch and Bilinear/Nearest, Options > Display rows; host-tested and checked by hand under Proton at 1920x1080 (2026-10-21); DPI awareness not done |
+| XeSS Super Resolution (experimental) | available | off | Experimental; slight jitter on still scenes. KZ3_DISPLAY_FILTER=xess or Options > Display > Scaling filter, with Bilinear fallback. Camera-only motion on the finished image, see docs/XESS.md. Native gameplay on an RTX 5070 (2026-11-03, 1280x720 to 1920x1080): steady in motion, 1 history reset in 3,000 dispatches; the pause screen still jitters slightly |
 | Rebindable controls (every action, primary and secondary key, conflict warning, reset; saved to a local config file) | available | on | Keyboard page in the game's Options menus and keybinds.ini in the data folder; on-screen prompts show the bound keys when the keyboard is in use (pad glyphs again on a pad press); keyboard play confirmed by hand (2026-10-14); gamepad remap later |
 | Button prompts that follow the device in use (PlayStation, Xbox, keyboard/mouse), XInput rumble | available | auto | Glyphs drawn by the port in the game's own style; chosen on Options > Controls > Advanced Settings > Layout and Prompts |
 | Discord Rich Presence: “Playing Project Helghast” with the current chapter | available | off (opt-in) | Opt-in: Options > Display > Discord status, or the Start menu entry “Discord status on or off” (both saved as discord_presence in kz3.ini), through the local Discord app on your PC; nothing is sent when it is off. Built, host-tested (tools/net/test_discord.sh) and checked under Proton without the Discord app; the live check against the Discord app is still being tested |
@@ -183,7 +184,7 @@ Non-original features are opt-in where they change gameplay; display and input i
 | Feature | State | Default | Switch, notes |
 |---|---|---|---|
 | Internal resolution scale (720p, 1080p, 1440p, 4K, match window) | planned | on where it looks right | Host render targets scaled while the game keeps its 1280x720 view |
-| Host anti-aliasing (FXAA) in place of SPU MLAA | planned | on at scaled resolutions | KZ3_HOST_AA=fxaa or off. The pass exists (patch 2023) and only runs once the port skips the SPU MLAA job, which is not active yet |
+| Host anti-aliasing (FXAA) in place of SPU MLAA | planned | on at scaled resolutions | KZ3_HOST_AA=fxaa or off. The pass exists (patch 2023) and only runs once the port skips the SPU MLAA job, which is not active yet. Skipped on jittered XeSS-SR frames |
 | Widescreen: 16:10 and 4:3 bars, ultrawide Hor+ field of view | planned | bars on; ultrawide opt-in | Gameplay view at the window aspect and the HUD, menus, subtitles and movies kept 16:9 and centred are built (see Available now); not done: 4:3 and 16:10 bars as an option and a HUD anchored to the screen edges |
 | VRR, frame limiter, low-latency mode | planned | - | The game's own 60 Hz clock stays fixed whatever the monitor |
 | 60 frames/s and above | planned | off where it changes gameplay | The game is paced from its vblank; some elements misbehave at higher rates |
@@ -203,7 +204,7 @@ Non-original features are opt-in where they change gameplay; display and input i
 | VR (SteamVR headsets) | planned | off | Wanted backlog (2026-10-08); not before the campaign is playable |
 | PlayStation Move and Sharpshooter (psmoveapi; camera tracking or motion-sensor pointer) | planned | off | Wanted backlog (2026-10-15); not before the campaign is playable |
 | Renderer choice (Direct3D 12, Vulkan or OpenGL, picked in the installer) | planned | Direct3D 12 | Goal recorded; scoped after the campaign renders correctly on Direct3D 12 |
-| Temporal anti-aliasing and upscaling (TAA, DLAA, DLSS, FSR): the game renders no motion vectors, so camera-only vectors first, character ghosting measured | planned | Backlog after parity; not started | SMAA/FXAA and resolution scale cover image quality until then |
+| Temporal anti-aliasing and upscaling (TAA, DLAA, DLSS, FSR): the game renders no motion vectors, so camera-only vectors first, character ghosting measured | planned | Backlog after parity; XeSS-SR exists as an experiment (see Available now) | SMAA/FXAA and resolution scale cover image quality until then |
 | Saves in the PS3's own format: copy a save between the port, RPCS3 and a PS3 | planned | - | The port writes a real PARAM.SFO so its save folder loads in RPCS3; 2026-10-14: the port writes PARAM.SFO as a binary PSF (checked by a host test with an independent reader, and written by a real checkpoint save in a hand-played session); older text files still load; opening a port save in RPCS3 or on a console is untested |
 | Online co-op campaign: the second player joins the host's split-screen co-op from another PC (their input to the host, their half of the picture streamed back) | planned | off (opt-in) | Wanted backlog (2026-10-16); after local split-screen co-op works and the campaign is playable |
 | In-game voice chat for multiplayer and the online co-op campaign (microphone and headset on the PC; online only when the player picks it) | planned | opt-in | Wanted backlog (2026-10-27); after online play and the online co-op campaign |

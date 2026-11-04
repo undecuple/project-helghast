@@ -361,6 +361,28 @@ def main():
         write(sd, "dll v2")
         check(fr.place_sdl3(root, os.path.join(root, "build")) is True
               and open(os.path.join(root, "build", "SDL3.dll")).read() == "dll v2", "8 a changed SDL3.dll (same size) is copied again")
+        xd = os.path.join(root, "runtime", "libxess.dll")
+        check(
+            not fr.place_xess(root, os.path.join(root, "build"))
+            and not os.path.exists(os.path.join(root, "build", "libxess.dll")),
+            "8 an old payload without XeSS: nothing placed, no error",
+        )
+        write(xd, "xess v1")
+        check(
+            fr.place_xess(root, os.path.join(root, "build"))
+            and open(os.path.join(root, "build", "libxess.dll")).read() == "xess v1",
+            "8 XeSS runtime placed in build/",
+        )
+        check(
+            not fr.place_xess(root, os.path.join(root, "build")),
+            "8 XeSS runtime already in place: not copied",
+        )
+        write(xd, "xess v2")
+        check(
+            fr.place_xess(root, os.path.join(root, "build"))
+            and open(os.path.join(root, "build", "libxess.dll")).read() == "xess v2",
+            "8 a changed XeSS runtime is copied again",
+        )
         os.remove(os.path.join(root, "build", "build-stamp.json"))
         calls.clear()
         ui = FakeUI([False])

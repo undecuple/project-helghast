@@ -36,6 +36,9 @@ REQUIRED = ("run.cmd", "manifest.json", "VERSION.txt",
             "fonts/Rajdhani-Medium.ttf", "fonts/Rajdhani-Bold.ttf", "licenses/Rajdhani-OFL.txt",
             # SDL3 for the pads (patch 4010) and its licence (assemble_payload SDL3_DEST)
             "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt",
+            # Intel XeSS SDK 3.0.2 runtime, redistribution terms, and third-party notices
+            "runtime/libxess.dll", "licenses/Intel-XeSS-LICENSE.txt",
+            "licenses/Intel-XeSS-THIRD-PARTY-NOTICES.txt",
             # the port UI text table the runtime reads from <exe dir>\lang (net 45)
             "lang/port_ui.tsv")
 NO_SCRUB_PREFIX = "toolchain/"

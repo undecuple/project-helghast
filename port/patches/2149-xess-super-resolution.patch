@@ -1,0 +1,1177 @@
+KZ3 patch 2149 (ENHANCEMENT, experimental): an opt-in Intel XeSS Super Resolution display filter.
+
+Off by default: Bilinear stays the default filter and with xess unselected no XeSS code runs. Selecting it
+(Options > Display > Scaling filter, confirmed by a prompt, or KZ3_DISPLAY_FILTER=xess) renders the stable four-target
+deferred pass with a Halton jitter applied to the scene geometry, takes its primary depth into an adapter-owned texture
+at the scene copy, pairs the camera with the renderer frame being built, and upscales the last scene presentation.
+The KZ3 build defines KZ3_XESS and supplies the port-owned xess.h adapter (port/kz3/xess.cpp); other ps3recomp users
+compile the renderer unchanged and have no Intel SDK dependency.
+
+Motion vectors are reconstructed from camera pose plus depth; no G-buffer is labelled as velocity, so object,
+animation, vegetation, particle and shader motion are not represented. The scene resolve and the final composed frame
+are paired to build XeSS's responsive-pixel mask; the display surface is captured right after the 3D compose, so
+pixels the HUD then changes get zero motion and full responsiveness. Jittered frames skip FXAA (XeSS is the frame's
+anti-aliasing) and get Intel's texture mip bias, log2(input / target), on the units of scene draws with a mip chain.
+A dispatch checks that the camera moved on by exactly one flip: the same flip means no camera motion, a skipped flip
+resets history. Re-initialising from the present path flushes the open command list first.
+
+XeSS-SR is attempted only for a larger same-aspect output. The renderer falls back to Bilinear on an unsupported
+scale, a missing or incompatible runtime, a rejected input resolution, incomplete deferred inputs or a dispatch
+failure; a jittered frame that falls back holds jitter off until a dispatch works. Switching the filter away from
+xess releases the context at the next present. When xess is selected the RSX_UPSCALE backend (patch 2145) is
+bypassed, also on fallback; the other filters keep it.
+
+One-run switches, read where they are used: KZ3_XESS_MIP_BIAS (default Intel's value), KZ3_XESS_CAMERA_LAG
+(default 0), KZ3_XESS_HUD_MASK=0 (default on). "[xess]" lines report status, fallbacks and camera pairing.
+
+Rules and host tests: port/kz3/xess_camera.h, xess_inputs.h, xess_motion.h with tools/smoke/test_xess_camera.c,
+test_xess_inputs.c, test_xess_motion.c, test_display_mode.c, and test_xess_compile.sh (adapter compile, renderer
+integration checks). tools/smoke/test_xess.cpp and test_xess_temporal.cpp need a D3D12 GPU and the Intel runtime.
+Written from Intel's public XeSS SDK 3.0.2 developer guide and API headers; no game code, no Intel source.
+
+diff --git a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+index 62284b2..5972485 100644
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -10,7 +10,7 @@
+  * (ResizeBuffers); the guest's 1280x720 image is drawn aspect-correct into it with linear filtering and black bars
+  * (rsx_live_draw.c). The mode comes from KZ3_DISPLAY=windowed|borderless|fullscreen (tests; wins), else display.ini
+  * beside keybinds.ini ([display] mode = ...), else Windowed; the Options > Display rows "Display mode", "Image scaling"
+- * (Fit/Stretch) and "Scaling filter" (Bilinear/Nearest; port/kz3/main.cpp patches common/displaysettings.gum) apply at
++ * (Fit/Stretch) and "Scaling filter" (Bilinear/Nearest/XeSS-SR; port/kz3/main.cpp patches common/displaysettings.gum) apply at
+  * once and are saved.
+  *
+  * This header is the platform-free part (host test: tools/smoke/test_display_mode.sh): names, the mode state machine,
+@@ -129,15 +129,25 @@ static inline rsx_dm_rect rsx_dm_fit(int sw, int sh, int dw, int dh)
+ }
+ 
+ /* Image scaling (Options row "Image scaling", KZ3_DISPLAY_SCALING): Fit = aspect-correct with bars, Stretch (default) =
+- * the whole client, aspect not kept. Filter (row "Scaling filter", KZ3_DISPLAY_FILTER): Bilinear (default) or Nearest;
++ * the whole client, aspect not kept. Filter (row "Scaling filter", KZ3_DISPLAY_FILTER): Bilinear (default), Nearest,
++ * or the KZ3-only experimental XeSS-SR path;
+  * Nearest with Fit uses the largest whole-number scale that fits (sharp, even pixels; wider bars), falling back to
+  * the plain fit when even 1x does not fit. Modelled on RPCS3's "stretch to display area" and "output scaling". */
+ enum { RSX_DM_FIT = 0, RSX_DM_STRETCH = 1 };
+ #define RSX_DM_SCALING_DEFAULT RSX_DM_STRETCH /* interim until the game renders at the screen aspect (RSX pass 91) */
+-enum { RSX_DM_BILINEAR = 0, RSX_DM_NEAREST = 1 };
++enum { RSX_DM_BILINEAR = 0, RSX_DM_NEAREST = 1, RSX_DM_XESS = 2 };
++
++static inline int rsx_dm_spatial_upscaler_allowed(int filter) { return filter != RSX_DM_XESS; }
++static inline int rsx_dm_sample_filter(int filter)
++{
++    return filter == RSX_DM_NEAREST ? RSX_DM_NEAREST : RSX_DM_BILINEAR;
++}
+ 
+ static inline const char* rsx_dm_scaling_name(int v) { return v == RSX_DM_STRETCH ? "stretch" : "fit"; }
+-static inline const char* rsx_dm_filter_name(int v) { return v == RSX_DM_NEAREST ? "nearest" : "bilinear"; }
++static inline const char* rsx_dm_filter_name(int v)
++{
++    return v == RSX_DM_NEAREST ? "nearest" : v == RSX_DM_XESS ? "xess" : "bilinear";
++}
+ 
+ static inline int rsx_dm_trim(const char** s, size_t* n)
+ {
+@@ -161,6 +171,7 @@ static inline int rsx_dm_parse_filter(const char* s)
+     if (!rsx_dm_trim(&s, &n)) return -1;
+     if (rsx_dm_ieq(s, n, "bilinear") || rsx_dm_ieq(s, n, "linear")) return RSX_DM_BILINEAR;
+     if (rsx_dm_ieq(s, n, "nearest") || rsx_dm_ieq(s, n, "point")) return RSX_DM_NEAREST;
++    if (rsx_dm_ieq(s, n, "xess") || rsx_dm_ieq(s, n, "xess-sr")) return RSX_DM_XESS;
+     return -1;
+ }
+ 
+@@ -369,7 +380,7 @@ static inline int rsx_dm_ini_write_ext(char* buf, size_t n, int mode, int scalin
+ {
+     return snprintf(buf, n,
+                     "# " PS3RECOMP_PRODUCT_NAME " display settings (Options > Display; Alt+Enter toggles the mode).\n"
+-                    "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest, vsync = on | off.\n"
++                    "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest | xess, vsync = on | off.\n"
+                     "# motion_blur = 0..100 (percent, steps of 10; 100 = the game, on / off of older files still read). fps_limit = 30 | 60 | 120: 30 is the game's own; above 30 can break gameplay timing.\n"
+                     "# KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER, KZ3_MOTION_BLUR, KZ3_FPS_LIMIT override them for one run.\n"
+                     "[display]\nmode = %s\nscaling = %s\nfilter = %s\nvsync = %s\nmotion_blur = %d\nfps_limit = %s\n",
+@@ -394,7 +405,7 @@ static inline int rsx_dm_ini_write(char* buf, size_t n, int mode, int scaling, i
+ {
+     return snprintf(buf, n,
+                     "# " PS3RECOMP_PRODUCT_NAME " display settings (Options > Display; Alt+Enter toggles the mode).\n"
+-                    "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest, vsync = on | off.\n"
++                    "# mode = windowed | borderless | fullscreen, scaling = fit | stretch, filter = bilinear | nearest | xess, vsync = on | off.\n"
+                     "# KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER override them for one run.\n"
+                     "[display]\nmode = %s\nscaling = %s\nfilter = %s\nvsync = %s\n", rsx_dm_name(mode), rsx_dm_scaling_name(scaling),
+                     rsx_dm_filter_name(filter), rsx_dm_vsync_name(vsync));
+@@ -447,6 +458,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         "\t\t\t\tdefault-value=\"bilinear\">\n"
+         "\t\t\t\t<selectitem value=\"bilinear\">@tr{disp.v.bilinear|Bilinear}</selectitem>\n"
+         "\t\t\t\t<selectitem value=\"nearest\">@tr{disp.v.nearest|Nearest}</selectitem>\n"
++        "\t\t\t\t<selectitem value=\"xess\">@tr{disp.v.xess|XeSS-SR (experimental)}</selectitem>\n"
+         "\t\t\t</select>\n\n\t\t\t"
+         "<select id=\"slc_kz3_vsync\" label=\"@tr{disp.vsync|VSync}\" onchange=\"script(settingscript,KZ3ChangeVSync)\"\n"
+         "\t\t\t\tdefault-value=\"on\">\n"
+@@ -543,6 +555,12 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         "\t\tcancelable=\"true\">\n"
+         "\t\t<dialogoption id=\"dlg_kz3_fps_yes\" label=\"@key{menu_dialog_yes}\" value=\"yes\"/>\n"
+         "\t\t<dialogoption id=\"dlg_kz3_fps_no\" label=\"@key{menu_dialog_no}\" value=\"no\"/>\n"
++        "\t</dialog>\n\n\t"
++        "<dialog id=\"dlg_kz3_xess\" label=\"@tr{disp.xess_warn|XeSS-SR is experimental. Camera-only motion and combined scene/UI input can cause ghosting or shimmer. Enable it?}\" "
++        "default-focus=\"dlg_kz3_xess_no\"\n"
++        "\t\tcancelable=\"true\">\n"
++        "\t\t<dialogoption id=\"dlg_kz3_xess_yes\" label=\"@key{menu_dialog_yes}\" value=\"yes\"/>\n"
++        "\t\t<dialogoption id=\"dlg_kz3_xess_no\" label=\"@key{menu_dialog_no}\" value=\"no\"/>\n"
+         "\t</dialog>\n\n\t";
+ 
+     /* patch 2110: the row descriptions, in the game's own tooltip panel (common/advancedcontroller.gum: a list onchange
+@@ -556,7 +574,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         "\n\t\tgKz3Tip = {\n"
+         "\t\t\tslc_kz3_display = \"@trl{disp.tip.display|Windowed, borderless window or exclusive fullscreen.}\",\n"
+         "\t\t\tslc_kz3_scaling = \"@trl{disp.tip.scaling|Fit keeps the picture's shape with black bars. Stretch fills the whole window.}\",\n"
+-        "\t\t\tslc_kz3_filter = \"@trl{disp.tip.filter|Bilinear smooths the scaled picture. Nearest keeps hard pixel edges.}\",\n"
++        "\t\t\tslc_kz3_filter = \"@trl{disp.tip.filter_xess|Bilinear smooths the picture. Nearest keeps hard edges. XeSS-SR uses experimental temporal upscaling.}\",\n"
+         "\t\t\tslc_kz3_vsync = \"@trl{disp.tip.vsync|Waits for the display's refresh to stop tearing. Off can lower input delay.}\",\n"
+         "\t\t\tslc_kz3_fps = \"@trl{disp.tip.fps|Killzone 3 was made for 30 frames per second. Higher limits can make physics, animation and "
+         "scripted events run wrong.}\",\n"
+@@ -641,9 +659,27 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         "\t\t\te:SetHandled(true)\n"
+         "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"scaling \"..e:GetSender():GetValue()) end\n"
+         "\t\tend\n\n"
++        "\t\tgKz3FilterWant = \"bilinear\"\n"
+         "\t\tfunction KZ3ChangeFilter(e)\n"
+         "\t\t\te:SetHandled(true)\n"
+-        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"filter \"..e:GetSender():GetValue()) end\n"
++        "\t\t\tif (gKz3Dm == 1) then\n"
++        "\t\t\t\tgKz3FilterWant = e:GetSender():GetValue()\n"
++        "\t\t\t\tif (gKz3FilterWant == \"xess\") then\n"
++        "\t\t\t\t\tgMenu:DoAction(\"dialog(dlg_kz3_xess, settingscript, OnKZ3XessClose)\")\n"
++        "\t\t\t\telse\n"
++        "\t\t\t\t\tKZ3DisplayCmd(\"filter \"..gKz3FilterWant)\n"
++        "\t\t\t\tend\n"
++        "\t\t\tend\n"
++        "\t\tend\n\n"
++        "\t\tfunction OnKZ3XessClose(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (e:GetSender():GetValue() == \"yes\") then\n"
++        "\t\t\t\tKZ3DisplayCmd(\"filter xess\")\n"
++        "\t\t\telse\n"
++        "\t\t\t\tgKz3Dm = 0\n"
++        "\t\t\t\tgRoot:GetTag(\"slc_kz3_filter\"):SetValue(KZ3DisplayCmd(\"filter\"))\n"
++        "\t\t\t\tgKz3Dm = 1\n"
++        "\t\t\tend\n"
+         "\t\tend\n\n"
+         "\t\tfunction KZ3ChangeUnfocused(e)\n"
+         "\t\t\te:SetHandled(true)\n"
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index ff1cd74..477c5ee 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -100,6 +100,10 @@ void rsx_live_draw_shutdown(void) {}
+ 
+ #include "rsx_dispatch.h"
+ #include "rsx_fp_decompiler.h"
++#if defined(KZ3_XESS)
++#include "xess.h"
++#include "xess_inputs.h"
++#endif
+ static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_surf = 0;
+ /* Set once PS1 VRAM actually holds a drawn frame (see the PS1_PC heartbeat).
+  * Every surface dump before this is an early-boot snapshot of a framebuffer the
+@@ -13794,6 +13798,57 @@ u64 rsx_live_draw_debug_chunk_submits(void) { return g_ld_chunk_submits; }
+  * squeezed UI already). */
+ #include "rsx_hud169.h"
+ static int ld_h169_factors(float* kx, float* ky);   /* after ld_dm_scaling_now */
++#if defined(KZ3_XESS)
++static u32 g_xess_zslot, g_xess_zframe = UINT32_MAX;
++static float g_xess_jitter_x, g_xess_jitter_y;
++static u32 g_xess_jitter_frame = UINT32_MAX;
++static kz3_xess_camera_state g_xess_camera;
++static u32 g_xess_camera_frame = UINT32_MAX;
++static u32 g_xess_context_w, g_xess_context_h, g_xess_context_generation;
++static u32 g_xess_last_dispatch_frame = UINT32_MAX;
++static u32 g_xess_last_dispatch_context_generation;
++static kz3_xess_capture_key g_xess_opaque_capture;
++static u32 g_xess_responsive_frame = UINT32_MAX;
++static u32 g_xess_responsive_context_generation;
++static int ld_xess_draw_jitter(u32 frame, float* x, float* y);
++/* KZ3 patch 2149: see the patch header. */
++static u32 g_xess_context_failed_frame = UINT32_MAX;   /* the draw-time init of that frame failed: kz3_xess_status() says why */
++static int g_xess_jitter_hold;                         /* a jittered frame fell back: no jitter until a dispatch works */
++static u32 g_xess_depth_frame = UINT32_MAX;
++static u32 g_xess_compose_frame = UINT32_MAX;
++static u32 g_xess_compose_context_generation;
++static uintptr_t g_xess_compose_resource;
++static int g_xess_mip_bias_fp;                         /* extra LOD bias of the scene draws, signed 4.8 */
++static kz3_xess_pairing g_xess_pairing;
++static int g_xess_have_last_camera;
++static u64 g_xess_last_camera_flip;
++static u32 g_xess_camera_repeats, g_xess_camera_jumps, g_xess_camera_misses;
++
++/* KZ3_XESS_HUD_MASK=0 turns the HUD mask off for one run (default on). */
++static int ld_xess_hud_mask_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("KZ3_XESS_HUD_MASK"); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++/* Intel: XeSS-SR needs a mip bias of log2(input / target). The units of a scene draw that have a mip chain get it; the
++ * guest's own sampler stays if the cache is full (sampler_slot then answers the default sampler). */
++static void ld_xess_bias_samplers(u32 texture_mask, u32* smp_slots)
++{
++    if (!g_xess_mip_bias_fp) return;
++    for (u32 u = 0; u < SMP_TABLE_SIZE; u++) {
++        if (!((texture_mask >> u) & 1u)) continue;
++        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
++        const u32 minf = (t.filter >> 16) & 0x7u;
++        if (minf < 3u || minf > 6u) continue;   /* decode_sampler's mip_present */
++        t.filter = kz3_xess_filter_with_bias(t.filter, g_xess_mip_bias_fp);
++        u32 skey[4]; sampler_key(&t, skey);
++        const u32 slot = sampler_slot(&t, skey);
++        if (slot != SMP_DEFAULT) smp_slots[u] = slot;
++    }
++}
++#endif
+ static u32 g_h169_frame = 0xFFFFFFFFu;
+ static int g_h169_depth_seen, g_h169_disp_seen, g_h169_rt_sampled;
+ static u32 g_h169_rt_off;
+@@ -14773,6 +14828,41 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         else
+             g_ld_vtex_unsupported++;
+     }
++#if defined(KZ3_XESS)
++    /* Patch 2149: decided here, not at xf below. The sampler table of this draw is built next, and a first-frame init
++     * blocks, so it runs before any of this draw's state is recorded. */
++    int xess_jitter = 0, xess_capture_opaque = 0;
++    float xess_jx = 0.0f, xess_jy = 0.0f;
++    {
++        const float xvw = (sf.clip_w ? (float)sf.clip_w : (float)g.width) / (float)sf.aa_sx;
++        const float xvh = (sf.clip_h ? (float)sf.clip_h : (float)g.height) / (float)sf.aa_sy;
++        const kz3_xess_draw_info xess_draw = {
++            g_ld_frames,
++            g.surfaces[target].offset,
++            g.surfaces[target].w,
++            g.surfaces[target].h,
++            n_mrt,
++            current_zslot,
++            g_h169_rt_off,
++            g.surfaces[target].location == 0u,
++            vp.scale[0] == xvw * 0.5f && vp.translate[0] == xvw * 0.5f &&
++                fabsf(vp.scale[1]) == xvh * 0.5f && vp.translate[1] == xvh * 0.5f,
++            (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0,
++            (rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u) != 0,
++            g_h169_rt_sampled
++        };
++        if (kz3_xess_is_deferred_primary(&xess_draw, g.width, g.height)) {
++            g_xess_zslot = current_zslot;
++            g_xess_zframe = g_ld_frames;
++        }
++        if (kz3_xess_should_jitter(&xess_draw, g.width, g.height, g_xess_zframe, g_xess_zslot) &&
++            ld_xess_draw_jitter(g_ld_frames, &xess_jx, &xess_jy)) {
++            xess_jitter = 1;
++            ld_xess_bias_samplers(texture_mask, smp_slots);
++        }
++        xess_capture_opaque = kz3_xess_is_opaque_resolve(&xess_draw, g.width, g.height);
++    }
++#endif
+     LDW_ADD(RSX_PERF_W_D_TEXLOOP_T, texloop_t0);
+     LDW_T0(desc_t0);   /* patch 2045 */
+     const u32 required_srv_tables = 1u + (vtex_mask != 0);
+@@ -14910,15 +15000,22 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+      * full-size render target sampled) is squeezed into the centred 16:9 box; the RE notes "Pass 162" s.4. */
+     float h_kx = 1.0f, h_ky = 1.0f;
+     int h169 = 0;
++#if defined(KZ3_XESS)
++    int xess_compose = 0;
++#endif
+     {
++        const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
++                         fabsf(vp.scale[1]) == Hv * 0.5f && vp.translate[1] == Hv * 0.5f;
++        const int is169 = (u32)Wv * 9u == (u32)Hv * 16u;
++        const int display = target < g.n_surfaces && ld_h169_is_display(target);
+         if (g_h169_frame != g_ld_frames) { g_h169_frame = g_ld_frames; g_h169_depth_seen = 0; g_h169_disp_seen = 0; }
+-        if (target < g.n_surfaces && ld_h169_is_display(target)) {
++        if (display) {
+             const int first = !g_h169_disp_seen;
+             g_h169_disp_seen = 1;
++#if defined(KZ3_XESS)
++            xess_compose = first && g_h169_depth_seen && full;   /* patch 2149: the frame before its HUD */
++#endif
+             if (ld_h169_factors(&h_kx, &h_ky)) {
+-                const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
+-                                 fabsf(vp.scale[1]) == Hv * 0.5f && vp.translate[1] == Hv * 0.5f;
+-                const int is169 = (u32)Wv * 9u == (u32)Hv * 16u;
+                 const int compose = first && g_h169_depth_seen;
+                 h169 = full && is169 && !compose && !g_h169_rt_sampled;
+                 if (ld_h169_log_on()) {
+@@ -14932,6 +15029,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 }
+             }
+         }
++#if defined(KZ3_XESS)
++        if (xess_jitter) {
++            xf[4] += 2.0f * xess_jx / Wv;
++            xf[5] -= 2.0f * xess_jy / Hv;
++        }
++#endif
+         {   /* patch 2118 diagnostics: KZ3_HUD_169_LOG=2 KZ3_HUD_169_LOGF=<frame>: every draw of 3 frames, any target */
+             static int dl = -2; static u32 df = 0;
+             if (dl == -2) { const char* e = getenv("KZ3_HUD_169_LOG"); const char* f = getenv("KZ3_HUD_169_LOGF");
+@@ -15118,6 +15221,52 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
+     }
+     ld_oq_after_draw(oq_pred);
++#if defined(KZ3_XESS)
++    if (oq_pred >= 0 && xess_capture_opaque && g_xess_context_w &&
++        (g_xess_opaque_capture.frame != g_ld_frames ||
++         g_xess_opaque_capture.context_generation !=
++             g_xess_context_generation ||
++         g_xess_opaque_capture.resource !=
++             (uintptr_t)g.surfaces[target].tex) &&
++        kz3_xess_capture_opaque_color(
++            g.list,
++            g.surfaces[target].tex,
++            g.surfaces[target].w,
++            g.surfaces[target].h)) {
++        static u32 capture_logs;
++        g_xess_opaque_capture.frame = g_ld_frames;
++        g_xess_opaque_capture.context_generation =
++            g_xess_context_generation;
++        g_xess_opaque_capture.target = target;
++        g_xess_opaque_capture.width = g.surfaces[target].w;
++        g_xess_opaque_capture.height = g.surfaces[target].h;
++        g_xess_opaque_capture.resource =
++            (uintptr_t)g.surfaces[target].tex;
++        if (capture_logs++ < 4)
++            fprintf(stderr,
++                    "[xess] frame %u: captured opaque scene "
++                    "surface 0x%08X\n",
++                    g_ld_frames, g.surfaces[target].offset);
++    }
++    if (oq_pred >= 0 && xess_compose && ld_xess_hud_mask_on() &&
++        g_xess_camera_frame == g_ld_frames &&
++        g_xess_compose_frame != g_ld_frames &&
++        kz3_xess_capture_compose_color(
++            g.list,
++            g.surfaces[target].tex,
++            g.surfaces[target].w,
++            g.surfaces[target].h)) {
++        static u32 compose_logs;
++        g_xess_compose_frame = g_ld_frames;
++        g_xess_compose_context_generation = g_xess_context_generation;
++        g_xess_compose_resource = (uintptr_t)g.surfaces[target].tex;
++        if (compose_logs++ < 4)
++            fprintf(stderr,
++                    "[xess] frame %u: captured composed scene "
++                    "surface 0x%08X\n",
++                    g_ld_frames, g.surfaces[target].offset);
++    }
++#endif
+     if (g_gt.on > 0) ld_gt_draw(target, n_mrt, mrt, current_zslot, n_tri, sf.clip_w * sf.clip_h, (u32)__builtin_popcount(texture_mask));   /* patch 2052 */
+     LDW_ADD(RSX_PERF_W_D_REC_T, rec_t0);
+     LDW_T0(post_t0);   /* patch 2045 */
+@@ -15676,7 +15825,8 @@ static int g_dm_scaling = RSX_DM_SCALING_DEFAULT, g_dm_filter = RSX_DM_BILINEAR;
+ void rsx_live_draw_set_scaling(int scaling, int filter)
+ {
+     g_dm_scaling = scaling == RSX_DM_FIT ? RSX_DM_FIT : scaling == RSX_DM_STRETCH ? RSX_DM_STRETCH : RSX_DM_SCALING_DEFAULT;
+-    g_dm_filter = filter == RSX_DM_NEAREST ? RSX_DM_NEAREST : RSX_DM_BILINEAR;
++    g_dm_filter = filter == RSX_DM_NEAREST ? RSX_DM_NEAREST :
++                  filter == RSX_DM_XESS ? RSX_DM_XESS : RSX_DM_BILINEAR;
+ }
+ static ID3D12Resource* g_dm_movie_tex;        /* movie path: guest-size copy target when the image is scaled */
+ static u32 g_dm_movie_w, g_dm_movie_h;
+@@ -15832,7 +15982,9 @@ static void ld_dm_sync_size(void)
+     const rsx_dm_rect r = rsx_dm_rect_for((int)g.width, (int)g.height, (int)w, (int)h, g_dm_scaling, g_dm_filter);
+     if (g_dm_resizes++ < 64)
+         fprintf(stderr, "[display] swap chain %ux%u (frame %u): image %dx%d at %d,%d%s\n", w, h, g_ld_frames, r.w, r.h,
+-                r.x, r.y, (w == g.width && h == g.height) ? " (copy, unscaled)" : g_dm_filter ? " (scaled, nearest)" : " (scaled, linear)");
++                r.x, r.y, (w == g.width && h == g.height) ? " (copy, unscaled)" :
++                g_dm_filter == RSX_DM_NEAREST ? " (scaled, nearest)" :
++                g_dm_filter == RSX_DM_XESS ? " (scaled, XeSS-SR requested)" : " (scaled, linear)");
+ }
+ 
+ static int ld_dm_pipeline(void)
+@@ -15939,6 +16091,169 @@ static int ld_dm_scaling_now(void)
+ {
+     return (g_dm_present_n - g_dm_wide_n <= 3 && rsx_display_view_ratio() != 1.0) ? RSX_DM_STRETCH : g_dm_scaling;
+ }
++#if defined(KZ3_XESS)
++static void ld_xess_output_size(u32 requested_w, u32 requested_h, u32* w, u32* h)
++{
++    const u32 max_w = g.width <= UINT32_MAX / 3u ? g.width * 3u : UINT32_MAX;
++    const u32 max_h = g.height <= UINT32_MAX / 3u ? g.height * 3u : UINT32_MAX;
++    *w = requested_w < max_w ? requested_w : max_w;
++    *h = requested_h < max_h ? requested_h : max_h;
++}
++
++/* KZ3_XESS_MIP_BIAS: the scene's extra LOD bias in mip levels, one run. Unset = Intel's log2(input / target); 0 = none. */
++static int ld_xess_mip_bias_now(u32 output_w)
++{
++    const char* e = getenv("KZ3_XESS_MIP_BIAS");
++    if (e && *e) return (int)lroundf((float)atof(e) * 256.0f);
++    return kz3_xess_mip_bias_fp(g.width, output_w);
++}
++
++/* may_flush: 0 from a draw, where a flush would lose this draw's recorded state. Nothing of XeSS is in the open list at
++ * the first scene draw of a frame, so the fence is enough there. The present path may hold this frame's captures. */
++static int ld_xess_ensure_context(u32 output_w, u32 output_h, int may_flush)
++{
++    const int changed =
++        g_xess_context_w != output_w || g_xess_context_h != output_h;
++    if (kz3_xess_would_recreate(
++            g.dev, g.width, g.height, output_w, output_h)) {
++        if (may_flush) {
++            ld_flush(LD_FLUSH_RETIRE_QUEUE);
++            if (!g.ready) return 0;
++        } else {
++            ld_wait_fence(g.fence_value);
++        }
++    }
++    if (!kz3_xess_initialize(
++            g.dev, g.width, g.height, output_w, output_h)) {
++        g_xess_context_w = g_xess_context_h = 0;
++        return 0;
++    }
++    if (changed) {
++        g_xess_context_w = output_w;
++        g_xess_context_h = output_h;
++        g_xess_context_generation++;
++        g_xess_depth_frame = UINT32_MAX;
++        g_xess_mip_bias_fp = ld_xess_mip_bias_now(output_w);
++    }
++    return 1;
++}
++
++/* KZ3_XESS_CAMERA_LAG: whole flips to step back from the paired camera, one run (default 0). Negative = take the latest
++ * published camera, the pairing of the first XeSS prototype. */
++static int ld_xess_camera_lag(void)
++{
++    static int lag = 0, read = 0;
++    if (!read) { const char* e = getenv("KZ3_XESS_CAMERA_LAG"); lag = e && *e ? atoi(e) : 0; read = 1; }
++    return lag;
++}
++
++static int ld_xess_pick_camera(kz3_xess_camera_state* camera)
++{
++    static u32 logs;
++    kz3_xess_camera_state latest;
++    if (!kz3_xess_get_camera(&latest)) return 0;
++    *camera = latest;
++    const int lag = ld_xess_camera_lag();
++    if (lag >= 0) {
++        const u64 want = kz3_xess_pair_flip(
++            &g_xess_pairing, latest.guest_flip, g_ld_frames, (u32)lag);
++        if (!kz3_xess_get_camera_for_flip(want, camera)) {
++            *camera = latest;
++            g_xess_camera_misses++;
++        }
++    }
++    if (logs < 8 || !(g_ld_frames % 600u)) {
++        logs++;
++        fprintf(stderr,
++                "[xess] camera pairing: renderer frame %u, latest %llu, used %llu "
++                "(repeats %u, jumps %u, misses %u)\n",
++                g_ld_frames,
++                (unsigned long long)latest.guest_flip,
++                (unsigned long long)camera->guest_flip,
++                g_xess_camera_repeats, g_xess_camera_jumps, g_xess_camera_misses);
++    }
++    return 1;
++}
++
++static int ld_xess_draw_jitter(u32 frame, float* x, float* y)
++{
++    if (g_dm_filter != RSX_DM_XESS) return 0;
++    if (g_xess_jitter_frame != frame) {
++        g_xess_jitter_frame = frame;
++        g_xess_camera_frame = UINT32_MAX;
++        g_xess_jitter_x = g_xess_jitter_y = 0.0f;
++        kz3_xess_camera_state camera;
++        const rsx_dm_rect output = rsx_dm_rect_for(
++            (int)g.width, (int)g.height,
++            (int)g_dm_bb_w, (int)g_dm_bb_h,
++            ld_dm_scaling_now(), RSX_DM_BILINEAR);
++        u32 output_w, output_h;
++        ld_xess_output_size((u32)output.w, (u32)output.h, &output_w, &output_h);
++        if (!ld_xess_pick_camera(&camera) ||
++            !(camera.flags & KZ3_XESS_CAMERA_PLANES_VALID) ||
++            (camera.flags & KZ3_XESS_CAMERA_MULTIPLE_VIEWS) ||
++            output_w < g.width || output_h < g.height ||
++            (output_w == g.width && output_h == g.height)) {
++            return 0;
++        }
++        if (!ld_xess_ensure_context(output_w, output_h, 0)) {
++            g_xess_context_failed_frame = frame;
++            return 0;
++        }
++        /* While held the frame is not jittered, but still goes through XeSS: that dispatch is the test that clears it. */
++        if (!g_xess_jitter_hold &&
++            !kz3_xess_get_jitter(
++                frame, g.width, output_w,
++                &g_xess_jitter_x, &g_xess_jitter_y)) {
++            return 0;
++        }
++        g_xess_camera = camera;
++        g_xess_camera_frame = frame;
++    }
++    *x = g_xess_jitter_x;
++    *y = g_xess_jitter_y;
++    return g_xess_jitter_x != 0.0f || g_xess_jitter_y != 0.0f;
++}
++
++static int ld_xess_frame_jittered(void)
++{
++    return g_dm_filter == RSX_DM_XESS && g_xess_jitter_frame == g_ld_frames &&
++           (g_xess_jitter_x != 0.0f || g_xess_jitter_y != 0.0f);
++}
++
++/* The depth of the scene pass, kept in the adapter's own texture: a later write to this zeta in the frame cannot reach
++ * XeSS. Taken at the scene copy, or at present when the frame had no scene copy. */
++static int ld_xess_capture_depth(void)
++{
++    if (g_xess_depth_frame == g_ld_frames) return 1;
++    if (g_xess_zframe != g_ld_frames || !g_xess_zslot || g_xess_zslot > g.n_zdepths) return 0;
++    zdepth_t* depth = &g.zdepths[g_xess_zslot - 1u];
++    if (!zdepth_snapshot(g_xess_zslot) || !depth->snapshot || !depth->snapshot_valid) return 0;
++    if (!kz3_xess_capture_depth(g.list, depth->snapshot, depth->snapshot_state,
++                                depth->snapshot_w, depth->snapshot_h)) return 0;
++    g_xess_depth_frame = g_ld_frames;
++    return 1;
++}
++
++static void ld_xess_forget(void)
++{
++    kz3_xess_shutdown();
++    g_xess_context_w = g_xess_context_h = 0;
++    g_xess_context_generation++;
++    g_xess_last_dispatch_frame = UINT32_MAX;
++    g_xess_jitter_frame = UINT32_MAX;
++    g_xess_camera_frame = UINT32_MAX;
++    g_xess_zframe = UINT32_MAX;
++    g_xess_responsive_frame = UINT32_MAX;
++    g_xess_depth_frame = UINT32_MAX;
++    g_xess_compose_frame = UINT32_MAX;
++    g_xess_context_failed_frame = UINT32_MAX;
++    g_xess_jitter_hold = 0;
++    g_xess_have_last_camera = 0;
++    memset(&g_xess_opaque_capture, 0, sizeof g_xess_opaque_capture);
++    memset(&g_xess_pairing, 0, sizeof g_xess_pairing);
++}
++#endif
+ /* patch 2113: KZ3_HUD_169 (=0 off, else on; one run) over display.ini hud_169 (rsx_live_draw_set_hud169; default on).
+  * Active only while the present stretches the buffer to a client that is not 16:9: KZ3_ASPECT=screen and Stretch now
+  * (Fit already letterboxes the whole frame; KZ3_ASPECT=16:9 keeps the PS3 picture). */
+@@ -15975,8 +16290,18 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
+     ID3D12Resource* bb = g.backbuf[bbi];
+     const rsx_dm_rect r = rsx_dm_rect_for((int)sd.Width, (int)sd.Height, (int)g_dm_bb_w, (int)g_dm_bb_h, ld_dm_scaling_now(),
+                                           g_dm_filter);
+-    int dm_filter = g_dm_filter;
+-    {   /* patch 2145: RSX_UPSCALE=fsr1 upscales the image to the rectangle's size first (EASU + RCAS compute on the
++    int dm_filter = rsx_dm_sample_filter(g_dm_filter);
++    if (!rsx_dm_spatial_upscaler_allowed(g_dm_filter)) {
++        static int reported;
++        if (!reported) {
++            rsx_upscale_config uc;
++            rsx_upscale_config_from_env(&uc);
++            if (uc.backend != RSX_UPSCALE_NONE)
++                fprintf(stderr, "[xess] RSX_UPSCALE=%s ignored while XeSS is selected; fallback is bilinear\n",
++                        rsx_upscale_backend_name(uc.backend));
++            reported = 1;
++        }
++    } else {   /* patch 2145: RSX_UPSCALE=fsr1 upscales the image to the rectangle's size first (EASU + RCAS compute on the
+          * composed picture, HUD included: this game has no pre-HUD tap), and the draw below copies it 1:1 with point
+          * sampling. ld_up_get() is NULL and wants_pass 0 with the switch off: nothing is recorded then. */
+         rsx_upscale* up = ld_up_get();
+@@ -15994,7 +16319,7 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
+                 src = (ID3D12Resource*)ur.resource;
+                 src_state = (D3D12_RESOURCE_STATES)ur.state;
+                 src->lpVtbl->GetDesc(src, &sd);
+-                dm_filter = 1;   /* 1:1 into the rectangle: point */
++                dm_filter = RSX_DM_NEAREST;   /* 1:1 into the rectangle: point */
+             }
+         }
+     }
+@@ -16013,17 +16338,22 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
+     gpu.ptr += (u64)base * g.srv_step;
+ 
+     D3D12_RESOURCE_BARRIER b[2] = {0};
+-    for (int q = 0; q < 2; q++) {
+-        b[q].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-        b[q].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    u32 nb = 0;
++    if (src_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
++        b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[nb].Transition.pResource = src;
++        b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[nb].Transition.StateBefore = src_state;
++        b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        nb++;
+     }
+-    b[0].Transition.pResource = src;
+-    b[0].Transition.StateBefore = src_state;
+-    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+-    b[1].Transition.pResource = bb;
+-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+-    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[nb].Transition.pResource = bb;
++    b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++    b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    nb++;
++    g.list->lpVtbl->ResourceBarrier(g.list, nb, b);
+     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(bbi);
+     static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+     g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, black, 0, NULL);
+@@ -16040,11 +16370,22 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
+     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+     g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+-    b[0].Transition.StateAfter = src_state;
+-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    nb = 0;
++    if (src_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
++        b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[nb].Transition.pResource = src;
++        b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        b[nb].Transition.StateAfter = src_state;
++        nb++;
++    }
++    b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[nb].Transition.pResource = bb;
++    b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++    nb++;
++    g.list->lpVtbl->ResourceBarrier(g.list, nb, b);
+     return 1;
+ }
+ 
+@@ -17803,22 +18144,29 @@ static int ld_gamma_pipeline(void)
+     return 1;
+ }
+ 
+-/* Returns the gamma-corrected copy (state COPY_SOURCE) of presented surface i, or NULL when no correction applies.
+- * The surface is left in RENDER_TARGET state. Recorded into the open list. */
+-static ID3D12Resource* ld_gamma_present(u32 i)
++/* Returns a gamma-corrected copy in COPY_SOURCE state, or NULL when no
++ * correction applies. The source is restored to source_state. */
++static ID3D12Resource* ld_gamma_present_resource(
++    ID3D12Resource* source, D3D12_RESOURCE_STATES source_state,
++    u32 width, u32 height, u32 location, u32 offset)
+ {
+     const float gm = cellAvconfExt_display_gamma();
+-    if (!ld_gamma_enabled() || !(gm > 0.0f) || gm == 1.0f || i >= MAX_SURFACES) return NULL;
+-    surface_t* sf = &g.surfaces[i];
+-    if (!sf->tex || sf->fmt != DXGI_FORMAT_R8G8B8A8_UNORM) return NULL;
+-    if (!ld_gamma_pipeline() || !ld_host_aa_target(sf->w, sf->h)) return NULL;
++    if (!ld_gamma_enabled() || !(gm > 0.0f) || gm == 1.0f || !source) return NULL;
++    D3D12_RESOURCE_DESC source_desc;
++    source->lpVtbl->GetDesc(source, &source_desc);
++    if (source_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM) return NULL;
++    if (!ld_gamma_pipeline() || !ld_host_aa_target(width, height)) return NULL;
+     if (g.srv_ring_used >= SRV_RING_TABLES) return NULL;
+     const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+-    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(SRV_SURFACE_BASE + i),
+-                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {0};
++    srv.Format = source_desc.Format;
++    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    srv.Texture2D.MipLevels = 1;
++    g.dev->lpVtbl->CreateShaderResourceView(g.dev, source, &srv, cpu);
+     cpu.ptr += g.srv_step;
+     g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(UAV_HOST_AA),
+                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+@@ -17830,9 +18178,9 @@ static ID3D12Resource* ld_gamma_present(u32 i)
+     D3D12_RESOURCE_BARRIER b[2] = {0};
+     u32 nb = 0;
+     b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-    b[nb].Transition.pResource = sf->tex;
++    b[nb].Transition.pResource = source;
+     b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+-    b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[nb].Transition.StateBefore = source_state;
+     b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+     nb++;
+     if (g_aa_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+@@ -17852,13 +18200,13 @@ static ID3D12Resource* ld_gamma_present(u32 i)
+     g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 1, gpu_uav);
+     {
+         const float inv = gm, pad = 0.0f;
+-        UINT k[4] = { sf->w, sf->h, 0, 0 };
++        UINT k[4] = { width, height, 0, 0 };
+         memcpy(&k[2], &inv, 4); memcpy(&k[3], &pad, 4);
+         g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 4, k, 0);
+     }
+-    g.list->lpVtbl->Dispatch(g.list, (sf->w + 7u) / 8u, (sf->h + 7u) / 8u, 1);
++    g.list->lpVtbl->Dispatch(g.list, (width + 7u) / 8u, (height + 7u) / 8u, 1);
+     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+-    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[0].Transition.StateAfter = source_state;
+     b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+     b[1].Transition.pResource = g_aa_tex;
+     b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+@@ -17867,11 +18215,21 @@ static ID3D12Resource* ld_gamma_present(u32 i)
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+     g_aa_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+     if (g_gm_logged++ < 3)
+-        fprintf(stderr, "[gamma] scan-out gamma %.3f on surface %u:0x%08X %ux%u (frame %u)\n", gm, sf->location, sf->offset,
+-                sf->w, sf->h, g_ld_frames);
++        fprintf(stderr, "[gamma] scan-out gamma %.3f on surface %u:0x%08X %ux%u (frame %u)\n", gm, location, offset,
++                width, height, g_ld_frames);
+     return g_aa_tex;
+ }
+ 
++static ID3D12Resource* ld_gamma_present(u32 i)
++{
++    if (i >= MAX_SURFACES) return NULL;
++    surface_t* sf = &g.surfaces[i];
++    if (!sf->tex) return NULL;
++    return ld_gamma_present_resource(
++        sf->tex, D3D12_RESOURCE_STATE_RENDER_TARGET,
++        sf->w, sf->h, sf->location, sf->offset);
++}
++
+ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+ {
+     static int en = -1;
+@@ -17891,7 +18249,57 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+         /* Patch 2023: a copy of a whole frame-sized colour surface is the
+          * scene leaving for the SPU post chain (KZ3: local 0x1300000 -> main
+          * 0x1310400, where SPU MLAA ran); the host AA pass runs on it first. */
+-        if (r0 <= s0 && r1 >= s1) ld_host_aa(i);
++        if (r0 <= s0 && r1 >= s1) {
++#if defined(KZ3_XESS)
++            if (g_dm_filter == RSX_DM_XESS &&
++                (g_xess_responsive_frame != g_ld_frames ||
++                 g_xess_responsive_context_generation !=
++                     g_xess_context_generation) &&
++                kz3_xess_is_scene_target(
++                    sf->offset,
++                    sf->w,
++                    sf->h,
++                    sf->location == 0u,
++                    g.width,
++                    g.height)) {
++                const kz3_xess_capture_key pre_upscale = {
++                    g_ld_frames,
++                    g_xess_context_generation,
++                    i,
++                    sf->w,
++                    sf->h,
++                    (uintptr_t)sf->tex
++                };
++                if (kz3_xess_capture_pair_matches(
++                        &g_xess_opaque_capture, &pre_upscale) &&
++                    kz3_xess_capture_pre_upscale_color(
++                        g.list, sf->tex, sf->w, sf->h)) {
++                    static u32 capture_logs;
++                    g_xess_responsive_frame = g_ld_frames;
++                    g_xess_responsive_context_generation =
++                        g_xess_context_generation;
++                    if (capture_logs++ < 4)
++                        fprintf(stderr,
++                                "[xess] frame %u: captured "
++                                "opaque-plus-translucent scene\n",
++                                g_ld_frames);
++                }
++            }
++            if (g_dm_filter == RSX_DM_XESS &&
++                g_xess_camera_frame == g_ld_frames &&
++                kz3_xess_is_scene_target(
++                    sf->offset,
++                    sf->w,
++                    sf->h,
++                    sf->location == 0u,
++                    g.width,
++                    g.height))
++                ld_xess_capture_depth();
++            /* Patch 2149: no spatial AA on jittered samples; XeSS is the frame's anti-aliasing. */
++            if (!ld_xess_frame_jittered())
++#endif
++            ld_host_aa(i);
++        }
+     }
+     LDW_T0(wb_t0);
+     ld_wb_cap_note(n, 0);
+@@ -18064,6 +18472,187 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
+     fflush(stderr);
+ }
+ 
++#if defined(KZ3_XESS)
++static ID3D12Resource* ld_xess_present(
++    u32 target, surface_t* surface, u32* output_width, u32* output_height)
++{
++    static int last_reason = -1;
++    static u32 success_logs;
++    enum {
++        XESS_BYPASS_NONE,
++        XESS_BYPASS_NO_SCALE,
++        XESS_BYPASS_COLOR,
++        XESS_BYPASS_DEPTH,
++        XESS_BYPASS_CAMERA,
++        XESS_BYPASS_CONTEXT,
++        XESS_BYPASS_DISPATCH
++    };
++    int reason = XESS_BYPASS_NONE;
++    const char* detail = NULL;
++    if (g_dm_filter != RSX_DM_XESS) {
++        g_xess_last_dispatch_frame = UINT32_MAX;
++        g_xess_have_last_camera = 0;
++        if (kz3_xess_has_context()) {   /* switched away: the memory goes back at once, not at exit */
++            ld_flush(LD_FLUSH_RETIRE_QUEUE);
++            if (g.ready) ld_xess_forget();
++        }
++        return NULL;
++    }
++
++    const rsx_dm_rect output = rsx_dm_rect_for(
++        (int)g.width, (int)g.height,
++        (int)g_dm_bb_w, (int)g_dm_bb_h,
++        ld_dm_scaling_now(), RSX_DM_BILINEAR);
++    u32 xess_output_w, xess_output_h;
++    ld_xess_output_size(
++        (u32)output.w, (u32)output.h, &xess_output_w, &xess_output_h);
++    if (xess_output_w < surface->w || xess_output_h < surface->h ||
++        (xess_output_w == surface->w && xess_output_h == surface->h)) {
++        reason = XESS_BYPASS_NO_SCALE;
++        detail = "the output is not larger than the render image";
++        goto bypass;
++    }
++    if (!surface->tex || surface->fmt != DXGI_FORMAT_R8G8B8A8_UNORM ||
++        surface->w != g.width || surface->h != g.height) {
++        reason = XESS_BYPASS_COLOR;
++        detail = "the scanout color is not the primary RGBA8 render image";
++        goto bypass;
++    }
++    if (g_xess_context_failed_frame == g_ld_frames) {   /* before the camera check: it would blame the camera */
++        reason = XESS_BYPASS_CONTEXT;
++        detail = kz3_xess_status();
++        goto bypass;
++    }
++    if (g_xess_zframe != g_ld_frames ||
++        !g_xess_zslot ||
++        g_xess_zslot > g.n_zdepths) {
++        reason = XESS_BYPASS_DEPTH;
++        detail = "no current full-resolution deferred depth pass was recorded";
++        goto bypass;
++    }
++
++    {
++        kz3_xess_camera_state camera = g_xess_camera;
++        if (g_xess_camera_frame != g_ld_frames ||
++            !(camera.flags & KZ3_XESS_CAMERA_PLANES_VALID) ||
++            (camera.flags & KZ3_XESS_CAMERA_MULTIPLE_VIEWS)) {
++            reason = XESS_BYPASS_CAMERA;
++            detail = "no coherent single-view camera and projection are available";
++            goto bypass;
++        }
++        if (!ld_xess_ensure_context(xess_output_w, xess_output_h, 1)) {
++            reason = XESS_BYPASS_CONTEXT;
++            detail = kz3_xess_status();
++            goto bypass;
++        }
++        if (!ld_xess_capture_depth()) {
++            reason = XESS_BYPASS_DEPTH;
++            detail = "the primary depth snapshot is unavailable or mismatched";
++            goto bypass;
++        }
++
++        /* Patch 2149: the camera must have moved on by one flip since the last dispatch. The same flip again means no
++         * camera motion, whatever delta that state carries; a skipped flip means the history no longer lines up. */
++        const enum kz3_xess_camera_step step = kz3_xess_camera_step_from(
++            g_xess_have_last_camera, g_xess_last_camera_flip, camera.guest_flip);
++        if (step == KZ3_XESS_CAMERA_STEP_REPEAT) {
++            kz3_xess_camera_hold(&camera);
++            g_xess_camera_repeats++;
++        } else if (step == KZ3_XESS_CAMERA_STEP_JUMP) {
++            g_xess_camera_jumps++;
++        }
++
++        D3D12_RESOURCE_BARRIER input = {0};
++        input.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        input.Transition.pResource = surface->tex;
++        input.Transition.Subresource =
++            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        input.Transition.StateBefore =
++            D3D12_RESOURCE_STATE_RENDER_TARGET;
++        input.Transition.StateAfter =
++            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &input);
++
++        kz3_xess_camera_dispatch_desc dispatch = {0};
++        dispatch.command_list = g.list;
++        dispatch.color = surface->tex;
++        dispatch.camera = camera;
++        dispatch.render_width = surface->w;
++        dispatch.render_height = surface->h;
++        dispatch.output_width = xess_output_w;
++        dispatch.output_height = xess_output_h;
++        dispatch.jitter_x =
++            g_xess_jitter_frame == g_ld_frames ? g_xess_jitter_x : 0.0f;
++        dispatch.jitter_y =
++            g_xess_jitter_frame == g_ld_frames ? g_xess_jitter_y : 0.0f;
++        dispatch.use_responsive_mask =
++            g_xess_responsive_frame == g_ld_frames &&
++            g_xess_responsive_context_generation ==
++                g_xess_context_generation;
++        dispatch.use_hud_mask =
++            ld_xess_hud_mask_on() &&
++            g_xess_compose_frame == g_ld_frames &&
++            g_xess_compose_context_generation == g_xess_context_generation &&
++            g_xess_compose_resource == (uintptr_t)surface->tex;
++        dispatch.reset =
++            step == KZ3_XESS_CAMERA_STEP_JUMP ||
++            g_xess_last_dispatch_frame == UINT32_MAX ||
++            g_ld_frames != g_xess_last_dispatch_frame + 1u ||
++            g_xess_context_generation !=
++                g_xess_last_dispatch_context_generation;
++        ID3D12Resource* result = kz3_xess_dispatch_camera(&dispatch);
++        LD_SM_INVALIDATE();
++
++        input.Transition.StateBefore =
++            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++        input.Transition.StateAfter =
++            D3D12_RESOURCE_STATE_RENDER_TARGET;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &input);
++        if (!result) {
++            reason = XESS_BYPASS_DISPATCH;
++            detail = kz3_xess_status();
++            goto bypass;
++        }
++
++        *output_width = xess_output_w;
++        *output_height = xess_output_h;
++        g_xess_last_dispatch_frame = g_ld_frames;
++        g_xess_last_dispatch_context_generation =
++            g_xess_context_generation;
++        g_xess_last_camera_flip = camera.guest_flip;
++        g_xess_have_last_camera = 1;
++        g_xess_jitter_hold = 0;
++        last_reason = XESS_BYPASS_NONE;
++        if (success_logs++ < 4)
++            fprintf(stderr,
++                    "[xess] frame %u: XeSS-SR 2.0.2 %ux%u -> %ux%u, "
++                    "depth-aware camera motion, responsive=%s, hud=%s, "
++                    "mip bias %.3f, jitter %.4f/%.4f, reset=%u\n",
++                    g_ld_frames, surface->w, surface->h,
++                    *output_width, *output_height,
++                    dispatch.use_responsive_mask ? "generated" : "none",
++                    dispatch.use_hud_mask ? "masked" : "none",
++                    g_xess_mip_bias_fp / 256.0f,
++                    dispatch.jitter_x, dispatch.jitter_y,
++                    dispatch.reset ||
++                        (camera.flags & KZ3_XESS_CAMERA_RESET));
++        return result;
++    }
++
++bypass:
++    g_xess_last_dispatch_frame = UINT32_MAX;
++    g_xess_have_last_camera = 0;
++    if (ld_xess_frame_jittered()) g_xess_jitter_hold = 1;   /* Bilinear must not show a jittered scene frame after frame */
++    if (reason != last_reason) {
++        last_reason = reason;
++        fprintf(stderr,
++                "[xess] unavailable, bilinear fallback: %s (frame %u)\n",
++                detail ? detail : "unknown reason", g_ld_frames);
++    }
++    return NULL;
++}
++#endif
++
+ static void ld_present_body(u32 buffer_id)
+ {
+     if (!g.ready) return;
+@@ -18283,37 +18872,102 @@ static void ld_present_body(u32 buffer_id)
+           ld_trace_target("present", target, buffer_id);
+           last_present_target = target;
+       } }
+-    ID3D12Resource* srcimg = presented_surface->tex;
+-    ID3D12Resource* gm_copy = ld_gamma_present(target);   /* patch 2070 */
+     ld_dm_sync_size();                                    /* patch 2095: back buffers at the client size */
++    ID3D12Resource* srcimg = presented_surface->tex;
++    ID3D12Resource* upscale = NULL;
++    u32 upscale_w = presented_surface->w, upscale_h = presented_surface->h;
++#if defined(KZ3_XESS)
++    upscale = ld_xess_present(target, presented_surface, &upscale_w, &upscale_h);
++#endif
++    ID3D12Resource* scanout = upscale ? upscale : srcimg;
++    D3D12_RESOURCE_STATES scanout_state = upscale
++        ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
++        : D3D12_RESOURCE_STATE_RENDER_TARGET;
++    ID3D12Resource* gm_copy = upscale
++        ? ld_gamma_present_resource(
++            upscale, scanout_state, upscale_w, upscale_h,
++            presented_surface->location, presented_surface->offset)
++        : ld_gamma_present(target);                       /* patch 2070: after the scaling filter */
++    ID3D12Resource* present_image = gm_copy ? gm_copy : scanout;
++    D3D12_RESOURCE_STATES present_state = gm_copy
++        ? D3D12_RESOURCE_STATE_COPY_SOURCE : scanout_state;
+     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+     ID3D12Resource* bb = g.backbuf[bbi];
+     /* patch 2095: a client of another size gets the image scaled aspect-correct, else the old copy */
+-    const int dm_scaled = (g_dm_bb_w != g.width || g_dm_bb_h != g.height) &&
+-        ld_dm_blit(gm_copy ? gm_copy : srcimg,
+-                   gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET, bbi);
+-    if (!dm_scaled) {
++    int dm_scaled = (upscale || g_dm_bb_w != g.width || g_dm_bb_h != g.height) &&
++        ld_dm_blit(present_image, present_state, bbi);
++#if defined(KZ3_XESS)
++    if (upscale && !dm_scaled) {
++        static u32 fallback_logs;
++        if (fallback_logs++ < 4)
++            fprintf(stderr,
++                    "[xess] display blit failed, bilinear fallback (frame %u)\n",
++                    g_ld_frames);
++        present_image = srcimg;
++        present_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        dm_scaled = (g_dm_bb_w != g.width || g_dm_bb_h != g.height) &&
++            ld_dm_blit(present_image, present_state, bbi);
++    }
++#endif
++    D3D12_RESOURCE_DESC present_desc, backbuffer_desc;
++    present_image->lpVtbl->GetDesc(present_image, &present_desc);
++    bb->lpVtbl->GetDesc(bb, &backbuffer_desc);
++    const int copy_compatible =
++        present_desc.Dimension == backbuffer_desc.Dimension &&
++        present_desc.Width == backbuffer_desc.Width &&
++        present_desc.Height == backbuffer_desc.Height &&
++        present_desc.DepthOrArraySize == backbuffer_desc.DepthOrArraySize &&
++        present_desc.MipLevels == backbuffer_desc.MipLevels &&
++        present_desc.Format == backbuffer_desc.Format &&
++        present_desc.SampleDesc.Count == backbuffer_desc.SampleDesc.Count &&
++        present_desc.SampleDesc.Quality == backbuffer_desc.SampleDesc.Quality;
++    if (!dm_scaled && !copy_compatible) {
++        static u32 mismatch_logs;
++        if (mismatch_logs++ < 4)
++            fprintf(stderr,
++                    "[display] scaling failed; refusing mismatched CopyResource "
++                    "%llux%u -> %llux%u (frame %u)\n",
++                    (unsigned long long)present_desc.Width,
++                    present_desc.Height,
++                    (unsigned long long)backbuffer_desc.Width,
++                    backbuffer_desc.Height,
++                    g_ld_frames);
++    }
++    if (!dm_scaled && copy_compatible) {
+ 
+     D3D12_RESOURCE_BARRIER bar[2] = {0};
+-    bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-    bar[0].Transition.pResource = srcimg;
+-    bar[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+-    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-    bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+-    bar[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-    bar[1].Transition.pResource = bb;
+-    bar[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+-    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+-    bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+-
+-    g.list->lpVtbl->CopyResource(g.list, bb, gm_copy ? gm_copy : srcimg);
+-
+-    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+-    bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+-    bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
++    u32 nbar = 0;
++    if (present_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
++        bar[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        bar[nbar].Transition.pResource = present_image;
++        bar[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        bar[nbar].Transition.StateBefore = present_state;
++        bar[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        nbar++;
++    }
++    bar[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    bar[nbar].Transition.pResource = bb;
++    bar[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    bar[nbar].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++    bar[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++    nbar++;
++    g.list->lpVtbl->ResourceBarrier(g.list, nbar, bar);
++
++    g.list->lpVtbl->CopyResource(g.list, bb, present_image);
++
++    nbar = 0;
++    if (present_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
++        bar[nbar].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        bar[nbar].Transition.StateAfter = present_state;
++        nbar++;
++    }
++    bar[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    bar[nbar].Transition.pResource = bb;
++    bar[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    bar[nbar].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++    bar[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++    nbar++;
++    g.list->lpVtbl->ResourceBarrier(g.list, nbar, bar);
+     }   /* patch 2095 */
+ 
+     ld_flush(LD_FLUSH_PRESENT);
+@@ -19246,12 +19900,20 @@ unsigned long long rsx_perf_fifo_flips(void) { return g_ld_flip_consumed; }
+ 
+ void rsx_live_draw_shutdown(void)
+ {
+-    if (!g.ready) return;
++    if (!g.ready) {
++#if defined(KZ3_XESS)
++        ld_xess_forget();
++#endif
++        return;
++    }
+     ld_vertex_diag_emit("shutdown", 1);
+     ld_present_measure_dump();
+     /* let the GPU drain, then release. (Best-effort; process teardown also
+      * reclaims.) */
+     ld_flush(LD_FLUSH_SHUTDOWN);
++#if defined(KZ3_XESS)
++    ld_xess_forget();
++#endif
+ #if defined(YZ_PERF_PROFILE)
+     fprintf(stderr,
+             "[rsx-perf-summary] frames=%u "
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index 9580d9a..218361d 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -66,7 +66,7 @@ static int s_present_suppressed = 0;
+ extern int rsx_live_draw_set_fullscreen(int on);   /* 1 taken, 0 refused, -1 no swap chain yet, -2 DXGI mode change in progress (rsx_live_draw.c) */
+ extern int rsx_live_draw_is_fullscreen(void);
+ extern int rsx_live_draw_take_present_failure(void);   /* patch 2130 */
+-extern void rsx_live_draw_set_scaling(int scaling, int filter);   /* Fit/Stretch, Bilinear/Nearest */
++extern void rsx_live_draw_set_scaling(int scaling, int filter);   /* Fit/Stretch, Bilinear/Nearest/XeSS-SR */
+ extern void rsx_live_draw_set_vsync(int on);   /* patch 2103 */
+ 
+ #define RSX_DM_WM_SET (WM_APP + 0x95)
+@@ -260,7 +260,7 @@ static int rsx_dm_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res
+     if (msg == RSX_DM_WM_SCALE) {
+         const int sc = (int)wp - 1, f = (int)lp - 1;
+         if (sc == RSX_DM_FIT || sc == RSX_DM_STRETCH) s_dm_scaling = sc;
+-        if (f == RSX_DM_BILINEAR || f == RSX_DM_NEAREST) s_dm_filter = f;
++        if (f == RSX_DM_BILINEAR || f == RSX_DM_NEAREST || f == RSX_DM_XESS) s_dm_filter = f;
+         rsx_live_draw_set_scaling(s_dm_scaling, s_dm_filter);
+         rsx_dm_log_client("Options scaling");
+         rsx_dm_save_now();
+@@ -283,7 +283,7 @@ static int rsx_dm_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res
+ 
+ /* KZ3_TEST_DISPLAY="S:action,S:action,...": at S seconds after the window opened, `altenter` (a WM_SYSKEYDOWN
+  * VK_RETURN with the Alt bit, posted, so the window procedure's own path runs), `windowed|borderless|fullscreen` (as
+- * the Options row), `fit|stretch`, `bilinear|nearest`, `resize=WxH` (client size, windowed), `log`. */
++ * the Options row), `fit|stretch`, `bilinear|nearest|xess`, `resize=WxH` (client size, windowed), `log`. */
+ static void rsx_dm_script_step(void)
+ {
+     double t;
+@@ -344,7 +344,7 @@ static void rsx_dm_init_window(void)
+         const char* ef = getenv("KZ3_DISPLAY_FILTER");
+         const int vs = es && *es ? rsx_dm_parse_scaling(es) : -1, vf = ef && *ef ? rsx_dm_parse_filter(ef) : -1;
+         if (es && *es && vs < 0) printf("[display] KZ3_DISPLAY_SCALING=%s not understood (fit|stretch)\n", es);
+-        if (ef && *ef && vf < 0) printf("[display] KZ3_DISPLAY_FILTER=%s not understood (bilinear|nearest)\n", ef);
++        if (ef && *ef && vf < 0) printf("[display] KZ3_DISPLAY_FILTER=%s not understood (bilinear|nearest|xess)\n", ef);
+         if (vs >= 0 || vf >= 0) s_dm_env = 1;
+         s_dm_scaling = vs >= 0 ? vs : s_dm_cfg_scaling >= 0 ? s_dm_cfg_scaling : RSX_DM_SCALING_DEFAULT;
+         s_dm_filter = vf >= 0 ? vf : s_dm_cfg_filter >= 0 ? s_dm_cfg_filter : RSX_DM_BILINEAR;

@@ -78,6 +78,23 @@ def fake_repo(root):
     put(root, "work/release/fonts/OFL-rajdhani.txt", "SIL OPEN FONT LICENSE Version 1.1\n")
     put(root, "work/release/sdl3/SDL3.dll", fake_dll(3 << 20))   # over the 2 MiB binary cap on purpose
     put(root, "work/release/sdl3/LICENSE.txt", "Copyright (C) 1997-2026 Sam Lantinga\n")
+    xess = fake_dll(4096)
+    xess_license = b"Intel XeSS software license\n"
+    xess_notices = b"Intel XeSS third-party programs\n"
+    put(root, "work/release/xess/libxess.dll", xess)
+    put(root, "work/release/xess/LICENSE.txt", xess_license)
+    put(root, "work/release/xess/third-party-programs.txt", xess_notices)
+    ap.XESS_PINS = {
+        ap.XESS_DEST[0]: (len(xess), hashlib.sha256(xess).hexdigest()),
+        ap.XESS_DEST[1]: (
+            len(xess_license),
+            hashlib.sha256(xess_license).hexdigest(),
+        ),
+        ap.XESS_DEST[2]: (
+            len(xess_notices),
+            hashlib.sha256(xess_notices).hexdigest(),
+        ),
+    }
     put(root, "installer/art/art.json", json.dumps({"format": 1, "fonts_sha256": pins}))
 
 
@@ -143,7 +160,9 @@ def main():
                 "licenses/ps3recomp-LICENSE.txt", "licenses/at3_standalone-COPYING.LGPLv2.1.txt", "licenses/FidelityFX-FSR1-LICENSE.txt",
                 "README.md", "NOTICE.md", "run.cmd", "manifest.json", "VERSION.txt",
                 "fonts/Rajdhani-Medium.ttf", "fonts/Rajdhani-Bold.ttf", "licenses/Rajdhani-OFL.txt",
-                "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt"}
+                "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt",
+                "runtime/libxess.dll", "licenses/Intel-XeSS-LICENSE.txt",
+                "licenses/Intel-XeSS-THIRD-PARTY-NOTICES.txt"}
         check(got == want, "payload holds exactly the allowlisted files",
               f"extra {sorted(got - want)} missing {sorted(want - got)}")
         # profile_edit.py finds its level table where it looks for it in the repo (parents[2]/re/data)
@@ -292,6 +311,57 @@ def main():
         put(repo, "work/release/sdl3/LICENSE.txt", "Copyright (C) 1997-2026 Sam Lantinga\n")
         rc, txt = run(["--repo", repo, "--dry-run"])
         check(rc == 0, "SDL3.dll + licence restored: payload assembles again", txt)
+
+        # XeSS-SR: the exact official runtime, licence, and third-party notices are inseparable.
+        xdir = os.path.join(repo, "work", "release", "xess")
+        xdll = os.path.join(xdir, "libxess.dll")
+        with open(xdll, "rb") as f:
+            xess_good = f.read()
+        xess_pins = dict(ap.XESS_PINS)
+        os.remove(xdll)
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(
+            rc == 1 and "MISSING" in txt and "stage_xess.py" in txt,
+            "a payload without libxess.dll is refused with the fix",
+            txt,
+        )
+        bad_xess = fake_dll(4096, machine=0x14C)
+        put(repo, "work/release/xess/libxess.dll", bad_xess)
+        ap.XESS_PINS[ap.XESS_DEST[0]] = (
+            len(bad_xess),
+            hashlib.sha256(bad_xess).hexdigest(),
+        )
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(
+            rc == 1
+            and "SCRUB FAIL runtime/libxess.dll" in txt
+            and "AMD64" in txt,
+            "a 32-bit XeSS runtime is refused",
+            txt,
+        )
+        ap.XESS_PINS = xess_pins
+        put(repo, "work/release/xess/libxess.dll", xess_good + b"x")
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(
+            rc == 1 and "SHA-256 differs" in txt,
+            "a changed XeSS runtime is refused",
+            txt,
+        )
+        put(repo, "work/release/xess/libxess.dll", xess_good)
+        os.remove(os.path.join(xdir, "third-party-programs.txt"))
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(
+            rc == 1 and "third-party-programs.txt" in txt,
+            "XeSS without its third-party notices is refused",
+            txt,
+        )
+        put(
+            repo,
+            "work/release/xess/third-party-programs.txt",
+            b"Intel XeSS third-party programs\n",
+        )
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 0, "complete XeSS files restored: payload assembles again", txt)
 
         put(repo, "port/kz3/notes.txt", "see %USERPROFILE%\\logs and C:\\Users\\<name>\\x, /home/ is fine\n")
         rc, txt = run(["--repo", repo, "--dry-run"])

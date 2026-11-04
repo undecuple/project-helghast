@@ -228,8 +228,9 @@ Source: "art\kz3-uninstall.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; never installed on the system. The payload itself carries fonts\Rajdhani-Medium.ttf and -Bold.ttf (the game's error
 ; notice; firstrun.py and the launcher copy them next to build\kz3.exe) and licenses\Rajdhani-OFL.txt
 ; (assemble_payload.py FONTS, hash-checked against art\art.json like this one).
-; The payload also carries runtime\SDL3.dll (zlib; licenses\SDL3-LICENSE.txt): installed by the line above with the rest
-; of {app}, copied next to build\kz3.exe by firstrun.py and the launcher (place_sdl3); the game loads it for native pads.
+; The payload also carries runtime\SDL3.dll (zlib; licenses\SDL3-LICENSE.txt) and Intel's unmodified signed
+; runtime\libxess.dll (Intel XeSS terms; licenses\Intel-XeSS-LICENSE.txt and third-party notices). They are installed
+; by the line above and copied next to build\kz3.exe by firstrun.py and the launcher.
 Source: "{#FontDir}\Rajdhani-Bold.ttf"; Flags: dontcopy
 ; Advanced: "Copy the game files into the install" (opt-in, ~33 GB) with Inno's own progress, so the
 ; originals may go. The update keeps RPCS3's dev_hdd0\game\<disc title id> layout (BCUS98234, or BCES01007 / BCAS25008 / BCJS30066 for the other regions) (launch.rpcs3_hdd0). Never removed

@@ -889,13 +889,13 @@ NOTICE_FONTS = ("Rajdhani-Medium.ttf", "Rajdhani-Bold.ttf")
 
 
 SDL3_PAYLOAD = "runtime/SDL3.dll"
+XESS_PAYLOAD = "runtime/libxess.dll"
 
 
-def place_sdl3(root, build):
-    """Copy <root>/runtime/SDL3.dll (shipped in the payload, assemble_payload SDL3_DEST) next to <build>/kz3.exe: the game
-    loads it from its own folder for native pads (patch 4010; without it pads fall back to XInput). Copies only a missing
-    or different file (size, then hash); -> True when it copied. Called after every build and by the launcher."""
-    src, dst = os.path.join(root, *SDL3_PAYLOAD.split("/")), os.path.join(build, "SDL3.dll")
+def place_runtime_dll(root, build, payload_path):
+    """Copy one payload runtime beside kz3.exe when it is missing or different."""
+    src = os.path.join(root, *payload_path.split("/"))
+    dst = os.path.join(build, os.path.basename(payload_path))
     if not os.path.isfile(src):
         return False
     if os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(src) and file_sha256(dst) == file_sha256(src):
@@ -903,6 +903,16 @@ def place_sdl3(root, build):
     os.makedirs(build, exist_ok=True)
     shutil.copyfile(src, dst)
     return True
+
+
+def place_sdl3(root, build):
+    """Place SDL3 beside kz3.exe for native pad support."""
+    return place_runtime_dll(root, build, SDL3_PAYLOAD)
+
+
+def place_xess(root, build):
+    """Place the signed XeSS-SR runtime beside kz3.exe; it is inert unless XeSS is selected."""
+    return place_runtime_dll(root, build, XESS_PAYLOAD)
 
 
 def place_fonts(root, build):
@@ -973,6 +983,7 @@ def after_stamp(c):
     place_fonts(c.root, c.build)
     place_lang(c.root, c.build)
     place_sdl3(c.root, c.build)
+    place_xess(c.root, c.build)
     record_sources(c)
     stamp = {"inputs": c.fingerprint(("lift", "runtime")), "parts": c.parts(), "version": port_version(c.root),
              "eboot_stat": eboot_stat(c.eboot), "facts": c.facts, "jobs": c.jobs,

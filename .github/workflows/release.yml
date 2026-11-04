@@ -9,11 +9,13 @@
 # The release is created as a draft: the maintainer reads the notes and publishes it.
 #
 # Third-party pieces: actions/checkout and actions/upload-artifact (GitHub, MIT), Inno Setup 6.7.3 (Inno Setup
-# License; the vendor installer, pinned by SHA-256, when the runner image lacks it), the gh CLI (MIT, on the image); downloads at build time,
-# each pinned by SHA-256 in tools/release/toolchain.json or installer/art/art.json: llvm-mingw (Apache-2.0 WITH
+# License; the vendor installer, pinned by SHA-256, when the runner image lacks it), the gh CLI (MIT, on the image);
+# downloads at build time, each pinned in tools/release/toolchain.json, installer/art/art.json, or the XeSS staging
+# step and tools/release/stage_xess.py: llvm-mingw (Apache-2.0 WITH
 # LLVM-exception; mingw-w64 and winpthreads licences), the Python embeddable package (PSF), CMake (BSD-3-Clause),
-# Ninja (Apache-2.0), Rajdhani (SIL OFL 1.1).
-# Nothing of the game is used or produced here: the installer carries sources, the toolkit and the toolchain only.
+# Ninja (Apache-2.0), Rajdhani (SIL OFL 1.1), Intel XeSS SDK 3.0.2 (Intel binary redistribution terms).
+# Nothing of the game is used or produced here: the installer carries the port, its runtime dependencies, the
+# toolkit, and the toolchain only.
 #
 # Published files (names from tools/release/names.py, checked by tools/release/test_names.py):
 #   Project-Helghast-setup.exe, Project-Helghast-setup.exe.sha256,
@@ -119,12 +121,42 @@ jobs:
           T=work/release/toolchain-cache/trees/sdl3
           python3 tools/release/stage_sdl3.py --dll "$T/SDL3.dll" --license "$T/LICENSE.txt"
 
+      - name: Intel XeSS SDK 3.0.2 (official signed SR runtime, SHA-256 pinned)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/intel/xess/releases/download/v3.0.2/XeSS_SDK_3.0.2.zip"
+          $archive = Join-Path $env:RUNNER_TEMP "XeSS_SDK_3.0.2.zip"
+          $sdk = Join-Path $env:RUNNER_TEMP "xess-sdk"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $got = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          $want = "88b8a373f30e33f3558a77a93e634f11b8132fc3047ea1a8edeead32b8471990"
+          if ($got -ne $want) {
+            Write-Error "XeSS SDK archive SHA-256 mismatch: got $got, expected $want"
+            exit 1
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $sdk
+          $dll = Join-Path $sdk "bin/libxess.dll"
+          $sig = Get-AuthenticodeSignature $dll
+          if ($sig.Status -ne "Valid") {
+            Write-Error "XeSS DLL Authenticode status is $($sig.Status): $($sig.StatusMessage)"
+            exit 1
+          }
+          if ($sig.SignerCertificate.Subject -notmatch "Intel Corporation" -or
+              $sig.SignerCertificate.Thumbprint -ne "2B81BFC21940CD420FC263C975FB41A79B643DF4") {
+            Write-Error "Unexpected XeSS signer: $($sig.SignerCertificate.Subject), $($sig.SignerCertificate.Thumbprint)"
+            exit 1
+          }
+          python tools/release/stage_xess.py --dll $dll `
+            --license (Join-Path $sdk "LICENSE.txt") `
+            --notices (Join-Path $sdk "third-party-programs.txt")
+
       - name: Assemble the payload
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           python3 tools/release/assemble_payload.py --out build/release-payload --version "$VERSION" \
-            --toolchain work/release/toolchain-cache --launcher "build/launcher/Project Helghast.exe"
+            --toolchain work/release/toolchain-cache --launcher "build/launcher/Project Helghast.exe" \
+            --xess work/release/xess
 
       - name: Inno Setup
         shell: pwsh

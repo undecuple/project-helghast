@@ -1,0 +1,296 @@
+KZ3 patch 2150 (ENHANCEMENT, experimental, diagnostics): opt-in XeSS jitter experiments and draw coverage.
+
+Built on patch 2149. With none of the switches set the Halton rendering of 2149 is unchanged. The switches scale the
+projection and the execute jitter independently (KZ3_XESS_PROJECTION_SCALE_X/Y, KZ3_XESS_EXECUTE_SCALE_X/Y, -2..2,
+default 1), choose an alternating two-phase sample (KZ3_XESS_JITTER_PATTERN=two-phase, default halton), lag the execute
+jitter by one contiguous valid frame (KZ3_XESS_EXECUTE_JITTER_LAG=1, default 0), and log the pre-submission draw
+eligibility every N frames (KZ3_XESS_JITTER_TRACE=N, default 0 = off). Lag resets across holds, failures and context
+changes. They exist to isolate the remaining whole-scene jitter (docs/XESS.md, "Known problems"). Parsing and counters
+are in port/kz3/xess_diagnostics.h, host-tested by tools/smoke/test_xess_diagnostics.c/.sh.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 477c5ee..54cec6c 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -103,6 +103,7 @@ void rsx_live_draw_shutdown(void) {}
+ #if defined(KZ3_XESS)
+ #include "xess.h"
+ #include "xess_inputs.h"
++#include "xess_diagnostics.h"
+ #endif
+ static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_surf = 0;
+ /* Set once PS1 VRAM actually holds a drawn frame (see the PS1_PC heartbeat).
+@@ -13810,7 +13811,13 @@ static u32 g_xess_last_dispatch_context_generation;
+ static kz3_xess_capture_key g_xess_opaque_capture;
+ static u32 g_xess_responsive_frame = UINT32_MAX;
+ static u32 g_xess_responsive_context_generation;
++static kz3_xess_diagnostic_history g_xess_diagnostic_history;
++static kz3_xess_diagnostic_sample g_xess_diagnostic_sample;
++static kz3_xess_diagnostic_coverage g_xess_diagnostic_coverage;
++static u32 g_xess_diagnostic_coverage_frame = UINT32_MAX;
++static int g_xess_diagnostic_held;
+ static int ld_xess_draw_jitter(u32 frame, float* x, float* y);
++static void ld_xess_diagnostic_draw(const kz3_xess_draw_info* draw, int shifted);
+ /* KZ3 patch 2149: see the patch header. */
+ static u32 g_xess_context_failed_frame = UINT32_MAX;   /* the draw-time init of that frame failed: kz3_xess_status() says why */
+ static int g_xess_jitter_hold;                         /* a jittered frame fell back: no jitter until a dispatch works */
+@@ -14860,6 +14867,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             xess_jitter = 1;
+             ld_xess_bias_samplers(texture_mask, smp_slots);
+         }
++        ld_xess_diagnostic_draw(&xess_draw, xess_jitter && (xess_jx != 0.0f || xess_jy != 0.0f));
+         xess_capture_opaque = kz3_xess_is_opaque_resolve(&xess_draw, g.width, g.height);
+     }
+ #endif
+@@ -16092,6 +16100,94 @@ static int ld_dm_scaling_now(void)
+     return (g_dm_present_n - g_dm_wide_n <= 3 && rsx_display_view_ratio() != 1.0) ? RSX_DM_STRETCH : g_dm_scaling;
+ }
+ #if defined(KZ3_XESS)
++/* One-run diagnostics: pattern defaults to halton, all four axis scales to 1, lag and trace interval to 0.
++ * The KZ3_XESS_* variable names and accepted values are documented in docs/XESS.md. */
++static const kz3_xess_diagnostic_config* ld_xess_diagnostic_config(void)
++{
++    static int read;
++    static kz3_xess_diagnostic_config config;
++    if (!read) {
++        read = 1;
++        config = kz3_xess_diagnostic_defaults();
++        const char* pattern = getenv("KZ3_XESS_JITTER_PATTERN");
++        if (pattern && strcmp(pattern, "halton") != 0) {
++            if (strcmp(pattern, "two-phase") == 0) {
++                config.two_phase = 1;
++            } else {
++                fprintf(stderr, "[xess-diag] invalid KZ3_XESS_JITTER_PATTERN='%.64s'; using halton\n", pattern);
++            }
++        }
++        static const char* const scale_names[] = {
++            "KZ3_XESS_PROJECTION_SCALE_X", "KZ3_XESS_PROJECTION_SCALE_Y",
++            "KZ3_XESS_EXECUTE_SCALE_X", "KZ3_XESS_EXECUTE_SCALE_Y"
++        };
++        float* scales[] = {
++            &config.projection_scale_x, &config.projection_scale_y,
++            &config.execute_scale_x, &config.execute_scale_y
++        };
++        for (u32 i = 0; i < sizeof(scale_names) / sizeof(scale_names[0]); ++i) {
++            const char* value = getenv(scale_names[i]);
++            if (value && !kz3_xess_diagnostic_parse_scale(value, scales[i]))
++                fprintf(stderr, "[xess-diag] invalid %s='%.64s'; using 1 (expected -2 to 2)\n",
++                        scale_names[i], value);
++        }
++        const char* lag = getenv("KZ3_XESS_EXECUTE_JITTER_LAG");
++        if (lag) {
++            if (strcmp(lag, "1") == 0) config.execute_lag = 1;
++            else if (strcmp(lag, "0") != 0)
++                fprintf(stderr, "[xess-diag] invalid KZ3_XESS_EXECUTE_JITTER_LAG='%.64s'; using 0\n", lag);
++        }
++        const char* interval = getenv("KZ3_XESS_JITTER_TRACE");
++        if (interval && !kz3_xess_diagnostic_parse_interval(interval, &config.trace_interval))
++            fprintf(stderr, "[xess-diag] invalid KZ3_XESS_JITTER_TRACE='%.64s'; using 0 (expected 0 to 60000)\n",
++                    interval);
++        if (kz3_xess_diagnostic_modified(&config) || config.trace_interval)
++            fprintf(stderr,
++                    "[xess-diag] pattern=%s projection-scale=%.3f/%.3f execute-scale=%.3f/%.3f "
++                    "execute-lag=%u trace-interval=%u\n",
++                    config.two_phase ? "two-phase" : "halton",
++                    config.projection_scale_x, config.projection_scale_y,
++                    config.execute_scale_x, config.execute_scale_y,
++                    config.execute_lag, config.trace_interval);
++    }
++    return &config;
++}
++
++static void ld_xess_diagnostic_draw(const kz3_xess_draw_info* draw, int shifted)
++{
++    if (g_dm_filter != RSX_DM_XESS || !ld_xess_diagnostic_config()->trace_interval) return;
++    if (g_xess_diagnostic_coverage_frame != draw->frame) {
++        memset(&g_xess_diagnostic_coverage, 0, sizeof g_xess_diagnostic_coverage);
++        g_xess_diagnostic_coverage_frame = draw->frame;
++    }
++    kz3_xess_diagnostic_count_draw(
++        &g_xess_diagnostic_coverage, draw, g.width, g.height, g_xess_zframe, g_xess_zslot, shifted,
++        g_xess_jitter_frame == draw->frame && g_xess_diagnostic_sample.active);
++}
++
++static void ld_xess_diagnostic_present(int dispatched)
++{
++    if (g_dm_filter != RSX_DM_XESS) return;
++    const kz3_xess_diagnostic_config* config = ld_xess_diagnostic_config();
++    if (!config->trace_interval || g_ld_frames % config->trace_interval) return;
++    kz3_xess_diagnostic_sample sample = {0};
++    kz3_xess_diagnostic_coverage coverage = {0};
++    if (g_xess_jitter_frame == g_ld_frames) sample = g_xess_diagnostic_sample;
++    if (g_xess_diagnostic_coverage_frame == g_ld_frames) coverage = g_xess_diagnostic_coverage;
++    fprintf(stderr,
++            "[xess-diag] frame=%u dispatch=%s sample=%d held=%d nominal=%.9g/%.9g "
++            "projection=%.9g/%.9g execute=%.9g/%.9g lag-applied=%d "
++            "draws=%u deferred=%u scene=%u other=%u shifted=%u partial-viewport=%u "
++            "depth-disabled=%u depth-mismatch=%u zero-projection=%u unavailable=%u\n",
++            g_ld_frames, dispatched ? "ok" : "fallback", sample.active,
++            g_xess_jitter_frame == g_ld_frames ? g_xess_diagnostic_held : 0,
++            sample.nominal_x, sample.nominal_y, sample.projection_x, sample.projection_y,
++            sample.execute_x, sample.execute_y, sample.lag_applied,
++            coverage.draws, coverage.deferred, coverage.scene, coverage.other, coverage.shifted,
++            coverage.partial_viewport, coverage.depth_disabled, coverage.depth_mismatch,
++            coverage.zero_projection, coverage.unavailable);
++}
++
+ static void ld_xess_output_size(u32 requested_w, u32 requested_h, u32* w, u32* h)
+ {
+     const u32 max_w = g.width <= UINT32_MAX / 3u ? g.width * 3u : UINT32_MAX;
+@@ -16114,8 +16210,14 @@ static int ld_xess_ensure_context(u32 output_w, u32 output_h, int may_flush)
+ {
+     const int changed =
+         g_xess_context_w != output_w || g_xess_context_h != output_h;
+-    if (kz3_xess_would_recreate(
+-            g.dev, g.width, g.height, output_w, output_h)) {
++    const int recreate = kz3_xess_would_recreate(
++        g.dev, g.width, g.height, output_w, output_h);
++    if (changed || recreate) {
++        g_xess_diagnostic_history.valid = 0;
++        if (g_xess_jitter_frame == g_ld_frames)
++            kz3_xess_diagnostic_clear_lag(ld_xess_diagnostic_config(), &g_xess_diagnostic_sample);
++    }
++    if (recreate) {
+         if (may_flush) {
+             ld_flush(LD_FLUSH_RETIRE_QUEUE);
+             if (!g.ready) return 0;
+@@ -16126,6 +16228,7 @@ static int ld_xess_ensure_context(u32 output_w, u32 output_h, int may_flush)
+     if (!kz3_xess_initialize(
+             g.dev, g.width, g.height, output_w, output_h)) {
+         g_xess_context_w = g_xess_context_h = 0;
++        g_xess_diagnostic_history.valid = 0;
+         return 0;
+     }
+     if (changed) {
+@@ -16182,6 +16285,8 @@ static int ld_xess_draw_jitter(u32 frame, float* x, float* y)
+         g_xess_jitter_frame = frame;
+         g_xess_camera_frame = UINT32_MAX;
+         g_xess_jitter_x = g_xess_jitter_y = 0.0f;
++        memset(&g_xess_diagnostic_sample, 0, sizeof g_xess_diagnostic_sample);
++        g_xess_diagnostic_held = g_xess_jitter_hold;
+         kz3_xess_camera_state camera;
+         const rsx_dm_rect output = rsx_dm_rect_for(
+             (int)g.width, (int)g.height,
+@@ -16194,25 +16299,40 @@ static int ld_xess_draw_jitter(u32 frame, float* x, float* y)
+             (camera.flags & KZ3_XESS_CAMERA_MULTIPLE_VIEWS) ||
+             output_w < g.width || output_h < g.height ||
+             (output_w == g.width && output_h == g.height)) {
++            g_xess_diagnostic_history.valid = 0;
+             return 0;
+         }
+         if (!ld_xess_ensure_context(output_w, output_h, 0)) {
+             g_xess_context_failed_frame = frame;
+             return 0;
+         }
++        if (g_xess_last_dispatch_frame == UINT32_MAX ||
++            frame != g_xess_last_dispatch_frame + 1u ||
++            (camera.flags & KZ3_XESS_CAMERA_RESET) ||
++            kz3_xess_camera_step_from(g_xess_have_last_camera, g_xess_last_camera_flip, camera.guest_flip) ==
++                KZ3_XESS_CAMERA_STEP_JUMP)
++            g_xess_diagnostic_history.valid = 0;
+         /* While held the frame is not jittered, but still goes through XeSS: that dispatch is the test that clears it. */
++        float halton_x = 0.0f, halton_y = 0.0f;
+         if (!g_xess_jitter_hold &&
+             !kz3_xess_get_jitter(
+                 frame, g.width, output_w,
+-                &g_xess_jitter_x, &g_xess_jitter_y)) {
++                &halton_x, &halton_y)) {
++            g_xess_diagnostic_history.valid = 0;
+             return 0;
+         }
++        g_xess_diagnostic_sample = kz3_xess_diagnostic_next_sample(
++            ld_xess_diagnostic_config(), &g_xess_diagnostic_history, frame,
++            halton_x, halton_y, !g_xess_jitter_hold);
++        g_xess_jitter_x = g_xess_diagnostic_sample.projection_x;
++        g_xess_jitter_y = g_xess_diagnostic_sample.projection_y;
+         g_xess_camera = camera;
+         g_xess_camera_frame = frame;
+     }
+     *x = g_xess_jitter_x;
+     *y = g_xess_jitter_y;
+-    return g_xess_jitter_x != 0.0f || g_xess_jitter_y != 0.0f;
++    return g_xess_jitter_x != 0.0f || g_xess_jitter_y != 0.0f ||
++           (g_xess_diagnostic_sample.active && kz3_xess_diagnostic_modified(ld_xess_diagnostic_config()));
+ }
+ 
+ static int ld_xess_frame_jittered(void)
+@@ -16221,6 +16341,13 @@ static int ld_xess_frame_jittered(void)
+            (g_xess_jitter_x != 0.0f || g_xess_jitter_y != 0.0f);
+ }
+ 
++static int ld_xess_skip_fxaa(void)
++{
++    return ld_xess_frame_jittered() ||
++           (g_dm_filter == RSX_DM_XESS && g_xess_jitter_frame == g_ld_frames &&
++            g_xess_diagnostic_sample.active && kz3_xess_diagnostic_modified(ld_xess_diagnostic_config()));
++}
++
+ /* The depth of the scene pass, kept in the adapter's own texture: a later write to this zeta in the frame cannot reach
+  * XeSS. Taken at the scene copy, or at present when the frame had no scene copy. */
+ static int ld_xess_capture_depth(void)
+@@ -16250,6 +16377,10 @@ static void ld_xess_forget(void)
+     g_xess_context_failed_frame = UINT32_MAX;
+     g_xess_jitter_hold = 0;
+     g_xess_have_last_camera = 0;
++    memset(&g_xess_diagnostic_history, 0, sizeof g_xess_diagnostic_history);
++    memset(&g_xess_diagnostic_sample, 0, sizeof g_xess_diagnostic_sample);
++    memset(&g_xess_diagnostic_coverage, 0, sizeof g_xess_diagnostic_coverage);
++    g_xess_diagnostic_coverage_frame = UINT32_MAX;
+     memset(&g_xess_opaque_capture, 0, sizeof g_xess_opaque_capture);
+     memset(&g_xess_pairing, 0, sizeof g_xess_pairing);
+ }
+@@ -18296,7 +18427,7 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+                     g.height))
+                 ld_xess_capture_depth();
+             /* Patch 2149: no spatial AA on jittered samples; XeSS is the frame's anti-aliasing. */
+-            if (!ld_xess_frame_jittered())
++            if (!ld_xess_skip_fxaa())
+ #endif
+             ld_host_aa(i);
+         }
+@@ -18600,6 +18731,16 @@ static ID3D12Resource* ld_xess_present(
+             g_ld_frames != g_xess_last_dispatch_frame + 1u ||
+             g_xess_context_generation !=
+                 g_xess_last_dispatch_context_generation;
++        const kz3_xess_diagnostic_config* diagnostic = ld_xess_diagnostic_config();
++        if (kz3_xess_diagnostic_modified(diagnostic)) {
++            dispatch.use_execute_jitter_override = 1;
++            if (g_xess_jitter_frame == g_ld_frames) {
++                if (dispatch.reset || (camera.flags & KZ3_XESS_CAMERA_RESET))
++                    kz3_xess_diagnostic_clear_lag(diagnostic, &g_xess_diagnostic_sample);
++                dispatch.execute_jitter_x = g_xess_diagnostic_sample.execute_x;
++                dispatch.execute_jitter_y = g_xess_diagnostic_sample.execute_y;
++            }
++        }
+         ID3D12Resource* result = kz3_xess_dispatch_camera(&dispatch);
+         LD_SM_INVALIDATE();
+ 
+@@ -18622,6 +18763,12 @@ static ID3D12Resource* ld_xess_present(
+         g_xess_last_camera_flip = camera.guest_flip;
+         g_xess_have_last_camera = 1;
+         g_xess_jitter_hold = 0;
++        if (g_xess_jitter_frame == g_ld_frames && g_xess_diagnostic_sample.active) {
++            g_xess_diagnostic_history.frame = g_ld_frames;
++            g_xess_diagnostic_history.nominal_x = g_xess_diagnostic_sample.nominal_x;
++            g_xess_diagnostic_history.nominal_y = g_xess_diagnostic_sample.nominal_y;
++            g_xess_diagnostic_history.valid = 1;
++        }
+         last_reason = XESS_BYPASS_NONE;
+         if (success_logs++ < 4)
+             fprintf(stderr,
+@@ -18642,6 +18789,7 @@ static ID3D12Resource* ld_xess_present(
+ bypass:
+     g_xess_last_dispatch_frame = UINT32_MAX;
+     g_xess_have_last_camera = 0;
++    g_xess_diagnostic_history.valid = 0;
+     if (ld_xess_frame_jittered()) g_xess_jitter_hold = 1;   /* Bilinear must not show a jittered scene frame after frame */
+     if (reason != last_reason) {
+         last_reason = reason;
+@@ -18878,6 +19026,7 @@ static void ld_present_body(u32 buffer_id)
+     u32 upscale_w = presented_surface->w, upscale_h = presented_surface->h;
+ #if defined(KZ3_XESS)
+     upscale = ld_xess_present(target, presented_surface, &upscale_w, &upscale_h);
++    ld_xess_diagnostic_present(upscale != NULL);
+ #endif
+     ID3D12Resource* scanout = upscale ? upscale : srcimg;
+     D3D12_RESOURCE_STATES scanout_state = upscale

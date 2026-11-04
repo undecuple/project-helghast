@@ -55,6 +55,8 @@ Do not install into a OneDrive folder. Saves and settings: [docs/INSTALL.md](doc
 ## Settings and known issues
 
 Display, input and frame-rate settings are in the game's Options menu; the list is in [docs/FEATURES.md](docs/FEATURES.md).
+An experimental, opt-in XeSS-SR scaling filter is also available; its current visual jitter and other limitations are
+described in [docs/XESS.md](docs/XESS.md).
 
 - Speed is below the PS3's: about 16-22 frames/s in levels, target 30.
 - Audio stutters now and then in levels.

@@ -105,6 +105,7 @@ tools/spu/test_spu_lscold.sh
 tools/spu/test_spu_shufh.sh
 tools/smoke/test_tex_lru.sh
 tools/release/test_stage_sdl3.py
+tools/release/test_stage_xess.py
 tools/spu/test_lr_lastcheck.sh
 tools/spu/test_lang_layer.py
 tools/spu/test_r88_pr_tests.sh
@@ -116,6 +117,11 @@ tools/smoke/test_color_mask.sh
 tools/spu/test_r92_rawst_coh.sh
 tools/smoke/test_gpupass.sh
 tools/smoke/test_display_mode.sh
+tools/smoke/test_xess_motion.sh
+tools/smoke/test_xess_inputs.sh
+tools/smoke/test_xess_diagnostics.sh
+tools/smoke/test_xess_camera.sh
+tools/smoke/test_xess_compile.sh
 tools/spu/test_r97_mapper_window.sh
 tools/spu/test_r98_jobcost.sh
 tools/spu/test_r100_tramp_slot.sh

@@ -8,6 +8,8 @@ credits list is [NOTICE.md](../NOTICE.md). Nothing here covers the game itself, 
 - `ps3recomp-LICENSE.txt`: MIT, ps3recomp, the recompiler and runtime source that is built on the player's machine (payload folder `ps3recomp\`).
 - `at3_standalone-COPYING.LGPLv2.1.txt`: LGPL-2.1, the standalone ATRAC3/ATRAC3plus decoder inside ps3recomp's source (payload folder `ps3recomp\third_party\at3_standalone\`).
 - `SDL3-LICENSE.txt`: zlib, SDL3 (`SDL3.dll` in `runtime\`, unmodified; gamepads, rumble and motion sensors).
+- `Intel-XeSS-LICENSE.txt`: Intel XeSS SDK redistribution terms (`libxess.dll` in `runtime\`, unmodified; experimental XeSS Super Resolution).
+- `Intel-XeSS-THIRD-PARTY-NOTICES.txt`: third-party notices shipped with the Intel XeSS SDK.
 - `Rajdhani-OFL.txt`: SIL Open Font License 1.1, the Rajdhani fonts (`fonts\`, and embedded in the installer's headings).
 - `llvm-mingw/llvm-mingw-LICENSE.txt`: ISC, the llvm-mingw build scripts (bundled compiler, `toolchain\llvm-mingw\`).
 - `llvm-mingw/llvm-mingw-tree-LICENSE.TXT`: Apache-2.0 WITH LLVM-exception, as shipped inside the llvm-mingw package (clang, lld, compiler-rt, libc++, libunwind).
