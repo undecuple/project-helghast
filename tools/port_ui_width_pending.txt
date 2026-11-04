@@ -1,0 +1,11 @@
+# Label cells (max_chars 28) over the ~275 px label column. Format: key:column. The check fails for any
+# over-budget label cell NOT listed here, and for a listed cell that is no longer over budget.
+# 2026-11-03 (tester video, ru Options > Display): the value column is too close for the game's own rows too
+# ("Альтернативные цвета", 20 chars, overlaps), so shorter wording is not the fix. The rsx layout round places
+# the value column after the widest measured label on each page; these entries leave when it lands.
+disp.filter:ru
+lp.prompts:ru
+lp.layout:ru
+lp.dsu:ru
+lp.dsu:zh_tw
+disp.unfocused:ko
