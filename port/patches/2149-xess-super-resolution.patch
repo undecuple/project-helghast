@@ -1,4 +1,4 @@
-KZ3 patch 2147 (ENHANCEMENT, experimental): an opt-in Intel XeSS Super Resolution display filter.
+KZ3 patch 2149 (ENHANCEMENT, experimental): an opt-in Intel XeSS Super Resolution display filter.
 
 Off by default: Bilinear stays the default filter and with xess unselected no XeSS code runs. Selecting it
 (Options > Display > Scaling filter, confirmed by a prompt, or KZ3_DISPLAY_FILTER=xess) renders the stable four-target
@@ -188,7 +188,7 @@ index ff1cd74..477c5ee 100644
 +static u32 g_xess_responsive_frame = UINT32_MAX;
 +static u32 g_xess_responsive_context_generation;
 +static int ld_xess_draw_jitter(u32 frame, float* x, float* y);
-+/* KZ3 patch 2147: see the patch header. */
++/* KZ3 patch 2149: see the patch header. */
 +static u32 g_xess_context_failed_frame = UINT32_MAX;   /* the draw-time init of that frame failed: kz3_xess_status() says why */
 +static int g_xess_jitter_hold;                         /* a jittered frame fell back: no jitter until a dispatch works */
 +static u32 g_xess_depth_frame = UINT32_MAX;
@@ -234,7 +234,7 @@ index ff1cd74..477c5ee 100644
              g_ld_vtex_unsupported++;
      }
 +#if defined(KZ3_XESS)
-+    /* Patch 2147: decided here, not at xf below. The sampler table of this draw is built next, and a first-frame init
++    /* Patch 2149: decided here, not at xf below. The sampler table of this draw is built next, and a first-frame init
 +     * blocks, so it runs before any of this draw's state is recorded. */
 +    int xess_jitter = 0, xess_capture_opaque = 0;
 +    float xess_jx = 0.0f, xess_jy = 0.0f;
@@ -289,7 +289,7 @@ index ff1cd74..477c5ee 100644
              const int first = !g_h169_disp_seen;
              g_h169_disp_seen = 1;
 +#if defined(KZ3_XESS)
-+            xess_compose = first && g_h169_depth_seen && full;   /* patch 2147: the frame before its HUD */
++            xess_compose = first && g_h169_depth_seen && full;   /* patch 2149: the frame before its HUD */
 +#endif
              if (ld_h169_factors(&h_kx, &h_ky)) {
 -                const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
@@ -789,7 +789,7 @@ index ff1cd74..477c5ee 100644
 +                    g.width,
 +                    g.height))
 +                ld_xess_capture_depth();
-+            /* Patch 2147: no spatial AA on jittered samples; XeSS is the frame's anti-aliasing. */
++            /* Patch 2149: no spatial AA on jittered samples; XeSS is the frame's anti-aliasing. */
 +            if (!ld_xess_frame_jittered())
 +#endif
 +            ld_host_aa(i);
@@ -880,7 +880,7 @@ index ff1cd74..477c5ee 100644
 +            goto bypass;
 +        }
 +
-+        /* Patch 2147: the camera must have moved on by one flip since the last dispatch. The same flip again means no
++        /* Patch 2149: the camera must have moved on by one flip since the last dispatch. The same flip again means no
 +         * camera motion, whatever delta that state carries; a skipped flip means the history no longer lines up. */
 +        const enum kz3_xess_camera_step step = kz3_xess_camera_step_from(
 +            g_xess_have_last_camera, g_xess_last_camera_flip, camera.guest_flip);

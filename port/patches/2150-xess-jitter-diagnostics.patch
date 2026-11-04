@@ -1,6 +1,6 @@
-KZ3 patch 2148 (ENHANCEMENT, experimental, diagnostics): opt-in XeSS jitter experiments and draw coverage.
+KZ3 patch 2150 (ENHANCEMENT, experimental, diagnostics): opt-in XeSS jitter experiments and draw coverage.
 
-Built on patch 2147. With none of the switches set the Halton rendering of 2147 is unchanged. The switches scale the
+Built on patch 2149. With none of the switches set the Halton rendering of 2149 is unchanged. The switches scale the
 projection and the execute jitter independently (KZ3_XESS_PROJECTION_SCALE_X/Y, KZ3_XESS_EXECUTE_SCALE_X/Y, -2..2,
 default 1), choose an alternating two-phase sample (KZ3_XESS_JITTER_PATTERN=two-phase, default halton), lag the execute
 jitter by one contiguous valid frame (KZ3_XESS_EXECUTE_JITTER_LAG=1, default 0), and log the pre-submission draw
@@ -31,7 +31,7 @@ index 477c5ee..54cec6c 100644
 +static int g_xess_diagnostic_held;
  static int ld_xess_draw_jitter(u32 frame, float* x, float* y);
 +static void ld_xess_diagnostic_draw(const kz3_xess_draw_info* draw, int shifted);
- /* KZ3 patch 2147: see the patch header. */
+ /* KZ3 patch 2149: see the patch header. */
  static u32 g_xess_context_failed_frame = UINT32_MAX;   /* the draw-time init of that frame failed: kz3_xess_status() says why */
  static int g_xess_jitter_hold;                         /* a jittered frame fell back: no jitter until a dispatch works */
 @@ -14860,6 +14867,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
@@ -242,7 +242,7 @@ index 477c5ee..54cec6c 100644
 @@ -18296,7 +18427,7 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
                      g.height))
                  ld_xess_capture_depth();
-             /* Patch 2147: no spatial AA on jittered samples; XeSS is the frame's anti-aliasing. */
+             /* Patch 2149: no spatial AA on jittered samples; XeSS is the frame's anti-aliasing. */
 -            if (!ld_xess_frame_jittered())
 +            if (!ld_xess_skip_fxaa())
  #endif

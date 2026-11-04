@@ -145,8 +145,8 @@ Any missing, unsupported, or incoherent input
 | [`port/kz3/xess_inputs.h`](../port/kz3/xess_inputs.h) | Pure deferred-pass, scene-resolve, jitter, capture-pair, aspect, and mip-bias rules |
 | [`port/kz3/xess_diagnostics.h`](../port/kz3/xess_diagnostics.h) | Host-tested diagnostic parsing, phase/lag sampling, and draw accounting |
 | [`port/kz3/main.cpp`](../port/kz3/main.cpp) | Camera, FOV, and projection-plane publication |
-| [`port/patches/2147-xess-super-resolution.patch`](../port/patches/2147-xess-super-resolution.patch) | Renderer integration: input selection, jitter and mip bias, FXAA skip, camera pairing, captures, HUD mask, presentation ordering, UI, fallback and re-init safety |
-| [`port/patches/2148-xess-jitter-diagnostics.patch`](../port/patches/2148-xess-jitter-diagnostics.patch) | Opt-in jitter experiments and per-frame draw-coverage tracing |
+| [`port/patches/2149-xess-super-resolution.patch`](../port/patches/2149-xess-super-resolution.patch) | Renderer integration: input selection, jitter and mip bias, FXAA skip, camera pairing, captures, HUD mask, presentation ordering, UI, fallback and re-init safety |
+| [`port/patches/2150-xess-jitter-diagnostics.patch`](../port/patches/2150-xess-jitter-diagnostics.patch) | Opt-in jitter experiments and per-frame draw-coverage tracing |
 | [`tools/release/stage_xess.py`](../tools/release/stage_xess.py) | Release-time validation and staging of Intel's unmodified runtime and required notices |
 | [`tools/smoke/test_xess.cpp`](../tools/smoke/test_xess.cpp) | Native D3D12 context, dispatch, mask and motion contents, readback, and fallback smoke test |
 | [`tools/smoke/test_xess_temporal.cpp`](../tools/smoke/test_xess_temporal.cpp) | Native check that XeSS reconstructs with the port's jitter and motion conventions |
@@ -391,7 +391,7 @@ Validation that needs no game data:
 - the native temporal test feeds a moving scene for 64 frames and checks that the port's jitter and motion conventions
   reconstruct, that the NDC path matches pixel-unit motion, and that flipped axes do not.
 
-On this series (v0.1.8 plus patches 2147 and 2148), on Windows with an NVIDIA RTX 5070: the whole patch series
+On this series (v0.1.8 plus patches 2149 and 2150), on Windows with an NVIDIA RTX 5070: the whole patch series
 applies to the pinned ps3recomp, the XeSS host tests above pass, and `tools/smoke/test_xess.ps1` (dispatch, mask and
 motion readback, re-init, temporal conventions, missing- and wrong-runtime fallback) passes.
 
