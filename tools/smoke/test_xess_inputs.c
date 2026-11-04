@@ -27,6 +27,13 @@ int main(void)
     draw.full_viewport = 1;
     draw.depth_test = 1;
 
+    check("input delay applies after the previous flip", kz3_xess_inputs_delay_applies(1, 1, 100, 101));
+    check("input delay applies to a held camera (same flip)", kz3_xess_inputs_delay_applies(1, 1, 100, 100));
+    check("input delay does not span a skipped dispatch", !kz3_xess_inputs_delay_applies(1, 1, 100, 102));
+    check("input delay does not go backwards", !kz3_xess_inputs_delay_applies(1, 1, 100, 99));
+    check("input delay needs a previous dispatch", !kz3_xess_inputs_delay_applies(1, 0, 100, 101));
+    check("KZ3_XESS_INPUT_DELAY=0 turns it off", !kz3_xess_inputs_delay_applies(0, 1, 100, 101));
+
     check(
         "full-resolution four-target depth pass selects deferred depth",
         kz3_xess_is_deferred_primary(&draw, 1280, 720));

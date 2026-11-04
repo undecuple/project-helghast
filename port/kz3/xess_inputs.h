@@ -168,4 +168,19 @@ static inline int kz3_xess_capture_pair_matches(
            opaque->resource == pre_upscale->resource;
 }
 
+/* One-frame input alignment. The colour XeSS receives is the finished display surface, and the scene reaches it only
+ * through the SPU post chain and the next frame's compose, so at frame N it shows scene N-1 (measured in gameplay: XeSS
+ * steadier with the jitter, then also the camera, of the previous frame). Depth, camera, jitter and the scene captures
+ * of the previous dispatch are used with this frame's colour when that dispatch was the previous flip (or the same
+ * one, a held camera). Otherwise this frame's inputs are used as they are. */
+static inline int kz3_xess_inputs_delay_applies(
+    int enabled,
+    int have_previous,
+    uint64_t previous_flip,
+    uint64_t flip)
+{
+    return enabled && have_previous &&
+           (flip == previous_flip + 1u || flip == previous_flip);
+}
+
 #endif

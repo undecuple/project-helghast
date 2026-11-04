@@ -65,6 +65,22 @@ struct XessState {
     bool output_is_pixel_read = false;
     bool responsive_is_compute_read = false;
     bool depth_captured = false;
+    /* One-frame input alignment (see kz3_xess_dispatch_camera). The captures land in these hold textures; after each
+     * dispatch they are copied into scene_depth, opaque_color and pre_upscale_color, which the passes and XeSS read,
+     * so the next dispatch can use this frame's inputs with next frame's colour. */
+    ID3D12Resource* depth_hold = nullptr;
+    ID3D12Resource* opaque_hold = nullptr;
+    ID3D12Resource* pre_upscale_hold = nullptr;
+    D3D12_RESOURCE_STATES depth_hold_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_RESOURCE_STATES opaque_hold_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_RESOURCE_STATES pre_upscale_hold_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    bool have_previous = false;            /* the read textures hold the last successful dispatch's frame */
+    bool previous_translucent = false;     /* and its opaque/scene pair was coherent and requested */
+    kz3_xess_camera_state previous_camera{};
+    float previous_jitter_x = 0.0f;
+    float previous_jitter_y = 0.0f;
+    kz3_xess_jitter_offset previous_execute_jitter{};
+    uint64_t delayed_count = 0;
     uint64_t capture_serial = 0;
     uint64_t opaque_capture_serial = 0;
     uint64_t pre_upscale_capture_serial = 0;
@@ -178,6 +194,9 @@ void destroy_resources_locked()
     release(g_xess.motion_heap);
     release(g_xess.responsive_mask);
     release(g_xess.scene_depth);
+    release(g_xess.depth_hold);
+    release(g_xess.opaque_hold);
+    release(g_xess.pre_upscale_hold);
     release(g_xess.present_color);
     release(g_xess.compose_color);
     release(g_xess.pre_upscale_color);
@@ -190,6 +209,12 @@ void destroy_resources_locked()
     g_xess.compose_color_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     g_xess.present_color_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     g_xess.scene_depth_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_xess.depth_hold_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_xess.opaque_hold_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_xess.pre_upscale_hold_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_xess.have_previous = false;
+    g_xess.previous_translucent = false;
+    g_xess.delayed_count = 0;
     g_xess.motion_is_compute_read = false;
     g_xess.output_is_pixel_read = false;
     g_xess.responsive_is_compute_read = false;
@@ -573,6 +598,24 @@ bool create_resources_locked(
             device,
             render_width,
             render_height,
+            DXGI_FORMAT_R32_FLOAT,
+            &g_xess.depth_hold) ||
+        !create_texture(
+            device,
+            render_width,
+            render_height,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            &g_xess.opaque_hold) ||
+        !create_texture(
+            device,
+            render_width,
+            render_height,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            &g_xess.pre_upscale_hold) ||
+        !create_texture(
+            device,
+            render_width,
+            render_height,
             DXGI_FORMAT_R8_UNORM,
             &g_xess.responsive_mask) ||
         !create_motion_pipeline_locked(device) ||
@@ -714,9 +757,9 @@ bool capture_color_locked(
         command_list,
         color,
         D3D12_RESOURCE_STATE_RENDER_TARGET,
-        opaque ? g_xess.opaque_color : g_xess.pre_upscale_color,
-        opaque ? g_xess.opaque_color_state :
-                 g_xess.pre_upscale_color_state);
+        opaque ? g_xess.opaque_hold : g_xess.pre_upscale_hold,
+        opaque ? g_xess.opaque_hold_state :
+                 g_xess.pre_upscale_hold_state);
 
     if (opaque) {
         if (!++g_xess.capture_serial) {
@@ -730,6 +773,37 @@ bool capture_color_locked(
             g_xess.opaque_capture_serial;
     }
     return true;
+}
+
+/* The opaque and scene captures in the hold textures belong to one frame. */
+bool hold_pair_coherent_locked()
+{
+    return g_xess.opaque_capture_serial &&
+           g_xess.pre_upscale_capture_serial == g_xess.opaque_capture_serial;
+}
+
+/* Copies this frame's captures from the hold textures into the textures the passes and XeSS read. */
+void promote_holds_locked(ID3D12GraphicsCommandList* command_list)
+{
+    copy_texture_locked(
+        command_list, g_xess.depth_hold, g_xess.depth_hold_state,
+        g_xess.scene_depth, g_xess.scene_depth_state);
+    copy_texture_locked(
+        command_list, g_xess.opaque_hold, g_xess.opaque_hold_state,
+        g_xess.opaque_color, g_xess.opaque_color_state);
+    copy_texture_locked(
+        command_list, g_xess.pre_upscale_hold, g_xess.pre_upscale_hold_state,
+        g_xess.pre_upscale_color, g_xess.pre_upscale_color_state);
+}
+
+/* KZ3_XESS_INPUT_DELAY=0 turns the one-frame input alignment off for one run (default on). Read once. */
+bool input_delay_enabled()
+{
+    static const bool enabled = [] {
+        const char* value = getenv("KZ3_XESS_INPUT_DELAY");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
 }
 
 bool generate_responsive_locked(
@@ -747,15 +821,6 @@ bool generate_responsive_locked(
         set_status("XeSS-SR responsive-mask resources are unavailable");
         return false;
     }
-    if (translucent &&
-        (!g_xess.opaque_capture_serial ||
-         g_xess.pre_upscale_capture_serial !=
-             g_xess.opaque_capture_serial)) {
-        set_status(
-            "XeSS-SR responsive-mask dispatch has no current scene captures");
-        return false;
-    }
-
     if (g_xess.responsive_is_compute_read) {
         D3D12_RESOURCE_BARRIER writable{};
         writable.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1427,8 +1492,8 @@ extern "C" int kz3_xess_capture_depth(
         command_list,
         depth,
         depth_state,
-        g_xess.scene_depth,
-        g_xess.scene_depth_state);
+        g_xess.depth_hold,
+        g_xess.depth_hold_state);
     g_xess.depth_captured = true;
     return 1;
 }
@@ -1446,10 +1511,23 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
             "XeSS-SR camera dispatch received invalid state or resources");
         return nullptr;
     }
-    const kz3_xess_jitter_offset execute_jitter =
-        kz3_xess_execute_jitter(desc);
-    if (!std::isfinite(desc->jitter_x) ||
-        !std::isfinite(desc->jitter_y) ||
+    /* One-frame input alignment (kz3_xess_inputs_delay_applies): this frame's colour shows the previous frame's
+     * scene, so after a consecutive dispatch the previous frame's camera, jitter and captures go with it. */
+    const bool delay = kz3_xess_inputs_delay_applies(
+        input_delay_enabled(), g_xess.have_previous,
+        g_xess.previous_camera.guest_flip, desc->camera.guest_flip);
+    const kz3_xess_camera_state camera =
+        delay ? g_xess.previous_camera : desc->camera;
+    const float jitter_x = delay ? g_xess.previous_jitter_x : desc->jitter_x;
+    const float jitter_y = delay ? g_xess.previous_jitter_y : desc->jitter_y;
+    const kz3_xess_jitter_offset execute_jitter = delay ?
+        g_xess.previous_execute_jitter : kz3_xess_execute_jitter(desc);
+    const bool translucent = delay ?
+        g_xess.previous_translucent : desc->use_responsive_mask != 0;
+    const bool pair_now = hold_pair_coherent_locked();
+    g_xess.have_previous = false;   /* set again by a successful dispatch */
+    if (!std::isfinite(jitter_x) ||
+        !std::isfinite(jitter_y) ||
         !std::isfinite(execute_jitter.x) ||
         !std::isfinite(execute_jitter.y)) {
         set_status("XeSS-SR camera dispatch has invalid jitter offsets");
@@ -1458,8 +1536,8 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
     const uint32_t required_camera =
         KZ3_XESS_CAMERA_CURRENT_VALID |
         KZ3_XESS_CAMERA_PLANES_VALID;
-    if ((desc->camera.flags & required_camera) != required_camera ||
-        (desc->camera.flags & KZ3_XESS_CAMERA_MULTIPLE_VIEWS)) {
+    if ((camera.flags & required_camera) != required_camera ||
+        (camera.flags & KZ3_XESS_CAMERA_MULTIPLE_VIEWS)) {
         set_status(
             "XeSS-SR camera dispatch has no coherent single-view camera");
         return nullptr;
@@ -1487,32 +1565,32 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
     }
 
     const bool has_previous =
-        (desc->camera.flags &
+        (camera.flags &
          KZ3_XESS_CAMERA_PREVIOUS_VALID) != 0;
-    if (!kz3_xess_pose_valid(desc->camera.current_pose) ||
+    if (!kz3_xess_pose_valid(camera.current_pose) ||
         (has_previous &&
-         !kz3_xess_pose_valid(desc->camera.previous_pose)) ||
-        !std::isfinite(desc->camera.near_plane) ||
-        !std::isfinite(desc->camera.far_plane) ||
-        !(desc->camera.near_plane > 0.0f) ||
-        !(desc->camera.far_plane >
-          desc->camera.near_plane)) {
+         !kz3_xess_pose_valid(camera.previous_pose)) ||
+        !std::isfinite(camera.near_plane) ||
+        !std::isfinite(camera.far_plane) ||
+        !(camera.near_plane > 0.0f) ||
+        !(camera.far_plane >
+          camera.near_plane)) {
         set_status(
             "XeSS-SR camera dispatch has an invalid pose or projection");
         return nullptr;
     }
     const float* previous_pose = has_previous ?
-        desc->camera.previous_pose :
-        desc->camera.current_pose;
+        camera.previous_pose :
+        camera.current_pose;
     const float previous_horizontal_fov = has_previous ?
-        desc->camera.previous_horizontal_fov :
-        desc->camera.current_horizontal_fov;
+        camera.previous_horizontal_fov :
+        camera.current_horizontal_fov;
     const float previous_vertical_fov = has_previous ?
-        desc->camera.previous_vertical_fov :
-        desc->camera.current_vertical_fov;
+        camera.previous_vertical_fov :
+        camera.current_vertical_fov;
     const float tangents[4] = {
-        std::tan(desc->camera.current_horizontal_fov * 0.5f),
-        std::tan(desc->camera.current_vertical_fov * 0.5f),
+        std::tan(camera.current_horizontal_fov * 0.5f),
+        std::tan(camera.current_vertical_fov * 0.5f),
         std::tan(previous_horizontal_fov * 0.5f),
         std::tan(previous_vertical_fov * 0.5f)};
     if (!std::isfinite(tangents[0]) ||
@@ -1559,6 +1637,15 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
     g_xess.motion_is_compute_read = false;
     g_xess.output_is_pixel_read = false;
 
+    if (!delay) {
+        if (translucent && !pair_now) {
+            set_status(
+                "XeSS-SR responsive-mask dispatch has no current scene captures");
+            return nullptr;
+        }
+        promote_holds_locked(desc->command_list);
+    }
+
     /* The mask runs first: the motion pass reads its HUD pixels. */
     const bool use_hud = desc->use_hud_mask != 0;
     if (use_hud) {
@@ -1573,7 +1660,7 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
         desc->command_list,
         desc->render_width,
         desc->render_height,
-        desc->use_responsive_mask != 0,
+        translucent,
         use_hud);
     g_xess.opaque_capture_serial = 0;
     g_xess.pre_upscale_capture_serial = 0;
@@ -1585,7 +1672,7 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
     float constants[44]{};
     memcpy(
         constants,
-        desc->camera.current_pose,
+        camera.current_pose,
         3 * 4 * sizeof(float));
     memcpy(
         constants + 12,
@@ -1593,7 +1680,7 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
         3 * 4 * sizeof(float));
     memcpy(
         constants + 24,
-        desc->camera.current_pose + 12,
+        camera.current_pose + 12,
         3 * sizeof(float));
     memcpy(
         constants + 28,
@@ -1604,10 +1691,10 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
         static_cast<float>(desc->render_width);
     constants[37] =
         static_cast<float>(desc->render_height);
-    constants[38] = desc->jitter_x;
-    constants[39] = desc->jitter_y;
-    constants[40] = desc->camera.near_plane;
-    constants[41] = desc->camera.far_plane;
+    constants[38] = jitter_x;
+    constants[39] = jitter_y;
+    constants[40] = camera.near_plane;
+    constants[41] = camera.far_plane;
 
     ID3D12DescriptorHeap* heaps[] = {g_xess.motion_heap};
     desc->command_list->SetDescriptorHeaps(1, heaps);
@@ -1648,7 +1735,7 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
     execute.exposure_scale = 1.0f;
     execute.reset_history =
         desc->reset ||
-        (desc->camera.flags & KZ3_XESS_CAMERA_RESET) ||
+        (camera.flags & KZ3_XESS_CAMERA_RESET) ||
         !has_previous;
     execute.input_width = desc->render_width;
     execute.input_height = desc->render_height;
@@ -1656,9 +1743,9 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
         fprintf(
             stderr,
             "[xess] camera: guest flip %llu, view 0x%llX, flags 0x%X\n",
-            static_cast<unsigned long long>(desc->camera.guest_flip),
-            static_cast<unsigned long long>(desc->camera.view_id),
-            desc->camera.flags);
+            static_cast<unsigned long long>(camera.guest_flip),
+            static_cast<unsigned long long>(camera.view_id),
+            camera.flags);
     }
     const int result = g_xess.functions.execute(
         g_xess.context, desc->command_list, &execute);
@@ -1671,6 +1758,17 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
         return nullptr;
     }
     ++g_xess.dispatch_count;
+    if (delay) {
+        /* After XeSS read them: this frame's captures become the next dispatch's inputs. */
+        promote_holds_locked(desc->command_list);
+        ++g_xess.delayed_count;
+    }
+    g_xess.have_previous = true;
+    g_xess.previous_translucent = desc->use_responsive_mask && pair_now;
+    g_xess.previous_camera = desc->camera;
+    g_xess.previous_jitter_x = desc->jitter_x;
+    g_xess.previous_jitter_y = desc->jitter_y;
+    g_xess.previous_execute_jitter = kz3_xess_execute_jitter(desc);
     if (execute.reset_history) {
         ++g_xess.history_reset_count;
     }
@@ -1678,10 +1776,11 @@ extern "C" ID3D12Resource* kz3_xess_dispatch_camera(
         g_xess.dispatch_count % 600u == 0u) {
         fprintf(
             stderr,
-            "[xess] history: %llu dispatches, %llu resets\n",
+            "[xess] history: %llu dispatches, %llu resets, %llu with inputs aligned to the previous frame\n",
             static_cast<unsigned long long>(g_xess.dispatch_count),
             static_cast<unsigned long long>(
-                g_xess.history_reset_count));
+                g_xess.history_reset_count),
+            static_cast<unsigned long long>(g_xess.delayed_count));
     }
 
     D3D12_RESOURCE_BARRIER output_ready{};

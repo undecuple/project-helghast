@@ -49,6 +49,7 @@ Switches for one run, each read once at the point named:
 | `KZ3_XESS_MIP_BIAS` | Intel's `log2(input / target)` | LOD bias of scene draws, in mip levels; `0` turns it off |
 | `KZ3_XESS_CAMERA_LAG` | `0` | Whole flips to step back from the paired camera; negative takes the latest published camera |
 | `KZ3_XESS_HUD_MASK` | on | `0` turns the HUD mask off |
+| `KZ3_XESS_INPUT_DELAY` | on | `0` turns off the one-frame input alignment (see Motion vectors) |
 
 ### Jitter diagnostics
 
@@ -62,7 +63,7 @@ documented default.
 | `KZ3_XESS_JITTER_PATTERN` | `halton` | `two-phase` alternates `(+0.25, 0)` and `(-0.25, 0)` input pixels by renderer-frame parity |
 | `KZ3_XESS_PROJECTION_SCALE_X`, `KZ3_XESS_PROJECTION_SCALE_Y` | `1`, `1` | Scale each axis applied to scene draws and removed during motion reconstruction |
 | `KZ3_XESS_EXECUTE_SCALE_X`, `KZ3_XESS_EXECUTE_SCALE_Y` | `1`, `1` | Independently scale each axis passed to XeSS execute |
-| `KZ3_XESS_EXECUTE_JITTER_LAG` | `0` | `1` uses the previous nominal sample for execute when it belongs to a contiguous successful dispatch |
+| `KZ3_XESS_EXECUTE_JITTER_LAG` | `0` | `1` uses the previous nominal sample for execute when it belongs to a contiguous successful dispatch. With the default input alignment this delays the execute jitter twice; use it only with `KZ3_XESS_INPUT_DELAY=0` |
 | `KZ3_XESS_JITTER_TRACE` | `0` | Log every Nth renderer frame; `1` logs every frame, `0` disables logging, maximum `60000` |
 
 Scale values must be finite numbers from `-2` to `2`; `0` disables an axis and `-1` reverses it. The lag applies the
@@ -245,6 +246,16 @@ The adapter generates `R16G16_FLOAT` motion at input resolution. For each pixel 
 This matches the current-to-previous NDC velocity convention requested through
 `XESS_INIT_FLAG_USE_NDC_VELOCITY`. Jitter is excluded from motion.
 
+**One-frame input alignment.** The colour XeSS receives is the finished display surface. The scene reaches it
+only through the SPU post chain and the next frame's compose, so at frame N it shows the scene of frame N-1. The
+adapter therefore dispatches frame N with the previous frame's camera, jitter (both the jitter removed from motion
+and the one passed to XeSS), depth and opaque/scene captures: captures land in hold textures and are copied into
+the textures XeSS reads after each dispatch. The alignment applies when the previous successful dispatch was the
+previous guest flip (or the same one, a held camera); otherwise the frame's own inputs are used. The `[xess]
+history` log line counts aligned dispatches. `KZ3_XESS_INPUT_DELAY=0` turns it off. Measured in gameplay
+(2026-11-03): with the jitter alone delayed the picture was steadier than undelayed, with the camera delayed too
+steadier again, and with every input aligned the moving picture showed no visible jitter.
+
 Depth makes camera translation spatially correct: nearby geometry moves farther than distant geometry. Camera
 rotation and translation are represented. Object, skeletal, vegetation, particle, and shader-driven motion are
 not. Those pixels currently receive camera motion only.
@@ -389,7 +400,10 @@ hardware D3D12 path on an NVIDIA RTX 5070, a 1280x720 game image, a 1920x1080 Fi
 and `KZ3_XESS_EXECUTE_JITTER_LAG=1`. Before the camera-pairing fix above, the log showed about 250 pairing misses and
 252 history resets in 3,600 dispatches, seen as a shudder about once a second, paused or not. With it: 0 misses, 0
 jumps, 1 reset (level start) in 3,600 dispatches, over 300 single skipped flips held, no fallback after the
-pre-scene frame, and the shudder gone. A finer whole-scene jitter remains, less visible than before.
+pre-scene frame, and the shudder gone. A finer whole-scene jitter remained. Delaying the execute jitter alone was steadier than no
+delay, delaying the camera as well steadier again, and with the one-frame input alignment (no switches set) the
+moving picture showed no visible jitter: 2,999 of 3,000 dispatches aligned, 1 history reset. The pause screen still
+jitters slightly (see Known issues).
 
 Earlier builds of the same code, which also carried unrelated, unsubmitted renderer experiments, were run in the same
 configuration without the lag. On 2026-10-31 the log showed:
@@ -427,10 +441,11 @@ than judging by eye; the target is below a tenth of an output pixel. Anything du
 
 ## Known issues
 
-- Normal XeSS jitter currently produces a constant small whole-scene visual jitter in native gameplay. A temporary
-  zero-jitter diagnostic removes it, but that mode gives up temporal sample placement and does not isolate the cause.
-  History use, motion and camera pairing, projection/execute phase and sign, masks, and coverage of jittered scene
-  draws need to be measured together; see [Diagnosing the whole-scene jitter](#diagnosing-the-whole-scene-jitter).
+- A still picture (the pause screen) still jitters slightly. The draw trace shows every deferred draw shifted but
+  none of the forward draws into the scene target: most are bound to a different depth buffer than the primary
+  pass (likely the first-person weapon and similar), the rest have depth testing off. XeSS removes a jitter those
+  draws never had. The moving picture shows no visible jitter. See
+  [Diagnosing the whole-scene jitter](#diagnosing-the-whole-scene-jitter).
 - Motion is camera-only. Moving characters, weapons, particles, vegetation, and shader animation can ghost or
   shimmer.
 - XeSS runs after tone-mapping, the SPU post chain (including motion blur) and the HUD, on display-referred color.
@@ -448,10 +463,8 @@ than judging by eye; the target is below a tenth of an output pixel. Anything du
 
 ## Future work
 
-1. Use the pause, two-phase, per-axis scale, phase-lag, and draw-coverage experiments in
-   [Diagnosing the whole-scene jitter](#diagnosing-the-whole-scene-jitter) to determine whether history use, motion,
-   jitter phase/sign, or missed draws cause the whole-scene jitter. Compare the pre-XeSS color phase with the
-   corresponding projection, depth, and camera before changing the default phase.
+1. Extend the jitter to the forward draws into the scene target that use another depth buffer, after identifying
+   them, and check the pause screen again.
 2. Publish coherent per-object and skeletal transforms and generate object motion vectors.
 3. Separate scene and UI composition so the HUD can be drawn after temporal upscaling.
 4. Replace the difference mask with semantic transparency/reactive information where the renderer exposes it.

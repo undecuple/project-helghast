@@ -32,9 +32,9 @@ Where each feature of the PS3 game stands today, and the port-only features with
 - 📋 60 fps and above (opt-in where it would change gameplay)
 - 📋 Motion blur strength setting (needs a clean way to switch the game's blur pass)
 - 🔧 Experimental XeSS Super Resolution (opt-in): deferred depth, camera motion, jitter, and responsive/HUD masks are
-  implemented and dispatch in native gameplay. A small constant whole-scene jitter remains; its cause (history use,
-  motion and camera pairing, jitter phase/sign, draw coverage) is open and blocks broader image-quality and hardware
-  testing, object motion, and UI separation
+  implemented and dispatch in native gameplay with every input aligned to the frame the picture shows; the moving
+  picture is steady. A still picture jitters slightly because forward draws into the scene are not jittered yet; that,
+  then broader image-quality and hardware testing, object motion, and UI separation come next
 - 📋 Further temporal anti-aliasing and upscaling (TAA, DLAA, DLSS, FSR), after the Windows build matches the console
 - 📋 Ray-traced sun shadows, then ambient occlusion and reflections (off by default)
 - 🔧 A settings menu in the game's own UI style (the Display and Mouse pages exist; more pages to come)
