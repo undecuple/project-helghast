@@ -5,7 +5,7 @@
  *   [game]
  *   eboot = D:\Games\BCUS98234\USRDIR\EBOOT.elf     ; argv[1] when kz3.exe gets no argument
  *   vfs_root = ...      ; PS3_VFS_ROOT: the folder that holds PS3_GAME (the dump, read in place)
- *   cache_root = ...    ; KZ3_CACHE_ROOT: every write (inflated archive entries psarc-cache, /dev_hdd1 cache); empty = vfs_root
+ *   cache_root = ...    ; KZ3_CACHE_ROOT: every write (inflated archive entries psarc-cache-v2, /dev_hdd1 cache); empty = vfs_root
  *   font_dir = ...    ; KZ3_FONT_DIR (the firmware's dev_flash/data/font)
  *   lang = ...          ; KZ3_LANG            update_dir, hdd0_root, edat_cache, shader_cache (the launcher's paths)
  *   data_dir = ...      ; working folder (where the saves' ./gamedata lands)

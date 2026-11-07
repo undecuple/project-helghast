@@ -7,8 +7,9 @@
  *
  *   - the part after the last "USRDIR/" is looked up case-insensitively in the
  *     archive's manifest (entry 0; KZ3 asks for the same file in several cases);
- *   - a hit is inflated once into <vfs root>/psarc-cache/<archive name> and the
- *     path is rewritten to it, so open/read/seek/stat/fstat all work unchanged;
+ *   - a hit is inflated once into <cache root>/psarc-cache-v2/files/<key digest> and
+ *     the path is rewritten to it, so open/read/seek/stat/fstat all work unchanged
+ *     without inheriting unbounded archive-name lengths on Windows;
  *   - a directory that exists only inside the archive is created empty in the
  *     cache so stat/opendir succeed (its listing stays empty: ASSUMPTION that KZ3
  *     does not enumerate archive directories; logged so it shows if it does).
@@ -104,6 +105,13 @@ std::string lower(std::string s)
     return s;
 }
 
+std::string cache_path(const char* group, const std::string& key)
+{
+    char name[33];
+    kz3_cache_name(key.c_str(), name);
+    return g_arc.cache + "/" + group + "/" + name;
+}
+
 /* Inflate entry `idx` into memory. Caller holds g_arc.lock (the FILE* is shared). */
 bool read_entry(size_t idx, std::vector<uint8_t>& out)
 {
@@ -196,14 +204,14 @@ void miss_hook(char* path, size_t cap)
     auto it = g_arc.by_key.find(key);
     if (it == g_arc.by_key.end()) {
         if (g_arc.dirs.count(key)) {
-            std::string dir = g_arc.cache + "/" + key;
+            std::string dir = cache_path("dirs", key);
             mkdirs(dir + "/");
             if (s_logged++ < 64) fprintf(stderr, "[psarc] dir %s (served empty)\n", key.c_str());
             snprintf(path, cap, "%s", dir.c_str());
         }
         return;
     }
-    std::string host = g_arc.cache + "/" + g_arc.names[it->second];
+    std::string host = cache_path("files", key);
     struct stat st;
     std::lock_guard<std::mutex> g(g_arc.lock);
     if (stat(host.c_str(), &st) != 0) {

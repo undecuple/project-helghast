@@ -7,6 +7,8 @@
 # The C side resolves a few paths from each layer; tools/psarc.py + tools/assets/pspatch.py give the reference.
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+CACHE_NAME_ONLY=0
+[[ ${1:-} == "--cache-name-only" ]] && CACHE_NAME_ONLY=1
 O="$ROOT/work/upstream-tests/vfs-overlay"
 EDAT="${EDAT:-$ROOT/GameUpdate/USRDIR/added_data_ps3.psarc.edat}"
 ELF="${ELF:-$ROOT/work/bin/EBOOT-114.elf}"
@@ -28,8 +30,13 @@ for p in "$ROOT"/port/patches/500[12]-*.patch; do
   (cd "$T" && patch -p1 -s < "$p") || { echo "FAIL: $(basename "$p") does not apply"; exit 1; }
 done
 gcc -std=gnu17 -O2 -Wall -Wextra -Werror -c "$ROOT/port/vfs/kz3_overlay.c" -o "$O/kz3_overlay.o" || { echo "FAIL: overlay build"; exit 1; }
-gcc -std=gnu17 -O2 -w -I "$T/libs/filesystem" -I "$ROOT/port/vfs" -o "$O/t" "$ROOT/port/vfs/test_vfs_overlay.c" \
-    "$O/kz3_overlay.o" -lz -lpthread || { echo "FAIL: test build"; exit 1; }
+gcc -std=gnu17 -O2 -w -I "$T/libs/filesystem" -I "$T/libs/codec" -I "$ROOT/port/vfs" -o "$O/t" \
+    "$ROOT/port/vfs/test_vfs_overlay.c" "$O/kz3_overlay.o" -lpthread || { echo "FAIL: test build"; exit 1; }
+"$O/t" --cache-name-only | grep -q '^C-CACHE-PASS$' || { echo "FAIL: cache digest fixture"; exit 1; }
+if (( CACHE_NAME_ONLY )); then
+  echo "PASS: fixed-length VFS cache names"
+  exit 0
+fi
 export PS3_EDAT_CACHE="$O/edat-cache"
 "$O/t" "$EDAT" "$ELF" "$DISC" "$PDIR" "$O/cache" "${KEYS[@]}" > "$O/c.txt" 2> "$O/c.err"
 RC=$?

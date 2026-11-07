@@ -1211,7 +1211,7 @@ static DWORD WINAPI frame_clock(LPVOID)
 static char s_vfs_root[1024];
 
 /* Read-only game root / writable root (release round KZ3-03): ppu_vfs_root is where /dev_bdvd and /app_home read (the
- * dump, in place, no link); KZ3_CACHE_ROOT (kz3.ini cache_root) is where this port writes: psarc-cache, the UI pages,
+ * dump, in place, no link); KZ3_CACHE_ROOT (kz3.ini cache_root) is where this port writes: psarc-cache-v2, the UI pages,
  * /dev_hdd1 (-> <cache>/cache) and, unless PS3_HDD0_ROOT is set, /dev_hdd0 (-> the working folder's gamedata/dev_hdd0,
  * where the trophies already land). Unset: everything stays under ppu_vfs_root as before. */
 static void kz3_setenv(const char* k, const char* v);
@@ -2072,7 +2072,7 @@ static std::string kz3_pause_exit_rows(const std::string& in, int* added)
 }
 
 static void (*s_kb_prev_miss)(char*, size_t) = nullptr;
-static std::string s_kb_dir;                  /* <vfs root>/psarc-cache/kz3-ui */
+static std::string s_kb_dir;                  /* <cache root>/psarc-cache-v2/kz3-ui */
 static int s_kb_page_test = 0;
 static CRITICAL_SECTION s_kb_vfs_lock;
 
@@ -3867,13 +3867,13 @@ static void kz3_kb_page_init(void)
     if (!kz3_kb_bridge_install()) return;
     const char* t = getenv("KZ3_KB_PAGE_TEST");
     s_kb_page_test = t && !strcmp(t, "1");
-    s_kb_dir = std::string(kz3_cache_root()) + "/psarc-cache/kz3-ui";
+    s_kb_dir = std::string(kz3_cache_root()) + "/psarc-cache-v2/kz3-ui";
     for (char& c : s_kb_dir) if (c == '\\') c = '/';
 #ifdef _WIN32
-    _mkdir((std::string(kz3_cache_root()) + "/psarc-cache").c_str());
+    _mkdir((std::string(kz3_cache_root()) + "/psarc-cache-v2").c_str());
     _mkdir(s_kb_dir.c_str());
 #else
-    mkdir((std::string(kz3_cache_root()) + "/psarc-cache").c_str(), 0755);
+    mkdir((std::string(kz3_cache_root()) + "/psarc-cache-v2").c_str(), 0755);
     mkdir(s_kb_dir.c_str(), 0755);
 #endif
     InitializeCriticalSection(&s_kb_vfs_lock);
@@ -4567,7 +4567,7 @@ int main(int argc, char** argv)
     {
         char arc[1100], cache[1100];
         snprintf(arc, sizeof arc, "%s/PS3_GAME/USRDIR/data_ps3.psarc", ppu_vfs_root);
-        snprintf(cache, sizeof cache, "%s/psarc-cache", kz3_cache_root());
+        snprintf(cache, sizeof cache, "%s/psarc-cache-v2", kz3_cache_root());
         kz3_psarc_vfs_init(arc, cache);
     }
 

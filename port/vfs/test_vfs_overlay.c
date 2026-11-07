@@ -17,14 +17,17 @@
 #include "edat.c"
 #include "kz3_overlay.h"
 
-#include <zlib.h>
 #include <pthread.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#ifdef _WIN32
+#define setenv(k, v, overwrite) _putenv_s((k), (v))
+#define unsetenv(k) _putenv_s((k), "")
+#endif
 
 static int zinflate(char* out, int olen, const char* in, int ilen)
 {
-    uLongf n = (uLongf)olen;
-    int rc = uncompress((Bytef*)out, &n, (const Bytef*)in, (uLong)ilen);
-    return (rc == Z_OK || (rc == Z_BUF_ERROR && n == (uLongf)olen)) ? (int)n : -1;
+    return stbi_zlib_decode_buffer(out, olen, in, ilen);
 }
 
 static uint8_t* rd(const char* p, size_t* n)
@@ -66,6 +69,19 @@ static const char* layer_name(int r)
     case KZ3_OVL_NONE: return "disc"; case KZ3_OVL_ADDED: return "added";
     case KZ3_OVL_PATCHED: return "patched"; case KZ3_OVL_DIR: return "dir"; default: return "error";
     }
+}
+
+static int cache_path_has_digest(const char* path, const char* group)
+{
+    char marker[32];
+    snprintf(marker, sizeof marker, "/%s/", group);
+    const char* p = strstr(path, marker);
+    if (!p) return 0;
+    p += strlen(marker);
+    if (strlen(p) != 32) return 0;
+    for (int i = 0; i < 32; i++)
+        if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'A' && p[i] <= 'F'))) return 0;
+    return 1;
 }
 
 /* Patch set switch (pass 155): after init the set is mp; for every key, PATCHED under a set iff that set's directory holds
@@ -138,6 +154,25 @@ static int patch_set_checks(int argc, char** argv, const char* spdir)
 
 int main(int argc, char** argv)
 {
+    char cache_name[33];
+    kz3_cache_name("abc", cache_name);
+    if (strcmp(cache_name, "900150983CD24FB0D6963F7D28E17F72") != 0) {
+        printf("FAIL: cache digest %s\n", cache_name);
+        return 1;
+    }
+    char long_key[2048], long_path[64];
+    memset(long_key, 'x', sizeof(long_key) - 1);
+    long_key[sizeof(long_key) - 1] = 0;
+    kz3_cache_name(long_key, cache_name);
+    snprintf(long_path, sizeof long_path, "/files/%s", cache_name);
+    if (!cache_path_has_digest(long_path, "files")) {
+        printf("FAIL: long key produced unbounded cache name\n");
+        return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--cache-name-only") == 0) {
+        printf("C-CACHE-PASS\n");
+        return 0;
+    }
     if (argc < 7) { fprintf(stderr, "usage: %s EDAT ELF DISC PATCHDIR CACHE KEY...\n", argv[0]); return 2; }
     const char* cache = getenv("PS3_EDAT_CACHE");
     if (!cache || !*cache) { printf("FAIL: PS3_EDAT_CACHE not set\n"); return 1; }
@@ -210,6 +245,11 @@ int main(int argc, char** argv)
     for (int i = 6; i < argc; i++) {
         char out[1200] = "";
         int lr = kz3_overlay_resolve(argv[i], out, sizeof out);
+        if ((lr == KZ3_OVL_ADDED && !cache_path_has_digest(out, "added")) ||
+            (lr == KZ3_OVL_DIR && !cache_path_has_digest(out, "added-dir"))) {
+            printf("FAIL: unbounded %s cache path\n", layer_name(lr));
+            fails++;
+        }
         if (lr == KZ3_OVL_ADDED || lr == KZ3_OVL_PATCHED) {
             size_t dn = 0;
             uint8_t* d = rd(out, &dn);
