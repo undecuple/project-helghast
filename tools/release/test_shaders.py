@@ -120,7 +120,8 @@ def main():
         times = [float(t) for t, _ in ev]
         check(0 < len(ev) <= 1024 and times == sorted(times) and max(times) < planned,
               f"1 {route}: {len(ev)} events sorted, last {max(times)} < planned {planned}")
-        check(planned - sh.IN_LEVEL in times and any("/" in b for _, b in ev), f"1 {route}: in-level walk from the start")
+        level_start = sh.PROFILE_LEVEL_START if route == "profile" else sh.FIRST_LEVEL_START
+        check(level_start in times and any("/" in b for _, b in ev), f"1 {route}: in-level walk from the start")
     text, planned = sh.route_script("first-boot")
     check("25:0x0008" in text.split() and planned >= sh.FIRST_LEVEL_START, "1 first-boot: START at 25 s, long route")
     mf = os.path.join(os.path.dirname(os.path.dirname(HERE)), "tools", "pad", "menu-fast.pad")
