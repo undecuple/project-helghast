@@ -5,7 +5,8 @@
  *   - maps KZ3's MUIS host name to that server and allows only its ports (patch 4001's strict egress policy:
  *     every other destination, port 53 and the telemetry host are refused),
  *   - signs the player in to NP with the configured online id and answers the ticket calls (np_kz3.c).
- * Every byte of the file is untrusted: bounded, validated, unknown keys ignored with a warning.
+ * Every byte of the file is untrusted: bounded and validated. Unknown keys are warned about; selector-shaped
+ * keys and invalid selectors fail closed. Credentials or an online identity also require a fully recognized config.
  */
 #ifndef KZ3_NET_H
 #define KZ3_NET_H
@@ -47,7 +48,11 @@ typedef struct {
     char     online_id[17];                   /* "" = none */
     char     ticket_file[260];                /* "" = built-in unsigned ticket; else a file the player gives
                                                  (absolute, or relative to online.ini's folder) */
-    char     server[KZ3_NET_NAME_MAX + 1];    /* top-level "server = NAME": which section to use; "" = the first */
+    int      ticket_requested;                /* a nonempty ticket_file was specified, even if it was rejected */
+    char     server[KZ3_NET_NAME_MAX + 1];    /* top-level "server = NAME"; no selector uses the normal default */
+    int      server_seen;                     /* an explicit selector was present */
+    int      server_invalid;                  /* invalid/ambiguous selection; sticky while parsing */
+    int      config_unsafe;                   /* rejected line or unknown section; unsafe with an identity or ticket */
     Kz3NetServer servers[KZ3_NET_MAX_SERVERS];   /* the [server NAME] sections, in file order */
     int      nservers;
 } Kz3NetConfig;
@@ -61,14 +66,21 @@ void kz3_net_config_defaults(Kz3NetConfig* cfg);
 /* Parses `len` bytes of online.ini text over `cfg`. Top-level keys: host, ports, region (the default server),
  * online_id, ticket_file, server (which section to use). A "[server NAME]" line starts a server entry (NAME: 1-32
  * letters, digits, spaces, '-', '_', '.'; at most 8 entries, names unique ignoring case) whose keys are host, ports
- * and region; any other [section] line goes back to the top level. '#'/';' start a comment outside double quotes;
+ * and region; other [section] lines return ordinary keys to the top level unless their name contains "server", but
+ * do not allow a selector. A bare [server] returns fully to the top level. '#'/';' start a
+ * comment outside double quotes;
  * a value in double quotes keeps its '#', ';' and edge spaces. Returns the number of rejected lines; each is reported
- * through `log` (may be NULL). The format is in the RE notes section 14.2. */
+ * through `log` (may be NULL). Invalid or duplicate selectors, unknown keys containing "server" (case-insensitive),
+ * malformed or unknown server-shaped sections and discarded overlong/NUL-bearing lines make selection fail closed.
+ * With a ticket file or online ID, any rejected line or unknown section also makes selection fail closed, regardless
+ * of order. Registration applies the same rule to inherited psnr configuration.
+ * The format is in the RE notes section 14.2. */
 int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_net_log_fn log);
 
 /* Picks the server in use: the section named by `server = NAME` (case-insensitive), else the top-level host if one
  * is set, else the first section. Copies its host, ports and region to the top-level fields. Returns 0, or -1 when
- * `server` names no section (logged; the top-level fields stay as they are). */
+ * the selector is invalid, names no section, or a config with a ticket or identity is not fully recognized (logged;
+ * the top-level fields stay as they are). An explicitly empty selector is invalid, not a request for the default. */
 int kz3_net_config_select(Kz3NetConfig* cfg, kz3_net_log_fn log);
 
 /* 1 when s (NUL-terminated) is a valid region label: well-formed UTF-8 (no overlong forms, no surrogates), code
@@ -102,8 +114,9 @@ int kz3_net_capture_start_kind(uint16_t port, const char* hello_file, const char
 /* The region label the capture's region list carries in <name> (escaped); NULL or "" = none. Call before start. */
 void kz3_net_capture_set_region_label(const char* label);
 
-/* Called once from kz3_hle_register (port/kz3/hle_kz3.cpp). Offline: does nothing. */
-void kz3_net_register(void);
+/* Called once before the guest starts. Offline: does nothing and returns 0. Failed online setup disables the runtime
+ * online switch, clears the policy and returns -1; the caller must not run the guest after failure. */
+int kz3_net_register(void);
 
 #ifdef __cplusplus
 }

@@ -1366,7 +1366,7 @@ static DWORD WINAPI kz3_watchdog(LPVOID p)
 }
 
 extern "C" int kz3_psarc_vfs_init(const char* archive, const char* cache_dir);  /* psarc_vfs.cpp */
-extern "C" void kz3_hle_register(void);                                         /* hle_kz3.cpp */
+extern "C" int kz3_hle_register(void);                                          /* hle_kz3.cpp */
 
 /* ---------------------------------------------------------------------------
  * Keyboard page (hooks A and B, RSX pass 37; ENHANCEMENT)
@@ -4580,7 +4580,10 @@ int main(int argc, char** argv)
     ppu_sysprx_register();   /* boot-critical CRT */
     ppu_fs_register();       /* cellFs over the game directory */
     lv2_init_syscalls();     /* the lv2 syscall table */
-    kz3_hle_register();      /* KZ3: imports the runtime leaves unresolved (hle_kz3.cpp) */
+    if (kz3_hle_register() != 0) {
+        fprintf(stderr, "[boot] online setup failed; refusing to run guest code\n");
+        return 1;
+    }
     /* Savedata User*Auto calls take a ninth argument (userdata) from the guest stack; the
      * generic table drops it (RE pass 9: KZ3's profile callbacks got userdata 0). */
     cellSaveData_register_ctx_handlers();

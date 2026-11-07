@@ -7,8 +7,8 @@ What the PS3 version of Killzone 3 does and how far the port reproduces it (sect
 |---|---|---|
 | works | verified in a run | 20 |
 | partial | runs, with known gaps | 13 |
-| not yet | not reached or not started | 8 |
-| not yet verified | present in code, never exercised | 0 |
+| not yet | not reached or not started | 7 |
+| not yet verified | present in code, never exercised | 1 |
 | declined | will not be done | 0 |
 | not applicable | has no equivalent on PC | 2 |
 
@@ -25,7 +25,7 @@ Port-only features: 38 available now, 28 planned.
 | Saves and profile | 100 % | 2 |
 | Menus and options | 100 % | 4 |
 | Trophies | 50 % | 1 |
-| Multiplayer | 20 % | 5 |
+| Multiplayer | 25 % | 5 |
 | Move and 3D TV | 0 % | 2 |
 | Update 1.14 | 50 % | 2 |
 | Subtitles and languages | 75 % | 2 |
@@ -102,7 +102,7 @@ Port-only features: 38 available now, 28 planned.
 
 | Feature | On the PS3 | In the port | Evidence |
 |---|---|---|---|
-| Online multiplayer (Warzone, Guerrilla Warfare, Operations) | Through PSN and Sony's game servers, which are closed | **not yet**: PSN itself: not applicable | Decided 2026-10-11: the game's own network code against a self-hosted server that speaks the original protocol, Nakama as the fallback; the protocol is mapped (progress area 6); the work is paused; nothing goes online today |
+| Online multiplayer (Warzone, Guerrilla Warfare, Operations) | Through PSN and Sony's game servers, which are closed | **not yet verified**: No 1.14 online session, genuine authentication or compatible server verified; PSN itself: not applicable | Game-free synthetic tests cover opt-in, server selection, ticket callbacks and RT framing; a prior local-model menu report was not reproduced |
 | Botzone (offline matches against bots) | Main menu > Botzone | **partial** | Offline matches start from the main menu (kz3-main-menu); with the game's own patch layer applying the 1.14 update (KZ3_NATIVE_PATCH, default on) Botzone reaches Career Selection (Corinth Highway) and campaign levels 200-208 all load (2026-10-27, scripted runs); no full match has been played; hand sessions on 2026-10-22 under Proton stopped at the syncing screen (3 of 3) and one on native Windows (2026-10-21) reached the spawn screen |
 | Split-screen co-op campaign | Two players on one console | **partial** | The game's own two-player campaign co-op works on one PC with two controllers, first played by hand on 2026-10-22 (mean 25.7 frames/s with loads included); the two views sit slightly out of place and the right-hand view can flicker |
 | Voice chat | Headset over PSN | **not yet** | Follows online play; the voice library is mostly implemented in the runtime (progress counts), untested |

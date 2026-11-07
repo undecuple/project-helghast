@@ -50,11 +50,13 @@ Where each feature of the PS3 game stands today, and the port-only features with
 
 - ✅ **Local split-screen co-op** campaign: works on one PC with two controllers (first played 2026-10-22); the two views sit slightly out of place and the right view can flicker
 - 🔧 **Botzone** (offline matches against bots): Botzone reaches Career Selection and campaign levels 200-208 all load (2026-10-27, scripted runs); no full match played by hand; hand sessions on 2026-10-22 under Proton stopped at the syncing screen
-- **Online multiplayer** in place of PSN, through a self-hosted server: the game's own network code against a Medius-compatible server, with [Nakama](https://heroiclabs.com/nakama/) as the fallback:
-  matchmaking, lobbies, Warzone and Guerrilla Warfare, up to 24 players
+- **Online multiplayer** in place of PSN, through a self-hosted server: planned matchmaking, lobbies, Warzone and
+  Guerrilla Warfare, up to 24 players. A compatible server and a complete session are unverified; see
+  [network evidence and limits](NETWORK-EVIDENCE.md).
 - **Online co-op campaign** (wanted): the second player joins the host's split-screen co-op from another PC, after local co-op works and the campaign is playable
 - Server choice in a settings page: a default server or any community server (address, key, TLS)
-- Goes online only when you choose online play, and only to the server you set
+- Experimental networking is off unless `KZ3_ONLINE` opts in. The selected host may be resolved through the
+  operating system's DNS service; the separate runtime resolver-policy gap remains unresolved.
 - DLC map packs from your own purchased copies
 - 📋 **In-game voice chat** for multiplayer and the online co-op campaign (microphone and headset; online only when you choose online play)
 
