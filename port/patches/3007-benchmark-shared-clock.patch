@@ -6,7 +6,7 @@ cross-thread log-write order as timing evidence.
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -4907,7 +4907,8 @@
+@@ -4907,5 +4907,6 @@
            if (!t0) t0 = now;
            ++n;
            if (n <= 400ull || (n % 10ull) == 0)
@@ -14,8 +14,6 @@ diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 +              fprintf(stderr, "[flip] %llu at %llu ms host=%llu ms%c",
 +                      n, now - t0, now, 10);
        } }
- 
-     { /* KZ3 patch 2025: conditional-render counters every 256 flips (only once live-draw has seen a report). */
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
