@@ -73,6 +73,9 @@ jobs:
           done
           if [ -n "$failed" ]; then echo "::error::failed host tests:$failed"; exit 1; fi
 
+      - name: Mission-0 benchmark synthetic tests (Windows)
+        run: python3 -B tools/perf/test_mission0.py
+
   secrets:
     runs-on: ubuntu-latest
     steps:
