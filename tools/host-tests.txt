@@ -192,3 +192,4 @@ tools/smoke/test_gcm_fast_methods.sh
 tools/smoke/test_menu_cols.sh
 tools/spu/test_evq_lat.sh
 tools/spu/test_task_pool.sh
+tools/net/test_network.py

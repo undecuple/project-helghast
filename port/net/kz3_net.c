@@ -6,6 +6,7 @@
 #include "net_policy.h"   /* ps3recomp libs/network, patch 4001 */
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -154,13 +155,30 @@ static int name_eq(const char* a, const char* b)
     return *a == *b;
 }
 
+/* Treat any key containing "server" as selector-shaped, even when it is misspelled or quoted. */
+static int selector_shaped(const char* key)
+{
+    static const char word[] = "server";
+    for (; *key; key++) {
+        size_t k = 0;
+        while (word[k] && key[k] && tolower((unsigned char)key[k]) == word[k]) k++;
+        if (!word[k]) return 1;
+    }
+    return 0;
+}
+
 int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_net_log_fn log)
 {
     int bad = 0, line = 0, in_quote = 0;
     int sec = -1;          /* -1 = top level, 0.. = cfg->servers[sec], -2 = a server section that was refused */
+    int other_section = 0; /* unknown headers keep legacy ordinary keys, but cannot contain a selector */
     size_t i = 0;
     if (!text || !cfg) return 0;
-    if (len > KZ3_NET_CONFIG_MAX) { say(log, 0, "file larger than 64 KiB, ignored"); return 1; }
+    if (len > KZ3_NET_CONFIG_MAX) {
+        cfg->server_invalid = 1;
+        say(log, 0, "file larger than 64 KiB, ignored");
+        return 1;
+    }
     while (i < len) {
         char buf[512];
         size_t k = 0;
@@ -172,7 +190,12 @@ int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_ne
             i++;
         }
         i++;   /* the newline */
-        if (too_long) { say(log, line, too_long == 2 ? "NUL byte, line ignored" : "line too long, ignored"); bad++; continue; }
+        if (too_long) {
+            cfg->server_invalid = 1;   /* discarded bytes may contain a selector */
+            say(log, line, too_long == 2 ? "NUL byte, line ignored" : "line too long, ignored");
+            bad++;
+            continue;
+        }
         buf[k] = 0;
         /* trim, strip CR and comments ('#'/';' outside double quotes) */
         char* s = buf;
@@ -188,11 +211,26 @@ int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_ne
         if (!n) continue;
         if (s[0] == '[') {
             sec = -1;
+            other_section = 0;
             char head[8] = {0};
             for (int k = 0; k < 7 && s[k]; k++) head[k] = (char)tolower((unsigned char)s[k]);
-            if (strncmp(head, "[server", 7) || (s[7] != ' ' && s[7] != '\t' && s[7] != ']')) continue;   /* other section */
+            if (strncmp(head, "[server", 7)) {
+                other_section = 1;
+                if (selector_shaped(s)) {
+                    cfg->server_invalid = 1;
+                    say(log, line, "unknown server-shaped section"); bad++; sec = -2;
+                }
+                continue;
+            }
+            if (s[7] != ' ' && s[7] != '\t' && s[7] != ']') {
+                cfg->server_invalid = 1;
+                say(log, line, "expected [server NAME]"); bad++; sec = -2; continue;
+            }
             char* close = strchr(s, ']');
-            if (!close || close[1]) { say(log, line, "expected [server NAME]"); bad++; sec = -2; continue; }
+            if (!close || close[1]) {
+                cfg->server_invalid = 1;
+                say(log, line, "expected [server NAME]"); bad++; sec = -2; continue;
+            }
             *close = 0;
             char* nm = s + 7;
             while (*nm == ' ' || *nm == '\t') nm++;
@@ -200,12 +238,19 @@ int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_ne
             while (nl && (nm[nl - 1] == ' ' || nm[nl - 1] == '\t')) nm[--nl] = 0;
             if (!nl) continue;   /* "[server]" with no name: the top level, as before pass 9 */
             if (!valid_server_name(nm)) {
+                cfg->server_invalid = 1;
                 say(log, line, "server name must be 1-32 letters, digits, spaces, - _ or ."); bad++; sec = -2; continue;
             }
             int dup = 0;
             for (int k = 0; k < cfg->nservers; k++) if (name_eq(cfg->servers[k].name, nm)) dup = 1;
-            if (dup) { say(log, line, "a server with this name is already listed; section ignored"); bad++; sec = -2; continue; }
-            if (cfg->nservers >= KZ3_NET_MAX_SERVERS) { say(log, line, "more than 8 servers; section ignored"); bad++; sec = -2; continue; }
+            if (dup) {
+                cfg->server_invalid = 1;
+                say(log, line, "a server with this name is already listed; section ignored"); bad++; sec = -2; continue;
+            }
+            if (cfg->nservers >= KZ3_NET_MAX_SERVERS) {
+                cfg->server_invalid = 1;
+                say(log, line, "more than 8 servers; section ignored"); bad++; sec = -2; continue;
+            }
             Kz3NetServer* sv = &cfg->servers[cfg->nservers];
             memset(sv, 0, sizeof(*sv));
             snprintf(sv->name, sizeof(sv->name), "%s", nm);
@@ -216,19 +261,38 @@ int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_ne
             sec = cfg->nservers++;
             continue;
         }
-        if (sec == -2) continue;   /* keys of a refused section (already reported once) */
         char* eq = strchr(s, '=');
-        if (!eq) { say(log, line, "expected key = value"); bad++; continue; }
+        if (!eq) {
+            if (selector_shaped(s)) cfg->server_invalid = 1;
+            if (sec != -2 || selector_shaped(s)) { say(log, line, "expected key = value"); bad++; }
+            continue;
+        }
         char* v = eq + 1;
         *eq = 0;
         n = strlen(s);
         while (n && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = 0;
         while (*v == ' ' || *v == '\t') v++;
+        int selector = selector_shaped(s);
         for (char* q = s; *q; q++) *q = (char)tolower((unsigned char)*q);
+        if (selector && (strcmp(s, "server") || sec != -1 || other_section)) {
+            cfg->server_invalid = 1;
+            say(log, line, "unknown or misplaced server selector"); bad++; continue;
+        }
+        if (sec == -2) continue;   /* other keys of a refused section */
+        if (selector) {
+            if (cfg->server_seen) {
+                cfg->server_invalid = 1;
+                say(log, line, "server selector specified more than once"); bad++; continue;
+            }
+            cfg->server_seen = 1;
+        }
         int quoted = 0;
         if (*v == '"') {                         /* "value": the quotes go, what is between them stays */
             size_t vl = strlen(v);
-            if (vl < 2 || v[vl - 1] != '"') { say(log, line, "unterminated double quote"); bad++; continue; }
+            if (vl < 2 || v[vl - 1] != '"') {
+                if (selector) cfg->server_invalid = 1;
+                say(log, line, "unterminated double quote"); bad++; continue;
+            }
             v[vl - 1] = 0;
             v++;
             quoted = 1;
@@ -241,6 +305,7 @@ int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_ne
             say(log, line, "a [server] section holds only host, ports and region; ignored");
             bad++;
         } else if (quoted && strcmp(s, "region")) {
+            if (selector) cfg->server_invalid = 1;
             say(log, line, "only region takes a quoted value"); bad++;
         } else if (!strcmp(s, "host")) {
             if (*v == 0) { host[0] = 0; continue; }
@@ -257,7 +322,10 @@ int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_ne
             }
             snprintf(region, region_cap, "%s", v);
         } else if (!strcmp(s, "server")) {
-            if (*v && !valid_server_name(v)) { say(log, line, "server must name a [server NAME] section"); bad++; continue; }
+            if (!valid_server_name(v)) {
+                cfg->server_invalid = 1;
+                say(log, line, "server must name a [server NAME] section"); bad++; continue;
+            }
             snprintf(cfg->server, sizeof(cfg->server), "%s", v);
         } else if (!strcmp(s, "online_id")) {
             if (*v == 0) { cfg->online_id[0] = 0; continue; }
@@ -281,6 +349,10 @@ int kz3_net_config_select(Kz3NetConfig* cfg, kz3_net_log_fn log)
 {
     int pick = -1;
     if (!cfg) return -1;
+    if (cfg->server_invalid) {
+        if (log) log("online.ini: invalid or ambiguous server selection");
+        return -1;
+    }
     if (cfg->server[0]) {
         for (int k = 0; k < cfg->nservers; k++) if (name_eq(cfg->servers[k].name, cfg->server)) pick = k;
         if (pick < 0) {
@@ -354,7 +426,11 @@ static char* read_small(FILE* f, size_t* len)
         return NULL;
     }
     buf = (char*)malloc((size_t)n + 1);
-    if (buf) { *len = fread(buf, 1, (size_t)n, f); buf[*len] = 0; }
+    if (buf) {
+        *len = fread(buf, 1, (size_t)n, f);
+        if (*len != (size_t)n) { free(buf); buf = NULL; *len = 0; }
+        else buf[*len] = 0;
+    }
     fclose(f);
     return buf;
 }
@@ -509,29 +585,53 @@ void kz3_net_register(void)
 {
     if (!ps3_net_online()) return;   /* offline (default): nothing here runs */
 
+    ps3_net_policy_reset();
+    ps3_net_set_np_signed_in(0);
+    ps3_net_policy_set_strict(1);    /* refuse all destinations until a selection is installed */
+    s_region_label[0] = 0;
     Kz3NetConfig cfg;
     char shown[200], m[300];
     size_t len = 0;
     kz3_net_config_defaults(&cfg);
-    char* text = read_small(open_config(shown, sizeof(shown)), &len);
+    errno = 0;
+    FILE* config_file = open_config(shown, sizeof(shown));
+    int config_error = errno, config_opened = config_file != NULL;
+    char* text = read_small(config_file, &len);
     if (text) {
         int bad = kz3_net_parse_config(text, len, &cfg, log_line);
         snprintf(m, sizeof(m), "config: %s (%d line(s) rejected)", shown, bad);
         free(text);
+    } else if (config_opened || config_error != ENOENT) {
+        cfg.server_invalid = 1;
+        snprintf(m, sizeof(m), "config: %s cannot be read", shown);
     } else {
         snprintf(m, sizeof(m), "config: %s not found", shown);
     }
     log_line(m);
-    kz3_net_config_select(&cfg, log_line);
+    if (kz3_net_config_select(&cfg, log_line) != 0) {
+        log_line("invalid server selection: every destination is refused");
+        return;
+    }
     if (cfg.nservers) {
         snprintf(m, sizeof(m), "%d server entr%s in online.ini; using %s", cfg.nservers, cfg.nservers == 1 ? "y" : "ies",
                  cfg.server[0] ? cfg.server : (cfg.host[0] ? "the selected entry" : "none"));
         log_line(m);
     }
     const char* e = getenv("KZ3_NET_SERVER");       /* tests */
-    if (e && *e) {
+#ifdef _WIN32
+    if (!e) {
+        /* The CRT can treat an explicitly empty environment variable as absent. */
+        SetLastError(ERROR_SUCCESS);
+        DWORD required = GetEnvironmentVariableW(L"KZ3_NET_SERVER", NULL, 0);
+        if (required || GetLastError() != ERROR_ENVVAR_NOT_FOUND) e = "";
+    }
+#endif
+    if (e) {
         if (valid_host(e)) snprintf(cfg.host, sizeof(cfg.host), "%s", e);
-        else log_line("KZ3_NET_SERVER is not a host name or IPv4 address, ignored");
+        else {
+            log_line("KZ3_NET_SERVER is not a host name or IPv4 address: every destination is refused");
+            return;
+        }
     }
     e = getenv("KZ3_NET_REGION");                   /* tests: the region label, validated like the file's */
     if (e && *e) {

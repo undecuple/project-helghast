@@ -9,7 +9,13 @@ Nothing, unless you ask for it. Each item is off until you turn it on, and this 
   repository's latest release, made only when you click "Check now" or tick "Check for new versions" (then at most
   once a day). Nothing about you, your computer or the game is sent; a new installer downloads only when you click it.
 - **Project website** (`site/`): viewing it loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit. The repository, installer and game do not.
-- **Online multiplayer** (planned): only through a self-hosted server you choose.
+- **Experimental networking** (off by default): setting `KZ3_ONLINE` to a nonempty value other than `0` opts in.
+  The port reads the selected server from `online.ini` and may resolve its host through the operating system,
+  which can contact the configured DNS service. The existing guest policy is intended to restrict destinations
+  to the selected server, but the generic resolver-policy gap remains unverified. With `KZ3_NET_CAPTURE` also
+  enabled and a loopback server selected, diagnostic listeners bind `127.0.0.1` on ports 10070, 10071, 10075,
+  10078 and 10079. Multiplayer and compatibility with any server are unverified:
+  [network evidence and limits](NETWORK-EVIDENCE.md).
 - **Discord status** (optional, off unless you turn it on in Options > Display > Discord status, with "Discord status on or off" in the Start menu, or with `discord_presence = 1` in `kz3.ini`): the port tells the Discord
   app on your own PC what to show on your profile (the activity text, the game's process id and the port's Discord
   application id), through the app's local connection. The port itself sends nothing over the network for it; the
@@ -17,7 +23,7 @@ Nothing, unless you ask for it. Each item is off until you turn it on, and this 
 
 The original PS3 game's online play is kept running by the PS Rewired community
 ([their Killzone 3 page](https://psrewired.com/servers/23044)). This port is not affiliated with or endorsed by
-PS Rewired and does not connect to their servers.
+PS Rewired; it has no default server and compatibility with their service has not been verified.
 
 ## Where your data goes
 

@@ -23,6 +23,7 @@ Index of the scripts and folders in this directory. Build and test details are i
 |---|---|
 | `spu/` | SPU lift (`lift_spu.sh`, `lift_spu.py`), version tables and the SPU host tests. |
 | `smoke/` | Host-side test harness: small C programs and Python checks that run without a GPU or game data. |
+| `net/` | Synthetic, offline-by-default network configuration, ticket and RT host tests; no game data or server. |
 | `release/` | Installer, portable zip and first-run build: payload assembly, toolchain fetch, disc and update checks, launcher. |
 | `upstream/` | Host tests for the general ps3recomp fixes the patches carry. |
 | `pad/` | Scripted pad-input files (`.pad`) that drive the menus and levels in automated runs. |

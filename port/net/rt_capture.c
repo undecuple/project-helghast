@@ -3,9 +3,9 @@
  *
  * Included by kz3_net.c. Runs only when the player is online (KZ3_ONLINE), KZ3_NET_CAPTURE is set and the server is
  * 127.0.0.0/8: a thread inside the game process listens on 127.0.0.1:10071 (never any other address), accepts the
- * game's MUIS connection and logs each RT frame (id, length, payload as hex up to 96 bytes) plus the decoded
- * CLIENT_HELLO parameters and CLIENT_CONNECT_TCP fields. The access token of CONNECT_TCP is logged as its length
- * and an FNV-1a hash only. It answers only what is needed to get those bytes:
+ * game's MUIS connection and logs RT frame IDs, lengths and selected non-sensitive message metadata. Payloads,
+ * hello/certificate bytes, tokens, signatures, session keys and ticket bytes are not logged. It answers only
+ * the modelled messages below:
  *   CLIENT_HELLO (0x24)       -> SERVER_HELLO (0x25) with the payload of KZ3_NET_CAPTURE_HELLO (a file the tester
  *                                provides; nothing is sent without it)
  *   CLIENT_CONNECT_TCP (0x00) -> SERVER_CONNECT_REQUIRE (0x22) {0, 584 LE} (the default of a self-hosted server)
@@ -34,13 +34,13 @@
  *   (world 3; the 4/0x8A record says world -1 = host unless KZ3_NET_CAPTURE_JOIN=1); RT 0x2D -> 0x2E (timebase).
  * Pass 7 (section 12): RT 0x3B CLIENT_MULTI_APP_TOSERVER is split into its RT parts, each handled as a frame (KZ3
  * sends DnasSignaturePost 4/0x0A, logged without its signature, and TicketLogin in one 0x3B after the region pick).
- * Four listeners, MUIS, MAS and MLS (kz3_net_capture_start once per port) and the SVO HTTP logger on 10070
+ * Five listeners: MUIS, MAS, MLS and DME (kz3_net_capture_start once per port), and the SVO HTTP logger on 10070
  * (kz3_net_capture_start_kind(..., 1): request line without query values, header names; GET
  * .../kin/stats/region_list.jsp answered with a one-region XML list, pass 7; kin/account/nplogin.do with a login
  * result of 30000, pass 9; everything else 404),
  * one accept thread each and one thread per connection (pass 8).
- * A hello's certificate is logged as offset, length and hash; a TicketLogin (Medius 4/0x58) as its header and the
- * ticket's offset, never the ticket. Every other frame is logged and left unanswered. RT framing: u8 id (bit 7 = encrypted, then a 4-byte hash), u16
+ * TicketLogin (Medius 4/0x58) is described by its class, type and length, never its prefix or ticket.
+ * Unmodelled frames are left unanswered. RT framing: u8 id (bit 7 = encrypted, then a 4-byte hash), u16
  * little-endian payload length, payload. All bytes from the peer are bounds-checked before use.
  */
 #include <stdint.h>
@@ -65,7 +65,6 @@ typedef int rtcap_sock;
 #endif
 
 #define RTCAP_HELLO_MAX   0x2000u
-#define RTCAP_LOG_MAX     8192u      /* payload bytes logged per connection */
 #define RTCAP_BUF         (3u + 4u + 0xFFFFu)
 #define RTCAP_OUT         (3u + RTCAP_HELLO_MAX)
 #define RTCAP_SESSION_KEY "kz3capture"
@@ -130,27 +129,10 @@ static size_t rt_frame_parse(const uint8_t* buf, size_t n, RtFrame* f)
     return hdr + len;
 }
 
-static uint32_t rt_fnv1a(const uint8_t* p, size_t n)
-{
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
-    return h;
-}
-
 static uint32_t le32(const uint8_t* p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint32_t be32c(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 
-static char s_cap_online_id[33];   /* the configured online id, compared with the ticket's field (never logged) */
-
-/* Message offset (class and type included) of a TicketLogin's ticket: its version word ("21 01 00 00", "31 00 00 00"
- * or "41 00 00 00"), searched after MessageID and SessionKey (a MessageID "1" or a key ending in '1' looks like one);
- * 0 = not found. */
-static size_t rt_ticket_at(const uint8_t* p, size_t len)
-{
-    for (size_t i = 2 + MED_MSGID + MED_SKEY; i + 4 <= len; i++)
-        if (((p[i] == 0x21 && p[i + 1] == 0x01) || p[i] == 0x31 || p[i] == 0x41) && !p[i + 2] && !p[i + 3]) return i;
-    return 0;
-}
+static char s_cap_online_id[33];   /* used in modeled responses, never logged */
 
 /* One line describing a frame's decoded fields ("" when the type is not decoded). */
 static void rt_describe(const RtFrame* f, char* out, size_t cap)
@@ -158,47 +140,11 @@ static void rt_describe(const RtFrame* f, char* out, size_t cap)
     out[0] = 0;
     if (f->encrypted) { snprintf(out, cap, "encrypted (not decoded)"); return; }
     if (f->id == 0x24) {
-        char* o = out;
-        size_t left = cap;
-        int w = snprintf(o, left, "CLIENT_HELLO params (u16 LE):");
-        for (size_t i = 0; w > 0 && (size_t)w < left && i + 1 < f->len && i < 14; i += 2) {
-            o += w; left -= (size_t)w;
-            w = snprintf(o, left, " %u", (unsigned)(f->payload[i] | f->payload[i + 1] << 8));
-        }
-        /* A DER certificate (30 82 hi lo) after the parameters: its length and hash, then the bytes after it. */
-        const uint8_t* p = f->payload;
-        for (size_t c = 6; w > 0 && (size_t)w < left && c + 4 <= f->len && c <= 32; c++) {
-            if (p[c] != 0x30 || p[c + 1] != 0x82) continue;
-            size_t cl = 4u + ((size_t)p[c + 2] << 8 | p[c + 3]);
-            if (c + cl > f->len) break;
-            o += w; left -= (size_t)w;
-            w = snprintf(o, left, " | certificate at %u, %u bytes, fnv %08x | tail %u bytes:", (unsigned)c, (unsigned)cl,
-                         rt_fnv1a(p + c, cl), (unsigned)(f->len - c - cl));
-            for (size_t i = c + cl; w > 0 && (size_t)w < left && i < f->len && i < c + cl + 16; i++) {
-                o += w; left -= (size_t)w;
-                w = snprintf(o, left, " %02x", p[i]);
-            }
-            break;
-        }
+        snprintf(out, cap, "CLIENT_HELLO payload redacted");
     } else if (f->id == 0x0B && f->len >= 2) {
-        /* CLIENT_APP_TOSERVER: a Medius message, class and type first. For TicketLogin (4/0x58) the offset of the
-         * ticket (its "21 01 00 00" / "31 00 00 00" / "41 00 00 00" version word) in the message, not its bytes. */
+        /* CLIENT_APP_TOSERVER: a Medius message, class and type first. */
         const uint8_t* p = f->payload;
-        int w = snprintf(out, cap, "CLIENT_APP_TOSERVER medius class %u type 0x%02X, %u bytes", p[0], p[1], (unsigned)f->len);
-        if (p[0] == 4 && p[1] == 0x58 && w > 0 && (size_t)w < cap) {
-            size_t at = rt_ticket_at(p, f->len);
-            if (at) {
-                size_t uid = at - 2 + 0x54;   /* body offset (after class and type) of the ticket's online id field */
-                const char* match = "not checked";
-                if (s_cap_online_id[0] && at + 0x54 + 32 <= f->len)
-                    match = (!strncmp((const char*)p + at + 0x54, s_cap_online_id, 32)) ? "yes" : "no";
-                snprintf(out + w, cap - (size_t)w,
-                         ", ticket at message offset %u = body offset %u (u32 before it: LE %u, BE %u), %u frame bytes "
-                         "from the ticket on, online id field at body offset %u (matches online_id: %s)",
-                         (unsigned)at, (unsigned)(at - 2), le32(p + at - 4), be32c(p + at - 4),
-                         (unsigned)(f->len - at), (unsigned)uid, match);
-            } else snprintf(out + w, cap - (size_t)w, ", no ticket version word found");
-        }
+        snprintf(out, cap, "CLIENT_APP_TOSERVER medius class %u type 0x%02X, %u bytes", p[0], p[1], (unsigned)f->len);
     } else if (f->id == 0x00 && f->len >= 8) {
         const uint8_t* p = f->payload;
         int key_zero = 1;
@@ -206,10 +152,8 @@ static void rt_describe(const RtFrame* f, char* out, size_t cap)
         for (size_t i = 8; i < key_end; i++) if (p[i]) key_zero = 0;
         size_t tok = f->len > 0x48 ? f->len - 0x48u : 0;
         snprintf(out, cap,
-                 "CLIENT_CONNECT_TCP world %u (BE %u), app id %u (BE %u), 0x40-byte key field %s%s, token %u bytes fnv %08x",
-                 le32(p), be32c(p), le32(p + 4), be32c(p + 4),
-                 f->len < 0x48 ? "short " : "", key_zero ? "all zero" : "non-zero",
-                 (unsigned)tok, tok ? rt_fnv1a(p + 0x48, tok) : 0u);
+                 "CLIENT_CONNECT_TCP 0x40-byte key field %s%s, token %u bytes",
+                 f->len < 0x48 ? "short " : "", key_zero ? "all zero" : "non-zero", (unsigned)tok);
     }
 }
 
@@ -266,9 +210,8 @@ static size_t med_frame(uint8_t cls, uint8_t type, const uint8_t* body, size_t b
  * (+0x18), key[5..8] (+0x5C), the record's +0x1E4 (+0x1C) and its data (+0x20) and goes to state 4 (match found).
  * Result 1 with reason 6 -> error -948, result 1 otherwise or -927 -> -977, others -> error. Every length from the
  * request is checked against len before use; key[5..15] stay 0 (key[5..8] -> matchmaker +0x5C, unknown). */
-/* Test-only diagnosis (KZ3_NET_CAPTURE_PEEK=1, v1.00 addresses): logs what the game's 4/0x8A handler 0x16074C will
- * compare, read from guest memory: the matchmaker 0x134086C (state +4, key word +0x58) and the request counter
- * 0x14DF138. Never used to build an answer (a server cannot see them). */
+/* Test-only diagnosis (KZ3_NET_CAPTURE_PEEK=1, v1.00 addresses): logs the matchmaker state. Never used to build
+ * an answer (a server cannot see it). Key words and request counters are not logged. */
 extern uint8_t* vm_base;
 static uint32_t rt_guest32(uint32_t ea) { uint8_t* b = vm_base + ea; return be32c(b); }
 static void rt_peek_matchmaker(void)
@@ -276,9 +219,8 @@ static void rt_peek_matchmaker(void)
     const char* e = getenv("KZ3_NET_CAPTURE_PEEK");
     if (!e || strcmp(e, "1") || !vm_base) return;
     uint32_t mm = rt_guest32(0x134086Cu);
-    if (mm < 0x10000u || mm > 0xFFFFFF00u) { printf("[kz3net-cap]   peek: no matchmaker (0x%08x)\n", mm); return; }
-    printf("[kz3net-cap]   peek: matchmaker 0x%08x state %u key word 0x%08x counter %u\n", mm, rt_guest32(mm + 4),
-           rt_guest32(mm + 0x58), vm_base[0x14DF138u]);
+    if (mm < 0x10000u || mm > 0xFFFFFF00u) { printf("[kz3net-cap]   peek: no matchmaker\n"); return; }
+    printf("[kz3net-cap]   peek: matchmaker state %u\n", rt_guest32(mm + 4));
 }
 #define RTCAP_MATCH_WORLD 3u            /* the match's game world in the 4/0x8A record */
 static size_t med_match_found(const uint8_t* p, size_t len, uint8_t* out, size_t cap)
@@ -292,9 +234,7 @@ static size_t med_match_found(const uint8_t* p, size_t len, uint8_t* out, size_t
     if (clen) key[0] = cookie[0];             /* the request counter */
     key[1] = (uint8_t)RTCAP_PARTY_WORLD; key[2] = (uint8_t)(RTCAP_PARTY_WORLD >> 8);   /* LE: the party's world id */
     key[3] = (uint8_t)(RTCAP_PARTY_WORLD >> 16); key[4] = (uint8_t)(RTCAP_PARTY_WORLD >> 24);
-    printf("[kz3net-cap]   4/0x88: %u list words, cookie %u bytes, key", (unsigned)n, (unsigned)clen);
-    for (size_t i = 0; i < sizeof(key); i++) printf(" %02x", key[i]);
-    printf("\n");
+    printf("[kz3net-cap]   4/0x88: %u list words, cookie %u bytes (contents redacted)\n", (unsigned)n, (unsigned)clen);
     rt_peek_matchmaker();
     MedW w = { out, 0, cap, 0 };
     medw_bytes(&w, key, sizeof(key));
@@ -713,28 +653,11 @@ static size_t rt_reply(const RtFrame* f, const uint8_t* hello, size_t hello_len,
     return 0;
 }
 
-static void rt_log_frame(uint16_t port, int conn, const RtFrame* f, size_t* logged)
+static void rt_log_frame(uint16_t port, int conn, const RtFrame* f)
 {
-    char line[1700], desc[300];
-    size_t show = f->len < 96 ? f->len : 96;
-    if (f->id == 0x0B && f->len >= 2 && f->payload[0] == 4 && f->payload[1] == 0x88)
-        show = f->len < 500 ? f->len : 500;           /* pass 13: the whole matchmaking request (no secrets in it) */
-    if (*logged >= RTCAP_LOG_MAX) show = 0;
-    if (f->id == 0x00 && show > 0x48) show = 0x48;   /* never the token bytes */
-    if (f->id == 0x3B) show = 0;                      /* a container: its parts are logged one by one */
-    if (f->id == 0x0B && f->len >= 2 && f->payload[0] == 4 && f->payload[1] == 0x0A && show > 2 + MED_MSGID + MED_SKEY)
-        show = 2 + MED_MSGID + MED_SKEY;              /* DnasSignaturePost: never the signature bytes */
-    if (f->id == 0x0B && f->len >= 2 && f->payload[0] == 4 && f->payload[1] == 0x58) {
-        size_t at = rt_ticket_at(f->payload, f->len); /* TicketLogin: the bytes before the ticket, never the ticket */
-        size_t lim = at ? at : 2 + MED_MSGID + MED_SKEY;
-        if (show > lim) show = lim;
-    }
-    int w = snprintf(line, sizeof(line), "[kz3net-cap] %u conn %d recv RT 0x%02X%s len %u:", (unsigned)port, conn, f->id,
-                     f->encrypted ? " (enc)" : "", (unsigned)f->len);
-    for (size_t i = 0; i < show && w > 0 && (size_t)w < sizeof(line) - 4; i++)
-        w += snprintf(line + w, sizeof(line) - (size_t)w, " %02x", f->payload[i]);
-    *logged += show;
-    printf("%s\n", line);
+    char desc[300];
+    printf("[kz3net-cap] %u conn %d recv RT 0x%02X%s len %u (payload redacted)\n",
+           (unsigned)port, conn, f->id, f->encrypted ? " (enc)" : "", (unsigned)f->len);
     rt_describe(f, desc, sizeof(desc));
     if (desc[0]) printf("[kz3net-cap] %u conn %d   %s\n", (unsigned)port, conn, desc);
     fflush(stdout);
@@ -782,17 +705,17 @@ static int        s_nlisten;
 /* One frame: logged, answered when rt_reply knows it. RT_MSG_CLIENT_MULTI_APP_TOSERVER (0x3B, pass 7: KZ3 sends
  * DnasSignaturePost 4/0x0A and TicketLogin 4/0x58 together in one) is a sequence of whole sub-frames (u8 id, u16 LE
  * length, payload): each is handled like a frame of its own, never past the container's payload. */
-static void rt_handle(rtcap_sock c, uint16_t port, int conn, const RtFrame* f, uint8_t* out, size_t* logged, int depth)
+static void rt_handle(rtcap_sock c, uint16_t port, int conn, const RtFrame* f, uint8_t* out, int depth)
 {
-    rt_log_frame(port, conn, f, logged);
+    rt_log_frame(port, conn, f);
     static int s_peeks;
     if (f->id == 0x05 && port == RTCAP_MLS_PORT && s_peeks < 6) { s_peeks++; rt_peek_matchmaker(); }   /* test only */
-    if (f->id == 0x3B && depth == 0) {
+    if (!f->encrypted && f->id == 0x3B && depth == 0) {
         RtFrame sf;
         size_t off = 0, used, k = 0;
         while (off < f->len && (used = rt_frame_parse(f->payload + off, f->len - off, &sf)) > 0) {
             printf("[kz3net-cap] %u conn %d   0x3B part %u:\n", (unsigned)port, conn, (unsigned)++k);
-            rt_handle(c, port, conn, &sf, out, logged, 1);
+            rt_handle(c, port, conn, &sf, out, 1);
             off += used;
         }
         if (off != f->len) printf("[kz3net-cap] %u conn %d   0x3B: %u trailing bytes not a whole frame\n", (unsigned)port,
@@ -812,9 +735,9 @@ static void rt_handle(rtcap_sock c, uint16_t port, int conn, const RtFrame* f, u
                        (unsigned)(fl - 3), sent);
             o += fl;
         }
-    } else if (f->id == 0x24) {
+    } else if (!f->encrypted && f->id == 0x24) {
         printf("[kz3net-cap] conn %d   no KZ3_NET_CAPTURE_HELLO file: hello left unanswered\n", conn);
-    } else if (f->id == 0x0B && f->len >= 2 && f->payload[0] == 4 && f->payload[1] == 0x58) {
+    } else if (!f->encrypted && f->id == 0x0B && f->len >= 2 && f->payload[0] == 4 && f->payload[1] == 0x58) {
         printf("[kz3net-cap] conn %d   TicketLogin reached: left unanswered (no account server here)\n", conn);
     }
     fflush(stdout);
@@ -822,7 +745,7 @@ static void rt_handle(rtcap_sock c, uint16_t port, int conn, const RtFrame* f, u
 
 static void rt_serve(rtcap_sock c, uint16_t port, int conn, uint8_t* buf, uint8_t* out)
 {
-    size_t have = 0, logged = 0;
+    size_t have = 0;
     for (;;) {
         int r = (int)recv(c, (char*)buf + have, (int)(RTCAP_BUF - have), 0);
         if (r <= 0) { printf("[kz3net-cap] %u conn %d closed by the game (%d)\n", (unsigned)port, conn, r); break; }
@@ -830,7 +753,7 @@ static void rt_serve(rtcap_sock c, uint16_t port, int conn, uint8_t* buf, uint8_
         RtFrame f;
         size_t used;
         while ((used = rt_frame_parse(buf, have, &f)) > 0) {
-            rt_handle(c, port, conn, &f, out, &logged, 0);
+            rt_handle(c, port, conn, &f, out, 0);
             memmove(buf, buf + used, have - used);
             have -= used;
         }

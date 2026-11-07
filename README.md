@@ -52,6 +52,10 @@ What each must contain: [docs/GETTING-FILES.md](docs/GETTING-FILES.md); regions,
 
 Do not install into a OneDrive folder. Saves and settings: [docs/INSTALL.md](docs/INSTALL.md). Changes per version: [CHANGELOG.md](CHANGELOG.md). Nothing goes online unless you turn it on: [docs/PRIVACY.md](docs/PRIVACY.md).
 
+Experimental networking is off by default. Opting in with `KZ3_ONLINE` can resolve the configured host through
+the operating system; optional loopback capture starts local diagnostic listeners. No compatible multiplayer
+server or complete online session has been verified: [network evidence and limits](docs/NETWORK-EVIDENCE.md).
+
 ## Settings and known issues
 
 Display, input and frame-rate settings are in the game's Options menu; the list is in [docs/FEATURES.md](docs/FEATURES.md).
