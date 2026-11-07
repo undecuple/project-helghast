@@ -22,6 +22,8 @@ tools/upstream/test_pad_script_v2.py
 tools/release/test_firstrun_check.py
 tools/release/test_version_agree.py
 tools/test_features.py
+tools/test_kz3_metrics.py
+tools/perf/test_mission0.py
 tools/spu/test_kz3_gameplay.sh
 tools/release/test_firstrun.py
 tools/release/test_rpcs3_import.py

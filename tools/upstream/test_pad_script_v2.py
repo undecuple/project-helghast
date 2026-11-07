@@ -17,6 +17,8 @@ HARNESS = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+static unsigned long long fake_host_ms;
+unsigned long long ps3_ms_now(void) { return ++fake_host_ms; }
 %s
 static int fails = 0;
 #define CHECK(name, cond) do { if (cond) printf("ok   %%s\n", name); else { fails++; printf("FAIL %%s (line %%d)\n", name, __LINE__); } } while (0)
@@ -110,7 +112,8 @@ def run(src, script_path):
         code.append(f)
     with tempfile.TemporaryDirectory() as d:
         open(f"{d}/t.c", "w").write(HARNESS % ("\n".join(code), script_path.replace("\\", "\\\\")))
-        r = subprocess.run(["cc", "-O0", "-w", f"{d}/t.c", "-o", f"{d}/t", "-lm"], capture_output=True, text=True)
+        r = subprocess.run([os.environ.get("CC", "cc"), "-O0", "-w", f"{d}/t.c", "-o", f"{d}/t", "-lm"],
+                           capture_output=True, text=True)
         if r.returncode:
             return "compile error: " + r.stderr[:600], ""
         out = subprocess.run([f"{d}/t"], capture_output=True, text=True).stdout
