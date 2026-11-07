@@ -216,6 +216,7 @@ int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_ne
             for (int k = 0; k < 7 && s[k]; k++) head[k] = (char)tolower((unsigned char)s[k]);
             if (strncmp(head, "[server", 7)) {
                 other_section = 1;
+                cfg->config_unsafe = 1;
                 if (selector_shaped(s)) {
                     cfg->server_invalid = 1;
                     say(log, line, "unknown server-shaped section"); bad++; sec = -2;
@@ -279,6 +280,7 @@ int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_ne
             say(log, line, "unknown or misplaced server selector"); bad++; continue;
         }
         if (sec == -2) continue;   /* other keys of a refused section */
+        if (!strcmp(s, "ticket_file") && *v) cfg->ticket_requested = 1;
         if (selector) {
             if (cfg->server_seen) {
                 cfg->server_invalid = 1;
@@ -342,6 +344,7 @@ int kz3_net_parse_config(const char* text, size_t len, Kz3NetConfig* cfg, kz3_ne
             bad++;
         }
     }
+    if (bad) cfg->config_unsafe = 1;
     return bad;
 }
 
@@ -351,6 +354,10 @@ int kz3_net_config_select(Kz3NetConfig* cfg, kz3_net_log_fn log)
     if (!cfg) return -1;
     if (cfg->server_invalid) {
         if (log) log("online.ini: invalid or ambiguous server selection");
+        return -1;
+    }
+    if ((cfg->ticket_requested || cfg->ticket_file[0] || cfg->online_id[0]) && cfg->config_unsafe) {
+        if (log) log("online.ini: a ticket or online identity requires a fully recognized configuration");
         return -1;
     }
     if (cfg->server[0]) {
@@ -581,9 +588,19 @@ int kz3_net_load_ticket(const char* path, Kz3NetConfig* cfg, kz3_net_log_fn log)
     return 0;
 }
 
-void kz3_net_register(void)
+static int fail_online_setup(void)
 {
-    if (!ps3_net_online()) return;   /* offline (default): nothing here runs */
+    ps3_net_set_online(0);
+    ps3_net_set_np_signed_in(0);
+    ps3_net_policy_reset();
+    ps3_net_policy_set_strict(1);
+    s_region_label[0] = 0;
+    return -1;
+}
+
+int kz3_net_register(void)
+{
+    if (!ps3_net_online()) return 0;   /* offline (default): nothing here runs */
 
     ps3_net_policy_reset();
     ps3_net_set_np_signed_in(0);
@@ -608,16 +625,25 @@ void kz3_net_register(void)
         snprintf(m, sizeof(m), "config: %s not found", shown);
     }
     log_line(m);
+    const char* e = getenv("KZ3_NET_ONLINE_ID");    /* tests */
+    if (e && *e) {
+        if (np_ticket_valid_online_id(e)) snprintf(cfg.online_id, sizeof(cfg.online_id), "%s", e);
+        else log_line("KZ3_NET_ONLINE_ID is not a valid online id, ignored");
+    }
+    if (cfg.config_unsafe && getenv("PSNR_SERVER")) {
+        log_line("online.ini: inherited psnr requires a fully recognized configuration");
+        return fail_online_setup();
+    }
     if (kz3_net_config_select(&cfg, log_line) != 0) {
         log_line("invalid server selection: every destination is refused");
-        return;
+        return fail_online_setup();
     }
     if (cfg.nservers) {
         snprintf(m, sizeof(m), "%d server entr%s in online.ini; using %s", cfg.nservers, cfg.nservers == 1 ? "y" : "ies",
                  cfg.server[0] ? cfg.server : (cfg.host[0] ? "the selected entry" : "none"));
         log_line(m);
     }
-    const char* e = getenv("KZ3_NET_SERVER");       /* tests */
+    e = getenv("KZ3_NET_SERVER");                   /* tests */
 #ifdef _WIN32
     if (!e) {
         /* The CRT can treat an explicitly empty environment variable as absent. */
@@ -630,7 +656,7 @@ void kz3_net_register(void)
         if (valid_host(e)) snprintf(cfg.host, sizeof(cfg.host), "%s", e);
         else {
             log_line("KZ3_NET_SERVER is not a host name or IPv4 address: every destination is refused");
-            return;
+            return fail_online_setup();
         }
     }
     e = getenv("KZ3_NET_REGION");                   /* tests: the region label, validated like the file's */
@@ -640,26 +666,24 @@ void kz3_net_register(void)
     }
     memcpy(s_region_label, cfg.region, sizeof(s_region_label));
     if (cfg.region[0]) log_line("region label configured (shown for the server's regions)");
-    e = getenv("KZ3_NET_ONLINE_ID");                /* tests */
-    if (e && *e) {
-        if (np_ticket_valid_online_id(e)) snprintf(cfg.online_id, sizeof(cfg.online_id), "%s", e);
-        else log_line("KZ3_NET_ONLINE_ID is not a valid online id, ignored");
-    }
-
     uint8_t ip[4];
     if (!cfg.host[0] || !resolve_server(cfg.host, ip)) {
-        kz3_net_apply(&cfg, NULL);
         snprintf(m, sizeof(m), "online, but %s: every destination is refused",
                  cfg.host[0] ? "the server name does not resolve" : "no server is configured (host = ...)");
         log_line(m);
-        return;
+        return fail_online_setup();
     }
-    if (kz3_net_apply(&cfg, ip)) log_line("network policy table full (entries dropped)");
+    if (cfg.ticket_file[0] && kz3_net_load_ticket(cfg.ticket_file, &cfg, log_line) != 0) {
+        return fail_online_setup();
+    }
+    if (kz3_net_apply(&cfg, ip)) {
+        log_line("network policy table full: every destination is refused");
+        return fail_online_setup();
+    }
     snprintf(m, sizeof(m), "online: %s -> %s (%u.%u.%u.%u), %d port range(s); everything else refused",
              KZ3_NET_MUIS_HOST, cfg.host, ip[0], ip[1], ip[2], ip[3], cfg.nranges);
     log_line(m);
 
-    if (cfg.ticket_file[0] && kz3_net_load_ticket(cfg.ticket_file, &cfg, log_line) != 0) return;
     if (cfg.online_id[0]) np_kz3_sign_in(cfg.online_id);
     else log_line("no online_id configured: not signed in to NP");
 
@@ -676,6 +700,7 @@ void kz3_net_register(void)
         }
         else log_line("KZ3_NET_CAPTURE ignored: the server is not on 127.0.0.0/8");
     }
+    return 0;
 }
 
 /* The loopback capture is its own file; included here so the exe's source list (port/kz3/CMakeLists.txt) and the

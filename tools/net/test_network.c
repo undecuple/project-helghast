@@ -22,7 +22,10 @@ typedef int test_socket;
 #  define TEST_CALL
 #endif
 
+#include "net_policy.h"
+
 static int resolver_calls, file_opens, ticket_opens, socket_calls, sends;
+static int policy_map_calls, policy_allow_calls;
 static uint8_t sent_ids[8];
 static char resolved_name[256];
 static struct sockaddr_in fake_address;
@@ -90,12 +93,27 @@ static FILE* fake_wfopen(const wchar_t* path, const wchar_t* mode);
 static FILE* fake_fopen(const char* path, const char* mode);
 static size_t fake_fread(void* ptr, size_t size, size_t count, FILE* stream);
 
+static int counted_policy_map(const char* name, const uint8_t ip[4])
+{
+    policy_map_calls++;
+    return ps3_net_policy_map_host(name, ip);
+}
+
+static int counted_policy_allow(const uint8_t ip[4], uint16_t lo, uint16_t hi, int protos)
+{
+    policy_allow_calls++;
+    if (getenv("KZ3_NET_TEST_ALLOW_FAIL") && policy_allow_calls == 2) return -1;
+    return ps3_net_policy_allow(ip, lo, hi, protos);
+}
+
 #define getaddrinfo fake_getaddrinfo
 #define freeaddrinfo fake_freeaddrinfo
 #define send fake_send
 #define socket fake_socket
 #define fopen fake_fopen
 #define fread fake_fread
+#define ps3_net_policy_map_host counted_policy_map
+#define ps3_net_policy_allow counted_policy_allow
 #ifdef _WIN32
 #  define WSAStartup fake_wsa_startup
 #  define _wfopen fake_wfopen
@@ -107,6 +125,8 @@ static size_t fake_fread(void* ptr, size_t size, size_t count, FILE* stream);
 #undef socket
 #undef fopen
 #undef fread
+#undef ps3_net_policy_map_host
+#undef ps3_net_policy_allow
 #ifdef _WIN32
 #  undef WSAStartup
 #  undef _wfopen
@@ -207,6 +227,23 @@ static void test_config(void)
     kz3_net_config_defaults(&cfg);
     assert(kz3_net_parse_config(default_host, sizeof(default_host) - 1, &cfg, NULL) == 1);
     assert(!kz3_net_config_select(&cfg, NULL) && !strcmp(cfg.host, "fallback.invalid"));
+    kz3_net_config_defaults(&cfg);
+    assert(kz3_net_parse_config("sever = first\n", 14, &cfg, NULL) == 1);
+    static const char ticket_after[] = "host = fallback.invalid\nticket_file = synthetic.ticket\n";
+    assert(!kz3_net_parse_config(ticket_after, sizeof(ticket_after) - 1, &cfg, NULL));
+    assert(kz3_net_config_select(&cfg, NULL) == -1);
+    kz3_net_config_defaults(&cfg);
+    assert(!kz3_net_parse_config(ticket_after, sizeof(ticket_after) - 1, &cfg, NULL));
+    assert(kz3_net_parse_config("unknown = value\n", 16, &cfg, NULL) == 1);
+    assert(kz3_net_config_select(&cfg, NULL) == -1);
+    static const char rejected_ticket[] = "host = fallback.invalid\nticket_file = \"synthetic.ticket\"\n";
+    kz3_net_config_defaults(&cfg);
+    assert(kz3_net_parse_config(rejected_ticket, sizeof(rejected_ticket) - 1, &cfg, NULL) == 1);
+    assert(!cfg.ticket_file[0] && cfg.ticket_requested && kz3_net_config_select(&cfg, NULL) == -1);
+    kz3_net_config_defaults(&cfg);
+    static const char identity_unknown[] = "host = fallback.invalid\nonline_id = TestUser1\nfuture = 1\n";
+    assert(kz3_net_parse_config(identity_unknown, sizeof(identity_unknown) - 1, &cfg, NULL) == 1);
+    assert(kz3_net_config_select(&cfg, NULL) == -1);
     static const char default_section[] = "[server first]\nhost = first.invalid\n";
     kz3_net_config_defaults(&cfg);
     assert(!kz3_net_parse_config(default_section, sizeof(default_section) - 1, &cfg, NULL));
@@ -414,7 +451,8 @@ static void set_online_env(const char* value)
 #endif
 }
 
-static void test_closed_registration(int expected_resolver_calls)
+static void test_closed_registration(int expected_resolver_calls, int expected_ticket_opens,
+                                     int expected_map_calls, int expected_allow_calls)
 {
     const uint8_t old_ip[4] = {192, 0, 2, 47};
     uint8_t mapped[4];
@@ -422,10 +460,11 @@ static void test_closed_registration(int expected_resolver_calls)
     assert(!ps3_net_policy_map_host(KZ3_NET_MUIS_HOST, old_ip));
     assert(!ps3_net_policy_allow(old_ip, 10071, 10071, PS3_NET_PROTO_TCP | PS3_NET_PROTO_UDP));
     ps3_net_set_np_signed_in(1);
-    kz3_net_register();
-    assert(file_opens == 1 && !ticket_opens && resolver_calls == expected_resolver_calls);
+    assert(kz3_net_register() == -1);
+    assert(file_opens == 1 && ticket_opens == expected_ticket_opens && resolver_calls == expected_resolver_calls);
+    assert(policy_map_calls == expected_map_calls && policy_allow_calls == expected_allow_calls);
     assert(!socket_calls && !sends && !registrations);
-    assert(!np_kz3_ticket_source_file() && !ps3_net_np_signed_in());
+    assert(!np_kz3_ticket_source_file() && !ps3_net_np_signed_in() && !ps3_net_online());
     assert(ps3_net_policy_strict());
     assert(!ps3_net_policy_resolve(KZ3_NET_MUIS_HOST, mapped));
     assert(!ps3_net_policy_check(PS3_NET_PROTO_TCP, old_ip, 10071));
@@ -439,11 +478,14 @@ static void test_good_registration(void)
     uint8_t mapped[4];
     const char* expected = getenv("KZ3_NET_EXPECT_HOST");
     int ticket = getenv("KZ3_NET_EXPECT_TICKET") != NULL;
+    int sign_in = getenv("KZ3_NET_EXPECT_NO_ID") == NULL;
     assert(ps3_net_online() && expected);
-    kz3_net_register();
+    assert(kz3_net_register() == 0);
     assert(file_opens == 1 && resolver_calls == 1 && !strcmp(resolved_name, expected));
+    assert(policy_map_calls == 1 && policy_allow_calls == 2);
     assert(ticket_opens == ticket && !socket_calls && !sends);
-    assert(registrations == 6 && identity_calls == 1 && ps3_net_policy_strict());
+    assert(registrations == (sign_in ? 6 : 0) && identity_calls == sign_in && ps3_net_policy_strict());
+    assert(ps3_net_np_signed_in() == sign_in);
     assert(ps3_net_policy_resolve(KZ3_NET_MUIS_HOST, mapped) == 1 && !memcmp(mapped, ip, 4));
     assert(ps3_net_policy_check(PS3_NET_PROTO_TCP, ip, 10071));
     assert(!ps3_net_policy_check(PS3_NET_PROTO_UDP, ip, 53));
@@ -461,12 +503,14 @@ int main(int argc, char** argv)
     if (!strcmp(argv[1], "make-ticket")) make_ticket();
     else if (!strcmp(argv[1], "offline")) {
         assert(!ps3_net_online());
-        kz3_net_register();
+        assert(kz3_net_register() == 0);
         np_kz3_sign_in("TestUser1");
         assert(!file_opens && !ticket_opens && !resolver_calls && !socket_calls && !sends && !registrations);
         puts("PASS offline: no config, resolver, socket or NP registration");
-    } else if (!strcmp(argv[1], "bad")) test_closed_registration(0);
-    else if (!strcmp(argv[1], "unresolved")) test_closed_registration(1);
+    } else if (!strcmp(argv[1], "bad")) test_closed_registration(0, 0, 0, 0);
+    else if (!strcmp(argv[1], "unresolved")) test_closed_registration(1, 0, 0, 0);
+    else if (!strcmp(argv[1], "bad-ticket")) test_closed_registration(1, 1, 0, 0);
+    else if (!strcmp(argv[1], "policy-failure")) test_closed_registration(1, 0, 1, 2);
     else if (!strcmp(argv[1], "good")) test_good_registration();
     else if (!strcmp(argv[1], "functional")) { test_config(); test_ticket(); }
     else if (!strcmp(argv[1], "rt")) test_rt();

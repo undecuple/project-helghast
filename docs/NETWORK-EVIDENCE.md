@@ -6,9 +6,10 @@ not establish a 1.14 connection or compatibility with any server.
 
 ## What was observed
 
-The game-free host test runs the existing port configuration, NP ticket and RT code together with the patched
-runtime's online switch and policy. It generates its own unsigned tickets and frames; host resolution, sockets and
-sends are replaced by test doubles. It exercises no game, real ticket, certificate, capture or server. Run
+The game-free host test runs the port configuration, NP ticket, HLE registration and RT code with the patched
+runtime's online switch, policy, NP manager, Score, Matching2 and psnr gate. It generates its own unsigned tickets
+and frames; host resolution, sockets, sends and the psnr transport connection are replaced by test doubles. It
+exercises no game, real ticket, certificate, capture or server. Run
 `python3 tools/net/test_network.py` after preparing the patched runtime. The test is also in
 [`tools/host-tests.txt`](../tools/host-tests.txt).
 
@@ -45,12 +46,24 @@ ticket. They do not prove PSN authentication, entitlement or acceptance by any s
 - Unknown keys and sections containing `server` anywhere, ignoring case, are conservatively treated as
   selector-shaped and fail closed. Malformed or duplicate server sections, an overlong or NUL-bearing line,
   an oversized or unreadable configuration, and an invalid or explicitly empty `KZ3_NET_SERVER` override also fail
-  closed. Other unknown keys remain warnings. `KZ3_NET_SERVER` is a test override, absent by default; when valid it
-  overrides a valid selection. On Windows, a native presence check catches an empty variable the CRT may treat as absent.
+  closed. A nonempty `ticket_file`, a configured online ID (including the `KZ3_NET_ONLINE_ID` test override), or an
+  inherited `PSNR_SERVER` also makes **any** rejected line or unknown section fatal, including a misspelled key.
+  This applies regardless of key order and even when a ticket path was rejected. Only without those settings do
+  other unknown keys remain warnings and unknown sections retain their legacy behavior. `KZ3_NET_SERVER` is a test
+  override, absent by default; when valid it overrides a valid selection. On Windows, a native presence check catches
+  an empty variable the CRT may treat as absent.
+- Failed online setup disables the runtime's online switch and NP sign-in, clears the policy back to strict refusal,
+  and returns failure through HLE registration; the program exits before running guest code. The process environment
+  is not changed. The host test checks the patched NP manager reports offline and both Score and Matching2 stop before
+  their psnr transport connection, even with an inherited `PSNR_SERVER`. Offline-by-default startup still proceeds.
 - On valid opt-in, resolving the configured host uses the operating system resolver and can itself cause a DNS
   request outside the guest socket policy. The existing policy then maps the MUIS name and allows the selected
   IPv4 address and configured ports; the test checks this policy directly with a fake resolver, not the host
-  network. A missing host or failed lookup leaves no allowed destination and does not load a ticket.
+  network. A missing host or failed lookup does not load a ticket; a rejected ticket or policy failure also aborts
+  startup without retaining allowed destinations.
+- With otherwise valid online setup, an inherited `PSNR_SERVER` can still enable the runtime's psnr Score/Matching
+  path outside the selected-server guest policy. Unset `PSNR_SERVER` when launching this port if that connection is
+  not intended. The tests do not contact a psnr server, and this work does not change successful-startup psnr behavior.
 - The **generic runtime resolver-policy gap remains a separate blocker**. These tests do not establish that every
   runtime resolver or HLE path respects the intended policy, and this change adds no resolver, errno or HLE patch.
   Do not infer a complete DNS, socket or PS3 error-semantics implementation from the configuration tests.

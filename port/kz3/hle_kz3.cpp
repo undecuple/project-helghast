@@ -14,7 +14,7 @@ extern "C" uint8_t* vm_base;
 typedef void (*hle_ctx_fn)(ppu_context*);
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn);
 #ifdef KZ3_WITH_NET
-extern "C" void kz3_net_register(void);   /* port/net/kz3_net.c: online setup, inert unless KZ3_ONLINE is set */
+extern "C" int kz3_net_register(void);   /* port/net/kz3_net.c: online setup, inert unless KZ3_ONLINE is set */
 #endif
 
 namespace {
@@ -64,13 +64,15 @@ void cellSpurs_94034C95(ppu_context* ctx)
 }  // namespace
 
 /* Called by main.cpp after the runtime's own HLE tables are registered. */
-extern "C" void kz3_hle_register(void)
+extern "C" int kz3_hle_register(void)
 {
     ps3_hle_register_ctx(0xFF0A21B7u, "cellKbRead", cellKbRead);
     ps3_hle_register_ctx(0x7A0A83C4u, "cellFontInitLibraryFreeTypeWithRevision", cellFontInitLibraryFreeTypeWithRevision);
     ps3_hle_register_ctx(0xA7FD2F5Bu, "cellCameraSetNotifyEventQueue2", cellCameraSetNotifyEventQueue2);
     ps3_hle_register_ctx(0x94034C95u, "cellSpurs_94034C95", cellSpurs_94034C95);
 #ifdef KZ3_WITH_NET
-    kz3_net_register();
+    return kz3_net_register();
+#else
+    return 0;
 #endif
 }

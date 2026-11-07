@@ -12,7 +12,9 @@ Nothing, unless you ask for it. Each item is off until you turn it on, and this 
 - **Experimental networking** (off by default): setting `KZ3_ONLINE` to a nonempty value other than `0` opts in.
   The port reads the selected server from `online.ini` and may resolve its host through the operating system,
   which can contact the configured DNS service. The existing guest policy is intended to restrict destinations
-  to the selected server, but the generic resolver-policy gap remains unverified. With `KZ3_NET_CAPTURE` also
+  to the selected server, but the generic resolver-policy gap remains unverified. An inherited `PSNR_SERVER` can
+  also enable the runtime's separate psnr connection on valid startup; unset it if that connection is not intended.
+  Invalid online setup stops the game before guest execution. With `KZ3_NET_CAPTURE` also
   enabled and a loopback server selected, diagnostic listeners bind `127.0.0.1` on ports 10070, 10071, 10075,
   10078 and 10079. Multiplayer and compatibility with any server are unverified:
   [network evidence and limits](NETWORK-EVIDENCE.md).

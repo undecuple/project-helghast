@@ -41,6 +41,9 @@ def main():
     WORK.mkdir(exist_ok=True)
     prefix = f"net-evidence-{os.getpid()}"
     exe = WORK / (prefix + (".exe" if os.name == "nt" else ""))
+    np_exe = WORK / (prefix + "-np" + (".exe" if os.name == "nt" else ""))
+    np_obj = WORK / (prefix + "-np.o")
+    hle_obj = WORK / (prefix + "-hle.o")
     config = WORK / (prefix + ".ini")
     ticket = WORK / (prefix + ".ticket")
     env = {k: v for k, v in os.environ.items()
@@ -64,8 +67,47 @@ def main():
         build += ["-lws2_32"] if os.name == "nt" else ["-pthread"]
         command(build, env)
 
+        includes = [
+            "-I" + str(RUNTIME / "include"),
+            "-I" + str(RUNTIME / "runtime" / "ppu"),
+            "-I" + str(RUNTIME / "libs" / "network"),
+            "-I" + str(ROOT / "port" / "net"),
+        ]
+        flags = ["-std=gnu11", "-O1", "-Wall", "-Wextra"] + includes
+        command(compiler() + flags + [
+            "-Dpsnr_connect=fixture_psnr_connect", "-c",
+            str(RUNTIME / "libs" / "network" / "np_psnr.c"), "-o", str(np_obj),
+        ], env)
+        command(compiler() + [
+            "-std=gnu++17", "-x", "c++", "-DKZ3_WITH_NET",
+            "-I" + str(ROOT / "tools" / "upstream" / "stub"),
+            "-c", str(ROOT / "port" / "kz3" / "hle_kz3.cpp"), "-o", str(hle_obj),
+        ], env)
+        command(compiler() + [
+            "-std=gnu++17", "-x", "c++", "-fsyntax-only",
+            "-I" + str(ROOT / "tools" / "upstream" / "stub"),
+            str(ROOT / "port" / "kz3" / "hle_kz3.cpp"),
+        ], env)
+        command(compiler() + flags + [
+            str(ROOT / "tools" / "net" / "test_np_gate.c"),
+            str(ROOT / "tools" / "net" / "host_stubs.c"),
+            str(ROOT / "port" / "net" / "np_kz3.c"),
+            str(ROOT / "port" / "net" / "np_ticket.c"),
+            str(RUNTIME / "libs" / "network" / "net_policy.c"),
+            str(RUNTIME / "libs" / "network" / "sceNp.c"),
+            str(RUNTIME / "libs" / "network" / "sceNpScore.c"),
+            str(RUNTIME / "libs" / "network" / "sceNpMatching2.c"),
+            str(RUNTIME / "libs" / "network" / "psnr" / "psnr.c"),
+            str(np_obj), str(hle_obj), "-o", str(np_exe),
+        ] + (["-lws2_32"] if os.name == "nt" else ["-pthread"]), env)
+
         def run(mode, extra=None):
             return command([str(exe), mode], dict(env, **(extra or {})))
+
+        def run_np(mode, extra=None):
+            np_env = dict(env, KZ3_ONLINE="1", PSNR_SERVER="psnr-fixture.invalid:36100")
+            np_env.update(extra or {})
+            return command([str(np_exe), mode], np_env)
 
         run("make-ticket")
         base = f"host = fallback.invalid\nonline_id = TestUser1\nticket_file = {ticket.name}\n"
@@ -73,6 +115,24 @@ def main():
                     "[server second]\nhost = selected.invalid\n")
         valid = base + "server = second\n" + sections
         config.write_bytes(valid.encode())
+
+        command([str(np_exe), "good"], dict(env, KZ3_ONLINE="1"))
+        run_np("positive-score")
+        run_np("positive-matching")
+        run_np("offline", {"KZ3_ONLINE": "0"})
+        config.write_bytes((base + "server = absent\n" + sections).encode())
+        run_np("closed")
+        config.write_bytes((base + "sever = second\n" + sections).encode())
+        run_np("closed")
+        config.write_bytes(("host = fallback.invalid\nfuture_option = enabled\n" + sections).encode())
+        run_np("closed")
+        config.write_bytes(valid.encode())
+        run_np("closed", {"KZ3_NET_SERVER": "invalid@host"})
+        run_np("closed-unresolved", {"KZ3_NET_TEST_RESOLVE_FAIL": "1"})
+        config.write_bytes(valid.replace("online_id = TestUser1", "online_id = OtherUser").encode())
+        run_np("closed-ticket")
+        config.write_bytes(valid.encode())
+        print("PASS patched NP status and outbound Score/Matching psnr gating")
 
         for value in (None, "", "0"):
             extra = {"KZ3_NET_SERVER": "override.invalid", "KZ3_NET_CAPTURE": "1"}
@@ -88,12 +148,15 @@ def main():
 
         good = {"KZ3_ONLINE": "1", "KZ3_NET_EXPECT_HOST": "selected.invalid", "KZ3_NET_EXPECT_TICKET": "1"}
         run("good", good)
+        config.write_bytes(valid.replace("online_id = TestUser1\n", "").encode())
+        run("good", good)
         config.write_bytes((base + sections).encode())
         run("good", dict(good, KZ3_NET_EXPECT_HOST="fallback.invalid"))
         config.write_bytes((f"online_id = TestUser1\nticket_file = {ticket.name}\n" + sections).encode())
         run("good", dict(good, KZ3_NET_EXPECT_HOST="first.invalid"))
-        config.write_bytes((valid.replace(f"ticket_file = {ticket.name}\n", "") + "unused = ignored\n").encode())
-        run("good", {"KZ3_ONLINE": "1", "KZ3_NET_EXPECT_HOST": "selected.invalid"})
+        non_sensitive = valid.replace(f"ticket_file = {ticket.name}\n", "").replace("online_id = TestUser1\n", "")
+        config.write_bytes((non_sensitive + "unused = ignored\n").encode())
+        run("good", {"KZ3_ONLINE": "1", "KZ3_NET_EXPECT_HOST": "selected.invalid", "KZ3_NET_EXPECT_NO_ID": "1"})
         config.write_bytes(valid.encode())
         run("good", dict(good, KZ3_NET_SERVER="override.invalid", KZ3_NET_EXPECT_HOST="override.invalid"))
         print("PASS explicit section selection, normal defaults and synthetic ticket loading")
@@ -110,6 +173,10 @@ def main():
             "selector-shaped camel key": "selectedServer = second\n",
             "selector-shaped joined key": "selectedserver = second\n",
             "selector-shaped suffix key": "selected_server = second\n",
+            "misspelled selector": "sever = second\n",
+            "unknown key": "future_option = enabled\n",
+            "unknown key with quoted value": 'future_option = "enabled"\n',
+            "misspelled key without equals": "sever second\n",
             "punctuated selector": "server? = second\n",
             "quoted key": '"server" = second\n',
             "repeated selector": "server = first\nserver = second\n",
@@ -132,6 +199,28 @@ def main():
                 run("bad", deny_env)
             except RuntimeError as error:
                 raise RuntimeError(f"selector case {label}: {error}") from error
+        # A ticket path is real and synthetic in every case; order and section must not hide an unknown key.
+        ticket_only = base.replace("online_id = TestUser1\n", "")
+        for fragment in ("sever = second\n", "future_option = enabled\n", 'future_option = "enabled"\n'):
+            config.write_bytes((ticket_only + fragment + sections).encode())
+            run("bad", deny_env)
+        config.write_bytes(("future_option = enabled\n" + valid.replace("online_id = TestUser1\n", "")).encode())
+        run("bad", deny_env)
+        config.write_bytes(("future_option = enabled\n" + valid).encode())
+        run("bad", deny_env)
+        config.write_bytes((valid + "future_option = enabled\n").encode())
+        run("bad", deny_env)
+        config.write_bytes((base + "[other]\nfuture_option = enabled\n[server]\nserver = second\n" + sections).encode())
+        run("bad", deny_env)
+        config.write_bytes((base + "[sever second]\nhost = fallback.invalid\n" + sections).encode())
+        run("bad", deny_env)
+        config.write_bytes(valid.replace(f"ticket_file = {ticket.name}",
+                                         f'ticket_file = "{ticket.name}"').encode())
+        run("bad", deny_env)
+        config.write_bytes((valid.replace(f"ticket_file = {ticket.name}\n", "") + "future_option = enabled\n").encode())
+        run("bad", deny_env)
+        config.write_bytes((non_sensitive + "future_option = enabled\n").encode())
+        run("bad", dict(deny_env, KZ3_NET_ONLINE_ID="TestUser1"))
         config.write_bytes((base + "server = first\n" + sections + "[server FIRST]\nhost = other.invalid\n").encode())
         run("bad", deny_env)
         config.write_bytes((base + "".join(f"[server s{i}]\nhost = s{i}.invalid\n" for i in range(9))).encode())
@@ -151,7 +240,13 @@ def main():
         run("bad", {"KZ3_ONLINE": "1"})
         config.write_bytes(valid.encode())
         run("unresolved", {"KZ3_ONLINE": "1", "KZ3_NET_TEST_RESOLVE_FAIL": "1"})
-        print(f"PASS {len(bad) + 11} fail-closed selector, file, override and resolution cases")
+        config.write_bytes(valid.replace("online_id = TestUser1", "online_id = OtherUser").encode())
+        run("bad-ticket", {"KZ3_ONLINE": "1"})
+        config.write_bytes(valid.replace(ticket.name, "missing-synthetic.ticket").encode())
+        run("bad-ticket", {"KZ3_ONLINE": "1"})
+        config.write_bytes(valid.replace(f"ticket_file = {ticket.name}\n", "").encode())
+        run("policy-failure", {"KZ3_ONLINE": "1", "KZ3_NET_TEST_ALLOW_FAIL": "1"})
+        print(f"PASS {len(bad) + 25} fail-closed selector, file, override, resolution and policy cases")
 
         output = run("rt")
         lower = output.lower()
@@ -169,7 +264,7 @@ def main():
                 raise AssertionError(f"synthetic RT secret leaked: {secret}")
         print("PASS generated RT framing, encrypted container, replies and payload redaction")
     finally:
-        for path in (exe, config, ticket):
+        for path in (exe, np_exe, np_obj, hle_obj, config, ticket):
             path.unlink(missing_ok=True)
     return 0
 
