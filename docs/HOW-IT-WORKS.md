@@ -57,7 +57,10 @@ game code where it pays off ([roadmap](ROADMAP.md)).
 
 The game's 31 GB archive is read in place through a case-insensitive virtual file system (the game's paths are not
 consistent in case). The 1.14 update is layered over it the way the PS3 does: whole replacement files from the
-update, and binary patches applied to disc entries on first use and cached.
+update, and binary patches applied to disc entries on first use and cached. Archive cache files and archive-only
+directories use fixed-length digest names so long guest asset names cannot exceed Windows host-path limits. They
+live under the versioned `psarc-cache-v2` namespace, separate from legacy mirrored-name caches, so an old guest
+path cannot be mistaken for a digest cache hit after an upgrade.
 
 ## What is patched
 

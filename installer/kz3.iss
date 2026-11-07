@@ -296,6 +296,7 @@ Type: filesandordirs; Name: "{app}\logs"
 ; player's dump and is removed as a link by CurUninstallStepChanged(usUninstall) before this list runs; nothing
 ; here recurses into vfs itself, so the dump is never reached even when the junction could not be removed.
 Type: filesandordirs; Name: "{app}\vfs\psarc-cache"
+Type: filesandordirs; Name: "{app}\vfs\psarc-cache-v2"
 Type: filesandordirs; Name: "{app}\vfs\cache"
 Type: files; Name: "{app}\vfs\link.json"
 Type: dirifempty; Name: "{app}\vfs"

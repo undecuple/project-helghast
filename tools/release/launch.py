@@ -21,7 +21,7 @@ well the game starts. A "No" starts nothing.
 
 Game environment (4.3), written to <root>/build/kz3.ini before each start (pass 26: kz3.exe reads it when started
 with no arguments, port/kz3/kz3_ini.h; the launcher no longer passes the variables or the EBOOT): PS3_VFS_ROOT=<root>/vfs, a writable folder whose PS3_GAME is a directory junction to
-<dump>/PS3_GAME (pass 17, ensure_vfs: the runtime inflates PSARC entries into <vfs root>/psarc-cache and maps
+<dump>/PS3_GAME (pass 17, ensure_vfs: the runtime inflates PSARC entries into <vfs root>/psarc-cache-v2 and maps
 /dev_hdd1 to <vfs root>/cache, so a read-only or untouched dump as the root made every asset open fail); KZ3_UPDATE_DIR=<update>/USRDIR (read by the 1.14 build, main's default);
 PS3_HDD0_ROOT=<...>/dev_hdd0 only when the update folder sits in an RPCS3 dev_hdd0/game/<id> tree;
 PS3_EDAT_CACHE=<root>/build/cache/edat; RSX_SHADER_CACHE_DIR=<data>/cache/shaders (pass 5: the shader disk cache,
@@ -563,7 +563,7 @@ def ensure_vfs(root, dump, no_link=False):
     no_link (link_free): only make <root>/vfs (the writable cache root) and drop the link an older start left in it
     (removing a link never touches its target; a real PS3_GAME folder there is left alone).
 
-    The player's dump is read in place and never written: the runtime's writes (psarc-cache, /dev_hdd1 cache) land
+    The player's dump is read in place and never written: the runtime's writes (psarc-cache-v2, /dev_hdd1 cache) land
     in <root>/vfs. A real folder named PS3_GAME there that our link record does not name is never removed (error
     instead); with our record (a moved install keeps the old link text) only an empty one can go (rmdir; a non-empty
     one gives an error); a link to another dump (the player picked a new folder) is replaced; removing a link leaves

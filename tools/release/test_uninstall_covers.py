@@ -18,6 +18,7 @@ import launch  # noqa: E402
 import assemble_payload as ap  # noqa: E402
 
 ISS = os.path.join(os.path.dirname(os.path.dirname(HERE)), "installer", "kz3.iss")
+ROOT = os.path.dirname(os.path.dirname(HERE))
 bad = 0
 
 
@@ -71,11 +72,19 @@ def main():
         "build output": "build/kz3.exe",
         "build cache": "build/cache/edat/x",
         "game VFS records": "vfs/link.json",
-        "game VFS caches": "vfs/psarc-cache/x",
+        "legacy game VFS caches": "vfs/psarc-cache/x",
+        "game VFS caches": "vfs/psarc-cache-v2/x",
         "portable shader cache": "cache/x",
     }
     for what, rel in files.items():
         check(covered(rel, pats), f"{what}: {rel}")
+
+    for rel in ("port/kz3/main.cpp", "port/net/kz3_prompts_ui.h"):
+        with open(os.path.join(ROOT, rel), encoding="utf-8") as source:
+            runtime = source.read()
+        check("psarc-cache-v2" in runtime, f"{rel} uses the versioned archive cache")
+        check(not re.search(r"psarc-cache(?!-v2)", runtime),
+              f"{rel} cannot collide with the legacy mirrored-name cache")
 
     # The payload's own folders: Inno removes the files it installed, but Python (kz3-setup, the embedded toolchain
     # python) writes __pycache__ beside them; the folder must go whole. Folders holding no program are exempt.

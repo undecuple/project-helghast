@@ -481,16 +481,16 @@ static const char* kz3_pu_root(void)    /* KZ3_CACHE_ROOT (kz3.ini cache_root), 
     return (e && *e) ? e : ppu_vfs_root;
 }
 
-static void kz3_pu_dir(char* dir, size_t cap)    /* <vfs root>/psarc-cache/kz3-ui, created */
+static void kz3_pu_dir(char* dir, size_t cap)    /* <cache root>/psarc-cache-v2/kz3-ui, created */
 {
-    snprintf(dir, cap, "%s/psarc-cache", kz3_pu_root());
+    snprintf(dir, cap, "%s/psarc-cache-v2", kz3_pu_root());
 #ifdef _WIN32
     _mkdir(dir);
-    snprintf(dir, cap, "%s/psarc-cache/kz3-ui", kz3_pu_root());
+    snprintf(dir, cap, "%s/psarc-cache-v2/kz3-ui", kz3_pu_root());
     _mkdir(dir);
 #else
     mkdir(dir, 0755);
-    snprintf(dir, cap, "%s/psarc-cache/kz3-ui", kz3_pu_root());
+    snprintf(dir, cap, "%s/psarc-cache-v2/kz3-ui", kz3_pu_root());
     mkdir(dir, 0755);
 #endif
 }
@@ -586,7 +586,7 @@ static char s_pc_out[1100];          /* the patched controller page's host path 
 static int  s_pc_state;              /* 0 not tried, 1 written, -1 served unchanged */
 
 /* Serve an archive page patched by fn: the first open reads the page the chain behind this hook serves, writes the
- * patched copy to psarc-cache/kz3-ui/<file> and serves it from then on; unchanged when fn refuses or the write fails. */
+ * patched copy to psarc-cache-v2/kz3-ui/<file> and serves it from then on; unchanged when fn refuses or the write fails. */
 static void kz3_pu_patch_serve(char* path, size_t cap, int* state, int* lang, char* outp, size_t outcap, const char* file,
                                Kz3PuPatchFn fn, const char* what)
 {

@@ -8,7 +8,9 @@
  *       MD5(upper("/data_ps3/" + path)) as 32 upper-case hex digits + ".pspatch"
  *       (traced in the 1.14 EBOOT: 0xe0e794 -> MD5 0xe21fe8 with upper-casing, the key is
  *       bsearched at 0xe0c490 and printed by 0xe0aae0 with "%s%016llX%016llX.pspatch").
- *       The patch is applied on first open; the output is cached as
+ *       Added files and archive-only directories use fixed-length MD5 cache
+ *       keys so guest archive-name lengths cannot exceed host path limits.
+ *       A patch is applied on first open; the output is cached as
  *       <cache>/pspatch/<base TOC md5>_<patch name> so later opens are a stat;
  *   (c) anything else: not ours, the caller serves the disc entry unchanged.
  * Plain C (MinGW and host gcc), no runtime dependencies: the zlib inflater and the EDAT
@@ -99,6 +101,9 @@ uint8_t* kz3_pspatch_apply(const uint8_t* patch, size_t patch_len,
 
 /* Patch file name stem (32 hex digits + NUL) for a path below USRDIR. */
 void kz3_pspatch_name(const char* key, char out[33]);
+
+/* Fixed-length cache name for an already-normalised path below USRDIR. */
+void kz3_cache_name(const char* key, char out[33]);
 
 /* The same key for the loose path ("/" + path, upper-cased): what the guest's patch layer computes while
  * data_ps3.psarc is not mounted in FIOS (path translator 1.14 @0x0002c7d4, the RE notes s.48.6). */
