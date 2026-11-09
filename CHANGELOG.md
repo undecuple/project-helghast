@@ -3,6 +3,11 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
+## [0.1.10] - 2026-11-09 (pre-release)
+
+### Fixed
+- On Windows, game files with long names could not be written to the port's disk cache when the full path went past Windows' 260-character limit. The next area then failed to load, which showed as a black screen after the HAMR section in chapter 2 (Pyrrhus Evac). Cache files now have short fixed-length names, and the cache is filled again on the first start after updating; files cached by earlier versions are left in place and no longer used. Reported by TimothyDong (#38).
+
 ## [0.1.9] - 2026-11-04 (pre-release)
 
 ### Added

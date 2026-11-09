@@ -7,7 +7,7 @@
  *
  *   - the part after the last "USRDIR/" is looked up case-insensitively in the
  *     archive's manifest (entry 0; KZ3 asks for the same file in several cases);
- *   - a hit is inflated once into <vfs root>/psarc-cache/<archive name> and the
+ *   - a hit is inflated once into <cache>/objects/<canonical-key digest><extension> and the
  *     path is rewritten to it, so open/read/seek/stat/fstat all work unchanged;
  *   - a directory that exists only inside the archive is created empty in the
  *     cache so stat/opendir succeed (its listing stays empty: ASSUMPTION that KZ3
@@ -22,6 +22,7 @@
  * a stored size of 0 means a full block. Blocks are zlib (with header) unless
  * their stored size equals the bytes wanted (stored raw). */
 #include <stdint.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -203,7 +204,12 @@ void miss_hook(char* path, size_t cap)
         }
         return;
     }
-    std::string host = g_arc.cache + "/" + g_arc.names[it->second];
+    char cached[1200];
+    if (kz3_cache_file_path(g_arc.cache.c_str(), key.c_str(), cached, sizeof cached) != 0) {
+        fprintf(stderr, "[psarc] cache path too long for %s\n", key.c_str());
+        return;
+    }
+    std::string host = cached;
     struct stat st;
     std::lock_guard<std::mutex> g(g_arc.lock);
     if (stat(host.c_str(), &st) != 0) {
@@ -215,7 +221,12 @@ void miss_hook(char* path, size_t cap)
         mkdirs(host);
         std::string tmp = host + ".part";
         FILE* o = fopen(tmp.c_str(), "wb");
-        if (!o) { fprintf(stderr, "[psarc] cannot write %s\n", tmp.c_str()); return; }
+        if (!o) {
+            const int error = errno;
+            fprintf(stderr, "[psarc] cannot write %s (errno %d: %s, cache path bytes %zu)\n",
+                    tmp.c_str(), error, strerror(error), tmp.size());
+            return;
+        }
         bool ok = fwrite(data.data(), 1, data.size(), o) == data.size();
         ok = (fclose(o) == 0) && ok;
         if (!ok || rename(tmp.c_str(), host.c_str()) != 0) { remove(tmp.c_str()); return; }

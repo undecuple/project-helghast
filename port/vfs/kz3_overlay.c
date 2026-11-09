@@ -88,6 +88,26 @@ static void hex16(const uint8_t d[16], char out[33])
     out[32] = 0;
 }
 
+/* Archive filenames can consume most of Win32 MAX_PATH before the cache root is
+ * prepended (issue 38). The guest key remains unchanged; only private storage is compact. */
+int kz3_cache_file_path(const char* root, const char* key, char* out, size_t cap)
+{
+    uint8_t digest[16];
+    char hex[33];
+    kz3_md5(key, strlen(key), digest);
+    hex16(digest, hex);
+    const char* ext = strrchr(key, '.');
+    if (ext) {
+        size_t n = strlen(ext);
+        if (n > 16) ext = NULL;
+        else for (size_t i = 1; i < n; i++)
+            if (!((ext[i] >= 'a' && ext[i] <= 'z') || (ext[i] >= '0' && ext[i] <= '9'))) { ext = NULL; break; }
+    }
+    int n = snprintf(out, cap, "%s/objects/%s%s", root, hex, ext ? ext : "");
+    if (n < 0 || (size_t)n >= cap) { if (cap) out[0] = 0; return -1; }
+    return 0;
+}
+
 /* @0x00e0e794 (1.14): MD5 (@0x00e21fe8, flag 1 = upper-case each byte a-z first) of the
  * archive path "/data_ps3/<path>"; the 16 digest bytes are printed as two big-endian u64
  * with "%016llX%016llX", i.e. the digest in hex, upper case. */
@@ -572,8 +592,10 @@ static int resolve_added(const char* k, char* out, size_t cap)
 {
     uint32_t idx;
     if (strmap_get(&g_added.by_key, k, &idx)) {
-        char host[1200];
-        snprintf(host, sizeof host, "%s/added/%s", g_cfg.cache_dir, k);
+        char host[1200], root[1200];
+        int len = snprintf(root, sizeof root, "%s/added", g_cfg.cache_dir);
+        if (len < 0 || (size_t)len >= sizeof root || kz3_cache_file_path(root, k, host, sizeof host) != 0)
+            return KZ3_OVL_ERROR;
         if (!file_size_is(host, g_added.e[idx].size)) {
             size_t n = 0;
             uint8_t* d = psarc_read(&g_added, idx, &n);

@@ -118,6 +118,11 @@ int kz3_overlay_host_composed(const char* key);
 
 void kz3_md5(const void* data, size_t len, uint8_t digest[16]);
 
+/* Private cache storage for a canonical (lower-case, '/' separated) archive key.
+ * Bounded filename independent of the guest basename; preserves a short extension
+ * so EDAT resolution still recognizes protected files. Returns 0, or -1 on truncation. */
+int kz3_cache_file_path(const char* root, const char* key, char* out, size_t cap);
+
 /* Test hook: walk every disc entry, apply each patch whose name matches, in memory.
  * Counts distinct patch files used, failures, and patched .core outputs that start with
  * "RTTIBin<1.73>". Returns the number of patches applied, or -1. */

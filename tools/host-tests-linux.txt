@@ -117,6 +117,7 @@ tools/net/test_discord.sh
 port/vfs/test_native_rekey.sh
 tools/smoke/test_cam_interp.sh
 port/vfs/test_splitfile.sh
+port/vfs/test_cache_paths.py
 tools/spu/test_r115_logroute.sh
 tools/upstream/test_sys_fs_flags.sh
 tools/spu/test_r118_walltime.sh

@@ -152,6 +152,7 @@ tools/release/test_release_notes.py
 tools/release/test_recomp_card.py
 tools/release/test_release_check.py
 port/vfs/test_splitfile.sh
+port/vfs/test_cache_paths.py
 tools/spu/test_r115_logroute.sh
 tools/upstream/test_sys_fs_flags.sh
 tools/port_ui_table.py
