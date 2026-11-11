@@ -62,6 +62,7 @@
 #ifdef _WIN32
 #include "fsr31.h"
 #include "fsr31_inputs.h"
+#include "xess.h"
 #endif
 #ifdef _WIN32
 /* RSX pass 125 (public issue #13 on the KZ2 port, same code): hybrid laptops run an exe on the integrated GPU unless it
@@ -785,6 +786,7 @@ static int s_h169_saved = 1;      /* patch 2113: display.ini hud_169 (2D layer k
 extern "C" void rsx_live_draw_set_hud169(int on);   /* rsx_live_draw.c */
 static volatile LONG s_upscale_eff = RSX_UPSCALE_NONE;
 static int s_upscale_saved = RSX_UPSCALE_NONE;
+static int s_upscale_previous_saved = RSX_UPSCALE_NONE;
 static int s_upscale_env;
 static volatile LONG s_fsr_sharpness_eff = KZ3_FSR31_SHARPNESS_DEFAULT;
 static int s_fsr_sharpness_saved = KZ3_FSR31_SHARPNESS_DEFAULT;
@@ -803,6 +805,8 @@ static int kz3_upscale_parse(const char* text)
         return RSX_UPSCALE_FSR1;
     if (rsx_dm_ieq(text, n, "fsr3") || rsx_dm_ieq(text, n, "fsr31") ||
         rsx_dm_ieq(text, n, "fsr3.1")) return RSX_UPSCALE_FSR3;
+    if (rsx_dm_ieq(text, n, "xess") || rsx_dm_ieq(text, n, "xess-sr"))
+        return RSX_UPSCALE_XESS;
     return -1;
 }
 
@@ -840,13 +844,16 @@ static void kz3_display_save(int mode, int scaling, int filter, int vsync)
         const int k = snprintf(
             t + n,
             sizeof t - (size_t)n,
-            "# upscaler = none | fsr3: temporal upscaling after the game render. "
+            "# upscaler = none | fsr3 | xess: temporal upscaling after the game render. "
             "RSX_UPSCALE overrides it for one run.\n"
             "upscaler = %s\n"
+            "# upscaler_previous is the setting restored by the launcher if the optional XeSS runtime is declined or invalid.\n"
+            "upscaler_previous = %s\n"
             "# fsr_sharpness = 0.0 .. 1.0 (steps of 0.1): RCAS sharpening used by FSR 3.1. "
             "KZ3_FSR_SHARPNESS overrides it for one run.\n"
             "fsr_sharpness = %s\n",
             kz3_upscale_name(s_upscale_saved),
+            kz3_upscale_name(s_upscale_previous_saved),
             kz3_fsr31_sharpness_name(
                 s_fsr_sharpness_saved, sharpness, sizeof sharpness));
         if (k > 0 && (size_t)(n + k) < sizeof t) n += k;
@@ -894,7 +901,8 @@ static void kz3_display_load(void)
 {
     wchar_t p[1100];
     char t[2048];
-    int mode = -1, scaling = -1, filter = -1, vsync = -1, upscaler = -1;
+    int mode = -1, scaling = -1, filter = -1, vsync = -1;
+    int upscaler = -1, upscaler_previous = -1;
     if (pad_kb_sibling_path(L"display.ini", p, 1100)) {
         FILE* f = _wfopen(p, L"rb");
         if (f) {
@@ -909,6 +917,10 @@ static void kz3_display_load(void)
             if (rsx_dm_ini_value(
                     t, "upscaler", value, sizeof value)) {
                 upscaler = kz3_upscale_parse(value);
+            }
+            if (rsx_dm_ini_value(
+                    t, "upscaler_previous", value, sizeof value)) {
+                upscaler_previous = kz3_upscale_parse(value);
             }
             const int sharpness =
                 rsx_dm_ini_value(
@@ -942,6 +954,10 @@ static void kz3_display_load(void)
     if (filter >= 0) s_dm_saved[2] = filter;
     if (vsync >= 0) s_dm_saved[3] = vsync;
     if (upscaler >= 0) s_upscale_saved = upscaler;
+    if (upscaler_previous == RSX_UPSCALE_NONE ||
+        upscaler_previous == RSX_UPSCALE_FSR3) {
+        s_upscale_previous_saved = upscaler_previous;
+    }
     /* patch 2107: one-run overrides (tests); the rows still save their own choice */
     const char* e = getenv("KZ3_MOTION_BLUR");
     const int mbe = e && *e ? rsx_dm_parse_pct(e) : -1;
@@ -975,9 +991,20 @@ static void kz3_display_load(void)
             upscale_override,
             kz3_upscale_name(s_upscale_saved));
     }
-    InterlockedExchange(
-        &s_upscale_eff,
-        upe >= 0 ? upe : s_upscale_saved);
+    int upscaler_effective =
+        upe >= 0 ? upe : s_upscale_saved;
+    if (upscaler_effective == RSX_UPSCALE_XESS &&
+        !kz3_xess_runtime_available()) {
+        upscaler_effective =
+            s_upscale_saved == RSX_UPSCALE_XESS ?
+                s_upscale_previous_saved : s_upscale_saved;
+        fprintf(
+            stderr,
+            "[xess] optional runtime unavailable; keeping %s: %s\n",
+            kz3_upscale_name(upscaler_effective),
+            kz3_xess_status());
+    }
+    InterlockedExchange(&s_upscale_eff, upscaler_effective);
     e = getenv("KZ3_FSR_SHARPNESS");
     const int fse = e && *e ? kz3_fsr31_parse_sharpness(e) : -1;
     InterlockedExchange(
@@ -1068,6 +1095,8 @@ static int kz3_rsx_init(uint32_t w, uint32_t h, const char* title)
 #ifdef _WIN32
     if (!kz3_fsr31_register())
         fprintf(stderr, "[fsr31] failed to register the rsx_upscale backend\n");
+    if (!kz3_xess_register())
+        fprintf(stderr, "[xess] failed to register the rsx_upscale backend\n");
     kz3_display_load();   /* patch 2095 */
     if (rsx_live_draw_enabled()) {
         if (rsx_null_backend_init(w, h, title) == 0 &&
@@ -1634,10 +1663,32 @@ static void kz3_kb_set(ppu_context* ctx)
             (cmd[8] == 0 || cmd[8] == ' ')) {
             const int v = cmd[8] ? kz3_upscale_parse(cmd + 9) : -1;
             if (!s_upscale_env &&
-                (v == RSX_UPSCALE_NONE || v == RSX_UPSCALE_FSR3)) {
-                InterlockedExchange(&s_upscale_eff, v);
+                (v == RSX_UPSCALE_NONE ||
+                 v == RSX_UPSCALE_FSR3 ||
+                 v == RSX_UPSCALE_XESS)) {
+                const int current =
+                    (int)InterlockedCompareExchange(
+                        &s_upscale_eff, 0, 0);
+                if (v == RSX_UPSCALE_XESS &&
+                    current != RSX_UPSCALE_XESS) {
+                    s_upscale_previous_saved =
+                        current == RSX_UPSCALE_FSR3 ?
+                            RSX_UPSCALE_FSR3 : RSX_UPSCALE_NONE;
+                }
                 s_upscale_saved = v;
-                kz3_upscale_apply();
+                const int pending_xess =
+                    v == RSX_UPSCALE_XESS &&
+                    !kz3_xess_runtime_available();
+                if (!pending_xess) {
+                    InterlockedExchange(&s_upscale_eff, v);
+                    kz3_upscale_apply();
+                } else {
+                    fprintf(
+                        stderr,
+                        "[xess] selection saved for the next start; "
+                        "the launcher must install the optional runtime: %s\n",
+                        kz3_xess_status());
+                }
                 kz3_display_save_extra();
             }
             snprintf(
@@ -2295,7 +2346,8 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
                                                                 (s_mb_override ? RSX_DM_GUM_MBLUR : 0u) |   /* 2107 */
                                                                 (s_bloom_override ? RSX_DM_GUM_BLOOM : 0u) |   /* 2121 */
                                                                 (s_fov_ok ? RSX_DM_GUM_FOV : 0u) |          /* 2109 */
-                                                                RSX_DM_GUM_FSR3);
+                                                                RSX_DM_GUM_FSR3 |
+                                                                RSX_DM_GUM_XESS);
                 /* patch 2151 (rsx_menu_cols.h): a label column wide enough for the language's longest Display label */
                 int mw = 0, mo = 0;
                 if (pg && rsx_mc_lookup(kz3_tr_lang(), &mw, &mo)) {
@@ -3085,6 +3137,12 @@ static void kz3_vf22_aspect(ppu_context* ctx)   /* GameViewGame::vf22 @0x007E590
                         s_fsr_camera_pose,
                         s_fsr_camera_hfov,
                         fv.vw);
+                    kz3_xess_note_camera(
+                        s_fsr_camera_flip,
+                        s_fsr_camera_view,
+                        s_fsr_camera_pose,
+                        s_fsr_camera_hfov,
+                        fv.vw);
                     break;
                 }
             }
@@ -3163,6 +3221,10 @@ static void kz3_cam_vf17_hud(ppu_context* ctx)   /* Camera::vf17 0x00329D80 (1.0
          * values and conflicting projections within one guest frame.
          */
         kz3_fsr31_note_camera_planes(
+            cellGcm_flip_request_count(),
+            kz3_bef(out + 4),
+            kz3_bef(out + 8));
+        kz3_xess_note_camera_planes(
             cellGcm_flip_request_count(),
             kz3_bef(out + 4),
             kz3_bef(out + 8));

@@ -63,6 +63,7 @@ sys.path.insert(0, HERE)
 import firstrun as fr  # noqa: E402
 import firstrun_check as fc  # noqa: E402  (the same update checks the first run makes)
 import names  # noqa: E402  (the product name, file names and links: one place, names.py)
+import xess_runtime as xr  # noqa: E402  (optional, consented Intel XeSS runtime)
 
 TITLE = names.PRODUCT
 SAVE_FOLDER = names.DATA_FOLDER         # under %APPDATA% when not portable
@@ -731,6 +732,10 @@ mode = windowed
 scaling = stretch
 ; filter = bilinear | nearest
 filter = bilinear
+; upscaler = none | fsr3 | xess. XeSS's optional Intel runtime is downloaded only after launcher consent.
+upscaler = none
+; fsr_sharpness = 0.0..1.0 (steps of 0.1). Used only by FSR 3.1.
+fsr_sharpness = 0.2
 ; vsync = on | off. off shows each frame as soon as it is ready, which can tear.
 vsync = on
 ; motion_blur = 0..100 (percent). 100 is the game's own look; the value is kept but does not act.
@@ -1335,8 +1340,24 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
         ui.info(f"{err}.{REPORT}")
         return 1
     gargv = game_argv(root, paths, extra)
+    settings_problems = ensure_default_inis(cwd)
+    xess_state, xess_detail, xess_fallback = xr.prepare_selected(
+        os.path.join(cwd, DISPLAY_INI),
+        os.path.dirname(gargv[0]),
+        ui,
+        fr.ini_set,
+    )
+    note(root, f"xess runtime: {xess_state}" + (f" ({xess_detail})" if xess_detail else ""))
+    if xess_state in ("declined", "failed"):
+        ui.info(
+            "XeSS was not enabled. "
+            f"The game will keep using {xess_fallback}.\n\n{xess_detail}"
+            + (REPORT if xess_state == "failed" else "")
+        )
+    elif xess_state == "installed":
+        ui.info(xess_detail + ".")
     note(root, f"kz3.ini: {write_game_ini(root, game_ini(root, paths, ini['portable'], environ, newer=newer))}")
-    note(root, "default settings files: " + ("; ".join(ensure_default_inis(cwd)) or "ok"))
+    note(root, "default settings files: " + ("; ".join(settings_problems) or "ok"))
     note(root, "game: " + " ".join(gargv) + f" (cwd {cwd}; the game's log is in build\\logs)")
     fr.place_lang(root, os.path.dirname(gargv[0]))
     fr.place_fonts(root, os.path.dirname(gargv[0]))     # the notice fonts next to kz3.exe (RSX pass 38)

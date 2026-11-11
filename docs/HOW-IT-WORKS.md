@@ -55,8 +55,11 @@ game code where it pays off ([roadmap](ROADMAP.md)).
    temporally upscaling ahead of scan-out gamma. ps3recomp exposes a generic registered-upscaler interface and
    metadata/action callbacks; the port-owned adapter keeps all KZ3 pass recognition and AMD FidelityFX runtime
    use outside the generic renderer. The separate Upscaler option defaults to Off and falls back to the ordinary
-   bilinear presentation path when any required input or capability is unavailable.
-   Architecture, inputs and current limitations: [FSR-3.1.md](FSR-3.1.md).
+   bilinear presentation path when any required input or capability is unavailable. XeSS-SR registers a second
+   backend through the same contract, adds a generic sampler mip-bias action and display-composition metadata, and
+   keeps all KZ3 pass selection and Intel runtime code in `port/kz3`. Its runtime is installed only by the launcher
+   after explicit consent and pin/signature validation.
+   Architecture, inputs and current limitations: [FSR-3.1.md](FSR-3.1.md) and [XESS.md](XESS.md).
 7. **Running.** The result is `kz3.exe`, a native Windows program. On Linux it runs under Proton, which is where it
    is mostly tested (it has also run natively on Windows 11 and on a Windows 10 test machine); a native Linux build is planned.
 

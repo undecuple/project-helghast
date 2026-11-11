@@ -295,10 +295,49 @@ static void test_gum(void)
                   strstr(out, "KZ3DisplayCmd(\"fps 30\")") && strstr(out, "\"fps \"..gKz3FpsWant"),
               "2107: the warning dialog before the settingscript, No focused; 30 applies at once, 60/120 after Yes");
         CHECK(!strstr(out, "<dialog id=\"dlg_kz3_fsr\"") &&
-                  !strstr(out, "function OnKZ3FsrClose"),
-              "FSR controls are absent without the FSR option flag");
+                  !strstr(out, "function OnKZ3FsrClose") &&
+                  !strstr(out, "<dialog id=\"dlg_kz3_xess\"") &&
+                  !strstr(out, "value=\"xess\""),
+              "temporal upscaler controls are absent without their option flags");
         CHECK(!strstr(out, "<select id=\"slc_kz3_mblur\"") && !strstr(out, "function KZ3MBlurOn") && strstr(out, "if (KZ3MBlurOn) then"),
               "2107: no Motion blur row without the hook (OnPageOn tests for its function)");
+        free(out);
+    }
+    out = rsx_dm_patch_gum_opts(
+        page,
+        sizeof page - 1,
+        &n,
+        RSX_DM_GUM_FSR3 | RSX_DM_GUM_XESS);
+    CHECK(out && n == strlen(out), "XeSS: combined temporal upscaler page patched");
+    if (out) {
+        const char* upscaler =
+            strstr(out, "<select id=\"slc_kz3_upscaler\"");
+        const char* upscaler_end =
+            upscaler ? strstr(upscaler, "</select>") : NULL;
+        const char* xess =
+            upscaler ? strstr(upscaler, "value=\"xess\"") : NULL;
+        const char* dialog =
+            strstr(out, "<dialog id=\"dlg_kz3_xess\"");
+        const char* script =
+            strstr(out, "<script id=\"settingscript\">");
+        CHECK(
+            upscaler && upscaler_end && xess && xess < upscaler_end &&
+                strstr(xess, "XeSS (experimental)</selectitem>"),
+            "XeSS: value is in the separate Upscaler row");
+        CHECK(
+            dialog && script && dialog < script &&
+                strstr(dialog, "optional Intel runtime") &&
+                strstr(dialog, "default-focus=\"dlg_kz3_xess_no\"") &&
+                strstr(
+                    out,
+                    "dialog(dlg_kz3_xess, settingscript, OnKZ3XessClose)") &&
+                strstr(out, "function OnKZ3XessClose") &&
+                strstr(out, "KZ3DisplayCmd(\"upscaler xess\")"),
+            "XeSS: selection requires confirmation and explains the optional runtime");
+        CHECK(
+            strstr(out, "FSR 3.1 and XeSS use current and previous frames") &&
+                strstr(out, "XeSS needs an optional Intel runtime"),
+            "XeSS: Upscaler tooltip describes temporal input and runtime");
         free(out);
     }
     out = rsx_dm_patch_gum_opts(page, sizeof page - 1, &n, RSX_DM_GUM_FSR3);
@@ -489,7 +528,8 @@ static void test_gum(void)
      * the shorter frame rate warning */
     out = rsx_dm_patch_gum_opts(
         page, sizeof page - 1, &n,
-        RSX_DM_GUM_MBLUR | RSX_DM_GUM_FOV | RSX_DM_GUM_FSR3);
+        RSX_DM_GUM_MBLUR | RSX_DM_GUM_FOV |
+            RSX_DM_GUM_FSR3 | RSX_DM_GUM_XESS);
     CHECK(out && n == strlen(out), "2110: page patched");
     if (out) {
         const char* le = strstr(out, "</list>");

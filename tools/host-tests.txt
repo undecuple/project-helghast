@@ -33,6 +33,11 @@ tools/release/test_export_refs.py
 tools/upstream/test_lifter_chunks.py
 tools/spu/test_kz3_fiber_stall.sh
 tools/release/test_launch.py
+tools/release/test_xess_runtime.py
+tools/smoke/test_xess_motion.sh
+tools/smoke/test_xess_inputs.sh
+tools/smoke/test_xess_camera.sh
+tools/smoke/test_xess_compile.sh
 tools/release/test_pack_zip.py
 tools/release/test_lift_fixups.py
 tools/release/test_shaders.py
