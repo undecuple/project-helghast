@@ -1,4 +1,4 @@
-KZ3 patch 2148 (ENHANCEMENT, experimental): feed FSR from the deferred scene rather than the depthless scanout.
+KZ3 patch 2161 (ENHANCEMENT, experimental): feed FSR from the deferred scene rather than the depthless scanout.
 
 A metadata-only gameplay capture established that the four-target full-resolution deferred pass owns the usable
 depth, while the alternating display surfaces receive a later depthless composition. Select that MRT pass

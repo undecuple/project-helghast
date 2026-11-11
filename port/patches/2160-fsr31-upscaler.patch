@@ -1,4 +1,4 @@
-KZ3 patch 2147 (ENHANCEMENT, experimental): an opt-in FidelityFX Super Resolution 3.1 presentation filter.
+KZ3 patch 2160 (ENHANCEMENT, experimental): an opt-in FidelityFX Super Resolution 3.1 presentation filter.
 
 The KZ3 build defines KZ3_FSR31 and supplies the port-owned fsr31.h adapter. Other ps3recomp users compile the
 renderer unchanged. When requested, the renderer associates the primary display surface with its full-size depth
