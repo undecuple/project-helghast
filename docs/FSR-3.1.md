@@ -60,8 +60,8 @@ Any missing or incoherent input
 | [`port/kz3/fsr31_motion.h`](../port/kz3/fsr31_motion.h) | Platform-independent reference implementation of normal-depth reconstruction and camera reprojection |
 | [`port/kz3/fsr31_inputs.h`](../port/kz3/fsr31_inputs.h) | Pure deferred-pass, scene-resolve and capture-pair selection rules |
 | [`port/kz3/main.cpp`](../port/kz3/main.cpp) | Camera/FOV publication, projection-plane assumption, settings persistence and Options-page commands |
-| [`port/patches/2147-fsr31-upscaler.patch`](../port/patches/2147-fsr31-upscaler.patch) | Initial renderer dispatch, presentation ordering, UI rows and fallback |
-| [`port/patches/2148-fsr31-game-buffer-inputs.patch`](../port/patches/2148-fsr31-game-buffer-inputs.patch) | Deferred-depth selection, scene jitter, paired scene captures and reactive-mask enablement |
+| [`port/patches/2160-fsr31-upscaler.patch`](../port/patches/2160-fsr31-upscaler.patch) | Initial renderer dispatch, presentation ordering, UI rows and fallback |
+| [`port/patches/2161-fsr31-game-buffer-inputs.patch`](../port/patches/2161-fsr31-game-buffer-inputs.patch) | Deferred-depth selection, scene jitter, paired scene captures and reactive-mask enablement |
 | [`third_party/fidelityfx-sdk/`](../third_party/fidelityfx-sdk/) | Minimal unchanged MIT-licensed FidelityFX C API headers needed by the adapter |
 | [`tools/release/stage_fidelityfx.py`](../tools/release/stage_fidelityfx.py) | Release-time validation and staging of AMD's official signed DirectX 12 DLL and licence |
 
@@ -354,7 +354,7 @@ runtime performs no network access. Licence and attribution details are in [`NOT
 | [`tools/smoke/test_fsr31.cpp`](../tools/smoke/test_fsr31.cpp) | Real D3D12 device with WARP fallback, exact provider query, deliberately different scene captures, generated reactivity, depth-aware motion, output readback, jitter and missing-DLL fallback |
 | [`tools/release/test_stage_fidelityfx.py`](../tools/release/test_stage_fidelityfx.py) | DLL/licence staging and rejection of wrong architecture, type, hash or licence |
 | Release host tests | Payload, launcher, first-run, portable ZIP, licence inventory and uninstall coverage |
-| Patch-series build | Patches 2147 and 2148 apply after the complete numbered series; the FSR-guarded renderer and adapter build |
+| Patch-series build | Patches 2160 and 2161 apply after the complete numbered series; the FSR-guarded renderer and adapter build |
 
 The native Windows probe has successfully dispatched the external-resource path and the adapter-owned
 depth-motion/generated-reactive path with the pinned FSR 3.1.4 provider, read back all 230,400 output pixels as
