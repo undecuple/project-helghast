@@ -1,4 +1,6 @@
 #include "fsr31.h"
+#include "rsx_live_draw.h"
+#include "rsx_upscale.h"
 
 #include <cstdio>
 #include <cstring>
@@ -6,6 +8,39 @@
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
+
+namespace {
+
+rsx_upscale_ops g_registered_ops{};
+rsx_live_upscale_hooks g_registered_hooks{};
+bool g_backend_registered = false;
+bool g_hooks_registered = false;
+
+} // namespace
+
+extern "C" int rsx_upscale_register_backend(
+    rsx_upscale_backend backend,
+    const rsx_upscale_ops* ops)
+{
+    if (backend != RSX_UPSCALE_FSR3 || !ops) {
+        return 0;
+    }
+    g_registered_ops = *ops;
+    g_backend_registered = true;
+    return 1;
+}
+
+extern "C" void rsx_live_draw_set_upscale_hooks(
+    const rsx_live_upscale_hooks* hooks)
+{
+    if (hooks) {
+        g_registered_hooks = *hooks;
+        g_hooks_registered = true;
+    } else {
+        g_registered_hooks = {};
+        g_hooks_registered = false;
+    }
+}
 
 namespace {
 
@@ -27,16 +62,19 @@ bool check(HRESULT hr, const char* action)
     return false;
 }
 
-bool create_device(ID3D12Device** out_device)
+bool create_device(bool force_warp, ID3D12Device** out_device)
 {
-    HRESULT hr = D3D12CreateDevice(
-        nullptr,
-        D3D_FEATURE_LEVEL_12_0,
-        IID_ID3D12Device,
-        reinterpret_cast<void**>(out_device));
-    if (SUCCEEDED(hr)) {
-        puts("[test_fsr31] using the default hardware adapter");
-        return true;
+    HRESULT hr = E_FAIL;
+    if (!force_warp) {
+        hr = D3D12CreateDevice(
+            nullptr,
+            D3D_FEATURE_LEVEL_12_0,
+            IID_ID3D12Device,
+            reinterpret_cast<void**>(out_device));
+        if (SUCCEEDED(hr)) {
+            puts("[test_fsr31] using the default hardware adapter");
+            return true;
+        }
     }
 
     IDXGIFactory4* factory = nullptr;
@@ -196,10 +234,30 @@ bool upload_input(
 
 int main(int argc, char** argv)
 {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
     constexpr uint32_t render_width = 320;
     constexpr uint32_t render_height = 180;
     constexpr uint32_t output_width = 640;
     constexpr uint32_t output_height = 360;
+
+    if (!kz3_fsr31_register() ||
+        !g_backend_registered ||
+        !g_hooks_registered ||
+        !g_registered_ops.create ||
+        !g_registered_ops.destroy ||
+        !g_registered_ops.evaluate ||
+        g_registered_hooks.backend != RSX_UPSCALE_FSR3 ||
+        !g_registered_hooks.inspect_draw ||
+        !g_registered_hooks.before_writeback) {
+        fputs(
+            "[test_fsr31] registered backend or renderer hooks are "
+            "incomplete\n",
+            stderr);
+        return 1;
+    }
+    puts("[test_fsr31] registered backend and renderer hooks: ok");
 
     {
         float pose[16] = {};
@@ -260,18 +318,57 @@ int main(int argc, char** argv)
     kz3_fsr31_dispatch_desc dispatch{};
     kz3_fsr31_camera_dispatch_desc camera_dispatch{};
     ID3D12Resource* camera_output = nullptr;
+    ID3D12Resource* registered_output = nullptr;
+    void* registered_backend = nullptr;
     int result = 1;
-    const bool expect_unsupported =
-        argc == 2 && strcmp(argv[1], "--expect-unsupported") == 0;
+    bool expect_unsupported = false;
+    bool force_warp = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--expect-unsupported") == 0) {
+            expect_unsupported = true;
+        } else if (strcmp(argv[i], "--warp") == 0) {
+            force_warp = true;
+        } else {
+            fprintf(stderr, "[test_fsr31] unknown option: %s\n", argv[i]);
+            return 1;
+        }
+    }
 
-    if (!create_device(&device)) {
+    if (!create_device(force_warp, &device)) {
         puts("[test_fsr31] SKIP: D3D12 is unavailable");
         return 0;
     }
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
+        if (SUCCEEDED(device->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                &options,
+                sizeof(options)))) {
+            printf(
+                "[test_fsr31] wave operations: %s (%u..%u lanes)\n",
+                options.WaveOps ? "yes" : "no",
+                options.WaveLaneCountMin,
+                options.WaveLaneCountMax);
+        }
+    }
     if (!kz3_fsr31_is_supported(device)) {
         if (expect_unsupported) {
+            const rsx_upscale_config config = {
+                RSX_UPSCALE_FSR3,
+                0.2f};
+            registered_backend =
+                g_registered_ops.create(device, &config);
+            if (registered_backend) {
+                fputs(
+                    "[test_fsr31] registered backend unexpectedly started "
+                    "without its adjacent runtime\n",
+                    stderr);
+                goto done;
+            }
             printf(
-                "[test_fsr31] missing-runtime fallback: ok (%s)\n",
+                force_warp
+                    ? "[test_fsr31] software-adapter fallback: ok (%s)\n"
+                    : "[test_fsr31] missing-runtime fallback: ok (%s)\n",
                 kz3_fsr31_status());
             result = 0;
             goto done;
@@ -286,18 +383,19 @@ int main(int argc, char** argv)
             stderr);
         goto done;
     }
-    if (!kz3_fsr31_initialize(
-            device,
-            render_width,
-            render_height,
-            output_width,
-            output_height,
-            KZ3_FSR31_CREATE_AUTO_EXPOSURE |
-                KZ3_FSR31_CREATE_DEBUG_CHECKING)) {
-        fprintf(stderr, "[test_fsr31] %s\n", kz3_fsr31_status());
+    {
+        const rsx_upscale_config config = {
+            RSX_UPSCALE_FSR3,
+            0.2f};
+        registered_backend = g_registered_ops.create(device, &config);
+    }
+    if (!registered_backend) {
+        fprintf(
+            stderr,
+            "[test_fsr31] registered backend creation failed: %s\n",
+            kz3_fsr31_status());
         goto done;
     }
-
     if (!check(
             device->CreateCommandQueue(
                 &queue_desc,
@@ -388,6 +486,94 @@ int main(int argc, char** argv)
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     }
     list->ResourceBarrier(3, barriers);
+
+    {
+        rsx_live_upscale_draw_info draw{};
+        draw.frame = 1;
+        draw.render_width = render_width;
+        draw.render_height = render_height;
+        draw.output_width = output_width;
+        draw.output_height = output_height;
+        draw.target_location = 0;
+        draw.target_width = render_width;
+        draw.target_height = render_height;
+        draw.mrt_count = 4;
+        draw.depth_slot = 1;
+        draw.full_viewport = 1;
+        draw.depth_test = 1;
+        draw.command_list = list;
+        draw.color_resource = color;
+        rsx_live_upscale_draw_action action{};
+        g_registered_hooks.inspect_draw(
+            g_registered_hooks.user, &draw, &action);
+        if (!action.select_depth || action.apply_jitter) {
+            fputs(
+                "[test_fsr31] first registered draw did not gate jitter "
+                "on context readiness\n",
+                stderr);
+            goto done;
+        }
+
+        const rsx_upscale_image bridge_depth = {
+            depth,
+            render_width,
+            render_height,
+            DXGI_FORMAT_R32_FLOAT,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+        rsx_upscale_eval bridge_eval{};
+        bridge_eval.cmd_list = list;
+        bridge_eval.input = {
+            color,
+            render_width,
+            render_height,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+        bridge_eval.output_width = output_width;
+        bridge_eval.output_height = output_height;
+        bridge_eval.depth = &bridge_depth;
+        bridge_eval.frame_time_ms = 1000.0f / 30.0f;
+        bridge_eval.reset_history = 1;
+        rsx_upscale_result bridge_result{};
+        if (!g_registered_ops.evaluate(
+                registered_backend,
+                &bridge_eval,
+                0.2f,
+                &bridge_result,
+                nullptr,
+                nullptr) ||
+            !bridge_result.resource ||
+            bridge_result.width != output_width ||
+            bridge_result.height != output_height ||
+            bridge_result.format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+            bridge_result.state !=
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+            fprintf(
+                stderr,
+                "[test_fsr31] registered backend dispatch failed: %s\n",
+                kz3_fsr31_status());
+            goto done;
+        }
+        registered_output =
+            static_cast<ID3D12Resource*>(bridge_result.resource);
+
+        draw.frame = 2;
+        action = {};
+        g_registered_hooks.inspect_draw(
+            g_registered_hooks.user, &draw, &action);
+        if (!action.select_depth || !action.apply_jitter) {
+            fputs(
+                "[test_fsr31] registered draw did not enable jitter after "
+                "context creation\n",
+                stderr);
+            goto done;
+        }
+        puts("[test_fsr31] registered backend dispatch and jitter gating: ok");
+    }
+
+    if (force_warp) {
+        camera_output = registered_output;
+        goto prepare_readback;
+    }
 
     barriers[0].Transition.pResource = scene;
     barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -485,6 +671,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "[test_fsr31] %s\n", kz3_fsr31_status());
         goto done;
     }
+prepare_readback:
     {
         const D3D12_RESOURCE_DESC desc = camera_output->GetDesc();
         if (desc.Width != output_width || desc.Height != output_height ||
@@ -616,18 +803,28 @@ int main(int argc, char** argv)
             static_cast<unsigned long long>(nonblack),
             output_width * output_height);
     }
-    printf(
-        "[test_fsr31] FSR 3.1.4 external, depth-motion, and reactive dispatches: "
-        "ok (jitter %.6f, %.6f)\n",
-        jitter_x,
-        jitter_y);
+    if (force_warp) {
+        puts(
+            "[test_fsr31] FSR 3.1.4 registered WARP dispatch and "
+            "readback: ok");
+    } else {
+        printf(
+            "[test_fsr31] FSR 3.1.4 external, depth-motion, and reactive "
+            "dispatches: ok (jitter %.6f, %.6f)\n",
+            jitter_x,
+            jitter_y);
+    }
     result = 0;
 
 done:
     if (event) {
         CloseHandle(event);
     }
-    kz3_fsr31_shutdown();
+    if (registered_backend) {
+        g_registered_ops.destroy(registered_backend, nullptr, nullptr);
+    } else {
+        kz3_fsr31_shutdown();
+    }
     for (ID3D12Resource*& upload : uploads) {
         release(upload);
     }

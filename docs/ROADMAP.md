@@ -31,11 +31,12 @@ Where each feature of the PS3 game stands today, and the port-only features with
 - 📋 Variable refresh rate, low-latency mode
 - 📋 60 fps and above (opt-in where it would change gameplay)
 - 📋 Motion blur strength setting (needs a clean way to switch the game's blur pass)
-- 🔧 [Experimental FSR 3.1 temporal upscaling](FSR-3.1.md) is wired, passes a native synthetic D3D12 dispatch probe,
-  and has an initial native Windows gameplay confirmation at 1920x1080; broader game and Proton quality validation,
-  object motion, broader particle/transparency masks, a separate transparency/composition mask, and separate UI
-  composition remain. Camera translation and a scene-composition reactive mask now use the game's deferred
-  buffers. TAA, DLAA, and DLSS are still planned
+- 🔧 [Experimental FSR 3.1 temporal upscaling](FSR-3.1.md) is wired through a generic registered-backend interface;
+  its host policy/interface tests, changed translation units and native synthetic D3D12 dispatch/readback probe
+  pass. The 1920x1080 gameplay confirmation used the earlier integration and must be repeated for the redesigned
+  path. Broader game and Proton quality validation, object motion, broader particle/transparency masks, a separate
+  transparency/composition mask, and separate UI composition remain. Camera translation and a scene-composition
+  reactive mask use the game's deferred buffers. TAA, DLAA, and DLSS are still planned
 - 📋 Ray-traced sun shadows, then ambient occlusion and reflections (off by default)
 - 🔧 A settings menu in the game's own UI style (the Display and Mouse pages exist; more pages to come)
 

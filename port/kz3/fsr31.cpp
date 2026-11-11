@@ -1,4 +1,7 @@
 #include "fsr31.h"
+#include "fsr31_inputs.h"
+#include "rsx_live_draw.h"
+#include "rsx_upscale.h"
 
 #include <algorithm>
 #include <cmath>
@@ -11,6 +14,7 @@
 
 #include <windows.h>
 #include <d3dcompiler.h>
+#include <dxgi1_4.h>
 
 #include "ffx_api/ffx_api_loader.h"
 #include "ffx_api/ffx_upscale.h"
@@ -66,6 +70,33 @@ struct CameraBridge {
 };
 
 CameraBridge g_camera;
+
+struct Fsr31Bridge {
+    ID3D12Device* device = nullptr;
+    uint32_t render_width = 0;
+    uint32_t render_height = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    uint32_t context_generation = 0;
+    uint32_t frame = UINT32_MAX;
+    uint32_t primary_depth_frame = UINT32_MAX;
+    uint32_t primary_depth_slot = 0;
+    uint32_t camera_frame = UINT32_MAX;
+    kz3_fsr31_camera_state camera{};
+    float jitter_x = 0.0f;
+    float jitter_y = 0.0f;
+    kz3_fsr31_capture_key opaque_capture{};
+    uint32_t reactive_frame = UINT32_MAX;
+    uint32_t reactive_context_generation = 0;
+    uint32_t last_dispatch_frame = UINT32_MAX;
+    uintptr_t last_dispatch_resource = 0;
+    uint32_t last_dispatch_context_generation = 0;
+    LARGE_INTEGER timer_frequency{};
+    LARGE_INTEGER previous_dispatch_time{};
+    int last_failure = 0;
+};
+
+Fsr31Bridge g_bridge;
 
 void set_status(const char* format, ...)
 {
@@ -831,6 +862,41 @@ int dispatch_locked(const kz3_fsr31_dispatch_desc* desc)
     return 1;
 }
 
+bool hardware_adapter_supported(ID3D12Device* device)
+{
+    IDXGIFactory4* factory = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    DXGI_ADAPTER_DESC1 desc{};
+    const LUID luid = device->GetAdapterLuid();
+    HRESULT result = CreateDXGIFactory1(
+        IID_IDXGIFactory4,
+        reinterpret_cast<void**>(&factory));
+    if (SUCCEEDED(result)) {
+        result = factory->EnumAdapterByLuid(
+            luid, IID_IDXGIAdapter1, reinterpret_cast<void**>(&adapter));
+    }
+    if (SUCCEEDED(result)) {
+        result = adapter->GetDesc1(&desc);
+    }
+    if (adapter) {
+        adapter->Release();
+    }
+    if (factory) {
+        factory->Release();
+    }
+    if (FAILED(result)) {
+        set_status(
+            "querying the D3D12 adapter failed (HRESULT 0x%08lX)",
+            static_cast<unsigned long>(result));
+        return false;
+    }
+    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+        set_status("FSR 3.1 does not support software D3D12 adapters");
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 extern "C" int kz3_fsr31_is_supported(ID3D12Device* device)
@@ -838,6 +904,9 @@ extern "C" int kz3_fsr31_is_supported(ID3D12Device* device)
     std::lock_guard<std::mutex> lock(g_fsr.mutex);
     if (!device) {
         set_status("FSR 3.1 support query received no D3D12 device");
+        return 0;
+    }
+    if (!hardware_adapter_supported(device)) {
         return 0;
     }
     if (!load_runtime_locked()) {
@@ -862,6 +931,9 @@ extern "C" int kz3_fsr31_initialize(
     std::lock_guard<std::mutex> lock(g_fsr.mutex);
     if (!device) {
         set_status("FSR 3.1 initialization received no D3D12 device");
+        return 0;
+    }
+    if (!hardware_adapter_supported(device)) {
         return 0;
     }
     if (!dimensions_valid(
@@ -1394,4 +1466,522 @@ extern "C" const char* kz3_fsr31_status(void)
     std::lock_guard<std::mutex> lock(g_fsr.mutex);
     copy = g_fsr.status;
     return copy.c_str();
+}
+
+namespace {
+
+enum BridgeFailure {
+    BRIDGE_OK = 0,
+    BRIDGE_BAD_INPUT,
+    BRIDGE_NO_DEPTH,
+    BRIDGE_NO_CAMERA,
+    BRIDGE_NO_CONTEXT,
+    BRIDGE_DISPATCH_FAILED,
+};
+
+void bridge_output_size(
+    uint32_t render_width,
+    uint32_t render_height,
+    uint32_t requested_width,
+    uint32_t requested_height,
+    uint32_t* output_width,
+    uint32_t* output_height)
+{
+    const uint64_t max_width = static_cast<uint64_t>(render_width) * 3u;
+    const uint64_t max_height = static_cast<uint64_t>(render_height) * 3u;
+    *output_width = static_cast<uint32_t>(
+        std::min<uint64_t>(requested_width, max_width));
+    *output_height = static_cast<uint32_t>(
+        std::min<uint64_t>(requested_height, max_height));
+}
+
+void bridge_fail(BridgeFailure failure, uint32_t frame, const char* detail)
+{
+    if (g_bridge.last_failure == failure) {
+        return;
+    }
+    g_bridge.last_failure = failure;
+    fprintf(
+        stderr,
+        "[fsr31] unavailable, bilinear fallback: %s (frame %u)\n",
+        detail ? detail : "unknown reason",
+        frame);
+}
+
+bool bridge_context_matches(
+    uint32_t render_width,
+    uint32_t render_height,
+    uint32_t requested_width,
+    uint32_t requested_height)
+{
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    bridge_output_size(
+        render_width,
+        render_height,
+        requested_width,
+        requested_height,
+        &output_width,
+        &output_height);
+    return g_bridge.render_width == render_width &&
+           g_bridge.render_height == render_height &&
+           g_bridge.output_width == output_width &&
+           g_bridge.output_height == output_height;
+}
+
+void* bridge_create(void* device, const rsx_upscale_config*)
+{
+    g_bridge = {};
+    g_bridge.frame = UINT32_MAX;
+    g_bridge.primary_depth_frame = UINT32_MAX;
+    g_bridge.camera_frame = UINT32_MAX;
+    g_bridge.reactive_frame = UINT32_MAX;
+    g_bridge.last_dispatch_frame = UINT32_MAX;
+    g_bridge.device = static_cast<ID3D12Device*>(device);
+    if (!g_bridge.device || !kz3_fsr31_is_supported(g_bridge.device)) {
+        fprintf(
+            stderr,
+            "[fsr31] backend unavailable: %s\n",
+            kz3_fsr31_status());
+        g_bridge.device = nullptr;
+        return nullptr;
+    }
+    return &g_bridge;
+}
+
+void bridge_destroy(
+    void* backend,
+    void (*)(void*, void*),
+    void*)
+{
+    if (backend == &g_bridge) {
+        kz3_fsr31_shutdown();
+        g_bridge = {};
+        g_bridge.frame = UINT32_MAX;
+        g_bridge.primary_depth_frame = UINT32_MAX;
+        g_bridge.camera_frame = UINT32_MAX;
+        g_bridge.reactive_frame = UINT32_MAX;
+        g_bridge.last_dispatch_frame = UINT32_MAX;
+    }
+}
+
+float bridge_frame_time(uint32_t* reset)
+{
+    if (!g_bridge.timer_frequency.QuadPart) {
+        QueryPerformanceFrequency(&g_bridge.timer_frequency);
+    }
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    float frame_time_ms = 1000.0f / 30.0f;
+    if (g_bridge.previous_dispatch_time.QuadPart) {
+        frame_time_ms = static_cast<float>(
+            static_cast<double>(
+                now.QuadPart - g_bridge.previous_dispatch_time.QuadPart) *
+            1000.0 /
+            static_cast<double>(g_bridge.timer_frequency.QuadPart));
+        if (!(frame_time_ms >= 1.0f && frame_time_ms <= 250.0f)) {
+            frame_time_ms = 1000.0f / 30.0f;
+            *reset = 1;
+        }
+    }
+    g_bridge.previous_dispatch_time = now;
+    return frame_time_ms;
+}
+
+int bridge_evaluate(
+    void* backend,
+    const rsx_upscale_eval* eval,
+    float sharpness,
+    rsx_upscale_result* result,
+    void (*)(void*, void*),
+    void*)
+{
+    if (backend != &g_bridge || !g_bridge.device || !eval || !result ||
+        !eval->cmd_list || !eval->input.resource ||
+        !eval->depth || !eval->depth->resource ||
+        eval->input.format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        eval->depth->format != DXGI_FORMAT_R32_FLOAT ||
+        eval->depth->width != eval->input.width ||
+        eval->depth->height != eval->input.height) {
+        bridge_fail(
+            eval && eval->depth ? BRIDGE_BAD_INPUT : BRIDGE_NO_DEPTH,
+            g_bridge.frame,
+            eval && eval->depth
+                ? "the color or depth input is incompatible"
+                : "no matching deferred depth snapshot is available");
+        return 0;
+    }
+    if (g_bridge.camera_frame != g_bridge.frame ||
+        !(g_bridge.camera.flags & KZ3_FSR31_CAMERA_PLANES_VALID) ||
+        (g_bridge.camera.flags & KZ3_FSR31_CAMERA_MULTIPLE_VIEWS)) {
+        bridge_fail(
+            BRIDGE_NO_CAMERA,
+            g_bridge.frame,
+            "no coherent single-view camera and projection are available");
+        return 0;
+    }
+
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    bridge_output_size(
+        eval->input.width,
+        eval->input.height,
+        eval->output_width,
+        eval->output_height,
+        &output_width,
+        &output_height);
+    if (output_width <= eval->input.width ||
+        output_height <= eval->input.height) {
+        bridge_fail(
+            BRIDGE_BAD_INPUT,
+            g_bridge.frame,
+            "the requested output does not enlarge both axes");
+        return 0;
+    }
+
+    const bool context_changed =
+        g_bridge.render_width != eval->input.width ||
+        g_bridge.render_height != eval->input.height ||
+        g_bridge.output_width != output_width ||
+        g_bridge.output_height != output_height;
+    if (!kz3_fsr31_initialize(
+            g_bridge.device,
+            eval->input.width,
+            eval->input.height,
+            output_width,
+            output_height,
+            KZ3_FSR31_CREATE_AUTO_EXPOSURE)) {
+        bridge_fail(
+            BRIDGE_NO_CONTEXT,
+            g_bridge.frame,
+            kz3_fsr31_status());
+        return 0;
+    }
+    if (context_changed) {
+        g_bridge.render_width = eval->input.width;
+        g_bridge.render_height = eval->input.height;
+        g_bridge.output_width = output_width;
+        g_bridge.output_height = output_height;
+        g_bridge.context_generation++;
+        g_bridge.opaque_capture = {};
+        g_bridge.reactive_frame = UINT32_MAX;
+        g_bridge.last_dispatch_frame = UINT32_MAX;
+    }
+
+    auto* command_list =
+        static_cast<ID3D12GraphicsCommandList*>(eval->cmd_list);
+    auto* color = static_cast<ID3D12Resource*>(eval->input.resource);
+    auto* depth = static_cast<ID3D12Resource*>(eval->depth->resource);
+    const auto color_state =
+        static_cast<D3D12_RESOURCE_STATES>(eval->input.state);
+    const auto depth_state =
+        static_cast<D3D12_RESOURCE_STATES>(eval->depth->state);
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    UINT barrier_count = 0;
+    if (color_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+        D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = color;
+        barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = color_state;
+        barrier.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+    if (depth_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+        D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = depth;
+        barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = depth_state;
+        barrier.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+    if (barrier_count) {
+        command_list->ResourceBarrier(barrier_count, barriers);
+    }
+
+    uint32_t timing_reset = 0;
+    kz3_fsr31_camera_dispatch_desc dispatch{};
+    dispatch.command_list = command_list;
+    dispatch.color = color;
+    dispatch.depth = depth;
+    dispatch.camera = g_bridge.camera;
+    dispatch.render_width = eval->input.width;
+    dispatch.render_height = eval->input.height;
+    dispatch.output_width = output_width;
+    dispatch.output_height = output_height;
+    dispatch.jitter_x = eval->jitter_x;
+    dispatch.jitter_y = eval->jitter_y;
+    dispatch.frame_time_ms = bridge_frame_time(&timing_reset);
+    dispatch.sharpness = std::clamp(sharpness, 0.0f, 1.0f);
+    dispatch.use_reactive_mask =
+        g_bridge.reactive_frame == g_bridge.frame &&
+        g_bridge.reactive_context_generation ==
+            g_bridge.context_generation;
+    dispatch.reset =
+        eval->reset_history ||
+        timing_reset ||
+        g_bridge.last_dispatch_frame == UINT32_MAX ||
+        g_bridge.frame != g_bridge.last_dispatch_frame + 1u ||
+        reinterpret_cast<uintptr_t>(color) !=
+            g_bridge.last_dispatch_resource ||
+        g_bridge.context_generation !=
+            g_bridge.last_dispatch_context_generation;
+    ID3D12Resource* output = kz3_fsr31_dispatch_camera(&dispatch);
+
+    barrier_count = 0;
+    if (color_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+        D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+        barrier.Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = color_state;
+    }
+    if (depth_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+        D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+        barrier.Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = depth_state;
+    }
+    if (barrier_count) {
+        command_list->ResourceBarrier(barrier_count, barriers);
+    }
+    if (!output) {
+        bridge_fail(
+            BRIDGE_DISPATCH_FAILED,
+            g_bridge.frame,
+            kz3_fsr31_status());
+        return 0;
+    }
+
+    result->resource = output;
+    result->width = output_width;
+    result->height = output_height;
+    result->format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    result->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g_bridge.last_dispatch_frame = g_bridge.frame;
+    g_bridge.last_dispatch_resource = reinterpret_cast<uintptr_t>(color);
+    g_bridge.last_dispatch_context_generation =
+        g_bridge.context_generation;
+    g_bridge.last_failure = BRIDGE_OK;
+    static uint32_t success_logs = 0;
+    if (success_logs++ < 4) {
+        fprintf(
+            stderr,
+            "[fsr31] frame %u: FSR 3.1.4 %ux%u -> %ux%u, "
+            "depth-aware camera motion, reactive=%s, "
+            "jitter %.4f/%.4f, reset=%u\n",
+            g_bridge.frame,
+            eval->input.width,
+            eval->input.height,
+            output_width,
+            output_height,
+            dispatch.use_reactive_mask ? "generated" : "none",
+            dispatch.jitter_x,
+            dispatch.jitter_y,
+            dispatch.reset ||
+                (dispatch.camera.flags & KZ3_FSR31_CAMERA_RESET));
+    }
+    return 1;
+}
+
+void bridge_inspect_draw(
+    void*,
+    const rsx_live_upscale_draw_info* info,
+    rsx_live_upscale_draw_action* action)
+{
+    if (!info || !action || !g_bridge.device) {
+        return;
+    }
+    if (g_bridge.frame != info->frame) {
+        g_bridge.frame = info->frame;
+        g_bridge.camera_frame = UINT32_MAX;
+        g_bridge.jitter_x = 0.0f;
+        g_bridge.jitter_y = 0.0f;
+    }
+
+    const kz3_fsr31_draw_info draw = {
+        info->frame,
+        info->target_offset,
+        info->target_width,
+        info->target_height,
+        info->mrt_count,
+        info->depth_slot,
+        info->sampled_render_target_offset,
+        info->target_location == 0u,
+        info->full_viewport,
+        info->depth_test,
+        info->blend,
+        info->sampled_full_size_render_target};
+    const bool context_ready = bridge_context_matches(
+        info->render_width,
+        info->render_height,
+        info->output_width,
+        info->output_height);
+    if (kz3_fsr31_is_deferred_primary(
+            &draw, info->render_width, info->render_height)) {
+        g_bridge.primary_depth_frame = info->frame;
+        g_bridge.primary_depth_slot = info->depth_slot;
+        action->select_depth = 1;
+    }
+    if (kz3_fsr31_should_jitter(
+            &draw,
+            info->render_width,
+            info->render_height,
+            g_bridge.primary_depth_frame,
+            g_bridge.primary_depth_slot)) {
+        if (g_bridge.camera_frame != info->frame) {
+            uint32_t output_width = 0;
+            uint32_t output_height = 0;
+            kz3_fsr31_camera_state camera{};
+            bridge_output_size(
+                info->render_width,
+                info->render_height,
+                info->output_width,
+                info->output_height,
+                &output_width,
+                &output_height);
+            if (output_width > info->render_width &&
+                output_height > info->render_height &&
+                kz3_fsr31_get_camera(&camera) &&
+                (camera.flags & KZ3_FSR31_CAMERA_PLANES_VALID) &&
+                !(camera.flags & KZ3_FSR31_CAMERA_MULTIPLE_VIEWS) &&
+                kz3_fsr31_get_jitter(
+                    info->frame,
+                    info->render_width,
+                    output_width,
+                    &g_bridge.jitter_x,
+                    &g_bridge.jitter_y)) {
+                g_bridge.camera = camera;
+                g_bridge.camera_frame = info->frame;
+            }
+        }
+        if (context_ready && g_bridge.camera_frame == info->frame) {
+            action->apply_jitter = 1;
+            action->jitter_x = g_bridge.jitter_x;
+            action->jitter_y = g_bridge.jitter_y;
+        }
+    }
+    action->capture_after_draw =
+        context_ready &&
+        kz3_fsr31_is_opaque_resolve(
+            &draw, info->render_width, info->render_height);
+}
+
+void bridge_after_draw(
+    void*,
+    const rsx_live_upscale_draw_info* info)
+{
+    if (!info || !info->command_list || !info->color_resource) {
+        return;
+    }
+    const kz3_fsr31_capture_key key = {
+        info->frame,
+        g_bridge.context_generation,
+        info->target,
+        info->target_width,
+        info->target_height,
+        reinterpret_cast<uintptr_t>(info->color_resource)};
+    if (g_bridge.opaque_capture.frame == key.frame &&
+        g_bridge.opaque_capture.context_generation ==
+            key.context_generation &&
+        g_bridge.opaque_capture.resource == key.resource) {
+        return;
+    }
+    if (kz3_fsr31_capture_opaque_color(
+            static_cast<ID3D12GraphicsCommandList*>(
+                info->command_list),
+            static_cast<ID3D12Resource*>(info->color_resource),
+            info->target_width,
+            info->target_height)) {
+        g_bridge.opaque_capture = key;
+        static uint32_t capture_logs = 0;
+        if (capture_logs++ < 4) {
+            fprintf(
+                stderr,
+                "[fsr31] frame %u: captured opaque scene "
+                "surface 0x%08X\n",
+                info->frame,
+                info->target_offset);
+        }
+    }
+}
+
+void bridge_before_writeback(
+    void*,
+    const rsx_live_upscale_surface_info* info,
+    rsx_live_upscale_surface_action* action)
+{
+    if (!info || !action ||
+        !kz3_fsr31_is_scene_target(
+            info->offset,
+            info->width,
+            info->height,
+            info->location == 0u,
+            info->render_width,
+            info->render_height)) {
+        return;
+    }
+    action->suppress_host_aa = 1;
+    if (!bridge_context_matches(
+            info->render_width,
+            info->render_height,
+            info->output_width,
+            info->output_height) ||
+        g_bridge.reactive_frame == info->frame ||
+        !info->command_list || !info->color_resource) {
+        return;
+    }
+    const kz3_fsr31_capture_key pre_upscale = {
+        info->frame,
+        g_bridge.context_generation,
+        info->target,
+        info->width,
+        info->height,
+        reinterpret_cast<uintptr_t>(info->color_resource)};
+    if (kz3_fsr31_capture_pair_matches(
+            &g_bridge.opaque_capture, &pre_upscale) &&
+        kz3_fsr31_capture_pre_upscale_color(
+            static_cast<ID3D12GraphicsCommandList*>(
+                info->command_list),
+            static_cast<ID3D12Resource*>(info->color_resource),
+            info->width,
+            info->height)) {
+        g_bridge.reactive_frame = info->frame;
+        g_bridge.reactive_context_generation =
+            g_bridge.context_generation;
+        static uint32_t capture_logs = 0;
+        if (capture_logs++ < 4) {
+            fprintf(
+                stderr,
+                "[fsr31] frame %u: captured "
+                "opaque-plus-translucent scene\n",
+                info->frame);
+        }
+    }
+}
+
+const rsx_upscale_ops g_fsr31_ops = {
+    bridge_create,
+    bridge_destroy,
+    bridge_evaluate};
+
+const rsx_live_upscale_hooks g_fsr31_hooks = {
+    RSX_UPSCALE_FSR3,
+    &g_bridge,
+    bridge_inspect_draw,
+    bridge_after_draw,
+    bridge_before_writeback};
+
+} // namespace
+
+extern "C" int kz3_fsr31_register(void)
+{
+    if (!rsx_upscale_register_backend(
+            RSX_UPSCALE_FSR3, &g_fsr31_ops)) {
+        return 0;
+    }
+    rsx_live_draw_set_upscale_hooks(&g_fsr31_hooks);
+    return 1;
 }

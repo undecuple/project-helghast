@@ -138,8 +138,8 @@ static void test_scaling(void)
     CHECK(rsx_dm_parse_scaling("fit") == RSX_DM_FIT && rsx_dm_parse_scaling(" Stretch ") == RSX_DM_STRETCH &&
               rsx_dm_parse_scaling("fill") < 0 && rsx_dm_parse_filter("bilinear") == RSX_DM_BILINEAR &&
               rsx_dm_parse_filter("NEAREST") == RSX_DM_NEAREST &&
-              rsx_dm_parse_filter("fsr31") == RSX_DM_FSR31 &&
-              rsx_dm_parse_filter("FSR3.1") == RSX_DM_FSR31 &&
+              rsx_dm_parse_filter("fsr31") < 0 &&
+              rsx_dm_parse_filter("FSR3.1") < 0 &&
               rsx_dm_parse_filter("fsr") < 0 &&
               rsx_dm_parse_scaling(NULL) < 0,
           "scaling/filter names");
@@ -149,8 +149,6 @@ static void test_scaling(void)
           "fit bilinear = rsx_dm_fit");
     CHECK(rect_is(rsx_dm_rect_for(1280, 720, 1920, 1080, RSX_DM_FIT, RSX_DM_NEAREST), 320, 180, 1280, 720),
           "nearest at 1080p: 1x centred (1.5x is not whole)");
-    CHECK(rect_is(rsx_dm_rect_for(1280, 720, 1920, 1080, RSX_DM_FIT, RSX_DM_FSR31), 0, 0, 1920, 1080),
-          "FSR at 1080p uses the full non-integer Fit target");
     CHECK(rect_is(rsx_dm_rect_for(1280, 720, 2560, 1440, RSX_DM_FIT, RSX_DM_NEAREST), 0, 0, 2560, 1440),
           "nearest at 1440p: 2x fills");
     CHECK(rect_is(rsx_dm_rect_for(1280, 720, 3840, 2160, RSX_DM_FIT, RSX_DM_NEAREST), 0, 0, 3840, 2160),
@@ -159,15 +157,6 @@ static void test_scaling(void)
           "nearest below 1x: plain fit");
     CHECK(rect_is(rsx_dm_rect_for(1280, 720, 1920, 1080, RSX_DM_STRETCH, RSX_DM_NEAREST), 0, 0, 1920, 1080),
           "stretch + nearest: whole client");
-    CHECK(rsx_dm_parse_fsr_sharpness("0") == 0 &&
-              rsx_dm_parse_fsr_sharpness(" 0.2 ") == 200 &&
-              rsx_dm_parse_fsr_sharpness("0.25") == 300 &&
-              rsx_dm_parse_fsr_sharpness("1.000") == 1000 &&
-              rsx_dm_parse_fsr_sharpness("1.01") < 0 &&
-              rsx_dm_parse_fsr_sharpness("-0.1") < 0 &&
-              rsx_dm_parse_fsr_sharpness("nan") < 0 &&
-              rsx_dm_parse_fsr_sharpness("0.") < 0,
-          "FSR sharpness accepts 0.0..1.0 and rejects invalid values");
     {
         rsx_dm_rect r = rsx_dm_rect_for(1280, 720, 1600, 1200, RSX_DM_STRETCH, RSX_DM_BILINEAR);
         int gx, gy;
@@ -224,7 +213,7 @@ static void test_ini(void)
     CHECK(m == 3, "all three modes round-trip (with scaling and filter)");
     CHECK(rsx_dm_ini_scaling(buf) >= 0 && rsx_dm_ini_scaling("[display]\nmode = borderless\n") < 0 &&
               rsx_dm_ini_filter("[display]\nfilter = Point\n") == RSX_DM_NEAREST &&
-              rsx_dm_ini_filter("[display]\nfilter = fsr31\n") == RSX_DM_FSR31 &&
+              rsx_dm_ini_filter("[display]\nfilter = fsr31\n") < 0 &&
               rsx_dm_ini_scaling("[display]\nscaling=Stretch\r\n") == RSX_DM_STRETCH,
           "scaling/filter keys: missing = none, aliases, case");
     CHECK(n > 0 && rsx_dm_ini_vsync(buf) >= 0, "vsync key written");
@@ -280,15 +269,11 @@ static void test_gum(void)
               "three values, bridge command, length");
         CHECK(strstr(out, "slc_kz3_scaling") && strstr(out, "slc_kz3_filter") && strstr(out, "slc_kz3_filter") < gam &&
                   strstr(out, "Stretch</selectitem>") && strstr(out, "Nearest</selectitem>") &&
-                  strstr(out, "FSR 3.1 (experimental)</selectitem>") &&
-                  strstr(out, "\"scaling \"..e") && strstr(out, "\"filter \"..gKz3FilterWant") &&
+                  !strstr(out, "FSR 3.1 (experimental)</selectitem>") &&
+                  !strstr(out, "<select id=\"slc_kz3_upscaler\"") &&
+                  strstr(out, "\"scaling \"..e") && strstr(out, "\"filter \"..e") &&
                   strstr(out, "KZ3DisplayCmd(\"filter\")"),
-              "Image scaling and Scaling filter rows with their functions");
-        CHECK(strstr(out, "slc_kz3_fsr_sharpness") &&
-                  strstr(out, "default-value=\"0.2\"") &&
-                  strstr(out, "\"fsrsharpness \"..e") &&
-                  strstr(out, "KZ3DisplayCmd(\"fsrsharpness\")"),
-              "FSR sharpness row uses 0.0..1.0 and the display bridge");
+              "Image scaling and Scaling filter remain spatial-only");
         CHECK(strstr(out, "slc_kz3_vsync") && strstr(out, "slc_kz3_vsync") < gam && strstr(out, "slc_kz3_vsync") > strstr(out, "slc_kz3_filter") &&
                   strstr(out, "label=\"VSync\"") && strstr(out, ">On</selectitem>") && strstr(out, ">Off</selectitem>") &&
                   strstr(out, "\"vsync \"..e") && strstr(out, "KZ3DisplayCmd(\"vsync\")") && strstr(out, "function KZ3ChangeVSync"),
@@ -309,15 +294,39 @@ static void test_gum(void)
                   strstr(out, "dialog(dlg_kz3_fps, settingscript, OnKZ3FpsClose)") && strstr(out, "function OnKZ3FpsClose") &&
                   strstr(out, "KZ3DisplayCmd(\"fps 30\")") && strstr(out, "\"fps \"..gKz3FpsWant"),
               "2107: the warning dialog before the settingscript, No focused; 30 applies at once, 60/120 after Yes");
-        const char* fsr_dlg = strstr(out, "<dialog id=\"dlg_kz3_fsr\"");
-        CHECK(fsr_dlg && fsr_dlg < scr &&
-                  strstr(fsr_dlg, "default-focus=\"dlg_kz3_fsr_no\"") &&
-                  strstr(out, "dialog(dlg_kz3_fsr, settingscript, OnKZ3FsrClose)") &&
-                  strstr(out, "function OnKZ3FsrClose") &&
-                  strstr(out, "KZ3DisplayCmd(\"filter fsr31\")"),
-              "FSR is experimental and requires confirmation before it is selected");
+        CHECK(!strstr(out, "<dialog id=\"dlg_kz3_fsr\"") &&
+                  !strstr(out, "function OnKZ3FsrClose"),
+              "FSR controls are absent without the FSR option flag");
         CHECK(!strstr(out, "<select id=\"slc_kz3_mblur\"") && !strstr(out, "function KZ3MBlurOn") && strstr(out, "if (KZ3MBlurOn) then"),
               "2107: no Motion blur row without the hook (OnPageOn tests for its function)");
+        free(out);
+    }
+    out = rsx_dm_patch_gum_opts(page, sizeof page - 1, &n, RSX_DM_GUM_FSR3);
+    CHECK(out && n == strlen(out), "FSR 3.1: page with separate upscaler rows patched");
+    if (out) {
+        const char* gam = strstr(out, "<listitem id=\"lst_gamma_screen\"");
+        const char* upscaler = strstr(out, "<select id=\"slc_kz3_upscaler\"");
+        const char* sharpness = strstr(out, "<select id=\"slc_kz3_fsr_sharpness\"");
+        const char* filter = strstr(out, "<select id=\"slc_kz3_filter\"");
+        const char* filter_end = filter ? strstr(filter, "</select>") : NULL;
+        const char* dialog = strstr(out, "<dialog id=\"dlg_kz3_fsr\"");
+        const char* script = strstr(out, "<script id=\"settingscript\">");
+        CHECK(upscaler && sharpness && gam && upscaler < sharpness && sharpness < gam &&
+                  strstr(upscaler, "value=\"none\">Off</selectitem>") &&
+                  strstr(upscaler, "value=\"fsr3\">FSR 3.1 (experimental)</selectitem>"),
+              "FSR 3.1: Off/FSR values live in a separate Upscaler row");
+        CHECK(filter && filter_end && upscaler && filter_end < upscaler &&
+                  strstr(out, "\"upscaler \"..gKz3UpscalerWant") &&
+                  strstr(out, "\"fsrsharpness \"..e") &&
+                  strstr(out, "KZ3DisplayCmd(\"upscaler\")") &&
+                  strstr(out, "KZ3DisplayCmd(\"fsrsharpness\")"),
+              "FSR 3.1: upscaler and sharpness use their own bridge commands");
+        CHECK(dialog && script && dialog < script &&
+                  strstr(dialog, "default-focus=\"dlg_kz3_fsr_no\"") &&
+                  strstr(out, "dialog(dlg_kz3_fsr, settingscript, OnKZ3FsrClose)") &&
+                  strstr(out, "function OnKZ3FsrClose") &&
+                  strstr(out, "KZ3DisplayCmd(\"upscaler fsr3\")"),
+              "FSR 3.1: experimental selection requires confirmation");
         free(out);
     }
     out = rsx_dm_patch_gum_opts(page, sizeof page - 1, &n, RSX_DM_GUM_MBLUR);
@@ -475,20 +484,12 @@ static void test_gum(void)
         CHECK(strstr(ib, "motion_blur = 60\n") && strstr(ib, "bloom = 10\n"), "2121: the writer rounds to the step too");
         rsx_dm_ini_write_ext3(ib, sizeof ib, RSX_DM_WINDOWED, RSX_DM_FIT, RSX_DM_BILINEAR, 1, 100, RSX_DM_FPS_30, 0, 1);
         CHECK(rsx_dm_ini_bloom(ib) == -1, "2121: a file from before the Bloom row has no bloom key (default 100 applies)");
-        k = rsx_dm_ini_write_ext5(
-            ib, sizeof ib, RSX_DM_WINDOWED, RSX_DM_FIT, RSX_DM_FSR31,
-            1, 100, RSX_DM_FPS_30, 0, 1, 100, 250);
-        CHECK(k > 0 && k < (int)sizeof ib &&
-                  strstr(ib, "filter = fsr31\n") &&
-                  strstr(ib, "fsr_sharpness = 0.3\n") &&
-                  rsx_dm_ini_fsr_sharpness(ib) == 300 &&
-                  rsx_dm_ini_fsr_sharpness(
-                      "[display]\nfsr_sharpness = 1.1\n") < 0,
-              "FSR filter and sharpness persist, round, and reject out-of-range input");
     }
     /* patch 2110 (RSX pass 104): row tooltips in the game's tooltip panel, Reset to defaults resets the port's rows,
      * the shorter frame rate warning */
-    out = rsx_dm_patch_gum_opts(page, sizeof page - 1, &n, RSX_DM_GUM_MBLUR | RSX_DM_GUM_FOV);
+    out = rsx_dm_patch_gum_opts(
+        page, sizeof page - 1, &n,
+        RSX_DM_GUM_MBLUR | RSX_DM_GUM_FOV | RSX_DM_GUM_FSR3);
     CHECK(out && n == strlen(out), "2110: page patched");
     if (out) {
         const char* le = strstr(out, "</list>");
@@ -503,12 +504,14 @@ static void test_gum(void)
         CHECK(strstr(out, "function KZ3Tooltip(e)") && strstr(out, "slc_kz3_fps = \"Used in missions. Menus and videos stay at 30. Above 30") &&
               strstr(out, "slc_kz3_fov = ") && strstr(out, "slc_kz3_mblur = ") && strstr(out, "slc_kz3_display = ") &&
               strstr(out, "slc_kz3_scaling = ") && strstr(out, "slc_kz3_filter = ") &&
-              strstr(out, "slc_kz3_fsr_sharpness = ") && strstr(out, "slc_kz3_vsync = "),
+              strstr(out, "slc_kz3_upscaler = ") && strstr(out, "slc_kz3_fsr_sharpness = ") &&
+              strstr(out, "slc_kz3_vsync = "),
               "2110: a tooltip for every port row");
         CHECK(rc && rc < strstr(sd, "end") && rf && rf < cd, "2110: the game's reset calls KZ3ResetDisplay right after SetDefaultDisplay");
         CHECK(rf && strstr(rf, "KZ3DisplayCmd(\"display windowed\")") && strstr(rf, "KZ3DisplayCmd(\"fps 30\")") &&
               strstr(rf, "KZ3DisplayCmd(\"vsync on\")") && strstr(rf, "KZ3DisplayCmd(\"scaling stretch\")") &&
               strstr(rf, "KZ3DisplayCmd(\"filter bilinear\")") &&
+              strstr(rf, "KZ3DisplayCmd(\"upscaler none\")") &&
               strstr(rf, "KZ3DisplayCmd(\"fsrsharpness 0.2\")") &&
               strstr(rf, "\"motionblur 100\"") && strstr(rf, "\"fov default\"") &&
               strstr(rf, "OnPageOn()"), "2110: the reset sets every port row to its default and shows the values");
@@ -516,8 +519,8 @@ static void test_gum(void)
               rsx_dm_parse_filter(RSX_DM_DEF_FILTER) == RSX_DM_BILINEAR && rsx_dm_parse_vsync(RSX_DM_DEF_VSYNC) == RSX_DM_VSYNC_ON &&
               rsx_dm_parse_fps(RSX_DM_DEF_FPS) == RSX_DM_FPS_30 && rsx_dm_parse_pct(RSX_DM_DEF_MBLUR) == 100 && rsx_dm_parse_pct(RSX_DM_DEF_BLOOM) == 100 &&
               rsx_dm_parse_fov(RSX_DM_DEF_FOV) == 0 &&
-              rsx_dm_parse_fsr_sharpness(RSX_DM_DEF_FSR_SHARPNESS) ==
-                  RSX_DM_FSR_SHARPNESS_DEFAULT,
+              !strcmp(RSX_DM_DEF_UPSCALER, "none") &&
+              !strcmp(RSX_DM_DEF_FSR_SHARPNESS, "0.2"),
               "2110: the reset values parse to the port's defaults");
         CHECK(strstr(out, "label=\"A frame rate limit above 30 can make the game run wrong. Are you sure?\"") != NULL,
               "2110: the warning is one line, like the game's own confirm dialogs");

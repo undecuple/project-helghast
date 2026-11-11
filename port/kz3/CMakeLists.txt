@@ -199,16 +199,14 @@ add_executable(${PROJECT_NAME}
 )
 
 # ENHANCEMENT: FSR 3.1 is loaded at runtime from the signed AMD DLL shipped by
-# the release. The renderer hooks are KZ3-only; upstream ps3recomp builds keep
-# no FidelityFX header or binary dependency.
+# the release. ps3recomp exposes generic renderer hooks; this KZ3 adapter owns
+# all game recognition and keeps FidelityFX headers and binaries out of the
+# generic runtime.
 if(WIN32)
     set(KZ3_FIDELITYFX_INCLUDE
         "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/fidelityfx-sdk/ffx-api/include")
     target_sources(${PROJECT_NAME} PRIVATE fsr31.cpp)
     target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE "${KZ3_FIDELITYFX_INCLUDE}")
-    target_compile_definitions(${PROJECT_NAME} PRIVATE KZ3_FSR31)
-    target_compile_definitions(ps3recomp_runtime PRIVATE KZ3_FSR31)
-    target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 # KZ3 release: the player's EBOOT.elf linked into kz3.exe. The release's first-run build

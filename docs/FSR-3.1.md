@@ -2,7 +2,7 @@
 
 Project Helghast has an opt-in experimental temporal upscaler built around AMD FidelityFX Super Resolution 3.1.
 It uses the FSR provider `3.1.4` in FidelityFX SDK v1.1.4. This is an **ENHANCEMENT**: the PS3 game does not have
-this presentation path, and Bilinear remains the default filter.
+this presentation path. Upscaler remains Off by default, and Bilinear remains the default scaling filter.
 
 The current implementation is the first stage of the work:
 
@@ -20,9 +20,10 @@ prerequisite or dispatch falls back to Bilinear instead of preventing the game f
 
 ## Architecture
 
-The implementation deliberately keeps AMD's API and the KZ3-specific hooks outside the general ps3recomp
-runtime. The KZ3 target defines `KZ3_FSR31`; a normal ps3recomp runtime build does not include the adapter or an
-FidelityFX dependency.
+The implementation keeps AMD's API and every KZ3-specific recognition rule in `port/kz3`. Generic ps3recomp
+provides a backend-registration surface in `rsx_upscale` and metadata-only live-renderer callbacks that a port may
+use for temporal inputs. The KZ3 target registers its FSR 3 backend and callbacks before renderer startup. A normal
+ps3recomp build has no FidelityFX header, binary dependency, KZ3 offset or pass-selection rule.
 
 ```text
 Recompiled game camera hooks
@@ -32,12 +33,13 @@ Recompiled game camera hooks
 RSX draw replay
   -> identify the full-resolution four-target deferred pass
   -> remember and jitter its depth-tested geometry
+  -> snapshot the selected depth immediately after that draw
   -> jitter later depth-tested draws into the scene target
   -> capture the opaque deferred resolve
   -> capture opaque-plus-translucent scene color before the post-chain copy
 
 Presentation
-  -> take a full-size R32_FLOAT depth snapshot
+  -> consume the current-frame full-size R32_FLOAT depth snapshot
   -> generate R16G16_FLOAT depth-aware camera motion vectors
   -> generate an R8_UNORM reactive mask from the coherent scene captures
   -> dispatch FidelityFX FSR 3.1 into an RGBA8 output
@@ -55,15 +57,30 @@ Any missing or incoherent input
 
 | Component | Role |
 |---|---|
-| [`port/kz3/fsr31.cpp`](../port/kz3/fsr31.cpp) | Secure runtime loading, exact provider selection, FSR context and resource ownership, scene captures, reactive-mask generation, motion-vector compute shader and dispatch |
-| [`port/kz3/fsr31.h`](../port/kz3/fsr31.h) | Stable C boundary between the C++ KZ3 code and the patched C renderer |
+| [`port/kz3/fsr31.cpp`](../port/kz3/fsr31.cpp) | Port-owned `rsx_upscale` backend registration, live-renderer callbacks, secure runtime loading, exact provider selection, context/resource ownership, scene captures, reactive-mask generation, motion-vector compute shader and dispatch |
+| [`port/kz3/fsr31.h`](../port/kz3/fsr31.h) | Stable C API for camera publication, adapter operations and backend registration |
 | [`port/kz3/fsr31_motion.h`](../port/kz3/fsr31_motion.h) | Platform-independent reference implementation of normal-depth reconstruction and camera reprojection |
-| [`port/kz3/fsr31_inputs.h`](../port/kz3/fsr31_inputs.h) | Pure deferred-pass, scene-resolve and capture-pair selection rules |
-| [`port/kz3/main.cpp`](../port/kz3/main.cpp) | Camera/FOV publication, projection-plane assumption, settings persistence and Options-page commands |
-| [`port/patches/2160-fsr31-upscaler.patch`](../port/patches/2160-fsr31-upscaler.patch) | Initial renderer dispatch, presentation ordering, UI rows and fallback |
-| [`port/patches/2161-fsr31-game-buffer-inputs.patch`](../port/patches/2161-fsr31-game-buffer-inputs.patch) | Deferred-depth selection, scene jitter, paired scene captures and reactive-mask enablement |
+| [`port/kz3/fsr31_inputs.h`](../port/kz3/fsr31_inputs.h) | Pure sharpness parsing plus deferred-pass, scene-resolve and capture-pair selection rules |
+| [`port/kz3/main.cpp`](../port/kz3/main.cpp) | Backend registration, camera/FOV publication, projection-plane assumption, upscaler persistence and Options-page commands |
+| [`port/patches/2160-fsr31-upscaler.patch`](../port/patches/2160-fsr31-upscaler.patch) | Generic external-backend registration and the separately flagged Upscaler/FSR sharpness UI |
+| [`port/patches/2161-fsr31-game-buffer-inputs.patch`](../port/patches/2161-fsr31-game-buffer-inputs.patch) | Generic live-renderer metadata/actions, immediate depth snapshot, temporal presentation ordering, lifecycle and fallback |
 | [`third_party/fidelityfx-sdk/`](../third_party/fidelityfx-sdk/) | Minimal unchanged MIT-licensed FidelityFX C API headers needed by the adapter |
 | [`tools/release/stage_fidelityfx.py`](../tools/release/stage_fidelityfx.py) | Release-time validation and staging of AMD's official signed DirectX 12 DLL and licence |
+
+### Generic integration boundary
+
+The patched runtime exposes two reusable pieces:
+
+- `rsx_upscale_register_backend` accepts a complete create/evaluate/destroy operation table for a reserved
+  upscaler ID. FSR 1 and None remain built in and cannot be replaced. The KZ3 port registers FSR 3; another port
+  can register its own implementation without adding that SDK to ps3recomp.
+- The live renderer publishes generic draw, writeback and frame-end metadata through registered callbacks. A port
+  can request a depth snapshot, projection jitter, a post-draw capture or host-AA suppression. The renderer owns
+  command ordering and resource-state restoration; the callback owns recognition policy.
+
+The operation and callback tables contain no FidelityFX types. The generic renderer does not know KZ3's surface
+offsets, deferred-pass layout, camera format, capture-pair rules or sharpness setting. Backend teardown runs during
+normal shutdown and device-loss cleanup, and a later renderer initialization recreates the selected backend.
 
 ## Frame pipeline
 
@@ -130,7 +147,8 @@ late, depthless composition targets. The stable full-resolution deferred set was
 No unidentified MRT is labelled or supplied as velocity. FSR has no normal-buffer input, and slot number or
 texture format alone does not establish a motion convention or scale.
 
-Patch 2148 selects the primary deferred pass structurally: a local, full-render-size target, a full viewport, at
+Patch 2161 publishes the generic draw metadata. The KZ3 callback selects the primary deferred pass structurally:
+a local, full-render-size target, a full viewport, at
 least four color targets, a bound depth slot and depth testing. It records that depth slot for the current renderer
 frame. The same FidelityFX jitter is applied to those deferred geometry draws and to later depth-tested draws into
 the validated scene target that reuse the recorded depth.
@@ -142,9 +160,10 @@ jittered.
 
 ### 4. Depth snapshot
 
-At presentation, the remembered depth surface is copied through the renderer's existing depth snapshot path into
-an `R32_FLOAT` resource. Color and depth must both match the fixed render dimensions and the current renderer
-frame. A stale, smaller or otherwise mismatched snapshot causes a Bilinear fallback.
+Immediately after the selected deferred draw, the renderer copies its depth surface through the existing depth
+snapshot path into an `R32_FLOAT` resource. Presentation consumes that same-frame snapshot; it does not recopy
+whatever depth surface happens to be bound later. Color and depth must both match the fixed render dimensions and
+the current renderer frame. A stale, smaller or otherwise mismatched snapshot causes a Bilinear fallback.
 
 The final color surface can still contain later post-processing and UI while the snapshot represents the deferred
 scene. That remaining color/depth mismatch is documented below, but the selected depth now comes from the actual
@@ -223,7 +242,7 @@ The adapter converts the caller's Direct3D 12 resources to FidelityFX API resour
 - optional RCAS sharpness.
 
 External reactive and transparency/composition resources remain supported by the low-level adapter boundary. The
-renderer supplies the generated reactive mask; transparency/composition remains null.
+KZ3 adapter supplies its generated reactive mask; transparency/composition remains null.
 
 Input color, depth, motion and any reactive resource are in
 `D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE`. The adapter-owned output starts as an unordered-access resource
@@ -243,7 +262,11 @@ part of the temporal input.
 The requested FSR output is the aspect-correct Fit rectangle or the full Stretch rectangle. Each output dimension
 is capped at three times the fixed render dimension. A larger window first receives at most a 3x FSR output and
 then uses the existing Bilinear display blit for the remainder. Nearest and Bilinear behavior are unchanged when
-FSR is not selected.
+FSR is Off.
+
+Temporal output geometry always uses the Bilinear Fit/Stretch calculation, independently of the spatial scaling
+filter. A successful output-sized FSR result receives a point-sampled 1:1 final blit. If evaluation fails, the
+original scene image is presented through an explicit Bilinear fallback even when the spatial filter is Nearest.
 
 FSR is bypassed when the output is not larger than the render image or when either output dimension is smaller
 than its input dimension.
@@ -290,6 +313,7 @@ The following conditions explicitly use Bilinear:
 |---|---|
 | DLL missing or fails to load | Log the Win32 error; no jitter; Bilinear |
 | FSR 3.1.4 provider missing | Log available providers; no jitter; Bilinear |
+| Software D3D12 adapter (including WARP) | Reject before provider/context creation; no jitter; Bilinear |
 | Output is not an upscale | Bilinear |
 | Color target is not the primary RGBA8 image | Bilinear |
 | Matching full-size depth snapshot is unavailable | Bilinear |
@@ -308,9 +332,13 @@ Fallback messages start with `[fsr31] unavailable, bilinear fallback:` and are e
 
 ```ini
 [display]
-filter = fsr31
+filter = bilinear
+upscaler = fsr3
 fsr_sharpness = 0.2
 ```
+
+`filter` remains the independent spatial scaling choice, `bilinear` or `nearest`. `upscaler` is `off` by default
+and accepts `fsr3` for the experimental temporal path.
 
 `fsr_sharpness` is stored as a locale-independent value from `0.0` through `1.0`, rounded to the Options page's
 `0.1` steps. `0.2` is the default. It affects only FSR.
@@ -318,13 +346,14 @@ fsr_sharpness = 0.2
 One-run overrides are:
 
 ```text
-KZ3_DISPLAY_FILTER=fsr31
+RSX_UPSCALE=fsr3
 KZ3_FSR_SHARPNESS=0.0..1.0
 ```
 
-The filter row accepts `fsr31` and `fsr3.1`; the shorter ambiguous value `fsr` is rejected. Selecting FSR in the
-Options page opens a confirmation dialog that names the camera-derived motion and combined scene/UI limitations.
-The label, warning and tooltip are present in all 19 supported UI languages.
+The Options page has separate Scaling filter, Upscaler and FSR sharpness rows. Selecting FSR in the Upscaler row
+opens a confirmation dialog that names the camera-derived motion and combined scene/UI limitations. Reset restores
+Upscaler to Off and sharpness to `0.2`. The label, warning and tooltip are present in all 19 supported UI
+languages.
 
 ## Release and licensing
 
@@ -349,34 +378,43 @@ runtime performs no network access. Licence and attribution details are in [`NOT
 | Test | Coverage |
 |---|---|
 | [`tools/smoke/test_fsr31_motion.c`](../tools/smoke/test_fsr31_motion.c) | Identity, known yaw, normal-depth reconstruction, camera translation at near/far depth, FOV change and invalid input |
-| [`tools/smoke/test_fsr31_inputs.c`](../tools/smoke/test_fsr31_inputs.c) | Deferred-primary selection, scene jitter, opaque-resolve recognition and strict capture-pair rejection |
-| [`tools/smoke/test_display_mode.c`](../tools/smoke/test_display_mode.c) | Filter aliases, Fit dimensions, sharpness parsing/persistence, warning dialog, reset and display bridge |
-| [`tools/smoke/test_fsr31.cpp`](../tools/smoke/test_fsr31.cpp) | Real D3D12 device with WARP fallback, exact provider query, deliberately different scene captures, generated reactivity, depth-aware motion, output readback, jitter and missing-DLL fallback |
+| [`tools/smoke/test_fsr31_inputs.c`](../tools/smoke/test_fsr31_inputs.c) | Deferred-primary selection, scene jitter, opaque-resolve recognition, strict capture-pair rejection and portable sharpness parsing |
+| [`tools/smoke/test_display_mode.c`](../tools/smoke/test_display_mode.c) | Independent spatial-filter/upscaler rows, Fit dimensions, sharpness persistence, warning dialog, reset and display bridge |
+| [`tools/smoke/test_upscale.c`](../tools/smoke/test_upscale.c) | Generic external-backend registration validation, evaluation, live sharpness updates, teardown and unregistration |
+| [`tools/smoke/test_fsr31.cpp`](../tools/smoke/test_fsr31.cpp) | Real hardware D3D12 device, registered operation/hook tables, exact provider query, context-gated jitter, deliberately different scene captures, generated reactivity, depth-aware motion, output readback, explicit WARP rejection and missing-DLL fallback |
 | [`tools/release/test_stage_fidelityfx.py`](../tools/release/test_stage_fidelityfx.py) | DLL/licence staging and rejection of wrong architecture, type, hash or licence |
 | Release host tests | Payload, launcher, first-run, portable ZIP, licence inventory and uninstall coverage |
-| Patch-series build | Patches 2160 and 2161 apply after the complete numbered series; the FSR-guarded renderer and adapter build |
+| Patch-series replay/compile | Patches 2160 and 2161 apply after the complete numbered series; the live-renderer object and KZ3 adapter translation unit compile independently |
 
-The native Windows probe has successfully dispatched the external-resource path and the adapter-owned
-depth-motion/generated-reactive path with the pinned FSR 3.1.4 provider, read back all 230,400 output pixels as
-non-black at 640x360, and confirmed that removing the adjacent DLL produces the expected unavailable status.
+The portable display-mode, KZ3 input-policy and generic-upscaler host tests pass against the regenerated patches.
+The complete 321-patch series also replays from the pinned ps3recomp commit. A full local runtime build currently
+stops in unrelated SPURS CPU-set code because the available MinGW headers do not expose the required Windows
+CPU-set APIs; the changed live-renderer object itself compiles.
 
-On 2026-10-31, a game executable built from this branch ran natively on Windows at 1920x1080 with `filter fsr31`
-from the main menu into the first campaign level on an NVIDIA GeForce RTX 5070 with Windows driver 32.0.16.1742.
-The runtime log confirmed paired opaque and opaque-plus-translucent captures, generated reactivity, nonzero jitter,
-depth-aware camera motion and FSR 3.1.4 dispatch from 1280x720 to 1920x1080. Menu frames without matching depth and
-some later transition frames without a coherent camera snapshot used the expected Bilinear fallback. The user had
-also confirmed the earlier experimental FSR path worked through first-level gameplay without a crash. These are
-initial functional checks rather than broad image-quality coverage.
+The native Windows D3D12 probe registers the current backend and renderer-hook tables, verifies that jitter stays
+off until the output context exists, and dispatches through the registered operation table with the pinned FSR
+3.1.4 provider. It also exercises the external-resource and adapter-owned depth-motion/generated-reactive paths,
+reads back all 230,400 output pixels as non-black at 640x360, and confirms the expected unavailable status after
+removing the adjacent DLL. It used the default hardware adapter. A forced WARP run confirms that software adapters
+are rejected before provider or context creation instead of executing an unsupported FidelityFX workload.
+
+On 2026-10-31, an earlier experimental implementation ran natively at 1920x1080 from the main menu into the first
+campaign level on an NVIDIA GeForce RTX 5070 with Windows driver 32.0.16.1742. Its log confirmed paired captures,
+generated reactivity, nonzero jitter, depth-aware camera motion and FSR 3.1.4 dispatch from 1280x720 to 1920x1080.
+That run supports the low-level input approach, but it does not physically validate the current registered-backend
+and generic-hook integration.
 
 Not yet tested:
 
+- the current registered-backend path in a game executable;
 - a Proton/vkd3d game run;
 - the standalone probe under Proton/vkd3d;
 - systematic visual quality across gameplay, movies, menus, particles and loading screens;
-- cross-vendor coverage beyond the one default native adapter used by the probe; or
+- cross-vendor hardware coverage; or
 - device recovery during a game run.
 
-This evidence supports experimental availability, not a broader feature-quality or platform-support claim.
+The current evidence supports continued experimental development, not a feature-quality or platform-support
+claim.
 
 ## Known issues and limitations
 
@@ -403,15 +441,17 @@ This evidence supports experimental availability, not a broader feature-quality 
    depth use Bilinear by design.
 10. **Outputs above 3x use two filters.** FSR stops at the 3x cap and the existing Bilinear pass performs the final
     enlargement.
-11. **Platform and game quality coverage is preliminary.** One native Windows gameplay confirmation and a successful
-    synthetic dispatch do not establish acceptable image quality across scenes, GPUs or Proton.
-12. **No frame generation.** This implementation does not create a proxy swap chain, generate intermediate
+11. **The redesigned path still needs physical game validation.** The current synthetic registered-backend
+    dispatch and earlier native gameplay do not establish acceptable quality across scenes, GPUs or Proton.
+12. **Hardware D3D12 adapter required.** Software adapters, including WARP, are rejected and use Bilinear.
+13. **No frame generation.** This implementation does not create a proxy swap chain, generate intermediate
     frames or change presentation pacing.
 
 ## Future work
 
 ### 1. Validate the current upscaler
 
+- Build a game executable and physically validate the generic-hook path before requesting broader quality testing.
 - Run the standalone probe under Proton/vkd3d.
 - Repeat native Windows coverage and run the game on Proton at several Fit and Stretch sizes.
 - Exercise resize, borderless, exclusive fullscreen, Alt+Enter, device recovery and shutdown.
