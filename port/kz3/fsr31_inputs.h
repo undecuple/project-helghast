@@ -1,10 +1,81 @@
 #ifndef KZ3_FSR31_INPUTS_H
 #define KZ3_FSR31_INPUTS_H
 
+#include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define KZ3_FSR31_SCENE_TARGET_OFFSET 0x01300000u
 #define KZ3_FSR31_DEFERRED_LIGHTING_OFFSET 0x01E40000u
+#define KZ3_FSR31_SHARPNESS_STEP 100
+#define KZ3_FSR31_SHARPNESS_DEFAULT 200
+
+static inline int kz3_fsr31_sharpness_round(int value)
+{
+    return value <= 0 ? 0 : value >= 1000 ? 1000 :
+        ((value + KZ3_FSR31_SHARPNESS_STEP / 2) /
+         KZ3_FSR31_SHARPNESS_STEP) * KZ3_FSR31_SHARPNESS_STEP;
+}
+
+static inline int kz3_fsr31_parse_sharpness(const char* text)
+{
+    if (!text) {
+        return -1;
+    }
+    while (*text == ' ' || *text == '\t' ||
+           *text == '\r' || *text == '\n') {
+        text++;
+    }
+    size_t length = 0;
+    while (text[length]) {
+        length++;
+    }
+    while (length &&
+           (text[length - 1] == ' ' || text[length - 1] == '\t' ||
+            text[length - 1] == '\r' || text[length - 1] == '\n')) {
+        length--;
+    }
+    if (!length || (text[0] != '0' && text[0] != '1')) {
+        return -1;
+    }
+    const int whole = text[0] - '0';
+    if (length == 1) {
+        return whole * 1000;
+    }
+    if (text[1] != '.' || length == 2 || length > 8) {
+        return -1;
+    }
+    int fraction = 0;
+    int scale = 1;
+    for (size_t i = 2; i < length; i++) {
+        if (text[i] < '0' || text[i] > '9') {
+            return -1;
+        }
+        fraction = fraction * 10 + (text[i] - '0');
+        scale *= 10;
+    }
+    if (whole && fraction) {
+        return -1;
+    }
+    const int thousandths =
+        whole ? 1000 : (fraction * 1000 + scale / 2) / scale;
+    return kz3_fsr31_sharpness_round(thousandths);
+}
+
+static inline const char* kz3_fsr31_sharpness_name(
+    int thousandths,
+    char* buffer,
+    size_t size)
+{
+    const int value = kz3_fsr31_sharpness_round(thousandths);
+    snprintf(
+        buffer,
+        size,
+        "%d.%d",
+        value / 1000,
+        (value % 1000) / 100);
+    return buffer;
+}
 
 typedef struct kz3_fsr31_draw_info {
     uint32_t frame;

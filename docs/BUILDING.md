@@ -216,9 +216,11 @@ Alt+Enter writes it, and you can edit it while the game is closed. Its keys are:
 mode = windowed
 ; stretch (default): the picture fills the window; fit: the picture keeps its shape, with bars
 scaling = stretch
-; bilinear (default), nearest, or fsr31 (experimental FSR 3.1 temporal upscaling)
+; bilinear (default) or nearest
 filter = bilinear
-; FSR RCAS sharpening, 0.0 to 1.0 in steps of 0.1; ignored by bilinear and nearest
+; off (default) or fsr3 (experimental FSR 3.1 temporal upscaling)
+upscaler = off
+; FSR RCAS sharpening, 0.0 to 1.0 in steps of 0.1; ignored when the upscaler is off
 fsr_sharpness = 0.2
 ; on (default) or off: off shows each frame as soon as it is ready, which can tear (Options > Display > VSync)
 vsync = on
@@ -228,6 +230,22 @@ When the file is missing, the launcher creates it with every display key at its 
 
 Two environment variables change the display for one run. Set `KZ3_DISPLAY=windowed|borderless|fullscreen` to choose the mode without saving it. Set `KZ3_ASPECT=16:9` (or
 `off`) to keep the PS3's 16:9 view in gameplay instead of following the window's shape.
+Set `KZ3_DISPLAY_FILTER=bilinear|nearest`, `RSX_UPSCALE=off|fsr3` or `KZ3_FSR_SHARPNESS=0.0..1.0` to override the corresponding setting for one run.
+
+FSR 3.1 is opt-in and experimental. It is used only when the output is larger than the game's fixed 1280x720
+render image. It now uses the full-resolution deferred depth for camera rotation and translation, plus a generated
+reactive mask from the scene before and after its transparent/overlay draws. It still has no object motion,
+complete particle mask, separate transparency/composition mask, or separate UI layer, so moving objects,
+particles, menus, and text can ghost or shimmer. The Options page shows this warning before selecting it. Releases
+place AMD's signed `amd_fidelityfx_dx12.dll` beside `kz3.exe`; a missing or rejected runtime, incoherent
+camera/depth input, split-screen view, or dispatch error is logged and falls back to Bilinear without preventing
+the game from starting.
+The current registered backend passes its native synthetic D3D12 dispatch/readback probe. An earlier experimental
+implementation completed an initial native Windows run from the main menu through the first campaign level at
+1920x1080 on 2026-10-31. The current integration still needs a game build and physical validation; broader scene,
+GPU and Proton quality coverage also remains future work.
+The complete dataflow, resource states, validation evidence and planned quality work are documented in
+[FSR-3.1.md](FSR-3.1.md).
 
 ## Tests without the game
 

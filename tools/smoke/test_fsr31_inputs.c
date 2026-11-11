@@ -15,6 +15,29 @@ static void check(const char* name, int condition)
 
 int main(void)
 {
+    char sharpness[16];
+    check(
+        "sharpness accepts 0.0 through 1.0 and rounds to tenths",
+        kz3_fsr31_parse_sharpness("0") == 0 &&
+        kz3_fsr31_parse_sharpness(" 0.2 ") == 200 &&
+        kz3_fsr31_parse_sharpness("0.25") == 300 &&
+        kz3_fsr31_parse_sharpness("1.000") == 1000);
+    check(
+        "sharpness rejects malformed and out-of-range values",
+        kz3_fsr31_parse_sharpness("1.01") < 0 &&
+        kz3_fsr31_parse_sharpness("-0.1") < 0 &&
+        kz3_fsr31_parse_sharpness("nan") < 0 &&
+        kz3_fsr31_parse_sharpness("0.") < 0 &&
+        kz3_fsr31_parse_sharpness(NULL) < 0);
+    check(
+        "sharpness names use the rounded portable representation",
+        !strcmp(
+            kz3_fsr31_sharpness_name(250, sharpness, sizeof(sharpness)),
+            "0.3") &&
+        !strcmp(
+            kz3_fsr31_sharpness_name(1001, sharpness, sizeof(sharpness)),
+            "1.0"));
+
     kz3_fsr31_draw_info draw;
     memset(&draw, 0, sizeof(draw));
     draw.frame = 42;

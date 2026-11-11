@@ -91,6 +91,7 @@ typedef struct kz3_fsr31_camera_dispatch_desc {
  * retains ownership and performs any barriers needed after dispatch.
  */
 int kz3_fsr31_is_supported(ID3D12Device* device);
+int kz3_fsr31_register(void);
 int kz3_fsr31_initialize(
     ID3D12Device* device,
     uint32_t max_render_width,
