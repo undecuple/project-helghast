@@ -955,20 +955,29 @@ def _close_process_windows(pid):
         fail("close_window_unavailable")
 
 
-def _process_creation_filetime(process):
+def _process_creation_filetime(pid):
     if os.name != "nt":
         fail("windows_required")
     import ctypes
     from ctypes import wintypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
                                          ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
                                          ctypes.POINTER(wintypes.FILETIME)]
     kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        fail("process_tracking_failed")
     created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
-    if not kernel32.GetProcessTimes(int(process._handle), ctypes.byref(created), ctypes.byref(exited),
-                                    ctypes.byref(kernel), ctypes.byref(user)):
+    got_times = kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                         ctypes.byref(kernel), ctypes.byref(user))
+    closed = kernel32.CloseHandle(handle)
+    if not got_times or not closed:
         fail("process_tracking_failed")
     return str((created.dwHighDateTime << 32) | created.dwLowDateTime)
 
@@ -1004,7 +1013,7 @@ def supervise():
                                            stderr=subprocess.STDOUT)
             except Exception:
                 fail("process_start_failed")
-            created = _process_creation_filetime(process)
+            created = _process_creation_filetime(process.pid)
             print(json.dumps({"event": "started", "pid": process.pid, "created_filetime": created},
                              separators=(",", ":")), flush=True)
 
