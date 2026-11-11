@@ -218,8 +218,10 @@ mode = windowed
 scaling = stretch
 ; bilinear (default) or nearest
 filter = bilinear
-; none (default; off is read the same way) or fsr3 (experimental FSR 3.1 temporal upscaling)
+; none (default; off is read the same way), fsr3 (experimental FSR 3.1 temporal upscaling) or xess (experimental XeSS temporal upscaling)
 upscaler = none
+; restored by the launcher if XeSS's optional runtime is declined or invalid
+upscaler_previous = none
 ; FSR RCAS sharpening, 0.0 to 1.0 in steps of 0.1; ignored when the upscaler is off
 fsr_sharpness = 0.2
 ; on (default) or off: off shows each frame as soon as it is ready, which can tear (Options > Display > VSync)
@@ -230,7 +232,7 @@ When the file is missing, the launcher creates it with every display key at its 
 
 Two environment variables change the display for one run. Set `KZ3_DISPLAY=windowed|borderless|fullscreen` to choose the mode without saving it. Set `KZ3_ASPECT=16:9` (or
 `off`) to keep the PS3's 16:9 view in gameplay instead of following the window's shape.
-Set `KZ3_DISPLAY_FILTER=bilinear|nearest`, `RSX_UPSCALE=off|fsr3` or `KZ3_FSR_SHARPNESS=0.0..1.0` to override the corresponding setting for one run.
+Set `KZ3_DISPLAY_FILTER=bilinear|nearest`, `RSX_UPSCALE=off|fsr3|xess` or `KZ3_FSR_SHARPNESS=0.0..1.0` to override the corresponding setting for one run.
 
 FSR 3.1 is opt-in and experimental. It is used only when the output is larger than the game's fixed 1280x720
 render image. It now uses the full-resolution deferred depth for camera rotation and translation, plus a generated
@@ -246,6 +248,13 @@ implementation completed an initial native Windows run from the main menu throug
 GPU and Proton quality coverage also remains future work.
 The complete dataflow, resource states, validation evidence and planned quality work are documented in
 [FSR-3.1.md](FSR-3.1.md).
+
+XeSS-SR is a second experimental backend behind the same registered interface. Its Intel runtime is not included in
+either release format. When XeSS is selected, the launcher asks before downloading Intel's pinned SDK 3.0.2 archive,
+then verifies the archive, individual files, PE type, Intel Authenticode signer/certificate, and VC++ x64 14.40
+runtime before installing the DLL and notices beside `kz3.exe`. Choosing No or any failed check restores
+`upscaler_previous` without making XeSS active. Architecture, exact pins, tests, and remaining visual evidence are in
+[XESS.md](XESS.md).
 
 ## Tests without the game
 

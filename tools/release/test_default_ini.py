@@ -28,7 +28,8 @@ def parse(text):
 vals = parse(la.DISPLAY_INI_TEXT)
 src = open(os.path.join(REPO, "port", "kz3", "main.cpp"), encoding="utf-8", errors="replace").read()
 patches = "".join(open(os.path.join(REPO, "port", "patches", f), encoding="utf-8", errors="replace").read()
-                  for f in sorted(os.listdir(os.path.join(REPO, "port", "patches"))) if f.startswith(("2095", "2103", "2107", "2109", "2113", "2121", "2126")))
+                  for f in sorted(os.listdir(os.path.join(REPO, "port", "patches")))
+                  if f.startswith(("2095", "2103", "2107", "2109", "2113", "2121", "2126", "2160")))
 
 m = re.search(r"s_dm_saved\[4\] = \{ RSX_DM_(\w+), RSX_DM_(\w+), RSX_DM_(\w+), RSX_DM_(\w+) \}", src)
 check(bool(m), "main.cpp has the s_dm_saved initialiser")
@@ -49,9 +50,13 @@ check(re.search(r"static int s_h169_saved = 1;", src) is not None and vals["hud_
 check(re.search(r"static int s_unf_saved = RSX_UNF_KEEP;", src) is not None and vals["unfocused"] == "keep", "unfocused default KEEP = keep")
 check(re.search(r"static int s_maxbl_saved = -1;.*missing = borderless", src) is not None and vals["maximize"] == "borderless",
       "maximize missing = borderless")
+check(re.search(r"s_upscale_saved = RSX_UPSCALE_NONE;", src) is not None and vals["upscaler"] == "none",
+      "upscaler default NONE = none")
+check(re.search(r"s_fsr_sharpness_saved = KZ3_FSR31_SHARPNESS_DEFAULT;", src) is not None and
+      vals["fsr_sharpness"] == "0.2", "FSR sharpness default = 0.2")
 for k in vals:   # every key is one the game's writer or reader names
     check(re.search(r'"%s = |\b%s\b' % (k, k), patches) is not None, f"key {k} appears in the display patches")
-check(len(vals) == 11, "eleven display keys")
+check(len(vals) == 13, "thirteen display keys")
 
 # online.ini: only comments, and its keys are the ones kz3_net.h documents
 net = open(os.path.join(REPO, "port", "net", "kz3_net.h"), encoding="utf-8").read()

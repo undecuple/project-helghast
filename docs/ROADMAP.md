@@ -37,6 +37,11 @@ Where each feature of the PS3 game stands today, and the port-only features with
   path. Broader game and Proton quality validation, object motion, broader particle/transparency masks, a separate
   transparency/composition mask, and separate UI composition remain. Camera translation and a scene-composition
   reactive mask use the game's deferred buffers. TAA, DLAA, and DLSS are still planned
+- 🔧 [Experimental XeSS-SR](XESS.md) now uses the same registered-backend architecture, with KZ3-owned camera/depth,
+  motion, responsive-mask and HUD-mask handling. Its optional Intel runtime is never bundled: the launcher asks for
+  consent, validates pinned archive/file hashes, PE type, Authenticode signer/certificate and VC++ 14.40, and restores
+  the prior upscaler on any failure. The registered hardware dispatch/readback and fallback probes pass; current
+  off/on screenshots, pass timing and still/pause jitter evidence remain required
 - 📋 Ray-traced sun shadows, then ambient occlusion and reflections (off by default)
 - 🔧 A settings menu in the game's own UI style (the Display and Mouse pages exist; more pages to come)
 

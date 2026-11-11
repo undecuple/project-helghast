@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+const rsx_upscale_ops rsx_upscale_fsr1_d3d12_ops = { 0 };
+
 #ifdef _WIN32
 static int test_setenv(const char* name, const char* value, int overwrite)
 {
@@ -23,6 +25,7 @@ static int fails;
 #define CHECK(c) do { if (c) printf("ok   %s\n", #c); else { printf("FAIL %s (line %d)\n", #c, __LINE__); fails++; } } while (0)
 
 static int g_create, g_destroy, g_eval;
+static int g_xess_create, g_xess_destroy, g_xess_eval;
 static float g_sharpness;
 static void* fk_create(void* dev, const rsx_upscale_config* cfg) { (void)cfg; g_create++; return dev ? dev : (void*)&g_create; }
 static void fk_destroy(void* be, void (*r)(void*, void*), void* u) { (void)be; (void)r; (void)u; g_destroy++; }
@@ -37,6 +40,30 @@ static int fk_eval(void* be, const rsx_upscale_eval* e, float sh, rsx_upscale_re
 }
 static const rsx_upscale_ops fake = { fk_create, fk_destroy, fk_eval };
 static const rsx_upscale_ops incomplete = { fk_create, NULL, fk_eval };
+static void* xess_create(void* dev, const rsx_upscale_config* cfg)
+{
+    (void)cfg;
+    g_xess_create++;
+    return dev ? dev : (void*)&g_xess_create;
+}
+static void xess_destroy(void* be, void (*r)(void*, void*), void* u)
+{
+    (void)be; (void)r; (void)u;
+    g_xess_destroy++;
+}
+static int xess_eval(void* be, const rsx_upscale_eval* e, float sh,
+                     rsx_upscale_result* res, void (*r)(void*, void*), void* u)
+{
+    (void)be; (void)sh; (void)r; (void)u;
+    g_xess_eval++;
+    res->resource = e->input.resource;
+    res->width = e->output_width;
+    res->height = e->output_height;
+    return 1;
+}
+static const rsx_upscale_ops fake_xess = {
+    xess_create, xess_destroy, xess_eval
+};
 
 static float bits_f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static int near(float a, float b) { return fabsf(a - b) <= 1e-6f * (fabsf(b) + 1.0f); }
@@ -74,7 +101,9 @@ int main(int argc, char** argv)
           !rsx_upscale_register_backend(RSX_UPSCALE_BACKEND_COUNT, &fake));
     CHECK(!rsx_upscale_register_backend(RSX_UPSCALE_FSR3, &incomplete));
     CHECK(rsx_upscale_register_backend(RSX_UPSCALE_FSR3, &fake));
-    CHECK(rsx_upscale_backend_implemented(RSX_UPSCALE_FSR3));
+    CHECK(rsx_upscale_register_backend(RSX_UPSCALE_XESS, &fake_xess));
+    CHECK(rsx_upscale_backend_implemented(RSX_UPSCALE_FSR3) &&
+          rsx_upscale_backend_implemented(RSX_UPSCALE_XESS));
 
     /* environment */
     rsx_upscale_config c;
@@ -87,6 +116,9 @@ int main(int argc, char** argv)
     setenv("RSX_UPSCALE", "fsr3", 1);
     rsx_upscale_config_from_env(&c);
     CHECK(c.backend == RSX_UPSCALE_FSR3);
+    setenv("RSX_UPSCALE", "xess", 1);
+    rsx_upscale_config_from_env(&c);
+    CHECK(c.backend == RSX_UPSCALE_XESS);
     setenv("RSX_UPSCALE_SHARPNESS", "1.5", 1);
     rsx_upscale_config_from_env(&c);
     CHECK(near(c.sharpness, 1.5f));
@@ -119,7 +151,7 @@ int main(int argc, char** argv)
     rsx_upscale_render_size(RSX_UPSCALE_Q_NATIVE, 2560, 1080, &rw, &rh);        CHECK(rw == 2560 && rh == 1080);
     rsx_upscale_render_size(RSX_UPSCALE_Q_PERFORMANCE, 1, 1, &rw, &rh);         CHECK(rw == 1 && rh == 1);
 
-    /* A registered port-owned FSR 3 backend is selected and dispatched through the same interface. */
+    /* Two port-owned temporal backends coexist and dispatch through their own operation tables. */
     rsx_upscale_eval ev; rsx_upscale_result res;
     memset(&ev, 0, sizeof ev);
     ev.cmd_list = (void*)1; ev.input.resource = (void*)2;
@@ -134,10 +166,20 @@ int main(int argc, char** argv)
     rsx_upscale_set_sharpness(ext_u, 0.7f);
     CHECK(rsx_upscale_evaluate(ext_u, &ev, &res) == 1 &&
           g_eval == 2 && near(g_sharpness, 0.7f));
+    rsx_upscale_config xess = { RSX_UPSCALE_XESS, 0.0f };
+    rsx_upscale* xess_u = rsx_upscale_create(&xess, (void*)8);
+    CHECK(xess_u != NULL && g_xess_create == 1 &&
+          rsx_upscale_get_backend(xess_u) == RSX_UPSCALE_XESS);
+    CHECK(rsx_upscale_evaluate(xess_u, &ev, &res) == 1 &&
+          g_xess_eval == 1 && g_eval == 2);
     rsx_upscale_destroy(ext_u);
+    rsx_upscale_destroy(xess_u);
     CHECK(g_destroy == 1);
+    CHECK(g_xess_destroy == 1);
     CHECK(rsx_upscale_register_backend(RSX_UPSCALE_FSR3, NULL));
-    CHECK(!rsx_upscale_backend_implemented(RSX_UPSCALE_FSR3));
+    CHECK(rsx_upscale_register_backend(RSX_UPSCALE_XESS, NULL));
+    CHECK(!rsx_upscale_backend_implemented(RSX_UPSCALE_FSR3) &&
+          !rsx_upscale_backend_implemented(RSX_UPSCALE_XESS));
     g_create = g_destroy = g_eval = 0;
 
     /* off: no context, no pass, nothing called */

@@ -3,3 +3,4 @@
 *.png binary
 *.patch -text linguist-generated=true
 re/data/*.tsv linguist-generated=true
+licenses/Intel-XeSS-THIRD-PARTY-NOTICES.txt -whitespace
