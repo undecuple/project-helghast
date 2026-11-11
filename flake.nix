@@ -113,7 +113,9 @@
         };
         # `nix develop .#ci` : what the public repo's CI needs (lint, patch apply, host tests): no Ghidra/RPCS3/GPU tools.
         ci = pkgs.mkShell {
-          packages = [ python pkgs.ruff pkgs.shellcheck pkgs.llvmPackages_19.clang-tools pkgs.git pkgs.gnumake pkgs.cmake pkgs.ninja pkgs.zlib ];   # zlib: test_host_composed links the overlay (-lz)
+          # clang: the host tests build with gcc and clang where present; without the shell's own clang a runner's system
+          # clang (built against the runner's glibc) was picked up and its programs failed against the shell's glibc.
+          packages = [ python pkgs.ruff pkgs.shellcheck pkgs.llvmPackages_19.clang pkgs.llvmPackages_19.clang-tools pkgs.git pkgs.gnumake pkgs.cmake pkgs.ninja pkgs.zlib ];   # zlib: test_host_composed links the overlay (-lz)
           shellHook = fixLdflags;
         };
         # `nix develop .#re` : lightweight shell for extraction / analysis
