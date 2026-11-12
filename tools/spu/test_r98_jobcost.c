@@ -41,7 +41,7 @@ void kz3_jobcall_close(spu_context* ctx, uint32_t pc);
  * THREAD CPU time (a preempted thread does not advance it), the zero-spin checks judge the call's thread CPU time
  * (a call that spins nothing cannot use more), and the F checks judge wall total / wall of the work part (about F
  * whatever the load did to the work), the lower bound on every run and the upper bound on the best of several runs
- * (a preemption only ever adds time). */
+ * (a preemption only ever adds time; the wall clock starts after the open, see call()). */
 static double clk_ms(clockid_t id)
 {
     struct timespec t;
@@ -63,8 +63,11 @@ static callms call(spu_context* c, int img, double work, uint32_t pc, int depth)
     callms r;
     c->resident_ovl = img;
     c->host_depth = 0;
-    const double w0 = clk_ms(CLOCK_MONOTONIC), c0 = clk_ms(CLOCK_THREAD_CPUTIME_ID);
+    const double c0 = clk_ms(CLOCK_THREAD_CPUTIME_ID);
     kz3_jobcall_open(c, 0x1000);
+    /* the wall clock starts after the bracket opened: the bracket's own wall time (which sets the spin) then always
+     * covers wall_work, so a preemption between the two clock reads can no longer make a run look short of xF */
+    const double w0 = clk_ms(CLOCK_MONOTONIC);
     while (clk_ms(CLOCK_THREAD_CPUTIME_ID) - c0 < work) {
     }
     r.wall_work = clk_ms(CLOCK_MONOTONIC) - w0;
