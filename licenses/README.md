@@ -10,6 +10,9 @@ credits list is [NOTICE.md](../NOTICE.md). Nothing here covers the game itself, 
 - `SDL3-LICENSE.txt`: zlib, SDL3 (`SDL3.dll` in `runtime\`, unmodified; gamepads, rumble and motion sensors).
 - `AMD-FidelityFX-SDK-LICENSE.txt`: MIT, AMD FidelityFX SDK v1.1.4
   (`amd_fidelityfx_dx12.dll` in `runtime\`, the official signed FSR 3.1.4 DirectX 12 runtime).
+- `Intel-XeSS-LICENSE.txt`: Intel Simplified Software License (October 2022), Intel XeSS SDK 3.0.2
+  (`libxess.dll` is not shipped; the launcher downloads it with the player's consent, next to `kz3.exe`, and keeps this text beside it).
+- `Intel-XeSS-THIRD-PARTY-NOTICES.txt`: the third-party notices Intel ships with the XeSS SDK (`third-party-programs.txt`).
 - `Rajdhani-OFL.txt`: SIL Open Font License 1.1, the Rajdhani fonts (`fonts\`, and embedded in the installer's headings).
 - `llvm-mingw/llvm-mingw-LICENSE.txt`: ISC, the llvm-mingw build scripts (bundled compiler, `toolchain\llvm-mingw\`).
 - `llvm-mingw/llvm-mingw-tree-LICENSE.TXT`: Apache-2.0 WITH LLVM-exception, as shipped inside the llvm-mingw package (clang, lld, compiler-rt, libc++, libunwind).
