@@ -113,6 +113,8 @@ const kz3_native_entry* kz3_native_find(int slot)
         if (kz3_native_lp[i].slot == slot) return &kz3_native_lp[i];
     for (unsigned i = 0; i < kz3_native_skin_n; i++)
         if (kz3_native_skin[i].slot == slot) return &kz3_native_skin[i];
+    for (unsigned i = 0; i < kz3_native_snd_n; i++)
+        if (kz3_native_snd[i].slot == slot) return &kz3_native_snd[i];
     return NULL;
 }
 
@@ -327,4 +329,5 @@ __attribute__((constructor)) static void kz3_native_gates_init(void)
     gate_add(kz3_native_dof, kz3_native_dof_n);
     gate_add(kz3_native_lp, kz3_native_lp_n);
     gate_add(kz3_native_skin, kz3_native_skin_n);
+    gate_add(kz3_native_snd, kz3_native_snd_n);
 }

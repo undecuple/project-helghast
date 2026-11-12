@@ -1,0 +1,11 @@
+{
+  "schema": "kz3.play/1",
+  "name": "salach-cache",
+  "steps": [
+    {"id": "level-request", "op": "wait", "text": "levels.single_player.pyrrhus_outskirts.leveldescription_optimized.core' ->", "timeout": 160},
+    {"id": "reported-asset", "op": "wait", "text": "gripsnondouble_cityblocksgpst_cityblocksartcityblockshigh_narvillekz2_allsniperr.core' -> fd", "timeout": 60},
+    {"id": "bootstrap-finished", "op": "wait", "text": "[cellPad] script t=156.0s press", "timeout": 60},
+    {"id": "settle", "op": "flips", "count": 120, "timeout": 40},
+    {"id": "salach-view", "op": "capture", "timeout": 10}
+  ]
+}

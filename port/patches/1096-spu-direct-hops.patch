@@ -25,8 +25,10 @@ Needs a relift (tools/spu/lift_spu.sh). Upstream candidate.
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (SPU_HOP / SPU_IB_HOP) over upstream SPU_DIRECT in the lifter; both context fields.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 152): ours (SPU_HOP / SPU_IB_HOP, hop_ret_pc) for normal lifts and upstream's SPU_DIRECT (#636) under --reloc, which KZ3 does not use; the call brackets (brsl, bisl) carry both the reloc_delta restore and hop_ret_pc; bisl keeps upstream's target-before-link read (_tg), so this patch does not undo the fix 1156 used to add. Needs a relift as before.
+
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 79067ca5..75bdf90a 100644
+index a1abd56..58be761 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
 @@ -357,6 +357,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
@@ -46,7 +48,7 @@ index 79067ca5..75bdf90a 100644
          g_spu_trampoline_fn = 0;
          spu_recent_mark(ctx, 5, ctx->pc);   /* KZ3 patch 1068 */
          spu_indirect_branch(ctx);
-@@ -1820,8 +1823,22 @@ static void spu_report_cross_image(uint32_t addr, int want, int got)
+@@ -1846,8 +1849,22 @@ static void spu_report_cross_image(uint32_t addr, int want, int got)
              "issue #59.\n", addr, want, got);
  }
  
@@ -69,7 +71,7 @@ index 79067ca5..75bdf90a 100644
      /* Match the context's active image; image_id 0 (context or entry) matches
       * any, for back-compat with single-image contexts. */
      for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
-@@ -1831,6 +1848,8 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
+@@ -1857,6 +1874,8 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
              /* One compare on the return path; the report itself is rare. */
              if (e->image_id != image_id)
                  spu_report_cross_image(addr, image_id, e->image_id);
@@ -78,7 +80,7 @@ index 79067ca5..75bdf90a 100644
              return e->fn;
          }
      }
-@@ -3019,8 +3038,102 @@ void kz3_jobcall_close(spu_context* ctx, uint32_t pc)
+@@ -3090,8 +3109,102 @@ void kz3_jobcall_close(spu_context* ctx, uint32_t pc)
      t_kz3_jc.t0 = 0;
  }
  
@@ -182,10 +184,10 @@ index 79067ca5..75bdf90a 100644
          if (g_kz3_pmend_ib < 0) { const char* e = getenv("KZ3_PMEND_IB"); g_kz3_pmend_ib = (e && *e == '1') ? 1 : 0; }
          if (g_kz3_pmend_ib) { spu_recent_mark(ctx, 6, ctx->pc); spu_recent_mark(ctx, 7, ctx->gpr[0]._u32[0]); }
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index 53a95786..9dbac9e6 100644
+index 782306f..9867d1a 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
-@@ -438,6 +438,9 @@ typedef struct spu_context {
+@@ -446,6 +446,9 @@ typedef struct spu_context {
       * spu_coh_reserve_fast). Written under that lock, read by the context's
       * own thread. */
      int coh_listed;
@@ -195,7 +197,7 @@ index 53a95786..9dbac9e6 100644
  } spu_context;
  
  /* event_status is written from more than one host thread: the SPU's own
-@@ -1082,6 +1085,62 @@ static inline __attribute__((always_inline)) void spu_drain_call(spu_context* ct
+@@ -1108,6 +1111,62 @@ static inline __attribute__((always_inline)) void spu_drain_call(spu_context* ct
      }
      spu_drain_call_full(ctx, return_pc);
  }
@@ -259,7 +261,7 @@ index 53a95786..9dbac9e6 100644
   *
   * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
 diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
-index 5d42b459..121b2e17 100644
+index 5d42b45..121b2e1 100644
 --- a/runtime/spu/spu_drain.c
 +++ b/runtime/spu/spu_drain.c
 @@ -664,6 +664,21 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
@@ -305,48 +307,56 @@ index 5d42b459..121b2e17 100644
                          *tramp = spu_indirect_branch;
                          SPU_DRAIN_POP_IRQ();
 diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
-index d34d5604..cb21309e 100644
+index ea37138..f9eee6a 100644
 --- a/tools/spu_lifter.py
 +++ b/tools/spu_lifter.py
-@@ -541,8 +541,7 @@ class SPULifter:
+@@ -547,8 +547,11 @@ class SPULifter:
          _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
          if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                  and end in getattr(self, "func_starts", set())):
 -            func.body_lines.append(
--                f"    {{ SPU_DIRECT(ctx, 0x{end:X}, {self.prefix}spu_func_{end:08X}); }}")
-+            func.body_lines.append(f"    {self._hop(end)}")
+-                f"    {{ SPU_DIRECT(ctx, {self._pc(end)}, {self.prefix}spu_func_{end:08X}); }}")
++            if self.reloc:
++                func.body_lines.append(
++                    f"    {{ SPU_DIRECT(ctx, {self._pc(end)}, {self.prefix}spu_func_{end:08X}); }}")
++            else:
++                func.body_lines.append(f"    {self._hop(end)}")
  
          # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
          # whole body is nops + an unconditional branch back into itself does
-@@ -879,8 +878,10 @@ class SPULifter:
-                 # `bi $r0` returns via host return) + SPU_DRAIN (drains the
-                 # callee's own tail-chains so they don't grow the caller frame)
+@@ -897,9 +900,11 @@ class SPULifter:
                  # + image save/restore (adopt-on-serve cannot leak upward).
--                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
--                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
+                 # --reloc: the callee's drain may dispatch into other placed code, which sets
+                 # ctx->reloc_delta for itself; put this placement's back on return.
 +                # KZ3 patch 1096: hop_ret_pc = this bracket's return point while the callee runs (direct hops).
-+                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; const uint32_t _hr = ctx->hop_ret_pc; "
-+                        f"ctx->hop_ret_pc = 0x{addr + 4:X}; "
+                 rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
+-                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
+-                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
++                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}const uint32_t _hr = ctx->hop_ret_pc; "
++                        f"ctx->hop_ret_pc = {self._pc(addr + 4)}; "
 +                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); ctx->hop_ret_pc = _hr; "
-                         f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+                         f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
              return f"{link} /* TODO spu: brsl unresolved target */;"
          if mn in _COND_BR:
-@@ -892,11 +893,9 @@ class SPULifter:
+@@ -911,11 +916,12 @@ class SPULifter:
              if func.start_addr <= tgt < func.end_addr:
                  return f"if ({cond}) goto loc_{tgt:08X};"
              self.branch_targets.add(tgt)
 -            # Cross-function conditional branch = conditional tail: a direct
 -            # tail call when the drain has nothing to do on this step, else
 -            # the trampoline and unwind (SPU_DIRECT, spu_context.h).
--            return (f"if ({cond}) {{ SPU_DIRECT(ctx, 0x{tgt:X}, "
+-            return (f"if ({cond}) {{ SPU_DIRECT(ctx, {self._pc(tgt)}, "
 -                    f"{self.prefix}spu_func_{tgt:08X}); }}")
-+            # Cross-function conditional branch = conditional tail: hand the
-+            # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
++            # Cross-function conditional branch = conditional tail: hand the target to the trampoline
++            # (KZ3 patch 1096: SPU_HOP) or, under --reloc, upstream's SPU_DIRECT.
++            if self.reloc:
++                return (f"if ({cond}) {{ SPU_DIRECT(ctx, {self._pc(tgt)}, "
++                        f"{self.prefix}spu_func_{tgt:08X}); }}")
 +            return f"if ({cond}) {{ {self._hop(tgt)} }}"
          # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
          # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
          # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
-@@ -924,8 +923,8 @@ class SPULifter:
+@@ -943,8 +949,8 @@ class SPULifter:
                      return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                  return f"{_ied}SPU_RET(ctx);"
              # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
@@ -357,19 +367,20 @@ index d34d5604..cb21309e 100644
          # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
          if mn == "iret":
              return (f"{_ied}ctx->pc = ctx->srr0; "
-@@ -944,8 +943,9 @@ class SPULifter:
-             # here and its `bi $r0` returns via host return.
-             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-                     f"{{ int32_t _si = (int32_t)ctx->image_id; "
--                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
--                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
-+                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; const uint32_t _hr = ctx->hop_ret_pc; "
-+                    f"ctx->hop_ret_pc = 0x{addr + 4:X}; ctx->host_depth++; "
-+                    f"spu_indirect_branch(ctx); ctx->hop_ret_pc = _hr; spu_drain_call(ctx, 0x{addr + 4:X}); "
-                     f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+@@ -964,9 +970,9 @@ class SPULifter:
+             # read the target BEFORE writing the link: rt may be the same register as ra
+             rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
+             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
+-                    f"int32_t _si = (int32_t)ctx->image_id; {rs}"
+-                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
+-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, {self._pc(addr + 4)}); "
++                    f"int32_t _si = (int32_t)ctx->image_id; {rs}const uint32_t _hr = ctx->hop_ret_pc; "
++                    f"{_ied}ctx->pc = _tg; ctx->hop_ret_pc = {self._pc(addr + 4)}; ctx->host_depth++; "
++                    f"spu_indirect_branch(ctx); ctx->hop_ret_pc = _hr; spu_drain_call(ctx, {self._pc(addr + 4)}); "
+                     f"ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
          # bisled: set link, branch to RA only if an external event is pending.
          if mn in ("bisled",):
-@@ -969,8 +969,7 @@ class SPULifter:
+@@ -991,8 +997,7 @@ class SPULifter:
                  if tgt_reg != "0":
                      return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
                  return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
@@ -379,7 +390,7 @@ index d34d5604..cb21309e 100644
  
          # hint-for-branch: pure performance hint, safe to drop
          if mn in ("hbr", "hbra", "hbrr"):
-@@ -1003,11 +1002,18 @@ class SPULifter:
+@@ -1025,11 +1030,21 @@ class SPULifter:
          if func.start_addr <= tgt < func.end_addr:
              return f"goto loc_{tgt:08X};"
          self.branch_targets.add(tgt)
@@ -387,9 +398,12 @@ index d34d5604..cb21309e 100644
 -        # drain has nothing to do on this step, else hand the target to the
 -        # trampoline and unwind so the enclosing SPU_DRAIN re-enters (no
 -        # host-stack growth either way; SPU_DIRECT, spu_context.h).
--        return (f"{{ SPU_DIRECT(ctx, 0x{tgt:X}, {self.prefix}spu_func_{tgt:08X}); }}")
-+        # Cross-function unconditional tail: hand the target to the trampoline
-+        # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
+-        return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, {self.prefix}spu_func_{tgt:08X}); }}")
++        # Cross-function unconditional tail: hand the target to the trampoline and unwind so the
++        # enclosing SPU_DRAIN re-enters (no host-stack growth); KZ3 patch 1096 SPU_HOP, upstream's
++        # SPU_DIRECT under --reloc.
++        if self.reloc:
++            return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, {self.prefix}spu_func_{tgt:08X}); }}")
 +        return self._hop(tgt)
 +
 +    def _hop(self, tgt) -> str:

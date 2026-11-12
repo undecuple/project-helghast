@@ -9,9 +9,17 @@ workload-policy and sys_event callers of spu_workload_dispatch_async keep the gl
 they were written for). spu_async_run logs "[taskset] MISMATCH" (first 16, then every power of two) when a job's image is not the ELF
 its task's TaskInfo names (TaskInfo at taskset + 0x80 + 48 * task, the ELF EA's low word at +0x14, flags masked): a scheduler fault.
 SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu/test_r139_task_ids.sh.
+
+Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): builds on #515 (ps3_env_once): spu_async_run's
+YDKJ_MINIMAL_CTX test is `j->taskset_ea && !ps3_env_once("YDKJ_MINIMAL_CTX")`. Upstream's new start path
+(spu_taskset_line_committed -> spu_taskset_start_pending -> spu_taskset_task_exited) dispatches through
+spu_dispatch_async_ids too.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 9df6af57..70166745 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -1482,7 +1482,9 @@
+@@ -1573,7 +1573,9 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                spu_taskset2_set_exit(taskset_ea, i, 0, 0); }   /* fresh entry for a recycled id */
              spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
                                     (uint64_t)context_ea, task_arg, task_lsp);
@@ -22,9 +30,11 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
              g_ydkj_real_taskset_ea = taskset_ea;
              g_ydkj_real_taskid     = i;
  
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index afbececa..0f2af07d 100644
 --- a/runtime/spu/spu_workload.c
 +++ b/runtime/spu/spu_workload.c
-@@ -864,6 +864,8 @@
+@@ -866,6 +866,8 @@ void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_co
                  task, create ? "created:" : "exited:", task, e[15], exit_code);
  }
  
@@ -33,7 +43,7 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
  static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task, int32_t exit_code)
  {
      extern uint8_t* vm_base;
-@@ -925,7 +927,8 @@
+@@ -932,7 +934,8 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task, int
          fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                          "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
          g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
@@ -43,7 +53,7 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
      }
      s_ts_held = 0; ts_unlock();
  }
-@@ -1021,7 +1024,7 @@
+@@ -1028,7 +1031,7 @@ int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image,
      extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
      ts_lock(); s_ts_held = 1;   /* dispatch_async marks the task running (#381): held, CreateTask marked it */
      g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
@@ -52,7 +62,7 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
      if (!rc && taskset_ea && t < 128) {           /* not started: let a later scan try */
          uint8_t* r = ts_running(taskset_ea);
          if (r) r[t / 8] &= (uint8_t)~(0x80u >> (t & 7));
-@@ -1098,8 +1101,8 @@
+@@ -1105,8 +1108,8 @@ static void spu_async_run(spu_async_job* j)
                   * real 0x40009F00 -> policy DMA'd garbage -> null branches. */
                  extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                  extern uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
@@ -63,12 +73,12 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
                  uint32_t inst = g_ydkj_real_spurs_ea ? g_ydkj_real_spurs_ea : 0x40009D00u;
                  uint8_t* p = ls + 0x1C0;
                  p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
-@@ -1129,11 +1132,11 @@
+@@ -1136,11 +1139,11 @@ static void spu_async_run(spu_async_job* j)
                  extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                  extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
                  #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
--                if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
-+                if (j->taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {   /* KZ3 patch 1150: this job's ids */
+-                if (g_ydkj_real_taskset_ea && !ps3_env_once("YDKJ_MINIMAL_CTX")) {
++                if (j->taskset_ea && !ps3_env_once("YDKJ_MINIMAL_CTX")) {   /* KZ3 patch 1150: this job's ids */
                      /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
                       * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
                       * so the cri leaf reads valid data instead of my planted guesses. */
@@ -77,8 +87,8 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
                      /* --- Golden-reference context fields for the CRI task, recovered from a
                       * WORKING RPCS3 SPU-LS snapshot via caner's rpcs3-guest-memory-dumper fork
                       * (github.com/canersaka/rpcs3-guest-memory-dumper): YDKJ BLUS30569, SPU0
-@@ -1169,7 +1172,7 @@
-                       if ((_e=getenv("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
+@@ -1176,7 +1179,7 @@ static void spu_async_run(spu_async_job* j)
+                       if ((_e=ps3_env_once("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
                            LSBE32(0x2798,v); LSBE32(0x279C,v); } }
                      fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
 -                            g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
@@ -86,7 +96,7 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
                  } else {
                      LSBE32(0x27C0, 0x100);     /* kernelMgmtAddr -> SPURS kernel ctx @LS 0x100 */
                      LSBE32(0x27C4, 0xA70);     /* syscallAddr -> HLE PM syscall trampoline (0xA70) */
-@@ -1235,6 +1238,23 @@
+@@ -1242,6 +1245,23 @@ static void spu_async_run(spu_async_job* j)
                   * globals, which the next CreateTask clobbers -- the race that made
                   * both audio tasks run task 1's descriptor). */
                  if (j->taskset_ea) {
@@ -110,7 +120,7 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
                      spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
                      fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
                              "taskset=0x%08X task=%u\n", j->image_id,
-@@ -1909,9 +1929,28 @@
+@@ -1997,8 +2017,27 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      return 0;
  }
  
@@ -126,7 +136,7 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
 +
  int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                  uint32_t args_ea)
- {
++{
 +    /* Callers outside a taskset scan (cellSpurs' workload policy dispatch, sys_event's cri path) keep the globals: the last
 +     * taskset and task the PPU created, which is what those paths were written for. */
 +    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
@@ -135,11 +145,10 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
 +
 +static int spu_dispatch_async_ids(const uint8_t* image, uint32_t image_size, uint32_t args_ea,
 +                                  uint32_t taskset_ea, uint32_t taskid)
-+{
+ {
      if (!image || image_size == 0) return 0;
  
-     uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
-@@ -1955,7 +1994,8 @@
+@@ -2043,7 +2082,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
       * set the globals for THIS task). Reading them later in the async thread races
       * the next CreateTask overwriting the single-slot globals -- with two audio
       * tasks that made both run task 1's descriptor. */
@@ -149,3 +158,62 @@ SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu
        j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
      /* Mark the task running NOW, not when its thread starts: in that gap another
       * task's exit saw it ready-but-not-running and started it a second time
+diff --git a/runtime/spu/tests/test_spu_taskset_elf_flags.c b/runtime/spu/tests/test_spu_taskset_elf_flags.c
+--- a/runtime/spu/tests/test_spu_taskset_elf_flags.c
++++ b/runtime/spu/tests/test_spu_taskset_elf_flags.c
+@@ -32,6 +32,14 @@
+ /* A task that exits leaves the set of tasks that work in signal rounds. */
+ void spu_taskset_round_drop(uint32_t taskset_ea, uint32_t task)
+ { (void)taskset_ea; (void)task; }
++/* The production functions below also call these (KZ3 patches 1066/1067 ts_stale, 1022 spu_task2_exit_code_set, 1150
++ * spu_dispatch_async_ids); same no-op / forwarding stand-ins as the stubs above. */
++static int ts_stale(uint32_t taskset_ea) { (void)taskset_ea; return 0; }
++void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_code, int create)
++{ (void)taskset_ea; (void)task; (void)exit_code; (void)create; }
++static int spu_dispatch_async_ids(const uint8_t* image, uint32_t image_size, uint32_t args_ea,
++                                  uint32_t taskset_ea, uint32_t taskid)
++{ (void)taskset_ea; (void)taskid; return spu_workload_dispatch_async(image, image_size, args_ea); }
+ /* PRODUCTION_FUNCTIONS */
+ static unsigned passed, failed;
+ #define CHECK(test, message) do { if (test) passed++; else { failed++; fprintf(stderr, "FAIL: %s\n", message); } } while (0)
+@@ -66,7 +74,7 @@
+     for (uint32_t flags = 0; flags < 8; flags++) for (int pending = 0; pending < 2; pending++) {
+         setup(flags, pending); uint8_t before[48];
+         memcpy(before, vm_base + TASKSET + 0x80, sizeof(before));
+-        spu_taskset_task_exited(TASKSET, 127);
++        spu_taskset_task_exited(TASKSET, 127, 0);
+         CHECK(dispatches == 1, "ready/pending task dispatches with ELF metadata tags");
+         CHECK(dispatched_image == vm_base + ELF, "dispatch uses ELF base, not tagged address");
+         CHECK(dispatched_size == 100, "real parser receives synthetic ELF header");
+@@ -79,25 +87,25 @@
+         CHECK(vm_base[TASKSET + 0x20] == 0, "pending-ready bit consumed on submission");
+     }
+     setup(1, 0); vm_base[TASKSET + 0x30] = 0;
+-    spu_taskset_task_exited(TASKSET, 127);
++    spu_taskset_task_exited(TASKSET, 127, 0);
+     CHECK(dispatches == 0, "disabled task is not dispatched");
+     setup(1, 0); ts_running(TASKSET)[0] = 0x80;
+-    spu_taskset_task_exited(TASKSET, 127);
++    spu_taskset_task_exited(TASKSET, 127, 0);
+     CHECK(dispatches == 0, "already running task is not duplicated");
+     setup(1, 0); vm_base[TASKSET + 0x10] = 0;
+-    spu_taskset_task_exited(TASKSET, 127);
++    spu_taskset_task_exited(TASKSET, 127, 0);
+     CHECK(dispatches == 0, "enabled task without work is not dispatched");
+     setup(1, 0); vm_base[ELF] = 0;
+-    spu_taskset_task_exited(TASKSET, 127);
++    spu_taskset_task_exited(TASKSET, 127, 0);
+     CHECK(dispatches == 0, "invalid untagged ELF is not dispatched");
+     CHECK(s_ts_run[0].running[0] == 0, "invalid ELF leaves host run table clear");
+     CHECK(vm_base[TASKSET + 0x10] == 0x80, "invalid ELF preserves ready state");
+     setup(7, 1); be32(vm_base + TASKSET + 0x94, 7);
+-    spu_taskset_task_exited(TASKSET, 127);
++    spu_taskset_task_exited(TASKSET, 127, 0);
+     CHECK(dispatches == 0, "metadata-only null ELF is not dispatched");
+     CHECK(vm_base[TASKSET + 0x20] == 0x80, "null ELF preserves pending state");
+     setup(1, 0); vm_base[TASKSET + 0x20] = 0x80; ts_running(TASKSET)[0] = 0x80;
+-    spu_taskset_task_exited(TASKSET, 0);
++    spu_taskset_task_exited(TASKSET, 0, 0);
+     CHECK(dispatches == 0, "exiting task is not restarted");
+     CHECK(vm_base[TASKSET + 0x10] == 0 && vm_base[TASKSET + 0x20] == 0 &&
+           vm_base[TASKSET + 0x30] == 0 && s_ts_run[0].running[0] == 0,

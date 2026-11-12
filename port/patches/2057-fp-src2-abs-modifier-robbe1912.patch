@@ -3,9 +3,10 @@ Third-source abs modifier of the fragment decompiler (opt-in LD_SRC2_ABS=1), plu
 decode_src(w3, 0, &s2) ignored DWORD3 bit 18 (SRC2.abs in RPCS3's FP decoder, the same position as SRC1.abs in DWORD2). With the switch on the third source of MAD/LRP-type ops decodes to abs(...). The switch changes shader text, so it is part of the PSO key (tag 0x5A2A, only when on).
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+Rebased on ps3recomp v0.19.0 (Toro, group C): upstream added per-source input precision modifiers in rsx_fp_decompiler.c (Src.prec, fp_src_prec_clamp, FP_SRCn_PREC_SHIFT, set from DWORD2 after decode_src). The patch's SRC2 abs switch (FP_SRC2_ABS, LD_SRC2_ABS, counter) is kept; its decode_src(w3, abs, &s2) call now precedes upstream's precision block so decode_src's prec reset does not clear s2.prec. Upstream's decode_src(w3, 0, &s2) is replaced by the patch's call (same with the switch off). Abs is applied before the precision clamp in upstream's emit path, as in RPCS3.
 
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
-index 1b31c6dd..d60eaa47 100644
+index 6dab2155..ddeb199a 100644
 --- a/libs/video/rsx_fp_decompiler.c
 +++ b/libs/video/rsx_fp_decompiler.c
 @@ -44,6 +44,7 @@
@@ -16,9 +17,9 @@ index 1b31c6dd..d60eaa47 100644
  #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
  
  /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
-@@ -341,6 +342,14 @@ typedef struct {
-     char swz[5];    /* e.g. "xyzw" */
- } Src;
+@@ -368,6 +369,14 @@ static const char* fp_src_prec_clamp(int prec)
+     }
+ }
  
 +int rsx_fp_src2_abs_seen[64];   /* patch 2057: per-opcode count of instructions with DWORD3 bit 18 set */
 +static int fp_src2_abs_mode(void)
@@ -31,7 +32,7 @@ index 1b31c6dd..d60eaa47 100644
  static void decode_src(u32 w, int abs_bit, Src* s)
  {
      static const char comp[4] = {'x','y','z','w'};
-@@ -809,7 +818,11 @@ static int rsx_fp_decompile_internal(
+@@ -843,7 +852,11 @@ static int rsx_fp_decompile_internal(
          Src s0, s1, s2;
          decode_src(w1, w1 & FP_SRC0_ABS, &s0);
          decode_src(w2, w2 & FP_SRC1_ABS, &s1);
@@ -41,11 +42,11 @@ index 1b31c6dd..d60eaa47 100644
 +        const int src2_abs = fp_src2_abs_mode();
 +        if ((w3 & FP_SRC2_ABS) && !(w2 & FP_BRANCH)) fp_src2_abs_note(opcode);
 +        decode_src(w3, src2_abs ? (int)(w3 & FP_SRC2_ABS) : 0, &s2);
- 
-         /* Inline constant: any CONST source pulls the next 16 bytes as a
-          * float4 literal and advances past it. */
+         if (!(w2 & FP_BRANCH)) {   /* a branch's DWORD2 holds other fields */
+             s0.prec = (int)((w2 >> FP_SRC0_PREC_SHIFT) & 7u);
+             s1.prec = (int)((w2 >> FP_SRC1_PREC_SHIFT) & 7u);
 diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
-index 5f6d1634..f37ef9b4 100644
+index bd4bdf6f..9ce81fbc 100644
 --- a/libs/video/rsx_fp_decompiler.h
 +++ b/libs/video/rsx_fp_decompiler.h
 @@ -96,6 +96,7 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
@@ -57,10 +58,10 @@ index 5f6d1634..f37ef9b4 100644
  /* Patch 2011: zeta-aliased texture units (see rsx_fp_decompiler.c).
   * Shadow compare: units in shadow_mask sample with SampleCmpLevelZero against
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index 0a2a456d..ed1cd120 100644
+index a017f0c8..26fb00cb 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -7827,6 +7827,8 @@ static void ld_feat_dump(void)
+@@ -7828,6 +7828,8 @@ static void ld_feat_dump(void)
          fprintf(stderr, "[feat] %s fmt=0x%02x remap=0x%04x aux=0x%x zalias=%u target=0x%08x tfmt=%u n=%llu\n",
                  kn[r->kind], r->fmt, r->remap, r->aux, r->zalias, r->target, r->tfmt, r->n);
      }
@@ -69,7 +70,7 @@ index 0a2a456d..ed1cd120 100644
      fflush(stderr);
  }
  static void ld_feat_draw(u32 fp_ctrl)
-@@ -8109,6 +8111,9 @@ static ID3D12PipelineState* get_pso(
+@@ -8110,6 +8112,9 @@ static ID3D12PipelineState* get_pso(
          key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
      if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
      if (srgb_out) key = fnv1a(&srgb_out, sizeof(srgb_out), key);   /* patch 2055 */

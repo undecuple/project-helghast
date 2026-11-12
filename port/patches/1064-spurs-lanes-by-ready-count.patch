@@ -7,10 +7,13 @@ KZ3_SPURS_LANES_READY=1 caps a kicked dispatch at the ready count read before th
 a per-wid histogram of those ready counts and of the lanes run, in a [spurs-lanes] line every 10 s next to
 [spurs-ready]. Default behaviour unchanged (opt-in until the A/B says otherwise).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 696220d..1521f9d 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -532,6 +532,32 @@
+@@ -594,6 +594,32 @@ __attribute__((constructor)) static void kz3_pm_switch_init(void)
  }
  /* kz3-pm-switch end */
  
@@ -41,9 +44,9 @@ diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 +            o ? line : " none", kz3_lanes_ready_on() ? " [KZ3_SPURS_LANES_READY]" : "");
 +}
  static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+ static int spurs_guest_range_valid(u32 ea, u32 bytes);
  /* KZ3 patch 1057 (SPU pass 39): called by the kernel thread when a workload's policy-module run starts (end 0,
-  * after the contention byte is set) and ends (end 1, after it is cleared, all lanes joined); NULL = off. The
-@@ -1974,6 +2000,7 @@
+@@ -2231,6 +2257,7 @@ static DWORD WINAPI spurs_watch_thread(LPVOID p)
                  fprintf(stderr, "[spurs-ready] t=%llus store=%ld/%ld swap=%ld/%ld cas=%ld/%ld (calls/byte changed) per wid:%s\n",
                          (unsigned long long)((now - s_t_start) / 1000), tot[0], chg[0], tot[1], chg[1], tot[2], chg[2],
                          o ? line : " none");
@@ -51,7 +54,7 @@ diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
              }
              for (u32 w = 0; w < 16; w++) {
                  u8 cc = *(vm_base + ea + SPURS_WKL_CURCONT + w);
-@@ -2182,10 +2209,12 @@
+@@ -2436,10 +2463,12 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              /* KZ3 patch 1052: the PPU updates this guest byte atomically
               * (cellSpursReadyCountStore/Swap/CompareAndSwap); a bare (*rdy)--
               * could write back a stale count over a concurrent kick. */
@@ -66,7 +69,7 @@ diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
              if (sig & (0x8000u >> wid))
                  vm_write32(ea + SPURS_WKL_SIGNAL1,
                             (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
-@@ -2264,6 +2293,10 @@
+@@ -2518,6 +2547,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                if (s_fs == -2) { const char* e = getenv("SPURS_FORCE_SPUS");
                  s_fs = e ? atoi(e) : -1; }
                if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }

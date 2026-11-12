@@ -214,7 +214,7 @@ Name: "checkupdates"; Description: "&Check for new versions: one anonymous reque
 Source: "{#Payload}\toolchain\python\*"; DestDir: "{tmp}\vcheck\python"; Flags: dontcopy recursesubdirs
 Source: "{#Payload}\kz3-setup\release\version_check.py"; DestDir: "{tmp}\vcheck"; Flags: dontcopy
 ; The EBOOT page's version test reads firstrun_check's own table of known EBOOTs (size, SHA-256), not a copy of it
-Source: "{#Payload}\kz3-setup\release\eboot_sha256.json"; Flags: dontcopy
+Source: "{#Payload}\kz3-setup\release\eboot_ids.json"; Flags: dontcopy
 ; run.cmd is the portable zip's entry point (firstrun.py --interactive); the installed copy uses the launcher
 Source: "{#Payload}\*"; DestDir: "{app}"; Excludes: "run.cmd"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Apps & features icon (UninstallDisplayIcon) and the Start menu's Uninstall entry
@@ -888,16 +888,16 @@ begin
   end;
 end;
 
-{ eboot_sha256.json (firstrun_check.py's table, extracted from the setup on first use): per known EBOOT version
-  an object with its size and sha256. '' when it cannot be read (then no EBOOT is refused). }
+{ eboot_ids.json (firstrun_check.py's table, extracted from the setup on first use): a list of entries, each with
+  title_id, region, app_ver, size and sha256 (the segment hash is for firstrun_check, not read here). '' when it cannot be read (then no EBOOT is refused). }
 function EbootTable: String;
 var
   A: AnsiString;
 begin
   if EbootTableText = '' then begin
     try
-      ExtractTemporaryFile('eboot_sha256.json');
-      if LoadStringFromFile(ExpandConstant('{tmp}\eboot_sha256.json'), A) then EbootTableText := String(A);
+      ExtractTemporaryFile('eboot_ids.json');
+      if LoadStringFromFile(ExpandConstant('{tmp}\eboot_ids.json'), A) then EbootTableText := String(A);
     except
       Log('EBOOT table: not readable (' + GetExceptionMessage + '); the EBOOT page checks only that the file exists');
     end;
@@ -922,12 +922,20 @@ begin
   end;
 end;
 
-{ The known version of the EBOOT at Path by its size, the way firstrun_check E1 tells it (EBOOT_ELF_SIZES, the same
-  sizes as the table); How says whether the SHA-256 matches the table's too (H1). '' = not a known EBOOT. }
+{ app_ver is the PARAM.SFO string ('01.14'); the page and #EbootTarget say '1.14' }
+function EbootLabel(AppVer: String): String;
+begin
+  Result := AppVer;
+  if (Length(Result) > 1) and (Result[1] = '0') then Result := Copy(Result, 2, MaxInt);
+end;
+
+{ The known version (app_ver) of the EBOOT at Path from the table's entries: an entry whose sha256 matches wins, else the
+  first whose size does (firstrun_check E1 / H1 tell it the same way); How says which. Entries are flat objects, so each
+  one runs from its opening brace to the next closing one. '' = not a known EBOOT. }
 function EbootVersionOf(Path: String; var How: String): String;
 var
-  T, R, K, S, V, Want, Got: String;
-  P, Q, E: Integer;
+  T, S, Want, Got: String;
+  P, E: Integer;
   Size: Int64;
 begin
   Result := '';
@@ -935,29 +943,37 @@ begin
   T := EbootTable;
   { ASSUMPTION: FileSize64 (Inno 6.2+) gives the size of a file over 2 GB as well; the EBOOTs are ~21 MB }
   if (T = '') or not FileSize64(Path, Size) then Exit;
-  R := T;
-  P := Pos('": ' + #123, R);
+  P := Pos('"entries": [', T);
+  if P = 0 then Exit;
+  T := Copy(T, P, MaxInt);
+  Got := '-';
+  P := Pos(#123, T);
   while P > 0 do begin
-    K := Copy(R, 1, P - 1);
-    Q := Length(K);
-    while (Q > 0) and (K[Q] <> '"') do Q := Q - 1;
-    V := Copy(K, Q + 1, MaxInt);
-    S := Copy(R, P, MaxInt);
+    S := Copy(T, P, MaxInt);
     E := Pos('}', S);
     if E > 0 then S := Copy(S, 1, E);
     if (JsonNumber(S, 'size') <> '') and (StrToInt64Def(JsonNumber(S, 'size'), -1) = Size) then begin
-      Result := V;
-      Want := Lowercase(JsonField(S, 'sha256'));
-      try
-        Got := Lowercase(GetSHA256OfFile(Path));
-      except
-        Got := '';
+      if Got = '-' then begin
+        try
+          Got := Lowercase(GetSHA256OfFile(Path));
+        except
+          Got := '';
+        end;
       end;
-      if (Want <> '') and (Got = Want) then How := 'size and SHA-256' else How := 'size only, SHA-256 ' + Got;
-      Exit;
+      Want := Lowercase(JsonField(S, 'sha256'));
+      if (Want <> '') and (Got = Want) then begin
+        Result := EbootLabel(JsonField(S, 'app_ver'));
+        How := 'size and SHA-256';
+        Exit;
+      end;
+      if Result = '' then begin
+        Result := EbootLabel(JsonField(S, 'app_ver'));
+        How := 'size only, SHA-256 ' + Got;
+      end;
     end;
-    R := Copy(R, P + 4, MaxInt);
-    P := Pos('": ' + #123, R);
+    if E = 0 then Exit;
+    T := Copy(T, P + E, MaxInt);
+    P := Pos(#123, T);
   end;
 end;
 

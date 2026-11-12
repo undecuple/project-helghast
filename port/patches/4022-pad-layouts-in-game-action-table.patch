@@ -9,9 +9,13 @@ writes the layout into the PlayerProfile's action table that ControlScheme::GetA
 actions move, vehicles / exo / turrets keep the scheme's own. KZ3_PAD_ACTIONS=0 turns the table writes off.
 Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 44812f7..463a68c 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -1251,9 +1251,11 @@
+@@ -1418,9 +1418,11 @@ int pad_kb_last_device_keyboard(void)
  /* ---------------------------------------------------------------------------
   * KZ3 patch 4013 (stage 3): pad presets and custom mapping (ENHANCEMENT, opt-in; pad_remap.h)
   * -----------------------------------------------------------------------*/
@@ -23,7 +27,7 @@ Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
  
  /* The modern preset's table depends on the pad: PlayStation pads (and a port with no host pad, i.e. a scripted one)
   * get the PS table, every other pad the Xbox one. KZ3_PAD_FAMILY=ps|xbox forces it (tests). */
-@@ -1336,24 +1338,25 @@
+@@ -1503,24 +1505,25 @@ static void pad_remap_refresh(void)
      if (!s_remap_set || sig[0] != s_remap_sig[0] || sig[1] != s_remap_sig[1]) {
          int g;
          printf("[pad] layout: %s%s\n", preset >= 0 && preset < PRM_N_PRESETS ? prm_preset_names[preset] : "?",
@@ -54,7 +58,7 @@ Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
  }
  
  /* The family the prompts describe: the pad last used; with no pad (keys, nothing) the glyph set's. */
-@@ -1367,7 +1370,8 @@
+@@ -1534,7 +1537,8 @@ static int pad_remap_prompt_family(void)
  /* For the prompt atlases (rsx_live_draw.c, patch 4013): 0 = identity, else a hash of the table. */
  unsigned pad_remap_sig(void)
  {
@@ -64,7 +68,7 @@ Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
  }
  
  /* The host button (PS3 name) that presses game button `game_input` ("r1", "cross" ...), "" when none, NULL for a name
-@@ -1376,12 +1380,75 @@
+@@ -1543,12 +1547,75 @@ const char* pad_remap_host_for(const char* game_input)
  {
      int g;
      const int f = pad_remap_prompt_family();
@@ -141,7 +145,7 @@ Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
  static void pad_poll_backend(void)
  {
      static unsigned long long s_last_ms = 0;
-@@ -1688,6 +1755,7 @@
+@@ -1857,6 +1924,7 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
  
      /* Poll fresh state */
      pad_poll_backend();
@@ -149,7 +153,7 @@ Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
  
      /* YDKJ_INJECT_PAD: the game's wait loop polls the pad (cellPadSetActDirect /
       * GetData) -- if it's parked on a "press button" prompt after loading, no
-@@ -1819,7 +1887,6 @@
+@@ -1988,7 +2056,6 @@ skip_inject: ;
            double now = pad_clock(t0);   /* PR #344: PAD_CLOCK=flips counts guest flips (3006's v2 grammar unchanged) */
            unsigned m = 0; unsigned char ax[6]; int ax_set = 0;
            pad_script_poll(&s_script, now, &m, ax, &ax_set);
@@ -157,7 +161,7 @@ Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
            data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(m & 0xFF);
            data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((m >> 8) & 0xFF);
            if (ax_set) {
-@@ -1868,7 +1935,7 @@
+@@ -2037,7 +2104,7 @@ skip_inject: ;
            }
            if (held_n > 0) {
                if (data->len > 0) held_n--;   /* upstream #570: holds survive empty drain reads */
@@ -166,6 +170,9 @@ Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
                data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(hm & 0xFF);
                data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((hm >> 8) & 0xFF); }
        } }
+diff --git a/libs/input/pad_actions.h b/libs/input/pad_actions.h
+new file mode 100644
+index 0000000..177bb14
 --- /dev/null
 +++ b/libs/input/pad_actions.h
 @@ -0,0 +1,249 @@

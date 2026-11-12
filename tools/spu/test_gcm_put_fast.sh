@@ -48,6 +48,8 @@ static int s_io_mapping_hw; /* patch 1119 (PR #449): one past the highest slot u
 /* patch 2083: populate_offset_table notes IO-mapped pages for the PPU store gate; off in this test (weak, unset). */
 static int s_ppu_note_on;
 extern int ppu_store_note_pages(uint32_t ea, uint32_t size, int on) __attribute__((weak));
+/* v0.19 (upstream): populate/clear mirror each entry into the guest's table copy once published; not published here */
+static void gcm_mirror_offset_entry(u32 ea_page, u32 io_page) { (void)ea_page; (void)io_page; }
 $POP
 $CLR
 $LOOK

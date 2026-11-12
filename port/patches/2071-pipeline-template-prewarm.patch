@@ -17,13 +17,15 @@ Merge tool: tools/smoke/pso_template.py; host test tools/smoke/test_pso_template
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ld_xlate/ld_pso_key_tail (2071's shared translator) take upstream's VP branch bits (new ld_xl_in.vp_branch_bits, set_branch_bits in ld_xlate, hashed when the VP uses them; prewarm passes 0) and unnorm_dim[16][3] (records keep [16][2]; key hashes w,h only as before).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index fe4eea10..b4ef697c 100644
+index 1b1611c..d96f9a7 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -126,7 +126,9 @@ static volatile long g_ld_ps1_vram_ready = 0;
- #include <d3dcompiler.h>
+@@ -127,7 +127,9 @@ static volatile long g_ld_ps1_vram_ready = 0;
  #include "rsx_vertex_formats.h"
+ #include "rsx_d3d12_device.h"
  #include "rsx_keycaps.h"   /* patch 2039: keycap prompts */
 -#include "rsx_pso_async.h"   /* patch 2048: asynchronous PSO build bookkeeping */
 +#include "rsx_pso_async.h"
@@ -32,7 +34,7 @@ index fe4eea10..b4ef697c 100644
  #include <sys/stat.h>
  
  #pragma comment(lib, "d3d12.lib")
-@@ -7229,7 +7231,7 @@ typedef struct {
+@@ -7230,7 +7232,7 @@ typedef struct {
      u8  attrs[RSX_DSP_NUM_VERTEX_ATTR];
      render_state_t rs;
  } ld_pl_rec;
@@ -41,7 +43,7 @@ index fe4eea10..b4ef697c 100644
  static struct {
      int on, opened, started;
      char path[MAX_PATH], lib_path[MAX_PATH];
-@@ -7455,7 +7457,7 @@ static void ld_pl_save_library(int wait)
+@@ -7456,7 +7458,7 @@ static void ld_pl_save_library(int wait)
      if (!g_ld_pl.save_thread) ld_pl_save_thread(NULL);
  }
  
@@ -50,7 +52,7 @@ index fe4eea10..b4ef697c 100644
  {
      EnterCriticalSection(&g_ld_pl.cs);
      if (g_ld_pl.n_staged == g_ld_pl.cap_staged) {
-@@ -7466,6 +7468,7 @@ static void ld_pl_stage(u64 key, ID3D12PipelineState* pso)
+@@ -7467,6 +7469,7 @@ static void ld_pl_stage(u64 key, ID3D12PipelineState* pso)
      }
      g_ld_pl.staged[g_ld_pl.n_staged].key = key;
      g_ld_pl.staged[g_ld_pl.n_staged].pso = pso;
@@ -58,7 +60,7 @@ index fe4eea10..b4ef697c 100644
      g_ld_pl.n_staged++;
      InterlockedExchange(&g_ld_pl.staged_flag, 1);
      LeaveCriticalSection(&g_ld_pl.cs);
-@@ -7504,7 +7507,7 @@ static DWORD WINAPI ld_pl_worker(LPVOID arg)
+@@ -7505,7 +7508,7 @@ static DWORD WINAPI ld_pl_worker(LPVOID arg)
          else if (SUCCEEDED(hr) && pso) { g_ld_pl.n_created++; g_ld_pl.create_us += cus; }
          else g_ld_pl.n_failed++;
          LeaveCriticalSection(&g_ld_pl.cs);
@@ -67,7 +69,7 @@ index fe4eea10..b4ef697c 100644
      }
      if (InterlockedDecrement(&g_ld_pl.workers_left) == 0) {
          fprintf(stderr, "[pso-preload] done: %u records, %u from library (%.1f ms), %u created (%.1f ms), %u failed, "
-@@ -7577,7 +7580,7 @@ static void ld_pl_drain(void)
+@@ -7578,7 +7581,7 @@ static void ld_pl_drain(void)
          if (i < g.n_psos || g.n_psos >= MAX_PSOS) { pso->lpVtbl->Release(pso); g_ld_pl.n_dup++; continue; }
          g.psos[g.n_psos].key = key;
          g.psos[g.n_psos].pso = pso;
@@ -76,7 +78,7 @@ index fe4eea10..b4ef697c 100644
          g.n_psos++;
      }
      g_ld_pl.n_staged = 0;
-@@ -7610,6 +7613,588 @@ static void ld_pl_shutdown(void)
+@@ -7611,6 +7614,588 @@ static void ld_pl_shutdown(void)
  }
  /* ===================== end of patch 2031 block ===================== */
  
@@ -665,7 +667,7 @@ index fe4eea10..b4ef697c 100644
  static ID3D12PipelineState* build_pso(
      const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
      const rsx_vertex_layout_plan* masked_layout, int packed_offsets, u64 key)
-@@ -8444,28 +9029,7 @@ static ID3D12PipelineState* get_pso(
+@@ -8445,28 +9030,7 @@ static ID3D12PipelineState* get_pso(
          return NULL;
      }
      const u64 kl_fp = key;   /* patch 2042: LD_PSO_KEYLOG component */
@@ -695,7 +697,7 @@ index fe4eea10..b4ef697c 100644
      /* Texel-addressed (RSX_TEX_FMT_UNNORM) units need their coordinates divided
       * by the texture size in the shader -- D3D12 has no unnormalised addressing
       * mode. The divisor is baked into the HLSL, so the sizes are part of the
-@@ -8497,30 +9061,20 @@ static ID3D12PipelineState* get_pso(
+@@ -8498,30 +9062,20 @@ static ID3D12PipelineState* get_pso(
              }
          }
      }
@@ -736,7 +738,7 @@ index fe4eea10..b4ef697c 100644
      LDW_ADD(RSX_PERF_W_PSO_KEY_T, gp_t2);
      LDW_T0(gp_t3);
      g_ld_current_pso.valid = 1;
-@@ -8556,7 +9110,7 @@ static ID3D12PipelineState* get_pso(
+@@ -8557,7 +9111,7 @@ static ID3D12PipelineState* get_pso(
  #if defined(YZ_PERF_PROFILE)
              g_ld_profile.total.pso_hits++;
  #endif
@@ -745,7 +747,7 @@ index fe4eea10..b4ef697c 100644
              LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
              if (g.psos[i].pending) return ld_apso_await(i);   /* RSX pass 57: wait, never skip */
              return g.psos[i].pso;
-@@ -8581,70 +9135,8 @@ static ID3D12PipelineState* get_pso(
+@@ -8582,70 +9136,8 @@ static ID3D12PipelineState* get_pso(
  #if defined(YZ_PERF_PROFILE)
      const LONGLONG decompile_begin = ld_profile_qpc();
  #endif
@@ -818,7 +820,7 @@ index fe4eea10..b4ef697c 100644
  #if defined(YZ_PERF_PROFILE)
      g_ld_profile.total.decompile_qpc +=
          (u64)(ld_profile_qpc() - decompile_begin);
-@@ -13668,6 +14160,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+@@ -13671,6 +14163,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
          make_depth_snapshot_pipeline() != 0)
          return -1;
      ld_pl_start();   /* patch 2031: PSO preload workers (LD_PSO_PRELOAD=0 records only) */
@@ -826,7 +828,7 @@ index fe4eea10..b4ef697c 100644
  
      static const u8 white[4] = {255, 255, 255, 255};
      g.white_tex = create_texture_rgba(white, 1, 1);
-@@ -16319,6 +16812,7 @@ static void ld_present_body(u32 buffer_id)
+@@ -16322,6 +16815,7 @@ static void ld_present_body(u32 buffer_id)
  void rsx_live_draw_present(u32 buffer_id)
  {
      ld_pl_tick();                                   /* patch 2031 */
@@ -834,7 +836,7 @@ index fe4eea10..b4ef697c 100644
      if (ld_pstat_on()) ld_pstat_flush_if_new_minute();   /* patch 2031: close the minute line on flips too */
      if (!rsx_perf_enabled()) { ld_present_body(buffer_id); return; }
      const long long t0 = rsx_perf_now();
-@@ -16538,6 +17032,7 @@ void rsx_live_draw_shutdown(void)
+@@ -16541,6 +17035,7 @@ void rsx_live_draw_shutdown(void)
                  (unsigned long long)g_ld_shader_disk_writes[1],
                  (unsigned long long)g_ld_shader_disk_rejects);
      }
@@ -844,7 +846,7 @@ index fe4eea10..b4ef697c 100644
      shader_blob_cache_release(&g.vs_blobs);
 diff --git a/libs/video/rsx_pso_template.h b/libs/video/rsx_pso_template.h
 new file mode 100644
-index 00000000..3259e182
+index 0000000..3259e18
 --- /dev/null
 +++ b/libs/video/rsx_pso_template.h
 @@ -0,0 +1,181 @@

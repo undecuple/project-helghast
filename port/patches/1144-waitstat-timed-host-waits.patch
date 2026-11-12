@@ -6,51 +6,12 @@ lv2s_sleep also records how close each timeout lies to the last wake of the same
 the upper bound of the Wine race exposure. Diagnostic only, behaviour unchanged (GetLastError is read before the note).
 Decides which site a fix patch has to cover.
 
---- a/runtime/syscalls/lv2_sync_core.h
-+++ b/runtime/syscalls/lv2_sync_core.h
-@@ -20,6 +20,7 @@
- #include <stdint.h>
- #include <stdio.h>
- #include <stdlib.h>
-+#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
- #ifdef _WIN32
- #ifndef WIN32_LEAN_AND_MEAN
- #define WIN32_LEAN_AND_MEAN
-@@ -58,6 +59,7 @@
-     pthread_mutex_t lock; pthread_cond_t cv;
- #endif
-     int inited;
-+    volatile int64_t wake_ts;   /* KZ3 patch 1144: when lv2s_wake_all last started (waitstat only) */
-     uint32_t owner;          /* thread id, 0 = free */
-     uint32_t count;          /* recursion count while owned */
-     int recursive;
-@@ -102,8 +104,10 @@
-     pthread_mutex_unlock(&m->lock);
- #endif
- }
-+static inline int64_t lv2s_now_ns(void);
- static inline void lv2s_wake_all(lv2s_mutex* m)
- {
-+    if (kz3_waitstat_on()) m->wake_ts = lv2s_now_ns();   /* KZ3 patch 1144 (KZ3_WAITSTAT=1) */
- #ifdef _WIN32
-     WakeAllConditionVariable(&m->cv);
- #else
-@@ -145,7 +149,14 @@
- #ifdef _WIN32
-     DWORD ms = INFINITE;
-     if (rem >= 0) { int64_t r = (rem + 999999) / 1000000; ms = r > 0xFFFFFFFEll ? 0xFFFFFFFEu : (DWORD)r; }
--    SleepConditionVariableSRW(&m->cv, &m->lock, ms, 0);
-+    {
-+        static kz3_waitstat st;
-+        const BOOL ok = SleepConditionVariableSRW(&m->cv, &m->lock, ms, 0);
-+        if (ms != INFINITE) {   /* KZ3 patch 1144 */
-+            if (!ok && deadline_ns >= 0) kz3_waitstat_near(&st, m->wake_ts - deadline_ns);
-+            kz3_waitstat_note(&st, "lv2s_sleep", !ok);
-+        }
-+    }
- #else
-     if (rem < 0) pthread_cond_wait(&m->cv, &m->lock);
-     else {
+Rebased on ps3recomp v0.19.0 (group B, R&C 2026-11-09): sys_event_queue_receive keeps upstream #622's absolute-deadline loop
+(d813e14c: evt_ms_until, deadline clamped at 2^40 us, the count re-tested before giving up); the waitstat note wraps its
+SleepConditionVariableCS (no GetLastError branch: the loop re-tests). Other files unchanged.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 3db44d23..97a9cb2b 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -19,6 +19,7 @@
@@ -61,7 +22,7 @@ Decides which site a fix patch has to cover.
  #include "../../runtime/ppu/ppu_context.h"  /* g_active_ctx: 9th argument on the guest stack */
  #include <stdio.h>
  #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
-@@ -209,7 +210,10 @@
+@@ -211,7 +212,10 @@ static inline void ef_unlock(EventFlagSync* s)
  static inline int ef_wait_timed(EventFlagSync* s, unsigned ms)
  {
  #ifdef _WIN32
@@ -73,6 +34,8 @@ Decides which site a fix patch has to cover.
  #else
      struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
      ts.tv_sec += ms / 1000; ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+diff --git a/libs/sync/cellSync2.c b/libs/sync/cellSync2.c
+index 419d828e..ed3d103c 100644
 --- a/libs/sync/cellSync2.c
 +++ b/libs/sync/cellSync2.c
 @@ -9,6 +9,7 @@
@@ -83,7 +46,7 @@ Decides which site a fix patch has to cover.
  #include <stdio.h>
  #include <string.h>
  
-@@ -247,8 +248,12 @@
+@@ -247,8 +248,12 @@ s32 cellSync2CondWait(CellSync2Cond* cond, u64 timeoutUsec)
  
  #ifdef _WIN32
      DWORD ms = (timeoutUsec == 0) ? INFINITE : (DWORD)(timeoutUsec / 1000);
@@ -98,7 +61,7 @@ Decides which site a fix patch has to cover.
                 ? CELL_SYNC2_ERROR_TIMEDOUT
                 : CELL_SYNC2_ERROR_STAT;
  #else
-@@ -495,7 +500,10 @@
+@@ -495,7 +500,10 @@ s32 cellSync2QueuePush(CellSync2Queue* queue, const void* data,
      EnterCriticalSection(&q->cs);
      DWORD ms = (timeoutUsec == 0) ? INFINITE : (DWORD)(timeoutUsec / 1000);
      while (q->count >= q->depth) {
@@ -110,7 +73,7 @@ Decides which site a fix patch has to cover.
              LeaveCriticalSection(&q->cs);
              return CELL_SYNC2_ERROR_TIMEDOUT;
          }
-@@ -590,7 +598,10 @@
+@@ -590,7 +598,10 @@ s32 cellSync2QueuePop(CellSync2Queue* queue, void* data,
      EnterCriticalSection(&q->cs);
      DWORD ms = (timeoutUsec == 0) ? INFINITE : (DWORD)(timeoutUsec / 1000);
      while (q->count == 0) {
@@ -122,6 +85,8 @@ Decides which site a fix patch has to cover.
              LeaveCriticalSection(&q->cs);
              return CELL_SYNC2_ERROR_TIMEDOUT;
          }
+diff --git a/libs/system/sysPrxForUser.c b/libs/system/sysPrxForUser.c
+index 4aeaee66..eebd4fe5 100644
 --- a/libs/system/sysPrxForUser.c
 +++ b/libs/system/sysPrxForUser.c
 @@ -11,6 +11,7 @@
@@ -132,7 +97,7 @@ Decides which site a fix patch has to cover.
  #include <stdarg.h>
  #include <string.h>
  #include <stdlib.h>
-@@ -748,10 +749,13 @@
+@@ -745,10 +746,13 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
  
  #ifdef _WIN32
      DWORD ms = (timeout == 0) ? INFINITE : (DWORD)(timeout / 1000);
@@ -149,173 +114,9 @@ Decides which site a fix patch has to cover.
              return CELL_ETIMEDOUT;
          return CELL_EFAULT;
      }
---- a/runtime/syscalls/sys_event.c
-+++ b/runtime/syscalls/sys_event.c
-@@ -3,6 +3,7 @@
-  */
- 
- #include "sys_event.h"
-+#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
- #include "sys_ppu_thread.h"         /* ppu_thread_note_block */
- #include "../ps3_log.h"
- #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
-@@ -288,6 +289,7 @@
- #ifdef _WIN32
-     EnterCriticalSection(&q->lock);
-     q->cancelled = 1;
-+    q->ws_wake = kz3_ws_now_ns();   /* KZ3 patch 1144 */
-     WakeAllConditionVariable(&q->not_empty);   /* every waiter, not one */
-     LeaveCriticalSection(&q->lock);
- #else
-@@ -619,8 +621,14 @@
-     } else {
-         DWORD ms = (DWORD)(timeout_us / 1000);
-         while (q->count == 0 && q->active && !q->cancelled) {
--            if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
--                if (GetLastError() == ERROR_TIMEOUT) {
-+            static kz3_waitstat st_evq;   /* KZ3 patch 1144 */
-+            const long long dl_evq = kz3_ws_now_ns() + (long long)ms * 1000000ll;
-+            const BOOL ok_evq = SleepConditionVariableCS(&q->not_empty, &q->lock, ms);
-+            if (!ok_evq) kz3_waitstat_near(&st_evq, q->ws_wake - dl_evq);
-+            const DWORD le_evq = ok_evq ? 0 : GetLastError();
-+            kz3_waitstat_note(&st_evq, "sys_event_queue_receive", !ok_evq);
-+            if (!ok_evq) {
-+                if (le_evq == ERROR_TIMEOUT) {
-                     LeaveCriticalSection(&q->lock);
-                     return (int64_t)(int32_t)CELL_ETIMEDOUT;
-                 }
-@@ -886,6 +894,7 @@
-                 (unsigned long long)evt->data2, (unsigned long long)evt->data3, (unsigned)q->count, (unsigned)q->capacity); }
- 
- #ifdef _WIN32
-+    q->ws_wake = kz3_ws_now_ns();   /* KZ3 patch 1144 */
-     WakeConditionVariable(&q->not_empty);
-     LeaveCriticalSection(&q->lock);
- #else
-@@ -1386,8 +1395,12 @@
-     } else {
-         DWORD ms = (DWORD)(timeout_us / 1000);
-         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
--            if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
--                if (GetLastError() == ERROR_TIMEOUT) {
-+            static kz3_waitstat st_evf;   /* KZ3 patch 1144 */
-+            const BOOL ok_evf = SleepConditionVariableCS(&f->cv, &f->lock, ms);
-+            const DWORD le_evf = ok_evf ? 0 : GetLastError();
-+            kz3_waitstat_note(&st_evf, "sys_event_flag_wait", !ok_evf);
-+            if (!ok_evf) {
-+                if (le_evf == ERROR_TIMEOUT) {
-                     /* Write current pattern even on timeout */
-                     if (result_addr != 0) {
-                         uint64_t* out = (uint64_t*)vm_to_host(result_addr);
---- a/runtime/syscalls/sys_event.h
-+++ b/runtime/syscalls/sys_event.h
-@@ -68,6 +68,7 @@
- #ifdef _WIN32
-     CRITICAL_SECTION lock;
-     CONDITION_VARIABLE not_empty;
-+    volatile long long ws_wake;   /* KZ3 patch 1144: when this queue was last woken (waitstat) */
- #else
-     pthread_mutex_t lock;
-     pthread_cond_t  not_empty;
---- a/runtime/spu/spu_workload.c
-+++ b/runtime/spu/spu_workload.c
-@@ -6,6 +6,10 @@
-  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
-  */
- #include "spu_workload.h"
-+#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
-+#ifdef _WIN32
-+static volatile long long g_ws_sig_wake;   /* when WAIT_SIGNAL waiters were last woken (waitstat) */
-+#endif
- #include "kz3_spu_sched.h"   /* KZ3 patch 1136 */
- #include "spu_lifted_job.h"   /* spu_run_lifted_job */
- #include "../ps3_log.h"      /* ps3_log_verbose */
-@@ -1689,7 +1693,7 @@
-     (void)opaque;
- #ifdef _WIN32
-     AcquireSRWLockExclusive(&s_sig_lock);
--    WakeAllConditionVariable(&s_sig_cv);
-+    g_ws_sig_wake = kz3_ws_now_ns(); WakeAllConditionVariable(&s_sig_cv);
-     ReleaseSRWLockExclusive(&s_sig_lock);
- #else
-     pthread_mutex_lock(&s_sig_lock);
-@@ -1757,7 +1761,7 @@
-         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
- #ifdef _WIN32
-         AcquireSRWLockExclusive(&s_sig_lock);
--        WakeAllConditionVariable(&s_sig_cv);
-+        g_ws_sig_wake = kz3_ws_now_ns(); WakeAllConditionVariable(&s_sig_cv);
-         ReleaseSRWLockExclusive(&s_sig_lock);
- #else
-         pthread_mutex_lock(&s_sig_lock);
-@@ -1775,7 +1779,7 @@
- void spu_taskset_wake_waiters(void)
- {
- #ifdef _WIN32
--    AcquireSRWLockExclusive(&s_sig_lock); WakeAllConditionVariable(&s_sig_cv); ReleaseSRWLockExclusive(&s_sig_lock);
-+    AcquireSRWLockExclusive(&s_sig_lock); g_ws_sig_wake = kz3_ws_now_ns(); WakeAllConditionVariable(&s_sig_cv); ReleaseSRWLockExclusive(&s_sig_lock);
- #else
-     pthread_mutex_lock(&s_sig_lock); pthread_cond_broadcast(&s_sig_cv); pthread_mutex_unlock(&s_sig_lock);
- #endif
-@@ -1846,7 +1850,12 @@
-     AcquireSRWLockExclusive(&s_sig_lock);
-     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId) || ts_stale(taskset_ea)) {   /* 1066 */
-         if (ts_cutoff_exit() && ts_stale(taskset_ea)) { cut = 1; break; }   /* 1067: never this task's signal */
--        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
-+        static kz3_waitstat st_sig;   /* KZ3 patch 1144 */
-+        const long long dl_sig = kz3_ws_now_ns() + 1000000000ll;
-+        const BOOL ok_sig = SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0);
-+        if (!ok_sig) kz3_waitstat_near(&st_sig, g_ws_sig_wake - dl_sig);
-+        kz3_waitstat_note(&st_sig, "spu_workload.wait_signal", !ok_sig);
-+        if (!ok_sig) {
-             static int _n = 0;
-             if (++secs && _n < 16) { _n++;
-                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
---- a/runtime/spu/spu_channels.c
-+++ b/runtime/spu/spu_channels.c
-@@ -13,6 +13,7 @@
-  */
- 
- #include "spu_dma.h"
-+#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
- #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
- #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
- #include "spu_lockstep.h"
-@@ -1397,8 +1398,12 @@
-             }
-             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-             if (!spu_ch_ready(ctx, channel))
--                SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-+            {   /* KZ3 patch 1144 */
-+                static kz3_waitstat st_ch;
-+                const BOOL ok_ch = SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-                                           (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
-+                kz3_waitstat_note(&st_ch, "spu_channels.ch_wait", !ok_ch);
-+            }
-             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-             unsigned long long waited = GetTickCount64() - start;
-             if (waited >= next_hb) {
---- a/runtime/syscalls/lv2_register.c
-+++ b/runtime/syscalls/lv2_register.c
-@@ -11,6 +11,7 @@
-  */
- 
- #include <stdlib.h>   /* calloc, free */
-+#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
- #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
- #include "lv2_syscall_table.h"
- #include "lv2_lock_line.h"
-@@ -1722,7 +1723,9 @@
-                 if ((queue = spu_port_queue_locked(bt, spu->spu_group_id, port)) != 0) break;
-                 const ULONGLONG now = GetTickCount64();
-                 if (!bt || now >= deadline) break;               /* no such thread: nothing will bind it */
--                SleepConditionVariableSRW(&s_spu_port_bound, &s_spu_port_lock, (DWORD)(deadline - now), 0);
-+                { static kz3_waitstat st_pb;   /* KZ3 patch 1144 */
-+                  const BOOL ok_pb = SleepConditionVariableSRW(&s_spu_port_bound, &s_spu_port_lock, (DWORD)(deadline - now), 0);
-+                  kz3_waitstat_note(&st_pb, "lv2_register.spu_port_bound", !ok_pb); }
-             }
-             ReleaseSRWLockExclusive(&s_spu_port_lock);
-         }
+diff --git a/runtime/platform/kz3_waitstat.h b/runtime/platform/kz3_waitstat.h
+new file mode 100644
+index 00000000..ede81734
 --- /dev/null
 +++ b/runtime/platform/kz3_waitstat.h
 @@ -0,0 +1,52 @@
@@ -371,3 +172,223 @@ Decides which site a fix patch has to cover.
 +                __atomic_load_n(&s->near100, __ATOMIC_RELAXED), __atomic_load_n(&s->near1k, __ATOMIC_RELAXED));
 +}
 +#endif
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 817e5276..266c4721 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -13,6 +13,7 @@
+  */
+ 
+ #include "spu_dma.h"
++#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
+ #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
+ #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
+ #include "spu_lockstep.h"
+@@ -1427,8 +1428,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+             }
+             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+             if (!spu_ch_ready(ctx, channel))
+-                SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
++            {   /* KZ3 patch 1144 */
++                static kz3_waitstat st_ch;
++                const BOOL ok_ch = SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                           (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
++                kz3_waitstat_note(&st_ch, "spu_channels.ch_wait", !ok_ch);
++            }
+             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+             unsigned long long waited = GetTickCount64() - start;
+             if (waited >= next_hb) {
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index da514b24..c40da8f2 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -6,6 +6,10 @@
+  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
+  */
+ #include "spu_workload.h"
++#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
++#ifdef _WIN32
++static volatile long long g_ws_sig_wake;   /* when WAIT_SIGNAL waiters were last woken (waitstat) */
++#endif
+ #include "kz3_spu_sched.h"   /* KZ3 patch 1136 */
+ #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+ #include "../ps3_log.h"      /* ps3_log_verbose */
+@@ -1748,7 +1752,7 @@ static void spu_taskset_wake_written(void* opaque)
+     (void)opaque;
+ #ifdef _WIN32
+     AcquireSRWLockExclusive(&s_sig_lock);
+-    WakeAllConditionVariable(&s_sig_cv);
++    g_ws_sig_wake = kz3_ws_now_ns(); WakeAllConditionVariable(&s_sig_cv);
+     ReleaseSRWLockExclusive(&s_sig_lock);
+ #else
+     pthread_mutex_lock(&s_sig_lock);
+@@ -1845,7 +1849,7 @@ void spu_taskset_line_committed(uint32_t line)
+         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
+ #ifdef _WIN32
+         AcquireSRWLockExclusive(&s_sig_lock);
+-        WakeAllConditionVariable(&s_sig_cv);
++        g_ws_sig_wake = kz3_ws_now_ns(); WakeAllConditionVariable(&s_sig_cv);
+         ReleaseSRWLockExclusive(&s_sig_lock);
+ #else
+         pthread_mutex_lock(&s_sig_lock);
+@@ -1863,7 +1867,7 @@ void spu_taskset_line_committed(uint32_t line)
+ void spu_taskset_wake_waiters(void)
+ {
+ #ifdef _WIN32
+-    AcquireSRWLockExclusive(&s_sig_lock); WakeAllConditionVariable(&s_sig_cv); ReleaseSRWLockExclusive(&s_sig_lock);
++    AcquireSRWLockExclusive(&s_sig_lock); g_ws_sig_wake = kz3_ws_now_ns(); WakeAllConditionVariable(&s_sig_cv); ReleaseSRWLockExclusive(&s_sig_lock);
+ #else
+     pthread_mutex_lock(&s_sig_lock); pthread_cond_broadcast(&s_sig_cv); pthread_mutex_unlock(&s_sig_lock);
+ #endif
+@@ -1934,7 +1938,12 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     AcquireSRWLockExclusive(&s_sig_lock);
+     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId) || ts_stale(taskset_ea)) {   /* 1066 */
+         if (ts_cutoff_exit() && ts_stale(taskset_ea)) { cut = 1; break; }   /* 1067: never this task's signal */
+-        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
++        static kz3_waitstat st_sig;   /* KZ3 patch 1144 */
++        const long long dl_sig = kz3_ws_now_ns() + 1000000000ll;
++        const BOOL ok_sig = SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0);
++        if (!ok_sig) kz3_waitstat_near(&st_sig, g_ws_sig_wake - dl_sig);
++        kz3_waitstat_note(&st_sig, "spu_workload.wait_signal", !ok_sig);
++        if (!ok_sig) {
+             static int _n = 0;
+             if (++secs && _n < 16) { _n++;
+                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 40ee13b2..46963d9d 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <stdlib.h>   /* calloc, free */
++#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
+ #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
+ #include "lv2_syscall_table.h"
+ #include "lv2_lock_line.h"
+@@ -1759,7 +1760,9 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
+                 if ((queue = spu_port_queue_locked(bt, spu->spu_group_id, port)) != 0) break;
+                 const ULONGLONG now = GetTickCount64();
+                 if (!bt || now >= deadline) break;               /* no such thread: nothing will bind it */
+-                SleepConditionVariableSRW(&s_spu_port_bound, &s_spu_port_lock, (DWORD)(deadline - now), 0);
++                { static kz3_waitstat st_pb;   /* KZ3 patch 1144 */
++                  const BOOL ok_pb = SleepConditionVariableSRW(&s_spu_port_bound, &s_spu_port_lock, (DWORD)(deadline - now), 0);
++                  kz3_waitstat_note(&st_pb, "lv2_register.spu_port_bound", !ok_pb); }
+             }
+             ReleaseSRWLockExclusive(&s_spu_port_lock);
+         }
+diff --git a/runtime/syscalls/lv2_sync_core.h b/runtime/syscalls/lv2_sync_core.h
+index 01444577..c3107965 100644
+--- a/runtime/syscalls/lv2_sync_core.h
++++ b/runtime/syscalls/lv2_sync_core.h
+@@ -20,6 +20,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
+ #ifdef _WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+@@ -58,6 +59,7 @@ typedef struct lv2s_mutex {
+     pthread_mutex_t lock; pthread_cond_t cv;
+ #endif
+     int inited;
++    volatile int64_t wake_ts;   /* KZ3 patch 1144: when lv2s_wake_all last started (waitstat only) */
+     uint32_t owner;          /* thread id, 0 = free */
+     uint32_t count;          /* recursion count while owned */
+     int recursive;
+@@ -102,8 +104,10 @@ static inline void lv2s_unlock(lv2s_mutex* m)
+     pthread_mutex_unlock(&m->lock);
+ #endif
+ }
++static inline int64_t lv2s_now_ns(void);
+ static inline void lv2s_wake_all(lv2s_mutex* m)
+ {
++    if (kz3_waitstat_on()) m->wake_ts = lv2s_now_ns();   /* KZ3 patch 1144 (KZ3_WAITSTAT=1) */
+ #ifdef _WIN32
+     WakeAllConditionVariable(&m->cv);
+ #else
+@@ -145,7 +149,14 @@ static inline int lv2s_sleep(lv2s_mutex* m, int64_t deadline_ns)
+ #ifdef _WIN32
+     DWORD ms = INFINITE;
+     if (rem >= 0) { int64_t r = (rem + 999999) / 1000000; ms = r > 0xFFFFFFFEll ? 0xFFFFFFFEu : (DWORD)r; }
+-    SleepConditionVariableSRW(&m->cv, &m->lock, ms, 0);
++    {
++        static kz3_waitstat st;
++        const BOOL ok = SleepConditionVariableSRW(&m->cv, &m->lock, ms, 0);
++        if (ms != INFINITE) {   /* KZ3 patch 1144 */
++            if (!ok && deadline_ns >= 0) kz3_waitstat_near(&st, m->wake_ts - deadline_ns);
++            kz3_waitstat_note(&st, "lv2s_sleep", !ok);
++        }
++    }
+ #else
+     if (rem < 0) pthread_cond_wait(&m->cv, &m->lock);
+     else {
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index 1631d7d3..c73b6a12 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include "sys_event.h"
++#include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
+ #include "sys_ppu_thread.h"         /* ppu_thread_note_block */
+ #include "../ps3_log.h"
+ #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
+@@ -345,6 +346,7 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
+ #ifdef _WIN32
+     EnterCriticalSection(&q->lock);
+     q->cancelled = 1;
++    q->ws_wake = kz3_ws_now_ns();   /* KZ3 patch 1144 */
+     WakeAllConditionVariable(&q->not_empty);   /* every waiter, not one */
+     LeaveCriticalSection(&q->lock);
+ #else
+@@ -700,7 +702,11 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+                 LeaveCriticalSection(&q->lock);
+                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
+             }
+-            SleepConditionVariableCS(&q->not_empty, &q->lock, ms);
++            static kz3_waitstat st_evq;   /* KZ3 patch 1144 */
++            const long long dl_evq = kz3_ws_now_ns() + (long long)ms * 1000000ll;
++            const BOOL ok_evq = SleepConditionVariableCS(&q->not_empty, &q->lock, ms);
++            if (!ok_evq) kz3_waitstat_near(&st_evq, q->ws_wake - dl_evq);
++            kz3_waitstat_note(&st_evq, "sys_event_queue_receive", !ok_evq);
+         }
+     }
+ 
+@@ -986,6 +992,7 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
+                 (unsigned long long)evt->data2, (unsigned long long)evt->data3, (unsigned)q->count, (unsigned)q->capacity); }
+ 
+ #ifdef _WIN32
++    q->ws_wake = kz3_ws_now_ns();   /* KZ3 patch 1144 */
+     WakeConditionVariable(&q->not_empty);
+     LeaveCriticalSection(&q->lock);
+ #else
+@@ -1500,8 +1507,12 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
+     } else {
+         DWORD ms = (DWORD)(timeout_us / 1000);
+         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+-            if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
+-                if (GetLastError() == ERROR_TIMEOUT) {
++            static kz3_waitstat st_evf;   /* KZ3 patch 1144 */
++            const BOOL ok_evf = SleepConditionVariableCS(&f->cv, &f->lock, ms);
++            const DWORD le_evf = ok_evf ? 0 : GetLastError();
++            kz3_waitstat_note(&st_evf, "sys_event_flag_wait", !ok_evf);
++            if (!ok_evf) {
++                if (le_evf == ERROR_TIMEOUT) {
+                     /* Write current pattern even on timeout */
+                     if (result_addr != 0) {
+                         uint64_t* out = (uint64_t*)vm_to_host(result_addr);
+diff --git a/runtime/syscalls/sys_event.h b/runtime/syscalls/sys_event.h
+index 1407bd7f..ec09e47a 100644
+--- a/runtime/syscalls/sys_event.h
++++ b/runtime/syscalls/sys_event.h
+@@ -74,6 +74,7 @@ typedef struct sys_event_queue_info {
+ #ifdef _WIN32
+     CRITICAL_SECTION lock;
+     CONDITION_VARIABLE not_empty;
++    volatile long long ws_wake;   /* KZ3 patch 1144: when this queue was last woken (waitstat) */
+ #else
+     pthread_mutex_t lock;
+     pthread_cond_t  not_empty;

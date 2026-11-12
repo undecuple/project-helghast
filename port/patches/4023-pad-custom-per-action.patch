@@ -8,10 +8,14 @@ picture's labels. pad_actions.h: pab_sync_block_user takes the per-action table 
 callers). pad_keybinds.h: the section, the "pa" verb. cellPad.c: Custom writes the per-action table through 4022,
 the page's capture runs next to 4014's, `[pad] custom per action: ...` log line.
 Host test: tools/net/test_pad_action_custom.c. Pages: port/net/kz3_padpage.h. Notes: the RE notes s.34.
-diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 463a68c..abf486d 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -454,7 +454,7 @@
+@@ -621,7 +621,7 @@ int pad_kb_capture_busy(void)
  {
      int b;
      AcquireSRWLockShared(&s_kb_lock);
@@ -20,7 +24,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
      ReleaseSRWLockShared(&s_kb_lock);
      return b;
  }
-@@ -538,6 +538,7 @@
+@@ -705,6 +705,7 @@ int pad_kb_ui_cmd(const char* cmd, char* out, size_t n)
      AcquireSRWLockExclusive(&s_kb_lock);
      pad_kb_ensure_loaded();
      s_kb_ui.pm.family = pad_remap_family_port0();   /* 4014 */
@@ -28,7 +32,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
      changed = pad_kb_ui_command(&s_kb_ui, &s_kb, cmd, out, n, GetTickCount64());
      if (changed) pad_kb_save();
      ReleaseSRWLockExclusive(&s_kb_lock);
-@@ -1287,7 +1288,7 @@
+@@ -1454,7 +1455,7 @@ static void pad_map_edit_poll(void)
      int p, esc = 0, del = 0, changed;
      unsigned long long now = GetTickCount64();
      AcquireSRWLockExclusive(&s_kb_lock);
@@ -37,7 +41,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
      if (tb == -2) {
          const char* e = getenv("KZ3_PM_TEST_BTN");
          tb = e && *e ? prm_button_by_name(e, strlen(e)) : -1;
-@@ -1299,9 +1300,11 @@
+@@ -1466,9 +1467,11 @@ static void pad_map_edit_poll(void)
          del = (GetAsyncKeyState(0x2E) & 0x8000) != 0;
      }
      if (tb >= 0 && s_kb_ui.pm.phase == PMU_WAIT && now - s_kb_ui.pm.t_wait >= 700) mask = 1u << tb;
@@ -50,7 +54,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
          for (p = 0; p < PAD_MAX_HOST_PORTS; p++) {
              PadHostState* hs = &s_host_state[p];
              hs->buttons = 0; hs->press_up = hs->press_right = hs->press_down = hs->press_left = 0;
-@@ -1401,6 +1404,7 @@
+@@ -1568,6 +1571,7 @@ static void pad_actions_sync(void)
      static int32_t last[2][PAB_N] = { { INT32_MIN }, { INT32_MIN } };
      static int said[2][3];
      unsigned char cust[16];
@@ -58,7 +62,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
      uint32_t prof;
      int p, kbd;
      if (off < 0) { const char* e = getenv("KZ3_PAD_ACTIONS"); off = e && !strcmp(e, "0"); }
-@@ -1414,6 +1418,27 @@
+@@ -1581,6 +1585,27 @@ static void pad_actions_sync(void)
      prof = vm_read32(pab_versions[ver].profile_ptr);
      if (!prof || prof >= 0x40000000u) return;
      for (p = 0; p < 16; p++) cust[p] = s_remap[0].src[p];
@@ -86,7 +90,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
      kbd = pad_prompt_device() == PAD_DEV_KEYBOARD;
      for (p = 0; p < 2; p++) {
          int32_t id = 0;
-@@ -1432,8 +1457,9 @@
+@@ -1599,8 +1624,9 @@ static void pad_actions_sync(void)
                  said[p][0] = 1;
              }
          }
@@ -98,8 +102,10 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
          if (r == PAB_WROTE || r == PAB_RESTORED) {
              printf("[pad] player %d: %s (scheme %d, %s%s)\n", p + 1,
                     r == PAB_RESTORED ? "the scheme's own action table back" : "action table set", (int)id,
-diff -ruN a/libs/input/pad_action_custom.h b/libs/input/pad_action_custom.h
---- a/libs/input/pad_action_custom.h
+diff --git a/libs/input/pad_action_custom.h b/libs/input/pad_action_custom.h
+new file mode 100644
+index 0000000..46d3600
+--- /dev/null
 +++ b/libs/input/pad_action_custom.h
 @@ -0,0 +1,393 @@
 +/*
@@ -495,10 +501,11 @@ diff -ruN a/libs/input/pad_action_custom.h b/libs/input/pad_action_custom.h
 +}
 +
 +#endif
-diff -ruN a/libs/input/pad_actions.h b/libs/input/pad_actions.h
+diff --git a/libs/input/pad_actions.h b/libs/input/pad_actions.h
+index 177bb14..eafe4e4 100644
 --- a/libs/input/pad_actions.h
 +++ b/libs/input/pad_actions.h
-@@ -135,6 +135,14 @@
+@@ -135,6 +135,14 @@ static void pab_custom(const signed char* base, const unsigned char src[16], int
      }
  }
  
@@ -513,7 +520,7 @@ diff -ruN a/libs/input/pad_actions.h b/libs/input/pad_actions.h
  static void pab_from_base(const signed char* base, int32_t out[PAB_N])
  {
      int a;
-@@ -192,18 +200,20 @@
+@@ -192,18 +200,20 @@ static int pab_detect(pab_rd32_fn rd32)
  /* What one block should hold. kbd = the keyboard is the device in use (keys name game buttons: they keep the game's
   * table). Returns 0 when the block is left alone. */
  static int pab_want(int preset, int family, int kbd, const signed char* base, const unsigned char custom_src[16],
@@ -536,7 +543,7 @@ diff -ruN a/libs/input/pad_actions.h b/libs/input/pad_actions.h
  {
      int32_t t[PAB_N];
      int f;
-@@ -211,6 +221,7 @@
+@@ -211,6 +221,7 @@ static int pab_ours(const int32_t* cur, const signed char* base, const unsigned
      if (pab_same(cur, t)) return 1;
      for (f = 0; f < 2; f++) { pab_modern_r34(base, f, t); if (pab_same(cur, t)) return 1; }
      if (custom_src) { pab_custom(base, custom_src, t); if (pab_same(cur, t)) return 1; }
@@ -544,7 +551,7 @@ diff -ruN a/libs/input/pad_actions.h b/libs/input/pad_actions.h
      return last && pab_same(cur, last);
  }
  
-@@ -219,8 +230,10 @@
+@@ -219,8 +230,10 @@ enum { PAB_NONE = 0, PAB_WROTE = 1, PAB_RESTORED = 2, PAB_FOREIGN = 3, PAB_BAD =
  
  /* One block: read, decide, write. `last` (PAB_N, may hold anything; last[0] == INT32_MIN = none) is what this file
   * wrote last into this block and is updated. */
@@ -557,7 +564,7 @@ diff -ruN a/libs/input/pad_actions.h b/libs/input/pad_actions.h
  {
      int32_t cur[PAB_N], want[PAB_N];
      const signed char* base;
-@@ -232,12 +245,12 @@
+@@ -232,12 +245,12 @@ static int pab_sync_block(uint32_t blk, int preset, int family, int kbd, const u
      if (!base) return PAB_NONE;
      for (a = 0; a < PAB_N; a++) cur[a] = (int32_t)rd32(blk + PAB_OFF_TABLE + 4u * (uint32_t)a);
      if (!pab_plausible(cur)) return PAB_BAD;
@@ -572,7 +579,7 @@ diff -ruN a/libs/input/pad_actions.h b/libs/input/pad_actions.h
              return PAB_FOREIGN;   /* the game's own table (or one we do not know): leave it */
          for (a = 0; a < PAB_N; a++)
              if (!pab_skip(a) && cur[a] != want[a]) wr32(blk + PAB_OFF_TABLE + 4u * (uint32_t)a, (uint32_t)want[a]);
-@@ -246,4 +259,10 @@
+@@ -246,4 +259,10 @@ static int pab_sync_block(uint32_t blk, int preset, int family, int kbd, const u
      }
  }
  
@@ -583,7 +590,8 @@ diff -ruN a/libs/input/pad_actions.h b/libs/input/pad_actions.h
 +}
 +
  #endif
-diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+index 6486db3..00390a0 100644
 --- a/libs/input/pad_keybinds.h
 +++ b/libs/input/pad_keybinds.h
 @@ -28,6 +28,7 @@
@@ -594,7 +602,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
  #include <stddef.h>
  #include <stdio.h>
  #include <string.h>
-@@ -115,7 +116,7 @@
+@@ -122,7 +123,7 @@ static const PadKbKey pad_kb_keys[] = {
  /* KZ3 patch 4013 (stage 3): `padmap` = the pad layout preset (PRM_*, section [pad] preset), `padc` = the custom
   * table (src of each game button, [pad] "r1 = r2"; identity unless the file says otherwise). */
  typedef struct { unsigned char key[PKB_N_INPUTS][PKB_SLOTS]; unsigned char prompts; unsigned char padmap;
@@ -603,7 +611,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
  
  enum { PKB_PROMPTS_AUTO = 0, PKB_PROMPTS_PS3, PKB_PROMPTS_PS4, PKB_PROMPTS_XBOX, PKB_PROMPTS_KEYBOARD, PKB_N_PROMPTS };
  static const char* const pkb_prompt_names[PKB_N_PROMPTS] = { "auto", "ps3", "ps4", "xbox", "keyboard" };
-@@ -333,6 +334,7 @@
+@@ -340,6 +341,7 @@ static void pad_kb_defaults(PadKeybinds* kb)
      memset(kb, 0, sizeof *kb);
      for (i = 0; i < PRM_N; i++) kb->padc[i] = (unsigned char)i;   /* 4013 */
      kb->padmap = PRM_DEFAULT_PRESET;
@@ -611,7 +619,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
      for (i = 0; i < sizeof d / sizeof d[0]; i++) {
          int k = pad_kb_input_by_name(d[i].in, strlen(d[i].in));
          if (k >= 0) { kb->key[k][0] = d[i].a; kb->key[k][1] = d[i].b; }
-@@ -355,7 +357,7 @@
+@@ -362,7 +364,7 @@ static int pad_kb_space(char c) { return c == ' ' || c == '\t' || c == '\r'; }
  static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* ctx)
  {
      const char* p = text;
@@ -620,7 +628,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
      if (!text) return 0;
      if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
      while (*p) {
-@@ -371,12 +373,27 @@
+@@ -378,12 +380,27 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
          if (a < b) {
              if (*a == '[') {
                  const char* r = memchr(a, ']', (size_t)(b - a));
@@ -650,7 +658,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
                  }
              } else if (in_pd) {
                  /* 4013: "preset = default|modern|custom" and "<game button> = <host button>|none" (custom table) */
-@@ -453,6 +470,7 @@
+@@ -460,6 +477,7 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
          }
          p = *e ? e + 1 : e;
      }
@@ -658,7 +666,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
      return bad;
  }
  
-@@ -560,6 +578,10 @@
+@@ -567,6 +585,10 @@ static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
      for (i = 0; i < PRM_N; i++)
          if (kb->padc[i] != i)
              PKB_PUT("%-9s= %s\n", prm_names[i], kb->padc[i] < PRM_N ? prm_names[kb->padc[i]] : "none");
@@ -669,7 +677,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
  #undef PKB_PUT
      return (int)o;
  }
-@@ -640,6 +662,7 @@
+@@ -647,6 +669,7 @@ typedef struct {
      int sel, sel_slot;          /* the page's selected cell + 1 ("sel R S", pass 38; 0 = page closed, so a zeroed
                                   * PadKbUi has none): Delete clears it */
      PadMapUi pm;                /* 4014: the Custom layout page's editor (pad_remap_ui.h) */
@@ -677,7 +685,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
  } PadKbUi;
  
  static int pad_kb_row_input(int row)
-@@ -819,6 +842,11 @@
+@@ -826,6 +849,11 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
      if (!n) return 0;
      out[0] = 0;
      if (sscanf(cmd, "%15s %d %d", verb, &r, &s) < 1) return 0;
@@ -689,7 +697,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
      if (!strcmp(verb, "pm")) {   /* 4014: the Custom layout page; see pad_remap_ui.h */
          const unsigned char before = kb->padmap;
          int ch = pmu_command(&u->pm, &kb->padmap, kb->padc, cmd + 2, out, n, now);
-@@ -888,7 +916,7 @@
+@@ -895,7 +923,7 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
      }
      if (!strcmp(verb, "reset")) {
          PadKeybinds keep = *kb;   /* 4011/4013: the Keyboard page's reset keeps the Button prompts and the pad layout */

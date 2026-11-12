@@ -1,0 +1,811 @@
+KZ3 patch 2156: present actual resource geometry and retain scheduled UI-transform ownership.
+
+Copy only compatible resources; scale only supported single-sample float textures.
+A failed incompatible scale clears the back buffer instead of recording an invalid copy.
+Publish target/image geometry only after a successful non-occluded Present.
+Track applied direct-UI factors with always-on surface versions through guarded writes,
+whole normalized transfers and accepted movie-overlay captures. Unknown blur/composite
+lineage retains explicit legacy mapping; this is not complete cached-UI provenance.
+
+Host controls exercise extracted routing/ownership with resource/window mocks.
+Native compile, GPU output, DPI and actual pointer behavior require separate validation.
+No internal render-resolution change is introduced by this presentation correction.
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -20,6 +20,8 @@
+  */
+
+ #include "rsx_live_draw.h"
++#include "rsx_present_geometry.h"
++#include "rsx_ui_provenance.h"
+ #include "rsx_cb_reuse.h"
+ #include "ps3emu/yz_runtime_config.h"
+ #include "ps3emu/yz_frontier_trace.h"
+@@ -28,6 +30,8 @@
+ #if !defined(_WIN32)
+
+ /* Non-Windows: the whole path is a no-op (D3D12 is Windows-only). */
++int rsx_live_draw_get_present_geometry(rsx_present_geometry* out)
++{ if (out) memset(out, 0, sizeof *out); return 0; }
+ int  rsx_live_draw_enabled(void) { return 0; }
+ int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
+ { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
+@@ -350,6 +354,7 @@
+     ID3D12Resource* tex;
+     u32 w, h;
+     DXGI_FORMAT fmt;
++    rsx_ui_provenance ui; /* always-on scheduled UI-transform ownership */
+     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
+     u32 pitch;                /* guest row pitch of colour target 0 (bytes), 0 = unknown */
+     /* Top-left windows of the surface for smaller aliasing textures (see surface_window). */
+@@ -532,6 +537,7 @@
+     u8*                        movie_overlay_mask;
+     u32                        movie_overlay_pitch;
+     int                        movie_overlay_valid;
++    rsx_ui_provenance          movie_overlay_ui; /* captured with accepted overlay pixels */
+     u64                        movie_overlay_frames;
+
+     ID3D12DescriptorHeap*      smp_cpu_heap;
+@@ -684,6 +690,47 @@
+ static u32 g_ld_last_consumed_buffer = UINT32_MAX;
+ static u32 g_ld_last_present_target = UINT32_MAX;
+ static u64 g_ld_last_dump_fingerprint = 0;
++enum {
++    LD_SURFACE_WRITE_NONE = 0,
++    LD_SURFACE_WRITE_CREATE = 1,
++    LD_SURFACE_WRITE_DRAW = 2,
++    LD_SURFACE_WRITE_CLEAR = 3,
++    LD_SURFACE_WRITE_COPY = 4,
++    LD_SURFACE_WRITE_BLIT = 5,
++    LD_SURFACE_WRITE_RESOLVE = 6,
++    LD_SURFACE_WRITE_OTHER = 7
++};
++
++/* Called independently of YZ_PERF_CLEAN diagnostics. Direct draws and clears
++ * commit below at their actual command sites, where masks/scissors are known. */
++static void ld_ui_note_other_write(u32 target, u32 kind)
++{
++    if (target >= MAX_SURFACES || kind == LD_SURFACE_WRITE_DRAW || kind == LD_SURFACE_WRITE_CLEAR) return;
++    rsx_ui_unknown(&g.surfaces[target].ui);
++}
++
++static void ld_ui_note_draw(u32 target, unsigned color_mask, int predication,
++                            long left, long top, long right, long bottom,
++                            int direct_ui, float kx, float ky)
++{
++    if (target >= MAX_SURFACES || !color_mask || predication < 0 || right <= left || bottom <= top) return;
++    if (predication > 0 || !direct_ui) {
++        rsx_ui_unknown(&g.surfaces[target].ui);
++        return;
++    }
++    rsx_ui_direct(&g.surfaces[target].ui, kx, ky, g_ld_frames);
++}
++
++static void ld_ui_note_clear(u32 target, int full)
++{
++    if (target < MAX_SURFACES) rsx_ui_clear(&g.surfaces[target].ui, full);
++}
++
++static void ld_ui_inherit(u32 target, const rsx_ui_provenance* source, int whole)
++{
++    if (target < MAX_SURFACES) rsx_ui_inherit(&g.surfaces[target].ui, source, whole);
++}
++
+ #if !defined(YZ_PERF_CLEAN)
+ static u32 g_ld_surface_generation = 0;
+ static u32 g_ld_surface_resource_serial = 0;
+@@ -696,16 +743,7 @@
+ static volatile LONG g_ld_diag_post_movie_pending = 0;
+ static volatile LONG g_ld_diag_post_movie_presents = 0;
+
+-enum {
+-    LD_SURFACE_WRITE_NONE = 0,
+-    LD_SURFACE_WRITE_CREATE = 1,
+-    LD_SURFACE_WRITE_DRAW = 2,
+-    LD_SURFACE_WRITE_CLEAR = 3,
+-    LD_SURFACE_WRITE_COPY = 4,
+-    LD_SURFACE_WRITE_BLIT = 5,
+-    LD_SURFACE_WRITE_RESOLVE = 6,
+-    LD_SURFACE_WRITE_OTHER = 7
+-};
++
+
+ /* Patch 2084 diagnostic, LD_POST_WB_DIAG=N (frames per report, 1 = 60): which SPU DMA reads (GETs) of a
+  * live surface's guest bytes saw the RSX's last write. Per surface record and report window: GPU writes
+@@ -791,6 +829,7 @@
+ {
+     if (target >= MAX_SURFACES)
+         return;
++    ld_ui_note_other_write(target, kind);
+     ld_gv_note_gpu_write(target);
+     surface_t* surface = &g.surfaces[target];
+     const u32 generation = ++g_ld_surface_generation;
+@@ -823,7 +862,7 @@
+ }
+ #else
+ #define ld_surface_note_write(target, kind) \
+-    do { if ((target) < MAX_SURFACES) g.surfaces[(target)].swin_wgen++; ld_gv_note_gpu_write(target); } while (0)
++    do { ld_ui_note_other_write((target), (kind)); if ((target) < MAX_SURFACES) g.surfaces[(target)].swin_wgen++; ld_gv_note_gpu_write(target); } while (0)
+ #endif
+
+ #define LD_LAYOUT_CACHE_CAP 256u
+@@ -5437,6 +5476,7 @@
+     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    rsx_ui_unknown(&s->ui); /* bytes uploaded from guest memory have no proven UI transform */
+     g_gv.uploads_bands += (rows + LD_GV_BAND - 1u) / LD_GV_BAND;
+     return 1;
+ }
+@@ -6876,7 +6916,10 @@
+     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    const rsx_ui_provenance ui_source = s->ui;
+     ld_surface_note_write(di, LD_SURFACE_WRITE_COPY);
++    ld_ui_inherit(di, &ui_source, sx == 0 && sy == 0 && sw == s->w && sh == s->h &&
++                  dx == 0 && dy == 0 && dw == d->w && dh == d->h);
+     { static int n = 0; if (n++ < 4)
+         fprintf(stderr, "[scaled-blit] surf %u (%.0f,%.0f %.0fx%.0f) -> surf %u (%u,%u %ux%u)\n",
+                 si, sx, sy, sw, sh, di, dx, dy, dw, dh); }
+@@ -6941,7 +6984,11 @@
+     if (!w || !h) return 0;
+     if (k > 1) {
+         if (!ld_downsample((u32)si, sx, sy, k, slot, dx, dy, w, h)) return 0;
++        const rsx_ui_provenance ui_source = g.surfaces[si].ui;
+         ld_surface_note_write(slot, LD_SURFACE_WRITE_COPY);
++        ld_ui_inherit(slot, &ui_source, sx == 0 && sy == 0 &&
++            (u64)w * k == g.surfaces[si].w && (u64)h * k == g.surfaces[si].h &&
++            dx == 0 && dy == 0 && w == dst->w && h == dst->h);
+         return 1;
+     }
+     ID3D12Resource* s = g.surfaces[si].tex;
+@@ -6964,7 +7011,10 @@
+         b[q].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+     }
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    const rsx_ui_provenance ui_source = g.surfaces[si].ui;
+     ld_surface_note_write(slot, LD_SURFACE_WRITE_COPY);
++    ld_ui_inherit(slot, &ui_source, sx == 0 && sy == 0 && w == g.surfaces[si].w && h == g.surfaces[si].h &&
++                  dx == 0 && dy == 0 && w == dst->w && h == dst->h);
+     ld_gt_other(LD_GT_COPY);   /* patch 2052 */
+     if (s_csv_file && s_csv_gate_open) {
+         fprintf(s_csv_file, "#resolve,%u,%u:0x%X,%u:0x%X,%u,%u,%ux%u\n", g_ld_frames,
+@@ -7031,7 +7081,10 @@
+         b[k].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+     }
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    const rsx_ui_provenance ui_source = g.surfaces[si].ui;
+     ld_surface_note_write((u32)di, LD_SURFACE_WRITE_COPY);
++    ld_ui_inherit((u32)di, &ui_source, sx == 0 && sy == 0 && w == g.surfaces[si].w && h == g.surfaces[si].h &&
++                  dx == 0 && dy == 0 && w == g.surfaces[di].w && h == g.surfaces[di].h);
+     ld_gt_other(LD_GT_COPY);   /* patch 2052 */
+     return 1;
+ }
+@@ -12344,6 +12397,7 @@
+         g.list->lpVtbl->ClearRenderTargetView(
+             g.list, rtv_handle(LD_SWAP_BUFFERS + i), transparent, 0, NULL);
+         ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
++        g.surfaces[i].ui.state = RSX_UI_EMPTY;
+     }
+     if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
+     ld_movie_reset_rings();
+@@ -12366,6 +12420,8 @@
+         g.movie_overlay_valid = 0;
+         return;
+     }
++    const rsx_ui_provenance overlay_ui = g.surfaces[target].ui;
++    const int overlay_ui_full = g.surfaces[target].w == g.width && g.surfaces[target].h == g.height;
+     ID3D12Resource* rt = g.surfaces[target].tex;
+     D3D12_RESOURCE_BARRIER b = {0};
+     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -12461,6 +12517,8 @@
+     }
+     g.movie_overlay_valid =
+         glyph_pixels >= 8 && glyph_pixels < band_pixels / 6;
++    rsx_ui_unknown(&g.movie_overlay_ui);
++    if (g.movie_overlay_valid && overlay_ui_full) rsx_ui_inherit(&g.movie_overlay_ui, &overlay_ui, 1);
+     g.movie_overlay_frames++;
+     if (g.movie_overlay_frames <= 16 ||
+         (g.movie_overlay_frames & 63) == 0 ||
+@@ -15116,18 +15174,19 @@
+     /* patch 2113: a 2D draw (display-buffer target, full guest viewport, 16:9 target, not the frame's 3D compose, no
+      * full-size render target sampled) is squeezed into the centred 16:9 box; the RE notes "Pass 162" s.4. */
+     float h_kx = 1.0f, h_ky = 1.0f;
+-    int h169 = 0;
++    int h169 = 0, ui_direct = 0;
+     {
+         if (g_h169_frame != g_ld_frames) { g_h169_frame = g_ld_frames; g_h169_depth_seen = 0; g_h169_disp_seen = 0; }
+         if (target < g.n_surfaces && ld_h169_is_display(target)) {
+             const int first = !g_h169_disp_seen;
+             g_h169_disp_seen = 1;
++            const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
++                             fabsf(vp.scale[1]) == Hv * 0.5f && vp.translate[1] == Hv * 0.5f;
++            const int is169 = (u32)Wv * 9u == (u32)Hv * 16u;
++            const int compose = first && g_h169_depth_seen;
++            ui_direct = rsx_ui_direct_candidate(1, full, is169, compose, g_h169_rt_sampled);
+             if (ld_h169_factors(&h_kx, &h_ky)) {
+-                const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
+-                                 fabsf(vp.scale[1]) == Hv * 0.5f && vp.translate[1] == Hv * 0.5f;
+-                const int is169 = (u32)Wv * 9u == (u32)Hv * 16u;
+-                const int compose = first && g_h169_depth_seen;
+-                h169 = full && is169 && !compose && !g_h169_rt_sampled;
++                h169 = ui_direct;
+                 if (ld_h169_log_on()) {
+                     static u32 n_log = 0;
+                     if (n_log < 400 || (compose && prim != 5u)) {
+@@ -15165,6 +15224,9 @@
+         if (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) g_h169_depth_seen = 1;
+         if (h169) rsx_h169_xf(xf, h_kx, h_ky);
+     }
++    const int ui_owner_direct = ui_direct && target < g.n_surfaces &&
++        rsx_ui_owner_extent_matches((u32)W, (u32)H, g.surfaces[target].w, g.surfaces[target].h,
++                                    (u32)Wv, (u32)Hv, g.width, g.height);
+     u32 cb_slot = g.cb_used;   /* ring offset this draw's root CBV points at */
+     int cb_reused = 0;
+     LDW_T0(vcb_t0);
+@@ -15346,6 +15408,11 @@
+       LDW_T0(rs_t0);
+       decode_render_state(&cw);
+       LDW_ADD(RSX_PERF_W_D_RS_T, rs_t0);
++      ld_ui_note_draw(target, cw.color_mask, oq_pred, sc.left, sc.top, sc.right, sc.bottom,
++                      ui_owner_direct, h169 ? h_kx : 1.0f, h169 ? h_ky : 1.0f);
++      for (u32 r = 1; r < n_mrt; r++)
++          ld_ui_note_draw(mrt[r], (cw.color_mask_mrt >> (4u * r)) & 0xFu, oq_pred,
++                          sc.left, sc.top, sc.right, sc.bottom, 0, 1.0f, 1.0f);
+       if (cw.color_mask && target < MAX_SURFACES) { g.surfaces[target].colour_gen = ++g_ld_cw_gen; ld_cw_note(target, "draw", cw.color_mask); }
+       for (u32 r = 1; r < n_mrt; r++)
+           if (((cw.color_mask_mrt >> (4u * r)) & 0xFu) && mrt[r] < MAX_SURFACES)
+@@ -15554,6 +15621,8 @@
+           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
+         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, n_crect, n_crect ? &crect : NULL);
+         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
++        ld_ui_note_clear(target, !n_crect || (crect.left <= 0 && crect.top <= 0 &&
++            crect.right >= (LONG)g.surfaces[target].w && crect.bottom >= (LONG)g.surfaces[target].h));
+         ld_gt_other(LD_GT_CLEAR);   /* patch 2052 */
+         if (target < MAX_SURFACES) { g.surfaces[target].colour_gen = ++g_ld_cw_gen; ld_cw_note(target, "clear", mask); }   /* patch 2044 */
+     }
+@@ -15962,7 +16031,8 @@
+     return 0;
+ }
+ /* Present with the interval and flags the setting asks for; logs "[rsx] vsync ..." once and on each change. */
+-static HRESULT ld_present_swap(void)
++static void ld_pg_commit(const rsx_present_geometry* p);
++static HRESULT ld_present_swap(const rsx_present_geometry* geometry)
+ {
+     static int s_env = -2;
+     unsigned tearing = 0, interval;
+@@ -15979,7 +16049,9 @@
+                 g_dm_fs && !g_ld_vsync ? ", exclusive fullscreen: interval 0 without the flag" : "");
+     }
+     if (!ld_present_slot()) return S_OK;   /* patch 2127 */
+-    return g.swap->lpVtbl->Present(g.swap, interval, tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
++    const HRESULT hr = g.swap->lpVtbl->Present(g.swap, interval, tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
++    if (SUCCEEDED(hr) && hr != DXGI_STATUS_OCCLUDED) ld_pg_commit(geometry);
++    return hr;
+ }
+
+ static void ld_dm_client(u32* w, u32* h)
+@@ -16134,7 +16206,7 @@
+     if (vsb) vsb->lpVtbl->Release(vsb);
+     if (psb) psb->lpVtbl->Release(psb);
+     if (FAILED(hr) || !g_dm_pso[0] || !g_dm_pso[1]) {
+-        fprintf(stderr, "[display] scale pipeline failed hr=0x%08lX: the image is copied unscaled\n", (unsigned long)hr);
++        fprintf(stderr, "[display] scale pipeline failed hr=0x%08lX: incompatible scaled presents stay black; compatible copies continue\n", (unsigned long)hr);
+         return 0;
+     }
+     g_dm_failed = 0;
+@@ -16143,7 +16215,7 @@
+
+ /* Record: back buffer bb (PRESENT) cleared black, src (state src_state, restored after; a 2D colour texture) drawn
+  * into the letterbox rectangle with linear filtering, bb back to PRESENT. Returns 0 (nothing recorded) when the pass
+- * cannot run; the caller then copies. */
++ * cannot run; the caller copies only compatible resources, otherwise clears black. */
+ /* patch 2096 (KZ3_ASPECT=screen): the camera hook (port/kz3/main.cpp) asks for the view aspect and notes each camera
+  * set up with it; a frame presented within 3 presents of such a note is stretched to the whole client (its image was
+  * drawn for that aspect), any other frame keeps the Image scaling setting. */
+@@ -16186,15 +16258,106 @@
+ /* For the menu mouse (rsx_null_backend.c rsx_display_client_to_ui): the factors the 2D draws get now. */
+ int rsx_live_draw_hud169_factors(float* kx, float* ky) { return ld_h169_factors(kx, ky); }
+
+-static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32 bbi)
++/* The existing draw/present ownership remains unchanged. Pending geometry is
++ * local to each present call. Only the published snapshot is shared; input
++ * copies it under this small lock and never holds the lock while calling DXGI. */
++static SRWLOCK g_pg_lock = SRWLOCK_INIT;
++static rsx_present_geometry g_pg_submitted;
++
++int rsx_live_draw_get_present_geometry(rsx_present_geometry* out)
++{
++    if (!out) return 0;
++    AcquireSRWLockShared(&g_pg_lock);
++    *out = g_pg_submitted;
++    ReleaseSRWLockShared(&g_pg_lock);
++    return out->valid;
++}
++
++static void ld_pg_commit(const rsx_present_geometry* p)
++{
++    AcquireSRWLockExclusive(&g_pg_lock);
++    g_pg_submitted = *p;
++    ReleaseSRWLockExclusive(&g_pg_lock);
++}
++
++static rsx_pg_resource ld_pg_resource(ID3D12Resource* resource)
++{
++    D3D12_RESOURCE_DESC d;
++    memset(&d, 0, sizeof d);
++    if (resource) resource->lpVtbl->GetDesc(resource, &d);
++    const rsx_pg_resource r = {d.Width, (unsigned)d.Dimension, d.Height,
++        d.DepthOrArraySize, d.MipLevels, (unsigned)d.Format, d.SampleDesc.Count, d.SampleDesc.Quality};
++    return r;
++}
++
++static int ld_pg_can_copy(ID3D12Resource* source, ID3D12Resource* target)
++{
++    if (!source || !target) return 0;
++    const rsx_pg_resource a = ld_pg_resource(source), b = ld_pg_resource(target);
++    return rsx_pg_copy_compatible(&a, &b);
++}
++
++static void ld_pg_record(rsx_present_geometry* p, ID3D12Resource* target, rsx_dm_rect r)
++{
++    const rsx_pg_resource d = ld_pg_resource(target);
++    p->valid = d.width && d.width <= 0x7FFFFFFFu && d.height && r.w > 0 && r.h > 0;
++    p->frame = g_ld_frames;
++    p->logical_w = g.width; p->logical_h = g.height;
++    p->target_w = (unsigned)d.width; p->target_h = d.height;
++    p->image.x = r.x; p->image.y = r.y; p->image.w = r.w; p->image.h = r.h;
++}
++
++static void ld_pg_black(ID3D12Resource* bb, u32 bbi, rsx_present_geometry* p)
++{
++    p->valid = 0; /* a submitted black fallback has no clickable game image */
++    if (!bb) return;
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition.pResource = bb;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    static const float black[4] = {0, 0, 0, 1};
++    g.list->lpVtbl->ClearRenderTargetView(g.list, rtv_handle(bbi), black, 0, NULL);
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++}
++
++/* The fixed display shader samples mip 0 as float4, and its PSO writes a
++ * single-sample RGBA8 RTV. A failed copy-compatibility check does not imply
++ * that arbitrary texture types can be converted by this shader. */
++static int ld_pg_blit_eligible(const D3D12_RESOURCE_DESC* source,
++                               const D3D12_RESOURCE_DESC* target)
++{
++    const int sample_format = source->Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
++        source->Format == DXGI_FORMAT_R16G16B16A16_FLOAT || source->Format == DXGI_FORMAT_R32_FLOAT;
++    return source->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
++        source->Width && source->Width <= 0x7FFFFFFFu && source->Height && source->Height <= 0x7FFFFFFFu &&
++        source->DepthOrArraySize == 1 && source->MipLevels >= 1 &&
++        source->SampleDesc.Count == 1 && source->SampleDesc.Quality == 0 &&
++        !(source->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && sample_format &&
++        target->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
++        target->Width && target->Width <= 0x7FFFFFFFu && target->Height && target->Height <= 0x7FFFFFFFu &&
++        target->DepthOrArraySize == 1 && target->MipLevels == 1 &&
++        target->SampleDesc.Count == 1 && target->SampleDesc.Quality == 0 &&
++        target->Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
++        (target->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
++}
++
++static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32 bbi,
++                       int effective_scaling, rsx_present_geometry* geometry)
+ {
+     g_dm_present_n++;
+-    if (!src || !ld_dm_pipeline() || g.srv_ring_used >= SRV_RING_TABLES) return 0;
++    if (!src || g.srv_ring_used >= SRV_RING_TABLES) return 0;
+     D3D12_RESOURCE_DESC sd;
+     src->lpVtbl->GetDesc(src, &sd);
+     ID3D12Resource* bb = g.backbuf[bbi];
+-    if (!bb) return 0;   /* patch 2152: no back buffer (GetBuffer failed) */
+-    const rsx_dm_rect r = rsx_dm_rect_for((int)sd.Width, (int)sd.Height, (int)g_dm_bb_w, (int)g_dm_bb_h, ld_dm_scaling_now(),
++    if (!bb) return 0;   /* no back buffer (GetBuffer failed) */
++    D3D12_RESOURCE_DESC bd; bb->lpVtbl->GetDesc(bb, &bd);
++    if (!ld_pg_blit_eligible(&sd, &bd) || !ld_dm_pipeline()) return 0;
++    const rsx_dm_rect r = rsx_dm_rect_for((int)sd.Width, (int)sd.Height, (int)bd.Width, (int)bd.Height, effective_scaling,
+                                           g_dm_filter);
+     int dm_filter = g_dm_filter;
+     {   /* patch 2145: RSX_UPSCALE=fsr1 upscales the image to the rectangle's size first (EASU + RCAS compute on the
+@@ -16212,9 +16375,12 @@
+             ev.output_width = (uint32_t)r.w; ev.output_height = (uint32_t)r.h;
+             ev.sharpness = -1.0f;
+             if (rsx_upscale_evaluate(up, &ev, &ur)) {
++                LD_SM_INVALIDATE(); /* upscale compute changed command-list bindings, including rejected outputs */
++                if (!ur.resource) return 0;
+                 src = (ID3D12Resource*)ur.resource;
+                 src_state = (D3D12_RESOURCE_STATES)ur.state;
+                 src->lpVtbl->GetDesc(src, &sd);
++                if (!ld_pg_blit_eligible(&sd, &bd)) return 0;
+                 dm_filter = 1;   /* 1:1 into the rectangle: point */
+             }
+         }
+@@ -16266,6 +16432,7 @@
+     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    ld_pg_record(geometry, bb, r);
+     return 1;
+ }
+
+@@ -16868,6 +17035,7 @@
+                 g.list->lpVtbl->ClearRenderTargetView(
+                     g.list, rtv_handle(LD_SWAP_BUFFERS + i), black, 0, NULL);
+                 ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
++                g.surfaces[i].ui.state = RSX_UI_EMPTY;
+             }
+             if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
+             ld_movie_reset_rings();
+@@ -17151,12 +17319,26 @@
+         }
+     }
+
++    rsx_present_geometry geometry; memset(&geometry, 0, sizeof geometry);
++    geometry.hud_kx = geometry.hud_ky = 1.0f; /* decoded movie is not HUD-squeezed */
++    geometry.hud_provenance = composite && g.movie_overlay_valid ?
++        RSX_PG_HUD_UNKNOWN : RSX_PG_HUD_MOVIE_PIXELS;
++    geometry.ui_state = composite && g.movie_overlay_valid ? g.movie_overlay_ui.state : RSX_UI_EMPTY;
++    geometry.ui_generation = composite && g.movie_overlay_valid ? g.movie_overlay_ui.generation : 0;
++    if (composite && g.movie_overlay_valid && w == g.width && h == g.height &&
++        rsx_ui_read(&g.movie_overlay_ui, &geometry.hud_kx, &geometry.hud_ky))
++        geometry.hud_provenance = RSX_PG_HUD_MOVIE_OWNER;
++    const int present_scaling = ld_dm_scaling_now();
+     ld_dm_sync_size();   /* patch 2095 */
+     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+     ID3D12Resource* bb = g.backbuf[bbi];
+     /* patch 2095: scaled present: the frame goes into a guest-size texture, which is drawn into the back buffer */
+-    ID3D12Resource* dm_tex = (g_dm_bb_w != g.width || g_dm_bb_h != g.height) && ld_dm_pipeline() ? ld_dm_movie_target(w, h) : NULL;
+-    if (dm_tex) bb = dm_tex;
++    const rsx_pg_resource bd = ld_pg_resource(bb);
++    const int direct_copy = bb && bd.width == w && bd.height == h && bd.depth == 1 && bd.mips == 1 &&
++        bd.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
++        bd.format == DXGI_FORMAT_R8G8B8A8_UNORM && bd.samples == 1 && bd.quality == 0;
++    ID3D12Resource* dm_tex = !direct_copy && ld_dm_pipeline() ? ld_dm_movie_target(w, h) : NULL;
++    bb = dm_tex ? dm_tex : direct_copy ? bb : NULL;
+
+     D3D12_RESOURCE_BARRIER b = {0};
+     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -17181,21 +17363,18 @@
+     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+     if (!dm_tex) { if (bb) g.list->lpVtbl->ResourceBarrier(g.list, 1, &b); }   /* patch 2152: bb */
+-    else if (!ld_dm_blit(dm_tex, D3D12_RESOURCE_STATE_COPY_DEST, bbi) && g.backbuf[bbi]) {   /* patch 2095; 2152 */
+-        b.Transition.pResource = g.backbuf[bbi];         /* no scale pass: an empty (black) frame, not a stale one */
+-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+-        { static const float k0[4] = { 0, 0, 0, 1 };
+-          g.list->lpVtbl->ClearRenderTargetView(g.list, rtv_handle(bbi), k0, 0, NULL); }
+-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    else if (!ld_dm_blit(dm_tex, D3D12_RESOURCE_STATE_COPY_DEST, bbi, present_scaling, &geometry))
++        ld_pg_black(g.backbuf[bbi], bbi, &geometry);
++    if (!dm_tex && direct_copy) {
++        const rsx_dm_rect full = {0, 0, (int)bd.width, (int)bd.height};
++        ld_pg_record(&geometry, g.backbuf[bbi], full);
++    } else if (!dm_tex && !direct_copy) {
++        ld_pg_black(g.backbuf[bbi], bbi, &geometry);
+     }
+
+     ld_flush(LD_FLUSH_MOVIE_PRESENT);
+     {
+-        const HRESULT present_hr = ld_present_swap();
++        const HRESULT present_hr = ld_present_swap(&geometry);
+         if (SUCCEEDED(present_hr))
+             ld_present_measure_record(g_ld_frames);
+         else {
+@@ -17961,7 +18140,9 @@
+     b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+     g.list->lpVtbl->ResourceBarrier(g.list, 1, b);
+     g_aa_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    const rsx_ui_provenance ui_source = sf->ui;
+     ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
++    ld_ui_inherit(i, &ui_source, 1);
+     g_aa_frame[i] = g_ld_frames + 1u;
+     if (g_aa_passes++ < 4)
+         fprintf(stderr, "[host-aa] fxaa on surface %u:0x%08X %ux%u (frame %u)\n",
+@@ -18506,14 +18687,26 @@
+       } }
+     ID3D12Resource* srcimg = presented_surface->tex;
+     ID3D12Resource* gm_copy = ld_gamma_present(target);   /* patch 2070 */
++    rsx_present_geometry geometry; memset(&geometry, 0, sizeof geometry);
++    const int present_scaling = ld_dm_scaling_now();
++    geometry.hud_kx = geometry.hud_ky = 1.0f;
++    if (ld_h169_on() && rsx_display_get_aspect() == RSX_DM_ASPECT_SCREEN && present_scaling == RSX_DM_STRETCH)
++        rsx_h169_factors(g_dm_bb_w, g_dm_bb_h, &geometry.hud_kx, &geometry.hud_ky);
++    geometry.hud_provenance = RSX_PG_HUD_GLOBAL_INFERENCE; /* explicit fallback for unknown lineage */
++    geometry.ui_surface = target; geometry.ui_generation = presented_surface->ui.generation;
++    geometry.ui_state = presented_surface->ui.state;
++    if (rsx_ui_read(&presented_surface->ui, &geometry.hud_kx, &geometry.hud_ky))
++        geometry.hud_provenance = RSX_PG_HUD_SURFACE_OWNER;
+     ld_dm_sync_size();                                    /* patch 2095: back buffers at the client size */
+     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+     ID3D12Resource* bb = g.backbuf[bbi];
+     /* patch 2095: a client of another size gets the image scaled aspect-correct, else the old copy */
+-    const int dm_scaled = (g_dm_bb_w != g.width || g_dm_bb_h != g.height) &&
++    const int copy_ok = ld_pg_can_copy(gm_copy ? gm_copy : srcimg, bb);
++    const int dm_scaled = !copy_ok &&
+         ld_dm_blit(gm_copy ? gm_copy : srcimg,
+-                   gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET, bbi);
+-    if (!dm_scaled && bb) {   /* patch 2152: bb NULL = GetBuffer failed: nothing copied, the resize is retried */
++                   gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET, bbi,
++                   present_scaling, &geometry);
++    if (!dm_scaled && bb && copy_ok) {   /* patch 2152: bb NULL = GetBuffer failed: nothing copied, the resize is retried */
+
+     D3D12_RESOURCE_BARRIER bar[2] = {0};
+     bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -18535,7 +18728,12 @@
+     bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+-    }   /* patch 2095 */
++        const rsx_pg_resource d = ld_pg_resource(bb);
++        const rsx_dm_rect full = {0, 0, (int)d.width, (int)d.height};
++        ld_pg_record(&geometry, bb, full);
++    } else if (!dm_scaled && bb) {
++        ld_pg_black(bb, bbi, &geometry); /* no incompatible copy on a failed scaling pass */
++    }   /* dimension-safe present routing */
+
+     ld_flush(LD_FLUSH_PRESENT);
+     {
+@@ -18557,7 +18755,7 @@
+         if (s_fail_at == -2) { const char* e = getenv("LD_TEST_PRESENT_FAIL"); s_fail_at = e && *e ? atol(e) : -1; }
+         const HRESULT present_hr = s_nopresent ? S_OK
+             : (s_fail_at >= 0 && (long)g_ld_frames == s_fail_at) ? DXGI_ERROR_INVALID_CALL
+-            : ld_present_swap();
++            : ld_present_swap(&geometry);
+         rsx_perf_add(RSX_PERF_SWAP_T, rsx_perf_now() - swap0);
+         if (SUCCEEDED(present_hr))
+             ld_present_measure_record(g_ld_frames + 1u);
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -63,6 +63,7 @@
+  * -----------------------------------------------------------------------*/
+ #include "rsx_display_mode.h"
+ #include "rsx_hud169.h"   /* patch 2113 */
++#include "rsx_present_geometry.h"
+ extern int rsx_live_draw_set_fullscreen(int on);   /* 1 taken, 0 refused, -1 no swap chain yet, -2 DXGI mode change in progress (rsx_live_draw.c) */
+ extern int rsx_live_draw_is_fullscreen(void);
+ extern int rsx_live_draw_take_present_failure(void);   /* patch 2130 */
+@@ -219,30 +220,26 @@
+
+ /* A client pixel -> the guest pixel under it, through the letterbox (1 inside the image, 0 on a bar). For the port's
+  * own mouse-driven UI; the game itself reads no cursor position. */
++static int rsx_display_client_map(int cx, int cy, int ui, int* gx, int* gy)
++{
++    RECT rc = {0, 0, 0, 0};
++    rsx_present_geometry geometry;
++    if (s_state.hwnd) GetClientRect(s_state.hwnd, &rc);
++    if (rsx_live_draw_get_present_geometry(&geometry))
++        return rsx_pg_map(&geometry, rc.right, rc.bottom, cx, cy, ui, gx, gy);
++    *gx = *gy = 0;
++    if (s_present_suppressed) return 0; /* no submitted game image, or black fallback */
++    /* The diagnostic GDI/null backend has no live-draw snapshot. */
++    const rsx_dm_rect r = rsx_dm_rect_for((int)s_state.width, (int)s_state.height,
++                                        rc.right, rc.bottom, s_dm_scaling, s_dm_filter);
++    return rsx_dm_to_guest(&r, (int)s_state.width, (int)s_state.height, cx, cy, gx, gy);
++}
++
+ int rsx_display_client_to_guest(int cx, int cy, int* gx, int* gy)
+-{
+-    RECT rc = {0, 0, 0, 0};
+-    rsx_dm_rect r;
+-    if (s_state.hwnd) GetClientRect(s_state.hwnd, &rc);
+-    r = rsx_dm_rect_for((int)s_state.width, (int)s_state.height, rc.right, rc.bottom, s_dm_scaling, s_dm_filter);
+-    return rsx_dm_to_guest(&r, (int)s_state.width, (int)s_state.height, cx, cy, gx, gy);
+-}
+-
+-/* KZ3 patch 2113: the menu mouse's map (patch 2098's g_mouse_guest, used only by the GUM hit test): a client pixel ->
+- * the guest UI pixel shown there while the 2D layer is squeezed into the centred 16:9 box (rsx_hud169.h); 0 on a bar.
+- * Look and aim read raw deltas and never come here. */
+-int rsx_live_draw_hud169_factors(float* kx, float* ky);   /* rsx_live_draw.c */
++{ return rsx_display_client_map(cx, cy, 0, gx, gy); }
++
+ int rsx_display_client_to_ui(int cx, int cy, int* gx, int* gy)
+-{
+-    int ok = rsx_display_client_to_guest(cx, cy, gx, gy);
+-    float kx, ky, ux, uy;
+-    if (ok && rsx_live_draw_hud169_factors(&kx, &ky)) {
+-        ok = rsx_h169_ui_point((float)*gx + 0.5f, (float)*gy + 0.5f, (float)s_state.width, (float)s_state.height, kx, ky,
+-                               &ux, &uy);
+-        *gx = (int)floorf(ux); *gy = (int)floorf(uy);
+-    }
+-    return ok;
+-}
++{ return rsx_display_client_map(cx, cy, 1, gx, gy); }
+
+ static int rsx_dm_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
+ {
+--- /dev/null
++++ b/libs/video/rsx_present_geometry.h
+@@ -0,0 +1,78 @@
++/* Presentation geometry shared by the renderer and inverse UI mapping.
++ * Coordinates describe the last successfully submitted presentation, not scanout.
++ * No Win32 types: synthetic host tests exercise the mapping and copy policy. */
++#ifndef RSX_PRESENT_GEOMETRY_H
++#define RSX_PRESENT_GEOMETRY_H
++#include <stdint.h>
++#include <math.h>
++
++typedef struct { int x, y, w, h; } rsx_pg_rect;
++/* Restricted direct-UI ownership propagates through proven whole transfers.
++ * Unknown partial/blur/composite paths retain explicit inference, which must
++ * not be mistaken for a transform captured at the visible HUD draw boundary. */
++enum { RSX_PG_HUD_UNKNOWN = 0, RSX_PG_HUD_GLOBAL_INFERENCE = 1, RSX_PG_HUD_MOVIE_PIXELS = 2,
++       RSX_PG_HUD_SURFACE_OWNER = 3, RSX_PG_HUD_MOVIE_OWNER = 4 };
++typedef struct {
++    int valid;
++    unsigned frame;
++    unsigned logical_w, logical_h, target_w, target_h;
++    rsx_pg_rect image;
++    float hud_kx, hud_ky;
++    int hud_provenance;
++    unsigned ui_surface, ui_state;
++    uint64_t ui_generation;
++} rsx_present_geometry;
++
++typedef struct {
++    uint64_t width;
++    unsigned dimension, height, depth, mips, format, samples, quality;
++} rsx_pg_resource;
++
++/* Strict compatibility is deliberately conservative. No fallback copy of a
++ * differently-sized/typed texture is permitted; scaling may recover later. */
++static inline int rsx_pg_copy_compatible(const rsx_pg_resource* a, const rsx_pg_resource* b)
++{
++    return a->dimension && a->width && a->height && a->depth && a->mips && a->samples &&
++           a->dimension == b->dimension && a->width == b->width && a->height == b->height &&
++           a->depth == b->depth && a->mips == b->mips && a->format == b->format &&
++           a->samples == b->samples && a->quality == b->quality;
++}
++
++/* Client pixel centres -> last submitted target -> image -> logical guest/UI.
++ * A negative image origin supports cropped Fill rectangles as well as Fit and
++ * Stretch. This does not introduce a Fill setting or an internal render scale. */
++static inline int rsx_pg_map(const rsx_present_geometry* p, int cw, int ch,
++                             int cx, int cy, int ui, int* gx, int* gy)
++{
++    *gx = *gy = 0;
++    if (!p->valid || !p->logical_w || !p->logical_h || !p->target_w || !p->target_h ||
++        p->image.w <= 0 || p->image.h <= 0 || cw <= 0 || ch <= 0 ||
++        !isfinite(p->hud_kx) || !isfinite(p->hud_ky) || p->hud_kx <= 0 || p->hud_ky <= 0)
++        return 0;
++    const double bx = ((double)cx + 0.5) * p->target_w / cw;
++    const double by = ((double)cy + 0.5) * p->target_h / ch;
++    const int inside = cx >= 0 && cy >= 0 && cx < cw && cy < ch &&
++        bx >= p->image.x && by >= p->image.y &&
++        bx < (double)p->image.x + p->image.w && by < (double)p->image.y + p->image.h;
++    double x = (bx - p->image.x) * p->logical_w / p->image.w;
++    double y = (by - p->image.y) * p->logical_h / p->image.h;
++    x = x < 0 ? 0 : x >= p->logical_w ? p->logical_w - 1 : x;
++    y = y < 0 ? 0 : y >= p->logical_h ? p->logical_h - 1 : y;
++    if (inside && ui) {
++        x = p->logical_w * 0.5 + (x - p->logical_w * 0.5) / p->hud_kx;
++        y = p->logical_h * 0.5 + (y - p->logical_h * 0.5) / p->hud_ky;
++    }
++    if (!isfinite(x) || !isfinite(y) || x < -2147483647.0 || x > 2147483647.0 ||
++        y < -2147483647.0 || y > 2147483647.0) return 0;
++    *gx = (int)floor(x); *gy = (int)floor(y);
++    return inside && x >= 0 && y >= 0 && x < p->logical_w && y < p->logical_h;
++}
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++int rsx_live_draw_get_present_geometry(rsx_present_geometry* out);
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/libs/video/rsx_ui_provenance.h
+@@ -0,0 +1,99 @@
++/* Scheduled UI-transform ownership, independent of renderer profiling.
++ * A tag describes a consistent direct-UI transform since a known full clear
++ * or whole-image copy. It is not a GPU pixel-coverage/scanout assertion. */
++#ifndef RSX_UI_PROVENANCE_H
++#define RSX_UI_PROVENANCE_H
++#include <stdint.h>
++#include <math.h>
++
++enum { RSX_UI_UNKNOWN = 0, RSX_UI_EMPTY = 1, RSX_UI_KNOWN = 2, RSX_UI_MIXED = 3 };
++typedef struct {
++    uint64_t generation;
++    uint64_t applied_generation;
++    unsigned state, draw_frame;
++    float kx, ky;
++} rsx_ui_provenance;
++
++static inline int rsx_ui_factors_valid(float kx, float ky)
++{ return isfinite(kx) && isfinite(ky) && kx > 0 && ky > 0; }
++
++static inline void rsx_ui_unknown(rsx_ui_provenance* p)
++{
++    p->generation++;
++    if (!p->generation) p->generation = 1;
++    p->state = RSX_UI_UNKNOWN;
++    p->applied_generation = 0;
++    p->kx = p->ky = 1.0f;
++}
++
++/* A constant clear adds no UI transform. A partial clear preserves the
++ * transform of remaining UI pixels; a full clear establishes an empty base. */
++static inline void rsx_ui_clear(rsx_ui_provenance* p, int full)
++{
++    p->generation++;
++    if (!p->generation) { p->generation = 1; p->state = RSX_UI_UNKNOWN; p->applied_generation = 0; }
++    if (full) {
++        p->state = RSX_UI_EMPTY;
++        p->applied_generation = 0;
++        p->kx = p->ky = 1.0f;
++    }
++}
++
++/* Classification matches the existing HUD-squeeze eligibility even when the
++ * requested factor is unit (HUD169 off, fixed camera, or 16:9 output). */
++static inline int rsx_ui_direct_candidate(int display, int full_viewport, int is169,
++                                           int compose, int sampled_full_surface)
++{ return display && full_viewport && is169 && !compose && !sampled_full_surface; }
++
++/* Keep the squeeze classification unchanged. Ownership additionally requires
++ * that the mapped logical viewport covers the resource whose pixels we tag. */
++static inline int rsx_ui_owner_extent_matches(unsigned clip_w, unsigned clip_h,
++    unsigned surface_w, unsigned surface_h, unsigned view_w, unsigned view_h,
++    unsigned logical_w, unsigned logical_h)
++{
++    return clip_w && clip_h && view_w && view_h && clip_w == surface_w && clip_h == surface_h &&
++           view_w == logical_w && view_h == logical_h;
++}
++
++/* Call only for a recorded, unconditional, colour-enabled, nonempty draw.
++ * Unknown backgrounds/composites remain unknown; this never promotes unknown
++ * historical contents merely because a later direct UI draw was observed. */
++static inline void rsx_ui_direct(rsx_ui_provenance* p, float kx, float ky, unsigned frame)
++{
++    p->generation++;
++    if (!p->generation) { p->generation = 1; p->state = RSX_UI_UNKNOWN; }
++    if (!rsx_ui_factors_valid(kx, ky)) {
++        p->state = RSX_UI_UNKNOWN; p->applied_generation = 0; return;
++    }
++    p->applied_generation = p->generation;
++    p->draw_frame = frame;
++    if (p->state == RSX_UI_EMPTY) {
++        p->state = RSX_UI_KNOWN; p->kx = kx; p->ky = ky;
++    } else if (p->state == RSX_UI_KNOWN && (p->kx != kx || p->ky != ky)) {
++        p->state = RSX_UI_MIXED;
++    }
++}
++
++/* The destination's write has already invalidated/advanced its version.
++ * Full normalized-image transfers preserve UI coordinates. Partial copies,
++ * crop, translation and arbitrary shader composites require richer lineage. */
++static inline void rsx_ui_inherit(rsx_ui_provenance* dst, const rsx_ui_provenance* src, int whole)
++{
++    if (!whole || !dst->generation) return;
++    if (!src->generation || (src->state == RSX_UI_KNOWN &&
++        (!src->applied_generation || src->applied_generation > src->generation ||
++         !rsx_ui_factors_valid(src->kx, src->ky)))) return;
++    const uint64_t version = dst->generation;
++    *dst = *src;
++    dst->generation = version;
++    /* A source's direct-write generation is not a destination version. */
++    dst->applied_generation = src->state == RSX_UI_KNOWN ? version : 0;
++}
++
++static inline int rsx_ui_read(const rsx_ui_provenance* p, float* kx, float* ky)
++{
++    if (!p->generation || !p->applied_generation || p->applied_generation > p->generation ||
++        p->state != RSX_UI_KNOWN || !rsx_ui_factors_valid(p->kx, p->ky)) return 0;
++    *kx = p->kx; *ky = p->ky; return 1;
++}
++#endif

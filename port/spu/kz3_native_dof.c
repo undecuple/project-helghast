@@ -5,7 +5,7 @@
  * in KZ3's schedule: 4 pixels a step (one quadword of pixels and one of weights, four float4 out), r6 counts pixels.
  * Bit-exact with the lifted code by construction (every float op is a plain SSE mul of values far from exponent 255)
  * and checked by tools/spu/native_diff.py on synthetic and recorded states. The gather @0x51F0 (pass 135) follows
- * below; KZ3_NATIVE_JOB_DOFGATHER=1 (or KZ3_NATIVE_JOB_POST=1) turns it on, default off until its toggle A/B.
+ * below; KZ3_NATIVE_JOB_DOFGATHER=1 (or KZ3_NATIVE_JOB_POST=1) turns it on, default on since SPU pass 157 (toggle A/B 3/3 faster; =0 turns it off); the 1.00 twin (slot 21) stays opt-in.
  * Registers: the kernel leaves r2-r79 as they were (call site 0x4C54 reads none: r4, r2-r6, r8, r9 are loaded again at
  * 0x4C58) and keeps r0, r1, r80-r127.
  */
@@ -197,7 +197,7 @@ static int dof_gather_51F0(spu_context* ctx)
 const kz3_native_entry kz3_native_dof[] = {
     {6, DOF_ENV, "Gfx.Post.DepthOfField", "job_011f9c80", 0x5780u, dof_unpack_5780, "dof_unpack", POOL_UNPACK, 1},
     {7, DOF_ENV, "Gfx.Post.DepthOfField", "job_0117d880", 0x5780u, dof_unpack_5780, "dof_unpack", POOL_UNPACK},
-    {20, GATHER_ENV, "Gfx.Post.DepthOfField", "job_011f9c80", 0x51F0u, dof_gather_51F0, "dof_gather", POOL_GATHER},
+    {20, GATHER_ENV, "Gfx.Post.DepthOfField", "job_011f9c80", 0x51F0u, dof_gather_51F0, "dof_gather", POOL_GATHER, 1},
     {21, GATHER_ENV, "Gfx.Post.DepthOfField", "job_0117d880", 0x51F0u, dof_gather_51F0, "dof_gather", POOL_GATHER},
 };
 const unsigned kz3_native_dof_n = sizeof kz3_native_dof / sizeof kz3_native_dof[0];

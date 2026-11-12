@@ -3,14 +3,14 @@
 # toolkit (work/ps3recomp-patched or KZ3_PATCHED_DIR). Three parts:
 #  1. no per-call getenv("NAME") is left for the switches 1127 caches (only the one-time reads it keeps by name);
 #  2. every changed file still compiles on POSIX (-fsyntax-only, implicit declarations are errors);
-#  3. the KZ3_ENV_ON / KZ3_ENV_STR macros, taken from the patched spurs_job.c, call getenv once per slot (getenv
+#  3. the KZ3_ENV_ON / KZ3_ENV_STR macros, taken from the patched sys_semaphore.c (v0.19: spurs_job.c reads SPURS_JOB_DUMP/DESCDUMP through upstream ps3_env_once), call getenv once per slot (getenv
 #     wrapped with -Wl,--wrap=getenv) and give the same answer as getenv for set, unset and empty switches.
 # Self-contained (no game data); SKIP without the patched tree. Exit 1 on any failure.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 [[ -d $T/runtime/spu ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
-grep -q "KZ3_ENV_ON" "$T/runtime/spu/spurs_job.c" || { echo "FAIL: patch 1127 not applied"; exit 1; }
+grep -q "KZ3_ENV_ON" "$T/runtime/syscalls/sys_semaphore.c" || { echo "FAIL: patch 1127 not applied"; exit 1; }
 fail=0; pass=0
 # file  name  per-name getenv calls allowed (the one-time reads; v0.18.0, SPU pass 108: upstream 634871d1 caches
 # SPU_ARGWATCH, SEMTID and SEMCHAIN itself in a static per site, so those lines count its one-time reads)
@@ -19,8 +19,6 @@ while read -r f n want; do
   got=$(grep -c "getenv(\"$n\")" "$T/$f")
   if [[ $got == "$want" ]]; then pass=$((pass+1)); else echo "FAIL $f $n: $got getenv(\"$n\") left, want $want"; fail=1; fi
 done <<'L'
-runtime/spu/spurs_job.c SPURS_JOB_DUMP 0
-runtime/spu/spurs_job.c SPURS_JOB_DESCDUMP 1
 runtime/spu/spu_lifted_job.h SPURS_TASKSET_TRACE 1
 runtime/spu/spu_lifted_job.h SPU_WORKER_TRACE 1
 runtime/spu/spu_channels.c SPU_ARGWATCH 1
@@ -59,7 +57,7 @@ for f in runtime/spu/spurs_job.c runtime/spu/spu_channels.c runtime/syscalls/sys
 done
 echo "part 2: $n files compile"
 { echo '#include <stdio.h>'; echo '#include <stdlib.h>'; echo '#include <string.h>'
-  sed -n '/^#ifndef KZ3_ENV_ON/,/^#endif/p' "$T/runtime/spu/spurs_job.c"
+  sed -n '/^#ifndef KZ3_ENV_ON/,/^#endif/p' "$T/runtime/syscalls/sys_semaphore.c"
   cat <<'C'
 static int calls;
 char* __real_getenv(const char*);

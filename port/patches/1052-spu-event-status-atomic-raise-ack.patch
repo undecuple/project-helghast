@@ -4,11 +4,13 @@ Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR290 registry list
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): largely absorbed by 81344af1 (`SPU_EVENT_SET/CLEAR`); 1052's raise/ack helpers and KZ3_SPU_RACE_OLD kept (1064 etc. use them); the WrEventAck path gains upstream's "list stall still pending re-raises Sn".
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index cd0adb89..f965e0a1 100644
+index 427fb9c..14b8774 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -2189,7 +2189,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -2374,7 +2374,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
              u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
              int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
@@ -24,10 +26,10 @@ index cd0adb89..f965e0a1 100644
                  vm_write32(ea + SPURS_WKL_SIGNAL1,
                             (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index d7a0e5ea..4ff9a3d4 100644
+index 69e66b2..c00d154 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1100,7 +1100,7 @@ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
+@@ -1119,7 +1119,7 @@ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
           * long-missing producer for event_status (previously only ever cleared
           * via WrEventAck -> RdEventStat waits could never complete). */
          if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
@@ -36,7 +38,7 @@ index d7a0e5ea..4ff9a3d4 100644
              spu_ch_wake(ctx);
          }
          return;
-@@ -1159,15 +1159,12 @@ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
+@@ -1178,15 +1178,12 @@ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
           * it still holds a reservation it has already lost, which is the parked
           * SPURS kernel this whole mechanism exists to wake. */
          spu_lockline_lock();
@@ -56,8 +58,8 @@ index d7a0e5ea..4ff9a3d4 100644
 +            spu_event_raise(ctx, 0x2u);
          spu_lockline_unlock();
          break;
-     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
-@@ -1228,7 +1225,7 @@ static void spu_resv_lost_poll(spu_context* ctx)
+     case SPU_WrSRR0:         ctx->srr0 = v & 0x3FFFCu;   /* a word-aligned LS address */ break;
+@@ -1247,7 +1244,7 @@ static void spu_resv_lost_poll(spu_context* ctx)
      if (!vm_base || ctx->resv_ea == 0) return;
      if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
          ctx->resv_valid = 0;
@@ -66,7 +68,7 @@ index d7a0e5ea..4ff9a3d4 100644
      }
  }
  
-@@ -1240,7 +1237,7 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
+@@ -1259,7 +1256,7 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
      case SPU_RdInMbox:      return ctx->rcv_evt_n != 0 || ctx->ch_in_mbox.count != 0;
      case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
      case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count != 0;
@@ -75,16 +77,16 @@ index d7a0e5ea..4ff9a3d4 100644
      default:                return 1;   /* non-blocking channels: always ready */
      }
  }
-@@ -1403,7 +1400,7 @@ static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel)
-         break;
-     }
-     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
--    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status; break;
-+    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = spu_event_load(ctx); break;
+@@ -1437,7 +1434,7 @@ static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel)
+      * not unmasked (an Lr left by a lost reservation, an Sn) must not show up
+      * in a read that is waiting on a different set; this is the condition
+      * spu_ch_ready and rchcnt already use. */
+-    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status & ctx->event_mask; break;
++    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = spu_event_load(ctx) & ctx->event_mask;   /* #619 mask, 1052 atomic load */ break;
      /* CBEA 9.8: numeric bit 0 is interrupt-enable, independent of run status.
       * This runtime models nonisolated SPUs, so the isolation bit stays clear. */
      case SPU_RdMachStat:    v = ctx->int_enable & 1u; break;
-@@ -1600,7 +1597,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+@@ -1634,7 +1631,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
       * lost-reservation poll, so the two now agree by construction. */
      case SPU_RdEventStat:
          spu_resv_lost_poll(ctx);
@@ -94,10 +96,10 @@ index d7a0e5ea..4ff9a3d4 100644
      /* Stall-and-notify status is a single-value channel: count is 1 while a
       * newly-stalled tag is pending to be read, else 0. The wwsjob interrupt
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index 4df1a8fc..a38ae59b 100644
+index 22ded47..4bab6f2 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
-@@ -454,6 +454,38 @@ typedef struct spu_context {
+@@ -462,6 +462,38 @@ typedef struct spu_context {
  #define SPU_EVENT_SET(c, b)   __atomic_fetch_or(&(c)->event_status, (uint32_t)(b), __ATOMIC_SEQ_CST)
  #define SPU_EVENT_CLEAR(c, b) __atomic_fetch_and(&(c)->event_status, ~(uint32_t)(b), __ATOMIC_SEQ_CST)
  #endif
@@ -136,7 +138,7 @@ index 4df1a8fc..a38ae59b 100644
  
  /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
   * base) that the HLE kernel plants as exitToKernelAddr / selectWorkloadAddr in
-@@ -1065,7 +1097,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+@@ -1091,7 +1123,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
              if (g_yz_lockstep_on) yz_lockstep_tick(ctx);       \
              spu_task_launch_check((ctx), (void*)_tf);          \
              if ((ctx)->int_enable &&                            \
@@ -146,7 +148,7 @@ index 4df1a8fc..a38ae59b 100644
              else if (__builtin_expect(g_spu_irqwait_diag != 0, 0) && \
                       (ctx)->int_enable)                         \
 diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
-index 7961c8a0..9c9451a0 100644
+index 7961c8a..9c9451a 100644
 --- a/runtime/spu/spu_dma.h
 +++ b/runtime/spu/spu_dma.h
 @@ -890,12 +890,7 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,

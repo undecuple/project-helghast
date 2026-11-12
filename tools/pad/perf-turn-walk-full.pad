@@ -1,0 +1,4 @@
+# Relative seconds. Full-stick turn followed by a short forward walk.
+# Require the camera-log rotation gate; input duration alone does not prove a full turn.
+0:0,0,1,0/29.5
+30:0,-1,0,0/4

@@ -191,3 +191,15 @@ index 15884a50..c9502c2d 100644
  
  #ifdef _WIN32
      WakeConditionVariable(&q->not_empty);
+diff --git a/tests/sync_stress/test_shims.c b/tests/sync_stress/test_shims.c
+--- a/tests/sync_stress/test_shims.c
++++ b/tests/sync_stress/test_shims.c
+@@ -43,6 +43,8 @@
+ void lbp_breadcrumb_dump(const char* tag) { (void)tag; }
+ void ps3_spu_job_complete_pending(void) {}
+ void ppu_log_host_chain(const char* tag) { (void)tag; }
++/* KZ3 patch 1029: sys_event.c's trace lines call it (defined by the platform layer in the game build). */
++unsigned long long ps3_ms_now(void) { return 0; }
+ 
+ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
+ {

@@ -1,0 +1,23 @@
+{
+  "schema": "kz3.play/1",
+  "name": "k4-checkpoint",
+  "steps": [
+    {
+      "id": "level-request",
+      "op": "wait",
+      "text": "levels.single_player.frozen_shores.leveldescription_optimized.core' ->",
+      "timeout": 150
+    },
+    {
+      "id": "checkpoint",
+      "op": "wait",
+      "text": "[cellSaveData] UserAutoSave(",
+      "timeout": 60
+    },
+    {"id": "settle", "op": "flips", "count": 360, "timeout": 40},
+    {"id": "checkpoint-view", "op": "capture", "timeout": 10},
+    {"id": "fire", "op": "key", "button": "R1", "reports": 4, "timeout": 10},
+    {"id": "after-fire-settle", "op": "flips", "count": 60, "timeout": 30},
+    {"id": "after-fire-view", "op": "capture", "timeout": 10}
+  ]
+}

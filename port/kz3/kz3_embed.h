@@ -8,7 +8,7 @@
  * (kz3_embedded_eboot returns NULL) and keeps taking argv[1] / kz3.ini / the EBOOT beside the exe.
  *
  * Header-only: a small SHA-256 (FIPS 180-4) and the known decrypted EBOOT hashes (numbers; the same values as
- * tools/release/eboot_sha256.json, test_kz3_embed.py keeps them equal). */
+ * tools/release/eboot_ids.json, test_kz3_embed.py keeps them equal). */
 #ifndef KZ3_EMBED_H
 #define KZ3_EMBED_H
 

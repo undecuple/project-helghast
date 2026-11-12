@@ -11,11 +11,13 @@ Rebased on ps3recomp v0.17.0 (SPU pass 95): #381's weak ppu_resv_break_line and 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (striped seqlock lock line) over c9a450d8 (lock-free GETLLAR for registered holders) and the list registry; upstream's bitmap pointer `g_spu_coh_bits` is now published by our reserve (the PPU store paths test it inline, spu_coh_bitmap.h; both store macros use `spu_coh_line_reserved`); upstream's line watches (`spu_coh_watch_add`, used by SPURS task signal waits 2913a317) kept and woken from our notifiers; #522's stwcx/stdcx re-check under the lock kept, under the line's stripe; upstream `spu_coh_reserve_fast` left dead (coh_listed never set).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 152): v0.19 #672 (holder array with prefetch, 'coh_listed' fast GETLLAR) replaced the registry around the same lines; the striped lock, seqlock GETLLAR and the 8-slot atomic holder registry stay ours in runtime/spu/spu_coherency.c (same choice as the v0.18 rebase over c9a450d8); cellSpurs.c keeps both upstream's ef_w32 helper and our stripe-based ef_line_begin.
+
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 97d20950..b42d0a33 100644
+index e68c383..9cca209 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -110,6 +110,9 @@ add_library(ps3recomp_runtime STATIC
+@@ -117,6 +117,9 @@ add_library(ps3recomp_runtime STATIC
  target_include_directories(ps3recomp_runtime PUBLIC
      "${CMAKE_CURRENT_SOURCE_DIR}/include"
  )
@@ -26,13 +28,13 @@ index 97d20950..b42d0a33 100644
  # HLE modules include their own headers
  target_include_directories(ps3recomp_runtime PRIVATE
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index f965e0a1..ad951df1 100644
+index 5e31dd6..6803d09 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -274,15 +274,20 @@ extern int  spu_coh_is_reserved(uint32_t);
- extern void spu_coh_notify_write(uint32_t);
- static inline u16 ef_r16(uint32_t a) { const uint8_t* p = vm_base + a; return (u16)((p[0] << 8) | p[1]); }
- static inline void ef_w16(uint32_t a, u16 v) { uint8_t* p = vm_base + a; p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+@@ -283,15 +283,20 @@ static inline void ef_w32(uint32_t a, u32 v)
+     uint8_t* p = vm_base + a;
+     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+ }
 +/* KZ3 patch 1056: the event flag's lines' stripes (ef_line_begin) instead of the whole lock. */
 +extern uint64_t spu_ll_mask(uint32_t ea, uint32_t len);
 +extern void spu_ll_lock_mask(uint64_t mask);
@@ -52,7 +54,7 @@ index f965e0a1..ad951df1 100644
      u16 events        = ef_r16(ea + EF_EVENTS);
      u16 used          = (u16)(ef_r16(ea + EF_SPU_USED_SLOTS) &
                                ~ef_r16(ea + EF_SPU_PENDING_RECV));
-@@ -2655,7 +2660,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
+@@ -2781,7 +2786,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
      if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
          /* Clear from the CURRENT word: bits an SPU set since `current` was
           * read must survive. */
@@ -61,7 +63,7 @@ index f965e0a1..ad951df1 100644
          ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
          ef_line_end(ea);
      }
-@@ -2699,7 +2704,7 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
+@@ -2825,7 +2830,7 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
      u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                         : (u16)(current & pattern);
      if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
@@ -70,7 +72,7 @@ index f965e0a1..ad951df1 100644
          ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
          ef_line_end(ea);
      }
-@@ -2719,7 +2724,7 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
+@@ -2845,7 +2850,7 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
          return CELL_SPURS_TASK_ERROR_STAT;
  
      ef_lock(sync);
@@ -80,10 +82,10 @@ index f965e0a1..ad951df1 100644
      ef_line_end(ea);
      ef_unlock(sync);
 diff --git a/libs/sync/cellSync.c b/libs/sync/cellSync.c
-index f1bf9456..1c413be9 100644
+index 0a0c854..3efab37 100644
 --- a/libs/sync/cellSync.c
 +++ b/libs/sync/cellSync.c
-@@ -73,12 +73,17 @@ extern void spu_lockline_lock(void);
+@@ -78,12 +78,17 @@ extern void spu_lockline_lock(void);
  extern void spu_lockline_unlock(void);
  extern int  spu_coh_is_reserved(uint32_t ea);
  extern void spu_coh_notify_write(uint32_t ea);
@@ -103,8 +105,8 @@ index f1bf9456..1c413be9 100644
      return ok;
  }
  
-@@ -90,10 +95,11 @@ s32 cellSyncMutexInitialize(CellSyncMutex* mutex)
-         return CELL_SYNC_ERROR_NULL_POINTER;
+@@ -97,10 +102,11 @@ s32 cellSyncMutexInitialize(CellSyncMutex* mutex)
+         return CELL_SYNC_ERROR_ALIGN;
  
      SYNC_WATCH_LOG("INIT", _ea, mutex);
 -    spu_lockline_lock();
@@ -117,7 +119,7 @@ index f1bf9456..1c413be9 100644
      return CELL_OK;
  }
  
-@@ -420,7 +426,8 @@ typedef int (*sq_op)(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos);
+@@ -433,7 +439,8 @@ typedef int (*sq_op)(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos);
  static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
  {
      uint32_t depth = vm_read32(q + 0x0C);
@@ -127,7 +129,7 @@ index f1bf9456..1c413be9 100644
      uint32_t x0 = vm_read32(q), x4 = vm_read32(q + 4);
      int ok = op(&x0, &x4, depth, pos);
      if (ok) {
-@@ -428,17 +435,18 @@ static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
+@@ -441,17 +448,18 @@ static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
          memcpy(vm_ptr8(q), raw, 8);
          if (spu_coh_is_reserved(q)) spu_coh_notify_write(q);
      }
@@ -150,10 +152,10 @@ index f1bf9456..1c413be9 100644
  
  static int sq_push_begin(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos)
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index e04080b6..85a25bdf 100644
+index d67fac3..f09a244 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
-@@ -867,6 +867,9 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
+@@ -866,6 +866,9 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  extern "C" int  spu_coh_is_reserved(uint32_t addr);
  extern "C" void spu_lockline_lock(void);
  extern "C" void spu_lockline_unlock(void);
@@ -163,7 +165,7 @@ index e04080b6..85a25bdf 100644
  extern "C" void spu_coh_notify_write(uint32_t addr);
  
  /* ---------------------------------------------------------------------------
-@@ -1067,18 +1070,18 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
+@@ -1065,18 +1068,18 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
              if ((++n % 100000) == 1)
                  fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                          n, (uint32_t)ea & ~127u); } }
@@ -188,7 +190,7 @@ index e04080b6..85a25bdf 100644
      }
      if (ok) ppu_resv_break(ea);
      resv_unlock(L);
-@@ -1144,14 +1147,17 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
+@@ -1142,14 +1145,17 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
      resv_lock(L);
      if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
      int coh = spu_coh_is_reserved((uint32_t)ea);
@@ -210,7 +212,7 @@ index e04080b6..85a25bdf 100644
      }
      if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
      resv_unlock(L);
-@@ -1591,10 +1597,11 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
+@@ -1589,10 +1595,11 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
  #define VM_WRITE_COH(a, src, n)                                               \
      do {                                                                      \
          if (spu_coh_line_reserved((uint32_t)(a))) {                           \
@@ -225,7 +227,7 @@ index e04080b6..85a25bdf 100644
              memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
          }                                                                     \
 diff --git a/runtime/ppu/ppu_memory.h b/runtime/ppu/ppu_memory.h
-index 97a9d17f..ad2c88be 100644
+index 97a9d17..ad2c88b 100644
 --- a/runtime/ppu/ppu_memory.h
 +++ b/runtime/ppu/ppu_memory.h
 @@ -137,6 +137,23 @@ int         spu_coh_is_reserved(uint32_t addr);
@@ -327,10 +329,10 @@ index 97a9d17f..ad2c88be 100644
          ok = atomic_compare_exchange_strong_explicit(
              atom, &expected, desired,
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 4ff9a3d4..a23f745c 100644
+index c00d154..9b162ef 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -705,7 +705,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -710,7 +710,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                      cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
          if (cmd == MFC_GETLLAR_CMD) {
              memset(ls, 0, MFC_ATOMIC_LINE);
@@ -339,7 +341,7 @@ index 4ff9a3d4..a23f745c 100644
          } else {
              ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
          }
-@@ -773,18 +773,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -778,18 +778,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           * peer that must WRITE the line waits for it (canersaka ticks the
           * GETLLAR fast+slow paths for exactly this reason). */
          yz_lockstep_tick(ctx);
@@ -361,7 +363,7 @@ index 4ff9a3d4..a23f745c 100644
  
          /* ONE read of guest memory, then the snapshot from that copy.
           *
-@@ -803,7 +794,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -808,7 +799,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           * same instant. Copying the snapshot from `ls` restores that property,
           * and a store that lands after the read now leaves BOTH stale -- which
           * is what makes the lost-reservation event fire. */
@@ -369,7 +371,7 @@ index 4ff9a3d4..a23f745c 100644
          /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
           * single atomic 128-byte read, so the reserved data and the reservation
           * come from the same instant. Reading guest memory twice lets a PPU store
-@@ -814,11 +804,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -819,11 +809,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           * the new value, finds no difference, and never raises the event. Nobody
           * wakes anybody. Snapshotting from `ls` makes a later store leave BOTH
           * stale, which is exactly what makes the lost-reservation event fire. */
@@ -385,7 +387,7 @@ index 4ff9a3d4..a23f745c 100644
          ctx->atomic_stat = 4;
          ctx->dbg_getllar++;
          /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
-@@ -843,7 +835,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -848,7 +840,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                    fprintf(stderr, " %02X%02X%02X%02X", m[4*_w], m[4*_w+1], m[4*_w+2], m[4*_w+3]);
                fprintf(stderr, "\n");
            } }
@@ -393,7 +395,7 @@ index 4ff9a3d4..a23f745c 100644
          /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
           * used and the first word as it lands in BOTH places.
           *
-@@ -906,7 +897,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -911,7 +902,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          { extern uint32_t g_barrier_sync_watch;
            uint32_t b = g_barrier_sync_watch;
            if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
@@ -406,7 +408,7 @@ index 4ff9a3d4..a23f745c 100644
          if (ctx->resv_valid && ctx->resv_ea == ea &&
              memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
              { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
-@@ -1000,7 +995,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -1005,7 +1000,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                        ctx->atomic_stat ? "FAIL" : "OK",
                        ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
          ctx->resv_valid = 0;                           /* reservation consumed */
@@ -415,7 +417,7 @@ index 4ff9a3d4..a23f745c 100644
          if (ctx->atomic_stat == 0) {
              spu_taskset_line_committed(ea & ~127u);
              if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
-@@ -1012,7 +1007,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -1017,7 +1012,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
  
      case MFC_PUTLLUC_CMD:
      case MFC_PUTQLLUC_CMD:
@@ -427,7 +429,7 @@ index 4ff9a3d4..a23f745c 100644
          { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
            spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
          kz3_curcont_check(ctx, ea, mem, ls, "PUTLLUC");  /* KZ3 patch 1013 */
-@@ -1024,10 +1022,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -1029,10 +1027,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           * has already overwritten. */
          spu_coh_notify_write(ea);
          ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
@@ -440,7 +442,7 @@ index 4ff9a3d4..a23f745c 100644
  
      default:
          return 0;
-@@ -1158,14 +1157,20 @@ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
+@@ -1177,14 +1176,20 @@ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
           * has just acknowledged the events it read goes back to sleep believing
           * it still holds a reservation it has already lost, which is the parked
           * SPURS kernel this whole mechanism exists to wake. */
@@ -467,9 +469,9 @@ index 4ff9a3d4..a23f745c 100644
 +            if ((v & 0x2u) && ctx->list_stall_stat) spu_event_raise(ctx, 0x2u);
 +        }
          break;
-     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
+     case SPU_WrSRR0:         ctx->srr0 = v & 0x3FFFCu;   /* a word-aligned LS address */ break;
      default:
-@@ -1224,8 +1229,10 @@ static void spu_resv_lost_poll(spu_context* ctx)
+@@ -1243,8 +1248,10 @@ static void spu_resv_lost_poll(spu_context* ctx)
      if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
      if (!vm_base || ctx->resv_ea == 0) return;
      if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
@@ -483,7 +485,7 @@ index 4ff9a3d4..a23f745c 100644
  }
  
 diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
-index ed2bcf58..9b0faefc 100644
+index 10a9f11..70d0bed 100644
 --- a/runtime/spu/spu_coherency.c
 +++ b/runtime/spu/spu_coherency.c
 @@ -18,6 +18,8 @@
@@ -495,7 +497,7 @@ index ed2bcf58..9b0faefc 100644
  
  #ifdef __cplusplus
  extern "C" {
-@@ -32,78 +34,196 @@ extern "C" {
+@@ -32,90 +34,196 @@ extern "C" {
   * exclusion semantics, now shared. MSVC uses a bounded polite spin loop;
   * POSIX spins briefly and then parks on a mutex (see below).
   * ===========================================================================*/
@@ -507,6 +509,13 @@ index ed2bcf58..9b0faefc 100644
 - * pause, and yield after a long wait. The bare exchange loop let GH3's four
 - * idle job-policy pollers saturate the line and delay every other SPU atomic
 - * -- FMOD's mixer task among them, 25-40 ms at a time. */
+-/* After ~1 ms of spinning (six rounds of 4096 pauses) the waiter sleeps instead.
+- * SwitchToThread only hands the core to a thread queued on this same processor,
+- * and Sleep(0) only to one of equal or higher priority -- neither reaches a
+- * lower-priority holder that is waiting for a core. With every core busy, waiters
+- * above the holder's priority could keep it off the CPU for tens of milliseconds.
+- * A normal wait is far under a microsecond and never gets here.
+- * SPU_LOCKLINE_SLEEP=0 keeps the plain spin. */
 -void spu_lockline_lock(void)
 +/* KZ3 patch 1056: the lock-line lock is striped, and GETLLAR reads under a
 + * sequence count instead of taking it. Idea from NoahBPeterson/ps3recomp
@@ -567,7 +576,18 @@ index ed2bcf58..9b0faefc 100644
 +                          s_st_fast, s_st_retry, s_st_locked, s_st_drop;
 +#define LL_ST(v, n) do { if (spu_ll_stats_on()) __atomic_fetch_add(&(v), (n), __ATOMIC_RELAXED); } while (0)
 +static void spu_ll_stats_tick(void)
-+{
+ {
+-    static int s_sleep = -1;
+-    unsigned spins = 0, rounds = 0;
+-    while (_InterlockedExchange(&g_lockline, 1)) {
+-        if (s_sleep < 0) { const char* e = getenv("SPU_LOCKLINE_SLEEP"); s_sleep = !(e && e[0] == '0'); }
+-        do {
+-            _mm_pause();
+-            if (++spins >= 4096) {
+-                spins = 0;
+-                if (rounds++ < 6 || !s_sleep) SwitchToThread(); else Sleep(1);
+-            }
+-        } while (g_lockline);
 +    static time_t last;
 +    static unsigned long long n;
 +    if ((++n & 0xFFFF) != 0) return;
@@ -597,26 +617,8 @@ index ed2bcf58..9b0faefc 100644
 +    for (uint32_t l = first; ; l++) {
 +        m |= 1ull << ((l * 0x9E3779B1u) >> (32 - SPU_LL_STRIPE_BITS));
 +        if (l == last) break;
-+    }
-+    return m;
-+}
-+static __attribute__((noinline)) void spu_ll_lock_slow(volatile uint32_t* w)
- {
-     unsigned spins = 0;
--    while (_InterlockedExchange(&g_lockline, 1)) {
--        do {
--            _mm_pause();
--            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
--        } while (g_lockline);
-+    LL_ST(s_st_cont, 1);
-+    for (;;) {
-+        uint32_t s = __atomic_load_n(w, __ATOMIC_RELAXED);
-+        if (!(s & 1u) && __atomic_compare_exchange_n(w, &s, s + 1u, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
-+            break;
-+        LL_PAUSE();
-+        if (++spins >= 4096) { spins = 0; LL_ST(s_st_yield, 1); LL_YIELD(); }
-+        LL_ST(s_st_spin, 1);
      }
++    return m;
  }
 -void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
 -#elif defined(_WIN32)
@@ -642,7 +644,7 @@ index ed2bcf58..9b0faefc 100644
 - * same non-recursive exclusion and acquire/release publication. */
 -static pthread_mutex_t g_lockline = PTHREAD_MUTEX_INITIALIZER;
 -static inline uint64_t spu_lockline_now_ns(void)
-+static inline void spu_ll_lock_i(uint32_t i)
++static __attribute__((noinline)) void spu_ll_lock_slow(volatile uint32_t* w)
  {
 -#if defined(__APPLE__)
 -    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -651,20 +653,40 @@ index ed2bcf58..9b0faefc 100644
 -    clock_gettime(CLOCK_MONOTONIC, &ts);
 -    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 -#endif
-+    volatile uint32_t* w = &s_ll[i].seq;
-+    uint32_t s = __atomic_load_n(w, __ATOMIC_RELAXED);
-+    LL_ST(s_st_lock, 1);
-+    if ((s & 1u) || !__atomic_compare_exchange_n(w, &s, s + 1u, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
-+        spu_ll_lock_slow(w);
++    unsigned spins = 0;
++    LL_ST(s_st_cont, 1);
++    for (;;) {
++        uint32_t s = __atomic_load_n(w, __ATOMIC_RELAXED);
++        if (!(s & 1u) && __atomic_compare_exchange_n(w, &s, s + 1u, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
++            break;
++        LL_PAUSE();
++        if (++spins >= 4096) { spins = 0; LL_ST(s_st_yield, 1); LL_YIELD(); }
++        LL_ST(s_st_spin, 1);
++    }
  }
 -static inline void spu_lockline_relax(void)
-+static inline void spu_ll_unlock_i(uint32_t i)
++static inline void spu_ll_lock_i(uint32_t i)
  {
 -#if defined(__aarch64__)
 -    __asm__ __volatile__("yield");
 -#elif defined(__x86_64__) || defined(__i386__)
 -    __builtin_ia32_pause();
 -#endif
++    volatile uint32_t* w = &s_ll[i].seq;
++    uint32_t s = __atomic_load_n(w, __ATOMIC_RELAXED);
++    LL_ST(s_st_lock, 1);
++    if ((s & 1u) || !__atomic_compare_exchange_n(w, &s, s + 1u, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
++        spu_ll_lock_slow(w);
+ }
+-void spu_lockline_lock(void)
++static inline void spu_ll_unlock_i(uint32_t i)
+ {
+-    if (!pthread_mutex_trylock(&g_lockline)) return;
+-    const uint64_t give_up = spu_lockline_now_ns() + 20000u;
+-    for (unsigned backoff = 16;; backoff = backoff < 1024u ? backoff * 2u : backoff) {
+-        for (unsigned i = 0; i < backoff; ++i) spu_lockline_relax();
+-        if (!pthread_mutex_trylock(&g_lockline)) return;
+-        if (spu_lockline_now_ns() >= give_up) break;
 +    volatile uint32_t* w = &s_ll[i].seq;
 +    __atomic_store_n(w, *w + 1u, __ATOMIC_RELEASE);
 +}
@@ -687,16 +709,9 @@ index ed2bcf58..9b0faefc 100644
 +{
 +    uint32_t s = __atomic_load_n(&s_ll[spu_ll_stripe_of(ea)].seq, __ATOMIC_ACQUIRE);
 +    return (s & 1u) ? 0xFFFFFFFFu : s;
- }
--void spu_lockline_lock(void)
++}
 +int spu_ll_read_valid(uint32_t ea, uint32_t seq)
- {
--    if (!pthread_mutex_trylock(&g_lockline)) return;
--    const uint64_t give_up = spu_lockline_now_ns() + 20000u;
--    for (unsigned backoff = 16;; backoff = backoff < 1024u ? backoff * 2u : backoff) {
--        for (unsigned i = 0; i < backoff; ++i) spu_lockline_relax();
--        if (!pthread_mutex_trylock(&g_lockline)) return;
--        if (spu_lockline_now_ns() >= give_up) break;
++{
 +    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 +    return __atomic_load_n(&s_ll[spu_ll_stripe_of(ea)].seq, __ATOMIC_SEQ_CST) == seq;
 +}
@@ -753,18 +768,25 @@ index ed2bcf58..9b0faefc 100644
  
  /* ===========================================================================
   * The reserved-line bitmap
-@@ -129,18 +249,15 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+@@ -141,25 +249,15 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
   * read unlocked, where a stale NULL costs at most one missed event on the very
   * first reservation of the run. */
  
 -/* Every live virtual context may retain a reservation between scheduling
 - * quanta; physical SPU count is not a bound on this set. All access is under
-- * the lock-line lock. Nodes are removed before their context's lifetime ends. */
--typedef struct spu_coh_entry {
--    spu_context* ctx;
--    struct spu_coh_entry* next;
--} spu_coh_entry;
--static spu_coh_entry* s_coh_ctxs;
+- * the lock-line lock. Entries are removed before their context's lifetime ends.
+- *
+- * A contiguous array, not a linked list: every notifier walks all of it with
+- * the line held, and a list's scattered nodes were a cache miss per holder on
+- * top of the one on each holder's resv_valid, which the walk now prefetches a
+- * few entries ahead. */
+-static spu_context** s_coh_ctxs;
+-static unsigned s_coh_n, s_coh_cap;
+-#define SPU_COH_PREFETCH 4
+-static inline void spu_coh_prefetch_holder(unsigned i)
+-{
+-    if (i < s_coh_n) __builtin_prefetch(&s_coh_ctxs[i]->resv_valid);
+-}
 -static spu_coh_watch* s_coh_watches;
 +/* The SPU contexts that have reserved a line. Sized to match the MFC engine
 + * registry in spu_channels.c, which is the ceiling on live SPU contexts. */
@@ -778,7 +800,7 @@ index ed2bcf58..9b0faefc 100644
  void spu_coh_reserve(spu_context* ctx, uint32_t ea)
  {
      /* Read before writing. The kernel reserves the same few lines over and
-@@ -148,25 +265,45 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+@@ -167,28 +265,45 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
       * from every other core: each PPU store then missed on the pointer and on
       * the bitmap byte. */
      uint32_t line = ea >> SPU_COH_LINE_SHIFT;
@@ -797,13 +819,18 @@ index ed2bcf58..9b0faefc 100644
 +    if (!__atomic_load_n(&g_spu_coh_bits, __ATOMIC_RELAXED))
 +        __atomic_store_n(&g_spu_coh_bits, (const unsigned char*)s_coh_bitmap, __ATOMIC_SEQ_CST);
      if (!ctx) return;
--    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
--        if (entry->ctx == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
--    spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
--    if (!entry) {
--        fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
--        fflush(stderr);
--        abort(); /* A missed holder loses invalidation events, including ABA. */
+-    for (unsigned i = 0; i < s_coh_n; i++)
+-        if (s_coh_ctxs[i] == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
+-    if (s_coh_n == s_coh_cap) {
+-        unsigned cap = s_coh_cap ? s_coh_cap * 2u : 64u;
+-        spu_context** grown = (spu_context**)realloc(s_coh_ctxs, cap * sizeof(*grown));
+-        if (!grown) {
+-            fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
+-            fflush(stderr);
+-            abort(); /* A missed holder loses invalidation events, including ABA. */
+-        }
+-        s_coh_ctxs = grown;
+-        s_coh_cap = cap;
 +    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
 +        if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) return;
 +    spu_coh_reserve_add(ctx);
@@ -825,9 +852,7 @@ index ed2bcf58..9b0faefc 100644
 +            __atomic_compare_exchange_n(&s_coh_ctxs[i], &none, ctx, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
 +            return;
      }
--    entry->ctx = ctx;
--    entry->next = s_coh_ctxs;
--    s_coh_ctxs = entry;
+-    s_coh_ctxs[s_coh_n++] = ctx;
 -    __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED);
 +    /* More live SPU contexts than the registry holds. The ones already in it
 +     * still get their events; this one would silently never wake, so say so. */
@@ -840,7 +865,7 @@ index ed2bcf58..9b0faefc 100644
  }
  
  void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
-@@ -198,6 +335,7 @@ static void spu_coh_wake_watches(uint32_t line)
+@@ -220,6 +335,7 @@ static void spu_coh_wake_watches(uint32_t line)
          if (w->line == line) w->wake(w->opaque);
  }
  
@@ -848,7 +873,7 @@ index ed2bcf58..9b0faefc 100644
  /* Drop a context from the reserving set.
   *
   * There was no way to do this, and the contexts that most need it are
-@@ -211,20 +349,20 @@ static void spu_coh_wake_watches(uint32_t line)
+@@ -233,18 +349,20 @@ static void spu_coh_wake_watches(uint32_t line)
  void spu_coh_unregister(spu_context* ctx)
  {
      if (!ctx) return;
@@ -865,11 +890,9 @@ index ed2bcf58..9b0faefc 100644
       * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
       * spu_coh_notify_write, reading a freed thread stack. */
      spu_lockline_lock();
--    for (spu_coh_entry** link = &s_coh_ctxs; *link; link = &(*link)->next) {
--        if ((*link)->ctx != ctx) continue;
--        spu_coh_entry* entry = *link;
--        *link = entry->next;
--        free(entry);
+-    for (unsigned i = 0; i < s_coh_n; i++) {
+-        if (s_coh_ctxs[i] != ctx) continue;
+-        s_coh_ctxs[i] = s_coh_ctxs[--s_coh_n];   /* order does not matter */
 -        break;
 -    }
 -    __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
@@ -878,30 +901,26 @@ index ed2bcf58..9b0faefc 100644
      spu_lockline_unlock();
  }
  
-@@ -237,18 +375,14 @@ void spu_coh_unregister(spu_context* ctx)
+@@ -257,16 +375,14 @@ void spu_coh_unregister(spu_context* ctx)
  void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
  {
      spu_lockline_lock();
--    for (spu_coh_entry** link = &s_coh_ctxs; *link;) {
--        spu_coh_entry* entry = *link;
--        uintptr_t c = (uintptr_t)entry->ctx;
+-    for (unsigned i = 0; i < s_coh_n;) {
 +    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
-+        uintptr_t c = (uintptr_t)s_coh_ctxs[i];
+         uintptr_t c = (uintptr_t)s_coh_ctxs[i];
          if (c >= lo && c < hi) {
              static int _n = 0;
              if (PS3_LOG_FIRST(_n, 16))
                  fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
--                        (void*)c, entry->ctx->image_id);
--            *link = entry->next;
--            free(entry);
+                         (void*)c, s_coh_ctxs[i]->image_id);
+-            s_coh_ctxs[i] = s_coh_ctxs[--s_coh_n];   /* re-check slot i */
 -        } else {
--            link = &entry->next;
-+                        (void*)c, s_coh_ctxs[i]->image_id);
+-            i++;
 +            __atomic_store_n(&s_coh_ctxs[i], NULL, __ATOMIC_RELEASE);
          }
      }
      spu_lockline_unlock();
-@@ -256,7 +390,9 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
+@@ -274,7 +390,9 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
  
  int spu_coh_is_reserved(uint32_t addr)
  {
@@ -912,7 +931,7 @@ index ed2bcf58..9b0faefc 100644
  }
  
  /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
-@@ -282,6 +418,15 @@ void ppu_resv_break_line_absent(uint32_t ea) { (void)ea; }
+@@ -300,6 +418,15 @@ void ppu_resv_break_line_absent(uint32_t ea) { (void)ea; }
  #else
  __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  #endif
@@ -928,15 +947,17 @@ index ed2bcf58..9b0faefc 100644
  
  /* ===========================================================================
   * GETLLAR without the lock-line lock
-@@ -350,16 +495,14 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
+@@ -368,18 +495,14 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
  void spu_coh_notify_write_except(uint32_t ea, const void* self)
  {
      uint32_t line = ea & ~127u;
 -    ppu_resv_break_line(ea);
 -    spu_coh_writer_fence();
 -    spu_coh_wake_watches(line);
--    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
--        spu_context* c = entry->ctx;
+-    for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
+-    for (unsigned i = 0; i < s_coh_n; i++) {
+-        spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
+-        spu_context* c = s_coh_ctxs[i];
 +    ppu_resv_break_line(ea);   /* upstream #381: line-granule PPU reservations */
 +    spu_coh_wake_watches(line);   /* upstream v0.18.0 */
 +    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
@@ -952,15 +973,17 @@ index ed2bcf58..9b0faefc 100644
              spu_ch_wake(c);
          }
      }
-@@ -368,15 +511,13 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
+@@ -388,17 +511,13 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
  void spu_coh_notify_write(uint32_t ea)
  {
      uint32_t line = ea & ~127u;
 -    ppu_resv_break_line(ea);
 -    spu_coh_writer_fence();
 -    spu_coh_wake_watches(line);
--    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
--        spu_context* c = entry->ctx;
+-    for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
+-    for (unsigned i = 0; i < s_coh_n; i++) {
+-        spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
+-        spu_context* c = s_coh_ctxs[i];
 +    ppu_resv_break_line(ea);   /* upstream #381: line-granule PPU reservations */
 +    spu_coh_wake_watches(line);   /* upstream v0.18.0 */
 +    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
@@ -974,7 +997,7 @@ index ed2bcf58..9b0faefc 100644
              /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
               * always fails for "no reservation" is useless without knowing who
               * took it away -- a peer SPU, or the PPU committing to the line. */
-@@ -386,7 +527,7 @@ void spu_coh_notify_write(uint32_t ea)
+@@ -408,7 +527,7 @@ void spu_coh_notify_write(uint32_t ea)
                    if ((++n % 200000) == 1)
                        fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",
                                n, line, c->image_id, (void*)c); } }
@@ -984,7 +1007,7 @@ index ed2bcf58..9b0faefc 100644
               * waiter re-polls its predicate on a timeout as well, so a
               * straggling store costs latency and not the wakeup itself. */
 diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
-index ea2e8351..4e5373a5 100644
+index ea2e835..4e5373a 100644
 --- a/runtime/spu/spu_coherency.h
 +++ b/runtime/spu/spu_coherency.h
 @@ -43,6 +43,23 @@ extern "C" {
@@ -1021,7 +1044,7 @@ index ea2e8351..4e5373a5 100644
   * write does not cost it its reservation on hardware. */
  void spu_coh_notify_write_except(uint32_t ea, const void* self);
 diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
-index 9c9451a0..be76e649 100644
+index 9c9451a..be76e64 100644
 --- a/runtime/spu/spu_dma.h
 +++ b/runtime/spu/spu_dma.h
 @@ -727,6 +727,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
@@ -1091,10 +1114,10 @@ index 9c9451a0..be76e649 100644
                      if (a == a1) break;
                  }
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
-index 2668c9cc..aae58d54 100644
+index 896f76e..8d39d34 100644
 --- a/runtime/spu/spu_workload.c
 +++ b/runtime/spu/spu_workload.c
-@@ -592,7 +592,10 @@ void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_co
+@@ -595,7 +595,10 @@ void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_co
      uint8_t* e = vm_base + ea;
      extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
      extern void spu_coh_notify_write(uint32_t ea);
@@ -1106,7 +1129,7 @@ index 2668c9cc..aae58d54 100644
      uint8_t st = e[15] & 0x0Fu;
      if (create) {
          if (st != 2 && st != 3) {          /* the task may already have exited: keep that */
-@@ -604,7 +607,7 @@ void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_co
+@@ -607,7 +610,7 @@ void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_co
          e[14] = 0; e[15] = (uint8_t)((e[15] & 0xF0u) | 2u);
      }
      spu_coh_notify_write(ea);              /* under the lock-line lock, as the notify expects (KZ3 patch 1030) */
@@ -1116,7 +1139,7 @@ index 2668c9cc..aae58d54 100644
      if (n++ < 16)
          fprintf(stderr, "[task2] taskset 0x%08X task %u %s exit_code[%u] state 0x%02X code %d\n", taskset_ea,
 diff --git a/runtime/spu/tests/test_spu_lockline_peer.c b/runtime/spu/tests/test_spu_lockline_peer.c
-index 32f1b479..2bb1236f 100644
+index 32f1b47..2bb1236 100644
 --- a/runtime/spu/tests/test_spu_lockline_peer.c
 +++ b/runtime/spu/tests/test_spu_lockline_peer.c
 @@ -558,69 +558,63 @@ static void test_unaligned_wide_put_around_a_reserved_line(void)

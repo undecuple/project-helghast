@@ -4,9 +4,13 @@ itself. A port module sets g_pad_kb_ext_cmd to answer its own commands before th
 Options > Display row "Discord status" ("discord state|on|off", port/net/kz3_discord.c, which turns the presence on
 or off at once and saves kz3.ini discord_presence). The hook runs on the guest's Lua thread and must not block long.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index abf486d..f07ed2e 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -531,10 +531,16 @@
+@@ -698,10 +698,16 @@ static void pad_kb_ensure_loaded(void)
  
  static int pad_remap_family_port0(void);   /* 4014, defined with the remap below */
  

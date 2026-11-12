@@ -10,7 +10,10 @@ time (the next look update uses them); pure clamp/step/format helpers (0.5..10 i
 pad_mouse_ini_upsert (set one key under [input] in kz3.ini text, other lines byte for byte) for the Options > Mouse
 page in port/kz3/main.cpp. Host test tools/smoke/test_mouse_opts.sh.
 
-diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+Rebased on ps3recomp v0.19.0 (SPU pass 154): the header part is on top of upstream's rsx_d3d12_device.h (see 2099): rsx_vendor_name, rsx_adapter_line and the once-per-process '[rsx] D3D12 adapter:' line inside upstream's rsx_d3d12_log_device. pad_mouse.{h,c} unchanged.
+
+diff --git a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+index a248e66..f42e78d 100644
 --- a/libs/input/pad_mouse.c
 +++ b/libs/input/pad_mouse.c
 @@ -13,6 +13,7 @@
@@ -21,7 +24,7 @@ diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
  static PadMouseEv  s_ev[PAD_MOUSE_SCRIPT_MAX];
  static int         s_nev;
  static double      s_t0 = -1.0;
-@@ -49,6 +50,8 @@
+@@ -49,6 +50,8 @@ static void pm_init(void)
      const float deg = pm_envf("KZ3_MOUSE_YAW", PAD_MOUSE_DEG_PER_COUNT);
      int bad = 0;
      s_cfg.sens = pad_mouse_rad_per_count(user, deg, &bad);
@@ -30,7 +33,7 @@ diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
      if (bad) fprintf(stderr, "[mouse] WARNING: KZ3_MOUSE_SENS/KZ3_MOUSE_YAW must be positive numbers: defaults used\n");
      s_cfg.zoom_sens = pm_envf("KZ3_MOUSE_ZOOM_SENS", 1.0f);
      if (!(s_cfg.zoom_sens > 0.0f)) {
-@@ -83,6 +86,24 @@
+@@ -83,6 +86,24 @@ int pad_mouse_enabled(void) { pm_init(); return s_on; }
  const PadMouseCfg* pad_mouse_cfg(void) { pm_init(); return &s_cfg; }
  int pad_mouse_log_each(void) { pm_init(); return s_log_each; }
  
@@ -55,7 +58,8 @@ diff -ruN a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
  /* Patch 2099: the accumulator's frame clock = the guest's flip requests (cellGcmSys.c; cellPad.c uses it too). */
  extern unsigned cellGcm_flip_request_count(void);
  static unsigned pm_flip_clock(void) { return cellGcm_flip_request_count(); }
-diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+diff --git a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+index 9116798..97f9b73 100644
 --- a/libs/input/pad_mouse.h
 +++ b/libs/input/pad_mouse.h
 @@ -44,6 +44,7 @@
@@ -66,7 +70,7 @@ diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
  #include <stdlib.h>
  #include <string.h>
  
-@@ -86,6 +87,90 @@
+@@ -86,6 +87,90 @@ static inline float pad_mouse_rad_per_count(float user, float deg_per_count, int
      return user * deg_per_count * 0.017453292519943295f;
  }
  
@@ -157,7 +161,7 @@ diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
  /* The look accumulator (pure; pad_mouse.c holds one under its lock). frame = the guest frame counter now. */
  typedef struct {
      long long dx, dy;      /* counts kept for the next take */
-@@ -280,6 +365,10 @@
+@@ -280,6 +365,10 @@ static inline int pad_menu_script_parse(const char* s, PadMenuScriptEv* ev, int
  int  pad_mouse_enabled(void);
  const PadMouseCfg* pad_mouse_cfg(void);
  int  pad_mouse_log_each(void);
@@ -168,14 +172,15 @@ diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
  void pad_mouse_add(int dx, int dy);
  /* Takes (and clears) the counts since the last call, plus the script's due events; `now` = seconds on the caller's
   * clock (the script's clock starts at the first call). Returns 1 when either count is non-zero. */
-diff -ruN a/libs/video/rsx_d3d12_device.h b/libs/video/rsx_d3d12_device.h
+diff --git a/libs/video/rsx_d3d12_device.h b/libs/video/rsx_d3d12_device.h
+index 24bd85b..daef41f 100644
 --- a/libs/video/rsx_d3d12_device.h
 +++ b/libs/video/rsx_d3d12_device.h
-@@ -35,6 +35,28 @@
- static inline int rsx_warp_try_hw(int mode) { return mode != RSX_WARP_FORCE; }
- static inline int rsx_warp_try_warp(int mode, int hw_ok) { return mode == RSX_WARP_FORCE || (mode == RSX_WARP_AUTO && !hw_ok); }
+@@ -76,6 +76,28 @@ static inline int rsx_pick_device(int mode, const rsx_adapter_info* a, int n,
+     return RSX_PICK_NONE;
+ }
  
-+/* Patch 2101: the one-line adapter summary the support package looks for (tools/release/support.py GPU_RX: "adapter"
++/* KZ3 patch 2101: the one-line adapter summary the support package looks for (tools/release/support.py GPU_RX: "adapter"
 + * ... a vendor name). `software`: 1 = DXGI_ADAPTER_FLAG_SOFTWARE (WARP), 0 = hardware, -1 = unknown. The vendor
 + * word comes from the PCI vendor id, so a driver description without it still names one. */
 +static inline const char* rsx_vendor_name(unsigned id)
@@ -199,20 +204,20 @@ diff -ruN a/libs/video/rsx_d3d12_device.h b/libs/video/rsx_d3d12_device.h
 +
  #ifdef _WIN32
  #include <stdlib.h>
- 
-@@ -72,6 +94,15 @@
-     sm.HighestShaderModel = (D3D_SHADER_MODEL)0x60;   /* 6_0; the answer is the highest one up to the request */
-     if (FAILED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm)))
-         sm.HighestShaderModel = (D3D_SHADER_MODEL)0x51;   /* runtimes that predate SM 6 know 5_1 */
+ #include <dxgi1_6.h>
+@@ -104,6 +126,15 @@ static inline void rsx_d3d12_log_device(ID3D12Device* dev, IDXGIFactory4* f,
+         }
+         ad->lpVtbl->Release(ad);
+     }
 +    {   /* patch 2101: the compact line, once per process (the live renderer and any later device share the adapter) */
 +        static int once;
 +        if (!once) {
 +            char line[400];
 +            once = 1;
-+            rsx_adapter_line(line, sizeof line, name, vendor, device, vram >> 20, software);
++            rsx_adapter_line(line, sizeof line, name, vendor, device, vram, software);
 +            fprintf(stderr, "%s\n", line);
 +        }
 +    }
-     fprintf(stderr, "[d3d12] device (%s, %s): adapter \"%s\" vendor=0x%04X device=0x%04X software=%d vram=%llu MB "
-                     "max-fl=0x%X binding-tier=%d typed-uav-load-x=%d highest-sm=0x%X (needs: fl 11_0, sm 5.0)\n",
-             who, how, name, vendor, device, software, vram >> 20, have_fl ? (unsigned)fl.MaxSupportedFeatureLevel : 0u,
+     /* KZ3 patch 2099: what the port needs from the device on the same line (max feature level, binding tier, typed UAV
+      * loads, highest shader model), for the support package and for reading a player's log. */
+     static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,

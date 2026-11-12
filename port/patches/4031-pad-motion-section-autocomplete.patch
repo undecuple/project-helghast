@@ -1,0 +1,336 @@
+KZ3 patch 4031 (network pass 16): ENHANCEMENT, off by default. Autocomplete of the motion sections (valve, charge), the
+opt-in button combo. Setting: keybinds.ini `[motion] autocomplete = off|hold` (default off; bridge command
+"autocomplete [off|hold]" like "dsu"). Trigger: both stick clicks (L3 + R3) held for 0.5 s while a human controller is
+in a valve or charge section, read from the pad packet after the bindings (a keyboard gets it through whatever keys are
+bound to L3 and R3: LeftShift + V or Mouse2 with the default keys; L1+R1 is avoided, KZ2 uses it). Outside the
+sections nothing is read. The post-hooks of patch 4030 (ValveJoystickController::Update 1.14 0x61AEB4; charge target
+0x6126E4) then overwrite the controller's own outputs after the game computed them: valve target +0x108 (and the
+follower's previous +0x114) and the grab gains +0x10C/+0x110 (0.0 held / 1.0 released), charge target +0x108 (previous
++0x118) and grab byte +0x114. The valve is driven through the game's ratchet (push to the hand limit with the grab
+held, return with it released, wrong-way detection flips the direction) until the valve position n reaches
+DisableValue's side; the charge alternates the ArmRanges window centres. The game's own completion (disable call
+0x5CA6D0, sounds, animation, Lua M_GetValveValue, checkpoint) runs unchanged; no script is skipped. Release the combo
+and the game's own controls are back at once. Values: ValveResource Valve_CounterClockwise_AutoDisable (hand -35..35,
+speed 360, Min 0, Max 200, Initial 180, DisableValue 0), ISA_D_Charge (windows +-0.7854 rad, ArmStepTime 0).
+Logs: "[assist] L3+R3 held 0.5 s", "[assist] combo held: valve autocomplete engaged", "[assist] valve sweep push",
+"[assist] valve done n=". Host test: tools/smoke/test_motion_assist.sh.
+
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 7640675..8993b2a 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -23,6 +23,7 @@
+ #include "pad_mouse.h"
+ #include "pad_kbport.h"   /* KZ3 patch 4026 */
+ #include "pad_assist.h"   /* KZ3 patch 4030 */
++#include "pad_assist_drive.h"   /* KZ3 patch 4031 */
+ 
+ /* KZ3 patch 4027 (network pass 45): the Keyboard page's own text in the game's language through the port's lookup
+  * (port/net/kz3_tr.h kz3_tr, set by port/net/kz3_discord.c at start); NULL = English. Before every include of
+@@ -932,10 +933,12 @@ static void pad_merge_keyboard(void)
+           fflush(stdout); } }
+ }
+ 
+-/* KZ3 patch 4030: Mouse1 for the motion sections' grab (pad_assist.h). */
++/* KZ3 patch 4030: Mouse1 for the motion sections' grab (pad_assist.h); 4031: the autocomplete setting. */
++static int pad_assist_mode(void) { return s_kb_ready ? (int)s_kb.assist : 0; }
+ static int pad_assist_mouse1(void) { return pad_host_window_focused() && !pad_mouse_menu_on() && (GetAsyncKeyState(0x01) & 0x8000) != 0; }
+ #endif
+ #ifndef _WIN32
++static int pad_assist_mode(void) { return 0; }
+ static int pad_assist_mouse1(void) { return 0; }
+ #endif
+ 
+@@ -1791,8 +1794,11 @@ static void pad_actions_sync(void)
+  * byte 0xB6 = 0, which the port forces on a pad without gyro). The mouse only fed the camera and the keys are digital,
+  * so a keyboard player had no gesture. While a human controller is in one of those sections (the post-hooks below
+  * stamp it every update), the mouse drives a virtual right stick and Mouse1 presses the button the game's own action
+- * table gives GrabRightHand. Default on (an input mapping, not a gameplay change); KZ3_MOUSE_STICK=0 turns it off. */
++ * table gives GrabRightHand. Default on (an input mapping, not a gameplay change); KZ3_MOUSE_STICK=0 turns it off.
++ * 4031: the opt-in autocomplete (ENHANCEMENT, [motion] autocomplete = hold in keybinds.ini) engages when L3+R3 are held
++ * for 0.5 s inside a section, read from the packet after the bindings, so any key bound to them works. */
+ static PasState s_pas;
++static PasDrive s_pasd;   /* 4031 */
+ static int pas_mstick_enabled(void)
+ {
+     static int v = -1;
+@@ -1841,8 +1847,14 @@ static void pad_assist_poll(CellPadData* data)
+ {
+     const unsigned long long now = pad_now_ms();
+     const int vl = pas_valve_live(&s_pas, now), cl = pas_charge_live(&s_pas, now), live = vl || cl;
+-    int dx = 0, dy = 0;
++    int dx = 0, dy = 0, ev;
+     uint8_t bx, by;
++    {   /* 4031: ENHANCEMENT, [motion] autocomplete = hold: L3+R3 (packet bits 1 and 2, after the bindings) for 0.5 s */
++        const unsigned b = (unsigned)data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] | ((unsigned)data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8);
++        s_pasd.mode = pad_assist_mode();
++        ev = pas_combo_step(&s_pasd.combo, live && s_pasd.mode == PAS_HOLD && (b & 6u) == 6u, now);
++        if (ev) { printf("[assist] L3+R3 %s (%s)\n", ev > 0 ? "held 0.5 s: autocomplete engaged" : "released", vl ? "valve" : "charge"); fflush(stdout); }
++    }
+     if (!pas_mstick_enabled()) return;
+     pad_mouse_stick_take(&dx, &dy);
+     pas_test_feed(&dx, &dy);
+@@ -1873,9 +1885,10 @@ static void pad_assist_poll(CellPadData* data)
+     }
+ }
+ /* The hooks (port/spu kz3_gameplay.h KZ3_HOOK_VALVE_ASSIST / KZ3_HOOK_CHARGE_ASSIST, post-hooks on 1.14 0x61AEB4 and
+- * 0x6126E4): vm = vm_base, ctrl = the controller (r3 on entry). They mark the section the pad layer above reads. */
+-int pad_assist_valve_post(uint8_t* vm, uint32_t ctrl) { PasView v; return pas_valve_mark(&s_pas, vm, ctrl, pad_now_ms(), &v); }
+-int pad_assist_charge_post(uint8_t* vm, uint32_t ctrl) { PasView v; return pas_charge_mark(&s_pas, vm, ctrl, pad_now_ms(), &v); }
++ * 0x6126E4): vm = vm_base, ctrl = the controller (r3 on entry). They mark the section the pad layer above reads and,
++ * while the autocomplete is engaged, drive the controller's outputs. */
++int pad_assist_valve_post(uint8_t* vm, uint32_t ctrl) { return pas_valve_post(&s_pas, &s_pasd, vm, ctrl, pad_now_ms()); }
++int pad_assist_charge_post(uint8_t* vm, uint32_t ctrl) { return pas_charge_post(&s_pas, &s_pasd, vm, ctrl, pad_now_ms()); }
+ 
+ static void pad_poll_backend(void)
+ {
+diff --git a/libs/input/pad_assist_drive.h b/libs/input/pad_assist_drive.h
+new file mode 100644
+index 0000000..18f0f26
+--- /dev/null
++++ b/libs/input/pad_assist_drive.h
+@@ -0,0 +1,167 @@
++/* pad_assist_drive.h -- KZ3 patch 4031 (network pass 16). ENHANCEMENT, off by default: `[motion] autocomplete = off|hold`
++ * in keybinds.ini. Hold L3+R3 for 0.5 s (read from the pad packet after the bindings, so a keyboard gets it through
++ * whatever keys are bound to L3 and R3; LeftShift + V or Mouse2 by default) while a human controller is in a valve or
++ * charge section, and the post-hooks of patch 4030 drive the controller's own outputs (target hand angle, grab) through
++ * the game's ratchet until DisableValue / the arm windows are reached. The game's completion, sounds, animation and Lua
++ * run unchanged; no script is skipped. Nothing is read or written outside the sections. Platform-free (host test). */
++#ifndef PAD_ASSIST_DRIVE_H
++#define PAD_ASSIST_DRIVE_H
++
++#include "pad_assist.h"
++
++#define PAS_HOLD_MS     500u     /* L3+R3 held this long engages the autocomplete */
++#define PAS_REACH_EPS   0.02f    /* rad: hand "at" its target */
++
++enum { PAS_OFF = 0, PAS_HOLD = 1, PAS_N_MODES };
++static inline int pas_mode_by_name(const char* s, size_t n)
++{
++    size_t i;
++    char b[8];
++    if (n == 0 || n >= sizeof b) return -1;
++    for (i = 0; i < n; i++) b[i] = (char)((s[i] >= 'A' && s[i] <= 'Z') ? s[i] + 32 : s[i]);
++    b[n] = 0;
++    if (!strcmp(b, "off") || !strcmp(b, "0") || !strcmp(b, "no")) return PAS_OFF;
++    if (!strcmp(b, "hold")) return PAS_HOLD;
++    return -1;
++}
++static inline const char* pas_mode_name(int m) { return m == PAS_HOLD ? "hold" : "off"; }
++
++/* ---- combo: both buttons held for PAS_HOLD_MS; returns +1 on the engage edge, -1 on release, else 0 ---- */
++typedef struct { unsigned long long since; int down, engaged; } PasCombo;
++static inline int pas_combo_step(PasCombo* c, int both_down, unsigned long long now_ms)
++{
++    if (!both_down) {
++        const int was = c->engaged;
++        c->down = 0;
++        c->engaged = 0;
++        return was ? -1 : 0;
++    }
++    if (!c->down) { c->down = 1; c->since = now_ms; }
++    if (!c->engaged && now_ms - c->since >= PAS_HOLD_MS) { c->engaged = 1; return 1; }
++    return 0;
++}
++
++/* ---- ratchet driver for the valve ---- */
++typedef struct { int phase;        /* 0 idle, 1 push (grab held, hand to the far limit), 2 return (grab released) */
++                 int flip;         /* 1 once a push moved the valve the wrong way */
++                 int pushes, done;
++                 float n0; } PasRatchet;
++static inline void pas_ratchet_reset(PasRatchet* r) { memset(r, 0, sizeof *r); }
++
++/* One update. n = valve position 0..1 ((angle - Min)/(Max - Min)), disable = DisableValue, hand = the hand angle,
++ * lo/hi = the hand limits (rad). Writes the controller outputs: *target (rad) and *grab (0.0 held / 1.0 released).
++ * Returns 0 running, 1 done (n reached DisableValue's side), -1 unusable input (non-finite, empty limits). *ev gets 1
++ * when a push started, 2 when a return started, 3 on a wrong-way flip (for the log), else 0. */
++static inline int pas_ratchet_step(PasRatchet* r, float n, float disable, float hand, float lo, float hi,
++                                   float* target, float* grab, int* ev)
++{
++    float far_, near_;
++    int want;
++    *ev = 0;
++    if (!isfinite(n) || !isfinite(disable) || !isfinite(hand) || !isfinite(lo) || !isfinite(hi)) return -1;
++    if (!(hi > lo + 0.05f)) return -1;
++    {
++        const int s = disable > n ? 1 : -1;   /* +1: the angle has to go up */
++        if ((s > 0 && n >= disable) || (s < 0 && n <= disable)) { r->done = 1; return 1; }
++        want = r->flip ? -s : s;              /* hand direction that moves the valve toward DisableValue */
++    }
++    far_ = want > 0 ? hi : lo;
++    near_ = want > 0 ? lo : hi;
++    if (r->phase == 0) { r->phase = 1; r->n0 = n; *ev = 1; }
++    if (r->phase == 1) {
++        *target = far_;
++        *grab = 0.0f;
++        if (fabsf(hand - far_) < PAS_REACH_EPS) {
++            const float moved = (n - r->n0) * (float)(disable > n ? 1 : -1);
++            r->pushes++;
++            if (moved < -1e-4f) {   /* that push moved the valve away from DisableValue: the other hand direction is right */
++                r->flip ^= 1;
++                r->n0 = n;
++                *ev = 3;
++                *target = near_;    /* the old near limit is the new far one; the grab stays held */
++            } else {
++                r->phase = 2;
++                *target = near_;
++                *grab = 1.0f;
++            }
++        }
++    } else {
++        *target = near_;
++        *grab = 1.0f;
++        if (fabsf(hand - near_) < PAS_REACH_EPS) { r->phase = 1; r->n0 = n; *target = far_; *grab = 0.0f; *ev = 2; }
++    }
++    return 0;
++}
++
++/* ---- the drivers' state ---- */
++typedef struct {
++    int mode;                          /* PAS_OFF / PAS_HOLD ([motion] autocomplete) */
++    PasCombo combo;
++    PasRatchet rt;
++    int v_active;                      /* valve: 0 idle, 1 driving, -1 unusable values (logged once) */
++    int c_active, c_idx;
++    unsigned long long c_t;
++} PasDrive;
++static inline int pas_engaged(const PasDrive* d) { return d->mode == PAS_HOLD && d->combo.engaged; }
++
++/* Valve post-hook: marks (patch 4030) and, while engaged, drives the controller outputs. Returns 1 when it wrote. */
++static inline int pas_valve_post(PasState* st, PasDrive* d, uint8_t* vm, uint32_t ctrl, unsigned long long now)
++{
++    PasView v;
++    float target = 0, grab = 1;
++    int ev = 0, rc;
++    if (!pas_valve_mark(st, vm, ctrl, now, &v)) return 0;
++    if (v.fresh) { pas_ratchet_reset(&d->rt); d->v_active = 0; }
++    if (!pas_engaged(d)) {
++        if (d->v_active) { d->v_active = 0; pas_ratchet_reset(&d->rt); printf("[assist] valve autocomplete released n=%.3f\n", (double)v.n); }
++        return 0;
++    }
++    if (d->rt.done) return 0;
++    rc = pas_ratchet_step(&d->rt, v.n, v.dis, v.hand, v.lo, v.hi, &target, &grab, &ev);
++    if (rc < 0) { if (d->v_active != -1) { d->v_active = -1; printf("[assist] valve: unusable resource values, not driven\n"); } return 0; }
++    if (rc == 1) {
++        d->v_active = 0;
++        printf("[assist] valve done n=%.3f (disable=%.3f, sweeps=%d)\n", (double)v.n, (double)v.dis, d->rt.pushes);
++        return 0;
++    }
++    if (d->v_active != 1) { d->v_active = 1; printf("[assist] combo held: valve autocomplete engaged n=%.3f\n", (double)v.n); }
++    if (ev == 1 || ev == 2) printf("[assist] valve sweep push n=%.3f hand=%.3f\n", (double)v.n, (double)v.hand);
++    if (ev == 3) printf("[assist] valve: that push moved the valve the wrong way, direction flipped n=%.3f\n", (double)v.n);
++    pas_wf(vm, ctrl + 0x108, target);
++    pas_wf(vm, ctrl + 0x114, target);   /* the follower's previous value: the next update clamps against it */
++    pas_wf(vm, ctrl + 0x10C, grab);
++    pas_wf(vm, ctrl + 0x110, grab);
++    return 1;
++}
++
++/* Charge post-hook. The arm windows alternate (ISA_D_Charge: centres +-0.7854 rad, ArmStepTime 0), the grab byte is
++ * held, and each window is held long enough for the hand to arrive at MaxRotationSpeed (the hand angle is not read:
++ * ASSUMPTION, the field is not mapped). */
++static inline int pas_charge_post(PasState* st, PasDrive* d, uint8_t* vm, uint32_t ctrl, unsigned long long now)
++{
++    PasView v;
++    float prev, hold_s, t;
++    if (!pas_charge_mark(st, vm, ctrl, now, &v)) return 0;
++    if (v.fresh) { d->c_active = 0; d->c_idx = 0; }
++    if (!pas_engaged(d) || v.nwin < 1) {
++        if (d->c_active) { d->c_active = 0; printf("[assist] charge autocomplete released\n"); }
++        return 0;
++    }
++    if (!d->c_active) { d->c_active = 1; d->c_t = now; d->c_idx = 0; printf("[assist] combo held: charge autocomplete engaged\n"); }
++    if (d->c_idx >= v.nwin) d->c_idx = 0;
++    prev = v.cen[(d->c_idx + v.nwin - 1) % v.nwin];
++    hold_s = (v.spd > 0.1f ? fabsf(v.cen[d->c_idx] - prev) / v.spd : 0.0f) + 0.15f + (isfinite(v.step) && v.step > 0 ? v.step : 0.0f);
++    if (now - d->c_t >= (unsigned long long)(hold_s * 1000.0f)) {
++        d->c_idx = (d->c_idx + 1) % v.nwin;
++        d->c_t = now;
++        printf("[assist] charge window %d centre=%.4f\n", d->c_idx, (double)v.cen[d->c_idx]);
++    }
++    t = v.cen[d->c_idx];
++    if (v.amx > v.amn) t = t < v.amn ? v.amn : t > v.amx ? v.amx : t;
++    pas_wf(vm, ctrl + 0x108, t);
++    pas_wf(vm, ctrl + 0x118, t);
++    vm[ctrl + 0x114] = 1;
++    return 1;
++}
++
++#endif
+diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+index 33a588e..fca1621 100644
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -30,6 +30,7 @@
+ #include "pad_remap_ui.h"   /* 4014 */
+ #include "pad_action_custom.h"   /* 4023: Custom per action, [pad actions] */
+ #include "pad_dsu.h"   /* 4028: DSU motion port setting */
++#include "pad_assist_drive.h"   /* 4031: [motion] autocomplete */
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -126,6 +127,7 @@ static const PadKbKey pad_kb_keys[] = {
+ typedef struct { unsigned char key[PKB_N_INPUTS][PKB_SLOTS]; unsigned char prompts; unsigned char padmap;
+                  unsigned char padc[PRM_N]; PadActCustom pac; /* 4023 */
+                  unsigned short dsu;   /* 4028: DSU server port on 127.0.0.1, 0 = off ([motion] dsu_port) */
++                 unsigned char assist; /* 4030: PAS_OFF|PAS_HOLD ([motion] autocomplete, pad_assist.h; ENHANCEMENT, default off) */
+                  PadDsuMap dsumap;     /* 4028: server axis -> SIXAXIS word ([motion] word_x..word_g) */ } PadKeybinds;
+ 
+ enum { PKB_PROMPTS_AUTO = 0, PKB_PROMPTS_PS3, PKB_PROMPTS_PS4, PKB_PROMPTS_XBOX, PKB_PROMPTS_KEYBOARD, PKB_N_PROMPTS };
+@@ -424,6 +426,11 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
+                         if (!me) { pad_kb_logf(log, ctx, line, "unknown axis (+-ax|ay|az|gx|gy|gz)", v, (size_t)(b - v)); bad++; }
+                         else kb->dsumap.w[wi] = (signed char)me;
+                     }
++                    else if (pad_kb_ieq(a, (size_t)(ne - a), "autocomplete")) {   /* 4030: off|hold */
++                        const int mv = pas_mode_by_name(v, (size_t)(b - v));
++                        if (mv < 0) { pad_kb_logf(log, ctx, line, "unknown autocomplete value (off|hold)", v, (size_t)(b - v)); bad++; }
++                        else kb->assist = (unsigned char)mv;
++                    }
+                     else if (!pad_kb_ieq(a, (size_t)(ne - a), "dsu_port")) { pad_kb_logf(log, ctx, line, "unknown motion setting", a, (size_t)(ne - a)); bad++; }
+                     else if ((pv = pdsu_port_by_name(v, (size_t)(b - v))) < 0) { pad_kb_logf(log, ctx, line, "unknown dsu_port value", v, (size_t)(b - v)); bad++; }
+                     else kb->dsu = (unsigned short)pv;
+@@ -626,7 +633,12 @@ static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
+                 "dsu_port = %s\n"
+                 "# Which server axis feeds each DS3 motion word (ax ay az = accelerometer, gx gy gz = gyro pitch yaw roll; + or -).\n"
+                 "# Not yet checked against a real DSU server: if aiming drifts or inverts, change these.\n"
+-                "word_x = %s\nword_y = %s\nword_z = %s\nword_g = %s\n", pv, wx, wy, wz, wg);
++                "word_x = %s\nword_y = %s\nword_z = %s\nword_g = %s\n"
++                "# ENHANCEMENT (off by default): hold, and holding the two stick clicks (L3 + R3: LeftShift + V or Mouse2 with the\n"
++                "# default keys, whatever your keys and pad layout bind to them) for half a second while turning a valve or\n"
++                "# placing a charge makes the game's own valve/charge controller finish the motion for you. Only inside those\n"
++                "# sections; the game's sounds, animation and scripts run as usual.\n"
++                "autocomplete = %s\n", pv, wx, wy, wz, wg, pas_mode_name(kb->assist));
+     }
+ #undef PKB_PUT
+     return (int)o;
+@@ -973,6 +985,19 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+         u->gen++;
+         return 1;
+     }
++    if (!strcmp(verb, "autocomplete")) {   /* 4030: "autocomplete" -> off|hold; "autocomplete <off|hold>" sets it (1 = changed, saved) */
++        const char* v = cmd + 12;
++        int mv;
++        while (*v == ' ') v++;
++        if (!*v) { snprintf(out, n, "%s", pas_mode_name(kb->assist)); return 0; }
++        mv = pas_mode_by_name(v, strlen(v));
++        if (mv < 0) { snprintf(out, n, "bad"); return 0; }
++        snprintf(out, n, "%s", pas_mode_name(mv));
++        if (kb->assist == mv) return 0;
++        kb->assist = (unsigned char)mv;
++        u->gen++;
++        return 1;
++    }
+     if (!strcmp(verb, "prompts")) {
+         /* 4011: "prompts" -> the Button prompts value's name; "prompts <name>" sets it (1 = changed, saved). */
+         const char* v = cmd + 7;
+@@ -1023,7 +1048,7 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+     }
+     if (!strcmp(verb, "reset")) {
+         PadKeybinds keep = *kb;   /* 4011/4013: the Keyboard page's reset keeps the Button prompts and the pad layout */
+-        pad_kb_defaults(kb); kb->prompts = keep.prompts; kb->padmap = keep.padmap; memcpy(kb->padc, keep.padc, sizeof kb->padc); kb->pac = keep.pac; kb->dsu = keep.dsu; kb->dsumap = keep.dsumap; u->phase = PKB_UI_IDLE; u->gen++; u->result = PKB_R_NONE;
++        pad_kb_defaults(kb); kb->prompts = keep.prompts; kb->padmap = keep.padmap; memcpy(kb->padc, keep.padc, sizeof kb->padc); kb->pac = keep.pac; kb->dsu = keep.dsu; kb->dsumap = keep.dsumap; kb->assist = keep.assist; u->phase = PKB_UI_IDLE; u->gen++; u->result = PKB_R_NONE;
+         snprintf(out, n, "ok");
+         return 1;
+     }

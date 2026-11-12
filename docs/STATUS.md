@@ -2,7 +2,7 @@
 
 Where the port stands today. The short version is on the [README](../README.md); what a release must meet to be called playable is in [RELEASE-CRITERIA.md](RELEASE-CRITERIA.md).
 
-As of 2026-11-03, on Windows x64, tested mostly under Proton on Linux (first runs on native Windows 11 on 2026-10-21 and on a Windows 10 test machine on 2026-10-22):
+As of 2026-11-11, on Windows x64, tested mostly under Proton on Linux (first runs on native Windows 11 on 2026-10-21 and on a Windows 10 test machine on 2026-10-22):
 
 | | |
 |---|---|
@@ -19,7 +19,7 @@ As of 2026-11-03, on Windows x64, tested mostly under Proton on Linux (first run
 | Online | the game's own client signs in to a local test server and reaches the MULTIPLAYER menu; joining a game is not built; online co-op campaign is on the wanted list |
 | Installer and portable zip | both work end to end in testing under Proton; on native Windows 11 the installer builds the game and the game reaches the menus (checked 2026-10-21); a game built the way the installer builds it plays the first level from a new profile in our tests (2026-10-28). Disc dumps as a folder, as a folder whose archive is split into parts, or as a decrypted ISO are accepted: see [GETTING-FILES.md](GETTING-FILES.md) |
 | Performance | a pipeline list from all eight chapters ships with the game, so shaders build in the background while a level loads (about 16.5 frames/s in the busy first minute of a level's first visit, with little stutter); the shader cache carries over between sessions (a warm start builds about 15 shaders instead of about 1,200). Planned: the game builds every shader in the shipped list at its first launch; until then the installer offers an optional shader warm-up step (about 17 minutes, off by default) |
-| Speed | about 22-23 frames/s in a busy Frozen Shores window (131-180 s after launch; in-level figures, means of alternated runs on 2026-10-27), target 30; the slowest 1 % of frames run at about 13-14 frames/s; menus and cutscenes hold 30. The renderer's command walker and the SPU job code are the limits, and the PS3 emulator RPCS3 holds 30 on the same scene and machine, so 30 is reachable. The light-probe job, the upsample and depth-of-field post-processing jobs and the character skinning job run as native code by default with the 1.14 update; they take less SPU time with the same results, and the frame rate stays bound by the command walker |
+| Speed | about 24-25 frames/s in a busy Frozen Shores window while the player turns and walks (131-180 s after launch; in-level figures, means of alternated runs on 2026-11-10), target 30; the slowest 1 % of frames run at about 14-15 frames/s; menus and cutscenes hold 30. The renderer's command walker and the SPU job code are the limits, and the PS3 emulator RPCS3 holds 30 on the same scene and machine, so 30 is reachable. The light-probe job, the upsample post-processing job, both depth-of-field stages, the character skinning job and one stage of the audio mixer run as native code by default with the 1.14 update; they take less SPU time with the same results, and the frame rate stays bound by the command walker |
 | Known bugs | the full list is in [KNOWN_ISSUES.md](KNOWN_ISSUES.md); audio stutters now and then in levels (the audio mixing code is about 1.2 % short of real time); windows and sky in far views look flat white |
 
 Feature by feature, the PS3 game against the port, and what the port adds: [FEATURES.md](FEATURES.md), with an estimated parity figure overall and per area (generated from the

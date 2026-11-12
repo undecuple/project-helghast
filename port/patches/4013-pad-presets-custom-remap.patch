@@ -1,10 +1,12 @@
 Rebased on ps3recomp v0.18.0 (SPU pass 108): remap on upstream #570's held-button decrement.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 32388fe7..a45dc12d 100644
+index e18987c..4141af8 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -1219,6 +1219,98 @@ int pad_kb_last_device_keyboard(void)
+@@ -1390,6 +1390,98 @@ int pad_kb_last_device_keyboard(void)
  }
  #endif
  
@@ -103,7 +105,7 @@ index 32388fe7..a45dc12d 100644
  static void pad_poll_backend(void)
  {
      static unsigned long long s_last_ms = 0;
-@@ -1241,6 +1333,7 @@ static void pad_poll_backend(void)
+@@ -1412,6 +1504,7 @@ static void pad_poll_backend(void)
      /* KZ3 patch 2037: keys always polled (not only with no pad on port 0) and merged into port 0. */
      pad_poll_keyboard();
  #endif
@@ -111,7 +113,7 @@ index 32388fe7..a45dc12d 100644
      pad_prompt_track();   /* 4011: before the keys are merged into port 0 */
  #ifdef _WIN32
      pad_merge_keyboard();
-@@ -1654,6 +1747,7 @@ skip_inject: ;
+@@ -1827,6 +1920,7 @@ skip_inject: ;
            double now = pad_clock(t0);   /* PR #344: PAD_CLOCK=flips counts guest flips (3006's v2 grammar unchanged) */
            unsigned m = 0; unsigned char ax[6]; int ax_set = 0;
            pad_script_poll(&s_script, now, &m, ax, &ax_set);
@@ -119,7 +121,7 @@ index 32388fe7..a45dc12d 100644
            data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(m & 0xFF);
            data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((m >> 8) & 0xFF);
            if (ax_set) {
-@@ -1701,9 +1795,10 @@ skip_inject: ;
+@@ -1874,9 +1968,10 @@ skip_inject: ;
                }
            }
            if (held_n > 0) {
@@ -134,7 +136,7 @@ index 32388fe7..a45dc12d 100644
  
      /* Analog sticks */
 diff --git a/libs/input/pad_host.h b/libs/input/pad_host.h
-index 456308cb..2efdc048 100644
+index 456308c..2efdc04 100644
 --- a/libs/input/pad_host.h
 +++ b/libs/input/pad_host.h
 @@ -496,5 +496,26 @@ static inline int pad_last_device_current(const PadLastDevice* l, const PadHostS
@@ -165,7 +167,7 @@ index 456308cb..2efdc048 100644
  
  #endif
 diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
-index efaa3908..0a65c4c9 100644
+index 8484c1b..9c2bb0c 100644
 --- a/libs/input/pad_keybinds.h
 +++ b/libs/input/pad_keybinds.h
 @@ -26,6 +26,7 @@
@@ -176,7 +178,7 @@ index efaa3908..0a65c4c9 100644
  #include <stddef.h>
  #include <stdio.h>
  #include <string.h>
-@@ -105,7 +106,10 @@ static const PadKbKey pad_kb_keys[] = {
+@@ -117,7 +118,10 @@ static const PadKbKey pad_kb_keys[] = {
  
  /* key[i][s] = virtual-key code of input i, slot s (0 = unbound). */
  /* KZ3 patch 4011: `prompts` = the Options row "Button prompts" (PKB_PROMPTS_*), section [prompts] of the file. */
@@ -188,7 +190,7 @@ index efaa3908..0a65c4c9 100644
  
  enum { PKB_PROMPTS_AUTO = 0, PKB_PROMPTS_PS3, PKB_PROMPTS_PS4, PKB_PROMPTS_XBOX, PKB_PROMPTS_KEYBOARD, PKB_N_PROMPTS };
  static const char* const pkb_prompt_names[PKB_N_PROMPTS] = { "auto", "ps3", "ps4", "xbox", "keyboard" };
-@@ -124,6 +128,14 @@ static int pad_kb_prompts_by_name(const char* s, size_t n)
+@@ -136,6 +140,14 @@ static int pad_kb_prompts_by_name(const char* s, size_t n)
      return -1;
  }
  
@@ -203,7 +205,7 @@ index efaa3908..0a65c4c9 100644
  /* What the keys add to the pad this poll. */
  typedef struct { unsigned short buttons; unsigned char dirs; } PadKbState;
  
-@@ -312,6 +324,8 @@ static void pad_kb_defaults(PadKeybinds* kb)
+@@ -325,6 +337,8 @@ static void pad_kb_defaults(PadKeybinds* kb)
      };
      unsigned i;
      memset(kb, 0, sizeof *kb);
@@ -212,7 +214,7 @@ index efaa3908..0a65c4c9 100644
      for (i = 0; i < sizeof d / sizeof d[0]; i++) {
          int k = pad_kb_input_by_name(d[i].in, strlen(d[i].in));
          if (k >= 0) { kb->key[k][0] = d[i].a; kb->key[k][1] = d[i].b; }
-@@ -334,7 +348,7 @@ static int pad_kb_space(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+@@ -347,7 +361,7 @@ static int pad_kb_space(char c) { return c == ' ' || c == '\t' || c == '\r'; }
  static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* ctx)
  {
      const char* p = text;
@@ -221,7 +223,7 @@ index efaa3908..0a65c4c9 100644
      if (!text) return 0;
      if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
      while (*p) {
-@@ -350,11 +364,32 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
+@@ -363,11 +377,32 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
          if (a < b) {
              if (*a == '[') {
                  const char* r = memchr(a, ']', (size_t)(b - a));
@@ -256,7 +258,7 @@ index efaa3908..0a65c4c9 100644
                  }
              } else if (in_pr) {
                  /* 4011: "buttons = auto|ps3|ps4|xbox|keyboard"; anything else is logged and the value kept */
-@@ -476,6 +511,17 @@ static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
+@@ -520,6 +555,17 @@ static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
              "# Button pictures in the game (Options > Controls > Button prompts): auto = the device you used last,\n"
              "# or always ps3, ps4 (PS4/PS5), xbox, keyboard.\n"
              "buttons  = %s\n", pkb_prompt_names[kb->prompts < PKB_N_PROMPTS ? kb->prompts : 0]);
@@ -274,7 +276,7 @@ index efaa3908..0a65c4c9 100644
  #undef PKB_PUT
      return (int)o;
  }
-@@ -714,6 +760,20 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+@@ -778,6 +824,20 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
      if (!n) return 0;
      out[0] = 0;
      if (sscanf(cmd, "%15s %d %d", verb, &r, &s) < 1) return 0;
@@ -295,7 +297,7 @@ index efaa3908..0a65c4c9 100644
      if (!strcmp(verb, "prompts")) {
          /* 4011: "prompts" -> the Button prompts value's name; "prompts <name>" sets it (1 = changed, saved). */
          const char* v = cmd + 7;
-@@ -763,8 +823,8 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+@@ -827,8 +887,8 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
          return 0;
      }
      if (!strcmp(verb, "reset")) {
@@ -308,7 +310,7 @@ index efaa3908..0a65c4c9 100644
      }
 diff --git a/libs/input/pad_remap.h b/libs/input/pad_remap.h
 new file mode 100644
-index 00000000..f6bd0bec
+index 0000000..68aee33
 --- /dev/null
 +++ b/libs/input/pad_remap.h
 @@ -0,0 +1,151 @@
@@ -464,10 +466,10 @@ index 00000000..f6bd0bec
 +
 +#endif
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index 321bd8c4..5dea457c 100644
+index 1d45a75..8adec94 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -145,6 +145,14 @@ static int ld_prompt_set(void)
+@@ -154,6 +154,14 @@ static int ld_prompt_set(void)
      return s >= PG_PS3 && s < PG_N_SETS ? s : PG_PS3;
  }
  static unsigned ld_prompt_opts(int set) { return set == PG_KBM ? PG_OPT_KBM_2039 : 0u; }
@@ -482,7 +484,7 @@ index 321bd8c4..5dea457c 100644
  /* The atlas cache signature: 0 = no source / off, 1 = the game's own atlas (PS3), 2039's binding hash for keycaps,
   * else a value per set and options (never 0/1; ASSUMPTION: a binding hash equal to one of these is negligible). */
  static uint32_t ld_prompt_sig(void)
-@@ -152,8 +160,63 @@ static uint32_t ld_prompt_sig(void)
+@@ -161,8 +169,63 @@ static uint32_t ld_prompt_sig(void)
      if (!kc_enabled()) return 0;
      const int set = ld_prompt_set();
      if (set == PG_KBM) return rsx_keycaps_sig();
@@ -548,7 +550,7 @@ index 321bd8c4..5dea457c 100644
  }
  #include "rsx_pso_async.h"
  /* patch 2048: asynchronous PSO build bookkeeping */
-@@ -4364,6 +4427,11 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+@@ -4782,6 +4845,11 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
                  fprintf(stderr, "[keycap] %s atlas %ux%u src=%u:0x%08X upload %s (%d cells, sig %08X)\n",
                          g_ld_kc_kind == KC_HUD ? "hud" : "menu", w, h, t->location, t->offset,
                          kc_copy ? set_name[set] : "pad glyphs", cells, g_ld_kc_sig);

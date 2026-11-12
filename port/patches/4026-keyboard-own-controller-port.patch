@@ -13,7 +13,10 @@ Test input: KZ3_TEST_FAKE_PAD=1 (port 0 counts as a host pad), KZ3_KB_SCRIPT / K
 grammar and clock, pressed as keyboard input). KZ3-specific (the game's table); the idea of a keyboard port next to
 the pads is general.
 
-diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index f07ed2e..711a85e 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
 @@ -21,6 +21,7 @@
@@ -24,7 +27,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
  unsigned (*g_pad_menu_bits_hook)(unsigned pad_buttons, int pad_active) = NULL;
  /* KZ3 patch 2106: a game menu has the focus, so the "back" keys (Esc) are menu Back (pad_keybinds.h pad_kb_eval). Only
   * when the port tracks the game's menus (2098's hook installed: a GUM context was found for this EBOOT); otherwise
-@@ -110,7 +111,8 @@
+@@ -110,7 +111,8 @@ static int s_data_fresh[PAD_MAX_HOST_PORTS];
  static int           s_port_dev[PAD_MAX_HOST_PORTS];
  static int           s_port_motion[PAD_MAX_HOST_PORTS];
  static PadLastDevice s_last_dev = { PAD_DEV_NONE, -1 };
@@ -34,7 +37,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
  
  #if PAD_BACKEND_SDL
  typedef struct PadSdlGamepad PadSdlGamepad;   /* SDL_Gamepad */
-@@ -663,16 +665,74 @@
+@@ -830,16 +832,74 @@ static void pad_poll_keyboard(void)
      s_keys_active = (s_kb_state.buttons || s_kb_state.dirs || pad_mouse_activity_take()) ? 1 : 0;
  }
  
@@ -113,7 +116,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
      /* (2038's "pad input makes the pad the last device again" is pad_prompt_track now, patch 4011) */
      if (!hs->connected) {
          memset(hs, 0, sizeof *hs);
-@@ -692,8 +752,8 @@
+@@ -859,8 +919,8 @@ static void pad_merge_keyboard(void)
      if (k->buttons & PKB_L2) hs->trigger_l2 = 255;
      if (k->buttons & PKB_R2) hs->trigger_r2 = 255;
      { static int said = -1;
@@ -124,7 +127,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
            fflush(stdout); } }
  }
  #endif
-@@ -1771,10 +1831,39 @@
+@@ -1940,10 +2000,39 @@ static char* pad_script_read_file(const char* path)        /* malloc'd, NUL-term
   * were fixed.) These used to be redeclared here with a 64-bit address
   * parameter, which conflicts with the header now that it is included. */
  
@@ -165,8 +168,10 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
      if (!s_pad_initialized)
          return CELL_PAD_ERROR_NOT_OPENED;
  
-diff -ruN a/libs/input/pad_kbport.h b/libs/input/pad_kbport.h
---- a/libs/input/pad_kbport.h
+diff --git a/libs/input/pad_kbport.h b/libs/input/pad_kbport.h
+new file mode 100644
+index 0000000..83b01db
+--- /dev/null
 +++ b/libs/input/pad_kbport.h
 @@ -0,0 +1,96 @@
 +/* KZ3 patch 4026 (network pass 43): keyboard and mouse as their own controller, so split-screen co-op needs one pad

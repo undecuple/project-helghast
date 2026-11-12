@@ -1,0 +1,10 @@
+{
+  "schema": "kz3.play/1",
+  "name": "k4-ring-perf",
+  "steps": [
+    {"id": "level-request", "op": "wait", "text": "levels.single_player.frozen_shores.leveldescription_optimized.core' ->", "timeout": 150},
+    {"id": "checkpoint", "op": "wait", "text": "[cellSaveData] UserAutoSave(", "timeout": 60},
+    {"id": "settle", "op": "flips", "count": 360, "timeout": 40},
+    {"id": "checkpoint-view", "op": "capture", "timeout": 10}
+  ]
+}

@@ -11,6 +11,12 @@
  * Expected: FAIL on v0.13.0 (no handlers), PASS with 3002. Build/run: tools/upstream/test_cellfs_imports.sh
  */
 #include "runtime/ppu/ppu_fs.cpp"
+/* v0.19's ppu_fs.cpp calls ps3_dev_flash_path (runtime/platform); the file does not exist before v0.19 */
+#if defined(__has_include)
+#  if __has_include("runtime/platform/ps3_dev_flash.c")
+#    include "runtime/platform/ps3_dev_flash.c"
+#  endif
+#endif
 #include <vector>
 
 /* ---- link stubs (none is on the path this test drives) ---- */

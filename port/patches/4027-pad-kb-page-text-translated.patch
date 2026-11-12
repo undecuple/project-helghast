@@ -5,6 +5,10 @@ at g_pad_kb_tr, which port/net/kz3_discord.c sets to the port's lookup (port/net
 port/text/port_ui.tsv); NULL or any other includer of pad_keybinds.h keeps the English text. {0}..{2} are filled by
 pad_kb_fmt (the lookup refuses a translation whose placeholders differ from the English text's).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 711a85e..17d52a1 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
 @@ -22,6 +22,12 @@
@@ -20,9 +24,11 @@ pad_kb_fmt (the lookup refuses a translation whose placeholders differ from the 
  unsigned (*g_pad_menu_bits_hook)(unsigned pad_buttons, int pad_active) = NULL;
  /* KZ3 patch 2106: a game menu has the focus, so the "back" keys (Esc) are menu Back (pad_keybinds.h pad_kb_eval). Only
   * when the port tracks the game's menus (2098's hook installed: a GUM context was found for this EBOOT); otherwise
+diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+index 00390a0..3792ac3 100644
 --- a/libs/input/pad_keybinds.h
 +++ b/libs/input/pad_keybinds.h
-@@ -627,6 +627,27 @@
+@@ -634,6 +634,27 @@ static int pad_kb_ini_portable(const char* text)
   * player's language and active preset; pass 38); `label` is the port's own fallback (file comments, host tests) and
   * the page text for the eight stick directions and Start, which have no string of their own in the game. */
  typedef struct { const char* input; const char* label; const char* button; } PadKbRow;
@@ -50,7 +56,7 @@ pad_kb_fmt (the lookup refuses a translation whose placeholders differ from the 
  static const PadKbRow pad_kb_rows[] = {
      { "ls_up", "Move forward", 0 },       { "ls_down", "Move back", 0 },
      { "ls_left", "Strafe left", 0 },      { "ls_right", "Strafe right", 0 },
-@@ -643,6 +664,18 @@
+@@ -650,6 +671,18 @@ static const PadKbRow pad_kb_rows[] = {
      { "back", "Back (menus)", 0 },        /* patch 2106 */
  };
  #define PKB_N_ROWS ((int)(sizeof pad_kb_rows / sizeof pad_kb_rows[0]))
@@ -69,7 +75,7 @@ pad_kb_fmt (the lookup refuses a translation whose placeholders differ from the 
  
  #define PKB_VK_CANCEL 0x1B      /* Escape: cancels a capture (so the page cannot bind it; the file can) */
  #define PKB_VK_CLEAR  0x2E      /* Delete: clears the slot being captured */
-@@ -807,15 +840,30 @@
+@@ -814,15 +847,30 @@ static void pad_kb_ui_hint(const PadKeybinds* kb, char* out, size_t n)
      size_t m;
      if (pad_kb_ui_key_of(kb, "back", PKB_VK_CANCEL)) bk = pad_kb_ui_key_of(kb, "back", PKB_VK_CANCEL);   /* 2106: menu Back */
      else if (bk != PKB_VK_CANCEL) bk = pad_kb_ui_key_of(kb, "circle", 0);    /* the page's Back is Circle, and Start */
@@ -105,7 +111,7 @@ pad_kb_fmt (the lookup refuses a translation whose placeholders differ from the 
      m = strlen(out);
      if (m >= 2 && out[m - 2] == ',') { out[m - 2] = '.'; out[m - 1] = 0; }
  }
-@@ -882,7 +930,7 @@
+@@ -889,7 +937,7 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
      }
      in = pad_kb_row_input(r);
      if (!strcmp(verb, "rows")) { snprintf(out, n, "%d", PKB_N_ROWS); return 0; }
@@ -114,7 +120,7 @@ pad_kb_fmt (the lookup refuses a translation whose placeholders differ from the 
      if (!strcmp(verb, "src")) { snprintf(out, n, "%s", in >= 0 && pad_kb_rows[r].button ? pad_kb_rows[r].button : ""); return 0; }
      if (!strcmp(verb, "key") || !strcmp(verb, "dup")) {
          if (in < 0 || s < 0 || s >= PKB_SLOTS) { snprintf(out, n, verb[0] == 'k' ? "?" : ""); return 0; }
-@@ -944,10 +992,14 @@
+@@ -951,10 +999,14 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
      if (!strcmp(verb, "hint")) { pad_kb_ui_hint(kb, out, n); return 0; }
      if (!strcmp(verb, "caphint")) { snprintf(out, n, "Esc cancels, Delete clears."); return 0; }
      if (!strcmp(verb, "status")) {

@@ -43,6 +43,9 @@
  *   KZ3_HOOK_SIXAXIS_DEFAULT(00964880)  1.14 only  defaults, profile = r3 (r31), stb r30,0xB6(r31) at 0x9648F8
  *   KZ3_HOOK_SIXAXIS_PADTYPE(009652DC)  1.14 only  pad-type hook, profile = r3 (r7), stb r4,0xB6(r7) at 0x9652F8
  *   KZ3_HOOK_SIXAXIS_LOAD(009703A0)     1.14 only  profile load, profile = r4 (r30), stb r3,0xB6(r30) at 0x9704A8
+ *   KZ3_HOOK_SIXAXIS_SETTER(00BB0CB4)   1.14 only  Lua/menu setter: profile r3, byte r4 -> +0xB6, dirty +0x28 (pre-hook filters r4)
+ *   KZ3_HOOK_VALVE_ASSIST(0061AEB4)     1.14 only  ValveJoystickController::Update, this = r3 (1.00 0x606884, no hook there)
+ *   KZ3_HOOK_CHARGE_ASSIST(006126E4)    1.14 only  ExplosiveLocationJoystickController target fn, this = r3 (1.00 0x5FE0B4)
  */
 #ifndef KZ3_GAMEPLAY_H
 #define KZ3_GAMEPLAY_H
@@ -73,6 +76,9 @@ int kz3_pad_has_gyro(void);
 uint8_t kz3_sixaxis_filter(uint8_t b);
 /* profile = host pointer at the PlayerProfile; *(profile+0xB6) = kz3_sixaxis_filter(old); returns the new byte. */
 uint8_t kz3_sixaxis_fixup(uint8_t* profile);
+/* 4030/4031: libs/input/cellPad.c (ps3recomp runtime), vm = guest base, ctrl = controller EA; return 1 when it wrote the outputs. */
+int pad_assist_valve_post(unsigned char* vm, unsigned int ctrl);
+int pad_assist_charge_post(unsigned char* vm, unsigned int ctrl);
 
 /* B4. State (last yaw/pitch/position/move) and a 1 s limiter. kz3_trace_on() is the only cost when off: one cached
  * int compare. now = seconds, any monotonic origin; kz3_trace_now() is the host clock. kz3_trace_emit writes one
@@ -182,6 +188,31 @@ void kz3_debug_menu_note(void);
         uint8_t old_ = ok_ ? vm_base[p_ + KZ3_SIXAXIS_OFF] : 0;                                                        \
         func_##ADDR##__lifted(ctx);                                                                                    \
         if (ok_ && !kz3_pad_has_gyro()) vm_base[p_ + KZ3_SIXAXIS_OFF] = old_;                                          \
+    }
+/* 4030/4031 (network pass 16): motion sections with the keyboard and mouse. Post-hooks on ValveJoystickController::Update
+ * (1.14 0x61AEB4; this = r3) and the charge target function (1.14 0x6126E4; this = r3): pad_assist_*_post (libs/input,
+ * cellPad.c) stamps the section for the mouse stick and, with [motion] autocomplete = hold and L3+R3 held, drives the
+ * controller outputs. KZ3_HOOK_SIXAXIS_SETTER filters the menu setter 0xBB0CB4 (profile r3, byte r4 -> +0xB6, dirty
+ * +0x28) like the three store sites above: a pad without gyro cannot turn Motion Sensor Function On from the menu. */
+#define KZ3_HOOK_VALVE_ASSIST(ADDR)                                                                                    \
+    void func_##ADDR(ppu_context* ctx)                                                                                 \
+    {                                                                                                                  \
+        uint32_t c_ = (uint32_t)ctx->gpr[3];                                                                           \
+        func_##ADDR##__lifted(ctx);                                                                                    \
+        if (vm_base && KZ3_GUEST_PTR_OK(c_)) pad_assist_valve_post(vm_base, c_);                                       \
+    }
+#define KZ3_HOOK_CHARGE_ASSIST(ADDR)                                                                                   \
+    void func_##ADDR(ppu_context* ctx)                                                                                 \
+    {                                                                                                                  \
+        uint32_t c_ = (uint32_t)ctx->gpr[3];                                                                           \
+        func_##ADDR##__lifted(ctx);                                                                                    \
+        if (vm_base && KZ3_GUEST_PTR_OK(c_)) pad_assist_charge_post(vm_base, c_);                                      \
+    }
+#define KZ3_HOOK_SIXAXIS_SETTER(ADDR)                                                                                  \
+    void func_##ADDR(ppu_context* ctx)                                                                                 \
+    {                                                                                                                  \
+        ctx->gpr[4] = kz3_sixaxis_filter((uint8_t)ctx->gpr[4]);                                                        \
+        func_##ADDR##__lifted(ctx);                                                                                    \
     }
 /* Test aids: post-hooks except DEBUG_MENU (a pre-hook on the String-from-C-string ctor that swaps r4 only at the one
  * call whose return address is LR). Off: one cached compare (DEBUG_MENU: an lr compare first). */

@@ -13,14 +13,17 @@ code page (TextOutA). KZ3_KB_LAYOUT=<KLID> forces a layout (Windows checks). Log
 W A S D are ... here; [keybinds] ... migrated to key positions. Host test: tools/smoke/test_pad_keybinds.sh
 (section 6, fake French AZERTY table).
 
-diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
---- a/libs/input/cellPad.c	2026-10-15 02:15:42.563769817 -0500
-+++ b/libs/input/cellPad.c	2026-10-15 02:17:10.417441955 -0500
-@@ -160,7 +160,93 @@
+Rebased on ps3recomp v0.19.0 (Toro, group C): upstream v0.19 routes keyboard reads through a backend function pad_key_down() (cellPad.c; GetAsyncKeyState on the XInput build) and its pad_kb_down_win became return pad_key_down(vk). The patch's key-position layer is kept whole (s_kb_layout, pad_kb_layout_update, pad_kb_sc_to_vk_win, pad_kb_sc_name_win, KZ3_KB_LAYOUT); only the final read changed: pad_kb_down_win maps the position code to a vk and calls upstream's pad_key_down(vk) instead of GetAsyncKeyState directly. The block sits inside the PAD_BACKEND_XINPUT section (Windows only), so the other backends are untouched. (The original file embeds a raw `diff -ruN` copy of the change between its text and the git diff; it is dropped here because git apply would take it as a second patch.)
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 0f9a94fb..ea9c1c5b 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -446,7 +446,93 @@ static void pad_kb_log(void* ctx, const char* msg)
      printf("[keybinds] %s\n", msg);
  }
  
--static int pad_kb_down_win(void* ctx, int vk) { (void)ctx; return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+-static int pad_kb_down_win(void* ctx, int vk) { (void)ctx; return pad_key_down(vk); }
 +/* Patch 2061: binding codes are key positions (pad_keybinds.h); s_kb_layout turns them into the active layout's
 + * virtual keys. Rebuilt when the foreground thread's layout (HKL) changes: the poll reads it each time, which sees the
 + * same switch WM_INPUTLANGCHANGE announces without a hook in the window procedure. KZ3_KB_LAYOUT=<KLID> (eight hex
@@ -106,12 +109,12 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
 +    int vk = code;
 +    (void)ctx;
 +    if (code > 0 && code < 256 && s_kb_layout_ok) vk = s_kb_layout.vk[code];
-+    return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
++    return vk && pad_key_down(vk);   /* upstream v0.19: pad_key_down wraps GetAsyncKeyState on this backend */
 +}
  static int pad_kb_down_none(void* ctx, int vk) { (void)ctx; (void)vk; return 0; }
  
  static char* pad_kb_read_w(const wchar_t* path)       /* malloc'd, NUL-terminated; NULL if unreadable */
-@@ -248,8 +334,25 @@
+@@ -534,8 +620,25 @@ static void pad_kb_load(int first)
          }
      } else {
          int bad = pad_kb_parse(&kb, text, pad_kb_log, NULL);
@@ -137,7 +140,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
      }
      if (!pad_kb_stamp(&s_kb_stamp)) memset(&s_kb_stamp, 0, sizeof s_kb_stamp);
      s_kb = kb;
-@@ -272,7 +375,7 @@
+@@ -558,7 +661,7 @@ static void pad_kb_save(void)
  
  static void pad_kb_ensure_loaded(void)
  {
@@ -146,7 +149,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
  }
  
  /* The Keyboard page's command entry (port/kz3/main.cpp calls it from the Lua bridge). See pad_kb_ui_command. */
-@@ -311,7 +414,13 @@
+@@ -597,7 +700,13 @@ int pad_kb_key_for_button(unsigned bit)
      return vk;
  }
  
@@ -161,7 +164,7 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
  
  /* patch 2039: the key in one slot of a keybinds.ini input ("cross", "ls_up", ...), 0 when unbound or before the
   * file is read. For keycap prompts (rsx_keycaps.h through port/kz3/main.cpp). */
-@@ -346,6 +455,7 @@
+@@ -632,6 +741,7 @@ static void pad_poll_keyboard(void)
      if (off) return;
  
      AcquireSRWLockExclusive(&s_kb_lock);
@@ -169,9 +172,10 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
      if (!s_kb_ready) pad_kb_ensure_loaded();
      else {
          unsigned long long now = GetTickCount64();
-diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
---- a/libs/input/pad_keybinds.h	2026-10-15 02:15:42.563769817 -0500
-+++ b/libs/input/pad_keybinds.h	2026-10-15 02:26:34.192063982 -0500
+diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+index 19046c60..16d8a882 100644
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
 @@ -14,6 +14,14 @@
   * '#' or ';' starts a comment; a "[keyboard]" header is optional, other sections are skipped (reserved for later
   * pages: gamepad remap, mouse look). A line with an unknown input, an unknown key or more than two keys is logged
@@ -187,7 +191,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
   */
  #ifndef PAD_KEYBINDS_H
  #define PAD_KEYBINDS_H
-@@ -91,7 +99,7 @@
+@@ -91,7 +99,7 @@ static const PadKbKey pad_kb_keys[] = {
      { "LeftAlt", 0xA4 }, { "RightAlt", 0xA5 },
      { "Semicolon", 0xBA }, { "Equals", 0xBB }, { "Comma", 0xBC }, { "Minus", 0xBD }, { "Period", 0xBE },
      { "Slash", 0xBF }, { "Grave", 0xC0 }, { "LeftBracket", 0xDB }, { "Backslash", 0xDC },
@@ -196,7 +200,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
  };
  #define PKB_N_KEYS ((int)(sizeof pad_kb_keys / sizeof pad_kb_keys[0]))
  
-@@ -153,6 +161,116 @@
+@@ -153,6 +161,116 @@ static int pad_kb_input_by_name(const char* s, size_t n)
      return -1;
  }
  
@@ -313,7 +317,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
  /* Defaults (PC layout on top of the Standard preset; ENHANCEMENT). Mouse look is not wired yet, so the
   * right stick is on I/J/K/L and the numpad. */
  static void pad_kb_defaults(PadKeybinds* kb)
-@@ -227,7 +345,8 @@
+@@ -227,7 +345,8 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
                      int in;
                      while (ne > a && pad_kb_space(ne[-1])) ne--;
                      in = pad_kb_input_by_name(a, (size_t)(ne - a));
@@ -323,7 +327,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
                      else {
                          unsigned char got[PKB_SLOTS] = { 0 };
                          int ng = 0, nbad = 0, nnone = 0;
-@@ -300,14 +419,19 @@
+@@ -300,14 +419,19 @@ static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
              "#\n"
              "#   <pad input> = <primary key>, <secondary key>      (\"none\" or nothing = unbound)\n"
              "#\n"
@@ -345,7 +349,7 @@ diff -ruN a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
      for (i = 0; i < PKB_N_INPUTS; i++) {
          char v[64];
          if (!kb->key[i][0] && !kb->key[i][1]) snprintf(v, sizeof v, "none");
-@@ -475,6 +599,8 @@
+@@ -475,6 +599,8 @@ static const char* pad_kb_key_short(int vk)
      };
      unsigned i;
      if (!vk) return "---";

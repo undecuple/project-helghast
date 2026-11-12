@@ -15,7 +15,8 @@ if ! grep -q gcm_fast_methods "$V/cellGcmSys.c"; then
   echo "[test_gcm_fast_methods] SKIP: toolkit without patch 2149"; exit 0; fi
 O="$ROOT/build/smoke-host/gcm_fast_methods"; mkdir -p "$O"
 CF=(-std=gnu17 -O1 -g -w -I "$PT/include" -I "$V" -ffunction-sections -fdata-sections "-Wl,--gc-sections" -pthread -lm)
-gcc "${CF[@]}" "$ROOT/tools/smoke/test_gcm_fast_methods.c" "$ROOT/tools/smoke/test_gcm_fast_methods_stubs.c" -o "$O/t"
+EXTRA_SRC=(); [[ -f "$V/rsx_tiling.c" ]] && EXTRA_SRC=("$V/rsx_tiling.c")   # an array, so a checkout path with spaces stays one word
+gcc "${CF[@]}" "$ROOT/tools/smoke/test_gcm_fast_methods.c" "$ROOT/tools/smoke/test_gcm_fast_methods_stubs.c" "${EXTRA_SRC[@]}" -o "$O/t"
 rc=0
 for cfg in "vtable live" "novtable live" "vtable nolive"; do
   set -- $cfg

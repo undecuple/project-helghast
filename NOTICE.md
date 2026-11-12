@@ -96,6 +96,13 @@ forks (MIT). Each patch names its source in its header or at the code it took.
   Monument Valley port (patch 2057):
   - the fragment decoder's third-source absolute modifier.
 
+## Contributors to this repository
+
+- **Tzeentchnet:** [PR #39](https://github.com/undecuple/project-helghast/pull/39) (rewritten against our current
+  network code, not merged as is):
+  - an unclear or misspelled server setting, an unrecognised online config or a failed online setup leaves the game
+    offline; the loopback capture log no longer writes tokens, certificate hashes or ticket details.
+
 ## References and thanks
 
 Facts recovered for this port are checked against the game binary; these public sources helped find and explain

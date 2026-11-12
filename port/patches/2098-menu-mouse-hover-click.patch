@@ -11,8 +11,10 @@ pad_mouse.c. The guest side (GUM context capture, tag walk, SetFocus) is port/kz
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): menu-mouse sent hook at upstream's emit (freshness now finalized earlier upstream, 6eb26c1e).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 6d86d461..7e5f1082 100644
+index e4a3d77..a261e85 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
 @@ -20,6 +20,11 @@
@@ -27,7 +29,7 @@ index 6d86d461..7e5f1082 100644
  
  /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
   * wall-clock seconds. A loaded machine runs a title at a third of its usual
-@@ -382,6 +387,9 @@ static int pad_kb_down_win(void* ctx, int code)
+@@ -531,6 +536,9 @@ static int pad_kb_down_win(void* ctx, int code)
      int vk = code;
      (void)ctx;
      if (code > 0 && code < 256 && s_kb_layout_ok) vk = s_kb_layout.vk[code];
@@ -35,9 +37,9 @@ index 6d86d461..7e5f1082 100644
 +     * not their keybinds.ini pad buttons (Mouse1 = R1 by default) */
 +    if ((vk == 0x01 || vk == 0x02 || vk == 0x04 || vk == 0x05 || vk == 0x06) && pad_mouse_menu_on()) return 0;
      /* KZ3 patch 2095: Alt+Enter switches the display mode (rsx_null_backend.c); its Enter is not a pad press */
-     if (vk == 0x0D && (GetAsyncKeyState(0x12) & 0x8000)) return 0;
-     return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
-@@ -462,6 +470,17 @@ int pad_kb_sibling_path(const wchar_t* name, wchar_t* out, size_t n)
+     if (vk == 0x0D && pad_key_down(0x12)) return 0;
+     return vk && pad_key_down(vk);   /* upstream v0.19: pad_key_down wraps GetAsyncKeyState on this backend */
+@@ -611,6 +619,17 @@ int pad_kb_sibling_path(const wchar_t* name, wchar_t* out, size_t n)
      return 1;
  }
  
@@ -55,7 +57,7 @@ index 6d86d461..7e5f1082 100644
  static int pad_kb_stamp(FILETIME* out)
  {
      WIN32_FILE_ATTRIBUTE_DATA a;
-@@ -1406,6 +1425,19 @@ skip_inject: ;
+@@ -1557,6 +1576,19 @@ skip_inject: ;
      data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
      data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]  = hs->analog_ly;
  
@@ -75,7 +77,7 @@ index 6d86d461..7e5f1082 100644
      /* Pressure-sensitive buttons (only meaningful if PRESS_ON) */
      if (setting & CELL_PAD_SETTING_PRESS_ON) {
          data->button[CELL_PAD_BTN_OFFSET_PRESS_RIGHT]    = hs->press_right;
-@@ -1480,6 +1512,8 @@ emit:
+@@ -1631,6 +1663,8 @@ emit:
       *
       * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
      {
@@ -86,7 +88,7 @@ index 6d86d461..7e5f1082 100644
          for (int _i = 0; _i < CELL_PAD_MAX_CODES; _i++)                    /* button[] u16 */
 diff --git a/libs/input/pad_menu_mouse.h b/libs/input/pad_menu_mouse.h
 new file mode 100644
-index 00000000..2576d441
+index 0000000..2576d44
 --- /dev/null
 +++ b/libs/input/pad_menu_mouse.h
 @@ -0,0 +1,157 @@
@@ -248,7 +250,7 @@ index 00000000..2576d441
 +#endif
 +#endif
 diff --git a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
-index 450aadf6..9e721fef 100644
+index 450aadf..9e721fe 100644
 --- a/libs/input/pad_mouse.c
 +++ b/libs/input/pad_mouse.c
 @@ -62,6 +62,9 @@ static void pm_init(void)
@@ -444,7 +446,7 @@ index 450aadf6..9e721fef 100644
  #endif
 +
 diff --git a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
-index da8028d6..692f5f2c 100644
+index da8028d..692f5f2 100644
 --- a/libs/input/pad_mouse.h
 +++ b/libs/input/pad_mouse.h
 @@ -71,6 +71,9 @@ static inline int pad_mouse_look_apply(const PadMouseCfg* c, int dx, int dy, flo
@@ -548,7 +550,7 @@ index da8028d6..692f5f2c 100644
  #ifdef __cplusplus
  }
 diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
-index ebe1cbbd..e7438824 100644
+index ebe1cbb..e743882 100644
 --- a/libs/video/rsx_null_backend.c
 +++ b/libs/video/rsx_null_backend.c
 @@ -521,6 +521,8 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)

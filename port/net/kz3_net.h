@@ -50,6 +50,12 @@ typedef struct {
     char     server[KZ3_NET_NAME_MAX + 1];    /* top-level "server = NAME": which section to use; "" = the first */
     Kz3NetServer servers[KZ3_NET_MAX_SERVERS];   /* the [server NAME] sections, in file order */
     int      nservers;
+    /* Fail-closed flags (idea from public PR #39 by Tzeentchnet). */
+    int      server_invalid;   /* a selector-shaped line (any key with "server" in it) was malformed, repeated, misplaced
+                                  or possibly lost in a discarded line: no server is used at all */
+    int      config_unsafe;    /* some line was rejected: a ticket_file or online_id then needs a clean file */
+    int      server_seen;      /* a top-level "server" key was read (a second one makes the selection invalid) */
+    int      ticket_requested; /* a ticket_file key with a value was read, even if it was refused later */
 } Kz3NetConfig;
 
 typedef void (*kz3_net_log_fn)(const char* msg);
@@ -86,6 +92,7 @@ const char* kz3_net_region_label_for_key(const char* key, size_t len);
 /* Puts the config into the network policy: strict mode, MUIS host -> server_ip, telemetry denied, server ports
  * allowed. Returns 0, or -1 if the policy tables refused an entry. */
 int kz3_net_apply(const Kz3NetConfig* cfg, const uint8_t server_ip[4]);
+int kz3_net_psnr_guard(const uint8_t server_ip[4]);   /* removes PSNR_SERVER when it names the Medius server */
 
 /* loads the player's ticket file (bounded read, np_ticket_check) into np_kz3 and settles the online id:
  * the ticket's id is used when online_id is empty; a different configured id refuses the file. Returns 0, or -1
@@ -101,6 +108,10 @@ int kz3_net_capture_start(uint16_t port, const char* hello_file, const char* onl
 int kz3_net_capture_start_kind(uint16_t port, const char* hello_file, const char* online_id, int http);
 /* The region label the capture's region list carries in <name> (escaped); NULL or "" = none. Call before start. */
 void kz3_net_capture_set_region_label(const char* label);
+
+/* Net pass 17: the online method of this run (repsn.ini / community.ini, kz3_online_cfg.h).
+ * 0 when no method file exists (the online.ini flow of earlier rounds) or the session is community/off. Port-added online features must ask kz3_net_port_features_allowed(). */
+int kz3_net_port_features_allowed(void);
 
 /* Called once from kz3_hle_register (port/kz3/hle_kz3.cpp). Offline: does nothing. */
 void kz3_net_register(void);

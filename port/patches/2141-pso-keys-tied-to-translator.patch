@@ -15,18 +15,21 @@ from another layout or another translator is deleted together with the pipeline 
 [pso-preload] line; the compiled shader blobs are keyed by their HLSL text and stay. Header layout: 32 bytes,
 id_lo at byte offset 24, id_hi at 28.
 
-diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 1a3d716..c0e99f8 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -224,6 +224,7 @@
+@@ -142,6 +142,7 @@ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context *
  /* patch 2048: asynchronous PSO build bookkeeping */
  #include "rsx_pso_template.h"   /* patch 2071 */
  #include "rsx_pace.h"           /* patch 2072 */
 +#include "rsx_pso_keys_hdr.h"   /* patch 2141: key file header with the translator id */
  #include "rsx_tex_lru.h"        /* patch 2075 */
  #include "rsx_gpupass.h"        /* patch 2086 */
- #include "rsx_d3d12_device.h"   /* patch 2099: WARP fallback */
-@@ -8190,12 +8191,9 @@
+ #include <sys/stat.h>
+@@ -8099,12 +8100,9 @@ static ID3DBlob* ld_pstat_disk_load(u32 stage, const char* source, u32 source_le
   * turns the preload and the library off (recording stays on, so an A/B run still produces the key file).
   * Recording is first-build-wins like the in-memory cache: the DSV format of a PSO follows the depth surface bound
   * at its first build (apply_render_state's g.depth test), which the key does not include, so the record keeps it. */
@@ -39,7 +42,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  typedef struct {
      u64 key, vs_hash, ps_hash;
      u32 vs_len, ps_len, flags, layout_mask, layout_stride, layout_count;
-@@ -8258,9 +8256,10 @@
+@@ -8167,9 +8165,10 @@ static void ld_pl_open(void)
      FILE* f = fopen(g_ld_pl.path, "rb");
      if (!f) return;
      ld_pl_hdr h; memset(&h, 0, sizeof h);
@@ -53,7 +56,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
      if (ok) {
          g_ld_pl.cap_recs = 1024;
          g_ld_pl.recs = (ld_pl_rec*)malloc(g_ld_pl.cap_recs * sizeof(ld_pl_rec));
-@@ -8279,8 +8278,16 @@
+@@ -8188,8 +8187,16 @@ static void ld_pl_open(void)
      }
      fclose(f);
      if (!ok) {
@@ -71,7 +74,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
      }
  }
  
-@@ -8302,7 +8309,8 @@
+@@ -8211,7 +8218,8 @@ static void ld_pl_record(u64 key, const render_state_t* rs, const rsx_vertex_lay
      if (!f) return;
      fseek(f, 0, SEEK_END);   /* MSVCRT: an "a" stream reports position 0 until its first write */
      if (ftell(f) == 0) {
@@ -81,8 +84,10 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
          fwrite(&h, sizeof h, 1, f);
      }
      fwrite(&r, sizeof r, 1, f);
-diff -ruN a/libs/video/rsx_pso_keys_hdr.h b/libs/video/rsx_pso_keys_hdr.h
---- a/libs/video/rsx_pso_keys_hdr.h
+diff --git a/libs/video/rsx_pso_keys_hdr.h b/libs/video/rsx_pso_keys_hdr.h
+new file mode 100644
+index 0000000..1e8b24c
+--- /dev/null
 +++ b/libs/video/rsx_pso_keys_hdr.h
 @@ -0,0 +1,44 @@
 +/* KZ3 patch 2141: the header of the PSO preload's key file (pso_keys.bin, patch 2031) and its check.

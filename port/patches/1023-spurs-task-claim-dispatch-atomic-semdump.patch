@@ -145,7 +145,7 @@ index e8baa926..566d07dd 100644
 +#endif
 +void kz3_semdump_note(uint32_t r28, uint32_t r29, uint32_t r30, uint32_t r31, uint32_t q, unsigned tid)
 +{
-+    static volatile LONG started = 0;
++    static volatile long started = 0;
 +    s_sd_r[0] = r28; s_sd_r[1] = r29; s_sd_r[2] = r30; s_sd_r[3] = r31;
 +    char why[48]; snprintf(why, sizeof why, "receive q=%u tid=%u", q, tid);
 +    kz3_semdump_now(why);

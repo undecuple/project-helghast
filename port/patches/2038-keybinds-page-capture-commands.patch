@@ -10,9 +10,13 @@ footer the page composes, "sel R S" + Delete clears the selected cell outside a 
 bound keys.
 Host test: tools/smoke/test_pad_keybinds.sh section 5.
 
---- a/libs/input/cellPad.c	2026-10-12 08:59:27.402446232 -0500
-+++ b/libs/input/cellPad.c	2026-10-12 09:02:48.101968062 -0500
-@@ -150,6 +150,10 @@
+Rebased on ps3recomp v0.19.0 (shared v0.19 group C): context only (pad_kb_down_win now reads upstream's pad_key_down, from 2037's rebase).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 88c6d198..5d24ff05 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -436,6 +436,10 @@ static wchar_t     s_kb_path[1024];
  static FILETIME    s_kb_stamp;
  static unsigned long long s_kb_checked_ms = 0;
  
@@ -23,15 +27,15 @@ Host test: tools/smoke/test_pad_keybinds.sh section 5.
  static void pad_kb_log(void* ctx, const char* msg)
  {
      (void)ctx;
-@@ -157,6 +161,7 @@
+@@ -443,6 +447,7 @@ static void pad_kb_log(void* ctx, const char* msg)
  }
  
- static int pad_kb_down_win(void* ctx, int vk) { (void)ctx; return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+ static int pad_kb_down_win(void* ctx, int vk) { (void)ctx; return pad_key_down(vk); }
 +static int pad_kb_down_none(void* ctx, int vk) { (void)ctx; (void)vk; return 0; }
  
  static char* pad_kb_read_w(const wchar_t* path)       /* malloc'd, NUL-terminated; NULL if unreadable */
  {
-@@ -251,6 +256,71 @@
+@@ -537,6 +542,71 @@ static void pad_kb_load(int first)
      fflush(stdout);
  }
  
@@ -103,7 +107,7 @@ Host test: tools/smoke/test_pad_keybinds.sh section 5.
  static void pad_poll_keyboard(void)
  {
      static int off = -1;
-@@ -258,19 +328,39 @@
+@@ -544,19 +614,39 @@ static void pad_poll_keyboard(void)
      s_kb_state.buttons = 0; s_kb_state.dirs = 0;
      if (off) return;
  
@@ -148,7 +152,7 @@ Host test: tools/smoke/test_pad_keybinds.sh section 5.
  }
  
  /* Port 0 = the XInput pad (if any) plus the keys. Without a pad, port 0 is the keys alone and is reported
-@@ -283,6 +373,10 @@
+@@ -569,6 +659,10 @@ static void pad_merge_keyboard(void)
      if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
      int had_pad = hs->connected;
      if (off) return;
@@ -159,9 +163,11 @@ Host test: tools/smoke/test_pad_keybinds.sh section 5.
      if (!hs->connected) {
          memset(hs, 0, sizeof *hs);
          hs->connected = 1;
---- a/libs/input/pad_keybinds.h	2026-10-12 08:59:27.404117662 -0500
-+++ b/libs/input/pad_keybinds.h	2026-10-12 09:02:48.102968084 -0500
-@@ -353,4 +353,277 @@
+diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+index dfe5cb9e..19046c60 100644
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -353,4 +353,277 @@ static int pad_kb_ini_portable(const char* text)
      return 0;
  }
  

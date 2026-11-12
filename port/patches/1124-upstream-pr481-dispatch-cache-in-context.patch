@@ -21,11 +21,16 @@ Upstream candidate: the context-resident variant (no TLS).
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (cache in the context, default off) over upstream's TLS cache (on by default upstream). TODO fixup: upstream's `dcache_id, dcache_residency` field in spu_context.h duplicates 1124's `dcache_residency` (compile error until removed).
 
+Rebased on ps3recomp v0.19.0 (group B, R&C 2026-11-09): builds on #636 (b3bfd018, relocatable lifts): spu_dcache_ent gains
+`reloc, reloc_delta` (entries are 40 bytes now, 20 KiB per context), a miss records the &reloc out-parameter of the
+3-argument spu_lifted_lookup_full and the reloc_delta it set, a hit repeats ctx->reloc_delta, the shadow compare passes NULL.
+Upstream's dcache_id/dcache_residency field and t_dcache stay replaced (no TLS, no context id); default still off.
+
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 1756a14b..3837c303 100644
+index 0cfb2782..614452b5 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1794,8 +1794,8 @@ void spu_register_function(uint32_t addr, spu_fn fn)
+@@ -1824,8 +1824,8 @@ void spu_register_function(uint32_t addr, spu_fn fn)
      else
          s_hash_next[s_hash_tail[h] - 1] = i + 1;
      s_hash_tail[h] = i + 1;
@@ -36,7 +41,7 @@ index 1756a14b..3837c303 100644
      __atomic_store_n(&s_registry_count, i + 1, __ATOMIC_RELEASE);
  }
  
-@@ -2059,99 +2059,93 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+@@ -2100,105 +2100,97 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
      return (spu_lifted_fn)fn;
  }
  
@@ -68,6 +73,10 @@ index 1756a14b..3837c303 100644
 -    spu_lifted_fn fn;
 -    uint32_t id, lsa, rgen, residency;
 -    int image, ovl, task;
+-    /* A relocatable resolution also sets ctx->reloc_delta, which a hit must
+-     * repeat: residency fixes the placement, so the delta is part of the answer. */
+-    int reloc;
+-    int32_t reloc_delta;
 -} spu_dcache_ent;
 -#define SPU_DCACHE_ENTRIES 512u
 -static SPU_TLS spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
@@ -132,7 +141,7 @@ index 1756a14b..3837c303 100644
  spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  {
      const int mode = spu_dcache_mode();
-     if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa);
+     if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa, NULL);
      spu_context* c = (spu_context*)ctx;
 -    uint32_t id = c->dcache_id;
 -    if (!id) {
@@ -151,10 +160,13 @@ index 1756a14b..3837c303 100644
 +    struct spu_dcache_ent* e = &c->dcache[((lsa >> 2) ^ (lsa >> 11)) & (SPU_DCACHE_ENTRIES - 1)];
 +    if (e->fn && e->lsa == lsa && e->rgen == rgen && e->residency == c->dcache_residency &&
 +        e->image == c->image_id && e->ovl == c->resident_ovl && e->task == c->resident_task) {
++        /* A relocatable resolution (#636) also set ctx->reloc_delta: residency fixes the placement, so the delta is
++         * part of the answer and a hit repeats it. */
+         if (e->reloc) c->reloc_delta = e->reloc_delta;
          if (mode == 2) {
 -            __atomic_fetch_add(&s_dcache_hits, 1, __ATOMIC_RELAXED);
 +            const unsigned long long nh = __atomic_add_fetch(&s_dcache_hits, 1, __ATOMIC_RELAXED);
-             const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa);
+             const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa, NULL);
 -            if (full != e->fn) {
 +            if (full != (spu_lifted_fn)e->fn) {
                  if (__atomic_fetch_add(&s_dcache_shadow_bad, 1, __ATOMIC_RELAXED) < 16)
@@ -176,7 +188,8 @@ index 1756a14b..3837c303 100644
 -        spu_dcache_shadow_stats();
 +        spu_dcache_shadow_stats(__atomic_add_fetch(&s_dcache_misses, 1, __ATOMIC_RELAXED));
      }
-     const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
+     int reloc = 0;
+     const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa, &reloc);
      if (fn) {
 -        /* The resolver may have verified a pending slot; the entry records the
 -         * residency it resolved against, read after it. */
@@ -186,11 +199,11 @@ index 1756a14b..3837c303 100644
 +        /* The resolver may have verified a pending slot; the entry records the residency read after it. */
 +        e->fn = (void*)fn; e->lsa = lsa; e->rgen = rgen; e->residency = c->dcache_residency;
 +        e->image = c->image_id; e->ovl = c->resident_ovl; e->task = c->resident_task;
+         e->reloc = reloc; e->reloc_delta = c->reloc_delta;
      }
      return fn;
- }
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index 7e17fa26..35c27d59 100644
+index 7cda9ce5..eac5196f 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
 @@ -221,6 +221,8 @@ typedef struct spu_channel {
@@ -202,9 +215,9 @@ index 7e17fa26..35c27d59 100644
  typedef struct spu_context {
      /* 128 general-purpose 128-bit registers */
      SPU_ALIGN16 u128 gpr[128];
-@@ -354,14 +356,6 @@ typedef struct spu_context {
-         int verify_state, source_index;
-     } resident_code[4];
+@@ -362,14 +364,6 @@ typedef struct spu_context {
+      * pc. Set by the dispatcher on entry into such code; only that code reads it. */
+     int32_t reloc_delta;
  
 -    /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
 -     * context's current lifetime: 0 after spu_context_init (or a zeroed
@@ -217,7 +230,7 @@ index 7e17fa26..35c27d59 100644
      /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
       * for co-resident tasks. A taskset may hold several tasks that all lift at the
       * SAME LS base (the shared task-code region at LS 0x3000+), so an LS address
-@@ -491,6 +485,19 @@ typedef struct spu_context {
+@@ -499,6 +493,20 @@ typedef struct spu_context {
      /* KZ3 patch 1096: return pc of the innermost open call bracket (lifted brsl/bisl, spu_drain_call_full), or 0 at
       * top level. A direct indirect hop to this address is left to the drain, which returns there. */
      uint32_t hop_ret_pc;
@@ -233,15 +246,16 @@ index 7e17fa26..35c27d59 100644
 +        void*    fn;
 +        uint32_t lsa, rgen, residency;
 +        int32_t  image, ovl, task;
-+    } dcache[SPU_DCACHE_ENTRIES];   /* no over-alignment: contexts come from malloc and live on job stacks */
++        int32_t  reloc, reloc_delta;   /* v0.19 #636: a relocatable answer and the reloc_delta a hit repeats */
++    } dcache[SPU_DCACHE_ENTRIES];  /* no over-alignment: contexts come from malloc and live on job stacks */
  } spu_context;
  
  /* event_status is written from more than one host thread: the SPU's own
 diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
-index ce11d991..414c9950 100644
+index e252a415..130b8baf 100644
 --- a/runtime/spu/tests/test_spu_lifted_start.c
 +++ b/runtime/spu/tests/test_spu_lifted_start.c
-@@ -555,7 +555,7 @@ static void test_resident_interpreter_rejoin(void)
+@@ -593,7 +593,7 @@ static void test_resident_interpreter_rejoin(void)
      c->resident_ovl = 0;
      check(spu_lifted_lookup(c, a) == rejoin_primary, "cleared resident identities expose primary");
      check(spu_lifted_lookup(c, 0x19000) == NULL, "all registry misses stay unlifted");
@@ -250,7 +264,7 @@ index ce11d991..414c9950 100644
      free(c);
  }
  
-@@ -570,6 +570,11 @@ static void dc_region(spu_context* c)  { c->gpr[9]._u32[0] = 4; }
+@@ -608,6 +608,11 @@ static void dc_region(spu_context* c)  { c->gpr[9]._u32[0] = 4; }
  static void test_dispatch_cache(void)
  {
      const uint32_t a = 0x1C000;
@@ -262,7 +276,7 @@ index ce11d991..414c9950 100644
      spu_context* c = calloc(1, sizeof *c);
      spu_context* d = calloc(1, sizeof *d);
      if (!c || !d) { check(0, "allocate dispatch cache contexts"); free(c); free(d); return; }
-@@ -612,14 +617,15 @@ static void test_dispatch_cache(void)
+@@ -650,14 +655,15 @@ static void test_dispatch_cache(void)
      spu_overlay_note_get(c, 0x850000, c->ls + a + 0x800, 16);
      check(spu_lifted_lookup(c, a) == dc_primary, "dcache: equal residency count in a new lifetime is a miss");
  

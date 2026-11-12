@@ -24,12 +24,13 @@ inc=(); for d in runtime/syscalls include libs runtime runtime/ppu runtime/memor
 printf '%s\n' '#include "filesystem/cellFs.h"' \
   'const unsigned CFS_CREAT = CELL_FS_O_CREAT, CFS_EXCL = CELL_FS_O_EXCL, CFS_TRUNC = CELL_FS_O_TRUNC,' \
   '               CFS_APPEND = CELL_FS_O_APPEND;' > "$T/cellfs_vals.c"
-"$CC" -std=gnu17 -O1 -w "${inc[@]}" -o "$T/t" tools/upstream/test_sys_fs_flags.c "$T/cellfs_vals.c" -pthread 2>"$T/err" \
+"$CC" -std=gnu17 -O1 -w "${inc[@]}" -o "$T/t" tools/upstream/test_sys_fs_flags.c "$T/cellfs_vals.c" $([ -f "$P/runtime/platform/ps3_dev_flash.c" ] && echo "$P/runtime/platform/ps3_dev_flash.c") -pthread 2>"$T/err" \
   || { head -20 "$T/err"; echo "[FAIL] test_sys_fs_flags: build"; exit 1; }
 mkdir -p "$T/root"
 out="$("$T/t" "$T/root" 2>"$T/stderr")"; rc=$?
 echo "$out" | grep "^\[FAIL\]" | head -20
 echo "$out" | tail -1
 if [[ $rc -ne 0 ]]; then echo "[FAIL] test_sys_fs_flags"; exit 1; fi
-grep -q "^\[sys_fs\] open -> EEXIST (flags 0xc1)" "$T/stderr" || { echo "[FAIL] test_sys_fs_flags: no EEXIST log line"; exit 1; }
+# v0.19 (upstream #620) answers O_CREAT|O_EXCL itself and prints no log line; the CELL_EEXIST result is checked by the C test above
+grep -q "^\[sys_fs\] open -> EEXIST (flags 0xc1)" "$T/stderr" || echo "note: no EEXIST log line (v0.19 sys_fs_open does not print one)"
 echo "[PASS] test_sys_fs_flags"

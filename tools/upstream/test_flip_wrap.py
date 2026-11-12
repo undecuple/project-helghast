@@ -32,6 +32,10 @@ static u32 gcm_ea2io(u32 ea) { return (ea >= IO_BASE && ea < IO_BASE + IO_SIZE) 
 static u32 s_fifo_getoff;
 static volatile u32 s_fifo_flips_queued;                 /* counted by gcm_flip_into_fifo since #343 (9343) */
 static int s_display_buffer_set[CELL_GCM_MAX_DISPLAY_BUFFER_NUM] = {1, 1};
+/* v0.19: the segmented-ring state (off here: s_seg_size 0) that gcm_ctx_room and gcm_flip_into_fifo consult */
+static u32 s_seg_size = 0, s_gcm_context_ea = 0;
+static void gcm_fifo_next_segment(u32 c) { (void)c; }
+%s
 %s
 %s
 /* ctx at C: begin B, end B+0x30000 (KZ3-sized), current near the end; callback descriptor at C+0x10 */
@@ -60,9 +64,10 @@ for label, tree in TREES.items():
     src = open(os.path.join(tree, "libs/video/cellGcmSys.c")).read()
     defs = "\n".join(X.define(src, n) for n in NAMES)
     ok_fn = X.function(src, r"static int gcm_flip_wrap_ok\(u32 ctx\)") or ""
+    room = X.function(src, r"static int gcm_ctx_room\(u32 ctx, u32 bytes\)") or "static int gcm_ctx_room(u32 c, u32 b) { return 1; }"
     fn = X.function(src, r"static int gcm_flip_into_fifo\(u32 ctx, u32 bufferId\)")
     with tempfile.TemporaryDirectory() as d:
-        open(f"{d}/t.c", "w").write(HARNESS % (defs, ok_fn, fn))
+        open(f"{d}/t.c", "w").write(HARNESS % (defs, room, ok_fn, fn))
         subprocess.run(["cc", "-O0", "-w", f"{d}/t.c", "-o", f"{d}/t"], check=True)
         for env in (None, "0", "1"):
             e = dict(os.environ); e.pop("GCM_FLIP_WRAP", None)

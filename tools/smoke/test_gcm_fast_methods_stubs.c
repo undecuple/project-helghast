@@ -11,3 +11,5 @@ Z(rsx_live_draw_watch_copy) Z(rsx_live_draw_writeback_range)
 int g_kz3_wacct;
 void* g_kz3_wtrace;
 unsigned long long g_rsx_game_frame_marks[1024];
+/* v0.19: cellGcmSys.c's nv3089 blit reads/writes through rsx_tiling.c and the walker asks spu_taskset_round_busy */
+int spu_taskset_round_busy(unsigned* ts, unsigned* tid) { (void)ts; (void)tid; return 0; }

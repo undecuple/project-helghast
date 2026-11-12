@@ -1,0 +1,172 @@
+KZ3 patch 2161 (RSX pass 149): sampler cache hash index (RSX_SMP_INDEX) and finer texture-loop timers (RSX_PERF_DRAW).
+1. sampler_slot() scanned every cached sampler key (up to 128 x 16-byte memcmp) for each enabled texture unit that missed the
+   binding row. rsx_smp_index.h keeps an open-addressed index (uint16, 512 entries, <= 25 % load, no deletion) beside g.smp_keys;
+   keys are unique, so a hit returns the same slot as the scan. RSX_SMP_INDEX unset or 0 = the scan (default since pass 151), 1 = index, "verify" = index plus scan with a
+   logged disagreement ([smp-index] verify FAILED). Host test tools/smoke/test_smp_index.sh: index == scan over
+   720,000 random lookups, negative control (an index missing one add is caught), micro-benchmark: scan 7.8/12.3/20.0/32.7 ns per
+   lookup at 16/32/64/128 cached keys, index 2.2-2.4 ns. The saving per draw is bounded by (enabled units that miss the row) x
+   that difference, i.e. well under 1 us of a ~20 us draw; it is a small win, not the texture-loop lever.
+2. RSX_PERF_DRAW=1 gains three rows under "texture loop (minus binds)": "loop: row check (all units)" (rsx_tex_l1_hit on every
+   unit), "loop: register decode (row miss)" (ld_tex_get) and "loop: sampler key+slot". The rest of the loop is the remainder.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 5a8147b8..1ea018e2 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -233,6 +233,7 @@ static uint8_t* ld_prompt_remap_cells(const uint8_t* cur, uint32_t w, uint32_t h
+ #include "rsx_pace.h"           /* patch 2072 */
+ #include "rsx_pso_keys_hdr.h"   /* patch 2141: key file header with the translator id */
+ #include "rsx_tex_lru.h"        /* patch 2075 */
++#include "rsx_smp_index.h"      /* patch 2161 */
+ #include "rsx_gpupass.h"        /* patch 2086 */
+ #include "rsx_upscale.h"        /* patch 2145: RSX_UPSCALE=fsr1 */
+ #include <sys/stat.h>
+@@ -546,6 +547,7 @@ typedef struct {
+     u32                        smp_ring_slots[SMP_RING_TABLES][SMP_TABLE_SIZE];
+     u32                        smp_keys[SMP_CACHE_SLOTS][4];
+     u32                        n_samplers;
++    uint16_t                   smp_idx[RSX_SMP_IDX_SIZE];   /* patch 2161: hash index over smp_keys (0 = empty, else index + 1) */
+ 
+     ID3D12RootSignature*       rootsig_x;
+     ID3D12RootSignature*       depth_snapshot_rootsig;
+@@ -2518,8 +2520,26 @@ static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
+     h.ptr += (size_t)slot * g.smp_step;
+     return h;
+ }
++/* Patch 2161: RSX_SMP_INDEX (opt-in: unset or "0" = off, "1" = on; "verify" also runs the scan and logs a disagreement). */
++static int ld_smp_index_mode(void)
++{
++    static int m = -1;
++    if (m < 0) { const char* e = getenv("RSX_SMP_INDEX"); m = (e && !strcmp(e, "verify")) ? 2 : (e && e[0] == '1' && !e[1]) ? 1 : 0; }
++    return m;
++}
+ static u32 sampler_slot(const rsx_dsp_texture* t, const u32 key[4])
+ {
++    const int mode = ld_smp_index_mode();
++    if (mode) {
++        const int f = rsx_smp_index_find(g.smp_idx, (const u32 (*)[4])g.smp_keys, key);
++        if (mode == 2) {
++            int s = -1;
++            for (u32 i = 0; i < g.n_samplers; i++)
++                if (!memcmp(g.smp_keys[i], key, sizeof g.smp_keys[i])) { s = (int)i; break; }
++            if (s != f) { static u32 nl; if (nl++ < 16) fprintf(stderr, "[smp-index] verify FAILED scan=%d index=%d\n", s, f); }
++        }
++        if (f >= 0) return 1 + (u32)f;
++    } else
+     for (u32 i = 0; i < g.n_samplers; i++)
+         if (!memcmp(g.smp_keys[i], key, sizeof g.smp_keys[i])) return 1 + i;
+     if (g.n_samplers >= SMP_CACHE_SLOTS) return SMP_DEFAULT;
+@@ -2527,6 +2547,7 @@ static u32 sampler_slot(const rsx_dsp_texture* t, const u32 key[4])
+     const u32 slot = 1 + g.n_samplers;
+     g.dev->lpVtbl->CreateSampler(g.dev, &sd, smp_cpu(slot));
+     memcpy(g.smp_keys[g.n_samplers++], key, sizeof g.smp_keys[0]);
++    rsx_smp_index_add(g.smp_idx, (const u32 (*)[4])g.smp_keys, slot - 1u);   /* kept current in every mode */
+     return slot;
+ }
+ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE])
+@@ -4325,6 +4346,8 @@ static ld_pd_stage g_pd[] = {
+     { "  pso build (new)", RSX_PERF_W_PSO_NEW_T, 0 },
+     { "ps constants (ring upload)", RSX_PERF_W_CONST_T, 1 },
+     { "texture loop (minus binds)", RSX_PERF_W_D_TEXLOOP_T, 1 }, { "texture binds", RSX_PERF_W_TEX_T, 1 },
++    { "  loop: row check (all units)", RSX_PERF_W_TL_L1_T, 0 }, { "  loop: register decode (row miss)", RSX_PERF_W_TL_GET_T, 0 },
++    { "  loop: sampler key+slot", RSX_PERF_W_TL_SMP_T, 0 },
+     { "  tex hash", RSX_PERF_W_TEX_HASH_T, 0 }, { "  tex new/decode", RSX_PERF_W_TEX_NEW_T, 0 },
+     { "  tex upload", RSX_PERF_W_TEX_UP_T, 0 },
+     { "descriptors+barriers+RT total", RSX_PERF_W_D_DESC_T, 1 },
+@@ -14856,7 +14879,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         u32 tm_raw[9];
+         if (te_mode && u < 16u) {   /* patch 2159: level 1, the unit's registers are unchanged since the row was recorded */
+             rsx_tex_l1* e = &g_ld_te[u];
+-            if (rsx_tex_l1_hit(e, &g.rsx, u, g_ld_surf_gen, g_ld_zgen, g_ld_tex_memo_epoch)) {
++            LDW_T0(l1_t0);
++            const int l1_hit = rsx_tex_l1_hit(e, &g.rsx, u, g_ld_surf_gen, g_ld_zgen, g_ld_tex_memo_epoch);
++            LDW_ADD(RSX_PERF_W_TL_L1_T, l1_t0);   /* patch 2161 */
++            if (l1_hit) {
+                 int why = 0;
+                 if (te_mode == 2) {
+                     why = ld_te_verify(u, e, target);
+@@ -14916,7 +14942,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 continue;
+             }
+         }
+-        rsx_dsp_texture t; ld_tex_get(u, &t);   /* patch 2159 */
++        rsx_dsp_texture t;
++        { LDW_T0(get_t0); ld_tex_get(u, &t);   /* patch 2159 */
++          LDW_ADD(RSX_PERF_W_TL_GET_T, get_t0); }   /* patch 2161 */
+         /* LD_PS1_BUF0=1 -- DIAGNOSTIC, not a fix. Force a 24-bit PS1 VRAM
+          * bind at buffer 1 (offset 0x4003C0) to sample buffer 0 (0x400000).
+          *
+@@ -14940,7 +14968,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             continue;
+         }
+         texture_mask |= 1u << u;
+-        { u32 skey[4]; sampler_key(&t, skey); smp_slots[u] = sampler_slot(&t, skey); }
++        { LDW_T0(smp_t0); u32 skey[4]; sampler_key(&t, skey); smp_slots[u] = sampler_slot(&t, skey);
++          LDW_ADD(RSX_PERF_W_TL_SMP_T, smp_t0); }   /* patch 2161 */
+         /* Pick WHICH surface at this offset to sample.
+          *
+          * Matching on (location, offset) alone was fine when only one surface
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 1df4cc6c..197a229f 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -283,6 +283,10 @@ enum {
+     RSX_PERF_X_VPH_T, RSX_PERF_X_VPH_N, RSX_PERF_X_VPH_B,
+     RSX_PERF_X_FPH_T, RSX_PERF_X_FPH_N, RSX_PERF_X_FPH_B, RSX_PERF_X_FPH_HIT,
+     RSX_PERF_X_FPCC_T, RSX_PERF_X_FPCC_N,   /* rsx_fp_collect_constants (a scan of the FP on every draw) */
++    /* patch 2161 (RSX_PERF_DRAW=1): the texture loop's own parts, none nested in another: the level-1 row check on
++     * every unit (rsx_tex_l1_hit), the register decode of a unit that missed the row (ld_tex_get), and the sampler
++     * key + slot lookup of an enabled unit that missed the row. */
++    RSX_PERF_W_TL_L1_T, RSX_PERF_W_TL_GET_T, RSX_PERF_W_TL_SMP_T,
+     RSX_PERF_COUNT
+ };
+ int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
+diff --git a/libs/video/rsx_smp_index.h b/libs/video/rsx_smp_index.h
+new file mode 100644
+index 00000000..68b1060d
+--- /dev/null
++++ b/libs/video/rsx_smp_index.h
+@@ -0,0 +1,43 @@
++/* KZ3 patch 2161: open-addressed index over the sampler cache's keys (RSX pass 149).
++ *
++ * sampler_slot() ran a linear memcmp over every cached sampler key (up to MAX_SAMPLERS = 128, 16 bytes each) for every
++ * enabled texture unit that missed the binding row, on the walker thread. Keys are unique in the cache (a key is
++ * only appended when the scan found none), so a hash lookup returns the same slot as the scan: the lowest, and only,
++ * index whose key equals the request. The index stores index + 1 (0 = empty) in a power-of-two table at <= 25 % load,
++ * linear probing, no deletion (the cache never removes keys). Pure C, no allocation. Host test:
++ * tools/smoke/test_smp_index.sh (equivalence with the scan, negative control, micro-benchmark). */
++#ifndef RSX_SMP_INDEX_H
++#define RSX_SMP_INDEX_H
++
++#include <stdint.h>
++#include <string.h>
++
++#define RSX_SMP_IDX_BITS 9u
++#define RSX_SMP_IDX_SIZE (1u << RSX_SMP_IDX_BITS)   /* >= 4 x 128 keys */
++
++static inline uint32_t rsx_smp_key_hash(const uint32_t key[4])
++{
++    uint32_t h = key[0] * 0x9E3779B1u;
++    h = (h ^ (h >> 15)) + key[1] * 0x85EBCA77u;
++    h = (h ^ (h >> 13)) + key[2] * 0xC2B2AE3Du;
++    h = (h ^ (h >> 16)) + key[3] * 0x27D4EB2Fu;
++    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12;
++    return h & (RSX_SMP_IDX_SIZE - 1u);
++}
++/* The cache index holding `key`, or -1. idx[] is zero-initialised; keys[i] are the n cached keys. */
++static inline int rsx_smp_index_find(const uint16_t idx[RSX_SMP_IDX_SIZE], const uint32_t (*keys)[4], const uint32_t key[4])
++{
++    for (uint32_t k = rsx_smp_key_hash(key);; k = (k + 1u) & (RSX_SMP_IDX_SIZE - 1u)) {
++        const uint32_t v = idx[k];
++        if (!v) return -1;
++        if (!memcmp(keys[v - 1u], key, 16)) return (int)(v - 1u);
++    }
++}
++/* Record keys[i] (just appended, not present before). */
++static inline void rsx_smp_index_add(uint16_t idx[RSX_SMP_IDX_SIZE], const uint32_t (*keys)[4], uint32_t i)
++{
++    uint32_t k = rsx_smp_key_hash(keys[i]);
++    while (idx[k]) k = (k + 1u) & (RSX_SMP_IDX_SIZE - 1u);
++    idx[k] = (uint16_t)(i + 1u);
++}
++#endif

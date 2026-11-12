@@ -9,8 +9,10 @@ and without one every slot reads as unplugged (keyboard on port 0 still works). 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): shrunk: upstream #494 (our own PR) has the run-time XInput load; 4019 keeps the comments and the lazy load in 4010's pad_init_backend (only when SDL3 is not used).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index d5dd906b..9d680686 100644
+index 75fb2fa..7843ddc 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
 @@ -4,7 +4,8 @@
@@ -23,7 +25,7 @@ index d5dd906b..9d680686 100644
   *   - Everywhere else: SDL3 Gamepad from libSDL3.so.0, loaded at run time
   */
  
-@@ -65,6 +66,10 @@ static double pad_clock(unsigned long long t0_ms)
+@@ -69,6 +70,10 @@ static double pad_clock(unsigned long long t0_ms)
    #include <dlfcn.h>
  #endif
  #if PAD_BACKEND_XINPUT
@@ -34,7 +36,7 @@ index d5dd906b..9d680686 100644
    #include <xinput.h>
  #endif
  #include "pad_host.h"
-@@ -765,7 +770,7 @@ static void pad_poll_xinput(void)
+@@ -936,7 +941,7 @@ static void pad_poll_xinput(void)
      }
  }
  
@@ -43,7 +45,7 @@ index d5dd906b..9d680686 100644
  
  #endif /* PAD_BACKEND_XINPUT */
  
-@@ -1109,12 +1114,12 @@ static void pad_sdl_shutdown(void)
+@@ -1280,12 +1285,12 @@ static void pad_sdl_shutdown(void)
  
  static void pad_init_backend(void)
  {

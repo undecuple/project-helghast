@@ -13,6 +13,7 @@
 #  - After N seconds (default 10) takes a screenshot (default work/shots/<name>.png), then kills the run.
 # Exit status: 0 if the program was still running at screenshot time or exited 0; the log is printed. 2: refused
 # before the run (runenv_check.py: a path switch the sandbox cannot see or write). 4: the run logged "cannot write".
+# 5: the required log-gated play failed or could not complete.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECONDS_RUN=10 SHOT="" NAME="" PROTON_DIR="$HOME/.local/share/Steam/compatibilitytools.d/Proton-GE Latest"
@@ -40,6 +41,19 @@ NAME="${NAME:-$(basename "$EXE" .exe)}"
 SHOT="${SHOT:-$ROOT/work/shots/$NAME.png}"
 RUN="$ROOT/work/proton/$NAME"
 [[ -x "$PROTON_DIR/proton" ]] || { echo "no proton at $PROTON_DIR" >&2; exit 2; }
+
+# Optional log-gated play: validate before staging and refuse old state/evidence.
+if [[ -n "${KZ3_PLAY_SCENARIO:-}" ]]; then
+  python3 "$ROOT/tools/gameplay/play.py" validate "$KZ3_PLAY_SCENARIO" || exit 2
+  KZ3_PLAY_SCENARIO="$(readlink -f "$KZ3_PLAY_SCENARIO")" || exit 2
+  export KZ3_PLAY_SCENARIO
+  if [[ -e "$RUN/run.json" || -e "$RUN/play.json" || -e "$RUN/play.jsonl" || -e "$RUN/app/app_stdout.txt" ]]; then
+    echo "proton-test: scripted play needs a fresh run name ($NAME)" >&2; exit 2
+  fi
+  [[ -z "${REAL:-}${KZ3_REAL_DISPLAY:-}" ]] || { echo "proton-test: scripted captures require hidden Xvfb" >&2; exit 2; }
+  # PAD_FILE admission is a debug message; retain it in stdout and record the override before provenance starts.
+  export KZ3_LOG="${KZ3_LOG:+$KZ3_LOG,}cellPad:debug"
+fi
 
 # Path switches preflight (2026-10-15, after a sweep spent 55 GPU minutes writing a template the sandbox could not
 # write): every KZ3_/LD_/RSX_ value that is a drive path must be inside this checkout, outputs under work/ or build/.

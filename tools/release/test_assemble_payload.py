@@ -49,7 +49,7 @@ def fake_repo(root):
     for rel in ("tools/release/firstrun.py", "tools/release/firstrun_check.py", "tools/release/iso9660.py", "tools/release/version_check.py", "tools/release/pathrules.py",
                 "tools/smoke/pso_template.py", "tools/release/launch.py", "tools/release/lift_fixups.py", "tools/release/shaders.py", "tools/release/names.py", "tools/release/support.py", "tools/release/support_text.py", "tools/release/rpcs3_import.py", "tools/release/rpcs3_text.py", "tools/release/rpcs3_locate.py",
                 "tools/assets/profile_edit.py",
-                "tools/release/eboot_sha256.json", "tools/release/psarc_sha256.json", "tools/release/test_firstrun.py",
+                "tools/release/eboot_ids.json", "tools/release/psarc_sha256.json", "tools/release/test_firstrun.py",
                 "tools/release/assemble_payload.py", "tools/jobmods.py", "tools/elf_info.py", "tools/psarc.py",
                 "tools/spu/lift_spu.py", "tools/spu/gen_spu_register.py", "tools/spu/kz3ver.py",
                 "tools/spu/test_spu_lift.py", "re/data/spu_map_114.tsv", "re/data/spu_seeds_114.tsv",
@@ -129,7 +129,7 @@ def main():
         check(rc == 0 and "scrub clean" in txt, "clean fake tree assembles", txt)
         got = listing(out)
         want = {"kz3-setup/release/firstrun.py", "kz3-setup/release/firstrun_check.py", "kz3-setup/release/iso9660.py",
-                "kz3-setup/release/version_check.py", "kz3-setup/release/pathrules.py", "kz3-setup/release/eboot_sha256.json", "kz3-setup/release/psarc_sha256.json", "kz3-setup/jobmods.py",
+                "kz3-setup/release/version_check.py", "kz3-setup/release/pathrules.py", "kz3-setup/release/eboot_ids.json", "kz3-setup/release/psarc_sha256.json", "kz3-setup/jobmods.py",
                 "kz3-setup/pso_template.py", "kz3-setup/release/launch.py", "kz3-setup/release/lift_fixups.py", "kz3-setup/release/shaders.py", "kz3-setup/release/names.py", "kz3-setup/release/support.py", "kz3-setup/release/support_text.py", "kz3-setup/release/rpcs3_import.py", "kz3-setup/release/rpcs3_text.py", "kz3-setup/release/rpcs3_locate.py",
                 "kz3-setup/assets/profile_edit.py",
                 "kz3-setup/elf_info.py", "kz3-setup/spu/lift_spu.py", "kz3-setup/spu/gen_spu_register.py",

@@ -19,11 +19,13 @@ Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream engine-wrote 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): decode_fast moved to upstream's rsx_vertex_fetch_attr_value (single-vertex path); upstream's attribute-major fetch_many left as is.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 70841f03..25e35b89 100644
+index e2858eb..d508053 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -16,6 +16,8 @@
+@@ -17,6 +17,8 @@
  #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
  #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
  #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
@@ -32,7 +34,7 @@ index 70841f03..25e35b89 100644
  #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
  #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
  static unsigned long s_perf_rsx_tid, s_perf_gcm_tid;   /* RSX_PERF thread labels (patch 2007) */
-@@ -510,6 +512,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+@@ -558,6 +560,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
  #ifdef _WIN32
      if (rsx_perf_enabled()) s_perf_gcm_tid = GetCurrentThreadId();   /* RSX_PERF label */
  #endif
@@ -40,7 +42,7 @@ index 70841f03..25e35b89 100644
      printf("[cellGcmSys] Init(cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%08X)\n",
             cmdSize, ioSize, ioAddress);
  
-@@ -1289,6 +1292,7 @@ static void nv3089_blit(void)
+@@ -1478,6 +1481,7 @@ static void nv3089_blit(void)
                           srow + (u32)(su >> 20) * 4, 4);
                }
            } }
@@ -48,7 +50,7 @@ index 70841f03..25e35b89 100644
          { static int _n = 0; static int cap = -1;
            if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
            if (cap && _n < cap) { _n++;
-@@ -1394,6 +1398,7 @@ static void nv3089_blit(void)
+@@ -1613,6 +1617,7 @@ static void nv3089_blit(void)
          const u32 y1 = (out_y + out_h < cy1) ? out_y + out_h : cy1;
          nv3089_engine_wrote(dst_pitch, x0, y0, x1, y1);
      }
@@ -56,15 +58,15 @@ index 70841f03..25e35b89 100644
      { static int _n = 0; static int cap = -1;
        if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
        if (cap && _n < cap) { _n++;
-@@ -1603,6 +1608,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
-                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
-                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
+@@ -1828,6 +1833,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+                 return;
+             }
              vm_write32(base + py * dst_pitch + px * 4, data);
 +            gcm_note_pages_ea(base + py * dst_pitch + px * 4, 4u);   /* patch 2033 */
              return;
          }
          return;
-@@ -2335,6 +2341,12 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+@@ -2560,6 +2566,12 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
                      d[RSX_PERF_W_M2MF_T] * tk, d[RSX_PERF_W_TEX_HASH_T] * tk,
                      d[RSX_PERF_W_PSO_PRE_T] * tk, d[RSX_PERF_W_PSO_UNITS_T] * tk, d[RSX_PERF_W_PSO_KEY_T] * tk,
                      d[RSX_PERF_W_PSO_FIND_T] * tk, d[RSX_PERF_W_PSO_MEMO_N]);
@@ -77,7 +79,7 @@ index 70841f03..25e35b89 100644
              s_perf_walk_on = s_perf_prof_a >= 0 && tnow >= s_perf_prof_a && tnow < s_perf_prof_b;
          }
          {   /* top 4 usleep sites of the cellGcmInit thread, real ms */
-@@ -4460,6 +4472,33 @@ u32 cellGcmResolveOffset(u32 offset)
+@@ -4804,6 +4816,33 @@ u32 cellGcmResolveOffset(u32 offset)
   * Safe from any thread; live-draw applies it before its next texture bind.
   * Local memory -> location 0, IO-mapped main memory -> location 1; other
   * addresses are not visible to the RSX and are ignored. */
@@ -112,7 +114,7 @@ index 70841f03..25e35b89 100644
  {
      if (!size || !rsx_live_draw_enabled()) return;
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index 4bc03bb8..31426fd0 100644
+index 0900074..4ca1eab 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
 @@ -52,6 +52,7 @@ void rsx_live_draw_debug_cond_render_stats(u64 o[6]) { for (int i = 0; i < 6; i+
@@ -123,7 +125,7 @@ index 4bc03bb8..31426fd0 100644
  void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
  u32  rsx_live_draw_before_guest_sync(void) { return 0; }
  void rsx_live_draw_debug_writeback_stats(double* t, u32* b, u32* s, u32* w)
-@@ -143,7 +144,10 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+@@ -144,7 +145,10 @@ extern volatile unsigned long long g_yz_auto_start_tick;
  
  #define LD_SWAP_BUFFERS  2
  #define MAX_SURFACES     64
@@ -135,7 +137,7 @@ index 4bc03bb8..31426fd0 100644
  #define MAX_RETIRED_TEXTURES 4096
  #define MAX_VTEX         64
  #define MAX_SAMPLERS     128
-@@ -289,6 +293,9 @@ typedef struct {
+@@ -290,6 +294,9 @@ typedef struct {
      u32 last_hash_frame;
      u64 last_use_serial;
      u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
@@ -145,7 +147,7 @@ index 4bc03bb8..31426fd0 100644
  } texcache_t;
  typedef struct {
      u32 location, offset, format, width, height, pitch;
-@@ -296,6 +303,7 @@ typedef struct {
+@@ -297,6 +304,7 @@ typedef struct {
      u64 content_hash;
      u32 last_hash_frame;
      u32 span;   /* patch 2015: guest bytes the decode reads (0 = unknown) */
@@ -153,7 +155,7 @@ index 4bc03bb8..31426fd0 100644
  } vtexcache_t;
  typedef struct { u64 key; ID3D12PipelineState* pso; u8 preloaded; } psocache_t;   /* patch 2031: preloaded until first use */
  typedef struct {
-@@ -2610,6 +2618,160 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
+@@ -2611,6 +2619,160 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
      return t->cubemap ? span * 6 : span;
  }
  
@@ -314,7 +316,7 @@ index 4bc03bb8..31426fd0 100644
  static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
  {
      const u32 span = texture_source_span(t);
-@@ -2644,20 +2806,10 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+@@ -2645,20 +2807,10 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
            tsn++;
        } }
  
@@ -339,7 +341,7 @@ index 4bc03bb8..31426fd0 100644
      /* LD_TEX_RAW_DUMP=<hex offset>|all: write the texture's raw guest bytes (all mip levels, as the decoder
       * reads them) to scratch/texraw_<loc>_<offset>_<n>_<w>x<h>_f<fmt>_r<remap>_m<mips>.bin when first seen and
       * each time they change (max 64 files), so a texture can be inspected offline
-@@ -3502,7 +3654,9 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size);
+@@ -3503,7 +3655,9 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size);
  
  void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size)
  {
@@ -350,7 +352,7 @@ index 4bc03bb8..31426fd0 100644
      LONG slot;
      for (;;) {                                           /* claim a slot unless the ring is full */
          slot = g_gv_ring_head;
-@@ -3605,6 +3759,79 @@ static void ld_gv_flip(void)
+@@ -3606,6 +3760,79 @@ static void ld_gv_flip(void)
      }
  }
  
@@ -430,7 +432,7 @@ index 4bc03bb8..31426fd0 100644
  /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
   * descriptor-only cache, re-hash the source once per frame and refresh the
   * D3D resource when the game rewrites the same guest address. */
-@@ -3619,20 +3846,17 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+@@ -3620,20 +3847,17 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
          g_gv_watch[4].armed | g_gv_watch[5].armed | g_gv_watch[6].armed | g_gv_watch[7].armed)
          ld_gv_watch_bind(t->location, t->offset, texture_source_span(t));
  
@@ -456,7 +458,7 @@ index 4bc03bb8..31426fd0 100644
              /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
               * reads are microseconds apart, so they can only disagree if a
               * guest thread is writing this texture right now -- i.e. we are
-@@ -3724,6 +3948,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+@@ -3725,6 +3949,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                  g.textures[index].last_use_serial)
                  index = i;
          evicted = g.textures[index].tex;
@@ -464,7 +466,7 @@ index 4bc03bb8..31426fd0 100644
          g_ld_texture_cache_evictions++;
          if (g_ld_texture_cache_full <= 16 ||
              (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
-@@ -3758,10 +3983,15 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+@@ -3759,10 +3984,15 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
          if (evicted)
              retire_texture(evicted);
          *entry = replacement;
@@ -481,7 +483,7 @@ index 4bc03bb8..31426fd0 100644
          g_ld_texture_decode_fail++;
          if (g_ld_texture_decode_fail <= 16 ||
              (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
-@@ -3866,7 +4096,8 @@ static u64 vertex_texture_hash(const rsx_dsp_vertex_texture* vt,
+@@ -3867,7 +4097,8 @@ static u64 vertex_texture_hash(const rsx_dsp_vertex_texture* vt,
      const u8* src = span ? guest_ptr(vt->location, vt->offset, span) : NULL;
      if (out_src) *out_src = src;
      if (out_pitch) *out_pitch = pitch;
@@ -491,7 +493,7 @@ index 4bc03bb8..31426fd0 100644
  }
  
  static ID3D12Resource* decode_vertex_texture(
-@@ -3944,8 +4175,10 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
+@@ -3945,8 +4176,10 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
              e->format != vt->format || e->width != vt->width ||
              e->height != vt->height || e->pitch != vt->pitch)
              continue;
@@ -503,7 +505,7 @@ index 4bc03bb8..31426fd0 100644
              e->last_hash_frame = g_ld_frames;
              if (hash && hash != e->content_hash) {
                  u64 replacement_hash = 0;
-@@ -7297,6 +7530,7 @@ static void fetch_batches(void)
+@@ -7296,6 +7529,7 @@ static void fetch_batches(void)
  static void fetch_batches_hoisted(
      const rsx_vertex_layout_plan* layout, int packed_payload)
  {
@@ -511,7 +513,7 @@ index 4bc03bb8..31426fd0 100644
      for (u32 batch = 0; batch < dc.n_arr && dc.fetch_ok; batch++)
          for (u32 i = 0; i < dc.arr[batch].count && dc.fetch_ok; i++)
              push_compact_ref(dc.arr[batch].first + i, 0);
-@@ -7360,6 +7594,8 @@ static void fetch_batches_hoisted(
+@@ -7359,6 +7593,8 @@ static void fetch_batches_hoisted(
      if (!dc.fetch_ok)
          return;
      dc.n_source_refs = dc.n_refs;
@@ -520,7 +522,7 @@ index 4bc03bb8..31426fd0 100644
      if (packed_payload && dc.n_refs > 1) {
          u32 unique_refs = dc.n_refs;
          if (rsx_vertex_remap_build(
-@@ -7368,6 +7604,8 @@ static void fetch_batches_hoisted(
+@@ -7367,6 +7603,8 @@ static void fetch_batches_hoisted(
              dc.n_refs = unique_refs;
          }
      }
@@ -529,7 +531,7 @@ index 4bc03bb8..31426fd0 100644
      dc.layout = *layout;
      rsx_vertex_fetch_plan_init(
          &dc.fetch_plan, &g.rsx, layout,
-@@ -7422,6 +7660,12 @@ static void fetch_batches_hoisted(
+@@ -7421,6 +7659,12 @@ static void fetch_batches_hoisted(
          }
      }
      dc.n_verts = dc.n_refs;
@@ -542,7 +544,7 @@ index 4bc03bb8..31426fd0 100644
  }
  
  static const float* dc_vertex_attr(
-@@ -8265,6 +8509,7 @@ static void ld_movie_capture_overlay(void)
+@@ -8264,6 +8508,7 @@ static void ld_movie_capture_overlay(void)
       * the guest surface is not sent to the swap chain. */
      rsx_live_draw_before_guest_sync();   /* patch 2017 */
      ld_gv_flip();
@@ -550,7 +552,7 @@ index 4bc03bb8..31426fd0 100644
      g_ld_frames++;
      ld_movie_reset_rings();
  }
-@@ -9761,6 +10006,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+@@ -9760,6 +10005,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          write_topology_indices(
              prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
      LDW_ADD(RSX_PERF_W_VTX_T, vcopy_t0);
@@ -558,7 +560,7 @@ index 4bc03bb8..31426fd0 100644
  
      LDW_T0(pso_t0);
      ID3D12PipelineState* pso = get_pso(
-@@ -11490,13 +11736,15 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size)
+@@ -11493,13 +11739,15 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size)
      const u32 stale = g_ld_frames - 1u;
      for (u32 i = 0; i < g.n_textures; i++) {
          texcache_t* e = &g.textures[i];
@@ -578,7 +580,7 @@ index 4bc03bb8..31426fd0 100644
      }
      for (u32 i = 0; i < g.n_surfaces; i++) {
          surface_t* s = &g.surfaces[i];
-@@ -11518,6 +11766,7 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size)
+@@ -11521,6 +11769,7 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size)
  u32 rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size)
  {
      if (!g.ready || !size) return 0;
@@ -586,7 +588,7 @@ index 4bc03bb8..31426fd0 100644
      if (ld_gv_enabled()) {
          for (u32 i = 0; i < g.n_surfaces; i++) {
              surface_t* s = &g.surfaces[i];
-@@ -11533,13 +11782,13 @@ u32 rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size)
+@@ -11536,13 +11785,13 @@ u32 rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size)
      for (u32 i = 0; i < g.n_textures; i++) {
          texcache_t* e = &g.textures[i];
          if (e->tex && ld_range_overlaps(e->location, e->offset, e->span, location, b0, b1)) {
@@ -602,7 +604,7 @@ index 4bc03bb8..31426fd0 100644
          }
      }
      return marked;
-@@ -12003,6 +12252,7 @@ static int ld_writeback_surface(u32 i, u32 for_off, u32 for_size)
+@@ -12006,6 +12255,7 @@ static int ld_writeback_surface(u32 i, u32 for_off, u32 for_size)
       * live-draw) go into the surface first, so the write-back keeps them. */
      ld_gv_validate(i);
      u8* gm = (u8*)guest_ptr(location, sf->offset, (u32)(s1 - s0));
@@ -610,7 +612,7 @@ index 4bc03bb8..31426fd0 100644
      const size_t n = (size_t)sf->w * sf->h * texel;
      u8* buf = gm ? (u8*)malloc(n) : NULL;
      if (!buf) return 0;
-@@ -12106,6 +12356,7 @@ static int ld_rb_store(u32 i, u32 k, u32 for_off, u32 for_size)
+@@ -12109,6 +12359,7 @@ static int ld_rb_store(u32 i, u32 k, u32 for_off, u32 for_size)
      const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
      const u32 pitch = (sf->w * texel + 255u) & ~255u;
      u8* gm = (u8*)guest_ptr(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel);
@@ -618,7 +620,7 @@ index 4bc03bb8..31426fd0 100644
      u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * sf->h};
      if (!gm || FAILED(g_ld_rb[k]->lpVtbl->Map(g_ld_rb[k], 0, &rr, (void**)&px))) return 0;
      for (u32 y = 0; y < sf->h; y++) {
-@@ -12960,6 +13211,7 @@ static void ld_present_body(u32 buffer_id)
+@@ -12963,6 +13214,7 @@ static void ld_present_body(u32 buffer_id)
        packets_at_last_frame = g_ld_stats.packets_seen; }
      rsx_live_draw_before_guest_sync();   /* patch 2017 */
      ld_gv_flip();
@@ -627,7 +629,7 @@ index 4bc03bb8..31426fd0 100644
  #if defined(YZ_PERF_PROFILE)
      ld_profile_present(g_ld_frames);
 diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
-index 09257c3d..af67c9fd 100644
+index 09257c3..af67c9f 100644
 --- a/libs/video/rsx_live_draw.h
 +++ b/libs/video/rsx_live_draw.h
 @@ -91,6 +91,9 @@ u32  rsx_live_draw_note_guest_write(u32 location, u32 offset, u32 size);
@@ -653,7 +655,7 @@ index 09257c3d..af67c9fd 100644
  };
  int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
 diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
-index e31b6112..fe9bd25b 100644
+index 0695bb9..d7899ad 100644
 --- a/libs/video/rsx_vertex_compact.c
 +++ b/libs/video/rsx_vertex_compact.c
 @@ -8,8 +8,13 @@
@@ -727,7 +729,7 @@ index e31b6112..fe9bd25b 100644
  int rsx_vertex_decode_element(
      u32 type, u32 size, const u8* source, float out[4])
  {
-@@ -299,7 +352,7 @@ static int rsx_vertex_fetch_attr_value(
+@@ -306,7 +359,7 @@ static int rsx_vertex_fetch_attr_value(
              fetch->elem_size);
      }
  
@@ -736,7 +738,7 @@ index e31b6112..fe9bd25b 100644
              fetch->desc.type, fetch->desc.size, source, value))
          return 1;
      if (attr == 0)
-@@ -427,6 +480,40 @@ int rsx_vertex_remap_build(
+@@ -434,6 +487,40 @@ int rsx_vertex_remap_build(
  
      if (count > UINT_MAX / 2u)
          return 0;
@@ -778,10 +780,10 @@ index e31b6112..fe9bd25b 100644
      const u32 required_slots = count * 2u;
      while (slot_capacity < required_slots) {
 diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
-index d778cc55..c3f3fa40 100644
+index cfdb6df..07ab5ad 100644
 --- a/runtime/spu/spu_coherency.c
 +++ b/runtime/spu/spu_coherency.c
-@@ -682,3 +682,9 @@ void spu_coh_notify_write(uint32_t ea)
+@@ -702,3 +702,9 @@ void spu_coh_notify_write(uint32_t ea)
  #ifdef __cplusplus
  }
  #endif
@@ -792,10 +794,10 @@ index d778cc55..c3f3fa40 100644
 +void (*g_spu_guest_write_hook)(uint32_t ea, uint32_t size) = 0;
 +void spu_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) { g_spu_guest_write_hook = hook; }
 diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
-index d7f497da..5802633b 100644
+index 80af007..d1e3ea9 100644
 --- a/runtime/spu/spu_dma.h
 +++ b/runtime/spu/spu_dma.h
-@@ -737,6 +737,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+@@ -739,6 +739,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
              extern void spu_lockline_unlock(void);
              extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
              spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");

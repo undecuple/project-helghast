@@ -1,10 +1,12 @@
 Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): three-way merged into cellPad.c after upstream #612 (PADKEY_*, pad_key_down) and Toro's 4010 (SDL3 names); the option and prompt logic is unchanged.
+
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 9eb33bab..32388fe7 100644
+index 49ba9d2..e18987c 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -68,6 +68,18 @@ static double pad_clock(unsigned long long t0_ms)
+@@ -72,6 +72,18 @@ static double pad_clock(unsigned long long t0_ms)
    #include <xinput.h>
  #endif
  #include "pad_host.h"
@@ -23,7 +25,7 @@ index 9eb33bab..32388fe7 100644
  
  /* ---------------------------------------------------------------------------
   * Internal state
-@@ -83,6 +95,13 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
+@@ -87,6 +99,13 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
  static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
  /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
  static int s_data_fresh[PAD_MAX_HOST_PORTS];
@@ -37,7 +39,7 @@ index 9eb33bab..32388fe7 100644
  
  #if PAD_BACKEND_SDL
  typedef struct PadSdlGamepad PadSdlGamepad;   /* SDL_Gamepad */
-@@ -245,7 +264,6 @@ static unsigned long long s_kb_checked_ms = 0;
+@@ -403,7 +422,6 @@ static unsigned long long s_kb_checked_ms = 0;
  
  static PadKbUi     s_kb_ui;             /* patch 2038: the Keyboard page's capture state */
  static SRWLOCK     s_kb_lock = SRWLOCK_INIT;   /* s_kb + s_kb_ui: pad poll vs the page's commands */
@@ -45,7 +47,7 @@ index 9eb33bab..32388fe7 100644
  
  static void pad_kb_log(void* ctx, const char* msg)
  {
-@@ -514,8 +532,19 @@ int pad_kb_ui_cmd(const char* cmd, char* out, size_t n)
+@@ -685,8 +703,19 @@ int pad_kb_ui_cmd(const char* cmd, char* out, size_t n)
      return changed;
  }
  
@@ -67,7 +69,7 @@ index 9eb33bab..32388fe7 100644
  {
      static int force = -1;
      if (force < 0) { const char* e = getenv("KZ3_KB_PROMPTS"); force = e ? atoi(e) : -1; if (force < 0) force = 2; }
-@@ -524,7 +553,7 @@ int pad_kb_last_device_keyboard(void)
+@@ -695,7 +724,7 @@ int pad_kb_last_device_keyboard(void)
          if (flip < 0) { const char* e = getenv("KZ3_KB_PROMPTS_FLIP"); flip = e ? atoi(e) : 0; t0 = GetTickCount64(); }
          if (flip > 0) return (int)(((GetTickCount64() - t0) / (1000ull * (unsigned)flip)) & 1);
      }
@@ -76,7 +78,7 @@ index 9eb33bab..32388fe7 100644
  }
  
  /* First key bound to a pad button bit (CELL_PAD_CTRL_*), or 0; slot order. For keycap prompts. */
-@@ -611,7 +640,7 @@ static void pad_poll_keyboard(void)
+@@ -782,7 +811,7 @@ static void pad_poll_keyboard(void)
      }
      s_kb_state = pad_kb_eval(&s_kb, pad_kb_down_win, NULL);
      ReleaseSRWLockExclusive(&s_kb_lock);
@@ -85,7 +87,7 @@ index 9eb33bab..32388fe7 100644
  }
  
  /* Port 0 = the XInput pad (if any) plus the keys. Without a pad, port 0 is the keys alone and is reported
-@@ -624,10 +653,7 @@ static void pad_merge_keyboard(void)
+@@ -795,10 +824,7 @@ static void pad_merge_keyboard(void)
      if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
      int had_pad = hs->connected;
      if (off) return;
@@ -97,7 +99,7 @@ index 9eb33bab..32388fe7 100644
      if (!hs->connected) {
          memset(hs, 0, sizeof *hs);
          hs->connected = 1;
-@@ -667,6 +693,7 @@ static void pad_poll_xinput(void)
+@@ -838,6 +864,7 @@ static void pad_poll_xinput(void)
      for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
          if (s_pad_empty_until[i] && now < s_pad_empty_until[i]) {
              s_host_state[i].connected = 0;
@@ -105,7 +107,7 @@ index 9eb33bab..32388fe7 100644
              continue;
          }
          XINPUT_STATE state;
-@@ -683,6 +710,8 @@ static void pad_poll_xinput(void)
+@@ -854,6 +881,8 @@ static void pad_poll_xinput(void)
          s_pad_empty_until[i] = 0;
  
          s_host_state[i].connected = 1;
@@ -114,7 +116,7 @@ index 9eb33bab..32388fe7 100644
          XINPUT_GAMEPAD* gp = &state.Gamepad;
  
          /* Map XInput buttons to PS3 CELL_PAD_CTRL_* */
-@@ -840,6 +869,7 @@ static int pad_sdl_enable_sensor(void* gc, int type)
+@@ -1011,6 +1040,7 @@ static int pad_sdl_enable_sensor(void* gc, int type)
  static void pad_sdl_open_log(int p, PadSdlGamepad* gc, uint32_t id, unsigned long long now)
  {
      pad_sensor_open(&s_sdl_sensors[p], now, pad_sdl_has_sensor, pad_sdl_enable_sensor, gc);
@@ -122,7 +124,7 @@ index 9eb33bab..32388fe7 100644
      const char* name = PSDL(SDL_GetGamepadName)(gc);
      printf("[pad] port %d: %s (%s), face %s/%s/%s/%s, sensors %s\n", p,
             pad_sdl_type_name(PSDL(SDL_GetGamepadType)(gc)), name ? name : "?",
-@@ -895,6 +925,8 @@ static void pad_sdl_sync(unsigned long long now)
+@@ -1066,6 +1096,8 @@ static void pad_sdl_sync(unsigned long long now)
          if (!(changed & (1u << p))) continue;
          if (s_sdl_controllers[p]) { PSDL(SDL_CloseGamepad)(s_sdl_controllers[p]); s_sdl_controllers[p] = NULL; }
          s_host_state[p].connected = 0;
@@ -131,7 +133,7 @@ index 9eb33bab..32388fe7 100644
          s_rumble_lo[p] = s_rumble_hi[p] = 0;
          memset(&s_sdl_sensors[p], 0, sizeof s_sdl_sensors[p]);
          if (s_sdl_slot_id[p] < 0) { printf("[pad] port %d: disconnected\n", p); fflush(stdout); continue; }
-@@ -917,7 +949,7 @@ static void pad_poll_sdl(void)
+@@ -1088,7 +1120,7 @@ static void pad_poll_sdl(void)
      pad_sdl_sync(now);
      for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
          PadSdlGamepad* gc = s_sdl_controllers[p];
@@ -140,7 +142,7 @@ index 9eb33bab..32388fe7 100644
          PadSdlRaw r;
          for (int b = 0; b < PAD_SDL_BUTTON_MAX; b++)
              r.button[b] = PSDL(SDL_GetGamepadButton)(gc, b) ? 1 : 0;
-@@ -925,6 +957,7 @@ static void pad_poll_sdl(void)
+@@ -1096,6 +1128,7 @@ static void pad_poll_sdl(void)
              r.axis[a] = PSDL(SDL_GetGamepadAxis)(gc, a);
          pad_sdl_map(&r, &s_host_state[p]);
          pad_sdl_sensor_recheck(p, gc, now);
@@ -148,7 +150,7 @@ index 9eb33bab..32388fe7 100644
          if (s_sdl_sensors[p].on) {
              float acc[3], gyr[3];
              int ha = (s_sdl_sensors[p].on & 1) && PSDL(SDL_GetGamepadSensorData)(gc, PAD_SDL_SENSOR_ACCEL, acc, 3);
-@@ -1113,6 +1146,79 @@ static unsigned long long pad_now_ms(void)
+@@ -1284,6 +1317,79 @@ static unsigned long long pad_now_ms(void)
  #endif
  }
  
@@ -228,18 +230,18 @@ index 9eb33bab..32388fe7 100644
  static void pad_poll_backend(void)
  {
      static unsigned long long s_last_ms = 0;
-@@ -1134,6 +1240,9 @@ static void pad_poll_backend(void)
- #ifdef _WIN32
+@@ -1305,6 +1411,9 @@ static void pad_poll_backend(void)
+ #if PAD_BACKEND_XINPUT
      /* KZ3 patch 2037: keys always polled (not only with no pad on port 0) and merged into port 0. */
      pad_poll_keyboard();
 +#endif
 +    pad_prompt_track();   /* 4011: before the keys are merged into port 0 */
 +#ifdef _WIN32
      pad_merge_keyboard();
- #endif
-     pad_track_assign();
+ #else
+     if (!s_host_state[0].connected) pad_poll_keyboard();
 diff --git a/libs/input/pad_host.h b/libs/input/pad_host.h
-index 845b2acf..456308cb 100644
+index 845b2ac..456308c 100644
 --- a/libs/input/pad_host.h
 +++ b/libs/input/pad_host.h
 @@ -419,4 +419,82 @@ static const char* const pad_sdl_env_hints[] PAD_HOST_UNUSED = {
@@ -326,10 +328,10 @@ index 845b2acf..456308cb 100644
 +
  #endif
 diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
-index 16d8a882..efaa3908 100644
+index e8282d1..8484c1b 100644
 --- a/libs/input/pad_keybinds.h
 +++ b/libs/input/pad_keybinds.h
-@@ -104,7 +104,25 @@ static const PadKbKey pad_kb_keys[] = {
+@@ -116,7 +116,25 @@ static const PadKbKey pad_kb_keys[] = {
  #define PKB_N_KEYS ((int)(sizeof pad_kb_keys / sizeof pad_kb_keys[0]))
  
  /* key[i][s] = virtual-key code of input i, slot s (0 = unbound). */
@@ -356,7 +358,7 @@ index 16d8a882..efaa3908 100644
  
  /* What the keys add to the pad this poll. */
  typedef struct { unsigned short buttons; unsigned char dirs; } PadKbState;
-@@ -316,7 +334,7 @@ static int pad_kb_space(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+@@ -329,7 +347,7 @@ static int pad_kb_space(char c) { return c == ' ' || c == '\t' || c == '\r'; }
  static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* ctx)
  {
      const char* p = text;
@@ -365,7 +367,7 @@ index 16d8a882..efaa3908 100644
      if (!text) return 0;
      if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
      while (*p) {
-@@ -332,10 +350,24 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
+@@ -345,10 +363,24 @@ static int pad_kb_parse(PadKeybinds* kb, const char* text, PadKbLog log, void* c
          if (a < b) {
              if (*a == '[') {
                  const char* r = memchr(a, ']', (size_t)(b - a));
@@ -392,7 +394,7 @@ index 16d8a882..efaa3908 100644
                  }
              } else if (in_kb) {
                  eq = memchr(a, '=', (size_t)(b - a));
-@@ -440,6 +472,10 @@ static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
+@@ -484,6 +516,10 @@ static int pad_kb_format(const PadKeybinds* kb, char* buf, size_t n)
          else snprintf(v, sizeof v, "%s, %s", pad_kb_key_name(kb->key[i][0]), pad_kb_key_name(kb->key[i][1]));
          PKB_PUT("%-9s= %-22s# %s\n", pad_kb_inputs[i].name, v, pad_kb_inputs[i].what);
      }
@@ -403,7 +405,7 @@ index 16d8a882..efaa3908 100644
  #undef PKB_PUT
      return (int)o;
  }
-@@ -678,6 +714,20 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+@@ -742,6 +778,20 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
      if (!n) return 0;
      out[0] = 0;
      if (sscanf(cmd, "%15s %d %d", verb, &r, &s) < 1) return 0;
@@ -424,7 +426,7 @@ index 16d8a882..efaa3908 100644
      in = pad_kb_row_input(r);
      if (!strcmp(verb, "rows")) { snprintf(out, n, "%d", PKB_N_ROWS); return 0; }
      if (!strcmp(verb, "label")) { snprintf(out, n, "%s", in >= 0 ? pad_kb_rows[r].label : ""); return 0; }
-@@ -713,7 +763,8 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
+@@ -777,7 +827,8 @@ static int pad_kb_ui_command(PadKbUi* u, PadKeybinds* kb, const char* cmd, char*
          return 0;
      }
      if (!strcmp(verb, "reset")) {

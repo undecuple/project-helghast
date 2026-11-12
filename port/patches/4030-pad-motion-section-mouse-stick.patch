@@ -1,0 +1,404 @@
+KZ3 patch 4030 (network pass 16): keyboard-and-mouse turn the valve and place the charge with the game's own code.
+Root cause of a 7-minute stall at the Flooded Pyrrhus burning-gate valve (level 201, the RE notes s.14): the
+valve (ValveJoystickController::Update 1.14 0x61AEB4, 1.00 0x606884) and the charge (ExplosiveLocationJoystickController,
+target function 1.14 0x6126E4, 1.00 0x5FE0B4) read the RIGHT STICK's absolute angle while the grab actions 30/31
+(GrabLeftHand/GrabRightHand; Standard and Alternate schemes: L1/R1, Modern: L2/R2) are held. The port already forces
+profile byte 0xB6 (Motion Sensor Function) to 0 on a pad without gyro (kz3_sixaxis_filter), so that stick path is the
+one in use. The mouse only fed the camera and the keys are digital, so there was no gesture a keyboard player could find.
+Fix (an input mapping, default on; KZ3_MOUSE_STICK=0 off): libs/input/pad_assist.h + cellPad.c. While a post-hook of
+those two controllers (port/spu glue: KZ3_HOOK_VALVE_ASSIST(0061AEB4), KZ3_HOOK_CHARGE_ASSIST(006126E4); they only
+stamp the section here) ran in the last 250 ms, the mouse drives a virtual right stick (counts integrated, full travel
+in the pointed direction above 0.25, so the valve's dead zone 0.29 and its x*x+y*y >= 0.25 test are cleared) and, while
+Mouse1 is down, the pad button that the game's OWN action table (profile +0xE4 + 4*31, read through the same version
+check as pad_actions_sync) gives GrabRightHand is pressed. A real stick or the right-stick keys win over the virtual
+one. pad_mouse.c keeps a separate count for it (pad_mouse_stick_take), so mouse look is not affected. Mouse look does not
+fire on a valve: kz3_mouse_look_pre acts on the soldier's on-foot SetViewAngles call (lr 0x0069B120) and the mounted-gun
+look update only. Test input: KZ3_MOUSE_STICK_FEED="T:dx,dy*SECONDS ..." (counts per second into the virtual stick on the pad script clock).
+Log lines: "[mousestick] section on/off", "[assist] valve section: entity=... n= disable= dir=
+handlimit=", "[assist] valve n= hand= grab=" (each 5 % of travel), "[assist] charge section: ... windows= centres=". Host test: tools/smoke/test_motion_assist.sh.
+
+Rebased on ps3recomp v0.19.0 (SPU pass 153): cellPad.c and pad_mouse.c context follows v0.19 plus 2099's pad_mouse part (look accumulator); hunks unchanged.
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index db486e9..7640675 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -22,6 +22,7 @@
+ #include "pad_menu_mouse.h"
+ #include "pad_mouse.h"
+ #include "pad_kbport.h"   /* KZ3 patch 4026 */
++#include "pad_assist.h"   /* KZ3 patch 4030 */
+ 
+ /* KZ3 patch 4027 (network pass 45): the Keyboard page's own text in the game's language through the port's lookup
+  * (port/net/kz3_tr.h kz3_tr, set by port/net/kz3_discord.c at start); NULL = English. Before every include of
+@@ -930,6 +931,12 @@ static void pad_merge_keyboard(void)
+           printf("[cellPad] keyboard input on port %d (%s)\n", route.target, had_pad ? "with a pad" : "no pad");
+           fflush(stdout); } }
+ }
++
++/* KZ3 patch 4030: Mouse1 for the motion sections' grab (pad_assist.h). */
++static int pad_assist_mouse1(void) { return pad_host_window_focused() && !pad_mouse_menu_on() && (GetAsyncKeyState(0x01) & 0x8000) != 0; }
++#endif
++#ifndef _WIN32
++static int pad_assist_mouse1(void) { return 0; }
+ #endif
+ 
+ /* XInputGetState on a slot with nothing plugged in costs about 140 us (2 us on
+@@ -1779,6 +1786,97 @@ static void pad_actions_sync(void)
+     }
+ }
+ 
++/* ---- KZ3 patch 4030 (network pass 16): motion sections with the keyboard and mouse (pad_assist.h) ----
++ * The game's valve and charge controllers read the right stick's absolute angle while the grab action is held (profile
++ * byte 0xB6 = 0, which the port forces on a pad without gyro). The mouse only fed the camera and the keys are digital,
++ * so a keyboard player had no gesture. While a human controller is in one of those sections (the post-hooks below
++ * stamp it every update), the mouse drives a virtual right stick and Mouse1 presses the button the game's own action
++ * table gives GrabRightHand. Default on (an input mapping, not a gameplay change); KZ3_MOUSE_STICK=0 turns it off. */
++static PasState s_pas;
++static int pas_mstick_enabled(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("KZ3_MOUSE_STICK"); v = !(e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "no"))); }
++    return v;
++}
++/* The pad button (a hs->buttons bit) the game's action table gives GrabRightHand now; 0 when the table is unknown. */
++static unsigned pas_grab_mask(void)
++{
++    static int ver = -2;
++    uint32_t prof;
++    int32_t eb;
++    if (ver == -2) ver = pab_detect(pab_rd32);
++    if (ver < 0) return 0;
++    prof = vm_read32(pab_versions[ver].profile_ptr);
++    if (!prof || prof >= 0x40000000u) return 0;
++    eb = (int32_t)vm_read32(prof + PAB_OFF_TABLE + 4u * (uint32_t)PAB_A_GRABRIGHT);
++    return eb >= 0 && eb < 16 ? 1u << pab_eb_to_bit[eb] : 0;
++}
++/* Test input (like KZ3_KB_SCRIPT, the same clock: seconds since the first cellPadGetData): KZ3_MOUSE_STICK_FEED="T:dx,dy*SECONDS ..."
++ * feeds dx,dy counts PER SECOND for SECONDS from T into the virtual stick only (KZ3_MOUSE_FEED, the look feed, starts at the
++ * first look take and runs on another clock, which cannot be lined up with a pad script's grab presses). */
++static int pas_test_feed(int* dx, int* dy)
++{
++    static PadMouseEv ev[PAD_MOUSE_SCRIPT_MAX];
++    static long long sx[PAD_MOUSE_SCRIPT_MAX], sy[PAD_MOUSE_SCRIPT_MAX];
++    static int n = -1;
++    double el;
++    int i;
++    if (n < 0) {
++        const char* e = getenv("KZ3_MOUSE_STICK_FEED");
++        int bad = 0;
++        n = e && *e ? pad_mouse_script_parse(e, ev, PAD_MOUSE_SCRIPT_MAX, &bad) : 0;
++        if (e && *e) { printf("[mousestick] KZ3_MOUSE_STICK_FEED: %d event(s), %d unreadable\n", n, bad); fflush(stdout); }
++    }
++    if (n <= 0 || !s_pad_t0_ms) return 0;
++    el = pad_clock(s_pad_t0_ms);
++    for (i = 0; i < n; i++) {
++        const long long ox = pad_mouse_feed_owed(ev[i].dx, ev[i].t, ev[i].left, el), oy = pad_mouse_feed_owed(ev[i].dy, ev[i].t, ev[i].left, el);
++        *dx += (int)(ox - sx[i]); *dy += (int)(oy - sy[i]);
++        sx[i] = ox; sy[i] = oy;
++    }
++    return 1;
++}
++static void pad_assist_poll(CellPadData* data)
++{
++    const unsigned long long now = pad_now_ms();
++    const int vl = pas_valve_live(&s_pas, now), cl = pas_charge_live(&s_pas, now), live = vl || cl;
++    int dx = 0, dy = 0;
++    uint8_t bx, by;
++    if (!pas_mstick_enabled()) return;
++    pad_mouse_stick_take(&dx, &dy);
++    pas_test_feed(&dx, &dy);
++    if (!live) {
++        if (s_pas.mstick_on) { s_pas.mstick_on = 0; memset(&s_pas.stick, 0, sizeof s_pas.stick); printf("[mousestick] section off\n"); fflush(stdout); }
++        return;
++    }
++    if (!s_pas.mstick_on) {
++        s_pas.mstick_on = 1;
++        memset(&s_pas.stick, 0, sizeof s_pas.stick);
++        printf("[mousestick] section on (%s): the mouse is the right stick, Mouse1 holds the grab (action button mask 0x%04X)\n",
++               vl ? "valve" : "charge", pas_grab_mask());
++        fflush(stdout);
++    }
++    pas_stick_add(&s_pas.stick, dx, dy);
++    {
++        const int rx = data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X], ry = data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y];
++        /* a real stick or the right-stick keys win: the virtual one only fills an idle stick */
++        if (pas_stick_bytes(&s_pas.stick, &bx, &by) && abs(rx - 128) <= 8 && abs(ry - 128) <= 8) {
++            data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = bx;
++            data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = by;
++        }
++    }
++    if (pad_assist_mouse1()) {
++        const unsigned m = pas_grab_mask();
++        data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(m & 0xFF);
++        data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((m >> 8) & 0xFF);
++    }
++}
++/* The hooks (port/spu kz3_gameplay.h KZ3_HOOK_VALVE_ASSIST / KZ3_HOOK_CHARGE_ASSIST, post-hooks on 1.14 0x61AEB4 and
++ * 0x6126E4): vm = vm_base, ctrl = the controller (r3 on entry). They mark the section the pad layer above reads. */
++int pad_assist_valve_post(uint8_t* vm, uint32_t ctrl) { PasView v; return pas_valve_mark(&s_pas, vm, ctrl, pad_now_ms(), &v); }
++int pad_assist_charge_post(uint8_t* vm, uint32_t ctrl) { PasView v; return pas_charge_mark(&s_pas, vm, ctrl, pad_now_ms(), &v); }
++
+ static void pad_poll_backend(void)
+ {
+     static unsigned long long s_last_ms = 0;
+@@ -2354,6 +2452,7 @@ skip_inject: ;
+     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
+     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
+     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]  = hs->analog_ly;
++    if (port_no == 0) pad_assist_poll(data);   /* 4030 */
+ 
+     /* KZ3 patch 2098 (RSX pass 93): menu mouse clicks and wheel notches (port/kz3/main.cpp kz3_menu_mouse_poll; no guest
+      * calls there). It gets the pad's own menu buttons (pads, keys) so the pad wins over hover, and returns presses to
+diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
+index b35fcb6..fab31e3 100644
+--- a/libs/input/cellPad.h
++++ b/libs/input/cellPad.h
+@@ -202,6 +202,10 @@ s32 cellPadClearBuf(u32 port_no);
+ /* Internal: call once per frame to update pad state from host input */
+ void cellPad_poll(void);
+ 
++/* KZ3 patch 4030: post-hooks of the valve and charge controllers (pad_assist.h); vm = guest base, ctrl = controller EA. */
++int pad_assist_valve_post(unsigned char* vm, unsigned int ctrl);
++int pad_assist_charge_post(unsigned char* vm, unsigned int ctrl);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libs/input/pad_assist.h b/libs/input/pad_assist.h
+new file mode 100644
+index 0000000..42d3a51
+--- /dev/null
++++ b/libs/input/pad_assist.h
+@@ -0,0 +1,188 @@
++/* pad_assist.h -- KZ3 patch 4030 (network pass 16). Platform-free logic for the motion sections (valve, charge) with the
++ * keyboard and mouse. Included by cellPad.c; the host test tools/smoke/test_motion_assist.c includes it too (through
++ * pad_assist_drive.h, patch 4031), over a fake guest memory, so nothing here may touch a Windows or ps3recomp symbol.
++ *
++ * Root fix, default on (an input mapping, not a gameplay change): while a human controller updates a Valve or an
++ * ExplosiveLocation, the mouse drives a virtual RIGHT stick (the stick the original code reads when profile byte 0xB6
++ * is 0, which the port forces on a pad without gyro, kz3_sixaxis_filter) and Mouse1 holds the grab action.
++ * Post-hooks (port/spu, ppu_overrides): ValveJoystickController::Update 0x61AEB4 (1.00 0x606884) and the charge
++ * target function 0x6126E4 (1.00 0x5FE0B4) only MARK the section here; the original code then reads the stick.
++ *
++ * Guest layout (big-endian; offsets read from the 1.00 code, 1.14 = +0x14630 for the functions; fields ASSUMPTION
++ * unchanged in 1.14): controller +0x20 entity, +0x108 target hand angle (f32 rad), valve +0x10C/+0x110 grab gains
++ * (0.0 = held, 1.0 = released), charge +0x114 grab byte, +0x118 follower previous; entity +0xE4 resource, valve entity
++ * +0x288 valve angle, +0x290 hand angle (rad); ValveResource +0x18C Min, +0x190 Max, +0x198 MinHand, +0x19C MaxHand
++ * (degrees), +0x1A0 speed (deg/s), +0x1A8 DisableValue; ExplosiveLocationResource +0x190/+0x194 Min/MaxAngle (deg),
++ * +0x198 speed (deg/s), +0x200 ArmRanges (ptr, count; ASSUMPTION), +0x20C ArmStepTime. */
++#ifndef PAD_ASSIST_H
++#define PAD_ASSIST_H
++
++#include <math.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#define PAS_SECTION_MS  250u     /* a section stamp is live this long (hooks run every update, ~33 ms) */
++#define PAS_STICK_GAIN  0.01f    /* virtual stick units per mouse count: 100 counts = full travel */
++#define PAS_STICK_ON    0.25f    /* below this the virtual stick rests (the game's own dead zone is 0.29 after) */
++#define PAS_DEADZONE    0.29f    /* the valve's stick read: radial dead zone (the RE notes s.14.2) */
++#define PAS_MIN_MAG2    0.25f    /* and its own test: x*x + y*y >= 0.25 after the response curve */
++#define PAS_DEG2RAD     0.017453292519943295f
++#define PAS_MAXWIN 4
++
++/* ---- mouse -> right stick ---- */
++typedef struct { float x, y; } PasStick;   /* y positive = down on screen = stick down (byte > 128) */
++static inline void pas_stick_add(PasStick* s, int dx, int dy)
++{
++    float m;
++    s->x += (float)dx * PAS_STICK_GAIN;
++    s->y += (float)dy * PAS_STICK_GAIN;
++    m = sqrtf(s->x * s->x + s->y * s->y);
++    if (m > 1.0f) { s->x /= m; s->y /= m; }
++}
++/* Full travel in the pointed direction above PAS_STICK_ON, else centred: the valve reads an absolute angle, and the
++ * stick magnitude must clear 0.5 after its dead zone, so the magnitude is 1. */
++static inline int pas_stick_bytes(const PasStick* s, uint8_t* bx, uint8_t* by)
++{
++    const float m = sqrtf(s->x * s->x + s->y * s->y);
++    int x, y;
++    if (!(m >= PAS_STICK_ON)) { *bx = *by = 128; return 0; }
++    x = 128 + (int)lroundf(s->x / m * 127.0f);
++    y = 128 + (int)lroundf(s->y / m * 127.0f);
++    *bx = (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);
++    *by = (uint8_t)(y < 0 ? 0 : y > 255 ? 255 : y);
++    return 1;
++}
++/* The valve's stick read as the port models it (ASSUMPTION: bytes -> -1..1 by /127, radial dead zone 0.29 rescaled to
++ * 0..1; the real response goes through the look curve 0x4DD198, monotone). Returns 1 when the controller would take
++ * the stick (x*x + y*y >= 0.25) and the angle atan2(x, y) in *ang (0 = up). */
++static inline int pas_game_stick(uint8_t bx, uint8_t by, float* ang)
++{
++    float x = ((float)bx - 128.0f) / 127.0f, y = ((float)by - 128.0f) / 127.0f, m;
++    if (x < -1.0f) x = -1.0f;
++    if (y < -1.0f) y = -1.0f;
++    m = sqrtf(x * x + y * y);
++    if (m <= PAS_DEADZONE) return 0;
++    { const float k = (m - PAS_DEADZONE) / (1.0f - PAS_DEADZONE) / m; x *= k; y *= k; }
++    if (x * x + y * y < PAS_MIN_MAG2) return 0;
++    if (ang) *ang = atan2f(x, -y);   /* stick up is byte 0 = y negative: the angle is measured from up */
++    return 1;
++}
++
++/* ---- guest memory (big-endian) over a host pointer ---- */
++static inline int pas_ptr_ok(uint32_t ea) { return ea >= 0x10000u && ea < 0xF0000000u && !(ea & 3u); }
++static inline uint32_t pas_r32(const uint8_t* vm, uint32_t ea)
++{
++    return ((uint32_t)vm[ea] << 24) | ((uint32_t)vm[ea + 1] << 16) | ((uint32_t)vm[ea + 2] << 8) | vm[ea + 3];
++}
++static inline float pas_rf(const uint8_t* vm, uint32_t ea)
++{
++    const uint32_t u = pas_r32(vm, ea);
++    float f;
++    memcpy(&f, &u, 4);
++    return f;
++}
++static inline void pas_wf(uint8_t* vm, uint32_t ea, float f)
++{
++    uint32_t u;
++    memcpy(&u, &f, 4);
++    vm[ea] = (uint8_t)(u >> 24); vm[ea + 1] = (uint8_t)(u >> 16); vm[ea + 2] = (uint8_t)(u >> 8); vm[ea + 3] = (uint8_t)u;
++}
++
++/* ---- the state the pad layer and the hooks share ---- */
++typedef struct {
++    PasStick stick;
++    unsigned long long valve_ms, charge_ms;   /* last hook call per section (0 = never) */
++    int mstick_on;                     /* 1 while the virtual stick is live (log edge) */
++    uint32_t valve_ent, chg_ent;       /* the entity of the last section line */
++    float v_logn;                      /* valve position at the last progress line */
++} PasState;
++
++static inline int pas_valve_live(const PasState* st, unsigned long long now)
++{
++    return st->valve_ms && now - st->valve_ms <= PAS_SECTION_MS;
++}
++static inline int pas_charge_live(const PasState* st, unsigned long long now)
++{
++    return st->charge_ms && now - st->charge_ms <= PAS_SECTION_MS;
++}
++
++/* What the hooks read from the guest (all range-checked: a value the game never wrote must not walk off the guest). */
++typedef struct {
++    uint32_t ent, res;
++    float ang, hand, n, dis, lo, hi;              /* valve: angle, hand angle (rad), position 0..1, DisableValue, hand limits (rad) */
++    int nwin;                                      /* charge */
++    float cen[PAS_MAXWIN], amn, amx, spd, step;
++    int fresh;                                     /* first sight of this entity: the section line was logged */
++} PasView;
++
++/* Post-hook of ValveJoystickController::Update (this = ctrl): stamps the section, fills *v, logs the section once per
++ * entity. Returns 1 when *v is usable. */
++static inline int pas_valve_mark(PasState* st, const uint8_t* vm, uint32_t ctrl, unsigned long long now, PasView* v)
++{
++    float mn, mx;
++    st->valve_ms = now ? now : 1;
++    if (!pas_ptr_ok(ctrl) || ctrl > 0x3FFFE000u) return 0;
++    v->ent = pas_r32(vm, ctrl + 0x20);
++    if (!pas_ptr_ok(v->ent) || v->ent > 0x3FFFE000u) return 0;
++    v->res = pas_r32(vm, v->ent + 0xE4);
++    if (!pas_ptr_ok(v->res) || v->res > 0x3FFFE000u) return 0;
++    v->ang = pas_rf(vm, v->ent + 0x288);
++    v->hand = pas_rf(vm, v->ent + 0x290);
++    mn = pas_rf(vm, v->res + 0x18C);
++    mx = pas_rf(vm, v->res + 0x190);
++    v->lo = pas_rf(vm, v->res + 0x198) * PAS_DEG2RAD;
++    v->hi = pas_rf(vm, v->res + 0x19C) * PAS_DEG2RAD;
++    v->dis = pas_rf(vm, v->res + 0x1A8);
++    if (!isfinite(v->ang) || !isfinite(mn) || !isfinite(mx) || !(mx > mn)) return 0;
++    v->n = (v->ang - mn * PAS_DEG2RAD) / ((mx - mn) * PAS_DEG2RAD);
++    v->fresh = st->valve_ent != v->ent;
++    if (v->fresh) {
++        st->valve_ent = v->ent;
++        printf("[assist] valve section: entity=0x%08X n=%.3f disable=%.3f dir=%+d handlimit=%.1f/%.1f\n", v->ent, (double)v->n,
++               (double)v->dis, v->dis > v->n ? 1 : -1, (double)(v->lo / PAS_DEG2RAD), (double)(v->hi / PAS_DEG2RAD));
++        st->v_logn = v->n;
++    } else if (fabsf(v->n - st->v_logn) >= 0.05f) {   /* progress: the valve position moved by 5 % of its travel */
++        printf("[assist] valve n=%.3f hand=%.3f grab=%.1f\n", (double)v->n, (double)v->hand, (double)pas_rf(vm, ctrl + 0x10C));
++        st->v_logn = v->n;
++    }
++    return 1;
++}
++
++/* Post-hook of the charge target function (this = ctrl): runs only while the soldier places a charge (the function
++ * itself returns at once when [ctrl+0x24] & 8, so does this). Reads the arm windows of the resource. */
++static inline int pas_charge_mark(PasState* st, const uint8_t* vm, uint32_t ctrl, unsigned long long now, PasView* v)
++{
++    uint32_t arr;
++    int i, cnt;
++    if (!pas_ptr_ok(ctrl) || ctrl > 0x3FFFE000u) return 0;
++    if (pas_r32(vm, ctrl + 0x24) & 8u) return 0;
++    st->charge_ms = now ? now : 1;
++    v->ent = pas_r32(vm, ctrl + 0x20);
++    if (!pas_ptr_ok(v->ent) || v->ent > 0x3FFFE000u) return 0;
++    v->res = pas_r32(vm, v->ent + 0xE4);
++    if (!pas_ptr_ok(v->res) || v->res > 0x3FFFE000u) return 0;
++    v->amn = pas_rf(vm, v->res + 0x190) * PAS_DEG2RAD;
++    v->amx = pas_rf(vm, v->res + 0x194) * PAS_DEG2RAD;
++    v->spd = pas_rf(vm, v->res + 0x198) * PAS_DEG2RAD;
++    arr = pas_r32(vm, v->res + 0x200);
++    cnt = (int)pas_r32(vm, v->res + 0x204);
++    v->step = pas_rf(vm, v->res + 0x20C);
++    v->nwin = 0;
++    if (cnt >= 1 && cnt <= PAS_MAXWIN && pas_ptr_ok(arr) && arr < 0x3FFFE000u)
++        for (i = 0; i < cnt; i++) {
++            const float a = pas_rf(vm, arr + 8u * (uint32_t)i), b = pas_rf(vm, arr + 8u * (uint32_t)i + 4u);
++            if (isfinite(a) && isfinite(b) && b >= a) v->cen[v->nwin++] = 0.5f * (a + b);
++        }
++    v->fresh = st->chg_ent != v->ent;
++    if (v->fresh) {
++        st->chg_ent = v->ent;
++        printf("[assist] charge section: entity=0x%08X windows=%d centres=%.4f/%.4f angle=%.1f..%.1f speed=%.0f step=%.2f\n", v->ent,
++               v->nwin, v->nwin > 0 ? (double)v->cen[0] : 0.0, v->nwin > 1 ? (double)v->cen[1] : 0.0, (double)(v->amn / PAS_DEG2RAD),
++               (double)(v->amx / PAS_DEG2RAD), (double)(v->spd / PAS_DEG2RAD), (double)v->step);
++    }
++    return 1;
++}
++
++#endif
+diff --git a/libs/input/pad_mouse.c b/libs/input/pad_mouse.c
+index 921e85e..2d21624 100644
+--- a/libs/input/pad_mouse.c
++++ b/libs/input/pad_mouse.c
+@@ -122,12 +122,26 @@ int pad_mouse_activity_take(void)
+     return r;
+ }
+ 
++/* Patch 4030: the counts for the virtual right stick of the motion sections (pad_assist.h). A separate sum that
++ * nobody else takes from, so the look code and the stick never compete; the pad layer empties it every poll. */
++static long s_stk_dx, s_stk_dy;
++void pad_mouse_stick_take(int* dx, int* dy)
++{
++    PM_LOCK();
++    *dx = (int)s_stk_dx; *dy = (int)s_stk_dy;
++    s_stk_dx = s_stk_dy = 0;
++    PM_UNLOCK();
++}
++
+ void pad_mouse_add(int dx, int dy)
+ {
+     const unsigned f = s_frame_clock();
+     unsigned long long (*clk)(void) = s_time_clock;
+     const unsigned long long tb = clk ? clk() : 0;   /* patch 2108: arrival time */
+     PM_LOCK();
++    s_stk_dx += dx; s_stk_dy += dy;
++    if (s_stk_dx > 100000) s_stk_dx = 100000; else if (s_stk_dx < -100000) s_stk_dx = -100000;
++    if (s_stk_dy > 100000) s_stk_dy = 100000; else if (s_stk_dy < -100000) s_stk_dy = -100000;
+     if (clk) pad_look_acc_add_at(&s_acc, dx, dy, f, tb);
+     else pad_look_acc_add(&s_acc, dx, dy, f);
+     PM_UNLOCK();
+diff --git a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
+index caa8735..86ba705 100644
+--- a/libs/input/pad_mouse.h
++++ b/libs/input/pad_mouse.h
+@@ -535,6 +535,7 @@ int  pad_mouse_log_each(void);
+ void pad_mouse_opts_set(float user, float zoom, int invert);
+ void pad_mouse_opts_get(float* user, float* zoom, int* invert);
+ void pad_mouse_add(int dx, int dy);
++void pad_mouse_stick_take(int* dx, int* dy);   /* 4030: the counts since the last call (virtual right stick) */
+ /* Takes (and clears) the counts since the last call, plus the script's due events; `now` = seconds on the caller's
+  * clock (the script's clock starts at the first call). Returns 1 when either count is non-zero. */
+ int  pad_mouse_take(double now, int* dx, int* dy);

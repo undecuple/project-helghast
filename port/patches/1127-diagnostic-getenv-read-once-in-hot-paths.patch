@@ -25,8 +25,14 @@ libs/video (RSX, 2xxx) not audited here. Test: tools/spu/test_r106_getenv_once.s
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream 634871d1 read the same switches once: those hunks are upstream's now.
 
+Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): builds on #515 (37b09103/6f590f42, ps3_env_once):
+the spurs_job.c part is dropped (SPURS_JOB_DESCDUMP and SPURS_JOB_DUMP are read through upstream's ps3_env_once there).
+The KZ3_ENV_ON/KZ3_ENV_STR caches in the nine files upstream did not convert are unchanged.
+Pass 2: tools/test_lwmutex_semantics.py (refreshed by 1122) extracts handlers that now use KZ3_ENV_ON; its harness defines
+KZ3_ENV_ON as 0 (switches off).
+
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index 0b14320a..61806d06 100644
+index ef2388db..79921075 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
 @@ -352,10 +352,19 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
@@ -49,7 +55,7 @@ index 0b14320a..61806d06 100644
  /* ---------------------------------------------------------------------------
   * PS3_SAMPLE=<ms>: a sampling profiler over GUEST code.
   *
-@@ -3622,7 +3631,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+@@ -3659,7 +3668,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
           * PhyreEngine init-failure fragment, dump the HOST backtrace (RVAs vs
           * the exe base) so we can map the error-reporter's call chain through
           * build_boot/flow.map and locate the failing function. */
@@ -59,7 +65,7 @@ index 0b14320a..61806d06 100644
              for (uint32_t i = 0; i < n; i++) t[i] = (char)vm_read8(buf + i);
              t[n] = 0;
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
-index a8e9a0f1..737438f0 100644
+index 59131249..9cad5899 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
 +++ b/runtime/ppu/ppu_sysprx.cpp
 @@ -116,6 +116,15 @@ static void sys_process_is_stack(ppu_context* ctx)
@@ -87,7 +93,7 @@ index a8e9a0f1..737438f0 100644
          fprintf(stderr, "[LWM] create #%lld lwm=0x%08X attr=0x%08X\n", _n, lwm, attr); }
      uint32_t protocol  = attr ? vm_read32(attr + 0) : 0;
      uint32_t recursive = attr ? vm_read32(attr + 4) : 0;
-@@ -491,7 +500,7 @@ static void crt_ok(ppu_context* ctx) { ctx->gpr[3] = 0; }
+@@ -497,7 +506,7 @@ static void crt_ok(ppu_context* ctx) { ctx->gpr[3] = 0; }
  static void sys_lwmutex_destroy_counted(ppu_context* ctx)
  {
      { static long long _n=0; _n++;
@@ -97,7 +103,7 @@ index a8e9a0f1..737438f0 100644
                  (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]); }
      /* KZ3 patch 1122: lv2 refuses while the lwmutex is owned or a thread sleeps on it or on a bound lwcond (EBUSY);
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 3837c303..b9ddb2d9 100644
+index 614452b5..66a817c4 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
 @@ -45,6 +45,15 @@
@@ -142,66 +148,8 @@ index 8c848cf1..e59f6b4c 100644
          fprintf(stderr, "[worker] spu=0x%X halted=%d steps=%llu status=0x%X pc=0x%05X "
                  "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
                  ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status,
-diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
-index 547968a2..5d0c2dab 100644
---- a/runtime/spu/spurs_job.c
-+++ b/runtime/spu/spurs_job.c
-@@ -44,6 +44,15 @@
- #include <string.h>
- #include "ps3emu/log_first.h"
- 
-+/* KZ3 patch 1127: diagnostic switches read once (-1 / (const char*)1 = unread) instead of
-+ * a getenv on every call; getenv is slow on Windows (CRT lock + linear environment scan;
-+ * upstream issue #243 measured half of a title's fps lost to one in an SPU loop). */
-+#ifndef KZ3_ENV_ON
-+#define KZ3_ENV_ON(slot, name)  ((slot) < 0 ? ((slot) = getenv(name) ? 1 : 0) : (slot))
-+#define KZ3_ENV_STR(slot, name) ((slot) == (const char*)1 ? ((slot) = getenv(name)) : (slot))
-+#endif
-+static int s_env_SPURS_JOB_DUMP = -1;
-+
- extern uint8_t* vm_base;
- extern int spu_run_with_halt(void (SPU_ABI *)(spu_context*), spu_context*);
- 
-@@ -298,7 +307,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
-      * its DMA and atomic EAs from these words, so when a job spins on a
-      * lock-line address that is not backed, this is what to read first. */
-     { static int _d = 0;
--      if (getenv("SPURS_JOB_DESCDUMP") && PS3_LOG_FIRST(_d, 4)) {
-+      static int s_dd = -1;   /* patch 1127: SPURS_JOB_DESCDUMP read once; 0 unset, 2 for a level >= 2, else 1 */
-+      if (s_dd < 0) { const char* e = getenv("SPURS_JOB_DESCDUMP"); s_dd = e ? (atoi(e) >= 2 ? 2 : 1) : 0; }
-+      if (s_dd && PS3_LOG_FIRST(_d, 4)) {
-           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
-           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
-               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
-@@ -309,7 +320,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
-            * data (past JH_SIZE) and dump what they point at. The job reads its
-            * parameters from there, so a wild DMA/atomic address usually
-            * originates in one of these blocks. */
--          if (atoi(getenv("SPURS_JOB_DESCDUMP")) >= 2) {
-+          if (s_dd >= 2) {
-               for (uint32_t o = JH_SIZE; o < dsz && o < 128; o += 4) {
-                   uint32_t v = g32(job_ea + o);
-                   if (v < 0x10000u || v >= 0xD0000000u) continue;
-@@ -328,7 +339,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
-      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
-      * the user data + that command block so the bail path is attributable. */
-     uint32_t dump_cmd = 0;
--    if (getenv("SPURS_JOB_DUMP")) {
-+    if (KZ3_ENV_ON(s_env_SPURS_JOB_DUMP, "SPURS_JOB_DUMP")) {
-         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
-         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
-         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
-@@ -433,7 +444,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
-           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
-                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
- 
--    if (getenv("SPURS_JOB_DUMP")) {
-+    if (KZ3_ENV_ON(s_env_SPURS_JOB_DUMP, "SPURS_JOB_DUMP")) {
-         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
-                 job_ea, ctx.status, ctx.stop_code, ctx.pc);
-         /* Post-run view of the same command block: the game polls result/status
 diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
-index 54f6ec04..a390cc28 100644
+index f72601b2..40ee13b2 100644
 --- a/runtime/syscalls/lv2_register.c
 +++ b/runtime/syscalls/lv2_register.c
 @@ -50,6 +50,18 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
@@ -250,7 +198,7 @@ index 54f6ec04..a390cc28 100644
              char tmp[256]; uint32_t n = len < 255 ? len : 255;
              memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
              /* The PhyreEngine failure message is written in fragments, so no
-@@ -856,7 +868,7 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
+@@ -861,7 +873,7 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
   * and signals completion -- satisfying the PPU's wait. Returns 1 if dispatched. */
  int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
  {
@@ -259,7 +207,7 @@ index 54f6ec04..a390cc28 100644
      /* Two callers reach here: an event-port send, which carries the frame's
       * work descriptor in data2, and the blocking-receive path, which has none
       * and passes 0. A worker started without a descriptor reads an empty inbox,
-@@ -1129,7 +1141,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+@@ -1148,7 +1160,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                  }
              }
          }
@@ -269,10 +217,10 @@ index 54f6ec04..a390cc28 100644
               * completing. Additive + env-gated so it can't destabilize titles
               * that rely on a registered fallback. */
 diff --git a/runtime/syscalls/sys_cond.c b/runtime/syscalls/sys_cond.c
-index 3896e9fe..25746479 100644
+index 058ec3c6..d1e71480 100644
 --- a/runtime/syscalls/sys_cond.c
 +++ b/runtime/syscalls/sys_cond.c
-@@ -12,6 +12,16 @@
+@@ -13,6 +13,16 @@
  #include <stdlib.h>
  #include <stdio.h>
  
@@ -289,7 +237,7 @@ index 3896e9fe..25746479 100644
  sys_cond_info g_sys_conds[SYS_COND_MAX];
  uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
  
-@@ -119,7 +129,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
+@@ -122,7 +132,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
      ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
      uint64_t timeout = LV2_ARG_U64(ctx, 1);
      /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
@@ -298,7 +246,7 @@ index 3896e9fe..25746479 100644
      if (peek) {
          uint32_t ea = (uint32_t)strtoul(peek, NULL, 16);
          if (ea) {
-@@ -131,7 +141,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
+@@ -134,7 +144,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
          }
      }
  #ifdef _WIN32
@@ -308,7 +256,7 @@ index 3896e9fe..25746479 100644
      if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
  #endif
 diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
-index 01aff4aa..3c2f6ac8 100644
+index 20395739..1631d7d3 100644
 --- a/runtime/syscalls/sys_event.c
 +++ b/runtime/syscalls/sys_event.c
 @@ -12,6 +12,17 @@
@@ -329,7 +277,7 @@ index 01aff4aa..3c2f6ac8 100644
  /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
   * context EA the title's SPU task runtime is dispatched against. */
  uint32_t g_ydkj_spurs_ctx_ea = 0;
-@@ -522,7 +533,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+@@ -579,7 +590,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      /* Diagnostic: main-thread per-frame poll on q=2/q=3 (timeout ~30us) never
       * advances to content. Dump its guest call chain to identify the frame-loop
       * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
@@ -338,7 +286,7 @@ index 01aff4aa..3c2f6ac8 100644
  #ifdef _WIN32
          static int _gs23 = 0; if (PS3_LOG_FIRST(_gs23, 4)) {
              void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
-@@ -683,7 +694,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+@@ -783,7 +794,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      ctx->gpr[5] = evt.data1;
      ctx->gpr[6] = evt.data2;
      ctx->gpr[7] = evt.data3;
@@ -347,7 +295,7 @@ index 01aff4aa..3c2f6ac8 100644
          "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
          (unsigned long long)evt.source, (unsigned long long)evt.data1,
          (unsigned long long)evt.data2); }
-@@ -1079,7 +1090,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
+@@ -1179,7 +1190,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
           * sends; we only fix the port->queue routing our HLE lost. Env YDKJ_PORTROUTE
           * (default ON) can be disabled for A/B. */
          if (port_id <= SYS_EVENT_QUEUE_MAX && g_sys_event_queues[port_id - 1].active
@@ -357,10 +305,10 @@ index 01aff4aa..3c2f6ac8 100644
              sys_event_t revt; revt.source = 0; revt.data1 = data1; revt.data2 = data2; revt.data3 = data3;
              int rc = event_queue_push(rq, &revt);
 diff --git a/runtime/syscalls/sys_fs.c b/runtime/syscalls/sys_fs.c
-index 75c9772e..707d4689 100644
+index 63dbbd77..1c839d99 100644
 --- a/runtime/syscalls/sys_fs.c
 +++ b/runtime/syscalls/sys_fs.c
-@@ -12,6 +12,17 @@
+@@ -13,6 +13,17 @@
  #include <sys/types.h>
  #include <sys/stat.h>
  
@@ -378,7 +326,7 @@ index 75c9772e..707d4689 100644
  #ifdef _WIN32
    #include <direct.h>
    #include <io.h>
-@@ -342,7 +353,7 @@ int64_t sys_fs_open(ppu_context* ctx)
+@@ -359,7 +370,7 @@ int64_t sys_fs_open(ppu_context* ctx)
      char host_path[1024];
      sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
  
@@ -387,7 +335,7 @@ index 75c9772e..707d4689 100644
          size_t _l = strlen(ps3_path);
          fprintf(stderr, "[TITLEOPEN] path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",
                  ps3_path, _l, (_l && ps3_path[_l-1]=='/')?1:0, (uint32_t)ctx->lr); fflush(stderr);
-@@ -356,7 +367,7 @@ int64_t sys_fs_open(ppu_context* ctx)
+@@ -373,7 +384,7 @@ int64_t sys_fs_open(ppu_context* ctx)
      /* DIAGNOSTIC (FLOW_TITLEFIX): the game builds the title path with an EMPTY filename
       * (a stale-lift string-construction bug) -> opens the dir. Redirect a bare
       * ".../Data/Titles/" open to the language file so we can confirm the render path. */
@@ -396,7 +344,7 @@ index 75c9772e..707d4689 100644
          size_t hl = strlen(host_path);
          if (hl >= 8 && (strcmp(host_path + hl - 8, "Titles\\") == 0 || strcmp(host_path + hl - 8, "Titles/") == 0
                          || strcmp(host_path + hl - 7, "Titles\\") == 0 || strcmp(host_path + hl - 7, "Titles/") == 0)) {
-@@ -555,7 +566,7 @@ int64_t sys_fs_read(ppu_context* ctx)
+@@ -591,7 +602,7 @@ int64_t sys_fs_read(ppu_context* ctx)
      /* FLOW_FSDBG: the lv2 path is what PhyreEngine titles actually use (they do
       * not go through the cellFs HLE), so PS3_FSLOG in ppu_fs.cpp never fires. */
      { extern char* getenv(const char*);
@@ -406,7 +354,7 @@ index 75c9772e..707d4689 100644
          fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
                          " head=%02X%02X%02X%02X lr=0x%08X\n",
 diff --git a/runtime/syscalls/sys_semaphore.c b/runtime/syscalls/sys_semaphore.c
-index 8b976c05..5638b3ec 100644
+index 1e17c72f..6d69752b 100644
 --- a/runtime/syscalls/sys_semaphore.c
 +++ b/runtime/syscalls/sys_semaphore.c
 @@ -11,6 +11,17 @@
@@ -427,7 +375,7 @@ index 8b976c05..5638b3ec 100644
  /* ---------------------------------------------------------------------------
   * Globals
   * -----------------------------------------------------------------------*/
-@@ -560,7 +571,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
+@@ -585,7 +596,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
  #ifdef _WIN32
      EnterCriticalSection(&s->value_lock);
      if (s->value + count > s->max_value) {
@@ -436,3 +384,15 @@ index 8b976c05..5638b3ec 100644
              fprintf(stderr, "[SEMTRACE] post OVERFLOW id=%u value=%d+%d > max=%d\n",
                      sem_id, s->value, count, s->max_value); }
          LeaveCriticalSection(&s->value_lock);
+diff --git a/tools/test_lwmutex_semantics.py b/tools/test_lwmutex_semantics.py
+index ada0e0e9..ddc9144b 100644
+--- a/tools/test_lwmutex_semantics.py
++++ b/tools/test_lwmutex_semantics.py
+@@ -60,6 +60,7 @@ struct ppu_context { uint64_t gpr[32]; uint64_t thread_id; };
+ #define _InterlockedExchange(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+ #define YieldProcessor() ((void)0)
+ #define PPU_FENCE(x) __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#define KZ3_ENV_ON(slot, name) 0   /* patch 1127: diagnostic switches off in the harness */
+ %s
+ %s
+ %s

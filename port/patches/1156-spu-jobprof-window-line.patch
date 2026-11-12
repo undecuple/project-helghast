@@ -1,0 +1,101 @@
+KZ3 patch 1156 (SPU pass 156, diagnostic, opt-in): KZ3_SPU_JOBPROF=N, a once-per-window "[spu-job] top N: ovlID=ms/calls ... | jobs= pmrun= ksleep= thr=K" line.
+The per-thread [wacct] lines (patch 1032) list each thread's 12 largest sites and never sum the threads, so the job modules of 7 SPURS kernel threads
+are cut off and have to be added by hand. This reads the same slot tables at print time (KZ3_WA_JOB per overlay image id, KZ3_WA_PMRUN, KZ3_WA_KSLEEP =
+the SPURS kernel idle) and prints the window's delta summed over threads. The SPU threads write nothing new (no hot-path change, no timing change); only the
+printer thread, which runs anyway under KZ3_WAIT_ACCT, does the extra pass. Off (default) = one predictable branch per window in the printer.
+N = 1 means top 12; N up to 32. Needs KZ3_WAIT_ACCT. Name mapping: tools/spu/spu_jobprof.py. Host test: tools/spu/test_r156_jobprof.sh.
+
+--- a/runtime/diag/kz3_wait_acct.c
++++ b/runtime/diag/kz3_wait_acct.c
+@@ -278,6 +278,83 @@
+ }
+ #endif
+ 
++/* ---- patch 1156: KZ3_SPU_JOBPROF=N, per-window job profile summed over all threads ------------------
++ * The per-thread [wacct] lines list only each thread's 12 largest sites and never add the threads up. This reads the
++ * same per-thread slot tables the printer already reads (KZ3_WA_JOB: job module resident, site = overlay image id;
++ * KZ3_WA_PMRUN: policy module run, site = wid; KZ3_WA_KSLEEP: SPURS kernel idle) and prints, once per window,
++ *   [spu-job] top N: ovl255=ms/calls ... | jobs=ms/calls pmrun=ms/calls ksleep=ms/calls thr=K
++ * ms and calls are the window's deltas summed over threads (thread-milliseconds, so 7 busy kernels give up to 7000 ms
++ * per second). Nothing is added to the hot path and no counter is written by the SPU threads for this: only the
++ * printer thread reads, and the state below belongs to it. Off by default (needs KZ3_WAIT_ACCT; N = 0 or unset = off,
++ * 1 = top 12). The overlay image id maps to a name through tools/spu/spu_jobprof.py (re/spu/spu_register_*.tsv). */
++enum { JP_IDS = 1024, JP_MAXN = 32 };
++static int s_jp_topn = -1;                     /* -1 not read yet, 0 off */
++static uint64_t s_jp_pns[JP_IDS], s_jp_pn[JP_IDS];   /* previous cumulative, per image id */
++static uint64_t s_jp_pk[3][2];                 /* previous cumulative: jobs, pmrun, ksleep (ns, calls) */
++
++static int jp_topn(void)
++{
++    if (s_jp_topn < 0) {
++        const char* e = getenv("KZ3_SPU_JOBPROF");
++        int n = e ? atoi(e) : 0;
++        if (n == 1) n = 12;
++        s_jp_topn = n < 0 ? 0 : n > JP_MAXN ? JP_MAXN : n;
++    }
++    return s_jp_topn;
++}
++
++static void jobprof_window(void)
++{
++    const int topn = jp_topn();
++    if (!topn) return;
++    uint64_t cns[JP_IDS] = {0}, cn[JP_IDS] = {0}, kns[3] = {0}, kn[3] = {0};
++    int nthr = 0;
++    long nt = s_nthr; if (nt > WA_THREADS) nt = WA_THREADS;
++    for (long i = 0; i < nt; i++) {
++        wa_thr* t = s_thr[i];
++        if (!t) continue;
++        int used = 0;
++        for (int s = 0; s < WA_SLOTS; s++) {
++            const uint64_t key = t->tab[s].key;
++            if (!key) continue;
++            const int kind = (int)(key >> 32) - 1;
++            const uint32_t site = (uint32_t)key;
++            const uint64_t a = t->tab[s].ns, b = t->tab[s].n;
++            if (kind == KZ3_WA_JOB) {
++                if (site < JP_IDS) { cns[site] += a; cn[site] += b; }
++                kns[0] += a; kn[0] += b; used = 1;
++            } else if (kind == KZ3_WA_PMRUN) { kns[1] += a; kn[1] += b; used = 1; }
++            else if (kind == KZ3_WA_KSLEEP)  { kns[2] += a; kn[2] += b; used = 1; }
++        }
++        nthr += used;
++    }
++    int best[JP_MAXN]; uint64_t bns[JP_MAXN], bn[JP_MAXN]; int nb = 0;
++    for (int id = 0; id < JP_IDS; id++) {
++        const uint64_t dn = cns[id] - s_jp_pns[id], dc = cn[id] - s_jp_pn[id];
++        s_jp_pns[id] = cns[id]; s_jp_pn[id] = cn[id];
++        if (!dn && !dc) continue;
++        int pos = nb;
++        while (pos > 0 && (bns[pos - 1] < dn || (bns[pos - 1] == dn && bn[pos - 1] < dc))) pos--;
++        if (pos >= topn) continue;
++        const int last = nb < topn ? nb : topn - 1;
++        for (int q = last; q > pos; q--) { best[q] = best[q - 1]; bns[q] = bns[q - 1]; bn[q] = bn[q - 1]; }
++        best[pos] = id; bns[pos] = dn; bn[pos] = dc;
++        if (nb < topn) nb++;
++    }
++    char line[1400]; int o = snprintf(line, sizeof line, "[spu-job] top %d:", topn);
++    for (int b = 0; b < nb; b++)
++        o += snprintf(line + o, sizeof line - o, " ovl%d=%.1f/%llu", best[b], (double)bns[b] / 1e6, (unsigned long long)bn[b]);
++    o += snprintf(line + o, sizeof line - o, " |");
++    static const char* nm[3] = { "jobs", "pmrun", "ksleep" };
++    for (int k = 0; k < 3; k++) {
++        const uint64_t dn = kns[k] - s_jp_pk[k][0], dc = kn[k] - s_jp_pk[k][1];
++        s_jp_pk[k][0] = kns[k]; s_jp_pk[k][1] = kn[k];
++        o += snprintf(line + o, sizeof line - o, " %s=%.1f/%llu", nm[k], (double)dn / 1e6, (unsigned long long)dc);
++    }
++    snprintf(line + o, sizeof line - o, " thr=%d", nthr);
++    fprintf(stderr, "%s\n", line);
++}
++
+ static void print_window(double t_s, long flips)
+ {
+     fprintf(stderr, "[wacct] ---- t=%.1fs window=%dms flips=%ld\n", t_s, g_kz3_wacct, flips);
+@@ -364,6 +441,7 @@
+         }
+         fprintf(stderr, "%s\n", line);
+     }
++    jobprof_window();   /* patch 1156 */
+     fflush(stderr);
+ }
+ 

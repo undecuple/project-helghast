@@ -29,6 +29,8 @@ pso_keys.bin and pso_library.bin). Working folder <data> (where cellSaveData's .
 when portable, else %APPDATA%/<names.DATA_FOLDER>. Portable is decided by data_mode (highest first): --portable /
 --appdata (one run), a file portable.txt in the install root, kz3-install.ini portable=1/0, default AppData; the log
 line and --open-data name the rule. --switch-data creates/removes portable.txt and writes the ini.
+A hand-edited data_dir in kz3.ini takes precedence for the working folder. Unless the player supplied a non-empty
+KZ3_KEYBINDS, the child receives keybinds.ini in that effective folder; the runtime reads/writes display.ini beside it.
 
 Version check (opt-in, kz3-install.ini [online] check_updates=1): at most once a day, version_check.py runs in the
 background (no window, 8 s timeout) and leaves its line in <root>/logs/version-check.txt; the next start shows
@@ -289,7 +291,7 @@ def cache_dir(root, portable, environ, localappdata=None, appdata=None):
     return os.path.join(local, SAVE_FOLDER) if local else data_dir(root, portable, environ, appdata)
 
 
-DATA_ENTRIES = ("gamedata", "keybinds.ini", "online.ini")   # saves and settings (the rest of the data folder is ours)
+DATA_ENTRIES = ("gamedata", "keybinds.ini", "display.ini", "online.ini")   # saves and settings (the rest of the data folder is ours)
 CACHE_ENTRIES = ("cache",)                                  # <cache dir>/cache/shaders and /shader-warmup
 
 
@@ -622,13 +624,15 @@ def game_env(root, paths, portable, environ, appdata=None, localappdata=None, bu
         if hdd0:   # ASSUMPTION (plan 4.3): trophies + update resolve; cellSaveData keeps ./gamedata (cwd), not this
             added["PS3_HDD0_ROOT"] = hdd0
     added["KZ3_INSTALL_DIR"] = root   # the game's log names it %INSTALL% (kz3_log_redact.h)
-    if not environ.get("KZ3_KEYBINDS"):   # the game picks keybinds.ini/display.ini itself (patch 2037) and knows only
-        added["KZ3_KEYBINDS"] = os.path.join(cwd, "keybinds.ini")   # kz3-install.ini, not portable.txt/--portable: say where
     for k, v in hand_paths(root, build).items():   # a path the player edited in kz3.ini is theirs (not rewritten)
         if k == "data_dir":
             cwd = v
         else:
             added[INI_ENV[k]] = v
+    # The runtime reads display.ini beside these bindings. Its stored portable flag
+    # cannot express a one-run mode or a hand-edited data_dir; pass the final path.
+    if not environ.get("KZ3_KEYBINDS"):
+        added["KZ3_KEYBINDS"] = os.path.join(cwd, "keybinds.ini")
     env = dict(environ)
     env.update(added)
     return [os.path.join(root, "build", "kz3.exe"), paths["eboot"]], cwd, env, added
@@ -1343,11 +1347,15 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
     tenv = template_env(root, cwd, environ, a.export_template)
     if tenv:
         note(root, "pipeline template: " + " ".join(f"{k}={v}" for k, v in tenv.items()))
-    # the paths are in kz3.ini (pass 26); the player's own variables win
+    # Paths supported by kz3.ini stay there, so the player's environment wins.
+    # Bindings/display have no INI mapping: forward just this computed override.
+    child_env = {**environ, **tenv}
+    if "KZ3_KEYBINDS" in added:
+        child_env["KZ3_KEYBINDS"] = added["KZ3_KEYBINDS"]
     out = tenv.get("LD_PSO_TEMPLATE_OUT") or environ.get("LD_PSO_TEMPLATE_OUT", "")
     if a.export_template and out and os.path.isfile(out):
         os.remove(out)   # an export left by an earlier run must not pass as this run's result
-    rc = run(gargv, cwd=cwd, env={**environ, **tenv})
+    rc = run(gargv, cwd=cwd, env=child_env)
     if a.export_template:
         tool = os.path.join(root, TEMPLATE_TOOL)
         if rc == 0 and out and os.path.isfile(out) and run([console_python(), tool, "check", out]) == 0:

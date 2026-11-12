@@ -8,8 +8,10 @@ ASSUMPTION: nothing else in v0.15.0 depends on #287's helpers (the revert applie
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): still a full revert of spu_helpers.h, now also of #445/#479/#500/#512 (SSE4.1/AVX2 forms), set to the old 1000 result; `spu_interp.c` keeps upstream #417 (interrupt E/D bits on taken indirect branches); deletes the helper-lineage tests test_spu_float_est/exact/rz_mode, test_spu_int_x86.c, tools/test_spu_float_rz_mode.py and the CMake test_spu_float_exact entry. Taking #512/#500 = its own round (job diff + A/B).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 152): still the revert of #287's helper stack. spu_helpers.h is again the old 1000 result, which drops v0.19's added SSE4.1 vector float forms (spu__x4_*) and NEON fi/cflts (#683/#677/#688 helper additions: none of them is used outside that file); the helper-lineage tests go, including v0.19's new test_spu_float_vector_scalar.c and test_spu_fi_cflts_neon.c with their CMake entries (test_spu_decode, the new interpreter decode test, is kept). spu_interp.c keeps upstream's changes. tools/spu_lifter.py: #287's lifter additions stay reverted (--merge-chunks, --return-entries, lv2 resuming stops, stopd code, weak_emit) but the bisl/bisled hunk is NOT reverted any more: upstream's target-before-link read (_tg) stays, which is what patch 1156 had to add back on v0.18 and is now dropped; v0.19's --reloc option and _pc() placement stay. Check: tools/spu/test_lifter_bisl_alias.sh (also run against the v0.19 tree, with a link-before-target mutation as negative control).
+
 diff --git a/.gitignore b/.gitignore
-index 1bd8dfe5..dd6a90c8 100644
+index 1bd8dfe..dd6a90c 100644
 --- a/.gitignore
 +++ b/.gitignore
 @@ -112,6 +112,3 @@ scratch/
@@ -20,10 +22,10 @@ index 1bd8dfe5..dd6a90c8 100644
 -# SPU differential test build products (runtime/spu/tests/build_diff_test.sh)
 -runtime/spu/tests/build_diff/
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 250d8d2c..97d20950 100644
+index d68ec3e..e68c383 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -408,15 +408,6 @@ if(PS3RECOMP_BUILD_TESTS)
+@@ -437,29 +437,6 @@ if(PS3RECOMP_BUILD_TESTS)
      add_test(NAME log_first COMMAND test_log_first)
  
      if(NOT WIN32)
@@ -35,12 +37,43 @@ index 250d8d2c..97d20950 100644
 -        target_link_libraries(test_spu_float_exact PRIVATE m)
 -        add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
 -        set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
+-        # The vector forms against the scalar per-lane forms, directly.
+-        add_executable(test_spu_float_vector_scalar
+-            runtime/spu/tests/test_spu_float_vector_scalar.c)
+-        target_include_directories(test_spu_float_vector_scalar PRIVATE include runtime/spu)
+-        target_compile_options(test_spu_float_vector_scalar PRIVATE -UNDEBUG)
+-        target_link_libraries(test_spu_float_vector_scalar PRIVATE m)
+-        add_test(NAME spu_float_vector_scalar COMMAND test_spu_float_vector_scalar 4)
+-        set_tests_properties(spu_float_vector_scalar PROPERTIES TIMEOUT 300)
+-        # On x86 both take the ISA the runtime and lifted code are built for, so the SSE4.1
+-        # vector form is the one under test; no contraction, as in the runtime.
+-        if(PS3RECOMP_HAS_MSSE41)
+-            target_compile_options(test_spu_float_exact PRIVATE -msse4.1 -ffp-contract=off)
+-            target_compile_options(test_spu_float_vector_scalar PRIVATE -msse4.1 -ffp-contract=off)
+-        endif()
+-
+         # The interpreter's op/immediate decode at the opcode-width and
+         # immediate-form boundaries, against ISA-layout encodings.
+         add_executable(test_spu_decode
+@@ -470,16 +447,6 @@ if(PS3RECOMP_BUILD_TESTS)
+         add_test(NAME spu_decode COMMAND test_spu_decode)
+         set_tests_properties(spu_decode PROPERTIES TIMEOUT 30)
+ 
+-        # fi and cflts (NEON on ARM64) against their scalar references, in the
+-        # default FPCR and under round-toward-zero plus flush-to-zero.
+-        add_executable(test_spu_fi_cflts_neon
+-            runtime/spu/tests/test_spu_fi_cflts_neon.c)
+-        target_include_directories(test_spu_fi_cflts_neon PRIVATE include runtime/spu)
+-        target_compile_options(test_spu_fi_cflts_neon PRIVATE -UNDEBUG)
+-        target_link_libraries(test_spu_fi_cflts_neon PRIVATE m)
+-        add_test(NAME spu_fi_cflts_neon COMMAND test_spu_fi_cflts_neon)
+-        set_tests_properties(spu_fi_cflts_neon PROPERTIES TIMEOUT 300)
 -
          add_executable(test_spu_lockline_wait
              runtime/spu/tests/test_spu_lockline_wait.c)
          target_include_directories(test_spu_lockline_wait PRIVATE include)
 diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
-index f04fda63..0fca7f55 100644
+index 9691a15..0fca7f5 100644
 --- a/runtime/spu/spu_helpers.h
 +++ b/runtime/spu/spu_helpers.h
 @@ -56,118 +56,6 @@ static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST
@@ -630,7 +663,7 @@ index f04fda63..0fca7f55 100644
  /* Bit-level quadword shifts/rotates operate on the WHOLE 128-bit big-endian
   * value. Our _u64[0]/_u64[1] are word-SCRAMBLED (host-LE: _u64[0] = word0 |
   * word1<<32, but SPU's MS half is word0<<32 | word1), so native shifts on them
-@@ -597,722 +273,26 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
+@@ -597,838 +273,26 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
      uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
      u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
  
@@ -1166,6 +1199,122 @@ index f04fda63..0fca7f55 100644
 -SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0); }            /* a*b + c */
 -SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
 -SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__x8_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
+-#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
+-/* The AVX2 form above with SSE4.1 only (the default x86-64 build), each f64x4 step done as two
+- * f64x2 halves: lanes 0-1 and lanes 2-3 widened exactly, the same operation, the 29 low
+- * significand bits cleared, narrowed exactly. The lane rules are the AVX2 ones word for word, so a
+- * lane takes the vector result only where that result is provably the exact truncation, and
+- * every other lane is redone by the per-lane path (spu__*_any). There is no FMA instruction here,
+- * so nothing can be contracted; the double product of two 24-bit significands is exact anyway.
+- * 64-bit compares other than equality are SSE4.2, so exponent range checks narrow the double
+- * exponents to 32-bit lanes first. */
+-#include <smmintrin.h>
+-#define SPU__X4_INLINE static inline __attribute__((always_inline))
+-#define SPU__X4_SLOW   static __attribute__((noinline, cold, unused))
+-SPU__X4_INLINE __m128i spu__x4_bexp(__m128i x) { return _mm_srli_epi32(_mm_slli_epi32(x, 1), 24); }
+-SPU__X4_INLINE __m128i spu__x4_zero(__m128i x) { return _mm_cmpeq_epi32(_mm_slli_epi32(x, 1), _mm_setzero_si128()); }
+-SPU__X4_INLINE __m128i spu__x4_plain0(__m128i x) {          /* biased exponent 1..254, or +-0 */
+-    const __m128i e = spu__x4_bexp(x);
+-    return _mm_or_si128(_mm_and_si128(_mm_cmpgt_epi32(e, _mm_setzero_si128()), _mm_cmpgt_epi32(_mm_set1_epi32(255), e)),
+-                        spu__x4_zero(x));
+-}
+-/* the four singles widened to doubles: lanes 0-1 in *lo, lanes 2-3 in *hi (exact) */
+-SPU__X4_INLINE void spu__x4_wide(__m128i x, __m128d* lo, __m128d* hi) {
+-    const __m128 f = _mm_castsi128_ps(x);
+-    *lo = _mm_cvtps_pd(f); *hi = _mm_cvtps_pd(_mm_movehl_ps(f, f));
+-}
+-/* the low 32 bits of each 64-bit lane of lo:hi, as four 32-bit lanes 0..3 */
+-SPU__X4_INLINE __m128i spu__x4_narrow(__m128i lo, __m128i hi) {
+-    return _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(lo), _mm_castsi128_ps(hi), _MM_SHUFFLE(2, 0, 2, 0)));
+-}
+-/* lo:hi truncated to singles. *ok: lanes whose result is a normal single or an exact zero and,
+- * when err is given, did not both round and land on a 24-bit boundary. *zm: the zero lanes. */
+-SPU__X4_INLINE __m128i spu__x4_trunc0(__m128d dlo, __m128d dhi, __m128i* ok, __m128i* zm,
+-                                      const __m128d* elo, const __m128d* ehi) {
+-    const __m128i ulo = _mm_castpd_si128(dlo), uhi = _mm_castpd_si128(dhi);
+-    const __m128i az = spu__x4_narrow(_mm_cmpeq_epi64(_mm_slli_epi64(ulo, 1), _mm_setzero_si128()),
+-                                      _mm_cmpeq_epi64(_mm_slli_epi64(uhi, 1), _mm_setzero_si128()));
+-    /* biased double exponent, 0..2047, per lane; a normal single needs it in 1023-126..1023+127 */
+-    const __m128i be = _mm_and_si128(spu__x4_narrow(_mm_srli_epi64(ulo, 52), _mm_srli_epi64(uhi, 52)), _mm_set1_epi32(0x7FF));
+-    __m128i good = _mm_andnot_si128(_mm_or_si128(_mm_cmpgt_epi32(_mm_set1_epi32(1023 - 126), be),
+-                                                 _mm_cmpgt_epi32(be, _mm_set1_epi32(1023 + 127))),
+-                                    _mm_set1_epi32(-1));
+-    if (elo) {
+-        const __m128i low = _mm_set1_epi64x(0x1FFFFFFF);
+-        const __m128i bnd = spu__x4_narrow(_mm_cmpeq_epi64(_mm_and_si128(ulo, low), _mm_setzero_si128()),
+-                                           _mm_cmpeq_epi64(_mm_and_si128(uhi, low), _mm_setzero_si128()));
+-        const __m128i rnd = spu__x4_narrow(_mm_castpd_si128(_mm_cmpneq_pd(*elo, _mm_setzero_pd())),
+-                                           _mm_castpd_si128(_mm_cmpneq_pd(*ehi, _mm_setzero_pd())));
+-        good = _mm_andnot_si128(_mm_and_si128(bnd, rnd), good);
+-    }
+-    *ok = _mm_or_si128(good, az);
+-    *zm = az;
+-    const __m128i keep = _mm_set1_epi64x(~0x1FFFFFFFll);
+-    const __m128 t = _mm_movelh_ps(_mm_cvtpd_ps(_mm_castsi128_pd(_mm_and_si128(ulo, keep))),
+-                                   _mm_cvtpd_ps(_mm_castsi128_pd(_mm_and_si128(uhi, keep))));
+-    return _mm_andnot_si128(_mm_and_si128(az, _mm_set1_epi32((int)0x80000000u)), _mm_castps_si128(t));
+-}
+-SPU__X4_INLINE int spu__x4_all4(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)) == 0xF; }
+-SPU__X4_INLINE __m128i spu__x4_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
+-SPU__X4_INLINE u128 spu__x4_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
+-SPU__X4_SLOW u128 spu__x4_fa_fix(u128 r, __m128i ok, u128 a, u128 b, uint32_t negb) {
+-    const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
+-    for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fa_any(a._u32[i], b._u32[i] ^ negb);
+-    return r;
+-}
+-SPU__X4_SLOW u128 spu__x4_fm_fix(u128 r, __m128i ok, u128 a, u128 b) {
+-    const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
+-    for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fm_any(a._u32[i], b._u32[i]);
+-    return r;
+-}
+-SPU__X4_SLOW u128 spu__x4_fma_fix(u128 r, __m128i ok, u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+-    const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
+-    for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);
+-    return r;
+-}
+-SPU__X4_INLINE u128 spu__x4_fa(u128 a, u128 b, uint32_t negb) {
+-    const __m128i x = spu__x4_ld(a), y = _mm_xor_si128(spu__x4_ld(b), _mm_set1_epi32((int)negb));
+-    /* the exponent-gap limit applies only between two nonzero terms */
+-    const __m128i gap = _mm_cmpgt_epi32(_mm_set1_epi32(30), _mm_abs_epi32(_mm_sub_epi32(spu__x4_bexp(x), spu__x4_bexp(y))));
+-    const __m128i pre = _mm_and_si128(_mm_and_si128(spu__x4_plain0(x), spu__x4_plain0(y)),
+-                                      _mm_or_si128(gap, _mm_or_si128(spu__x4_zero(x), spu__x4_zero(y))));
+-    __m128d xl, xh, yl, yh; spu__x4_wide(x, &xl, &xh); spu__x4_wide(y, &yl, &yh);
+-    __m128i ok, zm;
+-    const __m128i r = spu__x4_trunc0(_mm_add_pd(xl, yl), _mm_add_pd(xh, yh), &ok, &zm, NULL, NULL);
+-    ok = _mm_and_si128(ok, pre);
+-    return spu__x4_all4(ok) ? spu__x4_st(r) : spu__x4_fa_fix(spu__x4_st(r), ok, a, b, negb);
+-}
+-SPU__X4_INLINE u128 spu_fa(u128 a, u128 b) { return spu__x4_fa(a, b, 0); }
+-SPU__X4_INLINE u128 spu_fs(u128 a, u128 b) { return spu__x4_fa(a, b, 0x80000000u); }
+-SPU__X4_INLINE u128 spu_fm(u128 a, u128 b) {
+-    const __m128i x = spu__x4_ld(a), y = spu__x4_ld(b);
+-    __m128d xl, xh, yl, yh; spu__x4_wide(x, &xl, &xh); spu__x4_wide(y, &yl, &yh);
+-    __m128i ok, zm;
+-    const __m128i r = spu__x4_trunc0(_mm_mul_pd(xl, yl), _mm_mul_pd(xh, yh), &ok, &zm, NULL, NULL);
+-    ok = _mm_and_si128(ok, _mm_and_si128(spu__x4_plain0(x), spu__x4_plain0(y)));
+-    return spu__x4_all4(ok) ? spu__x4_st(r) : spu__x4_fm_fix(spu__x4_st(r), ok, a, b);
+-}
+-/* (+-a*b) + (+-c): the product is exact in double; TwoSum gives the add's exact rounding error. */
+-SPU__X4_INLINE void spu__x4_twosum(__m128d p, __m128d zz, __m128d* sum, __m128d* err) {
+-    const __m128d s = _mm_add_pd(p, zz), bb = _mm_sub_pd(s, p);
+-    *sum = s;
+-    *err = _mm_add_pd(_mm_sub_pd(p, _mm_sub_pd(s, bb)), _mm_sub_pd(zz, bb));
+-}
+-SPU__X4_INLINE u128 spu__x4_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+-    const __m128i x = _mm_xor_si128(spu__x4_ld(a), _mm_set1_epi32((int)negp)), y = spu__x4_ld(b);
+-    const __m128i z = _mm_xor_si128(spu__x4_ld(c), _mm_set1_epi32((int)negc));
+-    __m128d xl, xh, yl, yh, zl, zh; spu__x4_wide(x, &xl, &xh); spu__x4_wide(y, &yl, &yh); spu__x4_wide(z, &zl, &zh);
+-    __m128d sl, sh, el, eh;
+-    spu__x4_twosum(_mm_mul_pd(xl, yl), zl, &sl, &el);
+-    spu__x4_twosum(_mm_mul_pd(xh, yh), zh, &sh, &eh);
+-    __m128i ok, zm;
+-    const __m128i r = spu__x4_trunc0(sl, sh, &ok, &zm, &el, &eh);
+-    ok = _mm_and_si128(ok, _mm_and_si128(_mm_and_si128(spu__x4_plain0(x), spu__x4_plain0(y)), spu__x4_plain0(z)));
+-    return spu__x4_all4(ok) ? spu__x4_st(r) : spu__x4_fma_fix(spu__x4_st(r), ok, a, b, c, negp, negc);
+-}
+-SPU__X4_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__x4_fma(a, b, c, 0, 0); }            /* a*b + c */
+-SPU__X4_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__x4_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
+-SPU__X4_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__x4_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
 -#else
 -static inline u128 spu_fa(u128 a, u128 b) { return spu__fa_s(a, b); }
 -static inline u128 spu_fs(u128 a, u128 b) { return spu__fs_s(a, b); }
@@ -1373,7 +1522,7 @@ index f04fda63..0fca7f55 100644
  
  /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
   * Reassemble via _u32 -- our u128 is host-LE, so a naive _f64[i] would SWAP the
-@@ -1325,82 +305,45 @@ static inline void spu__dset(u128* r, int i, double d) {
+@@ -1441,82 +305,45 @@ static inline void spu__dset(u128* r, int i, double d) {
      uint64_t u; memcpy(&u, &d, sizeof u);
      r->_u32[i*2] = (uint32_t)(u >> 32); r->_u32[i*2+1] = (uint32_t)u;
  }
@@ -1482,7 +1631,7 @@ index f04fda63..0fca7f55 100644
  static inline u128 spu_shlqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) return a;
      uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
      uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh);
-@@ -1409,73 +352,29 @@ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) retur
+@@ -1525,73 +352,29 @@ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) retur
      uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
      uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
      u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
@@ -1569,7 +1718,7 @@ index f04fda63..0fca7f55 100644
      /* gather LSB of each SPU halfword H into bit (7-H). SPU halfword H maps to
       * our _u16[H^1] (the within-word halfword swap of the value layout). */
      uint32_t v=0; for(int i=0;i<8;i++) v |= ((uint32_t)(a._u16[i^1]&1) << (7-i));
-@@ -1483,15 +382,15 @@ static inline u128 spu_gbh_ref(u128 a) {
+@@ -1599,15 +382,15 @@ static inline u128 spu_gbh_ref(u128 a) {
  }
  /* gather LSB of each SPU byte i into bit (15-i); exact inverse of spu_fsmb.
   * SPU byte i lives at our _u8[SPU_W(i)] (byte-reversed within each word). */
@@ -1588,7 +1737,7 @@ index f04fda63..0fca7f55 100644
      u128 r;
      for(int i=0;i<4;i++) {
          uint32_t wa=a._u32[i], wb=b._u32[i];
-@@ -1503,13 +402,15 @@ static inline u128 spu_sumb_ref(u128 a, u128 b) {
+@@ -1619,13 +402,15 @@ static inline u128 spu_sumb_ref(u128 a, u128 b) {
  }
  /* Borrow generate: carry-out of (b + ~a + 1) == (b >= a unsigned ? 1 : 0).
   * The subtract-side sibling of cg; pairs with sf/sfx for extended subtraction. */
@@ -1610,7 +1759,7 @@ index f04fda63..0fca7f55 100644
  static const uint32_t spu_frest_fraction_lut[32] = {
      0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
      0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,
-@@ -1528,7 +429,7 @@ static const uint32_t spu_frsqest_fraction_lut[64] = {
+@@ -1644,7 +429,7 @@ static const uint32_t spu_frsqest_fraction_lut[64] = {
      0x4180D7, 0x4180D7, 0x3E24CC, 0x3E24CC, 0x3AF4C3, 0x3AF4C3, 0x37E8BA, 0x37E8BA
  };
  
@@ -1619,7 +1768,7 @@ index f04fda63..0fca7f55 100644
      u128 r;
      for (int i = 0; i < 4; i++) {
          uint32_t bits = a._u32[i];
-@@ -1543,151 +444,40 @@ static inline u128 spu_frsqest_ref(u128 a) {
+@@ -1659,198 +444,40 @@ static inline u128 spu_frsqest_ref(u128 a) {
  }
  /* frest: reciprocal estimate (refined by the following spu_fi Newton step).
   * Full-precision 1/x is exact after fi and >= HW-estimate accuracy. */
@@ -1771,6 +1920,53 @@ index f04fda63..0fca7f55 100644
 -    const __m128i nz = _mm_xor_si128(_mm_cmpeq_epi32(v, _mm_setzero_si128()), _mm_set1_epi32(-1));
 -    return spu__xe_st(spu__xe_cxflt(d, _mm_setzero_si128(), nz, i8));
 -}
+-#elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+-#include <arm_neon.h>
+-/* fi and cflts four lanes at a time on ARM64 (the others keep their references).
+- * test_spu_float_est.c checks both against the scalar references.
+- *
+- * fi: the reference's arithmetic in 32-bit lanes. (2^13 + base) * 2^19 is 2^32 plus
+- * u0 = base << 19, so with t = step * y (< 2^29) the magnitude is 2^32 + d, d = u0 - t.
+- * Without a borrow (d >= 0) the fraction is d >> 9; with one, u = d mod 2^32 lies in
+- * [2^32 - 2^29, 2^32), the value is normalised by one shift and the fraction is
+- * (u >> 8) & 0x7FFFFF, one exponent lower. */
+-static inline u128 spu_fi(u128 a, u128 b) {
+-    uint32x4_t est, av; memcpy(&est, &b, 16); memcpy(&av, &a, 16);
+-    const uint32x4_t exp  = vandq_u32(vshrq_n_u32(est, 23), vdupq_n_u32(0xFFu));
+-    const uint32x4_t u0   = vshlq_n_u32(vandq_u32(vshrq_n_u32(est, 10), vdupq_n_u32(0x1FFFu)), 19);
+-    const uint32x4_t t    = vmulq_u32(vandq_u32(est, vdupq_n_u32(0x3FFu)), vandq_u32(av, vdupq_n_u32(0x7FFFFu)));
+-    const uint32x4_t u    = vsubq_u32(u0, t);
+-    const uint32x4_t brw  = vcltq_u32(u0, t);
+-    const uint32x4_t frac = vbslq_u32(brw, vandq_u32(vshrq_n_u32(u, 8), vdupq_n_u32(0x7FFFFFu)), vshrq_n_u32(u, 9));
+-    const uint32x4_t e2   = vaddq_u32(exp, brw);                 /* a borrow lowers it by one */
+-    uint32x4_t r = vorrq_u32(vorrq_u32(vandq_u32(est, vdupq_n_u32(0x80000000u)), vshlq_n_u32(e2, 23)), frac);
+-    r = vbicq_u32(r, vorrq_u32(vceqzq_u32(exp), vceqzq_u32(e2))); /* zero operand, underflow: +0 */
+-    u128 out; memcpy(&out, &r, 16); return out;
+-}
+-static inline u128 spu_frest(u128 a)           { return spu_frest_ref(a); }
+-static inline u128 spu_frsqest(u128 a)         { return spu_frsqest_ref(a); }
+-/* cflts, scales 0..127: scaling by 2^scale is exact or overflows (an infinity, or
+- * FLT_MAX under round-toward-zero, both of which FCVTZS saturates like the SPU), and an
+- * underflow truncates to 0 either way. FCVTZS truncates toward zero and saturates
+- * exactly as cflts does. Exponent 0 is an SPU zero and exponent 255 an ordinary huge
+- * value, so those lanes are patched to 0 and to the saturated bound of their sign.
+- * Other scales use the reference. */
+-static inline u128 spu_cflts(u128 a, int i8) {
+-    const int scale = 173 - (i8 & 0xFF);
+-    if (scale < 0 || scale > 127) return spu_cflts_ref(a, i8);
+-    uint32x4_t x; memcpy(&x, &a, 16);
+-    const float32x4_t f = vmulq_f32(vreinterpretq_f32_u32(x),
+-                                    vreinterpretq_f32_u32(vdupq_n_u32((uint32_t)(scale + 127) << 23)));
+-    uint32x4_t r = vreinterpretq_u32_s32(vcvtq_s32_f32(f));
+-    const uint32x4_t e = vandq_u32(vshrq_n_u32(x, 23), vdupq_n_u32(0xFFu));
+-    const uint32x4_t sat = vaddq_u32(vshrq_n_u32(x, 31), vdupq_n_u32(0x7FFFFFFFu));
+-    r = vbslq_u32(vceqq_u32(e, vdupq_n_u32(0xFFu)), sat, r);
+-    r = vbicq_u32(r, vceqzq_u32(e));
+-    u128 out; memcpy(&out, &r, 16); return out;
+-}
+-static inline u128 spu_cfltu(u128 a, int i8)   { return spu_cfltu_ref(a, i8); }
+-static inline u128 spu_csflt(u128 a, int i8)   { return spu_csflt_ref(a, i8); }
+-static inline u128 spu_cuflt(u128 a, int i8)   { return spu_cuflt_ref(a, i8); }
 -#else
 -static inline u128 spu_fi(u128 a, u128 b)      { return spu_fi_ref(a, b); }
 -static inline u128 spu_frest(u128 a)           { return spu_frest_ref(a); }
@@ -1791,7 +1987,7 @@ index f04fda63..0fca7f55 100644
  /* xswd: rt.doubleword[d] = sign_extend_64(ra.word[2d+1]) -- the ODD word of
   * each doubleword, because that is the low half in big-endian order.
   *
-@@ -1701,7 +491,7 @@ static inline u128 spu_xshw_ref(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i]
+@@ -1864,7 +491,7 @@ static inline u128 spu_xshw_ref(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i]
   * block count was zero and it stopped on its own assert. Unlike its siblings
   * xsbh/xshw, whose source and destination swaps cancel, nothing cancels here.
   * Write the two words explicitly. */
@@ -1800,7 +1996,7 @@ index f04fda63..0fca7f55 100644
      u128 r;
      for (int d = 0; d < 2; d++) {
          int32_t v = (int32_t)a._u32[2*d + 1];
-@@ -1712,14 +502,14 @@ static inline u128 spu_xswd_ref(u128 a) {
+@@ -1875,14 +502,14 @@ static inline u128 spu_xswd_ref(u128 a) {
  }
  
  /* ---- Phase 3: OR across ---- */
@@ -1817,7 +2013,7 @@ index f04fda63..0fca7f55 100644
      u128 r; uint32_t v = a._u32[0] & 0xF;
      for(int i=0;i<4;i++) r._u32[i] = ((v>>(3-i))&1) ? 0xFFFFFFFFu : 0;
      return r;
-@@ -1728,7 +518,7 @@ static inline u128 spu_fsm_ref(u128 a) {
+@@ -1891,7 +518,7 @@ static inline u128 spu_fsm_ref(u128 a) {
   * our _u16[H^1] (within-word halfword swap of the value layout). Per-halfword
   * both bytes are identical so byte order within a halfword is irrelevant, but
   * the halfword ORDER within each word must be swapped. */
@@ -1826,7 +2022,7 @@ index f04fda63..0fca7f55 100644
      u128 r; uint32_t v = a._u32[0] & 0xFF;
      for(int i=0;i<8;i++) r._u16[i^1] = ((v>>(7-i))&1) ? 0xFFFFu : 0;
      return r;
-@@ -1739,7 +529,7 @@ static inline u128 spu_fsmh_ref(u128 a) {
+@@ -1902,7 +529,7 @@ static inline u128 spu_fsmh_ref(u128 a) {
   * andbi(fsmbi(0x101),-128) building a +0x80 EA offset in the low byte of words
   * 1,3) places the value in the correct byte lane. Raw _u8[P] would put 0x80 in
   * the high byte (bit 31) instead -> wrong DMA EA. */
@@ -1835,7 +2031,7 @@ index f04fda63..0fca7f55 100644
      u128 r; uint32_t v = a._u32[0] & 0xFFFF;
      for(int i=0;i<16;i++) r._u8[SPU_W(i)] = ((v>>(15-i))&1) ? 0xFFu : 0;
      return r;
-@@ -1759,51 +549,33 @@ static inline u128 spu_fsmbi(int32_t imm) {
+@@ -1922,51 +549,33 @@ static inline u128 spu_fsmbi(int32_t imm) {
   * a word, 0..7 for a doubleword. Every store is mapped through SPU_W to land at
   * the right host index. Verified to compose correctly with the fixed shufb for
   * both cbd-generated and immediate/LS-constant controls. */
@@ -1899,7 +2095,7 @@ index f04fda63..0fca7f55 100644
  static inline u128 spu_cdd(u128 a, int i7){ return spu_cdd_pos((int)a._u32[0]+i7); }
  static inline u128 spu_cbx(u128 a, u128 b){ return spu_cbd_pos((int)(a._u32[0]+b._u32[0])); }
  static inline u128 spu_chx(u128 a, u128 b){ return spu_chd_pos((int)(a._u32[0]+b._u32[0])); }
-@@ -1811,55 +583,22 @@ static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b
+@@ -1974,55 +583,22 @@ static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b
  static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0]+b._u32[0])); }
  
  /* ---- Phase 3: rotate-and-mask family ---- */
@@ -1962,7 +2158,7 @@ index f04fda63..0fca7f55 100644
  
  /* ---- Phase 3: halfword/byte immediate logic ---- */
  static inline u128 spu_andhi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]&v; return r; }
-@@ -1869,7 +608,7 @@ static inline u128 spu_orbi(u128 a, int32_t imm)  { u128 r; uint8_t  v=(uint8_t)
+@@ -2032,7 +608,7 @@ static inline u128 spu_orbi(u128 a, int32_t imm)  { u128 r; uint8_t  v=(uint8_t)
  static inline u128 spu_xorhi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]^v; return r; }
  
  /* ---- Phase 3: borrow-generate extended ---- */
@@ -1971,7 +2167,7 @@ index f04fda63..0fca7f55 100644
      u128 r;
      for(int i=0;i<4;i++) {
          uint64_t s = (uint64_t)b._u32[i] + (uint64_t)(~a._u32[i]) + (uint64_t)(t._u32[i]&1);
-@@ -1892,442 +631,4 @@ static inline u128 spu_iohl(u128 a, uint16_t imm){ u128 r; for(int i=0;i<4;i++)
+@@ -2055,442 +631,4 @@ static inline u128 spu_iohl(u128 a, uint16_t imm){ u128 r; for(int i=0;i<4;i++)
  }
  #endif
  
@@ -2415,10 +2611,10 @@ index f04fda63..0fca7f55 100644
 -
  #endif /* SPU_HELPERS_H */
 diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
-index e9b8f613..3a1657d9 100644
+index 6d63141..39e6930 100644
 --- a/runtime/spu/spu_interp.c
 +++ b/runtime/spu/spu_interp.c
-@@ -113,11 +113,11 @@ static int spu_step(spu_context* ctx) {
+@@ -91,11 +91,11 @@ static int spu_step(spu_context* ctx) {
      uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
                    | ((uint32_t)p[m+2] << 8) | p[m+3];
      spu_ins d; spu_decode1(insn, pc, &d);
@@ -2432,7 +2628,7 @@ index e9b8f613..3a1657d9 100644
      case SPU_ilh: DST = spu_ilh((uint16_t)I); break;
      case SPU_ilhu: DST = spu_splat_u32((uint32_t)I << 16); break;
      case SPU_ila:  DST = spu_splat_u32((uint32_t)I & 0x3FFFF); break;
-@@ -145,7 +145,6 @@ static int spu_step(spu_context* ctx) {
+@@ -123,7 +123,6 @@ static int spu_step(spu_context* ctx) {
      case SPU_cg:   DST = spu_cg(A,B); break;
      case SPU_cgx:  DST = spu_cgx(A,B,DST); break;
      case SPU_mpyi: DST = spu_mpyi(A,I); break;
@@ -2440,7 +2636,7 @@ index e9b8f613..3a1657d9 100644
      /* logical */
      case SPU_and: DST = spu_and(A,B); break;
      case SPU_or:  DST = spu_or(A,B); break;
-@@ -259,20 +258,15 @@ static int spu_step(spu_context* ctx) {
+@@ -237,20 +236,15 @@ static int spu_step(spu_context* ctx) {
      case SPU_clgthi:DST = spu_clgthi(A,I); break;
      /* integer / byte extras */
      case SPU_bg:    DST = spu_bg(A,B); break;
@@ -2462,7 +2658,7 @@ index e9b8f613..3a1657d9 100644
      case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
      case SPU_rotqmbii: DST = spu_rotqmbii(A,(int)I); break;
      case SPU_rotqbybi: DST = spu_rotqbybi(A,B); break;
-@@ -281,29 +275,14 @@ static int spu_step(spu_context* ctx) {
+@@ -259,29 +253,14 @@ static int spu_step(spu_context* ctx) {
      /* channels */
      case SPU_wrch: spu_wrch(ctx, d.ch, DST); break;
      case SPU_rdch: DST = spu_rdch(ctx, d.ch); break;
@@ -2495,7 +2691,7 @@ index e9b8f613..3a1657d9 100644
          { extern void spu_trace_call(uint32_t,uint32_t); spu_trace_call(pc, d.tgt); } break;
      case SPU_brz:  if (PREF(DST) == 0) next = d.tgt; break;
      case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
-@@ -342,7 +321,7 @@ static int spu_step(spu_context* ctx) {
+@@ -320,7 +299,7 @@ static int spu_step(spu_context* ctx) {
      case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
      case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
      case SPU_stop: case SPU_stopd:
@@ -2506,7 +2702,7 @@ index e9b8f613..3a1657d9 100644
       * else continue. The preferred word of ra is compared. */
 diff --git a/runtime/spu/tests/build_diff_test.sh b/runtime/spu/tests/build_diff_test.sh
 deleted file mode 100755
-index 17702353..00000000
+index 1770235..0000000
 --- a/runtime/spu/tests/build_diff_test.sh
 +++ /dev/null
 @@ -1,38 +0,0 @@
@@ -2550,7 +2746,7 @@ index 17702353..00000000
 -fi
 diff --git a/runtime/spu/tests/gen_lifted_cases.py b/runtime/spu/tests/gen_lifted_cases.py
 deleted file mode 100644
-index a5a17b1a..00000000
+index a5a17b1..0000000
 --- a/runtime/spu/tests/gen_lifted_cases.py
 +++ /dev/null
 @@ -1,48 +0,0 @@
@@ -2604,7 +2800,7 @@ index a5a17b1a..00000000
 -print(f"#define LC_NCASES {len(fns)}")
 diff --git a/runtime/spu/tests/rpcs3_oracle/README.md b/runtime/spu/tests/rpcs3_oracle/README.md
 deleted file mode 100644
-index d27ded31..00000000
+index d27ded3..0000000
 --- a/runtime/spu/tests/rpcs3_oracle/README.md
 +++ /dev/null
 @@ -1,22 +0,0 @@
@@ -2632,7 +2828,7 @@ index d27ded31..00000000
 -but the differential test binaries.
 diff --git a/runtime/spu/tests/rpcs3_oracle/extract.py b/runtime/spu/tests/rpcs3_oracle/extract.py
 deleted file mode 100644
-index 31203661..00000000
+index 3120366..0000000
 --- a/runtime/spu/tests/rpcs3_oracle/extract.py
 +++ /dev/null
 @@ -1,101 +0,0 @@
@@ -2739,7 +2935,7 @@ index 31203661..00000000
 -open(out, "w", encoding="utf-8").write(hdr + luts + "\n" + imm + "\n" + src + "\n" + dispatch)
 diff --git a/runtime/spu/tests/rpcs3_oracle/oracle.h b/runtime/spu/tests/rpcs3_oracle/oracle.h
 deleted file mode 100644
-index bdf6c50a..00000000
+index bdf6c50..0000000
 --- a/runtime/spu/tests/rpcs3_oracle/oracle.h
 +++ /dev/null
 @@ -1,24 +0,0 @@
@@ -2769,7 +2965,7 @@ index bdf6c50a..00000000
 -#endif
 diff --git a/runtime/spu/tests/rpcs3_oracle/oracle_run.inc b/runtime/spu/tests/rpcs3_oracle/oracle_run.inc
 deleted file mode 100644
-index f14ad6db..00000000
+index f14ad6d..0000000
 --- a/runtime/spu/tests/rpcs3_oracle/oracle_run.inc
 +++ /dev/null
 @@ -1,38 +0,0 @@
@@ -2813,7 +3009,7 @@ index f14ad6db..00000000
 -}
 diff --git a/runtime/spu/tests/rpcs3_oracle/shim/oracle_shim.h b/runtime/spu/tests/rpcs3_oracle/shim/oracle_shim.h
 deleted file mode 100644
-index 109d9089..00000000
+index 109d908..0000000
 --- a/runtime/spu/tests/rpcs3_oracle/shim/oracle_shim.h
 +++ /dev/null
 @@ -1,94 +0,0 @@
@@ -2913,7 +3109,7 @@ index 109d9089..00000000
 -}
 diff --git a/runtime/spu/tests/spu_float_referee.py b/runtime/spu/tests/spu_float_referee.py
 deleted file mode 100644
-index 2159e117..00000000
+index 2159e11..0000000
 --- a/runtime/spu/tests/spu_float_referee.py
 +++ /dev/null
 @@ -1,127 +0,0 @@
@@ -3046,7 +3242,7 @@ index 2159e117..00000000
 -    main()
 diff --git a/runtime/spu/tests/spu_interp_diff_test.c b/runtime/spu/tests/spu_interp_diff_test.c
 deleted file mode 100644
-index 47488b29..00000000
+index 47488b2..0000000
 --- a/runtime/spu/tests/spu_interp_diff_test.c
 +++ /dev/null
 @@ -1,784 +0,0 @@
@@ -3834,9 +4030,88 @@ index 47488b29..00000000
 -    printf("spu_interp_diff_test%s: %s\n", g_audit ? " (audit hand-ref vs RPCS3)" : "", okk ? "PASS" : "FAIL");
 -    return okk ? 0 : 1;
 -}
+diff --git a/runtime/spu/tests/test_spu_fi_cflts_neon.c b/runtime/spu/tests/test_spu_fi_cflts_neon.c
+deleted file mode 100644
+index d7c9dda..0000000
+--- a/runtime/spu/tests/test_spu_fi_cflts_neon.c
++++ /dev/null
+@@ -1,73 +0,0 @@
+-/*
+- * The NEON spu_fi and spu_cflts against their scalar references
+- * (spu_fi_ref, spu_cflts_ref in spu_helpers.h), lane for lane.
+- *
+- * Inputs: every exponent and sign with random fractions, the borrow edge of
+- * fi (step * y around base << 19), zero and exponent-255 lanes, and every
+- * cflts scale. Run once in the default FPCR and once with round-toward-zero
+- * plus flush-to-zero, the mode SPU_FLOAT_RZ runs lifted code in.
+- *
+- * Build:
+- *   clang -std=gnu17 -O2 -I include -I runtime/spu \
+- *         -o /tmp/test_spu_fi_cflts_neon runtime/spu/tests/test_spu_fi_cflts_neon.c
+- */
+-#include "spu_helpers.h"
+-#include <stdio.h>
+-#include <stdlib.h>
+-
+-static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
+-static uint32_t rnd(void) { s_rng ^= s_rng << 13; s_rng ^= s_rng >> 7; s_rng ^= s_rng << 17; return (uint32_t)s_rng; }
+-
+-static unsigned long long g_n, g_bad;
+-static void cmp(const char* what, u128 got, u128 want, u128 a, u128 b, int i8)
+-{
+-    g_n++;
+-    if (!memcmp(&got, &want, 16)) return;
+-    if (g_bad++ < 10)
+-        fprintf(stderr, "FAIL %s i8=%d a=%08X b=%08X got=%08X want=%08X\n", what, i8,
+-                a._u32[0], b._u32[0], got._u32[0], want._u32[0]);
+-}
+-
+-static uint32_t edge_float(void)
+-{
+-    uint32_t r = rnd();
+-    switch (r & 7) {
+-    case 0: return r & 0x807FFFFFu;                       /* exponent 0 */
+-    case 1: return r | 0x7F800000u;                       /* exponent 255 */
+-    default: return r;
+-    }
+-}
+-
+-static void run(void)
+-{
+-    for (int round = 0; round < 400000; ++round) {
+-        u128 a, b;
+-        for (int i = 0; i < 4; ++i) { a._u32[i] = edge_float(); b._u32[i] = edge_float(); }
+-        /* fi near its borrow edge: step * y close to base << 19 */
+-        if (round & 1) for (int i = 0; i < 4; ++i) {
+-            uint32_t base = rnd() & 0x1FFFu, step = (rnd() & 0x3FFu) | 1u;
+-            uint32_t y = (uint32_t)(((uint64_t)base << 19) / step) + (rnd() % 5) - 2;
+-            b._u32[i] = (b._u32[i] & 0xFF800000u) | (base << 10) | step;
+-            a._u32[i] = (a._u32[i] & ~0x7FFFFu) | (y & 0x7FFFFu);
+-        }
+-        cmp("fi", spu_fi(a, b), spu_fi_ref(a, b), a, b, 0);
+-        const int i8 = (int)(rnd() & 0xFF);
+-        cmp("cflts", spu_cflts(a, i8), spu_cflts_ref(a, i8), a, b, i8);
+-        for (int s = 46; s <= 173; s += 31) cmp("cflts", spu_cflts(b, s), spu_cflts_ref(b, s), b, a, s);
+-    }
+-}
+-
+-int main(void)
+-{
+-#if defined(__aarch64__)
+-    run();
+-    uint64_t fpcr; __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+-    __asm__ volatile("msr fpcr, %0" :: "r"(fpcr | (3ull << 22) | (1ull << 24)));   /* RZ + FZ */
+-    run();
+-    __asm__ volatile("msr fpcr, %0" :: "r"(fpcr));
+-#else
+-    run();
+-#endif
+-    printf("spu_fi/spu_cflts NEON vs reference: %llu vectors, %llu mismatched\n", g_n, g_bad);
+-    return g_bad != 0;
+-}
 diff --git a/runtime/spu/tests/test_spu_float_est.c b/runtime/spu/tests/test_spu_float_est.c
 deleted file mode 100644
-index 0cda949f..00000000
+index 0cda949..0000000
 --- a/runtime/spu/tests/test_spu_float_est.c
 +++ /dev/null
 @@ -1,109 +0,0 @@
@@ -3951,7 +4226,7 @@ index 0cda949f..00000000
 -}
 diff --git a/runtime/spu/tests/test_spu_float_exact.c b/runtime/spu/tests/test_spu_float_exact.c
 deleted file mode 100644
-index a3d19d70..00000000
+index d971943..0000000
 --- a/runtime/spu/tests/test_spu_float_exact.c
 +++ /dev/null
 @@ -1,221 +0,0 @@
@@ -3966,7 +4241,7 @@ index a3d19d70..00000000
 - *  3. random vectors from a mix of generators aimed at the hard spots: results near 2^-126 and
 - *     2^128, cancellation in fa/fs and fma (z close to -x*y), fma sums rounded onto a 24-bit
 - *     boundary, wide exponent gaps, zeros of every kind, extended-range words, raw words.
-- * Build (arm64, or x86 with -mavx2 -mfma):
+- * Build (arm64; x86 with -msse4.1 for the SSE4.1 form, or -mavx2 -mfma for the AVX2 form):
 - *   cc -O2 -I runtime/spu -I include runtime/spu/tests/test_spu_float_exact.c -lm -o t && ./t [scale]
 - * scale (default 1) multiplies the pass-3 size: 1 = 64M vectors (256M lanes). */
 -#include "spu_helpers.h"
@@ -4178,7 +4453,7 @@ index a3d19d70..00000000
 -}
 diff --git a/runtime/spu/tests/test_spu_float_neon.c b/runtime/spu/tests/test_spu_float_neon.c
 deleted file mode 100644
-index ac634cd9..00000000
+index ac634cd..0000000
 --- a/runtime/spu/tests/test_spu_float_neon.c
 +++ /dev/null
 @@ -1,196 +0,0 @@
@@ -4380,7 +4655,7 @@ index ac634cd9..00000000
 -}
 diff --git a/runtime/spu/tests/test_spu_float_rz_mode.c b/runtime/spu/tests/test_spu_float_rz_mode.c
 deleted file mode 100644
-index 3e96dc4e..00000000
+index 3e96dc4..0000000
 --- a/runtime/spu/tests/test_spu_float_rz_mode.c
 +++ /dev/null
 @@ -1,86 +0,0 @@
@@ -4470,11 +4745,103 @@ index 3e96dc4e..00000000
 -    (void)c; (void)a; (void)b; (void)d; abort();
 -}
 -uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+diff --git a/runtime/spu/tests/test_spu_float_vector_scalar.c b/runtime/spu/tests/test_spu_float_vector_scalar.c
+deleted file mode 100644
+index 547d561..0000000
+--- a/runtime/spu/tests/test_spu_float_vector_scalar.c
++++ /dev/null
+@@ -1,86 +0,0 @@
+-/* The vector single-precision ops this build selects (spu_fa/fs/fm/fma/fms/fnms: the SSE4.1, AVX2
+- * or NEON form) against the scalar per-lane forms (spu__*_s: scalar fast path, else exact), lane
+- * by lane and bit for bit. test_spu_float_exact compares both against the exact references; this
+- * one is the direct differential check between the two code paths a build can take.
+- * Lanes are drawn from SPU edge words (+-0, words with biased exponent 0 and a fraction, the
+- * smallest normal, the largest IEEE-finite word, extended-range words of biased exponent 255,
+- * Smax), random normal values in a narrow and a wide exponent window, values whose product or
+- * sum lands near 2^-126 or 2^128, fma addends close to -x*y, and raw random words; each vector
+- * mixes generators per lane so that a vector with one odd lane still takes the fix-up path.
+- * Build: cc -O2 -msse4.1 -ffp-contract=off -I runtime/spu -I include THIS -lm -o t && ./t [millions] */
+-#include "spu_helpers.h"
+-#include <stdio.h>
+-#include <stdlib.h>
+-
+-static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
+-static inline uint32_t rnd32(void)
+-{
+-    s_rng ^= s_rng << 13; s_rng ^= s_rng >> 7; s_rng ^= s_rng << 17;
+-    return (uint32_t)(s_rng >> 16);
+-}
+-static const uint32_t k_edge[] = {
+-    0x00000000u, 0x80000000u, 0x00000001u, 0x807FFFFFu, 0x00400000u, 0x00800000u, 0x80800000u,
+-    0x00800001u, 0x3F800000u, 0xBF800000u, 0x3F7FFFFFu, 0x3F800001u, 0x7F7FFFFFu, 0xFF7FFFFFu,
+-    0x7F000000u, 0x7F800000u, 0xFF800000u, 0x7FC00000u, 0x7F800001u, 0x7FFFFFFFu, 0xFFFFFFFFu,
+-    0x01000000u, 0x00FFFFFFu, 0x4B000000u, 0x4B7FFFFFu, 0x33800000u, 0x34000000u, 0x5F800000u,
+-    0x1F800000u, 0x20000000u, 0x60000000u,
+-};
+-#define NEDGE (sizeof k_edge / sizeof k_edge[0])
+-static uint32_t word(uint32_t z)
+-{
+-    const uint32_t sign = rnd32() & 0x80000000u;
+-    switch (rnd32() % 9) {
+-    case 0: return k_edge[rnd32() % NEDGE] ^ (rnd32() & 0x80000000u);
+-    case 1: return sign | ((100u + rnd32() % 56u) << 23) | (rnd32() & 0x7FFFFFu);      /* narrow window */
+-    case 2: return sign | ((1u + rnd32() % 254u) << 23) | (rnd32() & 0x7FFFFFu);       /* any normal */
+-    case 3: return sign | ((rnd32() % 2u ? 255u : 0u) << 23) | (rnd32() & 0x7FFFFFu);  /* exp 0 / 255 */
+-    case 4: return sign | ((1u + rnd32() % 4u) << 23) | (rnd32() & 0x7FFFFFu);         /* near 2^-126 */
+-    case 5: return sign | ((250u + rnd32() % 6u) << 23) | (rnd32() & 0x7FFFFFu);       /* near 2^128 */
+-    case 6: return z ? (z ^ 0x80000000u) + (rnd32() % 5u) - 2u : rnd32();               /* cancellation */
+-    case 7: return sign | ((63u + rnd32() % 2u) << 23) | (rnd32() & 0x7FFFFFu);        /* products near 2^-126 */
+-    default: return rnd32();
+-    }
+-}
+-static long s_bad, s_lanes;
+-static const char* const k_ops[6] = { "fa", "fs", "fm", "fma", "fms", "fnms" };
+-static void check(int op, u128 a, u128 b, u128 c)
+-{
+-    u128 got, ref;
+-    switch (op) {
+-    case 0:  got = spu_fa(a, b);      ref = spu__fa_s(a, b); break;
+-    case 1:  got = spu_fs(a, b);      ref = spu__fs_s(a, b); break;
+-    case 2:  got = spu_fm(a, b);      ref = spu__fm_s(a, b); break;
+-    case 3:  got = spu_fma(a, b, c);  ref = spu__fma_s(a, b, c); break;
+-    case 4:  got = spu_fms(a, b, c);  ref = spu__fms_s(a, b, c); break;
+-    default: got = spu_fnms(a, b, c); ref = spu__fnms_s(a, b, c); break;
+-    }
+-    s_lanes += 4;
+-    for (int i = 0; i < 4; i++)
+-        if (got._u32[i] != ref._u32[i] && s_bad++ < 20)
+-            printf("MISMATCH %s a=%08X b=%08X c=%08X vector=%08X scalar=%08X\n", k_ops[op],
+-                   a._u32[i], b._u32[i], c._u32[i], got._u32[i], ref._u32[i]);
+-}
+-int main(int argc, char** argv)
+-{
+-    const long millions = argc > 1 ? atol(argv[1]) : 16;
+-    /* every pair of edge words in every lane position */
+-    for (unsigned i = 0; i < NEDGE; i++) for (unsigned j = 0; j < NEDGE; j++) for (unsigned k = 0; k < NEDGE; k++) {
+-        u128 a, b, c;
+-        for (int l = 0; l < 4; l++) {
+-            a._u32[l] = k_edge[(i + l) % NEDGE]; b._u32[l] = k_edge[(j + 3 * l) % NEDGE]; c._u32[l] = k_edge[(k + 5 * l) % NEDGE];
+-        }
+-        for (int op = 0; op < 6; op++) check(op, a, b, c);
+-    }
+-    for (long n = 0; n < millions * 1000000L; n++) {
+-        u128 a, b, c;
+-        for (int l = 0; l < 4; l++) {
+-            a._u32[l] = word(0); b._u32[l] = word(0);
+-            /* for fma, an addend close to -a*b in the cancellation generator */
+-            const u128 one = { ._u32 = { a._u32[l], 0, 0, 0 } }, two = { ._u32 = { b._u32[l], 0, 0, 0 } };
+-            c._u32[l] = word(spu__fm_s(one, two)._u32[0]);
+-        }
+-        check((int)(n % 6), a, b, c);
+-    }
+-    printf("test_spu_float_vector_scalar: %ld lanes, %ld mismatches\n", s_lanes, s_bad);
+-    return s_bad != 0;
+-}
 diff --git a/runtime/spu/tests/test_spu_helpers.c b/runtime/spu/tests/test_spu_helpers.c
-index 1c95a40b..3366971a 100644
+index 2c7d567..cec7c74 100644
 --- a/runtime/spu/tests/test_spu_helpers.c
 +++ b/runtime/spu/tests/test_spu_helpers.c
-@@ -419,72 +419,6 @@ static void test_float_fused(void) {
+@@ -420,72 +420,6 @@ static void test_float_fused(void) {
      else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
  }
  
@@ -4547,7 +4914,7 @@ index 1c95a40b..3366971a 100644
  /* ===========================================================================
   * main: run all and report
   * ===========================================================================*/
-@@ -518,7 +452,6 @@ int main(void) {
+@@ -519,7 +453,6 @@ int main(void) {
      test_fsmbi();
      test_sign_extend();
      test_float_fused();
@@ -4557,7 +4924,7 @@ index 1c95a40b..3366971a 100644
      return g_fail == 0 ? 0 : 1;
 diff --git a/runtime/spu/tests/test_spu_int_neon.c b/runtime/spu/tests/test_spu_int_neon.c
 deleted file mode 100644
-index d2437277..00000000
+index d243727..0000000
 --- a/runtime/spu/tests/test_spu_int_neon.c
 +++ /dev/null
 @@ -1,83 +0,0 @@
@@ -4646,7 +5013,7 @@ index d2437277..00000000
 -}
 diff --git a/runtime/spu/tests/test_spu_int_x86.c b/runtime/spu/tests/test_spu_int_x86.c
 deleted file mode 100644
-index 3c0610f8..00000000
+index 3c0610f..0000000
 --- a/runtime/spu/tests/test_spu_int_x86.c
 +++ /dev/null
 @@ -1,86 +0,0 @@
@@ -4737,7 +5104,7 @@ index 3c0610f8..00000000
 -    return s_fail != 0;
 -}
 diff --git a/runtime/spu/tests/test_spu_shufb.c b/runtime/spu/tests/test_spu_shufb.c
-index 195c75e3..98fa95f7 100644
+index 195c75e..98fa95f 100644
 --- a/runtime/spu/tests/test_spu_shufb.c
 +++ b/runtime/spu/tests/test_spu_shufb.c
 @@ -1,15 +1,14 @@
@@ -4763,7 +5130,7 @@ index 195c75e3..98fa95f7 100644
      srand(12345);
 diff --git a/tests/bench/spu/.gitignore b/tests/bench/spu/.gitignore
 deleted file mode 100644
-index ea93687f..00000000
+index ea93687..0000000
 --- a/tests/bench/spu/.gitignore
 +++ /dev/null
 @@ -1,2 +0,0 @@
@@ -4771,7 +5138,7 @@ index ea93687f..00000000
 -__pycache__/
 diff --git a/tests/bench/spu/README.md b/tests/bench/spu/README.md
 deleted file mode 100644
-index ee849293..00000000
+index ee84929..0000000
 --- a/tests/bench/spu/README.md
 +++ /dev/null
 @@ -1,66 +0,0 @@
@@ -4843,7 +5210,7 @@ index ee849293..00000000
 -helper optimisation, on an M1 Pro with the machine otherwise loaded.
 diff --git a/tests/bench/spu/apply_barriers.py b/tests/bench/spu/apply_barriers.py
 deleted file mode 100755
-index 6a52f773..00000000
+index 6a52f77..0000000
 --- a/tests/bench/spu/apply_barriers.py
 +++ /dev/null
 @@ -1,46 +0,0 @@
@@ -4895,7 +5262,7 @@ index 6a52f773..00000000
 -main()
 diff --git a/tests/bench/spu/bench_barrier.h b/tests/bench/spu/bench_barrier.h
 deleted file mode 100644
-index fd9af946..00000000
+index fd9af94..0000000
 --- a/tests/bench/spu/bench_barrier.h
 +++ /dev/null
 @@ -1,47 +0,0 @@
@@ -4948,7 +5315,7 @@ index fd9af946..00000000
 -#endif
 diff --git a/tests/bench/spu/gen_spu_bench.py b/tests/bench/spu/gen_spu_bench.py
 deleted file mode 100755
-index 9f4b5c28..00000000
+index 9f4b5c2..0000000
 --- a/tests/bench/spu/gen_spu_bench.py
 +++ /dev/null
 @@ -1,495 +0,0 @@
@@ -5449,7 +5816,7 @@ index 9f4b5c28..00000000
 -    main()
 diff --git a/tests/bench/spu/results/2026-10-06-m1pro-baseline.csv b/tests/bench/spu/results/2026-10-06-m1pro-baseline.csv
 deleted file mode 100644
-index 7e187622..00000000
+index 7e18762..0000000
 --- a/tests/bench/spu/results/2026-10-06-m1pro-baseline.csv
 +++ /dev/null
 @@ -1,412 +0,0 @@
@@ -5867,7 +6234,7 @@ index 7e187622..00000000
 -atomic,issue,"PUTLLUC + atomic stat",2.11191e+07,47.3506,9.89505e+06,101.061
 diff --git a/tests/bench/spu/results/2026-10-06-m1pro-baseline.txt b/tests/bench/spu/results/2026-10-06-m1pro-baseline.txt
 deleted file mode 100644
-index 8f5212aa..00000000
+index 8f5212a..0000000
 --- a/tests/bench/spu/results/2026-10-06-m1pro-baseline.txt
 +++ /dev/null
 @@ -1,415 +0,0 @@
@@ -6288,7 +6655,7 @@ index 8f5212aa..00000000
 -atomic    issue         PUTLLUC + atomic stat              21.12 M    47.351        9.90 M    101.06       2x
 diff --git a/tests/bench/spu/run_spu_bench.sh b/tests/bench/spu/run_spu_bench.sh
 deleted file mode 100755
-index 37545ecc..00000000
+index 37545ec..0000000
 --- a/tests/bench/spu/run_spu_bench.sh
 +++ /dev/null
 @@ -1,36 +0,0 @@
@@ -6330,7 +6697,7 @@ index 37545ecc..00000000
 -"$OUT/spu_bench" "$@"
 diff --git a/tests/bench/spu/spu_bench_main.c b/tests/bench/spu/spu_bench_main.c
 deleted file mode 100644
-index b2d353dd..00000000
+index b2d353d..0000000
 --- a/tests/bench/spu/spu_bench_main.c
 +++ /dev/null
 @@ -1,220 +0,0 @@
@@ -6555,7 +6922,7 @@ index b2d353dd..00000000
 -    return halted ? 1 : 0;
 -}
 diff --git a/tools/find_spu_functions.py b/tools/find_spu_functions.py
-index af16afd8..520fbec8 100644
+index af16afd..520fbec 100644
 --- a/tools/find_spu_functions.py
 +++ b/tools/find_spu_functions.py
 @@ -560,18 +560,6 @@ _TERMINATORS_NO_FALLTHROUGH = {
@@ -6587,7 +6954,7 @@ index af16afd8..520fbec8 100644
              # range, the function ends here.
              return pc + 4
 diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
-index 35d8d428..d98d0a78 100644
+index 4610a36..889cb1e 100644
 --- a/tools/spu_lifter.py
 +++ b/tools/spu_lifter.py
 @@ -338,43 +338,6 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
@@ -6646,7 +7013,7 @@ index 35d8d428..d98d0a78 100644
  class SPULifter:
      def __init__(self, trace: bool = False, prefix: str = ""):
          self.functions: list[LiftedFunction] = []
-@@ -577,10 +535,7 @@ class SPULifter:
+@@ -583,10 +541,7 @@ class SPULifter:
          # into the next sequential function. Emit a tail-call so the chain isn't
          # truncated (this was silently dropping execution mid-job).
          _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
@@ -6657,8 +7024,8 @@ index 35d8d428..d98d0a78 100644
 +        if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                  and end in getattr(self, "func_starts", set())):
              func.body_lines.append(
-                 f"    {{ SPU_DIRECT(ctx, 0x{end:X}, {self.prefix}spu_func_{end:08X}); }}")
-@@ -665,15 +620,7 @@ class SPULifter:
+                 f"    {{ SPU_DIRECT(ctx, {self._pc(end)}, {self.prefix}spu_func_{end:08X}); }}")
+@@ -678,15 +633,7 @@ class SPULifter:
          if mn == "stop":
              # Preserve the 14-bit stop-and-signal code: SPURS leaf tasks use
              # `stop <code>` to invoke kernel syscalls (EXIT/YIELD/WAIT_SIGNAL/...).
@@ -6675,7 +7042,7 @@ index 35d8d428..d98d0a78 100644
                      f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
  
          # ---- immediate loaders ----
-@@ -720,8 +667,7 @@ class SPULifter:
+@@ -733,8 +680,7 @@ class SPULifter:
                      f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
                      f"spu_halt(ctx); return; }}")
          if mn == "stopd":
@@ -6685,46 +7052,7 @@ index 35d8d428..d98d0a78 100644
                      "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
  
          # ---- integer arithmetic (register) ----
-@@ -902,7 +848,7 @@ class SPULifter:
-             tgt = self._branch_target(insn)
-             # Link register: preferred word only, other slots ZERO (real HW /
-             # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
--            link = f"{g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X});"   # wraps at the end of LS
-+            link = f"{g(link_rt)} = spu_link(0x{addr + 4:X});"
-             # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
-             # infinite loop on real SPU (re-sets the link each pass, never
-             # advances) -- a trap, NOT a call. Emitting a host call recurses
-@@ -990,21 +936,19 @@ class SPULifter:
-             # Indirect call: nested dispatch bracketed like brsl (host_depth +
-             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
-             # here and its `bi $r0` returns via host return.
--            # read the target BEFORE writing the link: rt may be the same register as ra
--            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
--                    f"int32_t _si = (int32_t)ctx->image_id; "
--                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
-+            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-+                    f"{{ int32_t _si = (int32_t)ctx->image_id; "
-+                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
-                     f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
-                     f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
-         # bisled: set link, branch to RA only if an external event is pending.
-         if mn in ("bisled",):
--            link_rt = insn.raw & 0x7F            # rt = link
--            tgt_reg = (insn.raw >> 7) & 0x7F     # ra = target (the disassembler's last operand is rb, not the target)
--            # read the target before writing the link: rt may alias ra
--            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
-+            link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
-+            tgt_reg = _reg(ops[-1])
-+            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
-                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
--                    f"{_ied}ctx->pc = _tg; "
--                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }} }}")
-+                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
-+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
-         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
-         if mn in ("biz", "binz", "bihz", "bihnz"):
-             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
-@@ -1079,9 +1023,8 @@ class SPULifter:
+@@ -1099,9 +1045,8 @@ class SPULifter:
  
      def emit_source(self,header_name: str) -> str:
          lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
@@ -6735,7 +7063,7 @@ index 35d8d428..d98d0a78 100644
              for b in f.body_lines:
                  lines.append(b if b.endswith(":") else f"    {b}")
              lines.append("}")
-@@ -1159,16 +1102,6 @@ def main() -> None:
+@@ -1180,16 +1125,6 @@ def main() -> None:
                          "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                          "targets that --auto-functions can't detect statically. "
                          "Splits the containing auto-detected function at each addr.")
@@ -6752,7 +7080,7 @@ index 35d8d428..d98d0a78 100644
      p.add_argument("--code-end", type=lambda x: int(x, 0), default=0,
                     help="Address where executable code ends and an embedded "
                          "rodata/const tail begins. Drops any auto-detected "
-@@ -1179,15 +1112,6 @@ def main() -> None:
+@@ -1200,20 +1135,11 @@ def main() -> None:
                          "garbage `functions` (e.g. the LBP WWS physics jobmods, "
                          "which append a zlib inflate string table + float tables "
                          "after the code at 0xAE68 / 0xAE48).")
@@ -6763,12 +7091,17 @@ index 35d8d428..d98d0a78 100644
 -                        "by trampolines. Every chunk is still emitted and "
 -                        "registered on its own for indirect entry, so this only "
 -                        "changes speed, not which code can be reached.")
+     p.add_argument("--reloc", action="store_true",
+                    help="Position-independent code the title places at a different LS "
+                         "address per load: lift once at --base, and offset every "
+                         "pc-derived address by ctx->reloc_delta at run time (register "
+                         "with spu_overlay_register_region_reloc).")
 -    p.add_argument("--max-group-insns", type=int, default=4000,
 -                   help="Cap on instructions per merged group (keeps clang fast).")
      p.add_argument("--force-indirect", default="",
                     help="Comma-separated `bi $rN` addresses to emit as GENERIC "
                          "indirect dispatch, overriding the link-register-return "
-@@ -1238,28 +1162,6 @@ def main() -> None:
+@@ -1264,28 +1190,6 @@ def main() -> None:
              # No boundary info: treat the whole image as one function.
              bounds = [(base, base + len(data))]
  
@@ -6797,7 +7130,7 @@ index 35d8d428..d98d0a78 100644
      # Add extra function entry points (indirect-branch targets auto-detect misses)
      # by splitting whichever bound contains each address.
      if args.extra_funcs:
-@@ -1332,17 +1234,8 @@ def main() -> None:
+@@ -1359,17 +1263,8 @@ def main() -> None:
                f"(`bi $rN` where rN is a brsl/bisl link reg): "
                f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
      lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
@@ -6818,7 +7151,7 @@ index 35d8d428..d98d0a78 100644
      hp = os.path.join(args.output, args.header_name)
 diff --git a/tools/test_spu_float_rz_mode.py b/tools/test_spu_float_rz_mode.py
 deleted file mode 100755
-index ca1af4e3..00000000
+index ca1af4e..0000000
 --- a/tools/test_spu_float_rz_mode.py
 +++ /dev/null
 @@ -1,34 +0,0 @@

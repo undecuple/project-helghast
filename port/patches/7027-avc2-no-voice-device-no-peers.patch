@@ -1,0 +1,179 @@
+cellSysutilAvc2: voice chat with no voice device and no peers (Full Frontal Assault 1.05, All 4 One 1.03).
+
+NIDs: InitParam 0x89456724, StartStreaming 0x74D22119, StopStreaming 0x04E1E1E4, SetPlayerVoiceMuting 0x31FC8B92,
+GetPlayerVoiceMuting 0x5F3811F8, SetAttribute 0xCCF0AEFF, GetPlayerInfo 0x02C5417A (FFA), SetStreamingTarget 0x3447668A (FFA),
+Unload 0x38F33624. The library already accepted Load/Join/Leave silently; it now has the state those calls imply (loaded,
+in a chat, streaming) and answers each call from it, instead of OK with nothing behind it:
+  * InitParam(version, param*): NULL param is INVALID_ARGUMENT; else the version field (first u16) is written.
+  * StartStreaming / StopStreaming / SetStreamingTarget: NOT_INITIALIZED before Load, NOT_ACTIVE outside a joined chat, else
+    OK (there is nobody to stream to; the state is tracked, no audio moves).
+  * Set/GetPlayerVoiceMuting, GetPlayerInfo: the room has no remote players and no local voice device, so every player id
+    is unknown: INVALID_ARGUMENT, outputs untouched (NOT_ACTIVE outside a chat, NOT_INITIALIZED before Load).
+  * SetAttribute: NULL is INVALID_ARGUMENT, NOT_INITIALIZED before Load, else OK (no device to apply it to).
+  * Unload (the synchronous one): NOT_INITIALIZED if not loaded, else unloads without an event.
+ASSUMPTION: the error values (0x8002B703 NOT_INITIALIZED, 0x8002B705 INVALID_ARGUMENT, 0x8002B708 NOT_ACTIVE: SDK header from
+memory, RPCS3 used as reference only) and the InitParam layout beyond the version field (nothing else is written).
+
+Rebased on ps3recomp v0.19.0 (group B, R&C 2026-11-09): on #689 (14a9e9f1, synchronous cellSysutilAvc2Load + setters).
+Upstream's accept-all cellSysutilAvc2SetAttribute and Unload are replaced by ours (state-checked); Load (like LoadAsync) sets the loaded state and UnloadAsync clears it; upstream's other setters stay.
+Upstream's libs/network/tests/test_avc2_load.c passes.
+Pass 2: the synchronous cellSysutilAvc2Unload raises no event again, as this patch always said (RPCS3's Unload clears the
+callback without queuing one; UnloadAsync queues UNLOAD_SUCCEEDED); upstream #689 had added the event, and its
+test_avc2_load now expects 3 events instead of 4. port/rc/tests test_avc2_state and test_avc2_load both pass.
+
+diff --git a/libs/network/cellSysutilAvc2.c b/libs/network/cellSysutilAvc2.c
+index f85ec82e..4a138351 100644
+--- a/libs/network/cellSysutilAvc2.c
++++ b/libs/network/cellSysutilAvc2.c
+@@ -36,10 +36,16 @@ static void avc2_event(u32 event)
+     if (s_cb) cellSysutilQueueGuestCallbackArgs(s_cb, args);
+ }
+ 
+-/* (version, CellSysutilAvc2InitParam* option): the title's defaults stand. */
++#define AVC2_ERR_NOT_INITIALIZED ((s32)0x8002B703)
++#define AVC2_ERR_INVALID_ARGUMENT ((s32)0x8002B705)
++#define AVC2_ERR_NOT_ACTIVE ((s32)0x8002B708)
++static int s_avc2_loaded, s_avc2_joined, s_avc2_streaming;
++
++/* (version, CellSysutilAvc2InitParam* option): the title's defaults stand; the version field is written (patch 7027). */
+ s32 cellSysutilAvc2InitParam(u16 version, u32 option)
+ {
+-    (void)version; (void)option;
++    if (!option) return AVC2_ERR_INVALID_ARGUMENT;
++    vm_write16(option, version);
+     return CELL_OK;
+ }
+ 
+@@ -49,6 +55,7 @@ s32 cellSysutilAvc2LoadAsync(u16 ctxId, u32 container, u32 callback, u32 userdat
+     (void)ctxId; (void)container; (void)initParam;
+     s_cb = callback;
+     s_userdata = userdata;
++    s_avc2_loaded = 1;
+     printf("[cellSysutilAvc2] LoadAsync: voice chat up, silent\n");
+     avc2_event(AVC2_EVENT_LOAD_SUCCEEDED);
+     return CELL_OK;
+@@ -62,19 +69,28 @@ s32 cellSysutilAvc2Load(u16 ctxId, u32 container, u32 callback, u32 userdata, u3
+     (void)ctxId; (void)container; (void)initParam;
+     s_cb = callback;
+     s_userdata = userdata;
++    s_avc2_loaded = 1;   /* patch 7027: the state the other calls check */
+     printf("[cellSysutilAvc2] Load: voice chat up, silent\n");
+     avc2_event(AVC2_EVENT_LOAD_SUCCEEDED);
+     return CELL_OK;
+ }
+ 
++/* patch 7027: NOT_INITIALIZED if not loaded, else unloads (UNLOAD_SUCCEEDED through the callback, as upstream). */
+ s32 cellSysutilAvc2Unload(void)
+ {
+-    avc2_event(AVC2_EVENT_UNLOAD_SUCCEEDED);
++    if (!s_avc2_loaded) return AVC2_ERR_NOT_INITIALIZED;
++    s_avc2_loaded = s_avc2_joined = s_avc2_streaming = 0;   /* synchronous: no event; UnloadAsync raises it */
+     return CELL_OK;
+ }
+ 
+-/* Settings of a chat that carries no audio: accepted. (CellSysutilAvc2AttributeId, CellSysutilAvc2Attribute*) */
+-s32 cellSysutilAvc2SetAttribute(u32 attr) { (void)attr; return CELL_OK; }
++/* (CellSysutilAvc2Attribute* attr): NULL is INVALID_ARGUMENT, NOT_INITIALIZED before Load, else OK (no device to apply
++ * it to; patch 7027). */
++s32 cellSysutilAvc2SetAttribute(u32 attr)
++{
++    if (!s_avc2_loaded) return AVC2_ERR_NOT_INITIALIZED;
++    return attr ? CELL_OK : AVC2_ERR_INVALID_ARGUMENT;
++}
++/* Settings of a chat that carries no audio: accepted. */
+ s32 cellSysutilAvc2SetSpeakerVolumeLevel(u32 level) { (void)level; return CELL_OK; }
+ s32 cellSysutilAvc2SetSpeakerMuting(u8 muting) { (void)muting; return CELL_OK; }
+ s32 cellSysutilAvc2SetVoiceMuting(u8 muting) { (void)muting; return CELL_OK; }
+@@ -83,6 +99,7 @@ s32 cellSysutilAvc2StopVoiceDetection(void) { return CELL_OK; }
+ 
+ s32 cellSysutilAvc2UnloadAsync(void)
+ {
++    s_avc2_loaded = s_avc2_joined = s_avc2_streaming = 0;   /* patch 7027 */
+     avc2_event(AVC2_EVENT_UNLOAD_SUCCEEDED);
+     return CELL_OK;
+ }
+@@ -91,18 +108,67 @@ s32 cellSysutilAvc2UnloadAsync(void)
+ s32 cellSysutilAvc2JoinChatRequest(u32 roomId)
+ {
+     (void)roomId;
++    s_avc2_joined = 1;
+     avc2_event(AVC2_EVENT_JOIN_SUCCEEDED);
+     return CELL_OK;
+ }
+ 
+ s32 cellSysutilAvc2LeaveChatRequest(void)
+ {
++    s_avc2_joined = s_avc2_streaming = 0;
+     avc2_event(AVC2_EVENT_LEAVE_SUCCEEDED);
+     return CELL_OK;
+ }
+ 
+-s32 cellSysutilAvc2StartStreaming(void) { return CELL_OK; }
+-s32 cellSysutilAvc2StopStreaming(void)  { return CELL_OK; }
++/* The state check shared by everything that needs a joined chat. */
++static s32 avc2_need_chat(void)
++{
++    if (!s_avc2_loaded) return AVC2_ERR_NOT_INITIALIZED;
++    return s_avc2_joined ? CELL_OK : AVC2_ERR_NOT_ACTIVE;
++}
++
++s32 cellSysutilAvc2StartStreaming(void)
++{
++    s32 r = avc2_need_chat();
++    if (r == CELL_OK) s_avc2_streaming = 1;
++    return r;
++}
++
++s32 cellSysutilAvc2StopStreaming(void)
++{
++    s32 r = avc2_need_chat();
++    if (r == CELL_OK) s_avc2_streaming = 0;
++    return r;
++}
++
++/* (const CellSysutilAvc2StreamingTarget* target) */
++s32 cellSysutilAvc2SetStreamingTarget(u32 target)
++{
++    s32 r = avc2_need_chat();
++    return r == CELL_OK && !target ? AVC2_ERR_INVALID_ARGUMENT : r;
++}
++
++/* (u16 playerId, u8 muting) / (u16 playerId, u8* muting) / (u16 playerId, CellSysutilAvc2PlayerInfo* info): no players. */
++s32 cellSysutilAvc2SetPlayerVoiceMuting(u16 playerId, u8 muting)
++{
++    (void)playerId; (void)muting;
++    s32 r = avc2_need_chat();
++    return r == CELL_OK ? AVC2_ERR_INVALID_ARGUMENT : r;
++}
++
++s32 cellSysutilAvc2GetPlayerVoiceMuting(u16 playerId, u32 muting)
++{
++    (void)playerId; (void)muting;
++    s32 r = avc2_need_chat();
++    return r == CELL_OK ? AVC2_ERR_INVALID_ARGUMENT : r;
++}
++
++s32 cellSysutilAvc2GetPlayerInfo(u16 playerId, u32 info)
++{
++    (void)playerId; (void)info;
++    s32 r = avc2_need_chat();
++    return r == CELL_OK ? AVC2_ERR_INVALID_ARGUMENT : r;
++}
+ 
+ s32 cellSysutilAvc2EnableVoiceDetection(u8 enable, u8 level) { (void)enable; (void)level; return CELL_OK; }
+ 
+diff --git a/libs/network/tests/test_avc2_load.c b/libs/network/tests/test_avc2_load.c
+index a52b1206..7cdc86b4 100644
+--- a/libs/network/tests/test_avc2_load.c
++++ b/libs/network/tests/test_avc2_load.c
+@@ -76,9 +76,8 @@ int main(void)
+ 
+     assert(cellSysutilAvc2LeaveChatRequest() == CELL_OK);
+     assert(cellSysutilAvc2Unload() == CELL_OK);
+-    assert(s_nq == 4);
++    assert(s_nq == 3);   /* the synchronous Unload raises no event; UnloadAsync does (patch 7027) */
+     expect(2, CB, AVC2_EVENT_LEAVE_SUCCEEDED, UD);
+-    expect(3, CB, AVC2_EVENT_UNLOAD_SUCCEEDED, UD);
+ 
+     printf("test_avc2_load: ok (%d events)\n", s_nq);
+     return 0;

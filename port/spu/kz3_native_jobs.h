@@ -44,6 +44,8 @@ extern const kz3_native_entry kz3_native_lp[];
 extern const unsigned kz3_native_lp_n;
 extern const kz3_native_entry kz3_native_skin[];   /* kz3_native_skin.c, SPU pass 141 */
 extern const unsigned kz3_native_skin_n;
+extern const kz3_native_entry kz3_native_snd[];    /* kz3_native_snd.c, SPU pass 159 */
+extern const unsigned kz3_native_snd_n;
 
 const kz3_native_entry* kz3_native_find(int slot);
 int kz3_native_run(spu_context* ctx, const kz3_native_entry* e);

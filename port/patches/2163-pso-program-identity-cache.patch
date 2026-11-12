@@ -1,0 +1,420 @@
+KZ3 patch 2163 (RSX pass 150): multi-entry program identity cache in get_pso (rsx_pso_memo.h).
+get_pso kept a one-slot fragment-program memo (g_ld_fpm) and a one-slot vertex-program memo (g_ld_vpm); alternating programs
+missed both and re-ran the FP size scan, the FP structural hash, the VP FNV, the texture-unit and TXL masks, the VP flow scans (per
+draw, in ld_pso_key_tail) and rsx_fp_collect_constants. Two direct-mapped tables (VP by start slot, FP by location+offset, 16 entries
+each) now hold the program bytes and the values derived from them; a hit needs a memcmp of the entry's bytes against the guest
+bytes now (never reused unvalidated). The FP key hash is cached per (mode, VP seed), two results per entry. The VP size scan is
+skipped on a hit (equal bytes end at the same end-bit instruction). Programs over the entry buffers (FP 8 KB) are never cached.
+LD_PSO_MEMO_N=0 = the old single-slot code, 1..16 = entries per table (default 16), LD_PSO_MEMO_VERIFY=1 = recompute on every hit,
+use the recomputed values, count mismatches ([pso-memo] lines). ld_xl_in gains vp_cached/vp_flow/vp_bbits so the key tail skips
+its rsx_vp_has_flow / branch-bit scans. Host test tools/smoke/test_pso_memo.sh.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -234,6 +234,7 @@ static uint8_t* ld_prompt_remap_cells(const uint8_t* cur, uint32_t w, uint32_t h
+ #include "rsx_pso_keys_hdr.h"   /* patch 2141: key file header with the translator id */
+ #include "rsx_tex_lru.h"        /* patch 2075 */
+ #include "rsx_smp_index.h"      /* patch 2161 */
++#include "rsx_pso_memo.h"       /* patch 2163 */
+ #include "rsx_gpupass.h"        /* patch 2086 */
+ #include "rsx_upscale.h"        /* patch 2145: RSX_UPSCALE=fsr1 */
+ #include <sys/stat.h>
+@@ -8860,6 +8861,7 @@ typedef struct {
+     u32 fp_const_count; u32 fp_alpha_ref;
+     int vgpu;                                  /* patch 2076: GPU-fetch vertex shader (packed payload 2) */
+     u32 wpos_aa;                               /* patch 2088: aa_sx | aa_sy << 8 of the target, 0 = 1x1 */
++    u8  vp_cached, vp_flow, vp_bbits;          /* patch 2163: vp_cached = flow/branch-bit use known (program identity cache) */
+ } ld_xl_in;
+ static CRITICAL_SECTION g_ld_xl_cs;
+ static volatile LONG g_ld_xl_state;
+@@ -9044,11 +9046,12 @@ static u64 ld_pso_key_tail(u64 key, const ld_xl_in* xi, int packed_payload, u64*
+     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+     /* patch 2077: a branching VP's HLSL depends on the slot it starts at (rsx_vp_set_branch_base in ld_xlate) */
+     const u64 key_pre_vbs = key;
+-    key = rsx_vp_key_branch_base(key, xi->vp_uc, xi->vp_instrs * 16u, xi->vp_start);
++    if (xi->vp_cached) { if (xi->vp_flow) key = rsx_pm_vbs_key(key, xi->vp_start); }   /* patch 2163: == rsx_vp_key_branch_base */
++    else key = rsx_vp_key_branch_base(key, xi->vp_uc, xi->vp_instrs * 16u, xi->vp_start);
+     /* patch 2100 (PR #485): BRB/CLB outcomes are baked into the HLSL, so the branch bits are identity only for a
+      * program that tests them; other keys are unchanged. This runs per draw: the BRB/CLB scan is made only for a
+      * program 2077 found flow in (it changed the key), so a branch-free program pays one compare. */
+-    if (key != key_pre_vbs && rsx_vp_uses_branch_bits(xi->vp_uc, xi->vp_instrs * 16u))
++    if (key != key_pre_vbs && (xi->vp_cached ? xi->vp_bbits : rsx_vp_uses_branch_bits(xi->vp_uc, xi->vp_instrs * 16u)))
+         key = fnv1a(&xi->vp_branch_bits, sizeof(xi->vp_branch_bits), key);
+     if (gamma_mask) key = fnv1a(&gamma_mask, sizeof(gamma_mask), key);
+     if (srgb_out) key = fnv1a(&srgb_out, sizeof(srgb_out), key);   /* patch 2055 */
+@@ -10168,6 +10171,31 @@ static int ld_pso_memo(void)
+     if (on < 0) { const char* e = getenv("LD_PSO_MEMO"); on = e ? atoi(e) != 0 : 1; }
+     return on;
+ }
++/* KZ3 patch 2163 (RSX pass 150): program identity cache, LD_PSO_MEMO_N entries per table (0 = the one-slot memos below),
++ * LD_PSO_MEMO_VERIFY=1 recomputes on every hit and counts mismatches ([pso-memo] lines). Needs LD_PSO_MEMO (default on). */
++static rsx_pm g_ld_pm;
++static rsx_pm* ld_pm(void)
++{
++    static int st = -1;
++    if (st < 0) {
++        const uint32_t n = ld_pso_memo() ? rsx_pm_slots_from(getenv("LD_PSO_MEMO_N")) : 0;
++        const char* v = getenv("LD_PSO_MEMO_VERIFY");
++        rsx_pm_init(&g_ld_pm, n, v && v[0] == '1');
++        st = n ? 1 : 0;
++        fprintf(stderr, "[pso-memo] %u entries per table%s (LD_PSO_MEMO_N, LD_PSO_MEMO_VERIFY)\n", n, g_ld_pm.verify ? ", verify" : "");
++    }
++    return st ? &g_ld_pm : NULL;
++}
++static void ld_pm_note(rsx_pm* pm)
++{
++    static uint64_t next = 1u << 16, said_bad = 0;
++    const uint64_t calls = pm->vp_hit + pm->vp_miss;
++    if (pm->mismatch > said_bad && pm->mismatch <= 8) { said_bad = pm->mismatch; fprintf(stderr, "[pso-memo] verify MISMATCH #%llu\n", (unsigned long long)pm->mismatch); }
++    if (calls >= next) { next += 1u << 16;
++        fprintf(stderr, "[pso-memo] vp %llu hit %llu miss, fp %llu hit %llu miss, big %llu, mismatches %llu\n", (unsigned long long)pm->vp_hit,
++                (unsigned long long)pm->vp_miss, (unsigned long long)pm->fp_hit, (unsigned long long)pm->fp_miss, (unsigned long long)pm->big,
++                (unsigned long long)pm->mismatch); }
++}
+ /* KZ3 patch 2159 (RSX pass 147): RSX_TEX_EPOCH (opt-in since pass 151: unset or 0 off, 1 on, verify = recompute and count). The per-unit texture
+  * registers decode through a cache keyed by the dispatcher's per-unit epoch (rsx_tex_epoch.h); the texture loop adds a
+  * per-unit binding row on top (g_ld_te, below). The diagnostics that read or rewrite units inside the loop keep the full
+@@ -10210,7 +10238,11 @@ static ID3D12PipelineState* get_pso(
+     const u32 start = rsx_dsp_vp_start(&g.rsx);
+     if (start >= RSX_DSP_VP_INSTR) { LD_PSO_BAIL("no vertex program uploaded (vp start out of range)"); return NULL; }
+     const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
+-    const u32 vp_instrs = rsx_vp_program_size_instrs(vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
++    rsx_pm* const pm = ld_pm();   /* patch 2163 */
++    const rsx_pm_vp* pv = NULL;
++    u32 vp_instrs;
++    if (pm) { pv = rsx_pm_vp_get(pm, vp_uc, start, (RSX_DSP_VP_INSTR - start) * 16, fnv1a); vp_instrs = pv->instrs; ld_pm_note(pm); }
++    else vp_instrs = rsx_vp_program_size_instrs(vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
+     if (!vp_instrs) { LD_PSO_BAIL("vertex program has zero instructions"); return NULL; }
+ 
+     u32 fp_loc = 0;
+@@ -10218,7 +10250,9 @@ static ID3D12PipelineState* get_pso(
+     const u8* fp_uc = guest_ptr(fp_loc, fp_off, 16);
+     if (!fp_uc) { LD_PSO_BAIL("fragment program address does not resolve to guest memory"); return NULL; }
+     u32 fp_size = 0; int fp_same = 0;   /* patch 2029 memo */
+-    if (ld_pso_memo() && g_ld_fpm.size && g_ld_fpm.loc == fp_loc && g_ld_fpm.off == fp_off) {
++    rsx_pm_fp* pf = NULL;   /* patch 2163 */
++    if (pm) { pf = rsx_pm_fp_lookup(pm, fp_loc, fp_off, fp_uc, guest_ptr); if (pf) { fp_size = pf->size; fp_same = 1; } }
++    else if (ld_pso_memo() && g_ld_fpm.size && g_ld_fpm.loc == fp_loc && g_ld_fpm.off == fp_off) {
+         LD_FX_T0(fx);   /* patch 2125 */
+         const u8* q = guest_ptr(fp_loc, fp_off, g_ld_fpm.size);
+         if (q && !memcmp(q, g_ld_fpm.bytes, g_ld_fpm.size)) { fp_size = g_ld_fpm.size; fp_same = 1; }
+@@ -10271,7 +10305,8 @@ static ID3D12PipelineState* get_pso(
+     /* re-resolve with the true size to validate the whole program is mapped */
+     fp_uc = guest_ptr(fp_loc, fp_off, fp_size);
+     if (!fp_uc) { LD_PSO_BAIL("fragment program is not fully mapped in guest memory"); return NULL; }
+-    if (ld_pso_memo() && !fp_same && fp_size <= sizeof g_ld_fpm.bytes) {
++    if (pm) { if (!fp_same) pf = rsx_pm_fp_insert(pm, fp_loc, fp_off, fp_uc, fp_size); }
++    else if (ld_pso_memo() && !fp_same && fp_size <= sizeof g_ld_fpm.bytes) {
+         g_ld_fpm.loc = fp_loc; g_ld_fpm.off = fp_off; g_ld_fpm.size = fp_size; g_ld_fpm.hvalid = 0;
+         memcpy(g_ld_fpm.bytes, fp_uc, fp_size);
+     }
+@@ -10285,7 +10320,7 @@ static ID3D12PipelineState* get_pso(
+     static int all_units = -1;
+     if (all_units < 0) { const char* e = getenv("LD_PSO_ALL_UNITS"); all_units = (e && e[0] == '1') ? 1 : 0;
+                          fprintf(stderr, "[pso-key] %s\n", all_units ? "all texture units (LD_PSO_ALL_UNITS=1)" : "sampled units only"); }
+-    const u32 fp_units = all_units ? 0xFFFFu : rsx_fp_texture_unit_mask(fp_uc, fp_size);
++    const u32 fp_units = all_units ? 0xFFFFu : pf ? rsx_pm_fp_units(pm, pf, fp_uc) : rsx_fp_texture_unit_mask(fp_uc, fp_size);
+     g_ld_fp_units_cur = fp_units;   /* patch 2045: the texture loop binds only these units */
+ 
+     /* Fragment output register mode (fp16 h0 vs fp32 r0) is driven by the
+@@ -10357,7 +10392,8 @@ static ID3D12PipelineState* get_pso(
+                        fprintf(stderr, "[srgb-out] %s (LD_SRGB_OUT)\n", srgb_sw ? "on" : "off"); }
+     const u32 srgb_out = srgb_sw && rsx_fp_srgb_output_enabled(rsx_dsp_reg(&g.rsx, 0x1FEC), fp_ctrl,
+                                                                rsx_dsp_reg(&g.rsx, 0x0208) & 0x1Fu);
+-    const u32 txl_mask = vp_txl_unit_mask(vp_uc, vp_instrs);
++    const u32 txl_mask = pv ? pv->txl : vp_txl_unit_mask(vp_uc, vp_instrs);
++    if (pv && pm->verify && txl_mask != vp_txl_unit_mask(vp_uc, vp_instrs)) pm->mismatch++;
+     if (txl_mask && !(txl_mask & vtex_mask)) {
+         g_ld_vtex_missing_for_txl++;
+         static u32 warned = 0;
+@@ -10388,8 +10424,8 @@ static ID3D12PipelineState* get_pso(
+     render_state_t rs;
+     decode_render_state(&rs);
+     { LD_FX_T0(fx);   /* patch 2125 */
+-    if (rsx_fp_collect_constants(
+-            fp_uc, fp_size, &g.fp_constants) < 0) {
++    if ((pf ? rsx_pm_fp_consts(pm, pf, fp_uc, &g.fp_constants) : rsx_fp_collect_constants(
++            fp_uc, fp_size, &g.fp_constants)) < 0) {
+         LD_PSO_BAIL("fragment program constant collection failed");
+         return NULL;
+     }
+@@ -10398,7 +10434,10 @@ static ID3D12PipelineState* get_pso(
+         rs.alpha_ref_raw, rs.alpha_ref_format);
+ 
+     u64 vp_h;   /* patch 2029: FNV of the VP, memoized; also g_ld_current_pso.vp_hash */
+-    {
++    if (pv) {   /* patch 2163 */
++        vp_h = pv->h;
++        if (pm->verify && vp_h != fnv1a(vp_uc, vp_instrs * 16u, 1469598103934665603ull)) pm->mismatch++;
++    } else {
+         const u32 vn = vp_instrs * 16;
+         LD_FX_T0(fx);   /* patch 2125: the compare, then the hash */
+         const int vhit = ld_pso_memo() && vn == g_ld_vpm.n && !memcmp(vp_uc, g_ld_vpm.bytes, vn);
+@@ -10419,8 +10458,14 @@ static ID3D12PipelineState* get_pso(
+     }
+     u64 key = vp_h;
+     const u32 fp_hmode = ld_fp_constants_buffered() ? 1u : 2u;
+-    if (fp_same && g_ld_fpm.hvalid && g_ld_fpm.hmode == fp_hmode && g_ld_fpm.hseed == key) {
+-        key = g_ld_fpm.h;
++    u64 pm_h = 0;
++    if (pf ? rsx_pm_fp_hash_get(pf, fp_hmode, key, &pm_h)
++           : (fp_same && g_ld_fpm.hvalid && g_ld_fpm.hmode == fp_hmode && g_ld_fpm.hseed == key)) {
++        key = pf ? pm_h : g_ld_fpm.h;
++        if (pf && pm->verify) {   /* patch 2163 */
++            const u64 rk = fp_hmode == 1u ? rsx_fp_structural_hash(fp_uc, fp_size, vp_h) : fnv1a(fp_uc, fp_size, vp_h);
++            if (rk != key) { pm->mismatch++; key = rk; }
++        }
+         if (rsx_perf_x_on()) rsx_perf_add(RSX_PERF_X_FPH_HIT, 1);   /* patch 2125 */
+     } else {
+         LD_FX_T0(fx);   /* patch 2125 */
+@@ -10429,7 +10474,8 @@ static ID3D12PipelineState* get_pso(
+             key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+         else
+             key = fnv1a(fp_uc, fp_size, key);
+-        if (ld_pso_memo() && g_ld_fpm.size == fp_size && g_ld_fpm.loc == fp_loc && g_ld_fpm.off == fp_off) {
++        if (pf) rsx_pm_fp_hash_put(pf, fp_hmode, seed, key);   /* patch 2163 */
++        else if (ld_pso_memo() && g_ld_fpm.size == fp_size && g_ld_fpm.loc == fp_loc && g_ld_fpm.off == fp_off) {
+             g_ld_fpm.hvalid = 1; g_ld_fpm.hmode = fp_hmode; g_ld_fpm.hseed = seed; g_ld_fpm.h = key;
+         }
+         if (fx) { rsx_perf_add(RSX_PERF_X_FPH_T, rsx_perf_now() - fx); rsx_perf_add(RSX_PERF_X_FPH_N, 1);
+@@ -10479,6 +10525,7 @@ static ID3D12PipelineState* get_pso(
+     xi.vp_branch_bits = rsx_dsp_reg(&g.rsx, 0x1FF8u);   /* patch 2100 (upstream #544 decompiler); hashed only for BRB/CLB programs */
+     xi.gamma_mask = gamma_mask; xi.argb_mask = argb_mask; xi.argb_remap = argb_remap; xi.srgb_out = srgb_out;
+     xi.fp_const_count = g.fp_constants.count; xi.fp_alpha_ref = g.fp_alpha_ref;
++    xi.vp_cached = pv != NULL; xi.vp_flow = pv ? (u8)pv->flow : 0; xi.vp_bbits = pv ? (u8)pv->bbits : 0;   /* patch 2163 */
+     xi.vgpu = masked_layout && packed_payload == 2;   /* patch 2076 */
+     xi.wpos_aa = 0;   /* patch 2088 */
+     if (ld_wpos_aa_on()) {
+diff --git a/libs/video/rsx_pso_memo.h b/libs/video/rsx_pso_memo.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_pso_memo.h
+@@ -0,0 +1,227 @@
++/* KZ3 patch 2163: multi-entry program identity cache for get_pso (RSX pass 150).
++ *
++ * get_pso() kept one fragment-program memo (g_ld_fpm: bytes + FP key hash) and one vertex-program memo (g_ld_vpm: bytes
++ * + FNV). Alternating programs (A B A B ...) defeat a one-slot memo, so every draw re-ran the FP size scan, the FP
++ * structural hash, the VP FNV, the texture-unit mask, the TXL mask, the flow scans and rsx_fp_collect_constants
++ * (pass 119 counters: 623 FP size scans + 623 FP key hashes + 320 VP FNVs per frame, ~1.1 ms/frame together).
++ *
++ * This keeps two small direct-mapped tables, VP by start slot and FP by (location, offset). Every entry holds the
++ * program bytes it was made for; a hit is only taken after a memcmp of those bytes against the current guest bytes
++ * (never reused unvalidated, so a guest rewrite at the same address misses). The derived values are pure functions of
++ * those bytes: VP instruction count, TXL mask, flow, branch-bit use, FNV; FP size, texture-unit mask and inline
++ * constants (rsx_fp_collect_constants; g.fp_constants has no other writer in the live draw). The FP key hash also
++ * depends on the VP hash (seed) and the constants mode, so each FP entry holds two (mode, seed, hash) results.
++ * Programs larger than the entry buffers are never cached (a transient entry is returned, nothing stored).
++ * The VP size scan is skipped on a hit: the cached bytes end in an instruction with the end bit and no earlier
++ * instruction has it, so equal bytes give the same count (verify mode re-scans and counts disagreements).
++ * LD_PSO_MEMO_N = entries per table (0 = old single-slot memos, rounded down to a power of two, max 16, default 16),
++ * LD_PSO_MEMO_VERIFY=1 = recompute everything on every hit, use the recomputed values and count mismatches.
++ * Host test: tools/smoke/test_pso_memo.sh. */
++#ifndef RSX_PSO_MEMO_H
++#define RSX_PSO_MEMO_H
++
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include "rsx_fp_decompiler.h"
++#include "rsx_vp_decompiler.h"
++
++#define RSX_PM_MAX_SLOTS 16u
++#define RSX_PM_VP_CAP    (544u * 16u)   /* RSX_DSP_VP_INSTR * 16 */
++#define RSX_PM_FP_CAP    8192u
++
++typedef struct rsx_pm_vp {
++    uint32_t valid, start, n, instrs;
++    uint32_t txl; int flow, bbits;
++    uint64_t h;
++    uint8_t bytes[RSX_PM_VP_CAP];
++} rsx_pm_vp;
++
++typedef struct rsx_pm_hash { uint32_t valid, mode; uint64_t seed, h; } rsx_pm_hash;
++
++typedef struct rsx_pm_fp {
++    uint32_t valid, loc, off, size;
++    int units_valid; uint32_t units;
++    int consts_valid; uint32_t nconst;   /* nconst = rsx_fp_collect_constants result (>= 0) */
++    rsx_pm_hash hs[2]; uint32_t hnext;
++    rsx_fp_constant_block consts;
++    uint8_t bytes[RSX_PM_FP_CAP];
++} rsx_pm_fp;
++
++typedef struct rsx_pm {
++    uint32_t n;            /* slots per table: 0 = off, else a power of two <= 16 */
++    int verify;
++    uint64_t vp_hit, vp_miss, fp_hit, fp_miss, mismatch, big;
++    rsx_pm_vp vp[RSX_PM_MAX_SLOTS], vp_tmp;
++    rsx_pm_fp fp[RSX_PM_MAX_SLOTS], fp_tmp;
++} rsx_pm;
++
++typedef uint64_t (*rsx_pm_hash_fn)(const void*, uint32_t, uint64_t);
++typedef const uint8_t* (*rsx_pm_guest_fn)(uint32_t loc, uint32_t off, uint32_t min_bytes);
++
++/* Test hook only (tools/smoke/test_pso_memo.sh negative control): RSX_PM_TEST_FLAW skips the byte validation. */
++#ifdef RSX_PM_TEST_FLAW
++#define RSX_PM_MEMCMP(a, b, n) 0
++#else
++#define RSX_PM_MEMCMP(a, b, n) memcmp((a), (b), (n))
++#endif
++
++#define RSX_PM_VP_SEED 1469598103934665603ull
++
++/* LD_PSO_MEMO_N parsing: unset = 16, "0" = 0, else floor-pow2 clamp to [1, 16]. */
++static inline uint32_t rsx_pm_slots_from(const char* e)
++{
++    if (!e || !e[0]) return RSX_PM_MAX_SLOTS;
++    int v = atoi(e);
++    if (v <= 0) return 0;
++    uint32_t n = 1;
++    while (n * 2u <= (uint32_t)v && n * 2u <= RSX_PM_MAX_SLOTS) n *= 2u;
++    return n;
++}
++static inline void rsx_pm_init(rsx_pm* pm, uint32_t n, int verify)
++{
++    memset(pm->vp, 0, sizeof pm->vp); memset(pm->fp, 0, sizeof pm->fp);   /* valid = 0 */
++    pm->vp_tmp.valid = 0; pm->fp_tmp.valid = 0;
++    pm->n = n; pm->verify = verify;
++    pm->vp_hit = pm->vp_miss = pm->fp_hit = pm->fp_miss = pm->mismatch = pm->big = 0;
++}
++
++static inline uint32_t rsx_pm_vp_slot(const rsx_pm* pm, uint32_t start)
++{ return ((start * 0x9E3779B1u) >> 28) & (pm->n - 1u); }
++static inline uint32_t rsx_pm_fp_slot(const rsx_pm* pm, uint32_t loc, uint32_t off)
++{ return ((((off >> 4) ^ (loc << 24)) * 0x9E3779B1u) >> 28) & (pm->n - 1u); }
++
++/* Same logic as rsx_live_draw.c vp_txl_unit_mask (kept there for the uncached path and the verify compare). */
++static inline uint32_t rsx_pm_vp_txl_mask(const uint8_t* uc, uint32_t instrs)
++{
++    uint32_t mask = 0;
++    for (uint32_t i = 0; i < instrs; i++) {
++        const uint8_t* p = uc + i * 16;
++        const uint32_t d1 = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
++        if (((d1 >> 22) & 0x1Fu) != 0x19u) continue;
++        const uint32_t d2 = (uint32_t)p[8] | ((uint32_t)p[9] << 8) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);
++        mask |= 1u << ((d2 >> 8) & 3u);
++    }
++    return mask;
++}
++/* rsx_vp_key_branch_base's key mix for a program with flow ("VBS1" + start slot), FNV-1a over 8 bytes. */
++static inline uint64_t rsx_pm_vbs_key(uint64_t key, uint32_t start_slot)
++{
++    const uint32_t w[2] = { 0x31534256u, start_slot };
++    const uint8_t* p = (const uint8_t*)w;
++    for (uint32_t i = 0; i < (uint32_t)sizeof w; i++) { key ^= p[i]; key *= 1099511628211ull; }
++    return key;
++}
++
++static inline void rsx_pm_vp_fill(rsx_pm_vp* e, const uint8_t* vp_uc, uint32_t start, uint32_t instrs, rsx_pm_hash_fn fnv)
++{
++    const uint32_t n = instrs * 16u;
++    e->start = start; e->instrs = instrs; e->n = n;
++    e->txl = rsx_pm_vp_txl_mask(vp_uc, instrs);
++    e->flow = rsx_vp_has_flow(vp_uc, n);
++    e->bbits = e->flow && rsx_vp_uses_branch_bits(vp_uc, n);
++    e->h = fnv(vp_uc, n, RSX_PM_VP_SEED);
++}
++
++/* The vertex program at vp_uc (avail_bytes readable from slot `start`). Returns an entry (valid for use until the next
++ * call); entry->instrs == 0 means no program (no end bit), same as rsx_vp_program_size_instrs. */
++static inline const rsx_pm_vp* rsx_pm_vp_get(rsx_pm* pm, const uint8_t* vp_uc, uint32_t start, uint32_t avail_bytes,
++                                             rsx_pm_hash_fn fnv)
++{
++    rsx_pm_vp* e = &pm->vp[rsx_pm_vp_slot(pm, start)];
++    if (e->valid && e->start == start && !RSX_PM_MEMCMP(vp_uc, e->bytes, e->n)) {
++        pm->vp_hit++;
++        if (pm->verify) {
++            rsx_pm_vp r; const uint32_t ri = rsx_vp_program_size_instrs(vp_uc, avail_bytes);
++            int bad = ri != e->instrs;
++            if (!bad) { rsx_pm_vp_fill(&r, vp_uc, start, ri, fnv);
++                bad = r.txl != e->txl || r.flow != e->flow || r.bbits != e->bbits || r.h != e->h; }
++            if (bad) { pm->mismatch++; e->valid = 0; goto miss; }
++        }
++        return e;
++    }
++miss:
++    pm->vp_miss++;
++    {
++        const uint32_t instrs = rsx_vp_program_size_instrs(vp_uc, avail_bytes);
++        rsx_pm_vp* t = &pm->vp_tmp;
++        if (!instrs) { t->valid = 0; t->instrs = 0; t->n = 0; return t; }
++        if (instrs * 16u > RSX_PM_VP_CAP) { pm->big++; t = &pm->vp_tmp; }
++        else t = e;
++        rsx_pm_vp_fill(t, vp_uc, start, instrs, fnv);
++        if (t == e) { memcpy(e->bytes, vp_uc, e->n); e->valid = 1; }
++        else t->valid = 0;
++        return t;
++    }
++}
++
++/* Lookup: a valid entry for (loc, off) whose bytes equal the guest bytes now, else NULL. fp_uc16 = the 16-byte
++ * resolution (the base the size scan reads from; verify only). */
++static inline rsx_pm_fp* rsx_pm_fp_lookup(rsx_pm* pm, uint32_t loc, uint32_t off, const uint8_t* fp_uc16,
++                                          rsx_pm_guest_fn gp)
++{
++    rsx_pm_fp* e = &pm->fp[rsx_pm_fp_slot(pm, loc, off)];
++    if (e->valid && e->loc == loc && e->off == off) {
++        const uint8_t* q = gp(loc, off, e->size);
++        if (q && !RSX_PM_MEMCMP(q, e->bytes, e->size)) {
++            pm->fp_hit++;
++            if (pm->verify && rsx_fp_program_size(fp_uc16, 0x10000) != e->size) { pm->mismatch++; e->valid = 0; return NULL; }
++            return e;
++        }
++    }
++    pm->fp_miss++;
++    return NULL;
++}
++/* Insert (after a miss and the caller's size scan); fp_uc = the bytes resolved with the true size. Never NULL. */
++static inline rsx_pm_fp* rsx_pm_fp_insert(rsx_pm* pm, uint32_t loc, uint32_t off, const uint8_t* fp_uc, uint32_t size)
++{
++    rsx_pm_fp* e = size <= RSX_PM_FP_CAP ? &pm->fp[rsx_pm_fp_slot(pm, loc, off)] : &pm->fp_tmp;
++    if (e == &pm->fp_tmp) pm->big++;
++    e->loc = loc; e->off = off; e->size = size;
++    e->units_valid = 0; e->consts_valid = 0; e->hs[0].valid = e->hs[1].valid = 0; e->hnext = 0;
++    if (e != &pm->fp_tmp) { memcpy(e->bytes, fp_uc, size); e->valid = 1; } else e->valid = 0;
++    return e;
++}
++static inline uint32_t rsx_pm_fp_units(rsx_pm* pm, rsx_pm_fp* e, const uint8_t* fp_uc)
++{
++    if (e->units_valid) {
++        if (pm->verify && rsx_fp_texture_unit_mask(fp_uc, e->size) != e->units) {
++            pm->mismatch++; e->units = rsx_fp_texture_unit_mask(fp_uc, e->size); }
++        return e->units;
++    }
++    e->units = rsx_fp_texture_unit_mask(fp_uc, e->size); e->units_valid = 1;
++    return e->units;
++}
++/* Inline constants into *out (count + count rows, like rsx_fp_collect_constants); < 0 = collection failed (not cached). */
++static inline int rsx_pm_fp_consts(rsx_pm* pm, rsx_pm_fp* e, const uint8_t* fp_uc, rsx_fp_constant_block* out)
++{
++    if (!e->consts_valid) {
++        const int rc = rsx_fp_collect_constants(fp_uc, e->size, &e->consts);
++        if (rc < 0) return rc;
++        e->nconst = (uint32_t)rc; e->consts_valid = 1;
++    } else if (pm->verify) {
++        static rsx_fp_constant_block ref;
++        const int rc = rsx_fp_collect_constants(fp_uc, e->size, &ref);
++        if (rc < 0 || (uint32_t)rc != e->nconst || memcmp(ref.values, e->consts.values, (size_t)rc * 16u)) {
++            pm->mismatch++;
++            if (rc < 0) return rc;
++            memcpy(&e->consts, &ref, sizeof ref); e->nconst = (uint32_t)rc;
++        }
++    }
++    out->count = e->nconst;
++    memcpy(out->values, e->consts.values, (size_t)e->nconst * 16u);
++    return (int)e->nconst;
++}
++static inline int rsx_pm_fp_hash_get(rsx_pm_fp* e, uint32_t mode, uint64_t seed, uint64_t* h)
++{
++    for (int i = 0; i < 2; i++)
++        if (e->hs[i].valid && e->hs[i].mode == mode && e->hs[i].seed == seed) { *h = e->hs[i].h; return 1; }
++    return 0;
++}
++static inline void rsx_pm_fp_hash_put(rsx_pm_fp* e, uint32_t mode, uint64_t seed, uint64_t h)
++{
++    rsx_pm_hash* s = &e->hs[e->hnext & 1u]; e->hnext++;
++    s->valid = 1; s->mode = mode; s->seed = seed; s->h = h;
++}
++
++#endif

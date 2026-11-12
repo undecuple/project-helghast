@@ -116,11 +116,21 @@ slot_q() {   # slot_q DIR NAME join|leave|head : edit the waiting queue under it
   [[ "$op" == head ]] && head -1 "$q"
   exec {fd}>&-
 }
+# slot_hold (optional, defined by the caller, e.g. lock.sh): returns 0 while this waiter must not take a slot (a GPU
+# reservation booked after it queued, 2026-11-11: a Toro run waiting in the queue started 26 s into KZ2's booking).
+# The waiter leaves the queue while held, so a priority or owner run behind it is not stuck, then joins again.
+slot_held_off() {   # slot_held_off DIR NAME
+  declare -F slot_hold >/dev/null && slot_hold || return 1
+  slot_q "$1" "$2" leave
+  while slot_hold; do sleep "${KZ3_RES_POLL_S:-10}"; done
+  slot_q "$1" "$2" join
+}
 slot_take() {
   local dir="$1" name="$2" n="$3" i fd wait=0
   slot_tok "$dir" "$name"
   slot_q "$dir" "$name" join
   while :; do
+    slot_held_off "$dir" "$name" && continue
     if slot_excl_waiting "$dir" "$name"; then sleep 2; continue; fi
     if [[ "$(slot_q "$dir" "$name" head)" != "t$SLOT_TOK" ]]; then sleep 0.3; continue; fi
     # First pass without waiting (a free slot is taken at once), then rotate with a 2 s wait per slot.
@@ -128,7 +138,9 @@ slot_take() {
       # Still the head? A shorter job may have joined while this one waited on a slot (NAME.sjf order).
       (( wait )) && [[ -f "$dir/$name.sjf" && "$(slot_q "$dir" "$name" head)" != "t$SLOT_TOK" ]] && break
       exec {fd}>"$(slot_file "$dir" "$name" "$i")"
-      if flock -w "$wait" "$fd"; then SLOT=$i; SLOT_FD=$fd; slot_q "$dir" "$name" leave; slot_tok_drop
+      if flock -w "$wait" "$fd"; then
+        if declare -F slot_hold >/dev/null && slot_hold; then exec {fd}>&-; break; fi   # booked while it waited on the slot
+        SLOT=$i; SLOT_FD=$fd; slot_q "$dir" "$name" leave; slot_tok_drop
         slot_hist "$dir" "$name" "$i"
         export "KZ3_HOLDS_${name//[^A-Za-z0-9]/_}=1"; return 0; fi
       exec {fd}>&-
@@ -137,17 +149,25 @@ slot_take() {
   done
 }
 slot_take_all() {
-  local dir="$1" name="$2" n="$3" i fd
-  if (( n > 1 )); then
-    slot_tok "$dir" "$name"
-    slot_q "$dir" "$name" join
-    while slot_excl_waiting "$dir" "$name" || [[ "$(slot_q "$dir" "$name" head)" != "t$SLOT_TOK" ]]; do sleep 2; done
-    echo "t$SLOT_TOK" > "$dir/$name.exclusive"   # the token stays held until every slot is taken
-    slot_q "$dir" "$name" leave
-  fi
-  for ((i = 0; i < n; i++)); do
-    exec {fd}>"$(slot_file "$dir" "$name" "$i")"
-    flock "$fd"
+  local dir="$1" name="$2" n="$3" i fd fds
+  (( n > 1 )) && slot_tok "$dir" "$name"
+  while :; do
+    if (( n > 1 )); then
+      slot_q "$dir" "$name" join
+      while slot_held_off "$dir" "$name" || slot_excl_waiting "$dir" "$name" || [[ "$(slot_q "$dir" "$name" head)" != "t$SLOT_TOK" ]]; do sleep 2; done
+      echo "t$SLOT_TOK" > "$dir/$name.exclusive"   # the token stays held until every slot is taken
+      slot_q "$dir" "$name" leave
+    fi
+    fds=()
+    for ((i = 0; i < n; i++)); do
+      exec {fd}>"$(slot_file "$dir" "$name" "$i")"
+      flock "$fd"; fds+=("$fd")
+    done
+    # A reservation booked while it waited for the slots: let them go and wait again (slot_hold, see slot_held_off).
+    declare -F slot_hold >/dev/null && slot_hold || break
+    for fd in "${fds[@]}"; do exec {fd}>&-; done
+    (( n > 1 )) && : > "$dir/$name.exclusive"
+    (( n > 1 )) || { while slot_hold; do sleep "${KZ3_RES_POLL_S:-10}"; done; }
   done
   if (( n > 1 )); then : > "$dir/$name.exclusive"; slot_tok_drop; fi
   slot_hist "$dir" "$name" all

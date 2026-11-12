@@ -6,11 +6,13 @@ open-addressed set. Same overlay for every GET (tools/spu/test_spu_ovl_index.sh 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): index add + upstream's atomic count publish; spu_ovl_find skips a verified source at another load address, as upstream's loop `continue`s (part 3: first-hit-only missed a later source at the same EA, upstream 02bd95d5's prefilter test).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 152): the hash-bucket index replaces the linear scan in spu_overlay_note_get; upstream #654's s_ovl_has_sig flag is still published before the count (release), and the canon field init stays. The early-out `spu_ovl_ea_known` prefilter of #654 is not needed: spu_ovl_find rejects an unrelated EA in one bucket probe.
+
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index c1ffe7cf..79067ca5 100644
+index 49ad1fb..a1abd56 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -2092,6 +2092,41 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
+@@ -2137,6 +2137,41 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
  #define SPU_OVL_SRC_MAX 128
  static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
  static int s_ovl_src_count = 0;
@@ -49,26 +51,26 @@ index c1ffe7cf..79067ca5 100644
 +        }
 +    return best;
 +}
- 
- /* Every MFC GET is checked against the registered sources, and a job that
-  * streams its data in small pieces issues thousands of GETs a frame against
-@@ -2138,6 +2173,7 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
-         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
+ /* Monotonic: published before any signature entry becomes visible through
+  * s_ovl_src_count. A reader that acquired that count cannot miss the flag.
+  * This lets EA-only registries reject unrelated GETs of every size. */
+@@ -2188,6 +2223,7 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
          s_ovl_src[s_ovl_src_count].image_id = image_id;
          s_ovl_src[s_ovl_src_count].has_sig = 0;
+         s_ovl_src[s_ovl_src_count].canon = 0;
 +        spu_ovl_index_add(s_ovl_src_count);   /* patch 1090 */
          __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
      }
  }
-@@ -2373,6 +2409,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
-         s_ovl_src[s_ovl_src_count].image_id = image_id;
+@@ -2440,6 +2476,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
          memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
          s_ovl_src[s_ovl_src_count].has_sig = 1;
+         atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
 +        spu_ovl_index_add(s_ovl_src_count);   /* patch 1090 */
-         s_ovl_src_count++;
+         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
      }
  }
-@@ -2440,17 +2477,20 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
+@@ -2507,17 +2544,20 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
   * design (several kernel threads): a duplicate line is harmless. */
  static void spu_overlay_map_note(spu_context* ctx, int image_id, uint32_t ea, uint32_t lsa)
  {
@@ -94,12 +96,17 @@ index c1ffe7cf..79067ca5 100644
          fprintf(stderr, "[spu-ovl-map] wid=%u overlay image %d src=0x%08X -> LS 0x%05X\n",
                  wid, image_id, ea, lsa);
      }
-@@ -2479,18 +2519,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2546,23 +2586,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
              }
          }
      }
 -    int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
--    if (size < 512 && !spu_ovl_ea_known(ea)) return;
+-    /* Invalidate destination code/residency above even for an unrelated EA.
+-     * Acquire count before the signature flag: if this snapshot contains a
+-     * signature, its earlier flag publication is visible. A racing future
+-     * signature can only force an unnecessary scan of the older snapshot. */
+-    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
+-        !spu_ovl_ea_known(ea)) return;
 -    for (int i = 0; i < nsrc; i++) {
 -        const spu_ovl_src* o = &s_ovl_src[i];
 -        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
@@ -116,9 +123,9 @@ index c1ffe7cf..79067ca5 100644
 -                if (o->code && lsa != o->load_lsa) continue;
 +                /* Verified sources at another load address were skipped by spu_ovl_find (patch 1090). */
                  for (unsigned slot = 0; slot < 4; ++slot) {
-                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
-                         continue;
-@@ -2527,11 +2564,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+                     /* A relocatable image takes over its own previous placement's slot: each load
+                      * lands somewhere new, and stale copies would fill the slots. */
+@@ -2603,11 +2635,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
   * chunk), so resident_ovl is set at branch-in time by matching the buffer head. */
  int spu_overlay_match_sig(const uint8_t hdr[16])
  {

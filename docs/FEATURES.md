@@ -12,7 +12,7 @@ What the PS3 version of Killzone 3 does and how far the port reproduces it (sect
 | declined | will not be done | 0 |
 | not applicable | has no equivalent on PC | 2 |
 
-Port-only features: 38 available now, 28 planned.
+Port-only features: 38 available now, 29 planned.
 
 **Estimated parity with the PS3 version: 65 %** (an estimate: works counts 1, partial 1/2, not yet verified 1/4, not yet 0; declined and not-applicable features are left out).
 
@@ -199,7 +199,7 @@ Non-original features are opt-in where they change gameplay; display and input i
 | Ray-traced sun shadows, then ambient occlusion and reflections | planned | off | KZ3_RT_SHADOWS=1 (planned). Geometry capture spike passed (patch 2024); after the campaign runs at speed |
 | Mod support (data mods as folders over the game's archive; code mods later) | planned | off (no mods = the game as shipped) | Late stage (decided 2026-10-09) |
 | Stereoscopic 3D output (side by side, top and bottom) from the game's own 3D mode | planned | off | Wanted backlog (2026-10-15); not before the campaign is playable |
-| VR (SteamVR headsets) | planned | off | Wanted backlog (2026-10-08); not before the campaign is playable |
+| VR (SteamVR headsets) | planned | off | Planned in-game label: VR (Experimental); explicit opt-in. Sustained 60 FPS gameplay is a priority before VR visual-quality sign-off; headset/runtime pacing also needs validation; not before the campaign is playable |
 | PlayStation Move and Sharpshooter (psmoveapi; camera tracking or motion-sensor pointer) | planned | off | Wanted backlog (2026-10-15); not before the campaign is playable |
 | Renderer choice (Direct3D 12, Vulkan or OpenGL, picked in the installer) | planned | Direct3D 12 | Goal recorded; scoped after the campaign renders correctly on Direct3D 12 |
 | Temporal anti-aliasing and upscaling (TAA, DLAA, DLSS, FSR): the game renders no motion vectors, so camera-only vectors first, character ghosting measured | planned | Backlog after parity; not started | SMAA/FXAA and resolution scale cover image quality until then |
@@ -209,5 +209,6 @@ Non-original features are opt-in where they change gameplay; display and input i
 | Motion blur strength (Options > Display > Motion blur, 0-100 %); no clean off yet: skipping the game's motion blur pass garbles the picture, so the row is not offered | planned | 100 (the game's own) | K4 check under Proton: with the pass skipped 2 of 2 runs show a false-colour picture, with it 2 of 2 are normal; needs the pass's strength input found. display.ini motion_blur is read and kept but does not act |
 | Minimap with enemy markers, using the game's own radar where possible | planned | - | Opt-in when it comes; changes gameplay |
 | FSR 1 upscaler (opt-in, default off) | planned | off | RSX_UPSCALE=fsr1, RSX_UPSCALE_SHARPNESS. Built (patch 2145, shared upscaler interface); not yet checked in a game run, no menu option yet |
+| Motion sections with the keyboard and mouse: mouse stick (patch 4030, default on) and autocomplete (patch 4031, opt-in) | planned | mouse stick on, autocomplete off | During valve and charge sections the mouse points the stick the game reads and Mouse1 grabs; holding L3+R3 for 0.5 s (keybinds.ini [motion] autocomplete = hold) turns the valve through the game's own completion. Host tests only; not yet tried at the valve in game |
 
 Progress and the order of the planned items: [ROADMAP.md](ROADMAP.md).

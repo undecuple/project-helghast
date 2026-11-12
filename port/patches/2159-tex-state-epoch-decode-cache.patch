@@ -1,0 +1,318 @@
+--- a/libs/video/rsx_dispatch.h	2026-11-10 20:23:00.805447163 -0600
++++ b/libs/video/rsx_dispatch.h	2026-11-10 20:23:00.807447208 -0600
+@@ -127,6 +127,9 @@
+     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */
+     u32 constants[RSX_DSP_NUM_CONSTANTS][4]; /* vec4 f32 bit patterns       */
+     u32 const_gen;                    /* bumped whenever a stored constant changes (patch 2148) */
++    u32 tex_ep[16];                   /* patch 2159: per-unit texture-state epoch, a fresh value from a never-reset counter
++                                       * whenever a store CHANGES one of the unit's 9 registers (0x1A00+u*32..+0x1C, SIZE1
++                                       * 0x1840+u*4); identical rewrites leave it alone */
+ 
+     rsx_dispatch_sink sink;
+ 
+--- a/libs/video/rsx_dispatch.c	2026-11-10 20:23:00.805447163 -0600
++++ b/libs/video/rsx_dispatch.c	2026-11-10 20:23:00.807447208 -0600
+@@ -144,9 +144,27 @@
+         rsx->klass[(method >> 2) + i] = klass;
+ }
+ 
++/* Patch 2159: texture-state epochs. One counter for the whole process, never reset, so a re-initialised or re-seeded
++ * register file can never hand out an epoch an older cached decode holds. Unit of a method: the 8-word blocks from
++ * M_TEX_OFFSET (0x1A00..0x1BFF) and the SIZE1 words (0x1840..0x187F). */
++static u32 g_tex_ep_ctr;
++static void tex_ep_all(rsx_dispatch* rsx)
++{
++    for (u32 u = 0; u < 16; u++) rsx->tex_ep[u] = ++g_tex_ep_ctr;
++}
++static inline void tex_ep_store(rsx_dispatch* rsx, u32 method, u32 idx, u32 arg)
++{
++    u32 u;
++    if (method - 0x1A00u < 0x200u) u = (method - 0x1A00u) >> 5;
++    else if (method - 0x1840u < 0x40u) u = (method - 0x1840u) >> 2;
++    else return;
++    if (rsx->regs[idx] != arg) rsx->tex_ep[u] = ++g_tex_ep_ctr;
++}
++
+ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
+ {
+     memset(rsx, 0, sizeof(*rsx));
++    tex_ep_all(rsx);   /* patch 2159 */
+     if (sink)
+         rsx->sink = *sink;
+ 
+@@ -242,6 +260,7 @@
+     if (count > RSX_DSP_NUM_REGS)
+         count = RSX_DSP_NUM_REGS;
+     memcpy(rsx->regs, regs, count * sizeof(u32));
++    tex_ep_all(rsx);   /* patch 2159 */
+ }
+ 
+ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count)
+@@ -342,6 +361,7 @@
+             return;
+     }
+     rsx->seen[idx]++;
++    tex_ep_store(rsx, method, idx, arg);   /* patch 2159: before the store (compares with the old value) */
+     rsx->regs[idx] = arg;
+     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
+         (method >= 0x0A80 && method < 0x0B00))
+--- a/libs/video/rsx_live_draw.c	2026-11-10 20:23:00.805447163 -0600
++++ b/libs/video/rsx_live_draw.c	2026-11-10 20:23:00.806447185 -0600
+@@ -4199,6 +4199,8 @@
+ 
+ /* Walker, at the flip: move the live bits aside and flag the entries under them. */
+ static void ld_tm_stat_print(void);   /* patch 2136 */
++static void ld_te_stat_print(void);   /* patch 2159 */
++static int ld_tex_epoch_mode(void);   /* patch 2159 */
+ static void ld_td_flip(void)
+ {
+     int any = 0;
+@@ -4255,6 +4257,7 @@
+         memset(&g_ld_tc, 0, sizeof g_ld_tc);
+     }
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) ld_tm_stat_print();   /* patch 2136 */
++    if (ld_tex_epoch_mode() && (rsx_perf_enabled() || ld_tex_epoch_mode() == 2) && (g_ld_frames % 256u) == 255u) ld_te_stat_print();   /* patch 2159 */
+     if (ld_sf_mode() && (g_ld_frames % 256u) == 255u) {   /* patch 2137 */
+         fprintf(stderr, "[tex-samef] frame=%u mode=%d flagged=%llu rehash_changed=%llu verify_checks=%llu untracked_late=%llu marks=%u\n", g_ld_frames, ld_sf_mode(),
+                 (unsigned long long)g_ld_sf_st.flagged, (unsigned long long)g_ld_sf_st.changed,
+@@ -10140,6 +10143,36 @@
+     if (on < 0) { const char* e = getenv("LD_PSO_MEMO"); on = e ? atoi(e) != 0 : 1; }
+     return on;
+ }
++/* KZ3 patch 2159 (RSX pass 147): RSX_TEX_EPOCH (opt-in since pass 151: unset or 0 off, 1 on, verify = recompute and count). The per-unit texture
++ * registers decode through a cache keyed by the dispatcher's per-unit epoch (rsx_tex_epoch.h); the texture loop adds a
++ * per-unit binding row on top (g_ld_te, below). The diagnostics that read or rewrite units inside the loop keep the full
++ * path, as for patch 2136. */
++#include "rsx_tex_epoch.h"
++static rsx_tex_dec g_ld_tdc[16];
++static rsx_tex_dec_stat g_ld_tds;
++static int ld_tex_epoch_mode(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("RSX_TEX_EPOCH");
++        on = rsx_tex_epoch_parse(e);
++        static const char* const diag[] = { "LD_UNITS", "LD_PS1_BUF0", "LD_UVDBG", "LD_ALIAS_DBG", "LD_ZPROBE",
++                                            "LD_FEAT_LOG", "KZ3_HUD_169_LOG" };
++        const char* why = NULL;
++        for (u32 k = 0; on && k < sizeof diag / sizeof diag[0]; k++) {
++            const char* d = getenv(diag[k]);
++            if (d && (k + 1u < sizeof diag / sizeof diag[0] || d[0] == '2')) { why = diag[k]; on = 0; }
++        }
++        if (on == 2 || why || (e && e[0]))
++            fprintf(stderr, "[tex-epoch] texture-state epochs %s (RSX_TEX_EPOCH=%s, patch 2159)%s%s\n",
++                    on == 2 ? "on + verify" : on ? "on" : "OFF", e ? e : "", why ? ", off because of " : "", why ? why : "");
++    }
++    return on;
++}
++static inline void ld_tex_get(u32 u, rsx_dsp_texture* t)
++{
++    rsx_tex_dec_get(g_ld_tdc, &g.rsx, u, t, ld_tex_epoch_mode(), &g_ld_tds);
++}
+ static struct { u32 n; u64 h; u8 bytes[RSX_DSP_VP_INSTR * 16]; } g_ld_vpm;
+ static struct { u32 loc, off, size, hvalid, hmode; u64 hseed, h; u8 bytes[0x10000]; } g_ld_fpm;
+ 
+@@ -10251,7 +10284,7 @@
+     for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
+         if (!((fp_units >> unit) & 1u)) continue;   /* patch 2042 */
+         rsx_dsp_texture texture;
+-        rsx_dsp_get_texture(&g.rsx, unit, &texture);
++        ld_tex_get(unit, &texture);   /* patch 2159 */
+         if (texture.enabled || unit == 0) ld_gamma_log(unit, &texture);
+         const int zalias = texture.enabled ? ld_shader_zalias_kind(&texture) : ZALIAS_NONE;   /* patch 2059 */
+         if (ld_feat_on()) { if (!(fp_units & ((1u << unit) - 1u))) ld_feat_draw(fp_ctrl);
+@@ -10390,7 +10423,7 @@
+     u32 unnorm_dim[16][3] = {{0}};
+     for (u32 uu = 0; uu < 16; uu++) {
+         if (!((fp_units >> uu) & 1u)) continue;   /* patch 2042 */
+-        rsx_dsp_texture ut; rsx_dsp_get_texture(&g.rsx, uu, &ut);
++        rsx_dsp_texture ut; ld_tex_get(uu, &ut);   /* patch 2159 */
+         if (!ut.enabled || !(ut.format & TEX_FMT_UNNORM)) continue;
+         if (!ut.width || !ut.height) continue;
+         unnorm_mask |= 1u << uu;
+@@ -14269,6 +14302,36 @@
+     memset(&g_ld_trg, 0, sizeof g_ld_trg);
+ }
+ 
++/* KZ3 patch 2159: the per-unit binding rows (level 1; the 2136 keyed table is level 2). Rows are recorded under the same
++ * conditions as a 2136 row; kind 1 = unit disabled. */
++static rsx_tex_l1 g_ld_te[16];
++static struct { u64 hit, hit_off, miss, entry, bad; } g_ld_tes;
++static int ld_te_verify(u32 u, const rsx_tex_l1* e, u32 target)
++{
++    u32 raw[9]; ld_tm_raw(u, raw);
++    if (e->kind == 1) return (raw[3] >> 31) ? 7 : 0;
++    if (memcmp(raw, e->raw, sizeof raw)) return 8;
++    ld_tex_memo_row mm; memset(&mm, 0, sizeof mm);
++    mm.t = e->t; mm.smp = e->smp; mm.idx = e->idx;
++    return ld_tm_verify(u, &mm, target);
++}
++static void ld_te_record(u32 u, const rsx_dsp_texture* t, const u32 raw[9], u32 smp)
++{
++    rsx_tex_l1* e = &g_ld_te[u];
++    memcpy(e->raw, raw, sizeof e->raw);
++    e->t = *t; e->kind = 2; e->ep = g.rsx.tex_ep[u]; e->surf_gen = g_ld_surf_gen; e->zgen = g_ld_zgen;
++    e->epoch = g_ld_tex_memo_epoch; e->idx = g_ld_tsl_index; e->smp = smp;
++}
++static void ld_te_stat_print(void)
++{
++    fprintf(stderr, "[tex-epoch] frame=%u binding rows: hits=%llu (disabled units %llu) miss=%llu entry-gone=%llu"
++                    " | decode cache hits=%llu miss=%llu | verify bad: rows=%llu decode=%llu\n", g_ld_frames,
++            (unsigned long long)g_ld_tes.hit, (unsigned long long)g_ld_tes.hit_off, (unsigned long long)g_ld_tes.miss,
++            (unsigned long long)g_ld_tes.entry, g_ld_tds.hit, g_ld_tds.miss, (unsigned long long)g_ld_tes.bad, g_ld_tds.bad);
++    memset(&g_ld_tes, 0, sizeof g_ld_tes);
++    memset(&g_ld_tds, 0, sizeof g_ld_tds);
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -14702,8 +14765,40 @@
+       } }
+     ld_trg_draw();   /* patch 2158: counters only */
+     const int tm_on = ld_tex_memo_on();   /* patch 2136 */
++    const int te_mode = ld_tex_epoch_mode();   /* patch 2159 */
+     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) {
+         u32 tm_raw[9];
++        if (te_mode && u < 16u) {   /* patch 2159: level 1, the unit's registers are unchanged since the row was recorded */
++            rsx_tex_l1* e = &g_ld_te[u];
++            if (rsx_tex_l1_hit(e, &g.rsx, u, g_ld_surf_gen, g_ld_zgen, g_ld_tex_memo_epoch)) {
++                int why = 0;
++                if (te_mode == 2) {
++                    why = ld_te_verify(u, e, target);
++                    if (why) { static u32 nl; g_ld_tes.bad++;
++                               if (nl++ < 32) fprintf(stderr, "[tex-epoch] verify FAILED frame=%u unit=%u kind=%u reason=%d\n",
++                                                      g_ld_frames, u, e->kind, why); }
++                }
++                if (!why && e->kind == 1) { g_ld_tes.hit++; g_ld_tes.hit_off++; continue; }
++                if (!why && ld_tex_entry_is(e->idx, &e->t)) {
++                    if (ld_unit_mask_bind_on() && !((g_ld_fp_units_cur >> u) & 1u)) {   /* patch 2045, as below */
++                        if (rsx_perf_walk_on()) rsx_perf_add(RSX_PERF_W_D_UNIT_SKIP_N, 1);
++                        continue;
++                    }
++                    g_ld_tes.hit++;
++                    texture_mask |= 1u << u;
++                    smp_slots[u] = e->smp;
++                    LDW_T0(tex_t0);
++                    ld_tsl_prologue(&e->t);
++                    slots[u] = texture_srv_slot_entry(&e->t, e->idx);   /* content checks run exactly as without the row */
++                    LDW_ADD(RSX_PERF_W_TEX_T, tex_t0);
++                    if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
++                    continue;
++                }
++                if (!why) g_ld_tes.entry++;
++                e->kind = 0;
++            }
++            g_ld_tes.miss++;
++        }
+         if (tm_on) {   /* patch 2136: binding memo hit = the full body below would bind the same entry and sampler */
+             ld_tm_raw(u, tm_raw);
+             if (!(tm_raw[3] >> 31)) continue;   /* control0 bit 31 = rsx_dsp_texture.enabled: `if (!t.enabled) continue` below */
+@@ -14735,7 +14830,7 @@
+                 continue;
+             }
+         }
+-        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
++        rsx_dsp_texture t; ld_tex_get(u, &t);   /* patch 2159 */
+         /* LD_PS1_BUF0=1 -- DIAGNOSTIC, not a fix. Force a 24-bit PS1 VRAM
+          * bind at buffer 1 (offset 0x4003C0) to sample buffer 0 (0x400000).
+          *
+@@ -14750,7 +14845,10 @@
+           if (fb0 < 0) fb0 = getenv("LD_PS1_BUF0") ? 1 : 0;
+           if (fb0 && t.location == 1u && t.offset == 0x4003C0u)
+               t.offset = 0x400000u; }
+-        if (!t.enabled) continue;
++        if (!t.enabled) {
++            if (te_mode && u < 16u) { g_ld_te[u].kind = 1; g_ld_te[u].ep = g.rsx.tex_ep[u]; }   /* patch 2159 */
++            continue;
++        }
+         if (ld_unit_mask_bind_on() && !((g_ld_fp_units_cur >> u) & 1u)) {   /* patch 2045 */
+             if (rsx_perf_walk_on()) rsx_perf_add(RSX_PERF_W_D_UNIT_SKIP_N, 1);
+             continue;
+@@ -15081,13 +15179,17 @@
+                 slots[u] = texture_srv_slot(&t);
+                 LDW_ADD(RSX_PERF_W_TEX_T, tex_t0);
+                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
+-                if (tm_on && g_ld_tsl_index != UINT32_MAX && ld_tm_zalias_free(&t) && ld_tm_surface_free(&t)) {   /* 2136 */
++                if ((tm_on || te_mode) && g_ld_tsl_index != UINT32_MAX && ld_tm_zalias_free(&t) && ld_tm_surface_free(&t)) {   /* 2136, 2159 */
++                    if (!tm_on) ld_tm_raw(u, tm_raw);
++                    if (te_mode && u < 16u) ld_te_record(u, &t, tm_raw, smp_slots[u]);   /* patch 2159 */
++                  if (tm_on) {
+                     ld_tex_memo_row* m = &g_ld_tm[ld_tm_row(tm_raw)];
+                     memcpy(m->raw, tm_raw, sizeof tm_raw);
+                     m->t = t; m->surf_gen = g_ld_surf_gen; m->zgen = g_ld_zgen;
+                     m->epoch = g_ld_tex_memo_epoch; m->idx = g_ld_tsl_index; m->smp = smp_slots[u]; m->valid = 1;
+                     g_ld_tms.rec++;
+                     if (tm_on == 2) ld_tm_hash_spot(&t, g_ld_tsl_index, 0);
++                  }
+                 } else if (tm_on && g_ld_tsl_index != UINT32_MAX) g_ld_tms.surf++;   /* texture path, not memoisable */
+             }
+         }
+--- /dev/null	2026-11-01 09:32:34.550103552 -0600
++++ b/libs/video/rsx_tex_epoch.h	2026-11-10 20:23:00.807447208 -0600
+@@ -0,0 +1,65 @@
++/* KZ3 patch 2159 (RSX pass 147): reuse the decoded texture-register state across draws.
++ *
++ * rsx_dispatch.tex_ep[u] changes (fresh value from a never-reset counter) exactly when a store changes one of unit u's
++ * 9 registers, so "tex_ep[u] equals the epoch a cached record was made at" means those 9 words are bit-identical now.
++ * Two users, both in rsx_live_draw.c:
++ *   - the decode cache (rsx_tex_dec): rsx_dsp_get_texture is a pure function of the 9 words;
++ *   - the per-unit binding row (rsx_tex_l1): what the registers resolved to when the unit took the plain texture-cache
++ *     path (same record condition and same validity checks as the patch 2136 keyed memo; the keyed memo stays as the
++ *     second level, RSX_TEX_CACHE=1).
++ * Texture CONTENT is never cached here: a hit still runs texture_srv_slot_entry (once-per-frame hash decision with the
++ * writers' page bitmap), exactly like a 2136 hit.
++ * RSX_TEX_EPOCH: unset or 0 off (default since pass 151), 1 on, verify = on, every reuse is recomputed and compared, mismatches are
++ * counted and the fresh value is used. Host test: tools/smoke/test_tex_epoch.py. */
++#ifndef RSX_TEX_EPOCH_H
++#define RSX_TEX_EPOCH_H
++#include <string.h>
++#include "rsx_dispatch.h"
++
++static inline int rsx_tex_epoch_parse(const char* e)
++{
++    if (!e || !e[0]) return 0;
++    if (!strcmp(e, "verify")) return 2;
++    return e[0] == '1' ? 1 : 0;
++}
++
++typedef struct { u32 valid, ep; rsx_dsp_texture t; } rsx_tex_dec;
++typedef struct { unsigned long long hit, miss, bad; } rsx_tex_dec_stat;
++
++/* rsx_dsp_get_texture through the per-unit cache. mode 0: plain decode. */
++static inline void rsx_tex_dec_get(rsx_tex_dec dc[16], const rsx_dispatch* rsx, u32 u, rsx_dsp_texture* out, int mode,
++                                   rsx_tex_dec_stat* st)
++{
++    if (!mode || u >= 16u) { rsx_dsp_get_texture(rsx, u, out); return; }
++    rsx_tex_dec* c = &dc[u];
++    if (c->valid && c->ep == rsx->tex_ep[u]) {
++        st->hit++;
++        if (mode == 2) {
++            rsx_dsp_texture f; rsx_dsp_get_texture(rsx, u, &f);
++            if (memcmp(&f, &c->t, sizeof f)) { st->bad++; c->t = f; *out = f; return; }
++        }
++        *out = c->t;
++        return;
++    }
++    st->miss++;
++    rsx_dsp_get_texture(rsx, u, out);
++    c->t = *out; c->ep = rsx->tex_ep[u]; c->valid = 1;
++}
++
++/* Per-unit binding row. kind 0 none, 1 unit disabled, 2 bound (idx/smp/gens valid). */
++typedef struct {
++    u32 kind, ep;
++    u32 raw[9];
++    rsx_dsp_texture t;
++    u32 surf_gen, zgen, epoch, idx, smp;
++} rsx_tex_l1;
++
++/* May the row stand in for this draw's resolution of unit u? Registers (epoch), surfaces/zetas/device generations;
++ * the caller still checks that the texture-cache entry still holds the key (ld_tex_entry_is). */
++static inline int rsx_tex_l1_hit(const rsx_tex_l1* r, const rsx_dispatch* rsx, u32 u, u32 surf_gen, u32 zgen, u32 epoch)
++{
++    if (!r->kind || r->ep != rsx->tex_ep[u]) return 0;
++    if (r->kind == 1) return 1;
++    return r->surf_gen == surf_gen && r->zgen == zgen && r->epoch == epoch;
++}
++#endif

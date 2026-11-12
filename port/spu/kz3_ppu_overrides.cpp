@@ -1174,6 +1174,15 @@ KZ3_HOOK_SIXAXIS_PADTYPE(009652DC)
 #ifdef PPU_OVERRIDE_009703A0
 KZ3_HOOK_SIXAXIS_LOAD(009703A0)
 #endif
+#ifdef PPU_OVERRIDE_00BB0CB4   /* network pass 16: the menu setter (1.14 only), filtered like the three store sites */
+KZ3_HOOK_SIXAXIS_SETTER(00BB0CB4)
+#endif
+#ifdef PPU_OVERRIDE_0061AEB4   /* patch 4030/4031: valve controller update (1.14 only) */
+KZ3_HOOK_VALVE_ASSIST(0061AEB4)
+#endif
+#ifdef PPU_OVERRIDE_006126E4   /* patch 4030/4031: charge controller target (1.14 only) */
+KZ3_HOOK_CHARGE_ASSIST(006126E4)
+#endif
 
 /* Pass 43: test aids (kz3_gameplay.h top comment; the RE notes "Test aids"), all off by default:
  * KZ3_GOD_MODE=1 on IsGodMode, KZ3_INFINITE_AMMO=1|2 on the Humanoid owner ammo test and the ejector's shot,

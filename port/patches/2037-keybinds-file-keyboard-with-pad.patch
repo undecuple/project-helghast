@@ -13,42 +13,37 @@ keys and data folder are port-specific).
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
 
+Rebased on ps3recomp v0.19.0 (shared v0.19 group C): upstream #612 (24c702ae) split the keyboard fallback into key sources (XInput, macOS, SDL) with one fixed table. The binding file stays Windows-only (PAD_BACKEND_XINPUT; it reuses upstream's pad_host_window_focused and pad_key_down), where it replaces the fixed table and merges with the pad; the macOS and SDL sources keep upstream's table and its no-pad-only rule.
+
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index bc86d412..15b335f4 100644
+index bdbe0162..88c6d198 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -251,22 +251,17 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
+@@ -304,6 +304,7 @@ static int pad_key_down(int key)
+ #define PADKEY_ESCAPE SDL_SCANCODE_ESCAPE
+ #endif
+ 
++#if !PAD_BACKEND_XINPUT   /* KZ3 patch 2037: the XInput build reads keybinds.ini instead (below) */
+ static void pad_poll_keyboard(void)
+ {
+     static int off = -1;
+@@ -353,6 +354,7 @@ static void pad_poll_keyboard(void)
+           printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
+           fflush(stdout); } }
+ }
++#endif
+ 
+ /* ---------------------------------------------------------------------------
+  * XInput backend
+@@ -414,6 +416,183 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
      return (u8)val;
  }
  
--/* Keyboard fallback for port 0.
-+/* Keyboard (and mouse buttons) on port 0.
-  *
-  * The only backend here is XInput, so on a machine with no controller plugged
-  * in a title gets a pad that is reported present and never presses anything --
-  * it can be watched but not played. That is what The Simpsons Arcade Game hit:
-  * it reached its attract loop and no input existed to start a game.
-  *
-- * Only fills in for port 0, only when XInput found nothing there, so a real
-- * controller always wins and nothing changes for a port that has one. Keys are
-- * read only while a window of THIS process is in the foreground, so typing in
-- * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
-- * disable it entirely.
-- *
-- * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
-- * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
-- * so a title that reads the stick instead is playable too. */
-+ * Keys are read only while a window of THIS process is in the foreground, so
-+ * typing in another application does not drive the game. Set PAD_NO_KEYBOARD=1
-+ * to disable it entirely. KZ3 patch 2037: the map is the player's keybinds.ini
-+ * (pad_keybinds.h has the defaults) and it adds to a connected XInput pad. */
- #ifdef _WIN32
- static int pad_host_window_focused(void)
- {
-@@ -277,54 +272,174 @@ static int pad_host_window_focused(void)
-     return pid == GetCurrentProcessId();
- }
- 
++/* Keyboard (and mouse buttons) on port 0 with the XInput backend (Windows). KZ3 patch 2037: the map is the
++ * player's keybinds.ini (pad_keybinds.h has the defaults) and it adds to a connected pad; the other key sources
++ * above keep upstream's fixed table (pad_poll_keyboard below the #else). */
++#if PAD_BACKEND_XINPUT
++
 +/* KZ3 patch 2037 (hook C): the keys come from a binding file instead of one fixed table, and they work
 + * alongside an XInput pad on port 0 (buttons OR'ed, a key-held stick direction overrides that stick). The file is
 + * keybinds.ini in the player's data folder, the same folder tools/release/launch.py data_dir() picks: the install
@@ -70,7 +65,7 @@ index bc86d412..15b335f4 100644
 +    printf("[keybinds] %s\n", msg);
 +}
 +
-+static int pad_kb_down_win(void* ctx, int vk) { (void)ctx; return (GetAsyncKeyState(vk) & 0x8000) != 0; }
++static int pad_kb_down_win(void* ctx, int vk) { (void)ctx; return pad_key_down(vk); }
 +
 +static char* pad_kb_read_w(const wchar_t* path)       /* malloc'd, NUL-terminated; NULL if unreadable */
 +{
@@ -165,13 +160,13 @@ index bc86d412..15b335f4 100644
 +    fflush(stdout);
 +}
 +
- static void pad_poll_keyboard(void)
- {
-     static int off = -1;
-     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
++static void pad_poll_keyboard(void)
++{
++    static int off = -1;
++    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
 +    s_kb_state.buttons = 0; s_kb_state.dirs = 0;
-     if (off) return;
- 
++    if (off) return;
++
 +    if (!s_kb_ready) { pad_kb_find_path(); pad_kb_load(1); s_kb_ready = 1; s_kb_checked_ms = GetTickCount64(); }
 +    else {
 +        unsigned long long now = GetTickCount64();
@@ -192,55 +187,16 @@ index bc86d412..15b335f4 100644
 +static void pad_merge_keyboard(void)
 +{
 +    static int off = -1;
-     PadHostState* hs = &s_host_state[0];
--    if (!pad_host_window_focused()) {
--        /* Release everything on focus loss, or a key held while alt-tabbing
--         * would stay down forever. */
--        hs->buttons = 0;
--        hs->analog_lx = hs->analog_ly = 128;
--        hs->analog_rx = hs->analog_ry = 128;
++    PadHostState* hs = &s_host_state[0];
 +    const PadKbState* k = &s_kb_state;
 +    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
 +    int had_pad = hs->connected;
 +    if (off) return;
 +    if (!hs->connected) {
 +        memset(hs, 0, sizeof *hs);
-         hs->connected = 1;
--        return;
++        hs->connected = 1;
 +        hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
-     }
--
--    /* The one keyboard -> pad table (KZ3 patch 2034 adds Esc = START, so Esc opens the pause menu in game and
--     * acts as the game's own back/resume in menus; Enter stays START too). A key-binding file replaces
--     * this table later. */
--    static const struct { int vk; u16 btn; } map[] = {
--        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
--        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
--        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
--        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
--        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
--        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
--        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
--        { VK_ESCAPE, CELL_PAD_CTRL_START },
--    };
--
--    u16 btns = 0;
--    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
--        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
--
--    hs->buttons   = btns;
--    hs->connected = 1;
--    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
--                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
--    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
--                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
--    hs->analog_rx = hs->analog_ry = 128;
--    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
--    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
--
--    { static int said = 0;
--      if (!said && btns) { said = 1;
--          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
++    }
 +    if (!k->buttons && !k->dirs) return;
 +    hs->buttons |= k->buttons;
 +    if (k->dirs & ((1u << PKB_LS_LEFT) | (1u << PKB_LS_RIGHT)))
@@ -256,20 +212,27 @@ index bc86d412..15b335f4 100644
 +    { static int said = -1;
 +      if (said != had_pad) { said = had_pad;
 +          printf("[cellPad] keyboard input on port 0 (%s)\n", had_pad ? "with the XInput pad" : "no XInput pad");
-           fflush(stdout); } }
- }
- #endif
-@@ -715,7 +830,9 @@ static void pad_poll_backend(void)
++          fflush(stdout); } }
++}
++#endif
++
+ /* XInputGetState on a slot with nothing plugged in costs about 140 us (2 us on
+  * a connected one), and the backend is polled at least once a frame: three
+  * empty slots beside one pad were 0.6 ms of every frame on God of War HD's
+@@ -799,7 +978,13 @@ static void pad_poll_backend(void)
+ #elif PAD_BACKEND_SDL2
      pad_poll_sdl2();
  #endif
- #ifdef _WIN32
--    if (!s_host_state[0].connected) pad_poll_keyboard();
++#if PAD_BACKEND_XINPUT
 +    /* KZ3 patch 2037: keys always polled (not only with no pad on port 0) and merged into port 0. */
 +    pad_poll_keyboard();
 +    pad_merge_keyboard();
- #endif
++#else
+     if (!s_host_state[0].connected) pad_poll_keyboard();
++#endif
      pad_track_assign();
      pad_unlock();
+ }
 diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
 new file mode 100644
 index 00000000..dfe5cb9e

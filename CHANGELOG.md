@@ -3,6 +3,19 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
+## [Unreleased]
+
+### Added
+- With the 1.14 update, keyboard and mouse players can turn the valve and place the charge in the motion sections (Flooded Pyrrhus burning gate, for example): the mouse points a virtual right stick and Mouse1 grabs, through the game's own controller code (`KZ3_MOUSE_STICK=0` turns this off). Checked with host tests only; not yet tried at the valve in the game.
+- Optional autocomplete for those sections, off by default: set `autocomplete = hold` under `[motion]` in `keybinds.ini`, then holding L3 and R3 together for half a second finishes the valve or charge through the game's own completion, and releasing them returns the normal controls.
+
+### Changed
+- The depth-of-field gather of the post-processing runs as native code by default with the 1.14 update (`KZ3_NATIVE_JOB_DOFGATHER=0` runs the original job code). Its output matched the original job on recorded jobs, and in a toggled test in Frozen Shores the frame rate window rose by about 2 % (24.03 to 24.53 fps).
+- One audio mixer stage (the gain ramp of the K7a job) runs as native code by default with the 1.14 update (`KZ3_NATIVE_JOB_SND_K7A=0` runs the original job code). Its output matched the original job on 24 recorded mixer states, and in a toggled test in Frozen Shores each mixer call took about 14 % less time.
+- Shader program lookups are cached by program identity, with every hit checked against the program bytes; in alternated test runs in Frozen Shores the frame rate window rose slightly (25.07 to 25.23 fps). `LD_PSO_MEMO_N=0` turns it off.
+- The first-run check names a wrong region, a wrong game version, an encrypted file, or an unknown or modified `EBOOT` in plain words, and refuses unsupported or unknown ones.
+- Online play: an `online.ini` whose server selection is ambiguous, or credentials without a clean configuration, are refused and the game stays offline. The network capture log no longer records tokens, certificate hashes or ticket offsets; `KZ3_NET_CAPTURE_PAYLOAD=1` logs the payload bytes again (#39, thanks @Tzeentchnet).
+
 ## [0.1.10] - 2026-11-09 (pre-release)
 
 ### Fixed

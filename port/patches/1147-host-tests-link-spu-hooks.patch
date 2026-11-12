@@ -10,6 +10,23 @@ link (found by the Ratchet & Clank port, 2026-11-02). Spu pass 138.
   module with stand-ins, gets stand-ins for the striped lock-line API (spu_ll_mask, spu_ll_lock_mask, spu_ll_unlock_mask,
   patch 1056) next to the existing spu_lockline_lock/unlock one.
 
+Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): context only (patch 1112's timespec_compat include
+next to the g_kz3_run_ctx_hook definition in spu_workload.c is gone; v0.19 includes mingw_timespec_get.h further down).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 266c4721..63f21fa4 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -340,8 +340,7 @@ static void spu_honour_stop_request(spu_context* ctx)
+ /* KZ3 patch 1081 (opt-in diagnostic, KZ3_STALL_DIAG=1): called with on=1 before and on=0 after every lifted job/task
+  * run (kind 0, a = image id, b = args EA; spu_lifted_job.h) and every policy-module run (kind 1, a = wid, b = spu_num;
+  * spurs_policy.c), so a run that never returns can be described from another thread. NULL unless
+- * port/spu/kz3_stall_diag.c installs it. Defined here, next to spu_run_with_halt, so every user of the runners links it. */
+-void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b) = 0;
++ * port/spu/kz3_stall_diag.c installs it. Defined in spu_workload.c (spu_lifted_job.h's runner, its main user). */
+ int spu_run_with_halt(void (SPU_ABI *entry)(spu_context*), spu_context* ctx)
+ {
+     const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
 diff --git a/runtime/spu/spu_fpmode.h b/runtime/spu/spu_fpmode.h
 index c7114e36..2ea5fae5 100644
 --- a/runtime/spu/spu_fpmode.h
@@ -54,7 +71,7 @@ index e102f46c..728f5192 100644
  
      c->status = SPU_STATUS_RUNNING;
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
-index c0c0d0cd..c13196b9 100644
+index c40da8f2..8d92209f 100644
 --- a/runtime/spu/spu_workload.c
 +++ b/runtime/spu/spu_workload.c
 @@ -6,6 +6,7 @@
@@ -65,7 +82,7 @@ index c0c0d0cd..c13196b9 100644
  #include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
  #ifdef _WIN32
  static volatile long long g_ws_sig_wake;   /* when WAIT_SIGNAL waiters were last woken (waitstat) */
-@@ -27,6 +28,10 @@ static volatile long long g_ws_sig_wake;   /* when WAIT_SIGNAL waiters were last
+@@ -28,6 +29,10 @@ static volatile long long g_ws_sig_wake;   /* when WAIT_SIGNAL waiters were last
  #endif
  #include "ps3emu/thread_name.h"
  
@@ -75,8 +92,8 @@ index c0c0d0cd..c13196b9 100644
 +
  static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
                                       uint32_t owner_ea);   /* below */
- #include "ps3emu/timespec_compat.h"   /* KZ3 patch 1112: msvcrt MinGW */
-@@ -1027,7 +1032,7 @@ int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image,
+ 
+@@ -1034,7 +1039,7 @@ int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image,
  SPU_THREAD_LOCAL uint32_t g_kz3_cur_taskset, g_kz3_cur_taskid;
  static void spu_async_run(spu_async_job* j)
  {
@@ -85,20 +102,6 @@ index c0c0d0cd..c13196b9 100644
      g_kz3_cur_taskset = j->taskset_ea; g_kz3_cur_taskid = j->taskid;   /* KZ3 patch 1081 */
      spu_taskset_mark(j->taskset_ea, j->taskid, 1);
      spu_taskset_bind_thread(j->taskset_ea);   /* KZ3 patch 1066 */
-diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index e4d142f7..07a8e1de 100644
---- a/runtime/spu/spu_channels.c
-+++ b/runtime/spu/spu_channels.c
-@@ -340,8 +340,7 @@ static void spu_honour_stop_request(spu_context* ctx)
- /* KZ3 patch 1081 (opt-in diagnostic, KZ3_STALL_DIAG=1): called with on=1 before and on=0 after every lifted job/task
-  * run (kind 0, a = image id, b = args EA; spu_lifted_job.h) and every policy-module run (kind 1, a = wid, b = spu_num;
-  * spurs_policy.c), so a run that never returns can be described from another thread. NULL unless
-- * port/spu/kz3_stall_diag.c installs it. Defined here, next to spu_run_with_halt, so every user of the runners links it. */
--void (*g_kz3_run_ctx_hook)(spu_context*, int on, int kind, uint32_t a, uint32_t b) = 0;
-+ * port/spu/kz3_stall_diag.c installs it. Defined in spu_workload.c (spu_lifted_job.h's runner, its main user). */
- int spu_run_with_halt(void (SPU_ABI *entry)(spu_context*), spu_context* ctx)
- {
-     const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
 diff --git a/runtime/spu/tests/test_spu_workload_masked.c b/runtime/spu/tests/test_spu_workload_masked.c
 index 81e3cc76..bc72f780 100644
 --- a/runtime/spu/tests/test_spu_workload_masked.c

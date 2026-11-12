@@ -18,11 +18,13 @@ Needs a relift. Upstream candidate (with 1096).
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): both.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 274023ba..1e995446 100644
+index 71859d5..139c357 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1891,6 +1891,31 @@ static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
+@@ -1921,6 +1921,31 @@ static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
      return m->fn;
  }
  
@@ -54,7 +56,7 @@ index 274023ba..1e995446 100644
  /* KZ3 patch 1028: exact-image probe for the interpreter's rejoin (no image-0
   * wildcard, no cross-image report): is there a lifted function of THIS overlay
   * image at addr? */
-@@ -2335,17 +2360,17 @@ static int s_task_entry_count = 0;
+@@ -2405,17 +2430,17 @@ static int s_task_entry_count = 0;
  /* KZ3 patch 1097: filters for spu_ib_direct (direct hops): a bit per registered task entry (hashed LS address) and
   * per taskset policy image id, so a job overlay's computed hop skips the LS read and the table scans. A clear bit
   * means no match; a set bit runs the scan as before. */
@@ -76,7 +78,7 @@ index 274023ba..1e995446 100644
      }
  }
  static int spu_taskset_task_image(uint32_t entry)
-@@ -2366,9 +2391,9 @@ void spu_taskset_register_task_elf(uint32_t elf_ea, int image_id, int policy_ima
+@@ -2436,9 +2461,9 @@ void spu_taskset_register_task_elf(uint32_t elf_ea, int image_id, int policy_ima
          s_task_elf[s_task_elf_count].image_id = image_id;
          s_task_elf[s_task_elf_count++].policy_image_id = policy_image_id;
          if ((unsigned)policy_image_id < SPU_TASK_POL_BITS)   /* KZ3 patch 1097 */
@@ -88,7 +90,7 @@ index 274023ba..1e995446 100644
      }
  }
  static int spu_taskset_resident_image(const spu_context* ctx)
-@@ -2385,6 +2410,8 @@ static int spu_taskset_resident_image(const spu_context* ctx)
+@@ -2455,6 +2480,8 @@ static int spu_taskset_resident_image(const spu_context* ctx)
  /* Lowest LS address of the shared task-code region: the taskset tasks all lift
   * at LS 0x3000 (below it is the SPURS kernel/policy/context, 0x290..0x2FFF). */
  #define SPU_TASKSET_TASK_LO 0x3000u
@@ -97,7 +99,7 @@ index 274023ba..1e995446 100644
  
  /* KZ3 patch 1043 (SPU pass 30): skip a streamed overlay module at its entry (A/B aid for KZ3's SPU
   * visibility culling jobs, KZ3_SPU_SKIP_OVL / KZ3_CULL_AB in the port's generated registration). When the
-@@ -2394,8 +2421,10 @@ static int spu_taskset_resident_image(const spu_context* ctx)
+@@ -2464,8 +2491,10 @@ static int spu_taskset_resident_image(const spu_context* ctx)
   * Tested on both dispatch paths (spu_dispatch_mt.c fast path and the resolver below); one global load on the
   * fast path when nothing is marked. kz3-ovl-skip begin */
  #define KZ3_OVL_SKIP_MAX 512u   /* image ids: ELFs 1..43, policy modules, job modules 200..290 */
@@ -109,7 +111,7 @@ index 274023ba..1e995446 100644
  /* KZ3 patch 1044 (SPU pass 31): an entry hook in place of the plain skip. It runs at the same point (the job
   * manager's call of the module entry; ctx->gpr[3] = the job context, LS[ctx+0x20] = the job's parameters) and
   * may edit the local store before the module runs; it returns 1 to skip the module after all, 0 to let it run
-@@ -3084,10 +3113,11 @@ static void spu_hop_stats_tick(void)
+@@ -3159,10 +3188,11 @@ static void spu_hop_stats_tick(void)
      if (now - s_t0 < 10000000u) return;
      s_t0 = now;
      fprintf(stderr, "[hop-stats] direct=%llu fallback: int=%llu ok=%llu diag=%llu (irq %llu pmend/trace %llu ftrace "
@@ -123,7 +125,7 @@ index 274023ba..1e995446 100644
  }
  #define SPU_HS(i) do { if (__builtin_expect(s_hop_stats > 0, 0)) s_hs[i]++; } while (0)
  spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
-@@ -3137,8 +3167,8 @@ spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
+@@ -3212,8 +3242,8 @@ spu_fn spu_ib_direct(spu_context* ctx, uint32_t t)
      }
      if (t >= SPU_TASKSET_TASK_LO) {   /* KZ3 patch 1097: the filters first (exact: a clear bit = no table match) */
          const unsigned ov = (unsigned)ctx->resident_ovl;
@@ -135,10 +137,10 @@ index 274023ba..1e995446 100644
              SPU_HS(7);
              return NULL;
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index 3a0f3d3d..3e009208 100644
+index c250a03..bab8a23 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
-@@ -1150,6 +1150,82 @@ static inline __attribute__((always_inline)) void spu_hop_note(spu_context* ctx,
+@@ -1176,6 +1176,82 @@ static inline __attribute__((always_inline)) void spu_hop_note(spu_context* ctx,
          g_spu_trampoline_fn = spu_indirect_branch;                                               \
          return;                                                                                  \
      } while (0)
@@ -222,7 +224,7 @@ index 3a0f3d3d..3e009208 100644
   *
   * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
 diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
-index 121b2e17..d5a4bbfd 100644
+index 121b2e1..d5a4bbf 100644
 --- a/runtime/spu/spu_drain.c
 +++ b/runtime/spu/spu_drain.c
 @@ -667,6 +667,7 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
@@ -246,7 +248,7 @@ index 121b2e17..d5a4bbfd 100644
  }
  
 diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
-index cb21309e..3658efc5 100644
+index f9eee6a..11a58f8 100644
 --- a/tools/spu_lifter.py
 +++ b/tools/spu_lifter.py
 @@ -342,6 +342,64 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
@@ -323,7 +325,7 @@ index cb21309e..3658efc5 100644
          # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
          # Lets multiple lifted SPU images link into one binary without collisions
          # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
-@@ -924,7 +984,7 @@ class SPULifter:
+@@ -950,7 +1010,7 @@ class SPULifter:
                  return f"{_ied}SPU_RET(ctx);"
              # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
              # KZ3 patch 1096: direct hop when the resolver would only dispatch (SPU_IB_HOP, spu_context.h)
@@ -332,7 +334,7 @@ index cb21309e..3658efc5 100644
          # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
          if mn == "iret":
              return (f"{_ied}ctx->pc = ctx->srr0; "
-@@ -969,7 +1029,7 @@ class SPULifter:
+@@ -997,7 +1057,7 @@ class SPULifter:
                  if tgt_reg != "0":
                      return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
                  return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
@@ -341,8 +343,8 @@ index cb21309e..3658efc5 100644
  
          # hint-for-branch: pure performance hint, safe to drop
          if mn in ("hbr", "hbra", "hbrr"):
-@@ -1006,6 +1066,15 @@ class SPULifter:
-         # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
+@@ -1037,6 +1097,15 @@ class SPULifter:
+             return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, {self.prefix}spu_func_{tgt:08X}); }}")
          return self._hop(tgt)
  
 +    def _ib_hop(self, addr, texpr) -> str:
@@ -357,7 +359,7 @@ index cb21309e..3658efc5 100644
      def _hop(self, tgt) -> str:
          """KZ3 patch 1096: a static cross-function transfer. SPU_HOP (spu_context.h) tail-calls the target when
          the drain loop's per-hop hooks would only do bookkeeping, else sets the trampoline as before. LS 0 keeps
-@@ -1035,6 +1104,9 @@ class SPULifter:
+@@ -1066,6 +1135,9 @@ class SPULifter:
  
      def emit_source(self,header_name: str) -> str:
          lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
@@ -367,7 +369,7 @@ index cb21309e..3658efc5 100644
          for f in self.functions:
              lines.append(f"void {f.name}(spu_context* ctx) {{")
              # KZ3 patch 1082: one LS base / debug-gate snapshot per function that touches LS (see SOURCE_PREAMBLE).
-@@ -1075,6 +1147,12 @@ class SPULifter:
+@@ -1107,6 +1179,12 @@ class SPULifter:
          lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
          lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
          lines.append("        spu_register_function(e->addr, e->func);")
@@ -380,7 +382,7 @@ index cb21309e..3658efc5 100644
          lines.append("}")
          lines.append("")
          return "\n".join(lines)
-@@ -1249,6 +1327,10 @@ def main() -> None:
+@@ -1287,6 +1365,10 @@ def main() -> None:
                f"(`bi $rN` where rN is a brsl/bisl link reg): "
                f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
      lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining

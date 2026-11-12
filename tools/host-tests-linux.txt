@@ -20,6 +20,12 @@ tools/upstream/test_aa_surface.py
 tools/upstream/test_texture_gamma.py
 tools/upstream/test_pad_script_v2.py
 tools/test_runprov.py
+tools/test_play_runner.py
+tools/test_workflow.py
+tools/test_perf_ab.py
+tools/test_perf_session.py
+tools/test_ring_evidence.py
+tools/test_installer_probes.py
 tools/spu/test_kz3_gameplay.sh
 tools/release/test_firstrun.py
 tools/release/test_assemble_payload.py
@@ -122,3 +128,4 @@ tools/spu/test_r115_logroute.sh
 tools/upstream/test_sys_fs_flags.sh
 tools/spu/test_r118_walltime.sh
 tools/smoke/test_window_place.sh
+tools/spu/test_ppu_resv_registry.sh

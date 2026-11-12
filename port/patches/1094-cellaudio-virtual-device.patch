@@ -11,11 +11,13 @@ KZ3_AUDIO_VDEV_PERIOD_US = period. Diagnostic only, off by default; nothing is p
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours + upstream's WASAPI underrun count (note: upstream 3bf0233d keeps 60 ms queued and runs the mixer ahead: KZ3 audio timing changes).
 
+Rebased on ps3recomp v0.19.0 (shared v0.19 group C): context only, once 1046 is in.
+
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index 45c0a99b..9852bae3 100644
+index c9a5f25d..9aa5be17 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
-@@ -414,6 +414,100 @@ static void audio_backend_wait(void)
+@@ -417,6 +417,100 @@ static void audio_backend_wait(void)
  }
  
  
@@ -116,7 +118,7 @@ index 45c0a99b..9852bae3 100644
  #endif /* AUDIO_BACKEND_WASAPI */
  
  /* ---------------------------------------------------------------------------
-@@ -705,8 +799,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+@@ -739,8 +833,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
      unsigned long long blocks = 0;
      while (s_mix_thread_running) {
@@ -129,7 +131,7 @@ index 45c0a99b..9852bae3 100644
  #if AUDIO_BACKEND_WASAPI
          /* Device queue under half a block: it is about to play silence (an
           * audible click/stutter). AUDIO_RATE reports how often. */
-@@ -773,6 +869,13 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+@@ -801,6 +897,13 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                } else if (e) fprintf(stderr, "[audio-wav] cannot open %s\n", e);
            }
            if (_kf) {
@@ -143,7 +145,7 @@ index 45c0a99b..9852bae3 100644
                fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _kf);
                _kblocks++;
                if (_kblocks % (10u * CELL_AUDIO_SAMPLE_RATE / CELL_AUDIO_BLOCK_SAMPLES) == 0) {
-@@ -794,6 +897,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+@@ -822,6 +925,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
            } }
          /* kz3-audio-wav end */
          audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);

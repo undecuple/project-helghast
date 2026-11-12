@@ -3,9 +3,13 @@ were the last input (pad_prompt_set() answers keycaps then). The text layer (por
 kz3_net_hooks.h) names pad buttons in the game's own strings ("Swap L1 and L2", "Hold down R2") by this set:
 Xbox pad LB/LT/RB/RT, PlayStation pad unchanged. No pad connected = the PS3 set (the game's text).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 2c0d948..db486e9 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -1327,6 +1327,18 @@
+@@ -1481,6 +1481,18 @@ int pad_prompt_set(void)
      return pad_prompt_set_for_device(dev);
  }
  

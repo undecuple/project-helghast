@@ -1,10 +1,13 @@
 Rebased on ps3recomp v0.17.0 (SPU pass 95): partly absorbed: the scan/exit bitsets under the lock-line lock are #388 (KZ3's PR); left: the exit-code notify under the lock, spu_taskset_dump_tracked.
 
+Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): the hunks are the v0.18 ones, unchanged
+(the round-2 1022 keeps spu_task2_exit_code_set, so the first hunk is back); context regenerated.
+
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
-index d1509499..06eb9596 100644
+index def19f6d..2aa23113 100644
 --- a/runtime/spu/spu_workload.c
 +++ b/runtime/spu/spu_workload.c
-@@ -466,8 +466,8 @@ void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_co
+@@ -606,8 +606,8 @@ void spu_task2_exit_code_set(uint32_t taskset_ea, uint32_t task, int32_t exit_co
          e[10] = (uint8_t)((uint32_t)exit_code >> 8); e[11] = (uint8_t)exit_code;
          e[14] = 0; e[15] = (uint8_t)((e[15] & 0xF0u) | 2u);
      }
@@ -14,7 +17,7 @@ index d1509499..06eb9596 100644
      static int n;
      if (n++ < 16)
          fprintf(stderr, "[task2] taskset 0x%08X task %u %s exit_code[%u] state 0x%02X code %d\n", taskset_ea,
-@@ -542,6 +542,30 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
+@@ -687,6 +687,30 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
      if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu, 0);
  }
  
@@ -46,10 +49,10 @@ index d1509499..06eb9596 100644
   * may have created a task or made one ready (KZ3's Havok task calls the SPU-side cellSpursCreateTask2,
   * elf_00f6b900 LS 0x1C710, then joins it). The real taskset policy module would schedule it; scan the
 diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
-index c3a49075..75e02833 100644
+index 5dbb203a..20395739 100644
 --- a/runtime/syscalls/sys_event.c
 +++ b/runtime/syscalls/sys_event.c
-@@ -310,6 +310,7 @@ static void kz3_semdump_now(const char* why)
+@@ -368,6 +368,7 @@ static void kz3_semdump_now(const char* why)
  {
      uint32_t r28 = s_sd_r[0], r29 = s_sd_r[1], r30 = s_sd_r[2], r31 = s_sd_r[3];
      fprintf(stderr, "[semdump] %s r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", why, r28, r29, r30, r31);
@@ -57,3 +60,13 @@ index c3a49075..75e02833 100644
      kz3_semdump_region("sem", r30, 0x10);
      /* KZ3 patch 1029: a Havok semaphore (0x8E88E4) keeps its (waiters << 16 | count) word at [r30+4]. */
      if (r30 >= 0x10000u && r30 < 0xF0000000u) { uint32_t wp = sd_rd32(r30 + 4u);
+diff --git a/tests/sync_stress/test_shims.c b/tests/sync_stress/test_shims.c
+--- a/tests/sync_stress/test_shims.c
++++ b/tests/sync_stress/test_shims.c
+@@ -57,3 +57,6 @@
+  * never read back. */
+ uint32_t g_spu_pending_evt[3];
+ int      g_spu_pending_evt_valid;
++
++/* KZ3 patch 1030: the taskset dump sys_event.c calls from its diagnostic path (runtime/spu/spu_workload.c in the game build). */
++void spu_taskset_dump_tracked(const char* why) { (void)why; }

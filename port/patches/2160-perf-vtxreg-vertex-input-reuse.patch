@@ -1,0 +1,234 @@
+Counter-only vertex input reuse profile (RSX_PERF_VTXREG=1, default off, with RSX_PERF=1 RSX_PERF_PROF=A,B).
+
+For every draw that reached the vertex stage inside the window: served by the device vertex cache, or fetched; a fetched draw is
+classified against the previous fetched draw (attribute words, batches/source spans, a byte compare against a copy of the previous
+source bytes, and the tracked-write page test). Prints [perf-vtxreg] when the window closes. The classifier is the pure header
+libs/video/rsx_vtx_reg.h (host test tools/smoke/test_vtx_reg.sh). No decision reads any counter.
+
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c	2026-11-10 22:40:34.894436899 -0600
++++ b/libs/video/rsx_live_draw.c	2026-11-10 22:40:58.086968734 -0600
+@@ -4415,6 +4415,7 @@
+ }
+ 
+ static void ld_trg_report(void);   /* patch 2158 */
++static void ld_vr_report(void);    /* patch 2160 */
+ void rsx_live_draw_perf_dump(void)   /* the reporter, when the RSX_PERF_PROF window closes */
+ {
+     LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+@@ -4422,6 +4423,7 @@
+     ld_fx_report(tick_ms);   /* patch 2125 */
+     ld_pd_report(tick_ms);   /* patch 2135 */
+     ld_trg_report();         /* patch 2158 */
++    ld_vr_report();          /* patch 2160 */
+     for (int which = 0; which < 3; which++) {
+         ld_rd_t* r = g_ld_rd[which]; const u32 n = g_ld_rd_n[which];
+         const char* tag = which == 0 ? "redecode" : which == 1 ? "hash" : "newtex";
+@@ -10148,6 +10150,7 @@
+  * per-unit binding row on top (g_ld_te, below). The diagnostics that read or rewrite units inside the loop keep the full
+  * path, as for patch 2136. */
+ #include "rsx_tex_epoch.h"
++#include "rsx_vtx_reg.h"   /* patch 2160 */
+ static rsx_tex_dec g_ld_tdc[16];
+ static rsx_tex_dec_stat g_ld_tds;
+ static int ld_tex_epoch_mode(void)
+@@ -14332,6 +14335,88 @@
+     memset(&g_ld_tds, 0, sizeof g_ld_tds);
+ }
+ 
++/* KZ3 patch 2160 (RSX pass 148): RSX_PERF_VTXREG=1, inside the RSX_PERF_PROF=A,B window (RSX_PERF=1): do the vertex
++ * fetch/convert inputs repeat between consecutive fetched draws? Counters only (a cached flag test per draw when off);
++ * the classes and what they can and cannot know are in rsx_vtx_reg.h. The key is built like 2047's (ld_vc_key) but
++ * without its eligibility counters; source spans like ld_vc_spans (index range + each used attribute's element range). */
++static rsx_vr_prev g_ld_vrp; static rsx_vr_stat g_ld_vrs;
++static int ld_vr_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_PERF_VTXREG"); on = (e && *e && *e != '0') ? 1 : 0;
++                  if (on) fprintf(stderr, "[perf-vtxreg] vertex input reuse counters on (RSX_PERF_VTXREG=1, patch 2160)\n"); }
++    return on;
++}
++static const u8* ld_vr_ptr_cb(void* ctx, const rsx_vr_span* sp) { (void)ctx; return (const u8*)guest_ptr(sp->loc, sp->off, sp->len); }
++static int ld_vr_written_cb(void* ctx, const rsx_vr_span* sp, u32 since) { (void)ctx; return ld_vc_span_written((const ld_vc_span*)sp, since); }
++static void ld_vr_draw(u32 prim, const rsx_vertex_layout_plan* layout, int served)
++{
++    if (!ld_vr_on() || !rsx_perf_walk_on()) return;
++    g_ld_vrs.draws++;
++    if (served) { g_ld_vrs.hits++; g_ld_vrs.hit_verts += dc.n_verts; return; }
++    if (!dc.fetch_ok || !ld_vertex_compact_payload()) { g_ld_vrs.skipped++; return; }
++    static u32 key[RSX_VR_KEY_MAX];
++    if (2u * (dc.n_arr + dc.n_idx) + 16u * 10u + 32u > RSX_VR_KEY_MAX) { g_ld_vrs.skipped++; return; }
++    u32 n = 0;
++    key[n++] = prim; key[n++] = layout->mask; key[n++] = layout->stride; key[n++] = layout->count;
++    key[n++] = rsx_dsp_vertex_data_base_offset(&g.rsx); key[n++] = rsx_dsp_vertex_data_base_index(&g.rsx);
++    key[n++] = rsx_dsp_reg(&g.rsx, 0x1FC0);
++    for (u32 slot = 0; slot < layout->count; slot++) {
++        const u32 attr = layout->attrs[slot];
++        rsx_dsp_vertex_attr d; rsx_dsp_get_vertex_attr(&g.rsx, attr, &d);
++        key[n++] = attr; key[n++] = d.type; key[n++] = d.size; key[n++] = d.stride; key[n++] = d.frequency;
++        key[n++] = d.offset; key[n++] = d.location;
++        if (!d.type || !d.size) { float dv[4]; rsx_dsp_vertex_default(&g.rsx, attr, dv); memcpy(key + n, dv, 16); n += 4; }
++    }
++    const u32 attr_n = n;
++    key[n++] = dc.n_arr;
++    for (u32 i = 0; i < dc.n_arr; i++) { key[n++] = dc.arr[i].first; key[n++] = dc.arr[i].count; }
++    key[n++] = dc.n_idx;
++    rsx_vr_span sp[RSX_VR_SPANS]; u32 ns = 0; int ok = !(dc.inl || dc.inl_bytes);
++    if (dc.n_idx) {
++        rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
++        key[n++] = ia.location; key[n++] = ia.offset; key[n++] = (u32)ia.is_u32;
++        for (u32 i = 0; i < dc.n_idx; i++) { key[n++] = dc.idx[i].first; key[n++] = dc.idx[i].count; }
++        const u32 esz = ia.is_u32 ? 4u : 2u;
++        u64 lo = ~0ull, hi = 0;
++        for (u32 i = 0; i < dc.n_idx; i++) {
++            if (!dc.idx[i].count) continue;
++            const u64 a = (u64)ia.offset + (u64)dc.idx[i].first * esz, b = a + (u64)dc.idx[i].count * esz;
++            if (a < lo) lo = a;
++            if (b > hi) hi = b;
++        }
++        if (hi > lo) {
++            if (hi > 0x100000000ull || ia.location > 1u) ok = 0;
++            else { sp[ns].loc = ia.location; sp[ns].off = (u32)lo; sp[ns].len = (u32)(hi - lo); ns++; }
++        }
++    }
++    for (u32 slot = 0; slot < dc.layout.count && ok; slot++) {
++        const rsx_vertex_fetch_attr* f = &dc.fetch_plan.attr[dc.layout.attrs[slot]];
++        if (!f->desc.type || !f->desc.size) continue;
++        if (!f->stable_base || f->desc.location > 1u || ns >= RSX_VR_SPANS) { ok = 0; break; }
++        const u64 a = (u64)dc.fetch_plan.base_offset + f->desc.offset + (u64)f->stable_first * f->stride;
++        const u64 b = (u64)dc.fetch_plan.base_offset + f->desc.offset + (u64)f->stable_last * f->stride + f->elem_size;
++        if (b > 0x100000000ull || b <= a) { ok = 0; break; }
++        sp[ns].loc = f->desc.location; sp[ns].off = (u32)a; sp[ns].len = (u32)(b - a); ns++;
++    }
++    rsx_vr_fetched(&g_ld_vrp, &g_ld_vrs, key, n, attr_n, sp, ok ? ns : 0u, dc.n_verts, g_ld_frames, ld_vr_ptr_cb,
++                   ld_vr_written_cb, NULL);
++}
++static void ld_vr_report(void)
++{
++    if (!ld_vr_on() || !g_ld_vrs.draws) return;
++    static const char* const nm[RSX_VR_N] = { "new-attr", "range", "same-clean", "same-page-fp", "chg-tracked", "chg-untracked", "unknown" };
++    const rsx_vr_stat* s = &g_ld_vrs;
++    const double nd = (double)s->draws, nf = s->fetched ? (double)s->fetched : 1.0, nv = s->verts ? (double)s->verts : 1.0;
++    fprintf(stderr, "[perf-vtxreg] draws %llu: cache-served %.1f%% (%llu verts), fetched %.1f%% (%llu verts), skipped %llu |"
++                    " fetched draws (%% of draws | %% of fetched verts):", (unsigned long long)s->draws, 100.0 * (double)s->hits / nd,
++            (unsigned long long)s->hit_verts, 100.0 * (double)s->fetched / nd, (unsigned long long)s->verts, (unsigned long long)s->skipped);
++    for (int c = 0; c < RSX_VR_N; c++)
++        fprintf(stderr, " %s %.1f|%.1f", nm[c], 100.0 * (double)s->cls[c] / nd, 100.0 * (double)s->cls_verts[c] / nv);
++    fprintf(stderr, " | compared %llu KB\n", (unsigned long long)(s->cmp_bytes >> 10)); (void)nf;
++    memset(&g_ld_vrs, 0, sizeof g_ld_vrs);   /* the previous-draw memo survives (it is the same stream) */
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -14420,6 +14505,7 @@
+     if (!dc.n_source_refs)
+         dc.n_source_refs = dc.n_verts;
+     LDW_ADD(RSX_PERF_W_VTX_T, vtx_t0);
++    ld_vr_draw(prim, &used_layout, vc_hit != NULL);   /* patch 2160: counters only, after the timed region */
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.vertex_fetch_pack_qpc +=
+         (u64)(ld_profile_qpc() - fetch_pack_begin);
+diff -ruN a/libs/video/rsx_vtx_reg.h b/libs/video/rsx_vtx_reg.h
+--- a/libs/video/rsx_vtx_reg.h	1969-12-31 18:00:00.000000000 -0600
++++ b/libs/video/rsx_vtx_reg.h	2026-11-10 22:40:34.898436991 -0600
+@@ -0,0 +1,99 @@
++/* KZ3 patch 2160 (RSX pass 148): RSX_PERF_VTXREG=1 counters, the pure core. Do vertex fetch/convert inputs repeat between
++ * consecutive fetched draws, and could the source bytes have changed? Counters only: no decision reads it.
++ *
++ * Per fetched draw (a draw the device vertex cache did not serve) the caller passes the fetch key (attribute words first,
++ * then the batch/index words), the source spans (index range + each used attribute's element range from the fetch plan)
++ * and the vertex count. The previous fetched draw's key, spans and a COPY of its source bytes are kept, so "unchanged"
++ * is a real byte compare, not the page notes: tracked writers (64 KB page bitmap + stamps, the same test the 2047/2092
++ * cache uses) are asked separately, which shows what the page notes alone could and could not tell:
++ *   NEW_ATTR      attribute words differ (format/stride/offset/location/base/layout), or no previous draw
++ *   RANGE         attribute words equal, batches or source spans differ (other mesh range, other index bytes)
++ *   SAME_CLEAN    key and spans equal, bytes identical, no tracked write       -> a converted-vertex cache could replay it
++ *   SAME_PAGE_FP  key and spans equal, bytes identical, a tracked write noted on a page (64 KB granularity, live bitmap
++ *                 covers the whole frame, so a write before the previous draw also counts: an upper bound)
++ *   CHG_TRACKED   bytes differ and a tracked writer noted the pages
++ *   CHG_UNTRACKED bytes differ and nothing noted it (PPU stores recompiled code makes: only a compare can see them)
++ *   UNKNOWN       not classifiable (inline vertices, no span, source too big for the copy, no guest pointer, no copy yet)
++ * Not knowable here: a write BETWEEN two draws of the same frame (the bitmap has frame granularity); the byte compare
++ * covers it, but only for draws that actually fetched (cache-served draws have no fetch plan and are counted apart). */
++#ifndef RSX_VTX_REG_H
++#define RSX_VTX_REG_H
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define RSX_VR_KEY_MAX 1200u
++#define RSX_VR_SPANS 17u
++#define RSX_VR_COPY_MAX (8u << 20)
++
++typedef struct { uint32_t loc, off, len; } rsx_vr_span;   /* same layout as rsx_vd_span */
++enum { RSX_VR_NEW_ATTR, RSX_VR_RANGE, RSX_VR_SAME_CLEAN, RSX_VR_SAME_PAGE_FP, RSX_VR_CHG_TRACKED, RSX_VR_CHG_UNTRACKED,
++       RSX_VR_UNKNOWN, RSX_VR_N };
++typedef const uint8_t* (*rsx_vr_ptr_fn)(void* ctx, const rsx_vr_span* sp);
++typedef int (*rsx_vr_written_fn)(void* ctx, const rsx_vr_span* sp, uint32_t since_frame);
++
++typedef struct {
++    int have, have_copy;
++    uint32_t key[RSX_VR_KEY_MAX]; uint32_t key_n, attr_n;
++    rsx_vr_span spans[RSX_VR_SPANS]; uint32_t n_spans;
++    uint32_t frame;
++    uint8_t* copy; uint32_t copy_cap, copy_bytes;
++} rsx_vr_prev;
++typedef struct {
++    uint64_t draws, hits, fetched, verts, hit_verts, skipped;
++    uint64_t cls[RSX_VR_N], cls_verts[RSX_VR_N];
++    uint64_t cmp_bytes;
++} rsx_vr_stat;
++
++/* spans: n_spans 0 = unclassifiable. Returns the class. */
++static inline int rsx_vr_fetched(rsx_vr_prev* p, rsx_vr_stat* st, const uint32_t* key, uint32_t key_n, uint32_t attr_n,
++                                 const rsx_vr_span* spans, uint32_t n_spans, uint32_t verts, uint32_t frame,
++                                 rsx_vr_ptr_fn ptr, rsx_vr_written_fn written, void* ctx)
++{
++    int cls;
++    uint32_t total = 0;
++    for (uint32_t i = 0; i < n_spans; i++) total += spans[i].len;
++    const int classifiable = n_spans > 0 && n_spans <= RSX_VR_SPANS && total <= RSX_VR_COPY_MAX && key_n <= RSX_VR_KEY_MAX;
++    if (!p->have || p->attr_n != attr_n || memcmp(p->key, key, (size_t)attr_n * 4u)) cls = RSX_VR_NEW_ATTR;
++    else if (p->key_n != key_n || memcmp(p->key, key, (size_t)key_n * 4u) || p->n_spans != n_spans ||
++             (n_spans && memcmp(p->spans, spans, (size_t)n_spans * sizeof spans[0]))) cls = RSX_VR_RANGE;
++    else if (!classifiable || !p->have_copy) cls = RSX_VR_UNKNOWN;
++    else {
++        int same = 1, ok = 1;
++        uint32_t o = 0;
++        for (uint32_t i = 0; i < n_spans && ok; i++) {
++            const uint8_t* b = ptr(ctx, &spans[i]);
++            if (!b) { ok = 0; break; }
++            if (memcmp(b, p->copy + o, spans[i].len)) same = 0;
++            o += spans[i].len; st->cmp_bytes += spans[i].len;
++        }
++        int wr = 0;
++        for (uint32_t i = 0; i < n_spans && ok; i++) if (written(ctx, &spans[i], p->frame)) wr = 1;
++        cls = !ok ? RSX_VR_UNKNOWN : same ? (wr ? RSX_VR_SAME_PAGE_FP : RSX_VR_SAME_CLEAN)
++                                          : (wr ? RSX_VR_CHG_TRACKED : RSX_VR_CHG_UNTRACKED);
++    }
++    st->fetched++; st->verts += verts; st->cls[cls]++; st->cls_verts[cls] += verts;
++    /* keep this draw as the previous one */
++    if (key_n <= RSX_VR_KEY_MAX) { memcpy(p->key, key, (size_t)key_n * 4u); p->key_n = key_n; p->attr_n = attr_n; p->have = 1; }
++    else p->have = 0;
++    p->n_spans = n_spans <= RSX_VR_SPANS ? n_spans : 0;
++    if (p->n_spans) memcpy(p->spans, spans, (size_t)n_spans * sizeof spans[0]);
++    p->frame = frame; p->have_copy = 0;
++    if (classifiable && p->have) {
++        if (p->copy_cap < total) {
++            uint8_t* n = (uint8_t*)realloc(p->copy, total);
++            if (n) { p->copy = n; p->copy_cap = total; }
++        }
++        if (p->copy_cap >= total) {
++            uint32_t o = 0; int ok = 1;
++            for (uint32_t i = 0; i < n_spans; i++) {
++                const uint8_t* b = ptr(ctx, &spans[i]);
++                if (!b) { ok = 0; break; }
++                memcpy(p->copy + o, b, spans[i].len); o += spans[i].len;
++            }
++            p->have_copy = ok; p->copy_bytes = o;
++        }
++    }
++    return cls;
++}
++#endif

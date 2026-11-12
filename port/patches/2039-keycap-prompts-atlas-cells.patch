@@ -10,9 +10,13 @@ signature it was drawn for, and a cache hit re-uploads (in place, patch 2035) wh
 cellPad.c: pad_kb_key_for_input(name, slot) for the lookups. KZ3_KEYCAPS=0 off; LD_KEYCAP_DBG=1 logs the
 fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/test_keycaps.sh.
 
---- a/libs/input/cellPad.c	2026-10-12 11:12:41.495991794 -0500
-+++ b/libs/input/cellPad.c	2026-10-12 11:25:57.970054607 -0500
-@@ -292,6 +292,11 @@
+Rebased on ps3recomp v0.19.0 (SPU pass 154): the include list of rsx_live_draw.c now has upstream's rsx_d3d12_device.h line; ours follows it.
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 5d24ff0..0f9a94f 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -578,6 +578,11 @@ int pad_kb_last_device_keyboard(void)
  {
      static int force = -1;
      if (force < 0) { const char* e = getenv("KZ3_KB_PROMPTS"); force = e ? atoi(e) : -1; if (force < 0) force = 2; }
@@ -24,7 +28,7 @@ fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/tes
      return force == 2 ? s_kb_last_keys : force;
  }
  
-@@ -308,6 +313,18 @@
+@@ -594,6 +599,18 @@ int pad_kb_key_for_button(unsigned bit)
  
  const char* pad_kb_key_label(int vk) { return pad_kb_key_name(vk); }
  
@@ -43,8 +47,11 @@ fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/tes
  /* KZ3_KB_TEST_KEY=<key name>: a capture that waits for a key gets this one after 0.7 s (Xvfb runs have no keyboard
   * focus; the page's capture is otherwise untestable there). */
  static int pad_kb_test_key(void)
+diff --git a/libs/video/rsx_keycaps.h b/libs/video/rsx_keycaps.h
+new file mode 100644
+index 0000000..e2416f7
 --- /dev/null
-+++ b/libs/video/rsx_keycaps.h	2026-10-12 11:25:57.969485039 -0500
++++ b/libs/video/rsx_keycaps.h
 @@ -0,0 +1,434 @@
 +/* KZ3 patch 2039 (RSX pass 39 hooks D/E): keycap prompts.
 + *
@@ -480,17 +487,19 @@ fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/tes
 +}
 +
 +#endif
---- a/libs/video/rsx_live_draw.c	2026-10-12 11:12:41.494991772 -0500
-+++ b/libs/video/rsx_live_draw.c	2026-10-12 11:15:24.963663414 -0500
-@@ -123,6 +123,7 @@
- #include <dxgi1_4.h>
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index f0d644d..8bae6af 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -125,6 +125,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
  #include <d3dcompiler.h>
  #include "rsx_vertex_formats.h"
+ #include "rsx_d3d12_device.h"
 +#include "rsx_keycaps.h"   /* patch 2039: keycap prompts */
  #include <sys/stat.h>
  
  #pragma comment(lib, "d3d12.lib")
-@@ -289,6 +290,8 @@
+@@ -297,6 +298,8 @@ typedef struct {
      u32 quiet;  /* patch 2033: consecutive hashes that found the same bytes (saturating) */
      u32 written;   /* patch 2033: a tracked writer touched the span since the last hash */
      u32 skip_frame;   /* patch 2033: frame of the last counted skip */
@@ -499,7 +508,7 @@ fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/tes
  } texcache_t;
  typedef struct {
      u32 location, offset, format, width, height, pitch;
-@@ -2428,6 +2431,15 @@
+@@ -2441,6 +2444,15 @@ typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
   * the copy), later draws the new ones, the same as a new resource gave. LD_TEX_INPLACE=0 restores the old path.
   * Cube, 3D and vertex textures keep the old path. Counted in [tex-hash] as inplace=N. */
  static ID3D12Resource* g_ld_tex_reuse;
@@ -515,7 +524,7 @@ fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/tes
  static unsigned long long g_ld_tex_inplace_n;
  static unsigned long long g_ld_b8_direct_n;   /* patch 2036 */
  static int ld_tex_inplace_on(void)
-@@ -3151,6 +3163,20 @@
+@@ -3164,6 +3176,20 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
              }
              return create_texture_cube(dxgi, cube_levels, n_mips);
          }
@@ -536,7 +545,7 @@ fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/tes
          tex_level_t levels[14];
          u32 mw = w, mh = h, off = 0, n = 0;
          for (u32 m = 0; m < n_mips; m++) {
-@@ -3166,7 +3192,9 @@
+@@ -3179,7 +3205,9 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
              mw = mw > 1 ? mw >> 1 : 1;
              mh = mh > 1 ? mh >> 1 : 1;
          }
@@ -547,7 +556,7 @@ fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/tes
      }
  
      if (ld_is_float_tex(base_fmt))   /* patch 2014 */
-@@ -3931,6 +3959,24 @@
+@@ -3944,6 +3972,24 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
  
      for (u32 i = ld_tex_index_find(t, remap); i != UINT32_MAX; i = UINT32_MAX) {   /* patch 2033: indexed */
          texcache_t* entry = &g.textures[i];
@@ -572,7 +581,7 @@ fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/tes
          if (refresh_enabled && entry->tex &&
              entry->last_hash_frame != g_ld_frames &&
              ld_tex_hash_due(entry->location, entry->offset, entry->span, entry->last_hash_frame,
-@@ -3988,9 +4034,11 @@
+@@ -4001,9 +4047,11 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
              if (readable && hash != entry->content_hash) {
                  /* patch 2035: offer the current resource for an in-place update */
                  g_ld_tex_reuse = ld_tex_inplace_on() ? entry->tex : NULL;
@@ -584,7 +593,7 @@ fingerprint of every candidate upload. Log: [keycap]. Host test: tools/smoke/tes
                  if (replacement && replacement == entry->tex) {
                      entry->content_hash = hash;   /* same resource, same SRV: nothing to rewrite or retire */
                      g_ld_tex_inplace_n++;
-@@ -4066,7 +4114,10 @@
+@@ -4079,7 +4127,10 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
          int readable = 0;
          replacement.content_hash = texture_content_hash(t, &readable);
      }

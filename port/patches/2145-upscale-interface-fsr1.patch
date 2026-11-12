@@ -18,10 +18,11 @@ The intermediate texture is re-made whenever it is missing or its size differs f
 output (from the Killzone 2 port's patch 6052; otherwise its size goes stale after a resolution change).
 Upstream candidate (the interface and FSR 1 backend are generic).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): the include line for rsx_d3d12_device.h (patch 2099 added it; upstream has it) is not in the context any more.
 
 diff --git a/libs/video/fsr1/LICENSE.txt b/libs/video/fsr1/LICENSE.txt
 new file mode 100644
-index 00000000..324cba59
+index 0000000..324cba5
 --- /dev/null
 +++ b/libs/video/fsr1/LICENSE.txt
 @@ -0,0 +1,19 @@
@@ -46,7 +47,7 @@ index 00000000..324cba59
 +THE SOFTWARE.
 diff --git a/libs/video/fsr1/README.txt b/libs/video/fsr1/README.txt
 new file mode 100644
-index 00000000..a6a7ca3c
+index 0000000..a6a7ca3
 --- /dev/null
 +++ b/libs/video/fsr1/README.txt
 @@ -0,0 +1,13 @@
@@ -65,7 +66,7 @@ index 00000000..a6a7ca3c
 +for the D3D12 shader compile.
 diff --git a/libs/video/fsr1/ffx_a.h b/libs/video/fsr1/ffx_a.h
 new file mode 100644
-index 00000000..d04bff55
+index 0000000..d04bff5
 --- /dev/null
 +++ b/libs/video/fsr1/ffx_a.h
 @@ -0,0 +1,2656 @@
@@ -2727,7 +2728,7 @@ index 00000000..d04bff55
 +#endif
 diff --git a/libs/video/fsr1/ffx_fsr1.h b/libs/video/fsr1/ffx_fsr1.h
 new file mode 100644
-index 00000000..4e0b3d54
+index 0000000..4e0b3d5
 --- /dev/null
 +++ b/libs/video/fsr1/ffx_fsr1.h
 @@ -0,0 +1,1199 @@
@@ -3932,7 +3933,7 @@ index 00000000..4e0b3d54
 +#endif
 diff --git a/libs/video/fsr1/fsr1_embed.h b/libs/video/fsr1/fsr1_embed.h
 new file mode 100644
-index 00000000..d9e804a0
+index 0000000..d9e804a
 --- /dev/null
 +++ b/libs/video/fsr1/fsr1_embed.h
 @@ -0,0 +1,3861 @@
@@ -7798,18 +7799,18 @@ index 00000000..d9e804a0
 +  "#endif",
 +};
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index f2b1cb38..1e1942f9 100644
+index 94843bb..4d8eaee 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -229,6 +229,7 @@ static uint8_t* ld_prompt_remap_cells(const uint8_t* cur, uint32_t w, uint32_t h
+@@ -146,6 +146,7 @@ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context *
+ #include "rsx_pso_keys_hdr.h"   /* patch 2141: key file header with the translator id */
  #include "rsx_tex_lru.h"        /* patch 2075 */
  #include "rsx_gpupass.h"        /* patch 2086 */
- #include "rsx_d3d12_device.h"   /* patch 2099: WARP fallback */
 +#include "rsx_upscale.h"        /* patch 2145: RSX_UPSCALE=fsr1 */
  #include <sys/stat.h>
  
  #pragma comment(lib, "d3d12.lib")
-@@ -15742,6 +15743,23 @@ static HWND g_dm_hwnd;
+@@ -15649,6 +15650,23 @@ static HWND g_dm_hwnd;
  static u32 g_dm_bb_w, g_dm_bb_h;              /* back-buffer size */
  static ID3D12RootSignature* g_dm_rootsig[2];   /* [filter]: the static sampler differs */
  static ID3D12PipelineState* g_dm_pso[2];
@@ -7833,7 +7834,7 @@ index f2b1cb38..1e1942f9 100644
  static int g_dm_failed;
  static int g_dm_scaling = RSX_DM_SCALING_DEFAULT, g_dm_filter = RSX_DM_BILINEAR;
  
-@@ -16046,6 +16064,31 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
+@@ -15953,6 +15971,31 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
      D3D12_RESOURCE_DESC sd;
      src->lpVtbl->GetDesc(src, &sd);
      ID3D12Resource* bb = g.backbuf[bbi];
@@ -7865,7 +7866,7 @@ index f2b1cb38..1e1942f9 100644
      const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
      D3D12_CPU_DESCRIPTOR_HANDLE cpu;
      g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
-@@ -16078,12 +16121,10 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
+@@ -15985,12 +16028,10 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
      g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
      ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
      g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
@@ -7880,7 +7881,7 @@ index f2b1cb38..1e1942f9 100644
      const D3D12_VIEWPORT vp = {(float)r.x, (float)r.y, (float)r.w, (float)r.h, 0.0f, 1.0f};
      const D3D12_RECT sc = {(LONG)r.x, (LONG)r.y, (LONG)(r.x + r.w), (LONG)(r.y + r.h)};
      g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
-@@ -19535,6 +19576,7 @@ void rsx_live_draw_shutdown(void)
+@@ -19445,6 +19486,7 @@ void rsx_live_draw_shutdown(void)
          g.depth_snapshot_rootsig->lpVtbl->Release(
              g.depth_snapshot_rootsig);
      if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
@@ -7890,7 +7891,7 @@ index f2b1cb38..1e1942f9 100644
      if (g_ld_info_queue) {
 diff --git a/libs/video/rsx_upscale.c b/libs/video/rsx_upscale.c
 new file mode 100644
-index 00000000..d42705cc
+index 0000000..d42705c
 --- /dev/null
 +++ b/libs/video/rsx_upscale.c
 @@ -0,0 +1,192 @@
@@ -8088,7 +8089,7 @@ index 00000000..d42705cc
 +uint64_t rsx_upscale_passes(const rsx_upscale* u) { return u ? u->passes : 0; }
 diff --git a/libs/video/rsx_upscale.h b/libs/video/rsx_upscale.h
 new file mode 100644
-index 00000000..c2c9e787
+index 0000000..c2c9e78
 --- /dev/null
 +++ b/libs/video/rsx_upscale.h
 @@ -0,0 +1,155 @@
@@ -8249,7 +8250,7 @@ index 00000000..c2c9e787
 +#endif
 diff --git a/libs/video/rsx_upscale_d3d12.c b/libs/video/rsx_upscale_d3d12.c
 new file mode 100644
-index 00000000..4185c968
+index 0000000..ad5227d
 --- /dev/null
 +++ b/libs/video/rsx_upscale_d3d12.c
 @@ -0,0 +1,269 @@
@@ -8524,7 +8525,7 @@ index 00000000..4185c968
 +#endif /* _WIN32 */
 diff --git a/libs/video/rsx_upscale_fsr1.c b/libs/video/rsx_upscale_fsr1.c
 new file mode 100644
-index 00000000..5a87cf4c
+index 0000000..5a87cf4
 --- /dev/null
 +++ b/libs/video/rsx_upscale_fsr1.c
 @@ -0,0 +1,102 @@

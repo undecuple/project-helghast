@@ -283,6 +283,21 @@ class Prov:
                               "secret-looking names redacted; harness defaults added as in the profile")
         self.step("config", "env", f_env)
 
+        def f_play():
+            scenario = os.environ.get("KZ3_PLAY_SCENARIO")
+            if not scenario:
+                return known(None, "no log-gated play scenario configured")
+            controller = self.root_path("tools/gameplay/play.py")
+            if not controller:
+                return unknown("play controller is missing from the checkout")
+            with open(scenario) as stream:
+                recipe = json.load(stream)
+            return known({"scenario_sha256": sha256_file(scenario), "controller_sha256": sha256_file(controller),
+                          "path": scenario, "step_ids": [s["id"] for s in recipe["steps"]],
+                          "capture_ids": [s["id"] for s in recipe["steps"] if s["op"] == "capture"]},
+                         "scenario and controller bytes/required steps at run start")
+        self.step("fixtures", "play", f_play)
+
         def f_proton():
             if not proton:
                 return unknown("no --proton given")
@@ -487,6 +502,19 @@ class Prov:
         self.step("outcome", "metrics", f_metrics)
         self.step("outcome", "levels_seen", lambda: self.levels_seen(log))
         self.step("outcome", "captures", lambda: self.captures(log))
+        def f_play_result():
+            configured = val(d["fixtures"].get("play"))
+            if not configured:
+                return known(None, "no log-gated play configured at start")
+            path = self.run_path("play.json")
+            if not os.path.isfile(path):
+                return unknown("configured play has no play.json result")
+            with open(path) as stream:
+                result = json.load(stream)
+            if not isinstance(result, dict) or result.get("schema") != "kz3.play/1":
+                return unknown("play.json has an invalid schema")
+            return known(result, "play.json produced by the sandboxed controller")
+        self.step("outcome", "play", f_play_result)
         self.step("outcome", "gpu", self.gpu_id)
         metrics = val(d["outcome"]["metrics"]) or {}
         flips, last = metrics.get("flips"), metrics.get("last_flip_ms")

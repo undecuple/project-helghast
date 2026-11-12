@@ -25,9 +25,13 @@ job_0116d380	0x4DD0	16	Gfx.LightProbes	KZ3_NATIVE_JOB_LP_LIGHT	dynamic-light SH:
 job_010f0f00	0x4DD0	17	Gfx.LightProbes	KZ3_NATIVE_JOB_LP_LIGHT	dynamic-light SH (1.00 twin)	0
 job_011d4680	0x52C0	18	Gfx.Post.Upsample	KZ3_NATIVE_JOB_UPSAMPLE	2x bilinear RGBA8 upsample row kernel, 9/3/3/1 >> 4, two output rows per call	1
 job_01158280	0x52C0	19	Gfx.Post.Upsample	KZ3_NATIVE_JOB_UPSAMPLE	2x bilinear RGBA8 upsample row kernel (1.00 twin)	0
-job_011f9c80	0x51F0	20	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOFGATHER	DOF gather: 36-tap disc sum per pixel (CoC-scaled, fa order of the SPU) then alpha/weight normalise to RGBA8 (pass 135)	0
+job_011f9c80	0x51F0	20	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOFGATHER	DOF gather: 36-tap disc sum per pixel (CoC-scaled, fa order of the SPU) then alpha/weight normalise to RGBA8 (pass 135)	1
 job_0117d880	0x51F0	21	Gfx.Post.DepthOfField	KZ3_NATIVE_JOB_DOFGATHER	DOF gather (1.00 twin)	0
 job_011f7d00	0x5460	22	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_MOTIONBLUR	MotionBlur blur row: 12 velocity-scaled taps per pixel (trapezoid weights, fa order of the SPU), weight normalise, times b0/256, to RGBA8 (pass 136; the prologue 0x5460 hops into the hot loop 0x5700)	0
 job_0117b900	0x5460	23	Gfx.Post.MotionBlur	KZ3_NATIVE_JOB_MOTIONBLUR	MotionBlur blur row (1.00 twin)	0
 job_01242c80	0x5670	24	Anim.Skinning	KZ3_NATIVE_JOB_SKIN	3-bone vertex skinning (prologue 0x5670 + software-pipelined loop 0x5868): two palettes, position + motion vector (half) + normal (half) + two 11:11:10 vectors, 32 bytes per vertex (pass 141)	1
 job_011c5b00	0x5670	25	Anim.Skinning	KZ3_NATIVE_JOB_SKIN	3-bone vertex skinning (1.00 twin)	0
+job_0125e300	0xDD80	26	Snd.Mixer	KZ3_NATIVE_JOB_SNDMIX|KZ3_NATIVE_JOB_SND_K7A	K7a mono->mono gain ramp (DD80 prologue + DE40/DE48 loop, 16 samples per iteration), default on since 2026-11-11 (toggle A/B about 14 % faster per call, 24 real records bit-exact; pass 159)	1
+job_011e1180	0xDD80	27	Snd.Mixer	KZ3_NATIVE_JOB_SNDMIX|KZ3_NATIVE_JOB_SND_K7A	K7a mono->mono gain ramp (1.00 twin)	0
+job_0125e300	0xCF80	28	Snd.Mixer	KZ3_NATIVE_JOB_SNDMIX|KZ3_NATIVE_JOB_SND_K3	K3 pitch resampler 4-tap polyphase (CF80 prologue + D100/D2DC loop, 8 outputs per iteration; returns the new phase in r3), opt-in (pass 159)	0
+job_011e1180	0xCF80	29	Snd.Mixer	KZ3_NATIVE_JOB_SNDMIX|KZ3_NATIVE_JOB_SND_K3	K3 pitch resampler (1.00 twin)	0

@@ -1,0 +1,108 @@
+PPU reservation registration is idempotent for stable context slots.
+
+Source: Ratchet & Clank port patch 6012-ppu-reservation-registry-idempotent.patch (MIT, ps3recomp-derived; credit for
+the NOTICE file: Ratchet & Clank port team). Reusing a thread-table slot registered the same ppu_context again on every
+thread start, so after ~127 starts the 128 places were full and ppu_resv_break_* no longer reached new threads.
+Registration now deduplicates under a mutex, publishes with a release count that readers load with acquire, and a
+genuine 129th distinct context aborts with a message. Capacity unchanged.
+
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 95a4541..0ea412e 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -26,6 +26,7 @@
+ #include <string.h>
+ #include <vector>
+ #include <atomic>
++#include <mutex>
+ #ifdef _WIN32
+ #  include <windows.h>
+ #else
+@@ -927,7 +928,12 @@ extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below)
+ #define PPU_RESV_MAX 128
+ #define PPU_RESV_INVALID 0x100000000ull   /* out of (uint32_t) ea range */
+ static ppu_context* g_resv_ctxs[PPU_RESV_MAX];
+-static volatile LONG g_resv_ctx_n = 0;
++/* Context slots are stable for the lifetime of guest execution. Reusing a
++ * thread-table slot must not consume another registry entry. Registrations
++ * serialize with each other; readers acquire the count before accessing the
++ * immutable, initialized pointer slots it publishes. */
++static std::atomic<long> g_resv_ctx_n{0};
++static std::mutex g_resv_registry_mutex;
+ /* Sharded by address: a single global lock convoyed all stwcx (workers spinning
+  * on a descheduled holder -> loader too slow to finish jobs). Shard by the
+  * 16-byte-block of ea so unrelated structures never serialize; same-structure
+@@ -943,9 +949,17 @@ static volatile LONG g_resv_locks[PPU_RESV_LOCKS];
+ extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
+ extern "C" void ppu_resv_register(ppu_context* c)
+ {
++    std::lock_guard<std::mutex> lock(g_resv_registry_mutex);
+     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
+-    long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
+-    if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
++    const long n = g_resv_ctx_n.load(std::memory_order_relaxed);
++    for (long i = 0; i < n; i++) if (g_resv_ctxs[i] == c) return;
++    if (n == PPU_RESV_MAX) {
++        fprintf(stderr, "[ppu] reservation registry exhausted: capacity=%u distinct contexts\n", PPU_RESV_MAX);
++        fflush(stderr);
++        abort();
++    }
++    g_resv_ctxs[n] = c;
++    g_resv_ctx_n.store(n + 1, std::memory_order_release);
+ }
+ /* Where every guest thread is, as a GUEST address.
+  *
+@@ -972,7 +986,7 @@ extern "C" void ppu_resv_register(ppu_context* c)
+  * last DIRECT call site and nothing more. */
+ extern "C" void ppu_report_guest_lrs(void)
+ {
+-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
++    long n = g_resv_ctx_n.load(std::memory_order_acquire);
+     for (long i = 0; i < n; i++) {
+         ppu_context* c = g_resv_ctxs[i];
+         if (!c) continue;
+@@ -997,7 +1011,7 @@ extern "C" void ppu_report_guest_lrs(void)
+ extern "C" void ppu_resv_break_store(uint64_t ea)
+ {
+     uint32_t a = (uint32_t)ea & ~3u;
+-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
++    long n = g_resv_ctx_n.load(std::memory_order_acquire);
+     for (long i = 0; i < n; i++) {
+         ppu_context* c = g_resv_ctxs[i];
+         if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & ~3u) == a)
+@@ -1015,7 +1029,7 @@ extern "C" void ppu_resv_break_line(uint32_t ea)
+ {
+     const uint32_t line = ea & ~127u;
+     ppu_context* self = g_active_ctx;
+-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
++    long n = g_resv_ctx_n.load(std::memory_order_acquire);
+     for (long i = 0; i < n; i++) {
+         ppu_context* c = g_resv_ctxs[i];
+         if (c && c != self && c->reserve_addr < PPU_RESV_INVALID &&
+@@ -1029,7 +1043,7 @@ static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
+ static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
+ {
+     uint64_t a = (uint32_t)addr;   /* match the inline guard: reserve_addr holds (uint32_t)ea */
+-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
++    long n = g_resv_ctx_n.load(std::memory_order_acquire);
+     for (long i = 0; i < n; i++) {
+         ppu_context* c = g_resv_ctxs[i];
+         if (c && c->reserve_addr == a) c->reserve_addr = PPU_RESV_INVALID;
+@@ -1041,13 +1055,13 @@ static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
+ static inline int resv_diag() { static int v = -1; if (v < 0) v = getenv("RESV_DIAG") ? 1 : 0; return v; }
+ static void resv_check_reg(ppu_context* self)
+ {
+-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
++    long n = g_resv_ctx_n.load(std::memory_order_acquire);
+     for (long i = 0; i < n; i++) if (g_resv_ctxs[i] == self) return;
+     static ppu_context* seen[64]; static long sn = 0;
+     for (long i = 0; i < sn; i++) if (seen[i] == self) return;
+     if (sn < 64) seen[sn++] = self;
+     fprintf(stderr, "[RESV-UNREG] stwcx/stdcx by UNREGISTERED ctx=%p tid=%llu (n_reg=%ld)\n",
+-            (void*)self, (unsigned long long)self->thread_id, g_resv_ctx_n);
++            (void*)self, (unsigned long long)self->thread_id, n);
+     fflush(stderr);
+ }
+ 

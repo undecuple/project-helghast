@@ -1,9 +1,9 @@
 KZ3 patch 1046 (SPU pass 34): KZ3_AUDIO_WAV=<file> writes the final cellAudio mix as a float32 WAV with a [audio-wav] start line (sample 0's host time) and samples-vs-elapsed drift lines; checker tools/spu/audio_check.py.
 
-Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
+Rebased on ps3recomp v0.19.0 (shared v0.19 group C): upstream moved the raw AUDIO_WAV dump into audio_dump_mix(); the KZ3_AUDIO_WAV block follows that call, unchanged.
 
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index 02b751b2..546f0004 100644
+index f231ea26..3dd967c6 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
 @@ -19,6 +19,7 @@
@@ -14,10 +14,10 @@ index 02b751b2..546f0004 100644
  #include <math.h>
  #include "ps3emu/log_first.h"
  #include "ps3emu/thread_name.h"
-@@ -623,6 +624,50 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
-         { static FILE* _wf = (FILE*)-1;
-           if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
-           if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+@@ -651,6 +652,50 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
+                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
+         audio_dump_mix();
 +        /* KZ3 patch 1046 (SPU pass 34): KZ3_AUDIO_WAV=<file>: the same final mix (after the +-1 clamp, what
 +         * audio_backend_submit hands the device) as a WAV (RIFF, format 3 = IEEE float32, 2 ch, 48 kHz; the
 +         * header sizes are fixed up every 10 s and at exit so a killed run still has a readable file). One

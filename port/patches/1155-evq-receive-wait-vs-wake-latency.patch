@@ -5,35 +5,12 @@ Walker-plan step 8c: pass 131 measured 0.22 ms per receive x ~300/s on ppu-main 
 max 2.8 ms: a spread far wider than one wake path, so mostly sender lateness; this table settles it per queue). Off (default) = no clock reads,
 no prints. Helper header runtime/platform/kz3_evq_lat.h; host test tools/spu/test_evq_lat.sh.
 
---- a/runtime/syscalls/sys_event.c
-+++ b/runtime/syscalls/sys_event.c
-@@ -4,6 +4,7 @@
- 
- #include "sys_event.h"
- #include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
-+#include "../platform/kz3_evq_lat.h"   /* KZ3 patch 1155 */
- #ifdef _WIN32
- #include "../platform/ps3_evcv.h"   /* KZ3 patch 1148 */
- #endif
-@@ -602,9 +603,18 @@
-         }
-     }
-     if (timeout_us == 0) {
-+        const long long t_sleep = q->count == 0 ? kz3_ws_now_ns() : 0;   /* KZ3 patch 1155: 0 unless KZ3_WAITSTAT=1 */
-+        int slept_evq = 0;
-         while (q->count == 0 && q->active && !q->cancelled) {
-+            slept_evq = 1;
-             ps3_evcv_sleep_cs(&q->not_empty, &q->lock, INFINITE);
-         }
-+        if (t_sleep || (kz3_waitstat_on() && !slept_evq)) {   /* KZ3 patch 1155: real wait vs wake latency */
-+            const long long t_run = kz3_ws_now_ns(), t_push = q->ws_wake;
-+            if (slept_evq && t_push >= t_sleep) kz3_evq_lat_note(queue_id, (uint32_t)ctx->lr, 1, t_push - t_sleep, t_run - t_push);
-+            else kz3_evq_lat_note(queue_id, (uint32_t)ctx->lr, 0, 0, 0);
-+            kz3_evq_lat_tick(t_run, stderr);
-+        }
-         if (q->count == 0 && q->cancelled) {
-             LeaveCriticalSection(&q->lock);
-             return (int64_t)(int32_t)CELL_ECANCELED;
+Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): KZ3's patch (not in R&C's series before), applied
+after 1144/1149: the untimed receive loop gained upstream's `q->waiters--` on cancel (context only). Plain git diff format.
+
+diff --git a/runtime/platform/kz3_evq_lat.h b/runtime/platform/kz3_evq_lat.h
+new file mode 100644
+index 00000000..3869c5b2
 --- /dev/null
 +++ b/runtime/platform/kz3_evq_lat.h
 @@ -0,0 +1,81 @@
@@ -118,3 +95,34 @@ no prints. Helper header runtime/platform/kz3_evq_lat.h; host test tools/spu/tes
 +        kz3_evq_lat_report(f);
 +}
 +#endif
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index 8e2ef8ce..32f96cc6 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -4,6 +4,7 @@
+ 
+ #include "sys_event.h"
+ #include "../platform/kz3_waitstat.h"   /* KZ3 patch 1144 */
++#include "../platform/kz3_evq_lat.h"   /* KZ3 patch 1155 */
+ #ifdef _WIN32
+ #include "../platform/ps3_evcv.h"   /* KZ3 patch 1148 */
+ #endif
+@@ -667,9 +668,18 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+         }
+     }
+     if (timeout_us == 0) {
++        const long long t_sleep = q->count == 0 ? kz3_ws_now_ns() : 0;   /* KZ3 patch 1155: 0 unless KZ3_WAITSTAT=1 */
++        int slept_evq = 0;
+         while (q->count == 0 && q->active && !q->cancelled) {
++            slept_evq = 1;
+             ps3_evcv_sleep_cs(&q->not_empty, &q->lock, INFINITE);
+         }
++        if (t_sleep || (kz3_waitstat_on() && !slept_evq)) {   /* KZ3 patch 1155: real wait vs wake latency */
++            const long long t_run = kz3_ws_now_ns(), t_push = q->ws_wake;
++            if (slept_evq && t_push >= t_sleep) kz3_evq_lat_note(queue_id, (uint32_t)ctx->lr, 1, t_push - t_sleep, t_run - t_push);
++            else kz3_evq_lat_note(queue_id, (uint32_t)ctx->lr, 0, 0, 0);
++            kz3_evq_lat_tick(t_run, stderr);
++        }
+         if (q->count == 0 && q->cancelled) {
+             q->waiters--;
+             LeaveCriticalSection(&q->lock);

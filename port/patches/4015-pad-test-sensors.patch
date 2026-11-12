@@ -5,9 +5,13 @@ SENSOR_ON, and the prompts and motion tips see a DualShock 4 with sensors, so an
 KZ3_WATCH32=EA[,EA...] (test only): logs every change of up to 16 guest words, checked on each SENSOR_ON pad read; an entry
 *EA+OFF watches the word at OFF from the pointer stored at EA (network pass 44).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index e4a5fe2..74bed58 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -753,7 +753,13 @@
+@@ -1042,7 +1042,13 @@ static int pad_sdl_enable_sensor(void* gc, int type)
   * opened the pad decides whether it can report motion at all). */
  static void pad_sdl_open_log(int p, PadSdlGamepad* gc, uint32_t id, unsigned long long now)
  {
@@ -22,7 +26,7 @@ KZ3_WATCH32=EA[,EA...] (test only): logs every change of up to 16 guest words, c
      s_port_dev[p] = pad_dev_from_sdl_type(PSDL(SDL_GetGamepadType)(gc));   /* 4011: prompts */
      const char* name = PSDL(SDL_GetGamepadName)(gc);
      printf("[pad] port %d: %s (%s), face %s/%s/%s/%s, sensors %s\n", p,
-@@ -1045,8 +1051,17 @@
+@@ -1337,8 +1343,17 @@ static void pad_prompt_track(void)
  }
  
  /* PAD_DEV_* of the device the prompts follow (the last input; before any, the first connected host pad). */
@@ -40,7 +44,7 @@ KZ3_WATCH32=EA[,EA...] (test only): logs every change of up to 16 guest words, c
      return pad_last_device_current(&s_last_dev, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS, NULL);
  }
  
-@@ -1054,6 +1069,7 @@
+@@ -1346,6 +1361,7 @@ int pad_prompt_device(void)
   * keyboard, XInput pads, pads without sensors and no device. For the motion tips (port/net/kz3_text_overrides.h). */
  int pad_prompt_motion(void)
  {
@@ -48,7 +52,7 @@ KZ3_WATCH32=EA[,EA...] (test only): logs every change of up to 16 guest words, c
      int port = -1;
      int dev = pad_last_device_current(&s_last_dev, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS, &port);
      if (dev == PAD_DEV_KEYBOARD || port < 0 || port >= PAD_MAX_HOST_PORTS) return 0;
-@@ -1799,6 +1815,44 @@
+@@ -2131,6 +2147,44 @@ skip_inject: ;
          data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = hs->has_sensor ? hs->sensor_y : 399;
          data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = hs->has_sensor ? hs->sensor_z : 512;
          data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = hs->has_sensor ? hs->sensor_g : 512;

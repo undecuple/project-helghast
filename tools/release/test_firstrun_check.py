@@ -332,11 +332,14 @@ def main():
         rc, out = run(["--dump", os.path.join(tmp, "missing"), "--update", u] + small)
         check("missing dump dir fails", rc == 1 and "FAIL D0" in out, out)
 
-        # H1: EBOOT SHA-256 against tools/release/eboot_sha256.json (or --hashes)
+        # H1: EBOOT SHA-256 against tools/release/eboot_ids.json (or --hashes)
         with open(fc.HASHES_FILE, encoding="utf-8") as f:
             shipped = json.load(f)
-        check("shipped hashes file has 1.14 and 1.00 entries", {"1.14", "1.00"} <= set(shipped)
-              and shipped["1.14"]["size"] == 21_228_256, shipped)
+        ents = {e["app_ver"]: e for e in shipped["entries"]}
+        check("shipped table has US 1.14 and 1.00 entries with a segment hash",
+              {"01.14", "01.00"} <= set(ents) and ents["01.14"]["size"] == 21_228_256 and all(
+                  e["title_id"] == "BCUS98234" and e["region"] == "US" and len(e["segment_sha256"]) == 64
+                  for e in ents.values()), shipped)
         elf = os.path.join(u, "USRDIR", "EBOOT.elf")
         got = fc.file_sha256(elf)
         hf = os.path.join(tmp, "hashes.json")
@@ -347,19 +350,121 @@ def main():
             return ["--hashes", hf]
 
         rc, out = run(["--dump", d, "--update", u] + small + hashes(""))
-        check("H1 unknown yet warns only", rc == 0 and levels(out, "H1") == {"WARN"} and "unknown yet" in out
+        check("H1 unknown yet warns only", rc == 0 and levels(out, "H1") == {"WARN"} and "no known EBOOT hashes yet" in out
               and got in out, out)
         rc, out = run(["--dump", d, "--update", u] + small + hashes(got.upper()))
         check("H1 match is OK", rc == 0 and levels(out, "H1") == {"OK"}, out)
         rc, out = run(["--dump", d, "--update", u] + small + hashes("ab" * 32))
-        check("H1 mismatch warns with size and both hashes", rc == 0 and levels(out, "H1") == {"WARN"}
-              and got in out and "ab" * 32 in out and "21,228,256" in out, out)
+        check("H1 mismatch (old format) warns: unknown or modified, with size and hash", rc == 0 and levels(out, "H1") == {"WARN"}
+              and got in out and "not a known build" in out and "21,228,256" in out, out)
         rc, out = run(["--dump", d, "--update", u, "--json"] + small + hashes(got))
         check("H1 hash in json facts", json.loads(out)["facts"]["eboot_elf"]["sha256"] == got, out)
         rc, out = run(["--dump", d, "--update", u] + small + ["--hashes", os.path.join(tmp, "nohashes.json")])
         check("H1 unreadable hashes file warns", rc == 0 and levels(out, "H1") == {"WARN"}, out)
         rc, out = run(["--dump", d, "--update", ux] + small + hashes(got))
         check("no H1 when E1 failed", "H1" not in out, out)
+
+        # the shared table format (pass 100): entries, segment_sha256, region / version / unknown messages
+        def mk_elf(path, segs, pad=0, tail=b""):
+            """64-bit BE PPC64 ELF with PT_LOAD segments (vaddr, bytes, memsz); pad = extra bytes before each segment"""
+            n = len(segs)
+            body, off, phs = b"", 64 + 56 * n, b""
+            for va, data_, memsz in segs:
+                off += pad
+                body += b"\xee" * pad + data_
+                phs += struct.pack(">IIQQQQQQ", 1, 5, off, va, va + 0x111, len(data_), memsz, 0x10000)
+                off += len(data_)
+            h = bytearray(64)
+            h[:4], h[4], h[5], h[6] = fc.ELF_MAGIC, 2, 2, 1
+            h[18:20] = struct.pack(">H", fc.EM_PPC64)
+            h[32:40] = struct.pack(">Q", 64)
+            h[54:58] = struct.pack(">HH", 56, n)
+            with open(path, "wb") as f:
+                f.write(bytes(h) + phs + body + tail)
+
+        segs = [(0x10000, b"code" * 100, 0x1000), (0x2000000, b"data" * 50, 0x4000)]
+        ea, eb, ec = (os.path.join(tmp, n) for n in ("a.elf", "b.elf", "c.elf"))
+        mk_elf(ea, segs)
+        mk_elf(eb, segs, pad=96, tail=b"trailing")                    # another decrypter's layout
+        mk_elf(ec, [segs[0], (0x2000000, b"dutu" * 50, 0x4000)])       # one changed segment byte run
+        sa, sb_, sc = fc.segment_sha256(ea), fc.segment_sha256(eb), fc.segment_sha256(ec)
+        check("segment hash: padding and trailing bytes do not change it", sa == sb_ and len(sa) == 64, (sa, sb_))
+        check("segment hash control: a changed segment byte changes it", sc != sa and fc.file_sha256(ea) != fc.file_sha256(eb))
+        mk_elf(ec, [(0x10001,) + segs[0][1:], segs[1]])
+        check("segment hash control: a changed vaddr changes it", fc.segment_sha256(ec) != sa)
+        mk_elf(ec, [segs[0], segs[1], (0x3000000, b"", 0)])
+        check("segment hash: an empty PT_LOAD (filesz and memsz 0) is skipped", fc.segment_sha256(ec) == sa)
+        mk_elf(ec, [segs[0][:2] + (0x2000,), segs[1]])
+        check("segment hash control: a changed memsz changes it", fc.segment_sha256(ec) != sa)
+        mk_elf(ec, list(reversed(segs)))
+        check("segment hash control: header order matters", fc.segment_sha256(ec) != sa)
+        import hashlib
+        want = hashlib.sha256()
+        for va, bts, ms in segs:      # the written definition, spelled out: vaddr, filesz, memsz (BE64) + bytes
+            want.update(struct.pack(">QQQ", va, len(bts), ms) + bts)
+        check("segment hash equals the written definition (paddr differs from filesz in the fixture)", sa == want.hexdigest())
+        check("segment hash: not an ELF -> None", fc.segment_sha256(os.path.join(tmp, "nothing")) is None)
+
+        def table(**kw):
+            e = dict(title_id="BCUS98234", region="US", app_ver="01.14", size=os.path.getsize(ea), sha256=fc.file_sha256(ea),
+                     status="tested", segment_sha256=sa)
+            e.update(kw)
+            with open(hf, "w", encoding="utf-8") as f:
+                json.dump({"entries": [e]}, f)
+            return ["--hashes", hf]
+
+        def h1(elfp, *a):
+            shutil.copyfile(elfp, os.path.join(u, "USRDIR", "EBOOT.elf"))
+            rc_, out_ = run(["--dump", d, "--update", u] + small + list(a))
+            return rc_, out_, [l for l in out_.splitlines() if " H1" in l]
+
+        rc, out, l = h1(ea, *table())
+        check("new format: exact SHA-256 is OK", rc == 0 and levels(out, "H1") == {"OK"}, out)
+        rc, out, l = h1(eb, *table())
+        check("new format: other layout, same segments is OK by the segment hash",
+              rc == 0 and levels(out, "H1") == {"OK"} and "segments match" in out, out)
+        rc, out, l = h1(ec, *table())
+        check("new format: changed content warns 'not a known build' (patched, other tool), exit 0",
+              rc == 0 and levels(out, "H1") == {"WARN"} and "not a known build" in out and "patched" in out, out)
+        rc, out, l = h1(ea, *table(app_ver="01.00"))
+        check("new format: hash of another version fails 'wrong version'",
+              rc == 1 and "FAIL H1" in out and "wrong version" in out and "Needed: Killzone 3 1.14" in out, out)
+        rc, out, l = h1(ea, *table(title_id="BCES01007", region="EU"))
+        check("new format: hash of another region warns 'wrong region' naming the needed build",
+              rc == 0 and levels(out, "H1") == {"WARN"} and "wrong region" in out and "EU" in out, out)
+        rc, out, l = h1(ea, *table(status="untested"))
+        check("new format: an untested build warns", rc == 0 and levels(out, "H1") == {"WARN"} and "untested" in out, out)
+        rc, out, l = h1(ea, *table(status="unsupported"))
+        check("new format: an unsupported build fails, naming the build and what is needed",
+              rc == 1 and levels(out, "H1") == {"FAIL"} and "known build of Killzone 3 that this port does not run" in out
+              and "Needed: " in out and "1.14" in out, out)
+        rc, out, l = h1(ea, *table(status="maybe"))
+        check("new format: an unknown status fails closed as a port problem",
+              rc == 1 and levels(out, "H1") == {"FAIL"} and "does not understand" in out and "not in your file" in out, out)
+        e0 = dict(title_id="BCUS98234", region="US", app_ver="01.14", size=os.path.getsize(ea), sha256=fc.file_sha256(ea), segment_sha256=sa)
+        with open(hf, "w", encoding="utf-8") as f:
+            json.dump({"entries": [e0]}, f)
+        rc, out, l = h1(ea, "--hashes", hf)
+        check("new format: a missing status fails closed", rc == 1 and levels(out, "H1") == {"FAIL"} and "does not understand" in out, out)
+        # negative control: the old rule (anything but untested is tested) would have passed all three
+        check("control: the old rule would have accepted these", (lambda st: st != "untested")("maybe") and (lambda st: st != "untested")("unsupported"))
+        check("new format: H1 messages name no folder and give no how-to",
+              l and not any(tmp in x or "decrypt" in x.lower() or "dump" in x.lower() or "download" in x.lower() for x in l), l)
+        rc, out, l = h1(ea, *table(sha256="", segment_sha256=""))
+        check("new format: entry without hashes warns only", rc == 0 and levels(out, "H1") == {"WARN"}, out)
+        shutil.copyfile(ea, os.path.join(u, "USRDIR", "EBOOT.elf"))
+        rc, out = run(["--dump", d, "--update", u, "--json"] + small + table())
+        check("new format: json facts carry the segment hash path and identified build",
+              "identified" in json.loads(out)["facts"]["eboot_elf"], out)
+        sce = os.path.join(u, "USRDIR", "EBOOT.elf")
+        open(sce, "wb").write(fc.SELF_MAGIC + b"\0" * 100)
+        rc, out = run(["--dump", d, "--update", u] + small + table())
+        check("encrypted SELF fails E1 with a plain message", rc == 1 and "FAIL E1" in out and "encrypted" in out
+              and "BCUS98234" in out and "H1" not in out, out)
+        open(sce, "wb").write(b"MZ" + b"\0" * 100)
+        rc, out = run(["--dump", d, "--update", u] + small + table())
+        check("not a PS3 executable fails E1", rc == 1 and "FAIL E1" in out and "not the EBOOT of Killzone 3" in out, out)
+        write_elf(sce, 21_228_256)     # put the plain 1.14-sized ELF back for the cases below
 
         # OneDrive (O1 install/build folder, O2 online-only files, O3 INFO): fake env vars and fake attributes
         env = {"OneDrive": "C:\\Users\\someone\\OneDrive", "OneDriveCommercial": "D:\\Work\\OneDrive - Corp"}

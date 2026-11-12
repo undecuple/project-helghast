@@ -15,10 +15,14 @@ blits go to the per-pixel loop; rows still run in ascending order. Default 0 (un
 tools/smoke/test_nv3089_rows.sh compares both rules with the per-pixel loop over 20000 random blits (bpp 1/2/4, clips,
 pitches, overlap, wrap): byte-identical, the exact rule never declines what the range rule copied, 2061 more copied.
 Defaults: see the RE notes "Pass 132".
+
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 1bd4bd5..a98fc45 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -1211,7 +1211,9 @@ static int nv3089_rows_on(void)
+@@ -1402,7 +1402,9 @@ static int nv3089_rows_on(void)
  {
      static int on = -1;
      if (on < 0) { const char* e = getenv("LD_NV3089_ROWS"); if (!e || !e[0]) e = getenv("NV3089_ROWCOPY");
@@ -29,9 +33,9 @@ diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
      return on;
  }
  /* Patch 2080: would vm_write* into [lo, lo+n) only store? (no write watch, no SPU line reservation, no PPU
-@@ -1380,8 +1382,8 @@ static void nv3089_blit_body(void)
-     int rows_done = 0;
-     if (nv3089_rows_on() && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
+@@ -1613,8 +1615,8 @@ static void nv3089_blit_body(void)
+         tiled_done = 1;   /* every row went through the tiling; no per-pixel loop */
+     } else if (nv3089_rows_on() && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
          extern u8* vm_base;
 -        rows_done = nv3089_rows_copy(vm_base, src, in_pitch, u0, v0, dst, dst_pitch, out_x, out_y, out_w, out_h,
 -                                     cx0, cx1, cy0, cy1, bpp, &nv_bytes, nv3089_dst_plain);
@@ -41,12 +45,13 @@ diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
          const u64 xa = out_x < cx0 ? cx0 : out_x, ya = out_y < cy0 ? cy0 : out_y;
          const u64 xb = (u64)out_x + out_w > cx1 ? cx1 : (u64)out_x + out_w, yb = (u64)out_y + out_h > cy1 ? cy1 : (u64)out_y + out_h;
 diff --git a/libs/video/rsx_nv3089_rows.h b/libs/video/rsx_nv3089_rows.h
+index d1dce61..fbb08a0 100644
 --- a/libs/video/rsx_nv3089_rows.h
 +++ b/libs/video/rsx_nv3089_rows.h
 @@ -19,11 +19,20 @@
  #include <stdint.h>
  #include <string.h>
-
+ 
 -static inline int nv3089_rows_copy(uint8_t* base, uint32_t src, uint32_t in_pitch, uint32_t u0, uint32_t v0,
 -                                   uint32_t dst, uint32_t dst_pitch, uint32_t out_x, uint32_t out_y,
 -                                   uint32_t out_w, uint32_t out_h, uint32_t cx0, uint32_t cx1, uint32_t cy0,

@@ -26,15 +26,23 @@ mkdir -p "$MAIN/work/locks"
 # A reservation expires (its "expires EPOCH" line; an old file without one: 120 min after it was written), so a
 # maintainer that died while holding it cannot stall the other worktrees.
 RES="$MAIN/work/locks/gpu.reserved"; T0=$(date +%s)
+# A booking's owner, the "owner" line gpu-reserve.sh writes since 2026-11-11, does not hold its own runs: a caller whose
+# GPU_RESERVE_OWNER (or LOCK_PROJECT) equals it goes through, so a project can book its window without blocking itself.
 res_live() {
   [[ -f "$RES" ]] || return 1
+  local me="${GPU_RESERVE_OWNER:-${LOCK_PROJECT:-}}"
+  [[ -n "$me" && "$(sed -n 's/^owner //p' "$RES" 2>/dev/null)" == "$me" ]] && return 1
   local e; e=$(awk '/^expires /{print $2}' "$RES" 2>/dev/null)
   [[ -n "$e" ]] || e=$(( $(stat -c %Y "$RES" 2>/dev/null || echo 0) + 7200 ))
   (( $(date +%s) < e ))
 }
-if [[ ( "$NAME" == gpu || "$NAME" == build ) && "${KZ3_GPU_PRIO:-0}" != 1 ]] && res_live; then   # a reservation also holds builds
+# A timed booking (the default) also holds builds (2026-11-04): CPU load skews its frame rates. A booking made with
+# --untimed ("timed 0" line, 2026-11-11 lessons round) holds only GPU runs, so CPU-only work shares the window.
+res_holds() { [[ "${KZ3_GPU_PRIO:-0}" != 1 ]] || return 1; [[ "$NAME" == gpu ]] && { res_live; return; }
+  [[ "$NAME" == build ]] && ! grep -q "^timed 0" "$RES" 2>/dev/null && res_live; }
+if res_holds; then
   echo "lock.sh: $NAME held by the maintainer's GPU reservation ($(head -1 "$RES")); waiting" >&2
-  while res_live; do sleep "${KZ3_RES_POLL_S:-10}"; done
+  while res_holds; do sleep "${KZ3_RES_POLL_S:-10}"; done
   [[ -f "$RES" ]] && echo "lock.sh: the GPU reservation expired; going ahead" >&2
 fi
 # KZ2 milestone priority (the KZ2 side reaches its next milestone, then priority returns): while
@@ -77,6 +85,8 @@ if [[ -z "${LOCK_EST_MIN:-}" ]]; then
   fi
   [[ -n "${LOCK_EST_MIN:-}" ]] && export LOCK_EST_MIN
 fi
+# A reservation booked while this run waits in the queue holds it too (slotlock.sh calls slot_hold before each try).
+slot_hold() { res_holds; }
 # shellcheck source=slotlock.sh
 source "$ROOT/tools/agents/slotlock.sh"
 export KZ3_HELD_LOCKS="${KZ3_HELD_LOCKS:-} $NAME"

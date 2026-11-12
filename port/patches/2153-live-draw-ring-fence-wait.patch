@@ -1,0 +1,405 @@
+Patch 2153: LD_RING_FENCE_WAIT, live-draw rings that wrap without draining the queue (RSX pass 144, walker plan step 1a).
+
+Today every ring wrap (descriptor, pixel-constant, vertex, constant, upload) calls ld_flush, which submits the open list and
+waits for the newest fence: the whole queue drains. With LD_RING_FENCE_WAIT=1 the descriptor rings (SRV tables and
+samplers) and the pixel-constant ring wrap differently: ld_submit_nowait sends the open list (a query left open cannot
+be split, then the old drain runs), the ring's (range, fence) marks of rsx_ring_marks.h move to the old generation, the
+cursor restarts at 0, and every later write into a range first waits for the newest fence that read that range
+(ld_rm_ensure; all eight SRV/sampler allocation sites go through ld_srv_take/ld_smp_take, the constant ring waits before
+its memcpy). Marks are recorded at both queue submits (flush body, chunk submit), kept per frame slot like the rings, and
+cleared wherever the old code reset the cursors (present slot switch, draining flush, movie reset, frame start).
+Marks only widen on doubt: overflow merges neighbours with the newest fence, an out-of-order fence or a cursor that moved
+back replaces the marks by one mark over the whole range.
+
+Not covered (still drain): the vertex ring (also resets vb/ib/cb and the descriptor rings together), the vertex-constant
+ring and the upload ring (ld_flush_body resets it on every flush; many placement sites). Default off (unset or 0 = the old
+full drain). One gate line "[ld-ring] fence wait on: ..." when on; [perf-flush] gains "| ringfence desc waits W avoided A
+pscb waits W avoided A" in windows where a ring wrapped without a drain (RSX_PERF_W_RFW_* slots).
+
+Host test: tools/smoke/test_ld_ring_marks.sh (mark arithmetic, randomized ring vs a per-slot reference).
+
+diff -ruN a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c	2026-11-05 00:29:35.445297744 +0000
++++ b/libs/video/cellGcmSys.c	2026-11-05 00:31:29.696076792 +0000
+@@ -2809,6 +2809,15 @@
+         snprintf(fl + fo, n - (size_t)fo, " | wraps srv %lld smp %lld up %lld vtx %lld cb %lld pscb %lld",
+                  d[RSX_PERF_W_WRAP_SRV], d[RSX_PERF_W_WRAP_SMP], d[RSX_PERF_W_FLUSH_N0 + 11],
+                  d[RSX_PERF_W_FLUSH_N0 + 2], d[RSX_PERF_W_FLUSH_N0 + 3], d[RSX_PERF_W_FLUSH_N0 + 8]);
++    /* patch 2153: LD_RING_FENCE_WAIT counters, only in windows where a ring wrapped without a drain */
++    if (d[RSX_PERF_W_RFW_DESC_AVOID] || d[RSX_PERF_W_RFW_PSCB_AVOID] ||
++        d[RSX_PERF_W_RFW_DESC_WAIT] || d[RSX_PERF_W_RFW_PSCB_WAIT]) {
++        const size_t len = strlen(fl);
++        if (len + 80 < n)
++            snprintf(fl + len, n - len, " | ringfence desc waits %lld avoided %lld pscb waits %lld avoided %lld",
++                     d[RSX_PERF_W_RFW_DESC_WAIT], d[RSX_PERF_W_RFW_DESC_AVOID],
++                     d[RSX_PERF_W_RFW_PSCB_WAIT], d[RSX_PERF_W_RFW_PSCB_AVOID]);
++    }
+ }
+ 
+ /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c	2026-11-05 00:29:35.445297744 +0000
++++ b/libs/video/rsx_live_draw.c	2026-11-05 00:33:38.441780677 +0000
+@@ -2311,6 +2311,90 @@
+     g.dev->lpVtbl->CreateUnorderedAccessView(
+         g.dev, tex, NULL, &ud, srv_cpu(slot));
+ }
++/* patch 2153 (walker plan step 1a): LD_RING_FENCE_WAIT=1 lets the descriptor rings (SRV tables + samplers) and the
++ * pixel-constant ring wrap without draining the queue: the open list is submitted, the ring's (range, fence) marks
++ * (rsx_ring_marks.h, one set per frame slot like the rings) move to the old generation, and every later write into a
++ * range waits only for the newest fence that read that range. The vertex, vertex-constant and upload rings still drain
++ * (open items, rsx notes pass 144). Default off: the old full drain. */
++#include "rsx_ring_marks.h"
++enum { LD_RM_SRV, LD_RM_SMP, LD_RM_PSCB, LD_RM_N };
++static rsx_ring_marks g_ld_rm[2][LD_RM_N];
++static unsigned long long g_ld_rm_wait_n[LD_RM_N], g_ld_rm_avoid_n[LD_RM_N], g_ld_rm_bad_n, g_ld_rm_fallback_n;
++static int ld_wait_fence(u64 v);
++static void ld_submit_nowait(void);
++static u32 g_ld_unsubmitted;
++static int ld_ring_fence_wait_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("LD_RING_FENCE_WAIT");
++        on = (e && e[0] && e[0] != '0') ? 1 : 0;
++        if (on)
++            fprintf(stderr, "[ld-ring] fence wait on: descriptor (srv+smp) and pixel-constant rings wrap without "
++                            "draining the queue (waits only for the fence that last read the range); vertex, "
++                            "vertex-constant and upload rings still drain (patch 2153)\n");
++    }
++    return on;
++}
++static rsx_ring_marks* ld_rm(int r) { return &g_ld_rm[g.fr_cur & 1u][r]; }
++static void ld_rm_clear_slot(u32 slot)
++{
++    for (int r = 0; r < LD_RM_N; r++) rsx_rm_clear(&g_ld_rm[slot & 1u][r]);
++}
++/* Every queue submit covers what each ring's cursor wrote so far. */
++static void ld_rm_note_submit(u64 fence)
++{
++    if (!ld_ring_fence_wait_on()) return;
++    const u64 used[LD_RM_N] = { g.srv_ring_used, g.smp_ring_used, g.ps_cb_used };
++    for (int r = 0; r < LD_RM_N; r++)
++        if (rsx_rm_submit(ld_rm(r), used[r], fence) < 0 && ++g_ld_rm_bad_n <= 8)   /* never expected: the marks widened */
++            fprintf(stderr, "[ld-ring] ring %d marks widened: cursor %llu fence %llu out of order (n=%llu)\n", r,
++                    (unsigned long long)used[r], (unsigned long long)fence, g_ld_rm_bad_n);
++}
++/* The cursor of ring r is about to write below `end`: wait for the fence that last read that range, nothing else. */
++static void ld_rm_ensure(int r, u64 end)
++{
++    rsx_ring_marks* m = ld_rm(r);
++    if (!m->old_n) return;
++    const u64 f = rsx_rm_acquire(m, end);
++    if (!f) return;
++    if (g.fence->lpVtbl->GetCompletedValue(g.fence) < f) {
++        g_ld_rm_wait_n[r]++;
++        if (rsx_perf_walk_on()) rsx_perf_add(r == LD_RM_PSCB ? RSX_PERF_W_RFW_PSCB_WAIT : RSX_PERF_W_RFW_DESC_WAIT, 1);
++    }
++    ld_wait_fence(f);
++}
++/* Ring wrap without a drain: submit the open list (a query left open cannot be split: then 0 = the caller drains as
++ * before), then move the listed rings to a new generation. 1 = done, the caller restarts the cursors at 0. */
++static int ld_rm_try_wrap(const int* rings, int n)
++{
++    if (!ld_ring_fence_wait_on() || !g.ready) return 0;
++    g_ld_unsubmitted = 1;
++    ld_submit_nowait();
++    if (g_ld_unsubmitted) {   /* an open query: the old drain */
++        if (++g_ld_rm_fallback_n <= 8)
++            fprintf(stderr, "[ld-ring] list not submitted (open query?): ring wrap drains as before n=%llu\n", g_ld_rm_fallback_n);
++        return 0;
++    }
++    for (int i = 0; i < n; i++) {
++        rsx_rm_wrap(ld_rm(rings[i]));
++        g_ld_rm_avoid_n[rings[i]]++;
++    }
++    if (rsx_perf_walk_on())
++        rsx_perf_add(rings[0] == LD_RM_PSCB ? RSX_PERF_W_RFW_PSCB_AVOID : RSX_PERF_W_RFW_DESC_AVOID, 1);
++    return 1;
++}
++static u32 ld_srv_take(void)
++{
++    ld_rm_ensure(LD_RM_SRV, (u64)g.srv_ring_used + 1u);
++    return g.srv_ring_used++ * SRV_TABLE_SIZE;
++}
++static u32 ld_smp_take(void)
++{
++    ld_rm_ensure(LD_RM_SMP, (u64)g.smp_ring_used + 1u);
++    return g.smp_ring_used++ * SMP_TABLE_SIZE;
++}
++
+ static D3D12_GPU_DESCRIPTOR_HANDLE srv_table(const u32 slots[SRV_TABLE_SIZE])
+ {
+     if (g.srv_ring_used >= SRV_RING_TABLES) {
+@@ -2328,7 +2412,7 @@
+             return hit;
+         }
+     }
+-    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    const u32 base = ld_srv_take();
+     if (ld_srvtbl_memo_on()) {
+         const u32 k = g_srvtbl_memo_next++ % LD_SRVTBL_MEMO;
+         memcpy(g_srvtbl_memo[k].slots, slots, sizeof g_srvtbl_memo[k].slots);
+@@ -2355,7 +2439,7 @@
+ {
+     if (zindex >= MAX_SURFACES || g.srv_ring_used >= SRV_RING_TABLES)
+         return 0;
+-    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    const u32 base = ld_srv_take();
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+         g.srv_heap, &cpu);
+@@ -2412,7 +2496,7 @@
+         D3D12_GPU_DESCRIPTOR_HANDLE invalid = {0};
+         return invalid;
+     }
+-    const u32 base = g.smp_ring_used++ * SMP_TABLE_SIZE;
++    const u32 base = ld_smp_take();
+     memcpy(g.smp_ring_slots[base / SMP_TABLE_SIZE], slots,
+            sizeof(g.smp_ring_slots[0]));
+     D3D12_CPU_DESCRIPTOR_HANDLE dst;
+@@ -3102,6 +3186,7 @@
+     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+     const u64 v = ++g.fence_value;
+     ld_gm_note(v);   /* patch 2051 */
++    ld_rm_note_submit(v);   /* patch 2153 */
+     const HRESULT signal_hr =
+         g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+     if (FAILED(signal_hr)) {
+@@ -3129,6 +3214,7 @@
+         { LD_FX_T0(fx); ld_drain_info_queue("flush"); ld_fx_add(LD_FX_INFO, fx); }
+         { LD_FX_T0(fx); ld_fr_release_retired(nxt); ld_fx_add(LD_FX_REL, fx); }
+         ld_fr_load(nxt);
++        ld_rm_clear_slot(nxt);   /* patch 2153: its last fence has passed */
+         { LD_FX_T0(fx);
+           g.alloc->lpVtbl->Reset(g.alloc);
+           if (g.calloc) g.calloc->lpVtbl->Reset(g.calloc);   /* patch 2053 */
+@@ -3194,6 +3280,7 @@
+     ld_fx_add(LD_FX_LIST, fx); }
+     if (reason == LD_FLUSH_PRESENT) ld_fx_frame_end();
+     g.upload_used = 0;
++    ld_rm_clear_slot(g.fr_cur);   /* patch 2153: the queue drained, no range is in use */
+     ld_rb_drain();   /* patch 2027 */
+ #if defined(YZ_PERF_PROFILE)
+     const u64 flush_ticks = (u64)(ld_profile_qpc() - flush_begin);
+@@ -7455,7 +7542,7 @@
+     }
+     if (s->rg16_gen != s->colour_gen) {
+         if (g.srv_ring_used >= SRV_RING_TABLES) return -1;
+-        const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++        const u32 base = ld_srv_take();
+         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+         g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+         cpu.ptr += (size_t)base * g.srv_step;
+@@ -7575,7 +7662,7 @@
+                        const rsx_dsp_surface* sf, u32 prim, int indexed)
+ {
+     if (!ld_gc_buffer() || g.srv_ring_used >= SRV_RING_TABLES) return;
+-    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    const u32 base = ld_srv_take();
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+@@ -10469,9 +10556,12 @@
+         return 0;
+     }
+     if (plan == 0) {
+-        ld_flush(LD_FLUSH_PIXEL_CONSTANT_RING);
+-        if (!g.ready)
+-            return 0;
++        static const int rm_pscb[1] = { LD_RM_PSCB };
++        if (!ld_rm_try_wrap(rm_pscb, 1)) {   /* patch 2153 */
++            ld_flush(LD_FLUSH_PIXEL_CONSTANT_RING);
++            if (!g.ready)
++                return 0;
++        }
+         g.ps_cb_used = 0;
+         plan = rsx_fp_constant_ring_plan(
+             g.ps_cb_used, PS_CB_RING_BYTES, data_bytes,
+@@ -10487,6 +10577,7 @@
+ #if defined(YZ_PERF_PROFILE)
+     const LONGLONG upload_begin = ld_profile_qpc();
+ #endif
++    ld_rm_ensure(LD_RM_PSCB, (u64)offset + allocation_bytes);   /* patch 2153 */
+     u8* destination = g.ps_cb_mapped + offset;
+     memset(destination, 0, data_bytes);
+     if (g.fp_constants.count)
+@@ -12156,6 +12247,7 @@
+     g.ps_cb_used = 0;
+     g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */
+     g.smp_ring_used = 0;
++    ld_rm_clear_slot(g.fr_cur);   /* patch 2153: same as the old reset, which did not wait either */
+     g.depth_cleared = 0;
+ }
+ 
+@@ -13869,6 +13961,7 @@
+     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+     const u64 v = ++g.fence_value;
+     ld_gm_note(v);   /* patch 2051 */
++    ld_rm_note_submit(v);   /* patch 2153 */
+     const HRESULT signal_hr = g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+     if (FAILED(signal_hr)) {
+         fprintf(stderr, "[d3d-fail] queue Signal (chunk) hr=0x%08lX frame=%u\n",
+@@ -14888,8 +14981,13 @@
+          * before recycling its shader-visible heap entries. Texture upload
+          * commands recorded while resolving slots are also completed here;
+          * no render-state command for this draw has been recorded yet. */
+-        ld_flush(LD_FLUSH_DESCRIPTOR_RING);
+-        if (!g.ready) return;
++        {   /* patch 2153: LD_RING_FENCE_WAIT=1 submits and waits later only for the fence that read a reused range */
++            static const int rm_desc[2] = { LD_RM_SRV, LD_RM_SMP };
++            if (!ld_rm_try_wrap(rm_desc, 2)) {
++                ld_flush(LD_FLUSH_DESCRIPTOR_RING);
++                if (!g.ready) return;
++            }
++        }
+         g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */
+         g.smp_ring_used = 0;
+     }
+@@ -16118,7 +16216,7 @@
+             }
+         }
+     }
+-    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    const u32 base = ld_srv_take();
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+@@ -17803,7 +17901,7 @@
+     if (g_aa_frame[i] == g_ld_frames + 1u) return 0;
+     if (!ld_host_aa_pipeline() || !ld_host_aa_target(sf->w, sf->h)) return 0;
+     if (g.srv_ring_used >= SRV_RING_TABLES) return 0;
+-    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    const u32 base = ld_srv_take();
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+@@ -17933,7 +18031,7 @@
+     if (!sf->tex || sf->fmt != DXGI_FORMAT_R8G8B8A8_UNORM) return NULL;
+     if (!ld_gamma_pipeline() || !ld_host_aa_target(sf->w, sf->h)) return NULL;
+     if (g.srv_ring_used >= SRV_RING_TABLES) return NULL;
+-    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    const u32 base = ld_srv_take();
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+@@ -19338,6 +19436,7 @@
+     /* new frame: reset per-frame ring cursors */
+     g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+     g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */ g.smp_ring_used = 0;
++    ld_rm_clear_slot(g.fr_cur);   /* patch 2153 */
+ #if !defined(YZ_PERF_CLEAN)
+     g_ld_frame_vertex_constant_ring_recycles = 0;
+ #endif
+diff -ruN a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h	2026-11-05 00:29:35.445297744 +0000
++++ b/libs/video/rsx_live_draw.h	2026-11-05 00:31:29.695156368 +0000
+@@ -259,6 +259,7 @@
+     RSX_PERF_W_TEX_UP_T,   /* the upload half (barriers + CopyTextureRegion) of TEX_NEW_T */
+     RSX_PERF_W_D_UNIT_SKIP_N,   /* enabled units not bound: the FP never samples them */
+     RSX_PERF_W_CB_COPY_N, RSX_PERF_W_CB_REUSE_N,   /* patch 2148: draws that copied the vertex constants / reused the previous slot */
++    RSX_PERF_W_RFW_DESC_WAIT, RSX_PERF_W_RFW_DESC_AVOID, RSX_PERF_W_RFW_PSCB_WAIT, RSX_PERF_W_RFW_PSCB_AVOID,   /* patch 2153: LD_RING_FENCE_WAIT waits / drains avoided */
+     RSX_PERF_W_WRAP_SRV, RSX_PERF_W_WRAP_SMP,   /* patch 2147: descriptor-ring wraps by ring (SRV table ring, sampler ring) */
+     RSX_PERF_W_FLUSH_N0, RSX_PERF_W_FLUSH_N_END = RSX_PERF_W_FLUSH_N0 + 11,   /* ld_flush by reason (11 reasons) */
+     RSX_PERF_W_FLUSH_T0, RSX_PERF_W_FLUSH_T_END = RSX_PERF_W_FLUSH_T0 + 11,
+diff -ruN a/libs/video/rsx_ring_marks.h b/libs/video/rsx_ring_marks.h
+--- a/libs/video/rsx_ring_marks.h	1970-01-01 00:00:00.000000000 +0000
++++ b/libs/video/rsx_ring_marks.h	2026-11-05 00:29:35.446297767 +0000
+@@ -0,0 +1,97 @@
++/* rsx_ring_marks.h - KZ3 patch 2153: per-ring (range, fence) marks for rings that wrap without draining the queue.
++ *
++ * A live-draw ring is written linearly from 0. Every queue submit covers the bytes (or table slots) the
++ * cursor advanced over since the previous submit: submit(used, fence) appends the mark [cur_end, used) -> fence.
++ * When the ring is full the caller submits the open list (so no unsubmitted work references the ring), calls
++ * wrap(), and restarts the cursor at 0. The old generation's marks stay as the "not yet re-entered" list: before
++ * the cursor writes [a, b) the caller calls acquire(b), which returns the newest fence among the old marks
++ * that start below b (the GPU may still read those ranges) and retires those marks. The caller waits for that
++ * fence; nothing else.
++ *
++ * Conservative on every doubt: a mark list that overflows merges neighbours (union range, newest fence), and
++ * an out-of-order submit (cursor moved back without wrap(), or a fence that does not increase) replaces the
++ * current marks with one mark over the whole range seen so far, so the next wait covers it.
++ * Pure arithmetic; no D3D12 types, so tools/smoke/test_ld_ring_marks.c builds it on the host. */
++#ifndef RSX_RING_MARKS_H
++#define RSX_RING_MARKS_H
++#include <stdint.h>
++
++#define RSX_RM_MAX 64u
++
++typedef struct { uint64_t start, end, fence; } rsx_rm_mark;   /* [start, end) last read by work up to `fence` */
++
++typedef struct {
++    rsx_rm_mark old[RSX_RM_MAX]; uint32_t old_n;   /* previous generations, sorted by start, disjoint */
++    rsx_rm_mark cur[RSX_RM_MAX]; uint32_t cur_n;   /* this generation, sorted, contiguous from 0 */
++    uint64_t cur_end;                              /* end of the last current mark */
++    uint64_t last_fence;                           /* newest fence seen; submits must exceed it */
++} rsx_ring_marks;
++
++static inline void rsx_rm_clear(rsx_ring_marks* m)
++{
++    m->old_n = 0; m->cur_n = 0; m->cur_end = 0; m->last_fence = 0;
++}
++
++/* Merge marks i and i+1 of a sorted list (union range, newest fence): the overflow rule. */
++static inline void rsx_rm_merge_at(rsx_rm_mark* a, uint32_t* n, uint32_t i)
++{
++    a[i].end = a[i + 1].end;
++    if (a[i + 1].fence > a[i].fence) a[i].fence = a[i + 1].fence;
++    for (uint32_t k = i + 1; k + 1 < *n; k++) a[k] = a[k + 1];
++    (*n)--;
++}
++
++/* A queue submit with `fence` covers everything the cursor wrote up to `used`. 1 = mark added, 0 = nothing new
++ * to mark, -1 = rejected (out of order: the marks were widened conservatively, see above). */
++static inline int rsx_rm_submit(rsx_ring_marks* m, uint64_t used, uint64_t fence)
++{
++    if (used < m->cur_end || fence <= m->last_fence) {
++        const uint64_t end = used > m->cur_end ? used : m->cur_end;
++        const uint64_t f = fence > m->last_fence ? fence : m->last_fence;
++        m->cur[0].start = 0; m->cur[0].end = end; m->cur[0].fence = f;
++        m->cur_n = 1; m->cur_end = end; m->last_fence = f;
++        return -1;
++    }
++    m->last_fence = fence;
++    if (used == m->cur_end) return 0;
++    if (m->cur_n == RSX_RM_MAX) rsx_rm_merge_at(m->cur, &m->cur_n, m->cur_n - 2);
++    m->cur[m->cur_n].start = m->cur_end; m->cur[m->cur_n].end = used; m->cur[m->cur_n].fence = fence;
++    m->cur_n++; m->cur_end = used;
++    return 1;
++}
++
++/* The cursor restarts at 0. The caller has submitted the open list first (so every byte written is marked).
++ * New old list = this generation's marks + the old marks beyond where this generation reached. */
++static inline void rsx_rm_wrap(rsx_ring_marks* m)
++{
++    rsx_rm_mark t[2u * RSX_RM_MAX]; uint32_t n = 0;
++    for (uint32_t i = 0; i < m->cur_n; i++) t[n++] = m->cur[i];
++    for (uint32_t i = 0; i < m->old_n; i++) {
++        rsx_rm_mark o = m->old[i];
++        if (o.end <= m->cur_end) continue;
++        if (o.start < m->cur_end) o.start = m->cur_end;
++        t[n++] = o;
++    }
++    while (n > RSX_RM_MAX) rsx_rm_merge_at(t, &n, n - 2);
++    for (uint32_t i = 0; i < n; i++) m->old[i] = t[i];
++    m->old_n = n; m->cur_n = 0; m->cur_end = 0;
++}
++
++/* The cursor is about to write below `end`. Returns the newest fence among the old marks that start below
++ * `end` (0 = none: the range is free) and retires them; the caller must wait for the fence before writing. */
++static inline uint64_t rsx_rm_acquire(rsx_ring_marks* m, uint64_t end)
++{
++    uint64_t f = 0; uint32_t keep = 0;
++    for (uint32_t i = 0; i < m->old_n; i++) {
++        rsx_rm_mark o = m->old[i];
++        if (o.start < end) {
++            if (o.fence > f) f = o.fence;
++            if (o.end <= end) continue;   /* fully re-entered */
++            o.start = end;                /* partly: the rest stays protected */
++        }
++        m->old[keep++] = o;
++    }
++    m->old_n = keep;
++    return f;
++}
++#endif

@@ -4,7 +4,7 @@
 C half: port/kz3/kz3_embed.h (SHA-256 + the known EBOOT hashes) and port/kz3/kz3_eboot_blob.c (the .incbin object)
 compiled with the host C compiler: the SHA-256 against hashlib at the padding edges, a random blob linked in through
 a generated kz3_eboot_embed.h (the way port/kz3/CMakeLists.txt writes it) read back and hashed, the same TU without
-the header (no EBOOT built in -> NULL), and the header's known hashes equal tools/release/eboot_sha256.json.
+the header (no EBOOT built in -> NULL), and the header's known hashes equal tools/release/eboot_ids.json.
 Python half: firstrun's -DKZ3_EMBED_EBOOT (only when the payload has kz3_eboot_blob.c), build-stamp's
 eboot_embedded, the launcher's kz3.ini without an eboot line for such a build, the font copy (copy_ps3_fonts,
 place_ps3_fonts, --font-copy no, --font-dir auto). No game data, no network. The C half says SKIP without a host
@@ -81,10 +81,10 @@ def c_half(tmp):
         return
     with open(os.path.join(src, "kz3_embed.h"), encoding="utf-8") as f:
         head = f.read()
-    with open(os.path.join(HERE, "eboot_sha256.json"), encoding="utf-8") as f:
-        known = json.load(f)
+    with open(os.path.join(HERE, "eboot_ids.json"), encoding="utf-8") as f:
+        known = {e["app_ver"].lstrip("0"): e for e in json.load(f)["entries"] if e["title_id"] == "BCUS98234"}
     for ver in ("1.00", "1.14"):
-        check(f'{{"{ver}", "{known[ver]["sha256"]}"}}' in head, f"kz3_embed.h knows {ver} as eboot_sha256.json does")
+        check(f'{{"{ver}", "{known[ver]["sha256"]}"}}' in head, f"kz3_embed.h knows {ver} as eboot_ids.json does")
     main_c = os.path.join(tmp, "t.c")
     write(main_c, TEST_C)
     flags = ["-std=c11", "-Wall", "-Wextra", "-Werror", "-I", src]

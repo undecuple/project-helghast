@@ -4,19 +4,21 @@ it from there. Upstream candidate (general: no KZ3 names).
 
 Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream PR263 image ranges added next to it.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): upstream added g_ppu_primary_priority above the declaration; both stay.
+
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index fac4bdc4..4ef8e05e 100644
+index ea7de18..1e1f530 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
-@@ -3407,6 +3407,7 @@ static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
-         if (addr < r.end && r.begin < end && r.end > next) next = r.end;
-     return next;
+@@ -3569,6 +3569,7 @@ static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
  }
+ /* Default used by the PS3 executable entry path when PROC_PARAM is absent. */
+ static int32_t g_ppu_primary_priority = 1001;
 +extern "C" uint32_t ppu_load_elf_image(const uint8_t* file, uint64_t fsz);
  
  extern "C" uint32_t ppu_load_elf(const char* path)
  {
-@@ -3415,14 +3416,22 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+@@ -3578,14 +3579,22 @@ extern "C" uint32_t ppu_load_elf(const char* path)
      fseek(f, 0, SEEK_END);
      long sz = ftell(f);
      fseek(f, 0, SEEK_SET);
@@ -43,7 +45,7 @@ index fac4bdc4..4ef8e05e 100644
      uint32_t entry = (uint32_t)be64(file + 24);
      uint64_t phoff = be64(file + 32);
      uint16_t phentsize = be16(file + 54);
-@@ -3474,7 +3483,6 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+@@ -3655,7 +3664,6 @@ extern "C" uint32_t ppu_load_elf(const char* path)
          g_ppu_image_ranges.push_back({p_vaddr, p_vaddr + (p_memsz > p_filesz ? p_memsz : p_filesz)});
          loaded++;
      }

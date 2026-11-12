@@ -12,11 +12,13 @@ Upstream candidate: a generic guest-write hook in the fs layer (RE pass 138).
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): hook after upstream's fs_set_dir fread.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 030ca301..3038d957 100644
+index 78cd624..002948b 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -4516,13 +4516,24 @@ u32 cellGcmResolveOffset(u32 offset)
+@@ -4860,13 +4860,24 @@ u32 cellGcmResolveOffset(u32 offset)
  static void gcm_note_pages_ea(u32 ea, u32 size)
  {
      if (!size || !rsx_live_draw_enabled()) return;
@@ -47,7 +49,7 @@ index 030ca301..3038d957 100644
  }
  /* KZ3 patch 2033: SPU DMA puts (runtime/spu/spu_dma.h) report through a pointer owned by the SPU runtime
   * (spu_coherency.c: spu_set_guest_write_hook). A weak function reference: programs without the SPU runtime
-@@ -4533,9 +4544,13 @@ extern void spu_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) _
+@@ -4877,9 +4888,13 @@ extern void spu_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) _
   * cache entries per put (r34a/b: texture binds 37-48 ms/frame against 21 in pass 30). The ring stays for
   * explicit callers (cellGcm_note_guest_write_ea: host tests, PPU-side copies). */
  void cellGcm_note_guest_write_pages_ea(u32 ea, u32 size) { gcm_note_pages_ea(ea, size); }
@@ -62,10 +64,10 @@ index 030ca301..3038d957 100644
  void cellGcm_note_guest_write_ea(u32 ea, u32 size)
  {
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
-index f73907c2..9d0ced2d 100644
+index a3d95fd..6fa8697 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
-@@ -451,6 +451,21 @@ static void cellFsClose(ppu_context* ctx)
+@@ -452,6 +452,21 @@ static void cellFsClose(ppu_context* ctx)
      ctx->gpr[3] = CELL_OK;
  }
  
@@ -87,7 +89,7 @@ index f73907c2..9d0ced2d 100644
  /* Pre-fault a guest range so the kernel can write into it.
   *
   * The flat VM is MEM_RESERVEd and each page is committed on FIRST ACCESS by a
-@@ -487,6 +502,7 @@ static void cellFsRead(ppu_context* ctx)
+@@ -488,6 +503,7 @@ static void cellFsRead(ppu_context* ctx)
      fs_prefault(buf, nbytes);
      fs_set_dir(fd, f, 1);
      size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
@@ -95,11 +97,11 @@ index f73907c2..9d0ced2d 100644
      /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
       * The intro cinematic is 28 seconds and this port renders it at a few frames
       * a second, so it cannot be watched to its end -- truncating the stream makes
-@@ -967,6 +983,7 @@ static void cellFsAioRead(ppu_context* ctx)
+@@ -1014,6 +1030,7 @@ static void cellFsAioRead(ppu_context* ctx)
              n = fread(vm_base + buf, 1, (size_t)size, f);
          if (pos >= 0) HOST_FSEEK64(f, pos);
          HOST_UNLOCKFILE(f);
 +        fs_note_guest_write(buf, n);   /* patch 2078 */
          err = CELL_OK;
      }
-     if (getenv("PS3_FSLOG"))
+     if (ps3_env_once("PS3_FSLOG"))

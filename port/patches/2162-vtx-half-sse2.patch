@@ -1,0 +1,147 @@
+KZ3 patch 2162 (RSX pass 149): SSE2 HALF conversion (2 or 4 components) in rsx_vertex_fetch_many, RSX_VTX_SIMD (opt-in since pass 151: unset or 0 = scalar loop, 1 = SSE2).
+HALF is the second CPU vertex-fetch cost on K4 (pass 55 [perf-vtxtype]: 3.09 ms of 10.0 ms per frame, 638 k slot-vertices; CMP32
+4.86 ms is first). The kernel runs the rsx_compact_be_f16_nb arithmetic on four 32-bit lanes (SSE2 only, no SSSE3/AVX, x86-64
+baseline): byte swap, rebias selected by the exponent, sign, zero/denormal flush, so the bits equal the scalar loop for all
+65,536 inputs; elements outside the stable mapping take the one-vertex path as before. CMP32 has no kernel: a 4-vertex SSE2 version
+measured 2.2x slower than the compiler's loop (3.18 vs 1.41 ns/vertex). Host test tools/smoke/test_vtx_simd.sh: simd == scalar ==
+fetch_one over random plans and every half value, a negative control build (-DRSX_VTX_SIMD_TEST_FLAW) that must fail, ASan/UBSan,
+and a micro-benchmark (HALF x4 5.0 -> 1.7 ns/vertex, HALF x2 3.1 -> 1.7, hot cache, single thread).
+
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index d233a6fc..c8e7c6d3 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -472,6 +472,96 @@ u32 rsx_vertex_refs_from_indices(rsx_vertex_ref* out, const unsigned char* src,
+     return i;
+ }
+ 
++
++/* KZ3 patch 2162: SSE2 kernel for HALF (2 or 4 components), the second K4 CPU-fetch type (pass 55 [perf-vtxtype]:
++ * HALF 3.09 ms of 10.0 ms per frame). x86-64 baseline only (SSE2, no SSSE3/AVX). Bit-exact with the scalar loop of
++ * rsx_vertex_fetch_many (integer pipeline, the rsx_compact_be_f16_nb arithmetic on four lanes). A vertex whose
++ * element lies outside the stable mapping takes the one-vertex path, as in the scalar loop. RSX_VTX_SIMD unset or 0 (or
++ * rsx_vtx_simd = 0 in a host test) selects the scalar loop, 1 the kernel. CMP32 has no kernel: a 4-vertex SSE2 version measured
++ * 2.2x SLOWER than the compiler's loop (3.18 vs 1.41 ns/vertex, three _mm_div_ps per four vertices), so it was dropped. */
++int rsx_vtx_simd = -1;
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#define RSX_VTX_SIMD_COMPILED 1
++
++static inline u32 rsx_simd_element(const rsx_vertex_ref* r, int plain, u32 freq, u32 modulo)
++{
++    return plain ? ((r->vertex_id + r->base_index) & 0x000FFFFFu)
++                 : rsx_vertex_element_index(r->vertex_id, r->base_index, freq, modulo);
++}
++
++/* four BE half floats (as 32-bit lanes holding the host-order 16-bit value) -> four float bit patterns */
++static inline __m128i rsx_simd_f16_bits(__m128i h)
++{
++    const __m128i m7fff = _mm_set1_epi32(0x7FFF), m7c00 = _mm_set1_epi32(0x7C00);
++#ifdef RSX_VTX_SIMD_TEST_FLAW   /* host-test negative control only: forget the sign bit */
++    const __m128i m8000 = _mm_set1_epi32(0);
++#else
++    const __m128i m8000 = _mm_set1_epi32(0x8000);
++#endif
++    const __m128i e = _mm_and_si128(h, m7c00);
++    const __m128i isinf = _mm_cmpeq_epi32(e, m7c00);
++    const __m128i iszero = _mm_cmpeq_epi32(e, _mm_setzero_si128());
++    const __m128i rebias = _mm_or_si128(_mm_and_si128(isinf, _mm_set1_epi32((int)(224u << 23))),
++                                        _mm_andnot_si128(isinf, _mm_set1_epi32((int)(112u << 23))));
++    const __m128i mag = _mm_add_epi32(_mm_slli_epi32(_mm_and_si128(h, m7fff), 13), rebias);
++    return _mm_or_si128(_mm_slli_epi32(_mm_and_si128(h, m8000), 16), _mm_andnot_si128(iszero, mag));
++}
++static inline __m128i rsx_simd_bswap16(__m128i x) { return _mm_or_si128(_mm_slli_epi16(x, 8), _mm_srli_epi16(x, 8)); }
++
++/* One attribute of `count` vertices, HALF with 2 or 4 components. Returns 0 only when the one-vertex path fails. */
++static int rsx_simd_half(const rsx_vertex_fetch_plan* plan, u32 attr, const rsx_vertex_fetch_attr* fetch, u32 slot,
++                         const rsx_vertex_ref* refs, u32 count, u8* out, u32 stride, int plain, u32 modulo, u32 n)
++{
++    const u8* base = fetch->stable_base;
++    const u32 first = fetch->stable_first, span = fetch->stable_last - first, fstride = fetch->stride;
++    const u32 freq = fetch->desc.frequency;
++    const __m128i zero = _mm_setzero_si128();
++    u32 i = 0;
++    if (n == 4) {
++        for (; i < count; i++) {
++            float* v = (float*)(out + (size_t)i * stride + slot * 16u);
++            const u32 el = rsx_simd_element(&refs[i], plain, freq, modulo);
++            if (el - first > span) { if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v)) return 0; continue; }
++            const u8* src = base + (u64)(el - first) * fstride;
++            const __m128i h = _mm_unpacklo_epi16(rsx_simd_bswap16(_mm_loadl_epi64((const __m128i*)src)), zero);
++            _mm_storeu_si128((__m128i*)v, rsx_simd_f16_bits(h));
++        }
++        return 1;
++    }
++    /* n == 2: two vertices per step; lanes a.x a.y b.x b.y, then (x, y, 0, 1) for each */
++    const __m128 d_lo = _mm_set_ps(0.0f, 0.0f, 1.0f, 0.0f), d_hi = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
++    for (; i + 2 <= count; i += 2) {
++        u32 el0 = rsx_simd_element(&refs[i], plain, freq, modulo), el1 = rsx_simd_element(&refs[i + 1], plain, freq, modulo);
++        float* v0 = (float*)(out + (size_t)i * stride + slot * 16u);
++        float* v1 = (float*)(out + (size_t)(i + 1) * stride + slot * 16u);
++        if (el0 - first > span || el1 - first > span) {
++            if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v0)) return 0;
++            if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i + 1], v1)) return 0;
++            continue;
++        }
++        u32 w0, w1;
++        memcpy(&w0, base + (u64)(el0 - first) * fstride, 4);
++        memcpy(&w1, base + (u64)(el1 - first) * fstride, 4);
++        const __m128i raw = _mm_unpacklo_epi32(_mm_cvtsi32_si128((int)w0), _mm_cvtsi32_si128((int)w1));
++        const __m128 r = _mm_castsi128_ps(rsx_simd_f16_bits(_mm_unpacklo_epi16(rsx_simd_bswap16(raw), zero)));
++        _mm_storeu_ps(v0, _mm_movelh_ps(r, d_lo));
++        _mm_storeu_ps(v1, _mm_movehl_ps(d_hi, r));
++    }
++    for (; i < count; i++) {
++        float* v = (float*)(out + (size_t)i * stride + slot * 16u);
++        const u32 el = rsx_simd_element(&refs[i], plain, freq, modulo);
++        if (el - first > span) { if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v)) return 0; continue; }
++        u32 w; memcpy(&w, base + (u64)(el - first) * fstride, 4);
++        const __m128 r = _mm_castsi128_ps(rsx_simd_f16_bits(
++            _mm_unpacklo_epi16(rsx_simd_bswap16(_mm_cvtsi32_si128((int)w)), zero)));
++        _mm_storeu_ps(v, _mm_movelh_ps(r, d_lo));
++    }
++    return 1;
++}
++
++#endif /* __SSE2__ */
++
+ int rsx_vertex_fetch_many(
+     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+     u8* out)
+@@ -481,6 +571,7 @@ int rsx_vertex_fetch_many(
+     const u32 stride = plan->layout.stride;
+     const int cmp32_batch = rsx_vtx_switch(&rsx_vtx_cmp32_batch, "LD_VTX_CMP32");   /* patch 2073 */
+     const int f16_fast = rsx_vtx_switch(&rsx_vtx_f16_fast, "LD_VTX_F16");   /* patch 2074 */
++    const int simd = rsx_vtx_simd >= 0 ? rsx_vtx_simd : (rsx_vtx_simd = getenv("RSX_VTX_SIMD") && getenv("RSX_VTX_SIMD")[0] == '1' && !getenv("RSX_VTX_SIMD")[1]);   /* patch 2162 */
+     for (u32 slot = 0; slot < plan->layout.count; slot++) {
+         const u32 attr = plan->layout.attrs[slot];
+         const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+@@ -500,6 +591,12 @@ int rsx_vertex_fetch_many(
+         const u32 modulo = (plan->divider_mask >> attr) & 1u;
+         const int plain = rsx_vertex_freq_plain(fetch->desc.frequency, modulo);
+         const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
++#ifdef RSX_VTX_SIMD_COMPILED
++        if (simd && type == RSX_VTX_TYPE_HALF && f16_fast && (n == 2 || n == 4)) {
++            if (!rsx_simd_half(plan, attr, fetch, slot, refs, count, out, stride, plain, modulo, n)) return 0;
++            continue;
++        }
++#endif
+         switch (type) {
+         case RSX_VTX_TYPE_FLOAT:
+             RSX_FETCH_LOOP(v[c] = rsx_compact_be_f32(src + c * 4))
+diff --git a/libs/video/rsx_vertex_compact.h b/libs/video/rsx_vertex_compact.h
+index 83be01dd..e5d0cb85 100644
+--- a/libs/video/rsx_vertex_compact.h
++++ b/libs/video/rsx_vertex_compact.h
+@@ -145,6 +145,11 @@ extern int rsx_vtx_cmp32_batch;
+  * (same rule as 2073's switch). */
+ #define RSX_VTX_PATCH_2074 1
+ extern int rsx_vtx_f16_fast;
++/* KZ3 patch 2162: SSE2 kernel for HALF (2 or 4 components) in rsx_vertex_fetch_many, bit-exact with the
++ * scalar loops. -1 = read RSX_VTX_SIMD once (only "1" = on); 0/1 set directly (host tests). The kernel
++ * needs F16 fast (2074) on, as the scalar loop it replaces. */
++#define RSX_VTX_PATCH_2162 1
++extern int rsx_vtx_simd;
+ 
+ /* Collapse repeated (vertex_id, base_index) references in first-use order.
+  * refs is rewritten in place with the unique prefix.  The occurrence map

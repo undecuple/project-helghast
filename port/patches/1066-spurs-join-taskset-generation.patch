@@ -11,11 +11,14 @@ One "[ts-join]" line per join (first 32, then every 64th, and every timeout). Up
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream's coherent signal watch + 1066's parked count; 1067's `!cut` on upstream's moved signalled update.
 
+Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): the hunks are the v0.18 ones, unchanged;
+context regenerated.
+
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 689fbacc..c084f3d6 100644
+index 1521f9d4..63e9cd63 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -1151,12 +1151,15 @@ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
+@@ -1244,12 +1244,15 @@ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
  
  s32 cellSpursJoinTaskset(CellSpursTaskset* taskset)
  {
@@ -33,10 +36,10 @@ index 689fbacc..c084f3d6 100644
  }
  
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
-index aae58d54..72e461e7 100644
+index f1d2cf38..f521de86 100644
 --- a/runtime/spu/spu_workload.c
 +++ b/runtime/spu/spu_workload.c
-@@ -509,7 +509,9 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
+@@ -512,7 +512,9 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
   * +0x30 enabled (task 0 = MSB of byte 0); task_info[t] at +0x80 + 0x30*t with
   * the ELF EA at +0x14 and the context save EA at +0x1C. */
  #define TS_TRACK 8
@@ -47,7 +50,7 @@ index aae58d54..72e461e7 100644
  static volatile LONG s_ts_lock;
  static _Thread_local int s_ts_held;   /* this thread holds s_ts_lock */
  static uint8_t* ts_running(uint32_t taskset_ea)
-@@ -521,6 +523,83 @@ static uint8_t* ts_running(uint32_t taskset_ea)
+@@ -524,6 +526,83 @@ static uint8_t* ts_running(uint32_t taskset_ea)
  static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
  static void ts_unlock(void) { InterlockedExchange(&s_ts_lock, 0); }
  
@@ -131,7 +134,7 @@ index aae58d54..72e461e7 100644
  static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
  {
      if (!taskset_ea || t >= 128 || s_ts_held) return;   /* held: caller set it */
-@@ -620,6 +699,12 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task, int
+@@ -623,6 +702,12 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task, int
      extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
      extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
      extern void spu_coh_notify_write(uint32_t);
@@ -144,7 +147,7 @@ index aae58d54..72e461e7 100644
      spu_task2_exit_code_set(taskset_ea, done_task, exit_code, 0);   /* KZ3 patch 1022 */
      ts_lock(); s_ts_held = 1;
      uint8_t* ts = vm_base + taskset_ea;
-@@ -777,6 +862,7 @@ int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image,
+@@ -785,6 +870,7 @@ int spu_taskset_dispatch(uint32_t taskset_ea, uint32_t t, const uint8_t* image,
  static void spu_async_run(spu_async_job* j)
  {
      spu_taskset_mark(j->taskset_ea, j->taskid, 1);
@@ -152,7 +155,7 @@ index aae58d54..72e461e7 100644
      /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
       * back to a fresh per-dispatch LS when disabled / no taskset. */
      spu_ts_ls_slot* ts_slot = NULL;
-@@ -1576,9 +1662,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+@@ -1665,9 +1751,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      spu_lockline_lock();
      spu_coh_watch_add(&watch, taskset_ea + CSTS_SIGNALLED, spu_taskset_wake_written, NULL);
      spu_lockline_unlock();
@@ -164,7 +167,7 @@ index aae58d54..72e461e7 100644
          if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
              static int _n = 0;
              if (++secs && _n < 16) { _n++;
-@@ -1590,7 +1677,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+@@ -1679,7 +1766,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      ReleaseSRWLockExclusive(&s_sig_lock);
  #else
      pthread_mutex_lock(&s_sig_lock);
@@ -173,7 +176,7 @@ index aae58d54..72e461e7 100644
          struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
          if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
              static int _n = 0;
-@@ -1607,6 +1694,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+@@ -1696,6 +1783,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      spu_lockline_unlock();
      /* Signals coalesce in the bit, so consuming it outside s_sig_lock loses none. */
      if (!drained) spu_signalled_update(taskset_ea, taskId, 0);

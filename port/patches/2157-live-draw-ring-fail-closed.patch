@@ -1,0 +1,200 @@
+Fail closed on device-wait failure in the live-draw ring paths.
+
+ld_wait_fence checks the WaitForSingleObject result and the fence completed value (all ones = device removed) and
+fails with g.ready = 0. ld_rm_ensure peeks the covering fence, waits, and retires the marks only after a successful
+wait; it reports failure. The descriptor takers return LD_TAKE_FAIL (no allocation after failure or g.ready == 0) and
+their callers back out; the pixel-constant allocator returns 0. ld_rm_try_wrap ends an open occlusion query before
+the no-drain submit, as ld_flush does for the drain it replaces (an open query made every wrap fall back to the
+drain). Failure paths only change behaviour with the switch off; the query end only runs with LD_RING_FENCE_WAIT=1.
+
+--- a/libs/video/rsx_live_draw.c	2026-11-09 17:46:37.447485007 -0600
++++ b/libs/video/rsx_live_draw.c	2026-11-09 17:46:49.852770017 -0600
+@@ -2360,6 +2360,7 @@
+ static rsx_ring_marks g_ld_rm[2][LD_RM_N];
+ static unsigned long long g_ld_rm_wait_n[LD_RM_N], g_ld_rm_avoid_n[LD_RM_N], g_ld_rm_bad_n, g_ld_rm_fallback_n;
+ static int ld_wait_fence(u64 v);
++static void ld_oq_close(void);
+ static void ld_submit_nowait(void);
+ static u32 g_ld_unsubmitted;
+ static int ld_ring_fence_wait_on(void)
+@@ -2392,23 +2393,29 @@
+                     (unsigned long long)used[r], (unsigned long long)fence, g_ld_rm_bad_n);
+ }
+ /* The cursor of ring r is about to write below `end`: wait for the fence that last read that range, nothing else. */
+-static void ld_rm_ensure(int r, u64 end)
++/* Patch 2157: 1 = the range is free (marks retired only after the wait succeeded), 0 = the wait failed or the
++ * device is lost: nothing was retired and the caller must not write the range. */
++static int ld_rm_ensure(int r, u64 end)
+ {
++    if (!g.ready) return 0;
+     rsx_ring_marks* m = ld_rm(r);
+-    if (!m->old_n) return;
+-    const u64 f = rsx_rm_acquire(m, end);
+-    if (!f) return;
++    if (!m->old_n) return 1;
++    const u64 f = rsx_rm_peek(m, end);
++    if (!f) return 1;
+     if (g.fence->lpVtbl->GetCompletedValue(g.fence) < f) {
+         g_ld_rm_wait_n[r]++;
+         if (rsx_perf_walk_on()) rsx_perf_add(r == LD_RM_PSCB ? RSX_PERF_W_RFW_PSCB_WAIT : RSX_PERF_W_RFW_DESC_WAIT, 1);
+     }
+-    ld_wait_fence(f);
++    if (!ld_wait_fence(f)) return 0;
++    rsx_rm_acquire(m, end);
++    return 1;
+ }
+ /* Ring wrap without a drain: submit the open list (a query left open cannot be split: then 0 = the caller drains as
+  * before), then move the listed rings to a new generation. 1 = done, the caller restarts the cursors at 0. */
+ static int ld_rm_try_wrap(const int* rings, int n)
+ {
+     if (!ld_ring_fence_wait_on() || !g.ready) return 0;
++    ld_oq_close();   /* patch 2157: end an open occlusion query in this list, as ld_flush (patch 2025) does for the drain it replaces */
+     g_ld_unsubmitted = 1;
+     ld_submit_nowait();
+     if (g_ld_unsubmitted) {   /* an open query: the old drain */
+@@ -2424,14 +2431,15 @@
+         rsx_perf_add(rings[0] == LD_RM_PSCB ? RSX_PERF_W_RFW_PSCB_AVOID : RSX_PERF_W_RFW_DESC_AVOID, 1);
+     return 1;
+ }
++#define LD_TAKE_FAIL 0xFFFFFFFFu   /* patch 2157: no descriptor table was allocated (failed wait, lost device) */
+ static u32 ld_srv_take(void)
+ {
+-    ld_rm_ensure(LD_RM_SRV, (u64)g.srv_ring_used + 1u);
++    if (!g.ready || !ld_rm_ensure(LD_RM_SRV, (u64)g.srv_ring_used + 1u)) return LD_TAKE_FAIL;
+     return g.srv_ring_used++ * SRV_TABLE_SIZE;
+ }
+ static u32 ld_smp_take(void)
+ {
+-    ld_rm_ensure(LD_RM_SMP, (u64)g.smp_ring_used + 1u);
++    if (!g.ready || !ld_rm_ensure(LD_RM_SMP, (u64)g.smp_ring_used + 1u)) return LD_TAKE_FAIL;
+     return g.smp_ring_used++ * SMP_TABLE_SIZE;
+ }
+ 
+@@ -2453,6 +2461,7 @@
+         }
+     }
+     const u32 base = ld_srv_take();
++    if (base == LD_TAKE_FAIL) { D3D12_GPU_DESCRIPTOR_HANDLE invalid = {0}; return invalid; }   /* patch 2157 */
+     if (ld_srvtbl_memo_on()) {
+         const u32 k = g_srvtbl_memo_next++ % LD_SRVTBL_MEMO;
+         memcpy(g_srvtbl_memo[k].slots, slots, sizeof g_srvtbl_memo[k].slots);
+@@ -2480,6 +2489,7 @@
+     if (zindex >= MAX_SURFACES || g.srv_ring_used >= SRV_RING_TABLES)
+         return 0;
+     const u32 base = ld_srv_take();
++    if (base == LD_TAKE_FAIL) return 0;   /* patch 2157 */
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+         g.srv_heap, &cpu);
+@@ -2537,6 +2547,7 @@
+         return invalid;
+     }
+     const u32 base = ld_smp_take();
++    if (base == LD_TAKE_FAIL) { D3D12_GPU_DESCRIPTOR_HANDLE invalid = {0}; return invalid; }   /* patch 2157 */
+     memcpy(g.smp_ring_slots[base / SMP_TABLE_SIZE], slots,
+            sizeof(g.smp_ring_slots[0]));
+     D3D12_CPU_DESCRIPTOR_HANDLE dst;
+@@ -2631,7 +2642,14 @@
+ /* Block until the queue fence reaches v. 0 on a D3D12 failure. */
+ static int ld_wait_fence(u64 v)
+ {
+-    if (!v || g.fence->lpVtbl->GetCompletedValue(g.fence) >= v) return 1;
++    if (!v) return 1;
++    const u64 done0 = g.fence->lpVtbl->GetCompletedValue(g.fence);
++    if (done0 == ~(u64)0) {   /* patch 2157: D3D12 reports a removed device as an all-ones completed value */
++        fprintf(stderr, "[d3d-fail] fence completed value is all ones (device removed) frame=%u\n", g_ld_frames);
++        g.ready = 0;
++        return 0;
++    }
++    if (done0 >= v) return 1;
+     const HRESULT event_hr =
+         g.fence->lpVtbl->SetEventOnCompletion(g.fence, v, g.fence_event);
+     if (FAILED(event_hr)) {
+@@ -2643,8 +2661,17 @@
+         return 0;
+     }
+     const long long w0 = rsx_perf_now();
+-    WaitForSingleObject(g.fence_event, INFINITE);
++    const DWORD wait_rc = WaitForSingleObject(g.fence_event, INFINITE);
+     rsx_perf_add(RSX_PERF_GPUWAIT_T, rsx_perf_now() - w0);
++    /* patch 2157: a wait that did not signal, or a fence that did not reach v (device removal completes the event
++     * with an all-ones value), is a failure: the caller must not treat the range as free. */
++    const u64 done1 = g.fence->lpVtbl->GetCompletedValue(g.fence);
++    if (wait_rc != WAIT_OBJECT_0 || done1 == ~(u64)0 || done1 < v) {
++        fprintf(stderr, "[d3d-fail] fence wait rc=0x%08lX completed=%llu wanted=%llu frame=%u\n",
++                (unsigned long)wait_rc, (unsigned long long)done1, (unsigned long long)v, g_ld_frames);
++        g.ready = 0;
++        return 0;
++    }
+     return 1;
+ }
+ static void ld_fr_release_retired(u32 i)
+@@ -7599,6 +7626,7 @@
+     if (s->rg16_gen != s->colour_gen) {
+         if (g.srv_ring_used >= SRV_RING_TABLES) return -1;
+         const u32 base = ld_srv_take();
++        if (base == LD_TAKE_FAIL) return -1;   /* patch 2157 */
+         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+         g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+         cpu.ptr += (size_t)base * g.srv_step;
+@@ -7719,6 +7747,7 @@
+ {
+     if (!ld_gc_buffer() || g.srv_ring_used >= SRV_RING_TABLES) return;
+     const u32 base = ld_srv_take();
++    if (base == LD_TAKE_FAIL) return;   /* patch 2157 */
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+@@ -10633,7 +10662,8 @@
+ #if defined(YZ_PERF_PROFILE)
+     const LONGLONG upload_begin = ld_profile_qpc();
+ #endif
+-    ld_rm_ensure(LD_RM_PSCB, (u64)offset + allocation_bytes);   /* patch 2153 */
++    if (!ld_rm_ensure(LD_RM_PSCB, (u64)offset + allocation_bytes))   /* patches 2153, 2157 */
++        return 0;
+     u8* destination = g.ps_cb_mapped + offset;
+     memset(destination, 0, data_bytes);
+     if (g.fp_constants.count)
+@@ -16386,6 +16416,7 @@
+         }
+     }
+     const u32 base = ld_srv_take();
++    if (base == LD_TAKE_FAIL) return 0;   /* patch 2157 */
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+@@ -18084,6 +18115,7 @@
+     if (!ld_host_aa_pipeline() || !ld_host_aa_target(sf->w, sf->h)) return 0;
+     if (g.srv_ring_used >= SRV_RING_TABLES) return 0;
+     const u32 base = ld_srv_take();
++    if (base == LD_TAKE_FAIL) return 0;   /* patch 2157 */
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+@@ -18216,6 +18248,7 @@
+     if (!ld_gamma_pipeline() || !ld_host_aa_target(sf->w, sf->h)) return NULL;
+     if (g.srv_ring_used >= SRV_RING_TABLES) return NULL;
+     const u32 base = ld_srv_take();
++    if (base == LD_TAKE_FAIL) return NULL;   /* patch 2157 */
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+--- a/libs/video/rsx_ring_marks.h	2026-11-09 17:46:37.447485007 -0600
++++ b/libs/video/rsx_ring_marks.h	2026-11-09 17:46:49.854007663 -0600
+@@ -91,6 +91,16 @@
+     m->old_n = n; m->cur_n = 0; m->cur_end = 0;
+ }
+ 
++/* Patch 2157: the fence rsx_rm_acquire(m, end) would return, without retiring any mark. The caller retires with
++ * rsx_rm_acquire only after waiting for it succeeded. */
++static inline uint64_t rsx_rm_peek(const rsx_ring_marks* m, uint64_t end)
++{
++    uint64_t f = 0;
++    for (uint32_t i = 0; i < m->old_n; i++)
++        if (m->old[i].start < end && m->old[i].fence > f) f = m->old[i].fence;
++    return f;
++}
++
+ /* The cursor is about to write below `end`. Returns the newest fence among the old marks that start below
+  * `end` (0 = none: the range is free) and retires them; the caller must wait for the fence before writing. */
+ static inline uint64_t rsx_rm_acquire(rsx_ring_marks* m, uint64_t end)

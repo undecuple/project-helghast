@@ -1,10 +1,13 @@
 KZ3 patch 4016 (RSX pass 93): pad_kb_capture_busy (patch 2098, menu mouse off while a port capture owns the input)
 also covers patch 4014's Custom pad layout capture. Applies after 4014 (2098 sits before it in the patch order).
 
-diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
---- a/libs/input/cellPad.c	2026-10-21 14:00:10.877401108 -0500
-+++ b/libs/input/cellPad.c	2026-10-21 14:00:10.888729378 -0500
-@@ -364,7 +364,7 @@
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 74bed58..75fb2fa 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -616,7 +616,7 @@ int pad_kb_capture_busy(void)
  {
      int b;
      AcquireSRWLockShared(&s_kb_lock);

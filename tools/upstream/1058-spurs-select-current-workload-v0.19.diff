@@ -1,0 +1,32 @@
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2723,7 +2723,15 @@
+         }
+         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
+             /* cellSpursModulePoll: report "no contention — keep running".
+-             * (The host scheduler admits bounded workers; this service does not preempt.) */
++             * (The host scheduler admits bounded workers; this service does not preempt.)
++             * selectWorkload returns the id of the workload this SPU should
++             * run next, so "keep running" is the CURRENT id (wklCurrentId,
++             * LS 0x1DC), not 0. A policy module that compares the answer with
++             * wklCurrentId (the WWS job manager's poll) takes any other id as
++             * a switch request and returns to the kernel: with a constant 0,
++             * every workload except id 0 ran one job per kernel run. */
++            uint32_t cur = ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16)
++                         | ((uint32_t)ctx->ls[0x1DE] << 8)  | ctx->ls[0x1DF];
+             unsigned n = ++g_spurs_pm_polls;
+             /* The count restarts with every policy-module run, and a job
+              * manager runs dozens of times a second, so these lines follow the
+@@ -2735,9 +2743,9 @@
+               /* Racy across workers; it only bounds a log. */
+               static volatile unsigned s_poll_logs;
+               if (s_t && (n <= 4 || (n % 4096) == 0) && s_poll_logs++ < 64)
+-                  fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+-                          n, ctx->gpr[3]._u32[0]); }
+-            ctx->gpr[3] = spu_make_preferred_u32(0);
++                  fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue (wid %u)\n",
++                          n, ctx->gpr[3]._u32[0], cur); }
++            ctx->gpr[3] = spu_make_preferred_u32(cur);
+             /* The kernel's selection copies the instance's first line into the
+              * context's tempArea (LS 0x100) on every call, not only at module
+              * entry, and jobs that ran since may have overwritten it. */

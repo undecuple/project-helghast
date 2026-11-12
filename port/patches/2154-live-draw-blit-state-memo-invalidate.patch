@@ -1,0 +1,30 @@
+KZ3 patch 2154: invalidate the live-draw state memo after draw-based helper blits.
+
+Adapted from Project Pyrrhus (Killzone 2), patch 6069, same author, MIT.
+ld_downsample and ld_scaled_blit bind their own PSO, root signature, heaps and render target.
+The next ordinary draw must restore its bindings even when its desired state matches the
+memo from before the helper. This correction is unconditional and independent of any
+optional recording memo. No new switch or scheduling change.
+
+Host regression: tools/smoke/test_ld_blit_state_memo.py executes the shipped binding
+blocks and ordinary memo guards through a fake D3D12 list. It fails on the old code
+and detects removal of either invalidation. GPU output is checked separately.
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -6721,6 +6721,7 @@
+     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+     g.list->lpVtbl->SetPipelineState(g.list, pso);
+     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.downsample_rootsig);
++    LD_SM_INVALIDATE();   /* patch 2154: helper draw replaced the ordinary draw bindings */
+     const u32 c[5] = {sx, sy, dx, dy, k};
+     g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 5, c, 0);
+     g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+@@ -6859,6 +6860,7 @@
+     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+     g.list->lpVtbl->SetPipelineState(g.list, pso);
+     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g_sblit_rs);
++    LD_SM_INVALIDATE();   /* patch 2154: helper draw replaced the ordinary draw bindings */
+     const float r[4] = { sx / (float)s->w, sy / (float)s->h,
+                          (sx + sw) / (float)s->w, (sy + sh) / (float)s->h };
+     g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, r, 0);

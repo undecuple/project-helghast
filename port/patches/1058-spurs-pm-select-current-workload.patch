@@ -1,8 +1,92 @@
 KZ3 patch 1058 (SPU pass 40, RE pass 86): the selectWorkload intercept answers the current workload id (wklCurrentId, LS 0x1DC) instead of 0, so the WWS job-manager policy module (every KZ3 job manager) runs jobs back to back instead of one job per kernel run; another id only when the port's kernel wants the SPU elsewhere (over KZ3_SPURS_RUN_MS, another kicked workload waits unclaimed, or every kernel thread is busy and the run is past KZ3_PM_QUANTUM_US, default 8000). off by default (KZ3_PM_SELECT=1 = on, KZ3_PM_SELECT=2 = the bare upstream form: always answer the current id, no budget/kick/quantum switch (SPU pass 75), KZ3_PM_SELECT_OLD=1 = force old), KZ3_PM_SELECT_TRACE=1 = [pm-sel] lines. Upstream candidate.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 80a7ad4..2295786 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -554,6 +554,45 @@ static struct SpursInst* spurs_inst_find(u32 ea)
+     return NULL;
+ }
+ 
++/* KZ3 patch 1058 (SPU pass 40): the port kernel's side of the selectWorkload answer (spurs_policy.c
++ * kz3_pm_select). A running policy module keeps its SPU (the answer is its own wklCurrentId) unless another
++ * workload of the instance is enabled, state 2, not claimed by a kernel thread, and
++ *  - kicked (ready count or signal): it waits for an SPU, as the real kernel's readyCount > contention rule, or
++ *  - every kernel thread of the instance is in a run and this run is past KZ3_PM_QUANTUM_US (default 8000; 0 =
++ *    none): the round-robin passes would otherwise stall behind long runs.
++ * A free kernel thread is not enough to keep running past a kick: an idle thread sleeps between passes, so a
++ * kicked workload (wid 10 LibMP3 next to wid 9) waited up to that sleep (pass 40 probe spu-40n, first variant). 
++ * ASSUMPTION: the real kernel weighs per-SPU priorities (wklInfo) too; the port's kernel threads are
++ * round-robin with no priorities, so any waiting kicked workload counts. kz3-pm-switch begin */
++static int s_kz3_quantum_us = -1;
++static int kz3_spurs_switch_wanted(u32 ea, u32 cur, u64 run_us)
++{
++    struct SpursInst* si = NULL;
++    for (int i = 0; i < MAX_SPURS_INST; i++) if (s_inst[i].ea == ea) { si = &s_inst[i]; break; }
++    if (!si) return 0;
++    const int j = (int)(si - s_inst);
++    int n = si->nthreads < 1 ? 1 : si->nthreads;
++    if (n > KZ3_KT_MAX) n = KZ3_KT_MAX;
++    if (s_kz3_quantum_us < 0) { const char* e = getenv("KZ3_PM_QUANTUM_US"); int q = e ? atoi(e) : 8000; s_kz3_quantum_us = q < 0 ? 0 : q; }
++    int over_q = s_kz3_quantum_us && run_us > (u64)s_kz3_quantum_us;
++    for (int kt = 0; kt < n && over_q; kt++) if (!s_run_t0[j][kt]) over_q = 0;
++    const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
++    const u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;
++    for (u32 w = 0; w < 16; w++) {
++        if (w == cur || !(enabled & (0x80000000u >> w))) continue;
++        if (*(vm_base + ea + SPURS_WKL_STATE1 + w) != 2) continue;
++        if (!s_workloads[w].in_use || s_workloads[w].spurs_ea != ea || s_wkl_busy[w]) continue;
++        if (over_q || *(vm_base + ea + SPURS_WKL_READY1 + w) || (sig & (0x8000u >> w))) return 1;
++    }
++    return 0;
++}
++__attribute__((constructor)) static void kz3_pm_switch_init(void)
++{
++    extern int (*g_kz3_spurs_switch_wanted)(uint32_t, uint32_t, uint64_t);
++    g_kz3_spurs_switch_wanted = kz3_spurs_switch_wanted;
++}
++/* kz3-pm-switch end */
++
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+ static int spurs_guest_range_valid(u32 ea, u32 bytes);
+ /* KZ3 patch 1057 (SPU pass 39): called by the kernel thread when a workload's policy-module run starts (end 0,
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 9b162ef..d868b0c 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2954,7 +2954,24 @@ void spu_indirect_branch(spu_context* ctx)
+                       fprintf(stderr, "[spurs-budget] poll #%u %u ms over KZ3_SPURS_RUN_MS: answering switch (#%u)\n",
+                               g_spurs_pm_polls + 1, (unsigned)over, s_bp);
+                   g_spurs_pm_polls++;
+-                  ctx->gpr[3] = spu_make_preferred_u32(1);
++                  /* KZ3 patch 1058: "another workload" = any id but wklCurrentId (it was 1, which is the current
++                   * id of wid 1); the old 1 is kept unless KZ3_PM_SELECT=1. */
++                  { extern uint32_t kz3_pm_select(const uint8_t*, uint32_t, uint32_t, int);
++                    ctx->gpr[3] = spu_make_preferred_u32(kz3_pm_select(ctx->ls, ctx->gpr[0]._u32[0], ctx->gpr[3]._u32[0], 1)); }
++                  ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++                  return;
++              } }
++            /* KZ3 patch 1058 (RE pass 86): the WWS job-manager PM compares this answer with wklCurrentId (LS 0x1DC)
++             * and stops after the job in flight when they differ; the old constant 0 below differed for every
++             * wid != 0, so each job manager ran one job per kernel run. Answer the current id unless the port's
++             * kernel wants the SPU elsewhere (spurs_policy.c kz3_pm_select; only with KZ3_PM_SELECT=1); otherwise falls through
++             * to the old 0 (the call still counts the poll for KZ3_PM_SELECT_TRACE). */
++            { extern uint32_t kz3_pm_select(const uint8_t*, uint32_t, uint32_t, int);
++              extern int kz3_pm_select_old(void);
++              const uint32_t ans = kz3_pm_select(ctx->ls, ctx->gpr[0]._u32[0], ctx->gpr[3]._u32[0], 0);
++              if (!kz3_pm_select_old()) {
++                  ++g_spurs_pm_polls;
++                  ctx->gpr[3] = spu_make_preferred_u32(ans);
+                   ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                   return;
+               } }
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 9307c89..f5ff05e 100644
 --- a/runtime/spu/spurs_policy.c
 +++ b/runtime/spu/spurs_policy.c
-@@ -128,6 +128,103 @@
+@@ -130,6 +130,103 @@ uint64_t kz3_pm_run_over_budget(int factor)
  }
  /* kz3-spurs-budget end */
  
@@ -106,7 +190,7 @@ KZ3 patch 1058 (SPU pass 40, RE pass 86): the selectWorkload intercept answers t
  int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                            const uint8_t* pm_host, uint32_t pm_size,
                            uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
-@@ -358,8 +455,10 @@
+@@ -368,8 +465,10 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      unsigned claim_before = g_spu_putllc_sync_hit;
  
      g_kz3_pm_run_t0 = kz3_pm_run_budget_ms() ? kz3_pm_now_ms() : 0;   /* patch 1048 */
@@ -117,82 +201,9 @@ KZ3 patch 1058 (SPU pass 40, RE pass 86): the selectWorkload intercept answers t
      /* A lane's run should only end through exitToKernel. Anything else strands
       * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
      if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
---- a/runtime/spu/spu_channels.c
-+++ b/runtime/spu/spu_channels.c
-@@ -2337,7 +2337,24 @@
-                       fprintf(stderr, "[spurs-budget] poll #%u %u ms over KZ3_SPURS_RUN_MS: answering switch (#%u)\n",
-                               g_spurs_pm_polls + 1, (unsigned)over, s_bp);
-                   g_spurs_pm_polls++;
--                  ctx->gpr[3] = spu_make_preferred_u32(1);
-+                  /* KZ3 patch 1058: "another workload" = any id but wklCurrentId (it was 1, which is the current
-+                   * id of wid 1); the old 1 is kept unless KZ3_PM_SELECT=1. */
-+                  { extern uint32_t kz3_pm_select(const uint8_t*, uint32_t, uint32_t, int);
-+                    ctx->gpr[3] = spu_make_preferred_u32(kz3_pm_select(ctx->ls, ctx->gpr[0]._u32[0], ctx->gpr[3]._u32[0], 1)); }
-+                  ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-+                  return;
-+              } }
-+            /* KZ3 patch 1058 (RE pass 86): the WWS job-manager PM compares this answer with wklCurrentId (LS 0x1DC)
-+             * and stops after the job in flight when they differ; the old constant 0 below differed for every
-+             * wid != 0, so each job manager ran one job per kernel run. Answer the current id unless the port's
-+             * kernel wants the SPU elsewhere (spurs_policy.c kz3_pm_select; only with KZ3_PM_SELECT=1); otherwise falls through
-+             * to the old 0 (the call still counts the poll for KZ3_PM_SELECT_TRACE). */
-+            { extern uint32_t kz3_pm_select(const uint8_t*, uint32_t, uint32_t, int);
-+              extern int kz3_pm_select_old(void);
-+              const uint32_t ans = kz3_pm_select(ctx->ls, ctx->gpr[0]._u32[0], ctx->gpr[3]._u32[0], 0);
-+              if (!kz3_pm_select_old()) {
-+                  ++g_spurs_pm_polls;
-+                  ctx->gpr[3] = spu_make_preferred_u32(ans);
-                   ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-                   return;
-               } }
---- a/libs/spurs/cellSpurs.c
-+++ b/libs/spurs/cellSpurs.c
-@@ -492,6 +492,45 @@
-     return NULL;
- }
- 
-+/* KZ3 patch 1058 (SPU pass 40): the port kernel's side of the selectWorkload answer (spurs_policy.c
-+ * kz3_pm_select). A running policy module keeps its SPU (the answer is its own wklCurrentId) unless another
-+ * workload of the instance is enabled, state 2, not claimed by a kernel thread, and
-+ *  - kicked (ready count or signal): it waits for an SPU, as the real kernel's readyCount > contention rule, or
-+ *  - every kernel thread of the instance is in a run and this run is past KZ3_PM_QUANTUM_US (default 8000; 0 =
-+ *    none): the round-robin passes would otherwise stall behind long runs.
-+ * A free kernel thread is not enough to keep running past a kick: an idle thread sleeps between passes, so a
-+ * kicked workload (wid 10 LibMP3 next to wid 9) waited up to that sleep (pass 40 probe spu-40n, first variant). 
-+ * ASSUMPTION: the real kernel weighs per-SPU priorities (wklInfo) too; the port's kernel threads are
-+ * round-robin with no priorities, so any waiting kicked workload counts. kz3-pm-switch begin */
-+static int s_kz3_quantum_us = -1;
-+static int kz3_spurs_switch_wanted(u32 ea, u32 cur, u64 run_us)
-+{
-+    struct SpursInst* si = NULL;
-+    for (int i = 0; i < MAX_SPURS_INST; i++) if (s_inst[i].ea == ea) { si = &s_inst[i]; break; }
-+    if (!si) return 0;
-+    const int j = (int)(si - s_inst);
-+    int n = si->nthreads < 1 ? 1 : si->nthreads;
-+    if (n > KZ3_KT_MAX) n = KZ3_KT_MAX;
-+    if (s_kz3_quantum_us < 0) { const char* e = getenv("KZ3_PM_QUANTUM_US"); int q = e ? atoi(e) : 8000; s_kz3_quantum_us = q < 0 ? 0 : q; }
-+    int over_q = s_kz3_quantum_us && run_us > (u64)s_kz3_quantum_us;
-+    for (int kt = 0; kt < n && over_q; kt++) if (!s_run_t0[j][kt]) over_q = 0;
-+    const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
-+    const u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;
-+    for (u32 w = 0; w < 16; w++) {
-+        if (w == cur || !(enabled & (0x80000000u >> w))) continue;
-+        if (*(vm_base + ea + SPURS_WKL_STATE1 + w) != 2) continue;
-+        if (!s_workloads[w].in_use || s_workloads[w].spurs_ea != ea || s_wkl_busy[w]) continue;
-+        if (over_q || *(vm_base + ea + SPURS_WKL_READY1 + w) || (sig & (0x8000u >> w))) return 1;
-+    }
-+    return 0;
-+}
-+__attribute__((constructor)) static void kz3_pm_switch_init(void)
-+{
-+    extern int (*g_kz3_spurs_switch_wanted)(uint32_t, uint32_t, uint64_t);
-+    g_kz3_spurs_switch_wanted = kz3_spurs_switch_wanted;
-+}
-+/* kz3-pm-switch end */
-+
- static DWORD WINAPI spurs_kernel_thread(LPVOID p);
- /* KZ3 patch 1057 (SPU pass 39): called by the kernel thread when a workload's policy-module run starts (end 0,
-  * after the contention byte is set) and ends (end 1, after it is cleared, all lanes joined); NULL = off. The
+diff --git a/runtime/spu/spurs_select.h b/runtime/spu/spurs_select.h
+new file mode 100644
+index 0000000..1519883
 --- /dev/null
 +++ b/runtime/spu/spurs_select.h
 @@ -0,0 +1,26 @@

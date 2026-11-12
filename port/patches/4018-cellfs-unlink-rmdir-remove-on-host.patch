@@ -6,10 +6,14 @@ changed (else CELL_EROFS), a ".." component is refused (CELL_EINVAL), errors map
 ENOTEMPTY/EBUSY/EACCES/EIO, and every call logs one "[fs] unlink|rmdir" line. Test: tools/net/test_fs_cache.sh
 (KZ3 network pass 30, the RE notes s.26). Upstream candidate.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): context follows upstream #620 (sys_fs.c / ppu_fs.cpp) and R&C's 1139; hunks unchanged.
+
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 7566dc6..8f889a7 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
-@@ -839,8 +839,71 @@
-     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
+@@ -910,8 +910,71 @@ static void cellFsMkdir(ppu_context* ctx)
+     if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
      ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
  }
 -static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }

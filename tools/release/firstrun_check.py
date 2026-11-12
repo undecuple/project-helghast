@@ -16,9 +16,9 @@ file sizes.
             (next to EBOOT.BIN), else an EBOOT.BIN that is already an ELF
             E1 FAILs on a known EBOOT of another version than --target (the disc's 1.00 one on the 1.14 build: the
             message names the update's USRDIR folder); an unknown size only warns
-  --hashes  expected EBOOT SHA-256 per version; default eboot_sha256.json next to this script. H1 checks
-            the ELF's SHA-256 against it: a mismatch is a WARN with the size and both hashes (never a FAIL: the build
-            only needs a 1.14 EBOOT that lifts); an empty value means "unknown yet" and also only warns.
+  --hashes  known EBOOT builds (eboot_ids.json format, or the old per-version one); default eboot_ids.json next to this script. H1 names the
+            build the ELF is (SHA-256, then segment_sha256): another version of the title FAILs, another region or an unknown /
+            patched / other-decrypter file only WARNs (the build may still work); no path, no how-to in these messages.
 
   --psarc-hashes  the known data_ps3.psarc (default psarc_sha256.json next to this script). A1: SHA-256 of the whole
             archive (chunked; about 23 s on an SSD) against it. OK = matches; FAIL on a listed disc (US, EU) = differs
@@ -76,7 +76,7 @@ ATTR_OFFLINE = 0x1000
 ATTR_RECALL_ON_OPEN = 0x40000
 ATTR_RECALL_ON_DATA_ACCESS = 0x400000
 ONLINE_ONLY_MASK = ATTR_OFFLINE | ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS
-HASHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eboot_sha256.json")
+HASHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eboot_ids.json")
 PSARC_HASHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psarc_sha256.json")
 PSARC_CACHE_NAME = "psarc-sha256-cache.json"
 HASH_CHUNK = 8 << 20
@@ -482,7 +482,12 @@ def check_eboot_elf(r, elf, target="1.14", update=None):
     h, size = head(elf, 64), os.path.getsize(elf)
     r.facts["eboot_elf"] = {"path": elf, "size": size}
     if len(h) < 64 or h[:4] != ELF_MAGIC:
-        r.fail("E1", f"{elf} is not an ELF (magic {h[:4]!r}); an encrypted SELF starts with 'SCE'")
+        if h[:4] == SELF_MAGIC:
+            r.fail("E1", "This EBOOT is encrypted (a SELF). The port needs the decrypted EBOOT of Killzone 3 "
+                         f"{target} (US, BCUS98234).")
+        else:
+            r.fail("E1", "This file is not a PS3 executable, so it is not the EBOOT of Killzone 3 "
+                         f"{target} (US, BCUS98234).")
         return
     cls, data = h[4], h[5]
     machine = struct.unpack(">H", h[18:20])[0] if data == 2 else struct.unpack("<H", h[18:20])[0]
@@ -519,9 +524,67 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def check_eboot_hash(r, elf, hashes_file):
-    """H1: the decrypted EBOOT's SHA-256 against the expected one for its version (1.14 when the size
-    is unknown). Warn-only: mismatch, unknown yet (empty value) and an unreadable hashes file all give WARN."""
+def segment_sha256(path):
+    """SHA-256 over every PT_LOAD (with filesz or memsz non-zero) of a 64-bit big-endian ELF, in program-header order: p_vaddr, p_filesz, p_memsz (each
+    8 bytes big-endian) then the p_filesz segment bytes. Nothing else (no ELF header, padding or trailing bytes), so
+    another decrypter's layout gives the same value. Same definition in eboot_ids.json's comment. None if unreadable."""
+    try:
+        with open(path, "rb") as f:
+            hd = f.read(64)
+            phoff = struct.unpack(">Q", hd[32:40])[0]
+            phentsize, phnum = struct.unpack(">HH", hd[54:58])
+            h = hashlib.sha256()
+            for i in range(phnum):
+                f.seek(phoff + i * phentsize)
+                ph = f.read(56)
+                if len(ph) < 56 or struct.unpack(">I", ph[:4])[0] != 1:
+                    continue
+                _, _, off, vaddr, _, filesz, memsz, _ = struct.unpack(">IIQQQQQQ", ph)
+                if not filesz and not memsz:
+                    continue
+                h.update(struct.pack(">QQQ", vaddr, filesz, memsz))
+                f.seek(off)
+                left = filesz
+                while left:
+                    chunk = f.read(min(left, 1 << 20))
+                    if not chunk:
+                        return None
+                    h.update(chunk)
+                    left -= len(chunk)
+            return h.hexdigest()
+    except (OSError, struct.error):
+        return None
+
+
+def load_eboot_ids(path):
+    """The known EBOOTs as a list of entry dicts. New format {"entries": [...]}; the old one ({"1.14": {size, sha256},
+    "1.00": ...}, US only) is still accepted and read as US entries. Raises OSError / ValueError."""
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+    if isinstance(d.get("entries"), list):
+        return [e for e in d["entries"] if isinstance(e, dict)]
+    return [{"title_id": TITLE_ID, "region": "US", "app_ver": "0" + k if len(k) == 4 else k, "size": v.get("size"), "sha256": v.get("sha256", ""),
+             "status": "tested"} for k, v in d.items() if isinstance(v, dict)]
+
+
+def _lc(e, k):
+    return str(e.get(k) or "").strip().lower()
+
+
+def _ver(e):
+    """The player-facing version label of an entry: its app_ver (the PARAM.SFO string, '01.14') without the leading zero"""
+    v = str(e.get("app_ver") or "").strip()
+    return v[1:] if v.startswith("0") and len(v) > 1 else v
+
+
+def _who(e):
+    return f"Killzone 3 {_ver(e)} ({e.get('region')}, {e.get('title_id')})"
+
+
+def check_eboot_hash(r, elf, hashes_file, target="1.14"):
+    """H1: which known build the decrypted EBOOT is, by SHA-256, then by segment_sha256 (the segments
+    survive another decrypter's padding). Wrong version of the same title: FAIL (the hash is certain). Wrong region and
+    unknown / modified: WARN. Messages name no path and say nothing on how to get a file."""
     info = r.facts.get("eboot_elf")
     if not info or "version" not in info:      # E1 failed (missing, not an ELF, wrong machine): nothing to hash
         return
@@ -531,22 +594,54 @@ def check_eboot_hash(r, elf, hashes_file):
         r.warn("H1", f"could not read {elf} to hash it: {e}")
         return
     info["sha256"] = got
-    ver = info.get("version") or "1.14"
     try:
-        with open(hashes_file, encoding="utf-8") as f:
-            want = (json.load(f).get(ver) or {}).get("sha256", "").strip().lower()
+        entries = load_eboot_ids(hashes_file)
     except (OSError, ValueError, AttributeError) as e:
         r.warn("H1", f"expected EBOOT hashes not readable ({hashes_file}: {e}); SHA-256 {got} not checked")
         return
-    if not want:
-        r.warn("H1", f"expected SHA-256 of the {ver} EBOOT is unknown yet (empty in {os.path.basename(hashes_file)}); "
-                     f"this one is {got} ({info['size']:,} bytes), not checked")
-    elif want == got:
-        r.ok("H1", f"EBOOT SHA-256 matches the known {ver} EBOOT")
-    else:
-        r.warn("H1", f"EBOOT SHA-256 differs from the known {ver} one: {info['size']:,} bytes, SHA-256 {got}, "
-                     f"expected {want}. The build may still work if it is a 1.14 EBOOT that lifts; if it fails, "
-                     "make the decrypted EBOOT from the update's EBOOT.BIN again")
+    disc = (r.facts.get("disc") or {}).get("TITLE_ID")
+    want_t = (next((e for e in entries if _ver(e) == target and e.get("title_id") == (disc or TITLE_ID)), None)
+              or next((e for e in entries if _ver(e) == target), None))
+    need = f"Needed: {_who(want_t)}." if want_t else f"Needed: Killzone 3 {target}."
+    how = "SHA-256"
+    hit = [e for e in entries if _lc(e, "sha256") == got]
+    if not hit:
+        seg = segment_sha256(elf)
+        info["segment_sha256"] = seg
+        hit = [e for e in entries if seg and _lc(e, "segment_sha256") == seg]
+        how = "segment hash"
+    if not hit:
+        if not any(_lc(e, "sha256") for e in entries):
+            r.warn("H1", f"no known EBOOT hashes yet; this one is {got} ({info['size']:,} bytes), not checked")
+        else:
+            near = any(e.get("size") == info["size"] for e in entries)
+            r.warn("H1", "This EBOOT is not a known build of Killzone 3: it may be patched, made by another tool, or from "
+                         f"another game. The build may still work. {need} SHA-256 {got}, {info['size']:,} bytes"
+                   + (" (the size matches a known build, the content does not)." if near else "."))
+        return
+    if how == "segment hash":
+        r.ok("H1", "EBOOT code segments match a known build; the file differs only in layout or padding")
+    same_title = [e for e in hit if not disc or e.get("title_id") == disc]
+    pick = next((e for e in same_title if _ver(e) == target), None)
+    if pick:
+        info["identified"] = _who(pick)
+        st = pick.get("status")
+        if st == "unsupported":
+            r.fail("H1", f"This EBOOT is a known build of Killzone 3 that this port does not run. It is {_who(pick)}. {need}")
+        elif st not in ("tested", "untested"):
+            r.fail("H1", f"The port's list of known EBOOTs has an entry for this file that the checker does not understand "
+                         f"(status {st!r}). That is a problem in the port's files, not in your file.")
+        elif st == "untested":
+            r.warn("H1", f"This EBOOT is {_who(pick)}. That build is untested. {need}")
+        elif how == "SHA-256":
+            r.ok("H1", f"EBOOT SHA-256 matches the known {_ver(pick)} EBOOT ({pick.get('region')})")
+        return
+    e = same_title[0] if same_title else hit[0]
+    info["identified"] = _who(e)
+    if not same_title:
+        r.warn("H1", f"This EBOOT is {_who(e)}, but the disc is {disc}: wrong region. {need}")
+    elif not any(c["code"] == "E1" and c["level"] == "FAIL" for c in r.checks):   # E1 already said it for a known size
+        r.fail("H1", f"This EBOOT is {_who(e)}: wrong version. {need}")
 
 
 GETTING_FILES = "https://github.com/undecuple/project-helghast/blob/main/docs/GETTING-FILES.md"
@@ -918,7 +1013,7 @@ def main(argv=None):
         cand = cand or [os.path.join(os.path.dirname(a.dump), "EBOOT.elf")]
         elf = next((c for c in cand if os.path.isfile(c) and head(c, 4) == ELF_MAGIC), cand[0])
     check_eboot_elf(r, elf, a.target, a.update)
-    check_eboot_hash(r, elf, a.hashes)
+    check_eboot_hash(r, elf, a.hashes, a.target)
     r.facts["reasons"] = input_reasons(r, a.dump, a.update, elf)
     return finish(r, a)
 

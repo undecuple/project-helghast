@@ -26,8 +26,22 @@ with; also runs the toolkit's tests/sync_stress suite). Notes the RE notes Pass 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (lv2 core) over #577 in ppu_sysprx.cpp and over upstream's sys_mutex/sys_cond (#474 MUTEX_WATCH=1 idea already in 1122; upstream MUTEX_WATCH=2 and its destroy EBUSY are covered/lost: ours refuses destroy too). Upstream's HLE fast path (9a3fbffd, `ps3_hle_register_fast`) kept, `sys_lwmutex_lock_fast` rewritten on the lv2 core (trylock under the slot lock; held or queued = full handler). `ppu_thread_note_block` (PS3_PRIO_START, opt-in) not called from the lv2 core waits.
 
+Rebased on ps3recomp v0.19.0 (group B, R&C 2026-11-09): ours (lv2 core) over upstream #621 (5d3494a9) and #684 (aca2b25c),
+which patched the CRITICAL_SECTION/semaphore code this replaces. Their semantics, checked against the core: contended
+sys_lwmutex_trylock is CELL_EBUSY 0x8001000A (#684; lv2s_trylock_locked), a non-recursive owner's trylock is EDEADLK for
+sys_mutex and sys_lwmutex (#621; lv2s_trylock_locked), sys_lwmutex_t +0x08 = protocol | recursive (#621), the sys_mutex name
+at +0x20 and the sys_cond name at +0x10 (#621, upstream lines kept). Not taken: #621's `timeout > 2^40 us = forever` clamp and
+cond QPC deadline in sys_mutex_lock/sys_cond_wait (cond_ms_until): the core keeps its own ns deadline (lv2s_deadline caps a
+timeout at 2^48 us, computed without the QPC multiply that wraps), so both answers are 'waits for days'. Upstream's
+tools/test_lwmutex_semantics.py, test_lwmutex_trylock_busy.py and test_lwcond_layout.py extracted the handlers over stubs of the
+old semaphore slot (lwm_try/lwm_release); their harnesses now build the real slot table (LwmSlot, lwm_slot, lwm_stamp,
+lwm_note_acquire, LwcSlot/lwc_slot) over lv2_sync_core.h, same checks, plus a non-recursive trylock EDEADLK case.
+Pass 2: upstream's tests/sync_stress/test_mutex_destroy.c read the host-mutex descriptor (waiters, mtx/cs); it now counts
+the core's hand-off queue (core.q.n, cond_wait's re-lock included) and check 4 (blocked on the host lock with count 0, a
+window the core does not have) checks a queued thread receives the mutex instead; mutex_destroy passes.
+
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
-index c447919c..59131249 100644
+index 9d9e4405..59131249 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
 +++ b/runtime/ppu/ppu_sysprx.cpp
 @@ -97,13 +97,25 @@ static void sys_process_is_stack(ppu_context* ctx)
@@ -57,7 +71,7 @@ index c447919c..59131249 100644
  #define LWM_OWNER  0x00
  #define LWM_ATTR   0x08
  #define LWM_RECUR  0x0C
-@@ -114,50 +126,8 @@ static void sys_process_is_stack(ppu_context* ctx)
+@@ -114,53 +126,8 @@ static void sys_process_is_stack(ppu_context* ctx)
   * concurrently -- fences vanished mid-ring. A zero id now means an
   * unregistered context (bug); stamp a sentinel that matches no real thread. */
  #define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
@@ -73,9 +87,12 @@ index c447919c..59131249 100644
 -      if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
 -        fprintf(stderr, "[LWM] create #%lld lwm=0x%08X attr=0x%08X\n", _n, lwm, attr); }
 -    uint32_t protocol = attr ? vm_read32(attr + 0) : 0;
+-    /* sys_lwmutex_t.attribute is protocol | recursive (the two words of
+-     * sys_lwmutex_attribute_t OR-ed together); the recursive word was dropped. */
+-    uint32_t recursive = attr ? vm_read32(attr + 4) : 0;
 -    vm_write32(lwm + 0x00, 0);          /* owner */
 -    vm_write32(lwm + 0x04, 0);          /* waiter */
--    vm_write32(lwm + LWM_ATTR, protocol);
+-    vm_write32(lwm + LWM_ATTR, protocol | recursive);
 -    vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
 -    vm_write32(lwm + 0x10, 0);          /* sleep_queue */
 -    vm_write32(lwm + 0x14, 0);
@@ -109,7 +126,7 @@ index c447919c..59131249 100644
      volatile long holder; volatile long long acq_us; volatile long long acq_fences;
      volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
  extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
-@@ -170,23 +140,16 @@ static volatile long g_lwm_tab_lock = 0;
+@@ -173,23 +140,16 @@ static volatile long g_lwm_tab_lock = 0;
   * long hold. The leaf holder (the one blocked on a non-lwmutex wait) is the
   * convoy root. Default OFF. */
  static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
@@ -142,7 +159,7 @@ index c447919c..59131249 100644
  static struct LwmSlot* lwm_slot(uint32_t addr)
  {
      if (!addr) return nullptr;
-@@ -199,10 +162,14 @@ static struct LwmSlot* lwm_slot(uint32_t addr)
+@@ -202,10 +162,14 @@ static struct LwmSlot* lwm_slot(uint32_t addr)
              while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
              struct LwmSlot* r = nullptr;
              if (g_lwm[idx].addr == 0) {
@@ -161,7 +178,7 @@ index c447919c..59131249 100644
              } else if ((uint32_t)g_lwm[idx].addr == addr) {
                  r = &g_lwm[idx];
              }
-@@ -213,38 +180,36 @@ static struct LwmSlot* lwm_slot(uint32_t addr)
+@@ -216,38 +180,36 @@ static struct LwmSlot* lwm_slot(uint32_t addr)
      }
      return nullptr;   /* table full (raise LWM_HASH) */
  }
@@ -226,7 +243,7 @@ index c447919c..59131249 100644
  }
  /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
   * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
-@@ -256,67 +221,49 @@ static void sys_lwmutex_lock(ppu_context* ctx)
+@@ -259,67 +221,49 @@ static void sys_lwmutex_lock(ppu_context* ctx)
  {
      uint32_t lwm = (uint32_t)ctx->gpr[3];
      uint32_t self = LWM_SELF(ctx);
@@ -328,7 +345,7 @@ index c447919c..59131249 100644
      ctx->gpr[3] = 0;
      return 1;
  }
-@@ -331,62 +278,57 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
+@@ -334,65 +278,57 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
  {
      uint32_t lwm = (uint32_t)ctx->gpr[3];
      uint32_t self = LWM_SELF(ctx);
@@ -368,7 +385,10 @@ index c447919c..59131249 100644
 +            if (v >= 0x00010000u && v < 0x00900000u && v != prev) {
 +                p += snprintf(b + p, sizeof(b) - p, " %08X", v); prev = v; found++; }
          }
--        if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
+-        /* Held by another thread: lv2 answers CELL_EBUSY (0x8001000A). 0x8001000B
+-         * is ETIMEDOUT, which only a lock with an expired timeout returns; titles
+-         * that poll with trylock and check for EBUSY treat it as a hard failure. */
+-        if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; }
 +        fprintf(stderr, "%s\n", b); fflush(stderr);
      }
 -    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
@@ -435,7 +455,7 @@ index c447919c..59131249 100644
      ctx->gpr[3] = 0;
  }
  
-@@ -402,97 +344,92 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
+@@ -408,97 +344,92 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
   * a 64-bit value left that word 0 (and the id store ran past the struct), so
   * the FIOS media thread spun forever holding its lwmutex.
   *
@@ -586,7 +606,7 @@ index c447919c..59131249 100644
  }
  
  /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
-@@ -563,7 +500,19 @@ static void sys_lwmutex_destroy_counted(ppu_context* ctx)
+@@ -569,7 +500,19 @@ static void sys_lwmutex_destroy_counted(ppu_context* ctx)
        if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
          fprintf(stderr, "[LWM] destroy #%lld lwm=0x%08X r4=0x%08X r5=0x%08X\n", _n,
                  (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]); }
@@ -916,10 +936,10 @@ index 00000000..01444577
 +#endif
 +#endif
 diff --git a/runtime/syscalls/sys_cond.c b/runtime/syscalls/sys_cond.c
-index 8bdacb48..ce486caf 100644
+index 9041b409..058ec3c6 100644
 --- a/runtime/syscalls/sys_cond.c
 +++ b/runtime/syscalls/sys_cond.c
-@@ -12,11 +12,6 @@
+@@ -13,11 +13,6 @@
  #include <stdlib.h>
  #include <stdio.h>
  
@@ -931,7 +951,7 @@ index 8bdacb48..ce486caf 100644
  sys_cond_info g_sys_conds[SYS_COND_MAX];
  uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
  
-@@ -24,32 +19,25 @@ uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
+@@ -25,45 +20,25 @@ uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
  static SRWLOCK s_table_lock = SRWLOCK_INIT;
  static void table_lock(void) { AcquireSRWLockExclusive(&s_table_lock); }
  static void table_unlock(void) { ReleaseSRWLockExclusive(&s_table_lock); }
@@ -940,6 +960,19 @@ index 8bdacb48..ce486caf 100644
 -static void cond_wake(sys_cond_info* c) { WakeAllConditionVariable(&c->cv); }
 -static void guest_lock(sys_mutex_info* m) { EnterCriticalSection(&m->cs); }
 -static void guest_unlock(sys_mutex_info* m) { LeaveCriticalSection(&m->cs); }
+-
+-/* Milliseconds left to a lv2_usec_deadline() deadline, rounded UP (a timed wait
+- * must not return before the guest's timeout); 0 once it has passed. */
+-static DWORD cond_ms_until(int64_t deadline)
+-{
+-    LARGE_INTEGER f, now;
+-    QueryPerformanceFrequency(&f);
+-    QueryPerformanceCounter(&now);
+-    if (now.QuadPart >= deadline) return 0;
+-    const uint64_t left = (uint64_t)(deadline - now.QuadPart), q = (uint64_t)f.QuadPart;
+-    const uint64_t ms = (left / q) * 1000ull + ((left % q) * 1000ull + q - 1) / q;
+-    return ms >= (uint64_t)INFINITE ? (DWORD)(INFINITE - 1) : (DWORD)ms;
+-}
  #else
  static pthread_mutex_t s_table_lock = PTHREAD_MUTEX_INITIALIZER;
  static void table_lock(void) { pthread_mutex_lock(&s_table_lock); }
@@ -971,7 +1004,7 @@ index 8bdacb48..ce486caf 100644
      return c;
  }
  
-@@ -65,6 +53,7 @@ int64_t sys_cond_create(ppu_context* ctx)
+@@ -79,6 +54,7 @@ int64_t sys_cond_create(ppu_context* ctx)
          sys_cond_info* c = &g_sys_conds[i];
          if (c->active) continue;
          if (!c->initialized) {
@@ -979,7 +1012,7 @@ index 8bdacb48..ce486caf 100644
  #ifdef _WIN32
              InitializeCriticalSection(&c->signal_lock);
              InitializeConditionVariable(&c->cv);
-@@ -79,8 +68,13 @@ int64_t sys_cond_create(ppu_context* ctx)
+@@ -93,8 +69,13 @@ int64_t sys_cond_create(ppu_context* ctx)
  #endif
              c->initialized = 1;
          }
@@ -992,9 +1025,9 @@ index 8bdacb48..ce486caf 100644
 -        c->waiters = NULL;
 +        c->q.head = c->q.tail = NULL; c->q.n = 0;
          memset(c->name, 0, sizeof(c->name));
-         if (attr) memcpy(c->name, (uint8_t*)vm_to_host(attr) + 8, 8);
-         c->active = 1;
-@@ -110,11 +104,12 @@ int64_t sys_cond_destroy(ppu_context* ctx)
+         /* sys_cond_attribute_t: pshared, flags, ipc_key u64 @0x08, name[8]
+          * @0x10. Offset 8 copied the ipc_key into the log name. */
+@@ -126,11 +107,12 @@ int64_t sys_cond_destroy(ppu_context* ctx)
      table_lock();
      sys_cond_info* c = &g_sys_conds[id - 1];
      if (!c->active) { table_unlock(); return (int32_t)CELL_ESRCH; }
@@ -1011,10 +1044,16 @@ index 8bdacb48..ce486caf 100644
      table_unlock();
      return result;
  }
-@@ -141,94 +136,31 @@ int64_t sys_cond_wait(ppu_context* ctx)
+@@ -157,101 +139,31 @@ int64_t sys_cond_wait(ppu_context* ctx)
      if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
  #endif
      if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
+-#ifdef _WIN32
+-    /* The QPC deadline below multiplies by the counter frequency in 64 bits;
+-     * past 2^40 us (12.7 days) that wraps, and nobody waits that long and
+-     * returns: treat it as infinite. */
+-    if (timeout > (1ull << 40)) timeout = 0;
+-#endif
 -    sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
 +    sys_mutex_info* m = NULL;
 +    sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0), &m);
@@ -1035,15 +1074,16 @@ index 8bdacb48..ce486caf 100644
 -
 -    int32_t result = CELL_OK;
 -#ifdef _WIN32
--    ULONGLONG start = GetTickCount64();
--    uint64_t duration = (timeout + 999) / 1000;
+-    /* The timeout runs on the QPC. GetTickCount64 advances in system-timer
+-     * ticks (up to 15.6 ms), so measuring a 1 ms timeout with it came back up
+-     * to a tick late. The slice handed to the condition variable is rounded up
+-     * to whole milliseconds, so a wait never ends before the guest's timeout. */
+-    const int64_t deadline = timeout ? lv2_usec_deadline(timeout) : 0;
 -    while (!waiter.signalled) {
 -        DWORD ms = INFINITE;
 -        if (timeout) {
--            uint64_t elapsed = GetTickCount64() - start;
--            if (elapsed >= duration) { result = (int32_t)CELL_ETIMEDOUT; break; }
--            uint64_t remaining = duration - elapsed;
--            ms = remaining >= INFINITE ? INFINITE - 1 : (DWORD)remaining;
+-            ms = cond_ms_until(deadline);
+-            if (ms == 0) { result = (int32_t)CELL_ETIMEDOUT; break; }
 -        }
 -        BOOL ok = SleepConditionVariableCS(&c->cv, &c->signal_lock, ms);
 -        if (!ok && GetLastError() != ERROR_TIMEOUT && !waiter.signalled) {
@@ -1136,7 +1176,7 @@ index f32f1c24..45e849bd 100644
  #ifdef _WIN32
      CONDITION_VARIABLE cv;
 diff --git a/runtime/syscalls/sys_mutex.c b/runtime/syscalls/sys_mutex.c
-index ed427714..ad88e236 100644
+index b07101d7..40e796d7 100644
 --- a/runtime/syscalls/sys_mutex.c
 +++ b/runtime/syscalls/sys_mutex.c
 @@ -67,6 +67,26 @@ static void write_be32(uint32_t addr, uint32_t val)
@@ -1181,8 +1221,8 @@ index ed427714..ad88e236 100644
  
      /* Read attributes from guest memory */
      if (attr_addr != 0) {
-@@ -115,23 +139,15 @@ int64_t sys_mutex_create(ppu_context* ctx)
-         memcpy(m->name, attr_raw + 24, 8);
+@@ -117,23 +141,15 @@ int64_t sys_mutex_create(ppu_context* ctx)
+         memcpy(m->name, attr_raw + 0x20, 8);
      }
  
 -    /* Initialize host mutex */
@@ -1214,7 +1254,7 @@ index ed427714..ad88e236 100644
  
      /* Write mutex ID (slot + 1) to guest */
      uint32_t mutex_id = (uint32_t)(slot + 1);
-@@ -147,6 +163,7 @@ int64_t sys_mutex_create(ppu_context* ctx)
+@@ -149,6 +165,7 @@ int64_t sys_mutex_create(ppu_context* ctx)
   * sys_mutex_destroy
   *
   * r3 = mutex_id
@@ -1222,7 +1262,7 @@ index ed427714..ad88e236 100644
   * -----------------------------------------------------------------------*/
  int64_t sys_mutex_destroy(ppu_context* ctx)
  {
-@@ -162,33 +179,14 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
+@@ -164,33 +181,14 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
          mtx_table_unlock();
          return (int64_t)(int32_t)CELL_ESRCH;
      }
@@ -1263,7 +1303,7 @@ index ed427714..ad88e236 100644
  }
  
  /* ---------------------------------------------------------------------------
-@@ -196,6 +194,7 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
+@@ -198,6 +196,7 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
   *
   * r3 = mutex_id
   * r4 = timeout_usec (0 = infinite)
@@ -1271,18 +1311,24 @@ index ed427714..ad88e236 100644
   * -----------------------------------------------------------------------*/
  #ifndef _WIN32
  /* MUTEX_WATCH=2 bookkeeping: who is blocked on which mutex since when. */
-@@ -254,92 +253,12 @@ int64_t sys_mutex_lock(ppu_context* ctx)
+@@ -256,98 +255,12 @@ int64_t sys_mutex_lock(ppu_context* ctx)
  {
      uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
      uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
+-    /* lv2_usec_deadline multiplies by the QPC frequency in 64 bits, which wraps
+-     * for a timeout past about 1.8e12 us (21 days at 10 MHz) and lands on an
+-     * arbitrary deadline: 2^63, say, comes out as "already passed" and times
+-     * out at once. Anything beyond 2^40 us (12.7 days) is indistinguishable
+-     * from waiting forever, so treat it as that. */
+-    if (timeout_us > (1ull << 40)) timeout_us = 0;
 -    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
-+    sys_mutex_info* m = mtx_acquire(mutex_id);
-+    if (!m)
-         return (int64_t)(int32_t)CELL_ESRCH;
+-        return (int64_t)(int32_t)CELL_ESRCH;
 -
 -    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
 -    if (!m->active)
--        return (int64_t)(int32_t)CELL_ESRCH;
++    sys_mutex_info* m = mtx_acquire(mutex_id);
++    if (!m)
+         return (int64_t)(int32_t)CELL_ESRCH;
 -
 -    uint64_t caller_tid = ctx->thread_id;
 -
@@ -1369,7 +1415,7 @@ index ed427714..ad88e236 100644
  }
  
  /* ---------------------------------------------------------------------------
-@@ -350,98 +269,29 @@ int64_t sys_mutex_lock(ppu_context* ctx)
+@@ -358,106 +271,29 @@ int64_t sys_mutex_lock(ppu_context* ctx)
  int64_t sys_mutex_trylock(ppu_context* ctx)
  {
      uint32_t mutex_id = LV2_ARG_U32(ctx, 0);
@@ -1411,6 +1457,14 @@ index ed427714..ad88e236 100644
 -        m->lock_count++;
 -        return CELL_OK;
 -    }
+-
+-    /* A non-recursive mutex the caller already holds is EDEADLK, as in
+-     * sys_mutex_lock above. Without this the host try-acquire below SUCCEEDS --
+-     * a CRITICAL_SECTION (and a recursive pthread mutex) is always re-enterable
+-     * by its owner -- so the guest was told it had taken a second level of a
+-     * mutex that has none. */
+-    if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0)
+-        return (int64_t)(int32_t)CELL_EDEADLK;
 -
 -#ifdef _WIN32
 -    if (!TryEnterCriticalSection(&m->cs)) {
@@ -1522,3 +1576,369 @@ index 08b20e46..1ecca2ba 100644
  } sys_mutex_info;
  
  extern sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
+diff --git a/tests/sync_stress/test_mutex_destroy.c b/tests/sync_stress/test_mutex_destroy.c
+index ed1f219d..437efc18 100644
+--- a/tests/sync_stress/test_mutex_destroy.c
++++ b/tests/sync_stress/test_mutex_destroy.c
+@@ -4,8 +4,9 @@
+  * initialised a new mutex over it, and the blocked thread waited on the dead
+  * one for good.
+  *
+- * The blocked acquires are counted in sys_mutex_info.waiters: sys_mutex_lock
+- * (both timeouts give the count back) and sys_cond_wait's re-lock. */
++ * The blocked acquires are the lv2 core's hand-off queue (KZ3 patch 1122,
++ * lv2_sync_core.h): sys_mutex_lock (a timeout leaves the queue) and
++ * sys_cond_wait's re-lock (the condition hands its waiter to that queue). */
+ #include "runtime/platform/win32_compat.h"
+ #include "runtime/syscalls/sys_cond.h"
+ #include <stdio.h>
+@@ -24,7 +25,7 @@ static uint32_t be_read(unsigned off) {
+     uint8_t* p=vm_base+off;
+     return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+ }
+-static int waiters(void) { return __atomic_load_n(&g_sys_mutexes[mid-1].waiters, __ATOMIC_SEQ_CST); }
++static int waiters(void) { return (int)__atomic_load_n(&g_sys_mutexes[mid-1].core.q.n, __ATOMIC_SEQ_CST); }
+ static int wait_waiters(int want) {
+     for (int i=0;i<2000 && waiters()!=want;i++) Sleep(1);
+     return waiters()==want;
+@@ -76,23 +77,17 @@ int main(void) {
+     CHECK(s_rc==(int32_t)CELL_ETIMEDOUT && waiters()==0);
+     CHECK(call(sys_mutex_unlock,&c,mid,0,0)==CELL_OK);
+ 
+-    /* 4. A thread blocked on the host lock while the guest count is 0 (the
+-     *    window in which a released mutex passes to a waiter): EBUSY. */
+-    sys_mutex_info* m=&g_sys_mutexes[mid-1];
+-#ifdef _WIN32
+-    EnterCriticalSection(&m->cs);
+-#else
+-    pthread_mutex_lock(&m->mtx);
+-#endif
++    /* 4. The release hands the mutex to the head of the queue under the core's
++     *    lock (no window with the guest count at 0 and a thread still blocked,
++     *    which the host-mutex version had to check for): a queued thread gets
++     *    it, and destroy stays EBUSY until that thread has released it. */
++    CHECK(call(sys_mutex_lock,&c,mid,0,0)==CELL_OK);
++    s_rc=-1;
+     h=CreateThread(NULL,0,locker,NULL,0,NULL);
+-    CHECK(wait_waiters(1) && m->lock_count==0);
+-    CHECK(call(sys_mutex_destroy,&c,mid,0,0)==(int32_t)CELL_EBUSY);
+-#ifdef _WIN32
+-    LeaveCriticalSection(&m->cs);
+-#else
+-    pthread_mutex_unlock(&m->mtx);
+-#endif
++    CHECK(wait_waiters(1));
++    CHECK(call(sys_mutex_unlock,&c,mid,0,0)==CELL_OK);
+     CHECK(WaitForSingleObject(h,2000)==WAIT_OBJECT_0); CloseHandle(h);
++    CHECK(s_rc==CELL_OK && waiters()==0);
+ 
+     /* 5. sys_cond_wait's re-lock counts as a waiter. */
+     CHECK(call(sys_cond_create,&c,0x204,mid,0)==CELL_OK);
+diff --git a/tools/test_lwcond_layout.py b/tools/test_lwcond_layout.py
+index 74232614..40823b78 100644
+--- a/tools/test_lwcond_layout.py
++++ b/tools/test_lwcond_layout.py
+@@ -9,6 +9,10 @@ an lwcond, and checks:
+   - +0x00 holds the lwmutex EA, +0x04 a nonzero id;
+   - nothing is written past the 8-byte structure;
+   - sys_lwcond_wait finds the lwmutex the lwcond was created with.
++
++KZ3 patch 1122 (rebased on v0.19.0): the lwcond is a queue on the lv2 core
++(runtime/syscalls/lv2_sync_core.h) kept in a slot table (LwcSlot, lwc_slot),
++which the harness takes from ppu_sysprx.cpp with the handlers.
+ """
+ import os
+ import re
+@@ -30,10 +34,24 @@ def extract(src, name):
+     return src[m.start():i]
+ 
+ 
++def lwc_table(src):
++    m = re.search(r'^#define LWC_MUTEX .*?^static struct LwcSlot\* lwc_slot\(uint32_t lwcond\)\s*\{.*?^\}', src,
++                  re.M | re.S)
++    assert m, 'lwcond slot table not found'
++    return m.group(0)
++
++
++def define(src, name):
++    m = re.search(r'^#define %s\b.*$' % name, src, re.M)
++    assert m, name + ' not found'
++    return m.group(0)
++
++
+ HARNESS = r'''
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
++#include "runtime/syscalls/lv2_sync_core.h"
+ static uint8_t mem[0x10000];
+ static void vm_write32(uint32_t a, uint32_t v) { for (int i = 0; i < 4; i++) mem[a + i] = (uint8_t)(v >> (24 - 8 * i)); }
+ static void vm_write64(uint32_t a, uint64_t v) { vm_write32(a, (uint32_t)(v >> 32)); vm_write32(a + 4, (uint32_t)v); }
+@@ -42,17 +60,17 @@ static uint64_t vm_read64(uint32_t a) { return (uint64_t)vm_read32(a) << 32 | vm
+ struct ppu_context { uint64_t gpr[32]; uint32_t thread_id; };
+ /* The lwmutex side of sys_lwcond_wait: record which lwmutex it asked for and
+  * hand back no slot, so the wait returns at once. */
+-#define LWM_OWNER 0x00
+-#define LWM_RECUR 0x04
++#define _InterlockedIncrement(p) __atomic_add_fetch((p), 1, __ATOMIC_SEQ_CST)
++#define PPU_FENCE(x) __atomic_thread_fence(__ATOMIC_SEQ_CST)
++%s
+ static uint32_t s_asked = 0xFFFFFFFFu;
+-struct LwmSlot;
++struct LwmSlot { lv2s_mutex m; };
+ static struct LwmSlot* lwm_slot(uint32_t lwmutex) { s_asked = lwmutex; return nullptr; }
+-static void lwm_release(struct LwmSlot*) {}
+-static int lwm_acquire(struct LwmSlot*, uint64_t) { return 1; }
+ static void Sleep(unsigned) {}
+ static void ppu_thread_note_block(uint64_t) {}
+ %s
+ %s
++%s
+ int main() {
+     const uint32_t LWC = 0x1000, MTX = 0x2468;
+     memset(mem, 0xAA, sizeof mem);
+@@ -85,12 +103,14 @@ def main():
+         print('SKIP: no C++ compiler')
+         return
+     src = (ROOT / 'runtime/ppu/ppu_sysprx.cpp').read_text()
+-    code = HARNESS % (extract(src, 'sys_lwcond_create'), extract(src, 'sys_lwcond_wait'))
++    code = HARNESS % (define(src, 'LWM_SELF'), lwc_table(src),
++                      extract(src, 'sys_lwcond_create'), extract(src, 'sys_lwcond_wait'))
+     with tempfile.TemporaryDirectory() as tmp:
+         c = Path(tmp) / 't.cpp'
+         exe = Path(tmp) / 't'
+         c.write_text(code)
+-        r = subprocess.run([cxx, '-std=c++17', '-O1', '-w', str(c), '-o', str(exe)], capture_output=True, text=True)
++        r = subprocess.run([cxx, '-std=c++17', '-O1', '-w', '-I', str(ROOT), str(c), '-o', str(exe), '-lpthread'],
++                           capture_output=True, text=True)
+         if r.returncode:
+             print(r.stderr[-2000:])
+             raise SystemExit('FAIL: harness did not compile')
+diff --git a/tools/test_lwmutex_semantics.py b/tools/test_lwmutex_semantics.py
+index e8287e94..ada0e0e9 100644
+--- a/tools/test_lwmutex_semantics.py
++++ b/tools/test_lwmutex_semantics.py
+@@ -7,7 +7,13 @@ host program over stubbed guest memory and checks:
+     sys_lwmutex_attribute_t, not the protocol alone;
+   - a trylock of a lwmutex another thread holds answers CELL_EBUSY (0x8001000A),
+     not 0x8001000B, which is CELL_ETIMEDOUT;
+-  - a free lwmutex is taken, and the owner's trylock nests.
++  - a free lwmutex is taken, and the owner's trylock nests;
++  - the owner's trylock of a non-recursive lwmutex is CELL_EDEADLK (0x80010008).
++
++KZ3 patch 1122 (rebased on v0.19.0): the lwmutex is an lv2-style object from
++runtime/syscalls/lv2_sync_core.h keyed by the guest EA, so the harness builds
++the real slot table code (LwmSlot, lwm_slot, lwm_stamp, lwm_note_acquire) over
++the real core instead of a stub semaphore.
+ """
+ import os
+ import re
+@@ -20,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
+ 
+ 
+ def extract(src, name):
+-    m = re.search(r'static void %s\(ppu_context\* ctx\)\s*\{' % name, src)
++    m = re.search(r'^static [^\n;]*\b%s\([^)]*\)\s*\{' % name, src, re.M)
+     assert m, name + ' not found'
+     i, depth = m.end(), 1
+     while depth:
+@@ -29,30 +35,45 @@ def extract(src, name):
+     return src[m.start():i]
+ 
+ 
++def define(src, name):
++    m = re.search(r'^#define %s\b.*$' % name, src, re.M)
++    assert m, name + ' not found'
++    return m.group(0)
++
++
++def slot_table(src):
++    m = re.search(r'^static struct LwmSlot \{.*?\} g_lwm\[LWM_HASH\];', src, re.M | re.S)
++    assert m, 'LwmSlot not found'
++    return m.group(0)
++
++
+ HARNESS = r'''
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include "runtime/syscalls/lv2_sync_core.h"
+ static uint8_t mem[0x10000];
+ static void vm_write32(uint32_t a, uint32_t v) { for (int i = 0; i < 4; i++) mem[a + i] = (uint8_t)(v >> (24 - 8 * i)); }
+ static uint32_t vm_read32(uint32_t a) { return (uint32_t)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
+ struct ppu_context { uint64_t gpr[32]; uint64_t thread_id; };
+-#define LWM_OWNER 0x00
+-#define LWM_ATTR  0x08
+-#define LWM_RECUR 0x0C
+-#define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
+-/* The kernel-object side: one binary lock per lwmutex, held by `s_held`. */
+-struct LwmSlot { int held; long holder; long long acq_us, acq_fences; unsigned long long acq_cpu_us; };
+-static LwmSlot s_slot;
+-static struct LwmSlot* lwm_slot(uint32_t) { return &s_slot; }
+-static void lwm_release(struct LwmSlot* sl) { sl->held = 0; }
+-static int lwm_try(struct LwmSlot* sl) { if (sl->held) return 0; sl->held = 1; return 1; }
+-static int lwm_trace() { return 0; }
+-static struct LwmSlot* lwm_find(uint32_t) { return nullptr; }
+-static long long lwm_now_us() { return 0; }
+-static long long g_gcm_ref_pub_count = 0;
++#define _InterlockedExchange(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
++#define YieldProcessor() ((void)0)
++#define PPU_FENCE(x) __atomic_thread_fence(__ATOMIC_SEQ_CST)
++%s
++%s
++%s
++%s
++#define LWM_HASH 64u
++%s
++static volatile long g_lwm_tab_lock = 0;
++static volatile long long g_gcm_ref_pub_count = 0;
+ static unsigned long long ppu_thread_cpu_us(unsigned) { return 0; }
++static int lwm_trace() { return 0; }
++static long long lwm_now_us(void){ return (long long)(lv2s_now_ns() / 1000); }
++%s
++%s
++%s
+ %s
+ %s
+ static int fails = 0;
+@@ -62,7 +83,7 @@ static void check(bool ok, const char* what, unsigned long long got)
+     fails += !ok;
+ }
+ int main() {
+-    const uint32_t LWM = 0x1000, ATTR = 0x2000;
++    const uint32_t LWM = 0x1000, ATTR = 0x2000, LWM2 = 0x1100, ATTR2 = 0x2100;
+     memset(mem, 0, sizeof mem);
+     vm_write32(ATTR + 0, 0x2);      /* protocol: SYS_SYNC_PRIORITY */
+     vm_write32(ATTR + 4, 0x10);     /* SYS_SYNC_RECURSIVE */
+@@ -81,6 +102,18 @@ int main() {
+     c = {}; c.gpr[3] = LWM; c.thread_id = 2;
+     sys_lwmutex_trylock(&c);
+     check((uint32_t)c.gpr[3] == 0x8001000Au, "trylock while another thread holds it is CELL_EBUSY", c.gpr[3]);
++
++    vm_write32(ATTR2 + 0, 0x2);
++    vm_write32(ATTR2 + 4, 0x20);    /* SYS_SYNC_NOT_RECURSIVE */
++    c = {}; c.gpr[3] = LWM2; c.gpr[4] = ATTR2; c.thread_id = 1;
++    sys_lwmutex_create(&c);
++    c = {}; c.gpr[3] = LWM2; c.thread_id = 1;
++    sys_lwmutex_trylock(&c);
++    check(c.gpr[3] == 0, "trylock on a free non-recursive lwmutex takes it", c.gpr[3]);
++    c = {}; c.gpr[3] = LWM2; c.thread_id = 1;
++    sys_lwmutex_trylock(&c);
++    check((uint32_t)c.gpr[3] == 0x80010008u && vm_read32(LWM2 + LWM_RECUR) == 1,
++          "the owner's trylock of a non-recursive lwmutex is CELL_EDEADLK", c.gpr[3]);
+     return fails ? 1 : 0;
+ }
+ '''
+@@ -92,12 +125,17 @@ def main():
+         print('SKIP: no C++ compiler')
+         return
+     src = (ROOT / 'runtime/ppu/ppu_sysprx.cpp').read_text()
+-    code = HARNESS % (extract(src, 'sys_lwmutex_create'), extract(src, 'sys_lwmutex_trylock'))
++    code = HARNESS % (define(src, 'LWM_OWNER'), define(src, 'LWM_ATTR'), define(src, 'LWM_RECUR'),
++                      define(src, 'LWM_SELF'),
++                      slot_table(src),
++                      extract(src, 'lwm_stamp'), extract(src, 'lwm_slot'), extract(src, 'lwm_note_acquire'),
++                      extract(src, 'sys_lwmutex_create'), extract(src, 'sys_lwmutex_trylock'))
+     with tempfile.TemporaryDirectory() as tmp:
+         c = Path(tmp) / 't.cpp'
+         exe = Path(tmp) / 't'
+         c.write_text(code)
+-        r = subprocess.run([cxx, '-std=c++17', '-O1', '-w', str(c), '-o', str(exe)], capture_output=True, text=True)
++        r = subprocess.run([cxx, '-std=c++17', '-O1', '-w', '-I', str(ROOT), str(c), '-o', str(exe), '-lpthread'],
++                           capture_output=True, text=True)
+         if r.returncode:
+             print(r.stderr[-2000:])
+             raise SystemExit('FAIL: harness did not compile')
+diff --git a/tools/test_lwmutex_trylock_busy.py b/tools/test_lwmutex_trylock_busy.py
+index 0af9ef61..4592f5d9 100644
+--- a/tools/test_lwmutex_trylock_busy.py
++++ b/tools/test_lwmutex_trylock_busy.py
+@@ -15,6 +15,11 @@ program over stubbed guest memory and a single stub semaphore, and checks:
+   - a trylock on a free mutex succeeds and stamps owner/recursion;
+   - a trylock by a second thread while it is held returns CELL_EBUSY, not
+     CELL_ETIMEDOUT, and leaves the holder's owner/recursion untouched.
++
++KZ3 patch 1122 (rebased on v0.19.0): the lwmutex is an lv2-style object from
++runtime/syscalls/lv2_sync_core.h, so the harness builds the real slot table
++code (LwmSlot, lwm_slot, lwm_stamp, lwm_note_acquire) over the real core
++instead of a single stub semaphore.
+ """
+ import os
+ import re
+@@ -27,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
+ 
+ 
+ def extract(src, name):
+-    m = re.search(r'static void %s\(ppu_context\* ctx\)\s*\{' % name, src)
++    m = re.search(r'^static [^\n;]*\b%s\([^)]*\)\s*\{' % name, src, re.M)
+     assert m, name + ' not found'
+     i, depth = m.end(), 1
+     while depth:
+@@ -42,29 +47,40 @@ def define(src, name):
+     return m.group(0)
+ 
+ 
++def slot_table(src):
++    m = re.search(r'^static struct LwmSlot \{.*?\} g_lwm\[LWM_HASH\];', src, re.M | re.S)
++    assert m, 'LwmSlot not found'
++    return m.group(0)
++
++
+ HARNESS = r'''
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
++#include "runtime/syscalls/lv2_sync_core.h"
+ static uint8_t mem[0x10000];
+ static void vm_write32(uint32_t a, uint32_t v) { for (int i = 0; i < 4; i++) mem[a + i] = (uint8_t)(v >> (24 - 8 * i)); }
+ static uint32_t vm_read32(uint32_t a) { return (uint32_t)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
+ struct ppu_context { uint64_t gpr[32]; uint64_t thread_id; };
++#define _InterlockedExchange(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
++#define YieldProcessor() ((void)0)
++#define PPU_FENCE(x) __atomic_thread_fence(__ATOMIC_SEQ_CST)
++%s
+ %s
+ %s
+ %s
+-/* One host-side slot standing in for the semaphore table: lwm_try takes it
+- * if free. Hold tracking (lwm_trace) stays off. */
+-struct LwmSlot { long holder; long long acq_us; long long acq_fences; unsigned long long acq_cpu_us; int held; };
+-static LwmSlot s_slot;
+-static struct LwmSlot* lwm_slot(uint32_t) { return &s_slot; }
+-static struct LwmSlot* lwm_find(uint32_t) { return &s_slot; }
+-static int lwm_try(struct LwmSlot* sl) { if (sl->held) return 0; sl->held = 1; return 1; }
++/* The real slot table over the lv2 core; hold tracking (lwm_trace) stays off. */
++#define LWM_HASH 64u
++%s
++static volatile long g_lwm_tab_lock = 0;
+ static int lwm_trace(void) { return 0; }
+ static long long lwm_now_us(void) { return 0; }
+ static volatile long long g_gcm_ref_pub_count = 0;
+ static unsigned long long ppu_thread_cpu_us(unsigned) { return 0; }
+ %s
++%s
++%s
++%s
+ static int32_t ret(const ppu_context& c) { return (int32_t)(uint32_t)c.gpr[3]; }
+ int main() {
+     const uint32_t LWM = 0x1000, A = 0x101, B = 0x102;
+@@ -102,13 +118,16 @@ def main():
+         print('SKIP: no C++ compiler')
+         return
+     src = (ROOT / 'runtime/ppu/ppu_sysprx.cpp').read_text()
+-    code = HARNESS % (define(src, 'LWM_OWNER'), define(src, 'LWM_RECUR'), define(src, 'LWM_SELF'),
++    code = HARNESS % (define(src, 'LWM_OWNER'), define(src, 'LWM_ATTR'), define(src, 'LWM_RECUR'),
++                      define(src, 'LWM_SELF'), slot_table(src),
++                      extract(src, 'lwm_stamp'), extract(src, 'lwm_slot'), extract(src, 'lwm_note_acquire'),
+                       extract(src, 'sys_lwmutex_trylock'))
+     with tempfile.TemporaryDirectory() as tmp:
+         c = Path(tmp) / 't.cpp'
+         exe = Path(tmp) / 't'
+         c.write_text(code)
+-        r = subprocess.run([cxx, '-std=c++17', '-O1', '-w', str(c), '-o', str(exe)], capture_output=True, text=True)
++        r = subprocess.run([cxx, '-std=c++17', '-O1', '-w', '-I', str(ROOT), str(c), '-o', str(exe), '-lpthread'],
++                           capture_output=True, text=True)
+         if r.returncode:
+             print(r.stderr[-2000:])
+             raise SystemExit('FAIL: harness did not compile')

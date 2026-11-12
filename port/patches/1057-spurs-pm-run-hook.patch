@@ -1,19 +1,23 @@
 KZ3 patch 1057 (SPU pass 39): g_kz3_pm_run_hook(spurs_ea, wid, end) at the start and end of every policy-module run of the SPURS kernel thread, for the audio probe's per-list timeline (KZ3_AUDIO_SPU=1).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index e70ba1a..80a7ad4 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -493,6 +493,10 @@
- }
+@@ -556,6 +556,10 @@ static struct SpursInst* spurs_inst_find(u32 ea)
  
  static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+ static int spurs_guest_range_valid(u32 ea, u32 bytes);
 +/* KZ3 patch 1057 (SPU pass 39): called by the kernel thread when a workload's policy-module run starts (end 0,
 + * after the contention byte is set) and ends (end 1, after it is cleared, all lanes joined); NULL = off. The
 + * port's audio probe (port/spu/kz3_audio_probe.c, KZ3_AUDIO_SPU=1) times the wid 9 job lists with it. */
 +void (*g_kz3_pm_run_hook)(u32 spurs_ea, u32 wid, int end) = 0;
  
- static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
- {
-@@ -2197,6 +2201,7 @@
+ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix,
+                                    u32 inst_size)
+@@ -2456,6 +2460,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  s_fs = e ? atoi(e) : -1; }
                if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
              *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
@@ -21,7 +25,7 @@ KZ3 patch 1057 (SPU pass 39): g_kz3_pm_run_hook(spurs_ea, wid, end) at the start
              {
                  const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
                  uint32_t sz = s_workloads[wid].sizePm;
-@@ -2256,6 +2261,7 @@
+@@ -2515,6 +2520,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              }
              s_run_t0[si - s_inst][kt & 7] = 0;   /* patch 1011 */
              *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;

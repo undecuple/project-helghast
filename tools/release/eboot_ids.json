@@ -1,0 +1,25 @@
+{
+ "comment": "Known decrypted PS3 EBOOTs (EBOOT.elf), one entry per build; shared format with the other ports. Only ids and hashes. Fields: title_id, region, app_ver (the PARAM.SFO APP_VER string exactly as written, e.g. 01.14), size (bytes of the decrypted ELF), sha256 (of the whole file), status (tested = the port was built and run on it; untested = identified only), optional self_sha256 (SHA-256 of the encrypted EBOOT.BIN, a SELF; empty = not recorded), optional segment_sha256. segment_sha256 = SHA-256 over the concatenation, for every program header with p_type == 1 (PT_LOAD) and p_filesz or p_memsz non-zero, in program-header order, of: p_vaddr (8 bytes, big-endian), p_filesz (8 bytes, big-endian), p_memsz (8 bytes, big-endian), then the p_filesz segment bytes read from file offset p_offset. Nothing else is hashed (no ELF header, section headers, padding between segments or trailing bytes), so a different decrypter's layout gives the same value. 64-bit big-endian ELF: e_phoff at 0x20, e_phentsize at 0x36, e_phnum at 0x38; p_type at +0 (u32), p_flags +4 (u32), p_offset +8, p_vaddr +16, p_paddr +24 (not used), p_filesz +32, p_memsz +40, p_align +48, all big-endian 64-bit.",
+ "entries": [
+  {
+   "title_id": "BCUS98234",
+   "region": "US",
+   "app_ver": "01.14",
+   "size": 21228256,
+   "sha256": "7ad9e4fe357469c15ad61091a5368035957436bd361f388670fc8b9d808bf7e4",
+   "status": "tested",
+   "self_sha256": "",
+   "segment_sha256": "086877b78c7e452163a21c0cb4ce21bc7939b198d228699b5d12f5d4198eca00"
+  },
+  {
+   "title_id": "BCUS98234",
+   "region": "US",
+   "app_ver": "01.00",
+   "size": 20745952,
+   "sha256": "faaa30432b7fec8529c25558ededc0568b6d630ec5c93842ae17b89b6a0bf611",
+   "status": "tested",
+   "self_sha256": "",
+   "segment_sha256": "761c4068b82994a75127103743db866becf47f038fd2f77cd3069df340765ff5"
+  }
+ ]
+}

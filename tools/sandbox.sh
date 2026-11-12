@@ -154,6 +154,9 @@ fi
 if [[ $GPU -eq 1 ]]; then
   args+=(--ro-bind /run/opengl-driver /run/opengl-driver)
   for d in /dev/nvidia* /dev/dri; do [[ -e $d ]] && args+=(--dev-bind "$d" "$d"); done
+  # KZ3_NTSYNC=1: bind the kernel's NT sync device (module ntsync), which GE-Proton 10-10+ then uses instead of fsync.
+  # Opt-in until an A/B decides (2026-11-10); runs without it keep the fsync baseline.
+  [[ ${KZ3_NTSYNC:-0} == 1 && -e /dev/ntsync ]] && args+=(--dev-bind /dev/ntsync /dev/ntsync)
   args+=(--ro-bind-try /sys /sys)
 fi
 

@@ -1,0 +1,55 @@
+Retain cached descriptors and delayed pixel constants through their latest submission.
+
+Conservatively refresh each allocated current-generation prefix on every submit.
+Old-generation tails remain protected independently. LD_RING_FENCE_WAIT stays off by default.
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2331,8 +2331,8 @@
+         on = (e && e[0] && e[0] != '0') ? 1 : 0;
+         if (on)
+             fprintf(stderr, "[ld-ring] fence wait on: descriptor (srv+smp) and pixel-constant rings wrap without "
+-                            "draining the queue (waits only for the fence that last read the range); vertex, "
+-                            "vertex-constant and upload rings still drain (patch 2153)\n");
++                            "draining the queue (waits for a covering fence); vertex, "
++                            "vertex-constant and upload rings still drain (patches 2153+2155; conservative live prefixes)\n");
+     }
+     return on;
+ }
+@@ -2341,13 +2341,14 @@
+ {
+     for (int r = 0; r < LD_RM_N; r++) rsx_rm_clear(&g_ld_rm[slot & 1u][r]);
+ }
+-/* Every queue submit covers what each ring's cursor wrote so far. */
++/* Patch 2155: retain all three allocated prefixes through each submit, including cache hits
++ * and pixel constants uploaded before an intervening submit and bound afterwards. */
+ static void ld_rm_note_submit(u64 fence)
+ {
+     if (!ld_ring_fence_wait_on()) return;
+     const u64 used[LD_RM_N] = { g.srv_ring_used, g.smp_ring_used, g.ps_cb_used };
+     for (int r = 0; r < LD_RM_N; r++)
+-        if (rsx_rm_submit(ld_rm(r), used[r], fence) < 0 && ++g_ld_rm_bad_n <= 8)   /* never expected: the marks widened */
++        if (rsx_rm_submit_live(ld_rm(r), used[r], fence) < 0 && ++g_ld_rm_bad_n <= 8)   /* never expected: the marks widened */
+             fprintf(stderr, "[ld-ring] ring %d marks widened: cursor %llu fence %llu out of order (n=%llu)\n", r,
+                     (unsigned long long)used[r], (unsigned long long)fence, g_ld_rm_bad_n);
+ }
+--- a/libs/video/rsx_ring_marks.h
++++ b/libs/video/rsx_ring_marks.h
+@@ -63,3 +63,17 @@
++/* Patch 2155: cached descriptors and delayed constant bindings can read an earlier allocation in a
++ * later command list, even when used is unchanged. Conservatively retain the whole allocated current
++ * prefix through every submit. Old-generation tails remain protected by their original marks.
++ * This avoids per-draw tracking at the cost of potentially longer waits than exact per-use marks. */
++static inline int rsx_rm_submit_live(rsx_ring_marks* m, uint64_t used, uint64_t fence)
++{
++    const int result = rsx_rm_submit(m, used, fence);
++    if (m->cur_end) {
++        m->cur[0].start = 0; m->cur[0].end = m->cur_end; m->cur[0].fence = m->last_fence;
++        m->cur_n = 1;
++    }
++    return result;
++}
++
+ /* The cursor restarts at 0. The caller has submitted the open list first (so every byte written is marked).
+  * New old list = this generation's marks + the old marks beyond where this generation reached. */
+ static inline void rsx_rm_wrap(rsx_ring_marks* m)

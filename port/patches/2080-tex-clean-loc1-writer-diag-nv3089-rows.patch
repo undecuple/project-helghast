@@ -16,8 +16,13 @@ NV3089 blit time/bytes plus an opt-in row copy. the RE notes "Pass 75".
    tools/smoke/test_nv3089_rows.sh (byte-identical to the per-pixel loop over 20,000 random blits).
 Refreshed for v0.15.0 (SPU pass 85): upstream's draw-engine calls nv3089_engine_read/_wrote sit next to the copy;
 the guest-copy timer starts after nv3089_engine_read, the engine write-back still runs for both copy paths.
+Rebased on ps3recomp v0.19.0 (Toro, group C): upstream's NV3089 now copies through tiled main memory
+(rsx_tiling.h, gcm_store/gcm_rows) and had its own row copy (gcm_row_copy, NV3089_ROWCOPY default 1). The tiled
+path stays first and is counted in the NV3089 bytes; 2080's switch and row copier replace upstream's untiled
+row copy (gcm_row_copy dropped; NV3089_ROWCOPY stays an alias, default 0 as in 2080).
+
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index f6e57b7..121c284 100644
+index 002948bb..2b7677b7 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -9,6 +9,7 @@
@@ -26,38 +31,33 @@ index f6e57b7..121c284 100644
  #include "rsx_live_draw.h"
 +#include "rsx_nv3089_rows.h"   /* patch 2080 */
  #include "rsx_draw_engine.h"
+ #include "rsx_tiling.h"
  #include "cellGcmSys.h"
- #include "../../runtime/platform/win32_compat.h"
-@@ -1080,26 +1081,37 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
-                                 x1 - x0, y1 - y0);
+@@ -1330,12 +1331,6 @@ static void gcm_store(u32 d, const u8* src, u32 n)
+     spu_lockline_unlock();
  }
  
--/* A guest-memory row copy with the same reservation bookkeeping a coherent
-- * PPU store does (ppu_loader.cpp VM_WRITE_COH), once per row instead of per
-- * pixel: an SPU holding a reservation on a 128-byte line the row overwrites
-- * loses it and gets its lost-reservation event. The two byte swaps a
-- * vm_read32/vm_write32 pair does cancel, so the bytes move verbatim. */
 -static void gcm_row_copy(u32 d, u32 s, u32 n)
+-{
+-    extern u8* vm_base;
+-    gcm_store(d, vm_base + s, n);
+-}
+-
+ /* Guest memory as the 2D engines reach it, for the tiled range copies
+  * (rsx_tiling.h): a write keeps gcm_store's reservation bookkeeping. */
+ static u8* gcm_tiled_ptr(void* user, u32 location, u32 offset, u32 len)
+@@ -1380,7 +1375,37 @@ static u8* gcm_rows(u32 bytes)
+     return rows;
+ }
+ 
 +static void nv3089_blit_body(void);
 +/* KZ3 patch 2080: NV3089 time and bytes per RSX_PERF period ([perf-nv3089]); the body is the original blit. */
-+static void nv3089_blit(void)
- {
--    extern u8* vm_base;
--    const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
--    int reserved = 0;
--    for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
--    if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
--    spu_lockline_lock();
--    memmove(vm_base + d, vm_base + s, n);
--    for (u32 a = l0; a <= l1; a += 128)
--        if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
--    spu_lockline_unlock();
+ static void nv3089_blit(void)
++{
 +    const long long t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;
 +    nv3089_blit_body();
 +    if (t0) { rsx_perf_add(RSX_PERF_W_NV3089_T, rsx_perf_now() - t0); rsx_perf_add(RSX_PERF_W_NV3089_N, 1); }
- }
--
--static void nv3089_blit(void)
++}
 +/* Upstream PR #334 (adapted): NV3089_ROWCOPY=1 copies an unscaled blit a row at a time; here it drives
 + * patch 2080's row copier (12.4 origin of patch 2083, per-row fallback to the per-pixel stores when a row meets a
 + * write watch, an SPU line reservation or a pending PPU reservation store) instead of the PR's gcm_row_copy.
@@ -84,7 +84,7 @@ index f6e57b7..121c284 100644
  {
      u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
      u32 out_x = s_nv3089.out_pt & 0xFFFF, out_y = s_nv3089.out_pt >> 16;
-@@ -1125,6 +1137,7 @@ static void nv3089_blit(void)
+@@ -1406,6 +1431,7 @@ static void nv3089_blit(void)
        } }
      /* A copy out of a surface the live renderer drew exists only on the GPU;
       * mirror 1:1 blits there too (the guest-memory copy below still runs). */
@@ -92,7 +92,7 @@ index f6e57b7..121c284 100644
      if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
          rsx_live_draw_enabled()) {
          const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
-@@ -1146,6 +1159,7 @@ static void nv3089_blit(void)
+@@ -1427,6 +1453,7 @@ static void nv3089_blit(void)
          if (!rok && s_nv3089.in_uv <= 0x00100010u && !s_nv3089.out_pt)
              rsx_live_draw_note_resolve(sl, s_nv3089.in_off, dl, s_gcm2d.dst_offset);
      }
@@ -100,7 +100,7 @@ index f6e57b7..121c284 100644
      /* Only the 32-bit colour formats are handled; anything else would need a
       * per-format converter and is better skipped loudly than written wrong. */
      u32 f = s_nv3089.fmt & 0xFF;
-@@ -1189,7 +1203,10 @@ static void nv3089_blit(void)
+@@ -1481,7 +1508,10 @@ static void nv3089_blit(void)
                           srow + (u32)(su >> 20) * 4, 4);
                }
            } }
@@ -111,7 +111,7 @@ index f6e57b7..121c284 100644
          { static int _n = 0; static int cap = -1;
            if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
            if (cap && _n < cap) { _n++;
-@@ -1245,33 +1262,19 @@ static void nv3089_blit(void)
+@@ -1537,15 +1567,9 @@ static void nv3089_blit(void)
               : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
      u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
      if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
@@ -124,6 +124,19 @@ index f6e57b7..121c284 100644
 -     * per-pixel copy, which is what the PPU store watches see. */
 -    static int rowcopy = -1;
 -    if (rowcopy < 0) { const char* e = getenv("NV3089_ROWCOPY"); rowcopy = e ? atoi(e) : 1; }
++    const long long copy_t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;   /* patch 2080 */
++    uint64_t nv_bytes = 0;
++    int rows_done = 0, tiled_done = 0;
+     /* A side in tiled main memory goes through the tiling (rsx_tiling.h).
+      * A retail title downsamples its scene and depth into a tiled main-memory
+      * region for an SPU depth-of-field job while aiming. */
+@@ -1574,26 +1598,19 @@ static void nv3089_blit(void)
+             }
+             rsx_tiled_write(&s_gcm_mem, dloc, s_gcm2d.dst_offset + dy * dst_pitch + (out_x + xa) * bpp,
+                             drow + xa * bpp, (xb - xa) * bpp);
++            nv_bytes += (u64)(xb - xa) * bpp;   /* patch 2080 counter */
+         }
+-    } else
 -    if (rowcopy && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
 -        /* the source start in whole texels: IMAGE_IN_POINT is 12.4 */
 -        const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
@@ -142,10 +155,8 @@ index f6e57b7..121c284 100644
 -            }
 -        }
 -    } else
-+    const long long copy_t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;   /* patch 2080 */
-+    uint64_t nv_bytes = 0;
-+    int rows_done = 0;
-+    if (nv3089_rows_on() && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
++        tiled_done = 1;   /* every row went through the tiling; no per-pixel loop */
++    } else if (nv3089_rows_on() && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
 +        extern u8* vm_base;
 +        rows_done = nv3089_rows_copy(vm_base, src, in_pitch, u0, v0, dst, dst_pitch, out_x, out_y, out_w, out_h,
 +                                     cx0, cx1, cy0, cy1, bpp, &nv_bytes, nv3089_dst_plain);
@@ -154,11 +165,11 @@ index f6e57b7..121c284 100644
 +        const u64 xb = (u64)out_x + out_w > cx1 ? cx1 : (u64)out_x + out_w, yb = (u64)out_y + out_h > cy1 ? cy1 : (u64)out_y + out_h;
 +        nv_bytes = (xa < xb && ya < yb) ? (xb - xa) * (yb - ya) * bpp : 0;
 +    }
-+    if (!rows_done)
++    if (!rows_done && !tiled_done)
      for (u32 y = 0; y < out_h; y++) {
          u32 dy = out_y + y;
          if (dy < cy0 || dy >= cy1) continue;
-@@ -1295,7 +1298,15 @@ static void nv3089_blit(void)
+@@ -1617,7 +1634,15 @@ static void nv3089_blit(void)
          const u32 y1 = (out_y + out_h < cy1) ? out_y + out_h : cy1;
          nv3089_engine_wrote(dst_pitch, x0, y0, x1, y1);
      }
@@ -175,7 +186,7 @@ index f6e57b7..121c284 100644
      { static int _n = 0; static int cap = -1;
        if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
        if (cap && _n < cap) { _n++;
-@@ -1388,9 +1399,12 @@ static void nv0039_copy(u32 notify)
+@@ -1719,9 +1744,12 @@ static void nv0039_copy(u32 notify)
      }
      if (m2mf_t0) rsx_perf_add(RSX_PERF_W_M2MF_T, rsx_perf_now() - m2mf_t0);
      u32 marked = 0;
@@ -189,9 +200,9 @@ index f6e57b7..121c284 100644
      if (rsx_live_draw_enabled())   /* patch 2017 diagnostic, LD_GUEST_WRITE_DBG=1 */
          rsx_live_draw_watch_copy(dl ? 0u : 1u, (u32)(lo_out - (s64)dst) + s_nv0039.off_out,
                                   (u32)(hi_out - lo_out));
-@@ -1505,7 +1519,9 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
-                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
-                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
+@@ -1842,7 +1870,9 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+                 return;
+             }
              vm_write32(base + py * dst_pitch + px * 4, data);
 +            rsx_live_draw_set_write_source(5u);   /* patch 2081 diagnostic tag: NV308A */
              gcm_note_pages_ea(base + py * dst_pitch + px * 4, 4u);   /* patch 2033 */
@@ -199,7 +210,7 @@ index f6e57b7..121c284 100644
              return;
          }
          return;
-@@ -2201,6 +2217,11 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+@@ -2586,6 +2616,11 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
                      d[RSX_PERF_W_D_POST_T] * tk, d[RSX_PERF_W_D_RS_T] * tk,
                      d[RSX_PERF_W_D_BAR_N], d[RSX_PERF_W_D_BAR_T] * tk, d[RSX_PERF_W_D_OMRT_T] * tk, d[RSX_PERF_W_D_SM_HIT_N],
                      d[RSX_PERF_W_D_UNIT_SKIP_N]);
@@ -211,7 +222,7 @@ index f6e57b7..121c284 100644
              if (d[RSX_PERF_W_ON]) {   /* patch 2045: flushes by reason (n/ms) and the texture upload half */
                  static const char* const rn[11] = { "present", "ref", "vring", "cbring", "retire", "movie",
                                                      "mpresent", "readback", "pscbring", "descring", "shutdown" };
-@@ -3990,21 +4011,32 @@ void cellGcm_note_guest_write_pages_ea(u32 ea, u32 size) { gcm_note_pages_ea(ea,
+@@ -4891,21 +4926,32 @@ void cellGcm_note_guest_write_pages_ea(u32 ea, u32 size) { gcm_note_pages_ea(ea,
  /* KZ3 patch 2078: host file reads into guest memory (runtime/ppu/ppu_fs.cpp: cellFsRead, the AIO read) mark
   * pages the same way; a weak reference for the same reason (host tests link without the fs layer). */
  extern void fs_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) __attribute__((weak));
@@ -251,10 +262,10 @@ index f6e57b7..121c284 100644
  
  u32 cellGcmResolveIO(u32 offset)
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index a65f64f..ab19948 100644
+index 0c3cac1b..7d8b6746 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -53,6 +53,7 @@ u32  rsx_live_draw_report_value(u32 off, u32 dflt) { (void)off; return dflt; }
+@@ -54,6 +54,7 @@ u32  rsx_live_draw_report_value(u32 off, u32 dflt) { (void)off; return dflt; }
  void rsx_live_draw_debug_report_readback_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] = 0; }
  void rsx_live_draw_note_guest_write_async(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
  void rsx_live_draw_note_guest_write_pages(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }   /* patch 2033 */
@@ -262,7 +273,7 @@ index a65f64f..ab19948 100644
  void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
  u32  rsx_live_draw_before_guest_sync(void) { return 0; }
  void rsx_live_draw_debug_writeback_stats(double* t, u32* b, u32* s, u32* w)
-@@ -3265,12 +3266,39 @@ static u32 ld_tex_hash_big(void)
+@@ -3253,12 +3254,39 @@ static u32 ld_tex_hash_big(void)
      return (u32)big;
  }
  
@@ -302,7 +313,7 @@ index a65f64f..ab19948 100644
      volatile LONG* td = g_ld_td[location];
      for (u32 p = p0; ; p++) {
          const LONG bit = (LONG)(1u << (p & 31u));
-@@ -3307,12 +3335,21 @@ static int ld_td_test(const u32* td, u32 offset, u32 span)
+@@ -3295,12 +3323,21 @@ static int ld_td_test(const u32* td, u32 offset, u32 span)
   * ([tex-clean] miss0/miss1 and [tex-clean-miss] lines); it must stay 0 where the bitmap is exact.
   * LD_TEX_CLEAN=0: the patch-2046 rule (size tier, LD_TEX_HASH_SPAN/BIG). */
  #define LD_TEX_CLEAN_PERIOD_DEFAULT 30u
@@ -325,7 +336,7 @@ index a65f64f..ab19948 100644
  static u32 ld_tex_clean_period(void)
  {
      static long long per = -1;
-@@ -3337,6 +3374,7 @@ static u32 ld_tex_clean_limit(u32 offset, u32 per)
+@@ -3325,6 +3362,7 @@ static u32 ld_tex_clean_limit(u32 offset, u32 per)
      return per - (((offset >> 6) * 2654435761u) >> 16) % half;
  }
  static u32 g_ld_tc_pending;   /* walker: 0, or the clean-rule reason of the decision in flight (1 net, 2 check) */
@@ -333,7 +344,7 @@ index a65f64f..ab19948 100644
  static struct { u64 skipped, net, checked, pinned, miss_net[2], miss_check[2]; } g_ld_tc;
  
  /* Walker, at a hash decision: hash now, or keep the cached decode for this frame? */
-@@ -3349,7 +3387,8 @@ static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_fra
+@@ -3337,7 +3375,8 @@ static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_fra
      if (location > 1u || !span) return 1;   /* never rate-limited; `written` stays as it is for the stat */
      if (*written) return 1;
      if (ld_td_test((const u32*)g_ld_td[location], offset, span)) { *written = 1; return 1; }
@@ -343,7 +354,7 @@ index a65f64f..ab19948 100644
          const u32 per = ld_tex_clean_period();
          if (*dyn & 2u) {
              if (quiet < (per ? per : 1u)) { g_ld_tc.pinned++; return 1; }
-@@ -3375,6 +3414,66 @@ static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_fra
+@@ -3363,6 +3402,66 @@ static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_fra
  }
  
  /* Walker, at a hash result: keep the quiet counter and the statistics. */
@@ -410,7 +421,7 @@ index a65f64f..ab19948 100644
  static void ld_tex_hash_note(int readable, int changed, u32* quiet, u32* written, u32* dyn, u32 location,
                               u32 offset, u32 w, u32 h, u32 fmt, u32 span)
  {
-@@ -3392,6 +3491,7 @@ static void ld_tex_hash_note(int readable, int changed, u32* quiet, u32* written
+@@ -3380,6 +3479,7 @@ static void ld_tex_hash_note(int readable, int changed, u32* quiet, u32* written
                      fprintf(stderr, "[tex-clean-miss] n=%u by=%s frame=%u src=%u:0x%08X %ux%u fmt=0x%02X span=%u\n",
                              n_miss, g_ld_tc_pending == 2u ? "check" : "net", g_ld_frames, location, offset, w, h,
                              fmt, span);
@@ -418,7 +429,7 @@ index a65f64f..ab19948 100644
              }
              static u32 n_untracked = 0;   /* patch 2046: who the untracked writers are (the evidence for the tier) */
              g_ld_th.untracked++;
-@@ -14898,7 +14998,9 @@ static int ld_writeback_surface(u32 i, u32 for_off, u32 for_size)
+@@ -14493,7 +14593,9 @@ static int ld_writeback_surface(u32 i, u32 for_off, u32 for_size)
       * live-draw) go into the surface first, so the write-back keeps them. */
      ld_gv_validate(i);
      u8* gm = (u8*)guest_ptr(location, sf->offset, (u32)(s1 - s0));
@@ -428,7 +439,7 @@ index a65f64f..ab19948 100644
      const size_t n = (size_t)sf->w * sf->h * texel;
      u8* buf = gm ? (u8*)malloc(n) : NULL;
      if (!buf) return 0;
-@@ -15002,7 +15104,9 @@ static int ld_rb_store(u32 i, u32 k, u32 for_off, u32 for_size)
+@@ -14597,7 +14699,9 @@ static int ld_rb_store(u32 i, u32 k, u32 for_off, u32 for_size)
      const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
      const u32 pitch = (sf->w * texel + 255u) & ~255u;
      u8* gm = (u8*)guest_ptr(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel);
@@ -439,7 +450,7 @@ index a65f64f..ab19948 100644
      if (!gm || FAILED(g_ld_rb[k]->lpVtbl->Map(g_ld_rb[k], 0, &rr, (void**)&px))) return 0;
      for (u32 y = 0; y < sf->h; y++) {
 diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
-index b4cab79..af85100 100644
+index b4cab79c..af851004 100644
 --- a/libs/video/rsx_live_draw.h
 +++ b/libs/video/rsx_live_draw.h
 @@ -94,6 +94,9 @@ void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size);
@@ -465,7 +476,7 @@ index b4cab79..af85100 100644
  int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
 diff --git a/libs/video/rsx_nv3089_rows.h b/libs/video/rsx_nv3089_rows.h
 new file mode 100644
-index 0000000..201a312
+index 00000000..201a3128
 --- /dev/null
 +++ b/libs/video/rsx_nv3089_rows.h
 @@ -0,0 +1,45 @@

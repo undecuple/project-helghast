@@ -10,6 +10,9 @@ Rules for every KZ3_/LD_/RSX_ variable whose value is a drive path (X:\\... or X
 - The host path must be inside ROOT (the sandbox's checkout).
 - Under ROOT/work or ROOT/build: fine (its folder is created if missing, since the game does not create folders).
 - Elsewhere under ROOT: read-only, so the file must already exist (an input).
+- A checkout-relative path (work/..., build/...) in a switch the game reads (a getenv("NAME") in port/, patches included;
+  host-side names such as KZ3_STAGE_EXE stay relative) is refused: the game resolves it against its own app folder in the run
+  dir, so every write fails (SPU pass 159 record run, 2026-11-11). Give it as Z:\\...
 
 usage: runenv_check.py ROOT      exit 0 = fine, 1 = refused (reasons on stderr)
 """
@@ -35,12 +38,31 @@ def inside(path, root):
     return path == root or path.startswith(root + "/")
 
 
+RELATIVE = re.compile(r"^(?:\./)?(?:work|build)[\\/]")
+GETENV = re.compile(rb'getenv\("((?:KZ3|LD|RSX)_[A-Z0-9_]+)"\)')
+
+
+def game_switches(root):
+    """Switch names the game code reads: getenv("NAME") literals under ROOT/port (sources and patches)."""
+    names = set()
+    for d, _, files in os.walk(os.path.join(root, "port")):
+        for f in files:
+            if f.endswith((".c", ".h", ".cpp", ".hpp", ".patch")):
+                with open(os.path.join(d, f), "rb") as fh:
+                    names.update(m.decode() for m in GETENV.findall(fh.read()))
+    return names
+
+
 def check(env, root, make_dirs=True):
     """List of problems (empty = fine)."""
     root = os.path.realpath(root)
     problems = []
+    game = None
     for name, value in sorted(env.items()):
         if not name.startswith(PREFIXES):
+            continue
+        if RELATIVE.match(value.strip()) and name in (game if game is not None else (game := game_switches(root))):
+            problems.append(f"{name}={value}: relative to the game's app folder, not the checkout; use Z:\\... (full path)")
             continue
         path, err = host_path(value.strip())
         if err:

@@ -16,12 +16,13 @@ Host test: tools/smoke/test_ppu_store_note.sh (compiles the patch's own blocks; 
 Refreshed for v0.15.0 (SPU pass 85): upstream's lifter writes the byte-reversed and vector stores through
 VM_RAW_ST / vm_raw_st16 (aligned single-copy atomic) instead of memcpy; the notes follow those, and the two direct
 vm_base stores v0.15.0 added (stdbrx, stvlx/stvrx) note too.
+Rebased on ps3recomp v0.19.0 (Toro, group C): upstream cellGcmInit now sets s_config.localSize = 0x0F900000u (249 MB, retail value; 256 MB overflowed the 28-bit heap size field). Upstream's line is kept; the patch's cellGcm_ppu_store_note_install() call follows it (the patch's old 256 MB line is dropped, upstream's value wins). gcm_ppu_note_pages_ea and the install function read s_config.localSize at call time, so they follow the 249 MB window. ppu_loader.cpp and ppu_lifter.py apply without change.
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 121c284..0a4d4ab 100644
+index 2b7677b7..90367216 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -18,6 +18,7 @@
+@@ -19,6 +19,7 @@
  #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
  #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
  void cellGcm_spu_guest_write_hook_install(void);   /* patch 2033 */
@@ -29,15 +30,15 @@ index 121c284..0a4d4ab 100644
  static void gcm_note_pages_ea(u32 ea, u32 size);           /* patch 2033 */
  #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
  #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
-@@ -511,6 +512,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+@@ -591,6 +592,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
       */
      s_config.localAddress    = 0xC0000000;  /* typical RSX local mem base */
-     s_config.localSize       = 256 * 1024 * 1024;  /* 256 MB */
+     s_config.localSize       = 0x0F900000u;  /* 249 MB: retail PS3 value; 256 MB overflows 28-bit heap size field */
 +    if (rsx_live_draw_enabled()) cellGcm_ppu_store_note_install();   /* patch 2082 */
      s_config.ioAddress       = ioAddress;
      s_config.ioSize          = ioSize;
      s_config.memoryFrequency = 650000000;   /* 650 MHz */
-@@ -4025,6 +4027,35 @@ void cellGcm_spu_guest_write_hook_install(void)
+@@ -4940,6 +4942,35 @@ void cellGcm_spu_guest_write_hook_install(void)
      if (spu_set_guest_write_hook) spu_set_guest_write_hook(gcm_spu_note_pages_ea);   /* 2033; tag 2081 */
      if (fs_set_guest_write_hook) fs_set_guest_write_hook(gcm_fs_note_pages_ea);   /* patch 2078; tag 2081 */
  }
@@ -74,10 +75,10 @@ index 121c284..0a4d4ab 100644
  {
      if (!size || !rsx_live_draw_enabled()) return;
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index ab19948..de93fb1 100644
+index 5331b8d1..88d4149f 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -3276,9 +3276,10 @@ static u32 ld_tex_hash_big(void)
+@@ -3286,9 +3286,10 @@ static u32 ld_tex_hash_big(void)
   * ([tex-watch]: host rip, [rsp], thread id, guest offset), which names a PPU writer. ASSUMPTION: a host ReadFile
   * into a protected page fails instead of faulting; host file reads are tracked (2078), so a watched page they hit
   * is a read error in that run, logged by the fs layer. */
@@ -90,7 +91,7 @@ index ab19948..de93fb1 100644
  #define LD_WS_PAGES 4096u
  static u8 g_ld_ws_src[LD_WS_PAGES];
  static u32 g_ld_ws_frame[LD_WS_PAGES];
-@@ -8717,6 +8718,10 @@ static void ld_gamma_log(u32 unit, const rsx_dsp_texture* t)
+@@ -9017,6 +9018,10 @@ static void ld_gamma_log(u32 unit, const rsx_dsp_texture* t)
  typedef struct { u32 kind, fmt, remap, aux, zalias, target, tfmt; unsigned long long n; } ld_feat_row;
  static ld_feat_row g_ld_feat[512]; static u32 g_ld_feat_n; static unsigned long long g_ld_feat_draws;
  static unsigned long long g_ld_feat_pk_fec, g_ld_feat_pk_fbc;
@@ -101,7 +102,7 @@ index ab19948..de93fb1 100644
  static int ld_feat_on(void)
  {
      static int on = -1;
-@@ -8735,9 +8740,9 @@ static void ld_feat_row_add(u32 kind, u32 fmt, u32 remap, u32 aux, u32 zalias, u
+@@ -9035,9 +9040,9 @@ static void ld_feat_row_add(u32 kind, u32 fmt, u32 remap, u32 aux, u32 zalias, u
  }
  static void ld_feat_dump(void)
  {
@@ -114,7 +115,7 @@ index ab19948..de93fb1 100644
      for (u32 i = 0; i < g_ld_feat_n; i++) {
          const ld_feat_row* r = &g_ld_feat[i];
          fprintf(stderr, "[feat] %s fmt=0x%02x remap=0x%04x aux=0x%x zalias=%u target=0x%08x tfmt=%u n=%llu\n",
-@@ -8765,6 +8770,13 @@ static void ld_feat_unit(const rsx_dsp_texture* t, int zalias)
+@@ -9065,6 +9070,13 @@ static void ld_feat_unit(const rsx_dsp_texture* t, int zalias)
      const u32 rm = r16 ? r16 : 0xAAE4u;
      if (((base >= 0x90u && base <= 0x94u) || base == 0x9Cu) && rm != 0xAAE4u)
          ld_feat_row_add(0, base, rm, 0, (u32)zalias, sf.color_offset[0], sf.color_format);
@@ -129,10 +130,10 @@ index ab19948..de93fb1 100644
      if (gam) {
          ld_feat_row_add(1, base, rm, gam, (u32)zalias, sf.color_offset[0], sf.color_format);
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index 8792490..713a1a3 100644
+index 887e9ea4..3522e866 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
-@@ -1497,7 +1497,22 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
+@@ -1626,7 +1626,22 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
          } else {                                                              \
              memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
          }                                                                     \
@@ -155,7 +156,7 @@ index 8792490..713a1a3 100644
  
  extern "C" {
  /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
-@@ -1623,6 +1638,30 @@ static void vm_inline_open(void)
+@@ -1767,6 +1782,30 @@ static void vm_inline_open(void)
          if (pg != ref_page) __atomic_or_fetch(&g_ppu_vm_page[pg], 1u, __ATOMIC_RELAXED);
      __atomic_thread_fence(__ATOMIC_RELEASE);
  }
@@ -187,10 +188,10 @@ index 8792490..713a1a3 100644
  {
      const char* en = getenv("KZ3_VM_FAST");
 diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
-index 5f70b39..4e2f053 100644
+index 0e5ad9f9..692ea3d2 100644
 --- a/tools/ppu_lifter.py
 +++ b/tools/ppu_lifter.py
-@@ -518,6 +518,18 @@ static inline __attribute__((always_inline)) uint64_t ppu_vmi_read64(uint64_t a)
+@@ -633,6 +633,18 @@ static inline __attribute__((always_inline)) uint64_t ppu_vmi_read64(uint64_t a)
  #endif
  /* ---- KZ3 patch 1091 end ---- */
  
@@ -209,7 +210,7 @@ index 5f70b39..4e2f053 100644
  /* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
   * Looks up the guest address in CTR via a hash table and calls the
   * corresponding host function. Handles OPD resolution. */
-@@ -2648,7 +2660,8 @@ class PPULifter:
+@@ -2899,7 +2911,8 @@ class PPULifter:
                  loop = "for (uint32_t i = 16u - sh; i < 16u; i++) m[i - (16u - sh)] = s[i];"
              return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint32_t sh = (uint32_t)(ea & 0xF); "
                      f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
@@ -219,7 +220,7 @@ index 5f70b39..4e2f053 100644
  
          if mn == "lwaux":
              rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-@@ -2658,7 +2671,7 @@ class PPULifter:
+@@ -2909,7 +2922,7 @@ class PPULifter:
          if mn == "stdbrx":
              rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
              return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint64_t raw = ctx->gpr[{rs}]; "
@@ -228,7 +229,7 @@ index 5f70b39..4e2f053 100644
  
          # ------- String word load/store -------
          # NB bytes (lswi: NB field, 0 = 32; lswx: XER[25:31]) move between memory
-@@ -2695,7 +2708,7 @@ class PPULifter:
+@@ -2946,7 +2959,7 @@ class PPULifter:
              rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
              return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                      f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
@@ -237,7 +238,7 @@ index 5f70b39..4e2f053 100644
  
          if mn == "lhbrx":
              rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-@@ -2716,7 +2729,7 @@ class PPULifter:
+@@ -2967,7 +2980,7 @@ class PPULifter:
              rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
              return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                      f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
@@ -246,7 +247,7 @@ index 5f70b39..4e2f053 100644
  
          # ------- Load algebraic -------
          if mn == "lwax":
-@@ -2753,7 +2766,7 @@ class PPULifter:
+@@ -3004,7 +3017,7 @@ class PPULifter:
              ra = _reg_idx(ops[0])
              rb = _reg_idx(ops[1])
              return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
@@ -255,7 +256,7 @@ index 5f70b39..4e2f053 100644
  
          if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
              return f"/* {mn}: cache hint, no-op */;"
-@@ -2851,7 +2864,7 @@ class PPULifter:
+@@ -3102,7 +3115,7 @@ class PPULifter:
              ra = _reg_idx(ops[1])
              rb = _reg_idx(ops[2])
              return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
@@ -264,7 +265,7 @@ index 5f70b39..4e2f053 100644
  
          # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
          # [EA&15 .. 15] of the aligned quadword left-justified into vD and
-@@ -2900,7 +2913,7 @@ class PPULifter:
+@@ -3151,7 +3164,7 @@ class PPULifter:
              return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                      f"ea &= ~{size - 1}ULL; "
                      f"{{ uint{size*8}_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); "

@@ -5,9 +5,13 @@ holds blocks of disc files the port rewrites (menu pages), FIOS treats a changed
 menu request fails with GUM error 20000 (network pass 41, the RE notes s.35). The hook removes that cache first, as
 FIOS does with a cache it rejects (patch 4018), so FIOS builds a new one. The hook must be quick and must not block.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index b06a7e8..1ab4c41 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
-@@ -87,6 +87,12 @@
+@@ -89,6 +89,12 @@ extern "C" const char* ppu_vfs_root = ".";
  extern "C" void (*g_ps3_fs_open_hook)(const char* guest_path);
  void (*g_ps3_fs_open_hook)(const char* guest_path) = NULL;
  
@@ -20,7 +24,7 @@ FIOS does with a cache it rejects (patch 4018), so FIOS builds a new one. The ho
  /* CELL_FS return / mode / flag constants. */
  #define CELL_OK              0
  #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
-@@ -279,6 +285,7 @@
+@@ -280,6 +286,7 @@ static void cellFsOpen(ppu_context* ctx)
      { char dec_path[1200];
        const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
        if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }

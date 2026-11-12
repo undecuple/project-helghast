@@ -1,10 +1,12 @@
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (SDL3 run-time loader, XInput fallback) over upstream's SDL2 backend; upstream's general pieces kept (pad_host_release centred sticks #496, poll lock, ASSIGN_CHANGES status, empty-slot recheck #581, run-time XInput load #494 called from pad_init_backend); upstream's SDL2 rumble/#372 hold code dropped (4010 has its own).
 
+Rebased on ps3recomp v0.19.0 (shared v0.19 group C): upstream #612's SDL keyboard source (PAD_BACKEND_SDL2, which 4010 renames) now takes SDL_GetKeyboardState/SDL_GetKeyboardFocus from the SDL2 the runtime links (window and audio), declared by hand with numeric scancodes.
+
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b42d0a33..a6772734 100644
+index d68ec3ee..9c8faa7e 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -138,9 +138,26 @@ if(WIN32)
+@@ -142,9 +142,26 @@ if(WIN32)
          ole32       # COM for WASAPI audio
          bcrypt      # BCryptGenRandom for SSL RNG
      )
@@ -34,7 +36,7 @@ index b42d0a33..a6772734 100644
      find_package(SDL2 QUIET)
      if(SDL2_FOUND)
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index e07ec489..9eb33bab 100644
+index ead4060f..60e79bbe 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
 @@ -4,11 +4,8 @@
@@ -51,7 +53,7 @@ index e07ec489..9eb33bab 100644
   */
  
  #include <time.h>
-@@ -43,32 +40,34 @@ static double pad_clock(unsigned long long t0_ms)
+@@ -38,32 +35,34 @@ static double pad_clock(unsigned long long t0_ms)
   * Backend selection
   * -----------------------------------------------------------------------*/
  
@@ -100,7 +102,7 @@ index e07ec489..9eb33bab 100644
  
  /* ---------------------------------------------------------------------------
   * Internal state
-@@ -76,45 +75,25 @@ static double pad_clock(unsigned long long t0_ms)
+@@ -71,45 +70,25 @@ static double pad_clock(unsigned long long t0_ms)
  
  #define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
  
@@ -157,7 +159,7 @@ index e07ec489..9eb33bab 100644
  
  /* A port with no device behind it: nothing pressed and both sticks CENTRED.
   * Zero is not neutral for a stick -- 0 is full deflection up / left. Port 0 is
-@@ -149,6 +128,7 @@ static void pad_unlock(void)   { __atomic_clear(&s_poll_lock, __ATOMIC_RELEASE);
+@@ -144,6 +123,7 @@ static void pad_unlock(void)   { __atomic_clear(&s_poll_lock, __ATOMIC_RELEASE);
   * since the title last asked (cellPadGetInfo/GetInfo2/PeriphGetInfo), as
   * libpad reports a controller plugged in or taken away. */
  static int s_port_reported[PAD_MAX_HOST_PORTS];
@@ -165,7 +167,7 @@ index e07ec489..9eb33bab 100644
  static int s_port_changed[PAD_MAX_HOST_PORTS];
  static void pad_track_assign(void)
  {
-@@ -164,37 +144,8 @@ static u32 pad_status_take(u32 port)
+@@ -159,37 +139,8 @@ static u32 pad_status_take(u32 port)
      return ch ? CELL_PAD_STATUS_ASSIGN_CHANGES : 0;
  }
  
@@ -203,9 +205,64 @@ index e07ec489..9eb33bab 100644
 +/* KZ3 patch 4010: rumble goes through pad_act_to_rumble (XInput) and pad_sdl_rumble (SDL3), which hold and
 + * renew a request like upstream PR #372 does (SPU pass 91); #372's PadRumble/pad_rumble_levels are not used. */
  
- /* ---------------------------------------------------------------------------
-  * XInput backend
-@@ -782,262 +733,355 @@ static void pad_poll_xinput(void)
+ /* Keyboard fallback for port 0.
+  *
+@@ -275,10 +226,15 @@ static int pad_key_down(int key)
+ #define PADKEY_RETURN 36
+ #define PADKEY_TAB 48
+ #define PADKEY_ESCAPE 53
+-#elif PAD_BACKEND_SDL2
++#else
+ /* Everywhere else the keyboard is SDL's: scancodes are physical keys, like the macOS codes above. The state is kept
+  * current by whoever pumps SDL's events (the window of the RSX backend); without a video subsystem nothing is ever
+- * pressed. "Focused" is that some window of this process has the keyboard focus. */
++ * pressed. "Focused" is that some window of this process has the keyboard focus.
++ * KZ3 patch 4010: the pads are SDL3, loaded at run time, but the window (and so the keyboard state) is the SDL2 the
++ * runtime links for the RSX and audio backends, so these two come from SDL2. Declared by hand: SDL2's header would
++ * clash with the SDL3 subset above. Scancodes are USB HID usages, the same in SDL2 and SDL3. */
++extern const unsigned char* SDL_GetKeyboardState(int* numkeys);
++extern void* SDL_GetKeyboardFocus(void);
+ static int pad_host_window_focused(void)
+ {
+     return SDL_GetKeyboardFocus() != NULL;
+@@ -287,21 +243,21 @@ static int pad_key_down(int key)
+ {
+     return SDL_GetKeyboardState(NULL)[key] != 0;
+ }
+-#define PADKEY_UP SDL_SCANCODE_UP
+-#define PADKEY_DOWN SDL_SCANCODE_DOWN
+-#define PADKEY_LEFT SDL_SCANCODE_LEFT
+-#define PADKEY_RIGHT SDL_SCANCODE_RIGHT
+-#define PADKEY_Z SDL_SCANCODE_Z
+-#define PADKEY_X SDL_SCANCODE_X
+-#define PADKEY_A SDL_SCANCODE_A
+-#define PADKEY_S SDL_SCANCODE_S
+-#define PADKEY_Q SDL_SCANCODE_Q
+-#define PADKEY_W SDL_SCANCODE_W
+-#define PADKEY_1 SDL_SCANCODE_1
+-#define PADKEY_2 SDL_SCANCODE_2
+-#define PADKEY_RETURN SDL_SCANCODE_RETURN
+-#define PADKEY_TAB SDL_SCANCODE_TAB
+-#define PADKEY_ESCAPE SDL_SCANCODE_ESCAPE
++#define PADKEY_UP 82   /* SDL_SCANCODE_UP */
++#define PADKEY_DOWN 81   /* SDL_SCANCODE_DOWN */
++#define PADKEY_LEFT 80   /* SDL_SCANCODE_LEFT */
++#define PADKEY_RIGHT 79   /* SDL_SCANCODE_RIGHT */
++#define PADKEY_Z 29   /* SDL_SCANCODE_Z */
++#define PADKEY_X 27   /* SDL_SCANCODE_X */
++#define PADKEY_A 4   /* SDL_SCANCODE_A */
++#define PADKEY_S 22   /* SDL_SCANCODE_S */
++#define PADKEY_Q 20   /* SDL_SCANCODE_Q */
++#define PADKEY_W 26   /* SDL_SCANCODE_W */
++#define PADKEY_1 30   /* SDL_SCANCODE_1 */
++#define PADKEY_2 31   /* SDL_SCANCODE_2 */
++#define PADKEY_RETURN 40   /* SDL_SCANCODE_RETURN */
++#define PADKEY_TAB 43   /* SDL_SCANCODE_TAB */
++#define PADKEY_ESCAPE 41   /* SDL_SCANCODE_ESCAPE */
+ #endif
+ 
+ #if !PAD_BACKEND_XINPUT   /* KZ3 patch 2037: the XInput build reads keybinds.ini instead (below) */
+@@ -768,261 +724,354 @@ static void pad_poll_xinput(void)
      }
  }
  
@@ -237,15 +294,6 @@ index e07ec489..9eb33bab 100644
 -{
 -    /* SDL axis: -32768..32767 -> 0..255 with center at 128 */
 -    int val = ((raw + 32768) * 255) / 65535;
--    if (val < 0) val = 0;
--    if (val > 255) val = 255;
--    return (u8)val;
--}
--
--static u8 pad_sdl_trigger_to_u8(int raw)
--{
--    /* SDL trigger: 0..32767 -> 0..255 */
--    int val = (raw * 255) / 32767;
 -    if (val < 0) val = 0;
 -    if (val > 255) val = 255;
 -    return (u8)val;
@@ -319,19 +367,41 @@ index e07ec489..9eb33bab 100644
 +#endif
 +#endif
  
+-static u8 pad_sdl_trigger_to_u8(int raw)
+-{
+-    /* SDL trigger: 0..32767 -> 0..255 */
+-    int val = (raw * 255) / 32767;
+-    if (val < 0) val = 0;
+-    if (val > 255) val = 255;
+-    return (u8)val;
+-}
++#define PAD_SDL_RUMBLE_MS   2000   /* each SDL rumble request lasts this long ... */
++#define PAD_SDL_REFRESH_MS  1000   /* ... and is re-sent this often while the game holds it */
++#define PAD_SDL_ENUM_MS     500    /* hot-plug scan interval */
+ 
 -/* Send port i's rumble state to its controller, with a fresh duration. */
 -static void pad_sdl_rumble_send(int i)
--{
++static unsigned long long pad_now_ms(void);
++static PadSdlMutex*       s_sdl_lock;
++static int                s_sdl_slot_id[PAD_MAX_HOST_PORTS];   /* SDL instance id per port, -1 = free */
++static unsigned long long s_sdl_enum_ms;
++static unsigned short     s_rumble_lo[PAD_MAX_HOST_PORTS], s_rumble_hi[PAD_MAX_HOST_PORTS];
++static unsigned long long s_rumble_ms[PAD_MAX_HOST_PORTS];
++static unsigned char       s_port_ps3_press[PAD_MAX_HOST_PORTS]; /* 1 = PS3-type pad with the 10 pressure axes */
++static PadSensorWatch     s_sdl_sensors[PAD_MAX_HOST_PORTS];   /* .on: bit 0 accel, bit 1 gyro, enabled */
++
++/* pad_host.h's sensor watch calls these with the SDL_Gamepad as ctx. */
++static int pad_sdl_has_sensor(void* gc, int type) { return PSDL(SDL_GamepadHasSensor)((PadSdlGamepad*)gc, type); }
++static int pad_sdl_enable_sensor(void* gc, int type)
+ {
 -    SDL_GameController* gc = s_sdl_controllers[i];
 -    if (!gc) return;
 -    PadRumble* r = &s_rumble[i];
 -    const int on = r->lo || r->hi;
 -    SDL_GameControllerRumble(gc, r->lo, r->hi, on ? PAD_RUMBLE_HOLD_MS : 0);
 -    r->sent_ms = on ? pad_now_ms() : 0;
--}
-+#define PAD_SDL_RUMBLE_MS   2000   /* each SDL rumble request lasts this long ... */
-+#define PAD_SDL_REFRESH_MS  1000   /* ... and is re-sent this often while the game holds it */
-+#define PAD_SDL_ENUM_MS     500    /* hot-plug scan interval */
++    return PSDL(SDL_SetGamepadSensorEnabled)((PadSdlGamepad*)gc, type, true);
+ }
  
 -/* ---- hot-plug ------------------------------------------------------------
 - * A DualSense over Bluetooth drops off when it is switched off or idles, and
@@ -359,31 +429,14 @@ index e07ec489..9eb33bab 100644
 -#define PAD_SDL_RESCAN_MS 1000
 -
 -static int pad_sdl_port_of(SDL_JoystickID id)
--{
--    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++)
--        if (s_sdl_controllers[p] && s_sdl_ids[p] == id) return p;
--    return -1;
-+static unsigned long long pad_now_ms(void);
-+static PadSdlMutex*       s_sdl_lock;
-+static int                s_sdl_slot_id[PAD_MAX_HOST_PORTS];   /* SDL instance id per port, -1 = free */
-+static unsigned long long s_sdl_enum_ms;
-+static unsigned short     s_rumble_lo[PAD_MAX_HOST_PORTS], s_rumble_hi[PAD_MAX_HOST_PORTS];
-+static unsigned long long s_rumble_ms[PAD_MAX_HOST_PORTS];
-+static unsigned char       s_port_ps3_press[PAD_MAX_HOST_PORTS]; /* 1 = PS3-type pad with the 10 pressure axes */
-+static PadSensorWatch     s_sdl_sensors[PAD_MAX_HOST_PORTS];   /* .on: bit 0 accel, bit 1 gyro, enabled */
-+
-+/* pad_host.h's sensor watch calls these with the SDL_Gamepad as ctx. */
-+static int pad_sdl_has_sensor(void* gc, int type) { return PSDL(SDL_GamepadHasSensor)((PadSdlGamepad*)gc, type); }
-+static int pad_sdl_enable_sensor(void* gc, int type)
-+{
-+    return PSDL(SDL_SetGamepadSensorEnabled)((PadSdlGamepad*)gc, type, true);
-+}
-+
 +/* Turn on the pad's accelerometer and gyro (SDL leaves them off), start the 10 s sensor re-check and log what the port
 + * is: type, name, face labels, sensors; then SDL's driver, bus, connection and device path (which of SDL's drivers
 + * opened the pad decides whether it can report motion at all). */
 +static void pad_sdl_open_log(int p, PadSdlGamepad* gc, uint32_t id, unsigned long long now)
-+{
+ {
+-    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++)
+-        if (s_sdl_controllers[p] && s_sdl_ids[p] == id) return p;
+-    return -1;
 +    pad_sensor_open(&s_sdl_sensors[p], now, pad_sdl_has_sensor, pad_sdl_enable_sensor, gc);
 +    const char* name = PSDL(SDL_GetGamepadName)(gc);
 +    printf("[pad] port %d: %s (%s), face %s/%s/%s/%s, sensors %s\n", p,
@@ -657,7 +710,7 @@ index e07ec489..9eb33bab 100644
 +            printf("[pad] PAD_SDL=0: %s\n", PAD_BACKEND_XINPUT ? "XInput backend" : "no pad backend");
 +            fflush(stdout);
 +            return 0;
-+        }
+         }
 +#ifdef _WIN32
 +        HMODULE m = LoadLibraryExW(L"SDL3.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
 +        #define PAD_SDL_SYM(n) (void (*)(void))GetProcAddress(m, n)
@@ -708,7 +761,7 @@ index e07ec489..9eb33bab 100644
 +                pad_log_clean(v, sizeof v, env);
 +                printf("[pad] SDL hint %s=%s from the environment (kept)\n", pad_sdl_env_hints[h], v);
 +            }
-         }
++        }
 +        if (!PSDL(SDL_InitSubSystem)(PAD_SDL_INIT_GAMEPAD)) {
 +            printf("[pad] SDL gamepad init failed (%s): %s\n", PSDL(SDL_GetError)(), fb);
 +            fflush(stdout);
@@ -737,7 +790,9 @@ index e07ec489..9eb33bab 100644
 +    PSDL(SDL_UnlockMutex)(s_sdl_lock);
 +    return 1;
 +}
-+
+ 
+-    /* Open any controllers already connected */
+-    pad_sdl_hotplug(1);
 +static void pad_sdl_shutdown(void)
 +{
 +    PSDL(SDL_LockMutex)(s_sdl_lock);
@@ -747,14 +802,15 @@ index e07ec489..9eb33bab 100644
 +        s_sdl_slot_id[p] = -1;
 +    }
 +    PSDL(SDL_UnlockMutex)(s_sdl_lock);
-+}
+ }
  
--    /* Open any controllers already connected */
--    pad_sdl_hotplug(1);
+-static void pad_shutdown_backend(void)
 +#endif /* PAD_BACKEND_SDL */
 +
 +static void pad_init_backend(void)
-+{
+ {
+-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) pad_sdl_close(i, 0);
+-    memset(s_rumble, 0, sizeof s_rumble);
 +#if PAD_BACKEND_XINPUT
 +    pad_xinput_load();   /* upstream #494: XInput loaded at run time (the fallback when SDL3 is absent) */
 +#endif
@@ -763,21 +819,17 @@ index e07ec489..9eb33bab 100644
 +#endif
  }
  
- static void pad_shutdown_backend(void)
- {
--    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) pad_sdl_close(i, 0);
--    memset(s_rumble, 0, sizeof s_rumble);
+-#endif /* PAD_BACKEND_SDL2 */
++static void pad_shutdown_backend(void)
++{
 +#if PAD_BACKEND_SDL
 +    if (s_use_sdl) pad_sdl_shutdown();
 +#endif
- }
++}
  
--#endif /* PAD_BACKEND_SDL2 */
--
  /* ---------------------------------------------------------------------------
   * Poll dispatcher
-  * -----------------------------------------------------------------------*/
-@@ -1081,10 +1125,11 @@ static void pad_poll_backend(void)
+@@ -1067,10 +1116,11 @@ static void pad_poll_backend(void)
       * every port. cellPadGetData hands each one out exactly once. */
      for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
  
@@ -790,9 +842,9 @@ index e07ec489..9eb33bab 100644
 -    pad_poll_sdl2();
 +    if (!s_use_sdl) pad_poll_xinput();
  #endif
- #ifdef _WIN32
+ #if PAD_BACKEND_XINPUT
      /* KZ3 patch 2037: keys always polled (not only with no pad on port 0) and merged into port 0. */
-@@ -1651,17 +1696,18 @@ skip_inject: ;
+@@ -1626,17 +1676,18 @@ skip_inject: ;
              { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x01, CELL_PAD_BTN_OFFSET_PRESS_L2 },
              { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x02, CELL_PAD_BTN_OFFSET_PRESS_R2 } };
          for (unsigned k = 0; k < sizeof pm / sizeof pm[0]; k++)
@@ -818,7 +870,7 @@ index e07ec489..9eb33bab 100644
      }
      }  /* end connected block */
  
-@@ -1968,18 +2014,12 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
+@@ -1941,18 +1992,12 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
  
      param = GUEST_PTR(param, CellPadActParam*);
  
@@ -842,7 +894,7 @@ index e07ec489..9eb33bab 100644
          XINPUT_VIBRATION vib;
          vib.wLeftMotorSpeed  = (WORD)lo;
          vib.wRightMotorSpeed = (WORD)hi;
-@@ -1987,10 +2027,9 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
+@@ -1960,10 +2005,9 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
      }
  #endif
  

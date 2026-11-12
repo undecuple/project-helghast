@@ -11,10 +11,13 @@ in every pipeline key, so no key changes. Not ported: the Killzone 2 port's DDY 
 window (needs its patch 2090, WPOS origin, which this port does not have). ASSUMPTION: DDY follows the window y.
 Host test: tools/smoke/test_fp_deriv.sh. Upstream candidate (DDX/DDY are general NV40 ops).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
---- a/libs/video/rsx_fp_decompiler.c	2026-11-02 15:28:13.107245172 -0600
-+++ b/libs/video/rsx_fp_decompiler.c	2026-11-02 15:28:13.115348182 -0600
-@@ -674,6 +674,22 @@
+index 719ada0..dd965db 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -681,6 +681,22 @@ u32 rsx_fp_texture_bx2_units(const u8* ucode, u32 max_bytes)
      return 0;
  }
  
@@ -37,7 +40,7 @@ diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
  static void fp_expand_helper(Out* out)
  {
      out_puts(out,
-@@ -828,6 +844,7 @@
+@@ -835,6 +851,7 @@ static int rsx_fp_decompile_internal(
      Out o = { out, out_size, 0, 1 };
      out[0] = '\0';
      int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
@@ -45,9 +48,15 @@ diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
      out_puts(&o,
          /* 64 each: the source and destination register fields are 6 bits
           * (FP_SRC_REG_MASK / FP_OUT_REG_MASK). 48 rejected every program
-@@ -1081,6 +1098,12 @@
+@@ -1087,12 +1104,13 @@ static int rsx_fp_decompile_internal(
+         case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
          case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
          case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+-        /* Screen-space derivatives. God of War: Ascension's font is a distance
+-         * field whose edge width is max(|ddx|, |ddy|) of the sampled value; as
+-         * an unhandled op the destination kept 0 and every glyph bloated. */
+-        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+-        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
          case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
 +        /* patch 2143 (the Killzone 2 port, patch 2096): screen-space derivatives. Unhandled, they wrote nothing, so the
 +         * destination kept 0 and a program dividing by fwidth (Killzone 2's anti-aliased menu panels) produced NaN,
@@ -58,7 +67,7 @@ diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
          /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
           * builtins): the packed word is a scalar that replicates. */
          case OP_PK4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(%s))", a); break;
-@@ -1505,6 +1528,7 @@
+@@ -1522,6 +1540,7 @@ static int rsx_fp_decompile_internal(
       * decompiler skipped, leaving the destination with whatever it held.
       * Only for a program that uses one, so every other program's text is
       * unchanged. */
@@ -67,9 +76,10 @@ diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
          "uint   _rsx_pk4ub(float4 v) { uint4 b = (uint4)round(saturate(v) * 255.0); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }\n"
          "float4 _rsx_up4ub(float v) { uint u = asuint(v); return float4(u & 255u, (u >> 8) & 255u, (u >> 16) & 255u, (u >> 24) & 255u) / 255.0; }\n"
 diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
---- a/libs/video/rsx_fp_decompiler.h	2026-11-02 15:28:13.107245172 -0600
-+++ b/libs/video/rsx_fp_decompiler.h	2026-11-02 15:28:13.115348182 -0600
-@@ -226,6 +226,11 @@
+index 9ce81fb..23b209c 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -238,6 +238,11 @@ int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format);
   * Returns 1, or -1 without mutation for malformed source/insufficient space.
   * Apply before alpha-test wrapping; disabled draws should skip this helper. */
  int rsx_fp_apply_srgb_output(char* hlsl, u32 capacity);
@@ -82,9 +92,10 @@ diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
  /* Gamma metadata is a post-filter/post-remap RGBA lane mask, with formats
   * validated by rsx_texture_gamma_mask. EXP_TEX overrides gamma per fetch.
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
---- a/libs/video/rsx_live_draw.c	2026-11-02 15:28:13.107245172 -0600
-+++ b/libs/video/rsx_live_draw.c	2026-11-02 15:28:13.115348182 -0600
-@@ -8682,6 +8682,20 @@
+index ace06cd..54bc17f 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8591,6 +8591,20 @@ static int ld_wpos_aa_on(void)
      }
      return on;
  }
@@ -105,7 +116,7 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  static int ld_wpos_aa_apply(char* hlsl, size_t size, u32 wpos_aa)
  {
      const u32 ax = wpos_aa & 0xFFu, ay = (wpos_aa >> 8) & 0xFFu;
-@@ -8783,6 +8797,8 @@
+@@ -8692,6 +8706,8 @@ static void ld_xlate(const ld_xl_in* in, char* vs_hlsl, size_t vs_sz, char* ps_h
          fi = -1;
      if (fi > 0 && in->wpos_aa && ld_wpos_aa_apply(ps_hlsl, ps_sz, in->wpos_aa) < 0)   /* patch 2088 */
          fi = -1;

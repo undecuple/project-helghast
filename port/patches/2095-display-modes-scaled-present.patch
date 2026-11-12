@@ -1,16 +1,20 @@
-diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
---- a/libs/input/cellPad.c	2026-10-20 19:56:31.416929301 -0500
-+++ b/libs/input/cellPad.c	2026-10-20 20:02:10.093005758 -0500
-@@ -290,6 +290,8 @@
+
+Rebased on ps3recomp v0.19.0 (Toro, group C): one conflict in cellPad.c: pad_kb_down_win. Upstream v0.19 reads keys through pad_key_down() (GetAsyncKeyState on the XInput build). The patch's Alt+Enter exclusion (an Enter press with Alt held is not a pad press) is kept and both reads use pad_key_down: pad_key_down(0x12) for Alt (VK_MENU), pad_key_down(vk) for the key. The rest of the patch (pad_kb_sibling_path, rsx_null_backend.c, display-mode files) applied without change. (The original file embeds a raw diff -ruN copy of the change before the git diff; dropped here because git apply would take it as a second patch.)
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index ea9c1c5b..e4a3d77a 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -531,6 +531,8 @@ static int pad_kb_down_win(void* ctx, int code)
      int vk = code;
      (void)ctx;
      if (code > 0 && code < 256 && s_kb_layout_ok) vk = s_kb_layout.vk[code];
 +    /* KZ3 patch 2095: Alt+Enter switches the display mode (rsx_null_backend.c); its Enter is not a pad press */
-+    if (vk == 0x0D && (GetAsyncKeyState(0x12) & 0x8000)) return 0;
-     return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
++    if (vk == 0x0D && pad_key_down(0x12)) return 0;
+     return vk && pad_key_down(vk);   /* upstream v0.19: pad_key_down wraps GetAsyncKeyState on this backend */
  }
  static int pad_kb_down_none(void* ctx, int vk) { (void)ctx; (void)vk; return 0; }
-@@ -353,6 +355,21 @@
+@@ -594,6 +596,21 @@ static void pad_kb_find_path(void)
      wcscpy(s_kb_path, L"keybinds.ini");               /* no APPDATA: the working folder */
  }
  
@@ -32,9 +36,11 @@ diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
  static int pad_kb_stamp(FILETIME* out)
  {
      WIN32_FILE_ATTRIBUTE_DATA a;
-diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
---- a/libs/video/rsx_display_mode.h	1969-12-31 18:00:00.000000000 -0600
-+++ b/libs/video/rsx_display_mode.h	2026-10-20 20:17:38.986507855 -0500
+diff --git a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+new file mode 100644
+index 00000000..cc682853
+--- /dev/null
++++ b/libs/video/rsx_display_mode.h
 @@ -0,0 +1,325 @@
 +/*
 + * KZ3 patch 2095 (RSX pass 90): display modes. ENHANCEMENT (display; the feature is on, the default mode is Windowed).
@@ -361,10 +367,11 @@ diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
 +}
 +
 +#endif /* RSX_DISPLAY_MODE_H */
-diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
---- a/libs/video/rsx_live_draw.c	2026-10-20 19:56:31.579601723 -0500
-+++ b/libs/video/rsx_live_draw.c	2026-10-20 20:17:06.584966227 -0500
-@@ -72,6 +72,9 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index e50ed14f..e205c82f 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -73,6 +73,9 @@ void rsx_live_draw_submit_pending(void) {}
  void rsx_live_draw_present(u32 b) { (void)b; }
  void rsx_live_draw_set_movie_mode(int on) { (void)on; }
  void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
@@ -374,7 +381,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  u32  rsx_live_draw_get_frames(void) { return 0; }
  void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
  u32  rsx_live_draw_get_last_draws(void) { return 0; }
-@@ -14495,6 +14498,270 @@
+@@ -14805,6 +14808,270 @@ static int make_depth_snapshot_pipeline(void)
      return SUCCEEDED(hr) ? 0 : -1;
  }
  
@@ -645,7 +652,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
                         rsx_live_guest_ptr_fn guest_fn, void* guest_user)
  {
-@@ -14641,7 +14908,10 @@
+@@ -14955,7 +15222,10 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
  
      /* swap chain bound to the runtime's HWND */
      DXGI_SWAP_CHAIN_DESC1 scd = {0};
@@ -657,7 +664,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
      scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
      scd.BufferCount = LD_SWAP_BUFFERS; scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
      IDXGISwapChain1* sc1 = NULL;
-@@ -14651,6 +14921,11 @@
+@@ -14965,6 +15235,11 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
      }
      sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g.swap);
      sc1->lpVtbl->Release(sc1);
@@ -669,7 +676,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
      factory->lpVtbl->Release(factory);
  
      /* RTV heap: [0..1] backbuffers, [2..] surface cache */
-@@ -14659,10 +14934,7 @@
+@@ -14973,10 +15248,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
      hd.NumDescriptors = LD_SWAP_BUFFERS + MAX_SURFACES;
      g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g.rtv_heap);
      g.rtv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -681,7 +688,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  
      /* upload arena */
      D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-@@ -15275,8 +15547,12 @@
+@@ -15589,8 +15861,12 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
          }
      }
  
@@ -694,7 +701,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  
      D3D12_RESOURCE_BARRIER b = {0};
      b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-@@ -15284,7 +15560,7 @@
+@@ -15598,7 +15874,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
      b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
      b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
      b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -703,7 +710,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  
      D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
      dst.pResource = bb; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
-@@ -15300,7 +15576,18 @@
+@@ -15614,7 +15890,18 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
  
      b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
      b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -723,7 +730,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  
      ld_flush(LD_FLUSH_MOVIE_PRESENT);
      {
-@@ -16569,8 +16856,14 @@
+@@ -16883,8 +17170,14 @@ static void ld_present_body(u32 buffer_id)
        } }
      ID3D12Resource* srcimg = presented_surface->tex;
      ID3D12Resource* gm_copy = ld_gamma_present(target);   /* patch 2070 */
@@ -738,7 +745,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  
      D3D12_RESOURCE_BARRIER bar[2] = {0};
      bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-@@ -16592,6 +16885,7 @@
+@@ -16906,6 +17199,7 @@ static void ld_present_body(u32 buffer_id)
      bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
      bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
      g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
@@ -746,7 +753,7 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  
      ld_flush(LD_FLUSH_PRESENT);
      {
-@@ -17738,6 +18032,7 @@
+@@ -18052,6 +18346,7 @@ void rsx_live_draw_shutdown(void)
          g.depth_snapshot_rootsig->lpVtbl->Release(
              g.depth_snapshot_rootsig);
      if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
@@ -754,10 +761,11 @@ diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
      if (g.swap) g.swap->lpVtbl->Release(g.swap);
      if (g_ld_info_queue) {
          g_ld_info_queue->lpVtbl->Release(g_ld_info_queue);
-diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
---- a/libs/video/rsx_null_backend.c	2026-10-20 19:56:31.455325701 -0500
-+++ b/libs/video/rsx_null_backend.c	2026-10-20 20:16:31.494484203 -0500
-@@ -55,11 +55,251 @@
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index 264f138c..0b5dea1d 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -55,11 +55,251 @@ static int s_present_suppressed = 0;
  #include "rsx_window_size.h"   /* KZ3 patch 2062: window size apart from the guest output */
  #include "../input/pad_mouse.h"   /* KZ3 patch 2069: mouse look (Raw Input, cursor clip) */
  
@@ -1010,7 +1018,7 @@ diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
      switch (msg) {
      case WM_CLOSE:
          s_state.window_closed = 1;
-@@ -286,6 +526,7 @@
+@@ -286,6 +526,7 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
      rsx_set_backend(&s_null_backend);
  
      printf("[RSX null] Window created: %ux%u (client %dx%d)\n", width, height, cw, ch);
@@ -1018,7 +1026,7 @@ diff -ruN a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
      return 0;
  }
  
-@@ -304,6 +545,8 @@
+@@ -304,6 +545,8 @@ void rsx_null_backend_shutdown(void)
  int rsx_null_backend_pump_messages(void)
  {
      MSG msg;

@@ -1,0 +1,90 @@
+Counter-only texture register stability profile (RSX_PERF_TEXREG=1, default off).
+
+Compares the 16 units' 9 raw texture words of each draw with the previous draw' inside the RSX_PERF_PROF window
+and prints [perf-texreg] when the window closes: draws with all units unchanged, with every enabled and used unit
+unchanged, per-unit change rates, and enabled units split into same / offset-only / other. No decision reads it.
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -4411,12 +4411,14 @@
+     }
+ }
+ 
++static void ld_trg_report(void);   /* patch 2158 */
+ void rsx_live_draw_perf_dump(void)   /* the reporter, when the RSX_PERF_PROF window closes */
+ {
+     LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+     const double tick_ms = 1000.0 / (double)(qf.QuadPart ? qf.QuadPart : 1);
+     ld_fx_report(tick_ms);   /* patch 2125 */
+     ld_pd_report(tick_ms);   /* patch 2135 */
++    ld_trg_report();         /* patch 2158 */
+     for (int which = 0; which < 3; which++) {
+         ld_rd_t* r = g_ld_rd[which]; const u32 n = g_ld_rd_n[which];
+         const char* tag = which == 0 ? "redecode" : which == 1 ? "hash" : "newtex";
+@@ -14215,6 +14217,58 @@
+     memset(&g_ld_tms, 0, sizeof g_ld_tms);
+ }
+ 
++/* KZ3 patch 2158 (RSX pass 146): RSX_PERF_TEXREG=1, inside the RSX_PERF_PROF=A,B window (RSX_PERF=1): how often the
++ * texture registers stay the same between consecutive draws. Counters only (one cached flag test per draw when off).
++ * Per draw, each of the 16 units' 9 raw words (ld_tm_raw) are compared with the previous draw's: a unit is "same" when
++ * all 9 are equal, "off-only" when only the offset word differs (a ring or atlas rebind), else "changed". [perf-texreg]
++ * is printed when the window closes. It shows how much of the per-draw texture register decode a "registers unchanged"
++ * reuse could skip; it does not change any decision. */
++static struct { u64 draws, all_same, fp_same, units_en, en_same, en_off, en_chg, draws_en0; u64 chg[16]; u32 raw[16][9]; int have; } g_ld_trg;
++static int ld_trg_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_PERF_TEXREG"); on = (e && *e && *e != '0') ? 1 : 0;
++                  if (on) fprintf(stderr, "[perf-texreg] texture register stability counters on (RSX_PERF_TEXREG=1, patch 2158)\n"); }
++    return on;
++}
++static void ld_trg_draw(void)
++{
++    if (!ld_trg_on() || !rsx_perf_walk_on()) return;
++    u32 cur[9]; u32 all_same = 1, fp_same = 1, any_en = 0;
++    for (u32 u = 0; u < 16u; u++) {
++        ld_tm_raw(u, cur);
++        u32* prev = g_ld_trg.raw[u];
++        const int enabled = (int)(cur[3] >> 31);
++        if (g_ld_trg.have) {
++            int diff = 0, diff_other = 0;
++            for (u32 k = 0; k < 9u; k++) if (cur[k] != prev[k]) { diff = 1; if (k) diff_other = 1; }
++            if (diff) { g_ld_trg.chg[u]++; all_same = 0; if (enabled && ((g_ld_fp_units_cur >> u) & 1u)) fp_same = 0; }
++            if (enabled) {
++                g_ld_trg.units_en++;
++                if (!diff) g_ld_trg.en_same++; else if (!diff_other) g_ld_trg.en_off++; else g_ld_trg.en_chg++;
++            }
++        }
++        any_en |= (u32)enabled;
++        memcpy(prev, cur, sizeof cur);
++    }
++    if (!g_ld_trg.have) { g_ld_trg.have = 1; return; }
++    g_ld_trg.draws++; g_ld_trg.all_same += all_same; g_ld_trg.fp_same += fp_same; g_ld_trg.draws_en0 += !any_en;
++}
++static void ld_trg_report(void)
++{
++    if (!ld_trg_on() || !g_ld_trg.draws) return;
++    const double n = (double)g_ld_trg.draws, e = g_ld_trg.units_en ? (double)g_ld_trg.units_en : 1.0;
++    fprintf(stderr, "[perf-texreg] draws %llu | draws with all 16 units unchanged %.1f%% | draws with every enabled+used unit unchanged %.1f%%"
++                    " | draws with no enabled unit %.1f%% | enabled units/draw %.2f: same %.1f%% offset-only %.1f%% other %.1f%%\n",
++            (unsigned long long)g_ld_trg.draws, 100.0 * (double)g_ld_trg.all_same / n, 100.0 * (double)g_ld_trg.fp_same / n,
++            100.0 * (double)g_ld_trg.draws_en0 / n, (double)g_ld_trg.units_en / n, 100.0 * (double)g_ld_trg.en_same / e,
++            100.0 * (double)g_ld_trg.en_off / e, 100.0 * (double)g_ld_trg.en_chg / e);
++    fprintf(stderr, "[perf-texreg] units changed per draw (u0..u15, %%):");
++    for (u32 u = 0; u < 16u; u++) fprintf(stderr, " %.1f", 100.0 * (double)g_ld_trg.chg[u] / n);
++    fprintf(stderr, "\n");
++    memset(&g_ld_trg, 0, sizeof g_ld_trg);
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -14646,6 +14700,7 @@
+               }
+           }
+       } }
++    ld_trg_draw();   /* patch 2158: counters only */
+     const int tm_on = ld_tex_memo_on();   /* patch 2136 */
+     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) {
+         u32 tm_raw[9];

@@ -29,12 +29,11 @@ if (cd "$T" && $CXX -std=gnu++17 -O2 -w -pthread -I "$ROOT/tools/upstream/stub" 
 else echo "FAIL lwsync (build): $(grep -m1 -E 'error|undefined' "$OUT/lw.log" | cut -c1-200)"; fail=1; fi
 # The toolkit's sync suite on the same sources (-include win32_compat.h: KZ3 patches use LONG in sys_event.c on POSIX) (what its CI runs through tests/sync_stress/CMakeLists.txt).
 SS="$T/tests/sync_stress"
-# KZ3 diagnostics sys_event.c reaches (patches 10xx); never called by the suite.
-printf '%s\n' 'unsigned long long ps3_ms_now(void) { return 0; }' 'void spu_taskset_dump_tracked(const char* w) { (void)w; }' > "$OUT/ssstub.c"
+# The KZ3 diagnostics sys_event.c reaches (ps3_ms_now, spu_taskset_dump_tracked) are stubbed in test_shims.c by patches 1029/1030 (SPU pass 155).
 if (cd "$T" && $CC -std=gnu17 -O2 -w -pthread -c -o "$OUT/w32.o" runtime/platform/win32_compat.c && \
       $CC -std=gnu17 -O2 -w -pthread -include runtime/platform/win32_compat.h -I "$SY" -I runtime -I include -o "$OUT/ss" \
       "$SS/main.c" "$SS/test_shims.c" "$SY/sys_mutex.c" "$SY/sys_cond.c" "$SY/sys_semaphore.c" "$SY/sys_event.c" \
-      "$SY/sys_rwlock.c" "$OUT/w32.o" "$OUT/ssstub.c") >"$OUT/ss.log" 2>&1; then run sync_stress "$OUT/ss"
+      "$SY/sys_rwlock.c" "$OUT/w32.o") >"$OUT/ss.log" 2>&1; then run sync_stress "$OUT/ss"
 else echo "FAIL sync_stress (build): $(grep -m1 -E 'error|undefined' "$OUT/ss.log" | cut -c1-200)"; fail=1; fi
 if (cd "$T" && $CC -std=gnu17 -O2 -w -pthread -I . -I "$SY" -I runtime -I include -o "$OUT/cs" "$SS/test_cond_semantics.c" \
       "$SS/test_shims.c" "$SY/sys_mutex.c" "$SY/sys_cond.c" runtime/platform/win32_compat.c) >"$OUT/cs.log" 2>&1; then

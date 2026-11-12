@@ -2,9 +2,13 @@ KZ3 patch 4021: cellFsOpen hook (KZ3 only). A port hook is told the guest path o
 successfully (after the fd exists). port/net/kz3_discord.c uses it to see which level lump the game opens (Discord
 Rich Presence, network pass 33). The hook must be quick and must not block.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): the hook call sits before upstream's ps3_env_once("PS3_FSLOG_BT") test (#515) instead of getenv; behaviour unchanged.
+
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 8f889a7..b06a7e8 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
-@@ -80,4 +80,8 @@
+@@ -85,6 +85,10 @@ extern "C" void     vm_write64(uint64_t a, uint64_t v);
  /* Host root that the PS3 mount points map into (dir containing PS3_GAME). */
  extern "C" const char* ppu_vfs_root = ".";
  
@@ -13,8 +17,13 @@ Rich Presence, network pass 33). The hook must be quick and must not block.
 +void (*g_ps3_fs_open_hook)(const char* guest_path) = NULL;
 +
  /* CELL_FS return / mode / flag constants. */
-@@ -296,3 +301,4 @@
+ #define CELL_OK              0
+ #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
+@@ -336,6 +340,7 @@ static void cellFsOpen(ppu_context* ctx)
+             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
            } }
        else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
 +    if (g_ps3_fs_open_hook) g_ps3_fs_open_hook(gpath);
-     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
+     if (ps3_env_once("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
+         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
+          * which criMv/criFs function opened the movie, so the reader-attach path

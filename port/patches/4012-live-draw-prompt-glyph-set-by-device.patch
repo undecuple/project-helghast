@@ -1,10 +1,12 @@
+Rebased on ps3recomp v0.19.0 (SPU pass 153): context in rsx_live_draw.c follows v0.19; the glyph-set selection is unchanged.
+
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index 54d527ac..352965a5 100644
+index 66c5485..1d45a75 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -129,6 +129,26 @@ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context *
- #include <d3dcompiler.h>
+@@ -144,6 +144,26 @@ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context *
  #include "rsx_vertex_formats.h"
+ #include "rsx_d3d12_device.h"
  #include "rsx_keycaps.h"   /* patch 2039: keycap prompts */
 +#include "rsx_prompt_glyphs.h"   /* patch 4012 (stage 2): PS4/PS5, Xbox glyph sets of patch 2090 */
 +/* patch 4012: the glyph set the prompt atlases are drawn with (cellPad.c patch 4011: the Options row "Button prompts",
@@ -29,7 +31,7 @@ index 54d527ac..352965a5 100644
  #include "rsx_pso_async.h"
  /* patch 2048: asynchronous PSO build bookkeeping */
  #include "rsx_pso_template.h"   /* patch 2071 */
-@@ -3105,9 +3125,9 @@ static ID3D12Resource* g_ld_tex_reuse;
+@@ -3438,9 +3458,9 @@ static u32 ld_kc_l1_sig(u32 frame)
  static int g_ld_kc_kind;
  static u32 g_ld_kc_sig;
  static u32 g_ld_kc_sig_frame = 0xFFFFFFFFu, g_ld_kc_sig_now;
@@ -41,7 +43,7 @@ index 54d527ac..352965a5 100644
      return g_ld_kc_sig_now;
  }
  static unsigned long long g_ld_tex_inplace_n;
-@@ -4212,17 +4232,20 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+@@ -4748,17 +4768,20 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
              }
              return create_texture_cube(dxgi, cube_levels, n_mips);
          }

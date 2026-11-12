@@ -29,6 +29,8 @@ static const kz3_native_entry* find_entry(int slot)
         if (kz3_native_lp[i].slot == slot) return &kz3_native_lp[i];
     for (unsigned i = 0; i < kz3_native_skin_n; i++)
         if (kz3_native_skin[i].slot == slot) return &kz3_native_skin[i];
+    for (unsigned i = 0; i < kz3_native_snd_n; i++)
+        if (kz3_native_snd[i].slot == slot) return &kz3_native_snd[i];
     return NULL;
 }
 
@@ -139,6 +141,59 @@ static void synth(spu_context* c, const char* kind, int variant)
         c->gpr[7] = spu_splat_u32(pitch);
         c->gpr[8] = spu_splat_u32(n);
     }
+    if (!strcmp(kind, "snd_k7a") || !strcmp(kind, "snd_k3")) {
+        /* pass 159: Snd.Mixer K7a (r3 src, r4 dst, r5 count, r6 g0, r7 step; word 0 only, other lanes stay random) and K3
+         * (r3 step, r4 phase0, r5 src, r6 dst, r7 n). Floats: realistic audio [-1, 1] and gains/steps, silent (exact
+         * zero and -0) buffers, raw random bits, denormals; modes by variant: in place, overlapping (the kernel declines),
+         * src or dst 0, g0 = step = +-0 (early return). */
+        const int k7 = !strcmp(kind, "snd_k7a");
+        const uint32_t half = span / 2;
+        const uint32_t cnt = k7 ? 16 * (1 + rnd() % (variant % 5 == 0 ? 2 : 32)) : 8 * (1 + rnd() % (variant % 5 == 0 ? 2 : 48));
+        const uint32_t sa = area + 0x100 + ((rnd() % (half - 0x4000)) & ~15u), da = area + half + ((rnd() % (half - 0x4000)) & ~15u);
+        const int mode = variant % 11, raw = variant % 7 == 3, silent = variant % 6 == 0, den = variant % 13 == 5;
+        const uint32_t len = k7 ? cnt : 4 * cnt + 64;  /* floats to fill at the source (K3: well past the last window) */
+        uint32_t src = sa, dst = da;
+        if (k7 && mode == 0) dst = src;
+        if (mode == 1) dst = src + 16 * (1 + rnd() % 8);
+        for (uint32_t i = 0; i < len + 16 && !raw; i++) {
+            float f = ((float)(rnd() & 0xFFFFFF) / 8388608.0f) - 1.0f;
+            uint32_t b; memcpy(&b, &f, 4);
+            if (den) b = (b & 0x80000000u) | (rnd() & 0x007FFFFFu);
+            if (silent) b = (rnd() & 3) ? 0 : 0x80000000u;
+            wbe32(ls, src - (k7 ? 0 : 16) + 4 * i, b);
+            if (k7 && dst != src) {
+                float g = ((float)(rnd() & 0xFFFFFF) / 8388608.0f) - 1.0f;
+                memcpy(&b, &g, 4);
+                if (silent) b = (variant % 12 == 0) ? 0x80000000u : 0;
+                wbe32(ls, dst + 4 * i, b);
+            }
+        }
+        float f0, f1;
+        if (k7) {
+            f0 = (float)(rnd() & 0xFFFF) / 65536.0f;
+            f1 = ((float)(rnd() & 0xFFFF) / 65536.0f - 0.5f) / 128.0f;
+            if (mode == 4) f0 = f1 = 0.0f;
+            if (mode == 5) { f0 = -0.0f; f1 = 0.0f; }
+            if (mode == 6) f1 = 0.0f;
+            if (mode == 7) f0 = 0.0f;
+            if (mode == 2) src = 0;
+            if (mode == 3) dst = 0;
+        } else {
+            f0 = (float)(rnd() & 0xFFFF) / 65536.0f * (variant % 4 == 1 ? 64.0f : 1.0f);   /* phase0 */
+            f1 = 0.05f + (float)(rnd() & 0xFFFF) / 65536.0f * (variant % 3 == 0 ? 1.0f : 4.0f);   /* step */
+            if (mode == 4) f1 = -f1;
+            if (mode == 5) f1 = 0.0f;
+            if (mode == 2) dst = src - 16 + 16 * (rnd() % 8);
+            if (mode == 3) src += 1 + rnd() % 3;   /* unaligned: declined */
+        }
+        uint32_t b0, b1; memcpy(&b0, &f0, 4); memcpy(&b1, &f1, 4);
+        if (raw) { b0 = rnd() ^ rnd() << 12; b1 = rnd() ^ rnd() << 12; }
+        if (k7) {
+            c->gpr[3]._u32[0] = src; c->gpr[4]._u32[0] = dst; c->gpr[5]._u32[0] = cnt; c->gpr[6]._u32[0] = b0; c->gpr[7]._u32[0] = b1;
+        } else {
+            c->gpr[3]._u32[0] = b1; c->gpr[4]._u32[0] = b0; c->gpr[5]._u32[0] = src; c->gpr[6]._u32[0] = dst; c->gpr[7]._u32[0] = cnt;
+        }
+    }
     if (!strcmp(kind, "skin")) {
         /* pass 141: r3 out (32 B per vertex), r4/r5 float4 streams, r6 record base (unaligned, records at r6 + 6 +
          * k r10), r7/r8 bone palettes (64 B per bone), r9 n, r10 stride. variant % 4 == 0 keeps setup()'s random bits
@@ -246,6 +301,7 @@ static void synth(spu_context* c, const char* kind, int variant)
 }
 
 
+static int g_cmp_r3;   /* snd_k3 returns r3 (the new phase): compared too */
 static uint32_t g_dead_lo, g_dead_hi;   /* LS bytes of the kernel's own dead scratch frame (compare skips them) */
 
 static void wbe32(uint8_t* ls, uint32_t a, uint32_t v)
@@ -428,7 +484,7 @@ static void compare(const char* what, spu_context* a, spu_context* b)
     }
     int reg = -1;
     for (int r = 0; r < 128 && !bad; r++)
-        if ((r < 2 || r >= 80) && memcmp(&a->gpr[r], &b->gpr[r], 16)) { bad = 1; reg = r; }
+        if ((r < 2 || r >= 80 || (r == 3 && g_cmp_r3)) && memcmp(&a->gpr[r], &b->gpr[r], 16)) { bad = 1; reg = r; }
     if ((b->pc & SPU_LS_MASK) != (a->pc & SPU_LS_MASK) && !bad) { bad = 1; reg = -2; }
     if (!bad) { g_equal++; return; }
     g_differ++;
@@ -510,6 +566,7 @@ int main(int argc, char** argv)
         printf("R slot %d %s: POOL HASH MISMATCH (image %s) have 0x%016llx\n", slot, e->kind, e->image, (unsigned long long)fnv_pool(P.ls, e->pool_lo, e->pool_hi));
         return 1;
     }
+    g_cmp_r3 = !strcmp(e->kind, "snd_k3");
     const int nrec = argc - 6;
     for (int t = 0; t < trials + nrec; t++) {
         char what[96];

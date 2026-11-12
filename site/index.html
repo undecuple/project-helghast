@@ -167,8 +167,8 @@
 <tr><td>Subtitles in movies and cutscenes</td><td>Subtitle cards and in-game subtitles</td><td><span class="st st-ok">works</span><br><span class="small">In-level (in-game) subtitles were not reached; the prenarrative text cards are part of the movie and show with either setting</span></td></tr>
 </tbody></table></div></details>
 <h3>What the port adds</h3>
-<p>38 available now, 28 planned. Changes to gameplay stay optional.</p>
-<details><summary>All 66 features</summary>
+<p>38 available now, 29 planned. Changes to gameplay stay optional.</p>
+<details><summary>All 67 features</summary>
 <div class="tw"><table>
 <thead><tr><th>Feature</th><th>State</th><th>Default</th></tr></thead>
 <tbody>
@@ -238,6 +238,7 @@
 <tr><td>Motion blur strength (Options &gt; Display &gt; Motion blur, 0-100 %); no clean off yet: skipping the game&#x27;s motion blur pass garbles the picture, so the row is not offered</td><td>planned</td><td>100 (the game&#x27;s own)</td></tr>
 <tr><td>Minimap with enemy markers, using the game&#x27;s own radar where possible</td><td>planned</td><td>-</td></tr>
 <tr><td>FSR 1 upscaler (opt-in, default off)</td><td>planned</td><td>off</td></tr>
+<tr><td>Motion sections with the keyboard and mouse: mouse stick (patch 4030, default on) and autocomplete (patch 4031, opt-in)</td><td>planned</td><td>mouse stick on, autocomplete off</td></tr>
 </tbody></table></div></details>
 <p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md">Every feature, with evidence<span aria-hidden="true"> &gt;</span></a></p>
 <p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>
@@ -317,7 +318,7 @@
 </article>
 <article id="about" class="news">
 <h2>About the port</h2>
-<p class="meta">by the project · how it works · 66 port features</p>
+<p class="meta">by the project · how it works · 67 port features</p>
 <div class="nb"><span class="frame pic-about" aria-hidden="true"></span><div class="nt"><p>The port is built on <a href="https://github.com/sp00nznet/ps3recomp">ps3recomp</a> (MIT): the PPU code and the game's SPU programs are lifted to C, the PS3 system libraries the game calls are reimplemented, and the game's RSX command stream is replayed on Direct3D 12. The game's archive is read in place from your dump. It is tested on Windows x64 under Proton; a native Linux build is planned. What comes next: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/ROADMAP.md">the roadmap</a>.</p>
 <p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/HOW-IT-WORKS.md">The technical overview<span aria-hidden="true"> &gt;</span></a></p>
 <p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>
@@ -328,7 +329,7 @@
 <section id="changelog" class="promo term">
 <h2>Changelog</h2>
 <ul class="clog">
-<li><time datetime="2026-11-09">11-09</time><span>The game no longer goes to a black screen after the HAMR section in chapter 2 (Pyrrhus Evac) on Windows....</span></li>
+<li><time datetime="2026-11-09">11-09</time><span>On Windows, game files with long names could not be written to the port&#x27;s disk cache when the full path went...</span></li>
 <li><time datetime="2026-11-04">11-04</time><span>The launcher creates `display.ini` (every display setting at its default) and `online.ini` (every key...</span></li>
 <li><time datetime="2026-11-04">11-04</time><span>The 3-bone vertex skinning of the animation SPU job runs as native code by default with the 1.14 update...</span></li>
 <li><time datetime="2026-11-04">11-04</time><span>The Options &gt; Display page keeps labels and values apart in languages with long labels: the value column is...</span></li>

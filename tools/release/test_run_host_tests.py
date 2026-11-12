@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Host test of tools/run-host-tests.sh's list rules (release pass 81): a test listed in tools/host-tests.txt that is
-missing from the tree FAILS the run (also without the developer-only tools: the public tree); a test in
-tools/host-tests-private.txt that is missing is skipped. Runs the script in a scratch tree.
+missing from the tree FAILS the run (also without the developer-only tools: the public tree); a test in the
+private list (host-tests-private.txt, never exported) that is missing is skipped. Runs the script in a scratch tree.
 KZ3_RUN_HOST_TESTS_SCRIPT=<path> tests another copy of the script. SKIP when bash is missing."""
 import os
 import shutil

@@ -10,17 +10,22 @@ missing blob in a table keyed by type, hash, length and source; the first job co
 The bookkeeping is platform-neutral in libs/video/rsx_pso_async.h (host test tools/smoke/test_pso_async.c).
 Aim: the cold-cache level-start stall (K4: 245 misses = 16.4 s of walker time, RSX pass 48).
 Statistics: [pso-async] every 256 frames once builds ran.
+
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index d04d08c..c976c55 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -125,6 +125,7 @@
- #include <d3dcompiler.h>
+@@ -127,6 +127,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
  #include "rsx_vertex_formats.h"
+ #include "rsx_d3d12_device.h"
  #include "rsx_keycaps.h"   /* patch 2039: keycap prompts */
 +#include "rsx_pso_async.h"   /* patch 2048: asynchronous PSO build bookkeeping */
  #include <sys/stat.h>
  
  #pragma comment(lib, "d3d12.lib")
-@@ -310,7 +311,7 @@
+@@ -318,7 +319,7 @@ typedef struct {
      u32 quiet, written, skip_frame;   /* patch 2033, as texcache_t */
      u32 dyn;   /* patch 2046, as texcache_t (content change seen) */
  } vtexcache_t;
@@ -29,7 +34,7 @@ Statistics: [pso-async] every 256 frames once builds ran.
  typedef struct {
      u64 hash;
      u32 source_length;
-@@ -2810,6 +2811,7 @@
+@@ -2823,6 +2824,7 @@ static volatile LONG g_ld_td[2][LD_TD_WORDS];   /* pages written since the last
  static u32 g_ld_td_prev[2][LD_TD_WORDS];        /* pages written during the previous frame (walker) */
  static u32 g_ld_pg_stamp[2][LD_TD_WORDS * 32u];  /* patch 2047: per 64 KB page, 1 + the last frame a tracked write hit it */
  static void ld_vc_stat_print(void);              /* patch 2047 */
@@ -37,7 +42,7 @@ Statistics: [pso-async] every 256 frames once builds ran.
  static int g_ld_tex_hash_span = -1;
  static struct { u64 hashes, skipped, changes, tracked, untracked, hashed_bytes, flip_flags, dyn_forced, wr_unchanged; } g_ld_th;
  
-@@ -2935,6 +2937,7 @@
+@@ -2948,6 +2950,7 @@ static void ld_td_flip(void)
          }
      }
      if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) ld_vc_stat_print();   /* patch 2047 */
@@ -45,7 +50,7 @@ Statistics: [pso-async] every 256 frames once builds ran.
      if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) {
          fprintf(stderr, "[tex-hash] span=%d big=%u frame=%u hashes=%llu skipped=%llu bytes=%.1fMB changes=%llu tracked=%llu"
                          " untracked=%llu flip-flags=%llu wr-unchanged=%llu dyn-forced=%llu inplace=%llu b8-direct=%llu"
-@@ -6669,6 +6672,238 @@
+@@ -7096,6 +7099,238 @@ static ID3D12PipelineState* build_pso(
      return SUCCEEDED(hr) ? pso : NULL;
  }
  
@@ -284,7 +289,7 @@ Statistics: [pso-async] every 256 frames once builds ran.
  static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
  {
      const u32 start = rsx_dsp_vp_start(&g.rsx);
-@@ -7083,6 +7318,7 @@
+@@ -7515,6 +7750,7 @@ static ID3D12PipelineState* get_pso(
      g_ld_profile.total.pso_lookups++;
  #endif
      ld_pl_drain();   /* patch 2031: take what the preload finished */
@@ -292,7 +297,7 @@ Statistics: [pso-async] every 256 frames once builds ran.
      for (u32 i = 0; i < g.n_psos; i++) {
  #if defined(YZ_PERF_PROFILE)
          g_ld_profile.total.pso_probes++;
-@@ -7092,6 +7328,7 @@
+@@ -7524,6 +7760,7 @@ static ID3D12PipelineState* get_pso(
              g_ld_profile.total.pso_hits++;
  #endif
              if (g.psos[i].preloaded) { g.psos[i].preloaded = 0; g_ld_pl_used++; }
@@ -300,7 +305,7 @@ Statistics: [pso-async] every 256 frames once builds ran.
              LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
              return g.psos[i].pso;
          }
-@@ -7234,7 +7471,11 @@
+@@ -7667,7 +7904,11 @@ static ID3D12PipelineState* get_pso(
          snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)live_legacy_pso_key());
          f = fopen(fn, "wb"); if (f) { fputs(fi > 0 ? ps_hlsl : "<fp fail>", f); fclose(f); }
        } }
@@ -313,7 +318,7 @@ Statistics: [pso-async] every 256 frames once builds ran.
          LDW_T0(bp_t0);
          pso = build_pso(
              vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key);
-@@ -7266,6 +7507,7 @@
+@@ -7699,6 +7940,7 @@ static ID3D12PipelineState* get_pso(
      }
      g.psos[g.n_psos].key = key;
      g.psos[g.n_psos].pso = pso;
@@ -321,6 +326,9 @@ Statistics: [pso-async] every 256 frames once builds ran.
      g.n_psos++;
      return pso;
  }
+diff --git a/libs/video/rsx_pso_async.h b/libs/video/rsx_pso_async.h
+new file mode 100644
+index 0000000..2fb613c
 --- /dev/null
 +++ b/libs/video/rsx_pso_async.h
 @@ -0,0 +1,96 @@

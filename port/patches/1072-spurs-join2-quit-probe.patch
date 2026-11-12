@@ -8,11 +8,13 @@ port's guest dump hook g_kz3_j2_guest_dump.
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): both (stop request, then the join2 note).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 153): v0.19.0 defines no cellSpursJoinTask2 / TryJoinTask2 / DestroyTaskset2 (#629 added Create/Attribute2/CreateTask2 only; the join names appear in comments, the NID table and a test), so the hook still sits in KZ3 code: it applies on R&C's trimmed 1019 (v019-b), which keeps those three functions and kz3_task2_enabled, and on 1066/1150 (task ids, t_task_gen) in the chain. Behaviour unchanged: KZ3_JOIN2_PROBE=1 dumps at ~3/20/40 s of spinning, off = one NULL pointer test per rdch/rchcnt. Offsets only.
+
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index c084f3d6..8fd7b438 100644
+index 63e9cd6..fb43a66 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -1106,6 +1106,9 @@ s32 cellSpursTryJoinTask2(void* taskset, u32 id, s32* exitCode)
+@@ -1199,6 +1199,9 @@ s32 cellSpursTryJoinTask2(void* taskset, u32 id, s32* exitCode)
      return CELL_OK;
  }
  
@@ -22,7 +24,7 @@ index c084f3d6..8fd7b438 100644
  s32 cellSpursJoinTask2(void* taskset, u32 id, s32* exitCode)
  {
      u32 ts = (u32)(uintptr_t)taskset;
-@@ -1115,6 +1118,17 @@ s32 cellSpursJoinTask2(void* taskset, u32 id, s32* exitCode)
+@@ -1208,6 +1211,17 @@ s32 cellSpursJoinTask2(void* taskset, u32 id, s32* exitCode)
      while (kz3_task2_enabled(ts, id)) {
          Sleep(spins < 64 ? 0 : 1);
          if (++spins == 20000) printf("[cellSpurs] JoinTask2 taskset=0x%08X id=%u still running after ~20 s\n", ts, id);
@@ -41,10 +43,10 @@ index c084f3d6..8fd7b438 100644
      if (exitCode) vm_write32((u32)(uintptr_t)exitCode, kz3_task2_take_exit_code(ts, id));
      else kz3_task2_take_exit_code(ts, id);
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 08aee851..64ab606c 100644
+index ff11b57..53cbc5b 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1364,9 +1364,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+@@ -1394,9 +1394,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
   * Channel read (returns value in the preferred word slot)
   * ===========================================================================*/
  static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel);
@@ -57,7 +59,7 @@ index 08aee851..64ab606c 100644
      u128 r = spu_rdch_impl(ctx, channel);
      if (g_kz3_trace_ctx == (void*)ctx) kz3_trace(ctx, "rd", channel, r._u32[0]);
      return r;
-@@ -1477,6 +1480,7 @@ static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel)
+@@ -1507,6 +1510,7 @@ static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel)
  uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
  {
      spu_honour_stop_request(ctx);
@@ -66,10 +68,10 @@ index 08aee851..64ab606c 100644
       * with the pc each SPU is sitting at.
       *
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
-index 6b9b21f6..7ead8e3b 100644
+index 22bfe40..ec8ecd7 100644
 --- a/runtime/spu/spu_workload.c
 +++ b/runtime/spu/spu_workload.c
-@@ -605,6 +605,142 @@ int spu_taskset_join_wait(uint32_t taskset_ea)
+@@ -608,6 +608,142 @@ int spu_taskset_join_wait(uint32_t taskset_ea)
      return busy > 0 ? busy : 0;
  }
  
@@ -212,7 +214,7 @@ index 6b9b21f6..7ead8e3b 100644
  static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
  {
      if (!taskset_ea || t >= 128 || s_ts_held) return;   /* held: caller set it */
-@@ -868,6 +1004,7 @@ static void spu_async_run(spu_async_job* j)
+@@ -876,6 +1012,7 @@ static void spu_async_run(spu_async_job* j)
  {
      spu_taskset_mark(j->taskset_ea, j->taskid, 1);
      spu_taskset_bind_thread(j->taskset_ea);   /* KZ3 patch 1066 */
@@ -220,7 +222,7 @@ index 6b9b21f6..7ead8e3b 100644
      /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
       * back to a fresh per-dispatch LS when disabled / no taskset. */
      spu_ts_ls_slot* ts_slot = NULL;
-@@ -1207,6 +1344,8 @@ static void spu_async_run(spu_async_job* j)
+@@ -1215,6 +1352,8 @@ static void spu_async_run(spu_async_job* j)
              fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                      "(job ran to completion, did not loop)\n", j->image_id, rc);
              spu_serial_release();
@@ -229,7 +231,7 @@ index 6b9b21f6..7ead8e3b 100644
              if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid, rc);
          }
          /* Persistent LS is retained in its taskset slot for the next task; a
-@@ -1220,6 +1359,7 @@ static void spu_async_run(spu_async_job* j)
+@@ -1228,6 +1367,7 @@ static void spu_async_run(spu_async_job* j)
          pthread_mutex_unlock(&ts_slot->lock);
  #endif
      }

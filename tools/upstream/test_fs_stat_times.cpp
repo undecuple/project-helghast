@@ -15,6 +15,12 @@
  *   tools/upstream/test_fs_stat_times.sh          (builds this against the patched toolkit; Linux only, no game data)
  */
 #include "ppu_fs.cpp"
+/* v0.19's ppu_fs.cpp calls ps3_dev_flash_path (runtime/platform); the file does not exist in v0.18 */
+#if defined(__has_include)
+#  if __has_include("../platform/ps3_dev_flash.c")
+#    include "../platform/ps3_dev_flash.c"
+#  endif
+#endif
 #include <sys/stat.h>
 #include <utime.h>
 #include <vector>

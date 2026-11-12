@@ -222,7 +222,7 @@ int main(void)
             set_fast(!mode);
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
-            for (int r = 0; r < 100; r++) rsx_vertex_fetch_many(&plan, big_refs, 16384, big_b, plan.layout.stride);
+            for (int r = 0; r < 100; r++) rsx_vertex_fetch_many(&plan, big_refs, 16384, big_b);
             clock_gettime(CLOCK_MONOTONIC, &t1);
             ns[mode] = ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / (100.0 * 16384);
         }
@@ -250,7 +250,7 @@ int main(void)
         clock_gettime(CLOCK_MONOTONIC, &t1);
         const double one = ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / (500.0 * 2048);
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        for (int r = 0; r < 500; r++) rsx_vertex_fetch_many(&plan, refs, 2048, outb, stride);
+        for (int r = 0; r < 500; r++) rsx_vertex_fetch_many(&plan, refs, 2048, outb);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         const double many = ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / (500.0 * 2048);
         printf("[time] fetch_one %.1f ns/vertex, fetch_many %.1f ns/vertex (5 attributes, stride %u)\n", one, many, stride);

@@ -32,8 +32,10 @@ idle admission the SPUs churn on wid 7 instead (14 flips). Host test tools/spu/t
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 152): cellSpursRequestIdleSpu is ours again (v0.19 #649 stores the same IDLE2 byte through spurs_api_lock, which the 1000-spurs revert removes); Initialize keeps upstream's is2 / SF1_32_WORKLOADS setting for Initialize2 callers next to our 0xFF receiver byte and kernel wake init.
+
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 8fd7b438..e1bd1712 100644
+index 4aa30fa..d84607d 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -15,6 +15,7 @@
@@ -44,7 +46,7 @@ index 8fd7b438..e1bd1712 100644
  #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
  #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
  #include "../../runtime/ppu/ppu_context.h"  /* g_active_ctx: 9th argument on the guest stack */
-@@ -109,8 +110,10 @@ static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
+@@ -111,8 +112,10 @@ static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
   * on its SPU task once or twice per 5.3 ms audio block, fell behind, and
   * GH3's songs played ~60% silence (heard as static). */
  static volatile long s_ef_ppu_waiters;
@@ -55,7 +57,7 @@ index 8fd7b438..e1bd1712 100644
      if (!s_ef_ppu_waiters) return;
      for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
          EventFlagSync* s = &s_ef_sync[i];
-@@ -469,6 +472,31 @@ static volatile long s_kz3_ready_calls[3][CELL_SPURS_MAX_WORKLOAD], s_kz3_ready_
+@@ -491,6 +494,31 @@ static volatile long s_kz3_ready_calls[3][CELL_SPURS_MAX_WORKLOAD], s_kz3_ready_
  static volatile int s_run_join[MAX_SPURS_INST][KZ3_KT_MAX];
  /* kz3-spurs-runstate end */
  static struct { struct SpursInst* si; int k; } s_kt_arg[MAX_SPURS_INST][8];
@@ -87,7 +89,7 @@ index 8fd7b438..e1bd1712 100644
  /* One kernel thread at a time per workload (patch 1006): the persistent PM
   * contexts are per (workload, lane), and a lane must not run twice at once. */
  static volatile long s_wkl_busy[CELL_SPURS_MAX_WORKLOAD];
-@@ -560,6 +588,15 @@ static void kz3_lanes_report(unsigned long long t_s)
+@@ -619,6 +647,15 @@ static void kz3_lanes_report(unsigned long long t_s)
      }
      fprintf(stderr, "[spurs-lanes] t=%llus%s (dispatches by ready count before the pass / by lanes run)%s\n", t_s,
              o ? line : " none", kz3_lanes_ready_on() ? " [KZ3_SPURS_LANES_READY]" : "");
@@ -102,11 +104,14 @@ index 8fd7b438..e1bd1712 100644
 +        }
  }
  static DWORD WINAPI spurs_kernel_thread(LPVOID p);
- /* KZ3 patch 1057 (SPU pass 39): called by the kernel thread when a workload's policy-module run starts (end 0,
-@@ -597,6 +634,14 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
-     memset(vm_base + spurs_ea, 0, SPURS_INST_SIZE);
+ static int spurs_guest_range_valid(u32 ea, u32 bytes);
+@@ -658,9 +695,15 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix,
+     memset(vm_base + spurs_ea, 0, inst_size);
      *(vm_base + spurs_ea + SPURS_NSPUS) = (u8)si->nspus;
      vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
+-    vm_write32(spurs_ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);      /* flag not raised */
+-    *(vm_base + spurs_ea + SPURS_WKL_FLAG_RECV) = 0xFF;
+-    /* SPU code tests SF1_32_WORKLOADS before it looks a wid >= 16 up. */
 +    /* KZ3 patch 1074: the workload flag's receiver byte (+0x77) = 0xFF, none (the memset left wid 0). */
 +    if (!kz3_kern_old()) {
 +        *(vm_base + spurs_ea + KZ3_K_FLAG_RCV) = 0xFF;
@@ -115,10 +120,11 @@ index 8fd7b438..e1bd1712 100644
 +        extern void (*g_spu_line_commit_hook)(uint32_t);
 +        g_spu_line_commit_hook = ef_line_committed;   /* forwards instance-line commits to kz3_kern_line_committed */
 +    }
++    /* upstream #629: CellSpurs2 has 32 workloads; the SPU code tests SF1_32_WORKLOADS before it looks a wid >= 16 up. */
+     si->is2 = inst_size == SPURS_INST2_SIZE;
+     if (si->is2) *(vm_base + spurs_ea + SPURS_FLAGS1) |= SPURS_SF1_32_WORKLOADS;
  
-     if (!si->kernel_live) {
-         si->kernel_live = 1;
-@@ -613,6 +658,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -679,6 +722,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix,
           * single poll thread. SPU pass 21: level 0.83 vs 0.34 flips/s with busy no-sleep (the RE notes). */
          int n = 8;
          { const char* e = getenv("KZ3_SPURS_THREADS"); if (e) n = atoi(e); }
@@ -127,7 +133,7 @@ index 8fd7b438..e1bd1712 100644
          if (n < 1) n = 1;
          if (n > (int)si->nspus) n = (int)si->nspus;
          if (n > 8) n = 8;
-@@ -2141,6 +2188,133 @@ static DWORD WINAPI kz3_lane_thread(LPVOID p)
+@@ -2253,6 +2298,133 @@ static DWORD WINAPI kz3_lane_thread(LPVOID p)
      return 0;
  }
  
@@ -261,7 +267,7 @@ index 8fd7b438..e1bd1712 100644
  static DWORD WINAPI spurs_kernel_thread(LPVOID p)
  {
  #ifdef _WIN32
-@@ -2156,6 +2330,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -2268,6 +2440,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              si->prefix, kt + 1, si->nthreads, si->ea, s_pm_off ? "DISABLED (PS3_NO_SPURS_PM)" : "enabled");
      fflush(stderr);
      if (kz3_wacct_on()) { char nm[40]; snprintf(nm, sizeof nm, "spurs-kern%d:%s", kt, si->prefix); kz3_wacct_name(nm); }
@@ -269,7 +275,7 @@ index 8fd7b438..e1bd1712 100644
  
      /* Instance change detector (SPURS_KERN_WATCH=1).
       *
-@@ -2458,12 +2633,35 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -2570,12 +2743,35 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
      }
  }
  
@@ -305,7 +311,7 @@ index 8fd7b438..e1bd1712 100644
  
      s_workloads[wid].readyCount = value;
      /* The real store: the instance byte the kernel (poll thread) watches. */
-@@ -2484,6 +2682,8 @@ s32 cellSpursReadyCountSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
+@@ -2596,6 +2792,8 @@ s32 cellSpursReadyCountSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
      if (!spurs || !old) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
      if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
      if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
@@ -314,7 +320,7 @@ index 8fd7b438..e1bd1712 100644
  
      vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
      s_workloads[wid].readyCount = value;
-@@ -2534,6 +2734,8 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
+@@ -2646,6 +2844,8 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
      if (!spurs || !old) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
      if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
      if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
@@ -323,7 +329,7 @@ index 8fd7b438..e1bd1712 100644
  
      vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
      if (s_workloads[wid].readyCount == compare) {
-@@ -2569,6 +2771,8 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
+@@ -2681,6 +2881,8 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
       * are common -- the guest calls it whenever it adds work) does not spawn
       * another copy. */
      const uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
@@ -332,18 +338,33 @@ index 8fd7b438..e1bd1712 100644
      for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
          SpursWorkload* w = &s_workloads[i];
          if (!w->in_use || w->started || w->spurs_ea != spurs_ea) continue;
-@@ -3749,10 +3953,23 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
+@@ -3861,25 +4063,23 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
   * Misc SPURS surface the title links (logged CELL_OK stubs).
   * =====================================================================*/
  
--s32 cellSpursRequestIdleSpu(u64 spurs_ea)
+-/* cellSpursRequestIdleSpu(spurs, wid, count): the workload may also run on up to
+- * `count` SPUs beyond its ready count. Stored in the instance byte the
+- * kernel reads (SPURS_WKL_IDLE2). */
+-s32 cellSpursRequestIdleSpu(u64 spurs_ea, u64 wid64, u64 count64)
 +/* KZ3 patch 1074: (spurs, wid, spuCount) as in PR #213 (NoahBPeterson): the workload's idleSpuCount byte (+0x10+wid),
 + * which the per-SPU kernel's selection reads; was a stub that dropped both arguments. KZ3 asks 7 for every job
 + * manager (0xA78964 / 0xA78A4C, after AddWorkload). */
 +s32 cellSpursRequestIdleSpu(u64 spurs_ea, u32 wid, u32 count)
  {
+-    const u32 wid = (u32)wid64, count = (u32)count64;
+-    if (!spurs_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+-    struct SpursInst* si;
+-    s32 rc = spurs_api_lock((u32)spurs_ea, &si);
+-    if (rc) return rc;
+-    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;   /* same as SetMaxContention */
+-    }
+-    vm_write8(si->ea + SPURS_WKL_IDLE2 + wid, (u8)count);
      static int _n = 0;
--    if (PS3_LOG_FIRST(_n, 4)) printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X)\n", (u32)spurs_ea);
+-    if (PS3_LOG_FIRST(_n, 8))
+-        printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X wid=%u count=%u)\n", (u32)spurs_ea, wid, count);
+-    spurs_api_unlock(si);
 +    if (PS3_LOG_FIRST(_n, 16)) printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X wid=%u count=%u)\n", (u32)spurs_ea, wid, count);
 +    if (kz3_kern_old()) return CELL_OK;
 +    const u32 ea = (u32)spurs_ea;
@@ -359,7 +380,7 @@ index 8fd7b438..e1bd1712 100644
  }
  
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 64ab606c..82f99dfd 100644
+index ff11b57..a410cab 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
 @@ -184,6 +184,9 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
@@ -372,7 +393,7 @@ index 64ab606c..82f99dfd 100644
  
  /* KZ3 patch 1067: end a task cut off by cellSpursJoinTaskset from inside its WAIT_SIGNAL: back to
   * spu_run_with_halt like a halt, without the halt's register dump; spu_async_run then runs the task's exit (which
-@@ -2957,6 +2960,22 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -3033,6 +3036,22 @@ void spu_indirect_branch(spu_context* ctx)
                    ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
                    return;
                } }
@@ -397,7 +418,7 @@ index 64ab606c..82f99dfd 100644
               * wid != 0, so each job manager ran one job per kernel run. Answer the current id unless the port's
 diff --git a/runtime/spu/spurs_kern_sched.h b/runtime/spu/spurs_kern_sched.h
 new file mode 100644
-index 00000000..b9686c14
+index 0000000..b9686c1
 --- /dev/null
 +++ b/runtime/spu/spurs_kern_sched.h
 @@ -0,0 +1,159 @@

@@ -14,11 +14,13 @@ Upstream candidate (general: any title whose SPU jobs load other job modules at 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): the located lookup after upstream's `spu_lifted_lookup` (#420), outside resident spans; `spu_resident_code_owner` added here (was 1123).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 82f99dfd..391589e1 100644
+index 0f631e9..bd90687 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1867,6 +1867,55 @@ spu_fn spu_lookup_ovl_exact(uint32_t addr, int image_id)
+@@ -1897,6 +1897,55 @@ spu_fn spu_lookup_ovl_exact(uint32_t addr, int image_id)
      return NULL;
  }
  
@@ -74,7 +76,7 @@ index 82f99dfd..391589e1 100644
  /* Which image registered a function at this LS address, or -1 if none did.
   *
   * Deliberately NOT spu_lookup(addr, 0): that call means "dispatch here in a
-@@ -1895,6 +1944,16 @@ int spu_have_function(uint32_t addr)
+@@ -1925,6 +1974,16 @@ int spu_have_function(uint32_t addr)
   * through would execute stale code registered under another image. Task and
   * unbounded overlay misses retain their existing primary-image fallback. */
  static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
@@ -88,10 +90,10 @@ index 82f99dfd..391589e1 100644
 +            return ctx->resident_code[slot].image_id;
 +    return 0;
 +}
- static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
+ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa, int* reloc)
  {
      /* Every probe below goes through #436's per-thread memo rather than
-@@ -3118,8 +3177,11 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -3204,8 +3263,11 @@ void spu_indirect_branch(spu_context* ctx)
          if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
          if (ti) ctx->resident_task = ti;
      }
@@ -106,7 +108,7 @@ index 82f99dfd..391589e1 100644
       * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
       * return landed on LS 0, which is the job's OWN entry, and it ran a second
 diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
-index 5a0ac622..79bd0818 100644
+index 5a0ac62..79bd081 100644
 --- a/runtime/spu/spu_drain.c
 +++ b/runtime/spu/spu_drain.c
 @@ -667,6 +667,10 @@ void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
@@ -121,10 +123,10 @@ index 5a0ac622..79bd0818 100644
                  { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
                      fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
 diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
-index fa80dd69..a34aee66 100644
+index 0aa0ae8..4019083 100644
 --- a/runtime/spu/spu_interp.c
 +++ b/runtime/spu/spu_interp.c
-@@ -536,6 +536,11 @@ static spu_lifted_fn spu_interp_rejoin_lookup(const spu_context* ctx, uint32_t p
+@@ -519,6 +519,11 @@ static spu_lifted_fn spu_interp_rejoin_lookup(const spu_context* ctx, uint32_t p
          spu_lifted_fn f = spu_lookup_ovl_exact(pc, ctx->resident_ovl);
          if (f) return f;
      }

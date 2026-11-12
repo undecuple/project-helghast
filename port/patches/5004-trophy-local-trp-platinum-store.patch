@@ -14,6 +14,8 @@ detail, for a host toast; ps3_trophy_set_user(id). Test: tools/assets/test_troph
 in the sandbox, negative control against the unpatched file). Upstream candidate (platinum, count, store path, BE
 structs).
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): the test's stub block follows v0.19: g_ps3_guest_caller is cellSysutil.c's (a second definition is a duplicate symbol); the VFS root stub stays.
+
 diff --git a/libs/network/sceNpTrophy.c b/libs/network/sceNpTrophy.c
 index d956e6d..7b1c379 100644
 --- a/libs/network/sceNpTrophy.c
@@ -886,13 +888,13 @@ index 48faefd..a553707 100644
  }
  #endif
 diff --git a/libs/network/tests/test_trophy_registration.c b/libs/network/tests/test_trophy_registration.c
-index cdbee09..8a17f28 100644
+index b08a5b2..c10b1dd 100644
 --- a/libs/network/tests/test_trophy_registration.c
 +++ b/libs/network/tests/test_trophy_registration.c
-@@ -14,6 +14,7 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
- void spu_lockline_lock(void) {}
- void spu_lockline_unlock(void) {}
- ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -19,6 +19,7 @@ void spu_lockline_unlock(void) {}
+ void cellMsgDialog_tick(void) {}
+ void np_psnr_pump(void) {}
+ void ps3_np_eula_tick(void) {}
 +const char* ppu_vfs_root = ".";   /* the TRP lookup (patch 5004) reads the VFS root */
  static unsigned calls;
  static void callback(u32 opd, u64 context, u64 status, u64 completed, u64 total,

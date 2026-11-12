@@ -4,15 +4,16 @@ Rebased on ps3recomp v0.15.0 (SPU pass 81): rebased onto upstream taskset size c
 Spu pass 82: the round-81 rebase put the side table before cellSpursCreateTaskset's closing brace (tsattr_remember and
 the functions after it became nested: "invalid storage class for function"); the brace is back.
 
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index a094c4e..5624ebc 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -808,6 +808,27 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
- {
-     return spurs_create_taskset(spurs, taskset, args, priority, maxContention,
+@@ -920,6 +920,27 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
                                  CSTS_STRUCT_END);
-+}
-+
+ }
+ 
 +/* What _cellSpursTasksetAttributeInitialize was given, keyed by the guest EA of
 + * the attribute (KZ3, patch 1005). The attribute used to be dropped here, so a
 + * taskset created WithAttribute always had args = 0 -- and a SPURS task receives
@@ -32,10 +33,12 @@ diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 +    unsigned i = s_tsattr_next++ % 64;
 +    s_tsattr[i].attr_ea = attr_ea; s_tsattr[i].args = args;
 +    s_tsattr[i].priority_ea = priority_ea; s_tsattr[i].max_contention = max_contention;
- }
- 
++}
++
  s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
-@@ -821,6 +840,14 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
+                                         CellSpursTaskset* taskset,
+                                         const CellSpursTasksetAttribute* attr)
+@@ -931,6 +952,14 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
      const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
      u32 size = attr_h->tasksetSize;
      if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
@@ -47,14 +50,14 @@ diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 +                                        (const u8*)(uintptr_t)s_tsattr[i].priority_ea,
 +                                        s_tsattr[i].max_contention, size);
 +        }
-     return spurs_create_taskset(spurs, taskset, 0, NULL, 0, size);
+     return spurs_create_taskset(spurs, taskset, attr_h->args, NULL, 0, size);
  }
  
-@@ -1174,8 +1201,9 @@ s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
+@@ -1396,8 +1425,9 @@ s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
                                           u32 revision, u32 sdkVersion, u64 argTaskset,
                                           u64 priority, u32 maxContention)
  {
--    (void)sdkVersion; (void)argTaskset; (void)priority; (void)maxContention;
+-    (void)sdkVersion; (void)priority; (void)maxContention;
 +    (void)sdkVersion;
      if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 +    tsattr_remember((u32)(uintptr_t)attr, argTaskset, (u32)priority, maxContention);
