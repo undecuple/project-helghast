@@ -17,7 +17,7 @@ static void reset(unsigned bw,unsigned bh) {
     make_resource(&bb_resource,bw,bh,D3D12_RESOURCE_STATE_PRESENT);
     make_resource(&movie_resource,1280,720,D3D12_RESOURCE_STATE_COPY_DEST);
     make_resource(&upload_resource,1280,720,D3D12_RESOURCE_STATE_COPY_SOURCE);
-    g.backbuf[0]=&bb_resource;surface.tex=&src_resource;gamma_copy=NULL;
+    g.backbuf[0]=&bb_resource;surface.tex=&src_resource;gamma_copy=NULL;surface.w=1280;surface.h=720;surface.location=surface.offset=0;
     g.list=&command_list;g.swap=&swap_chain;g.upload=g.movie_upload=&upload_resource;
     copies=textures=clears=blits=invalid_copy=invalid_texture=invalid_barrier=swap_calls=0;
     g.srv_ring_used=0;g.movie_overlay_valid=0;
@@ -104,8 +104,10 @@ static void eligibility_tests(void) {
         if(kind==8) bad->desc.Width=0;
         const rsx_present_geometry p=normal_route();
         char name[96];snprintf(name,sizeof name,"%s-upscale-reject-%s",phase?"after":"before",names[kind]);
-        check(name,!blits&&!copies&&clears==1&&!p.valid&&
-              (phase?(pipeline_calls==1&&upscale_calls==1&&state_invalidations==1):(pipeline_calls==0&&upscale_calls==0&&state_invalidations==0)));
+        /* An ineligible source is refused before the pipeline. An ineligible upscale result (patch 2221) is refused the same way
+         * and the present falls back to the original image, which scales fine: one blit, one pipeline call, a clean frame. */
+        check(name,phase?(blits==1&&!copies&&clears==0&&p.valid&&pipeline_calls==1&&upscale_calls==1&&state_invalidations==1)
+                        :(!blits&&!copies&&clears==1&&!p.valid&&pipeline_calls==0&&upscale_calls==0&&state_invalidations==0));
     }
     reset(1920,1080);src_resource.desc.MipLevels=3;
     rsx_present_geometry p=normal_route();check("multi-mip-source-mip0-accepted",blits==1&&p.valid);
@@ -122,12 +124,12 @@ static void eligibility_tests(void) {
     /* The old implementation dereferences NULL here. Keep optional baseline
        rejection semantic rather than accepting a sanitizer crash as proof. */
     reset(1920,1080);upscale_enabled=upscale_null=1;
-    p=normal_route();check("null-upscale-result-rejected",!blits&&!copies&&clears==1&&!p.valid&&state_invalidations==1);
+    p=normal_route();check("null-upscale-result-rejected",blits==1&&!copies&&clears==0&&p.valid&&state_invalidations==1);
 #endif
     reset(1920,1080);upscale_enabled=1;
     make_resource(&upscale_resource,1920,1080,D3D12_RESOURCE_STATE_COPY_SOURCE);
     upscale_resource.desc.DepthOrArraySize=2;p=normal_route();
-    check("rejected-upscale-output-invalidates-bindings",!blits&&state_invalidations==1);
+    check("rejected-upscale-output-invalidates-bindings",blits==1&&state_invalidations==1);
     reset(1920,1080);bb_resource.desc.Format=87; /* BGRA8 RTV is not this PSO's output format. */
     p=normal_route();check("non-rgba8-target-rejected",!blits&&!p.valid&&clears==1&&!pipeline_calls);
 }

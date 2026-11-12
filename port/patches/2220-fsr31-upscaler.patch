@@ -1,8 +1,8 @@
-KZ3 patch 2160 (ENHANCEMENT, experimental): let ports register temporal backends through rsx_upscale.
+KZ3 patch 2220 (ENHANCEMENT, experimental): let ports register temporal backends through rsx_upscale.
 
 Reserved backends such as FSR 3 and XeSS remain unimplemented by the generic toolkit until a port registers a
 complete create/destroy/evaluate operation table. Built-in None and FSR 1 cannot be replaced. Runtime sharpness
-changes reuse the active context, while backend changes are handled by the renderer integration in patch 2161.
+changes reuse the active context, while backend changes are handled by the renderer integration in patch 2221.
 
 Keep Scaling filter limited to Bilinear and Nearest. A separate, opt-in GUM flag adds Upscaler
 (Off / FSR 3.1 experimental), FSR sharpness, confirmation, tooltip, initialization, and reset behavior. This keeps
@@ -11,10 +11,10 @@ the generic display page unchanged for ports that do not provide FSR 3.
 Host coverage: tools/smoke/test_upscale.c and tools/smoke/test_display_mode.c.
 
 diff --git a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
-index b20fdb5a..2e823b19 100644
+index c1291a1d..ff554d34 100644
 --- a/libs/video/rsx_display_mode.h
 +++ b/libs/video/rsx_display_mode.h
-@@ -423,6 +423,8 @@ static inline const char* rsx_dm_find(const char* h, size_t n, size_t from, cons
+@@ -438,6 +438,8 @@ static inline const char* rsx_dm_find(const char* h, size_t n, size_t from, cons
  #define RSX_DM_DEF_MODE    "windowed"
  #define RSX_DM_DEF_SCALING "stretch"
  #define RSX_DM_DEF_FILTER  "bilinear"
@@ -23,15 +23,15 @@ index b20fdb5a..2e823b19 100644
  #define RSX_DM_DEF_VSYNC   "on"
  #define RSX_DM_DEF_FPS     "30"
  #define RSX_DM_DEF_MBLUR   "100"
-@@ -432,6 +434,7 @@ static inline const char* rsx_dm_find(const char* h, size_t n, size_t from, cons
+@@ -447,6 +449,7 @@ static inline const char* rsx_dm_find(const char* h, size_t n, size_t from, cons
  #define RSX_DM_GUM_MBLUR 1   /* rsx_dm_patch_gum_opts: add the Motion blur row (patch 2107) */
- #define RSX_DM_GUM_BLOOM 4   /* patch 2121: add the Bloom row */
+ #define RSX_DM_GUM_BLOOM 4   /* patch 2121: the Bloom row; patch 2206: no longer adds a row (Options > Graphics has it), kept so callers still compile */
  #define RSX_DM_GUM_FOV   2   /* rsx_dm_patch_gum_opts: add the Field of view row (patch 2109) */
 +#define RSX_DM_GUM_FSR3  8   /* add the port-owned FSR 3.1 backend rows */
  static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_n, unsigned opts)
  {
      static const char rsx_dm_gum_row[] =
-@@ -470,6 +473,26 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -485,6 +488,26 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
          "\t\t\t\t<selectitem value=\"mute\">@tr{disp.v.mute|Mute}</selectitem>\n"
          "\t\t\t\t<selectitem value=\"pause\">@tr{disp.v.pause|Pause}</selectitem>\n"
          "\t\t\t</select>\n\n\t\t\t";
@@ -58,7 +58,7 @@ index b20fdb5a..2e823b19 100644
      static const char rsx_dm_gum_row_mb[] =   /* patch 2107: only when the MotionBlur hook is in the exe */
          "<select id=\"slc_kz3_mblur\" label=\"@tr{disp.mblur|Motion blur}\" onchange=\"script(settingscript,KZ3ChangeMBlur)\"\n"
          "\t\t\t\tdefault-value=\"100\">\n"
-@@ -538,6 +561,37 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -530,6 +553,37 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
          "\t\t\te:SetHandled(true)\n"
          "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"motionblur \"..e:GetSender():GetValue()) end\n"
          "\t\tend\n";
@@ -96,7 +96,7 @@ index b20fdb5a..2e823b19 100644
      /* patch 2107: the warning for a limit above 30, shaped like the game's own confirm dialogs (No focused, cancelable;
       * Yes/No from the game's strings), placed beside the page's dialogconfirm include */
      static const char rsx_dm_gum_dlg[] =
-@@ -547,6 +601,13 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -539,6 +593,13 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
          "\t\t<dialogoption id=\"dlg_kz3_fps_yes\" label=\"@key{menu_dialog_yes}\" value=\"yes\"/>\n"
          "\t\t<dialogoption id=\"dlg_kz3_fps_no\" label=\"@key{menu_dialog_no}\" value=\"no\"/>\n"
          "\t</dialog>\n\n\t";
@@ -107,10 +107,10 @@ index b20fdb5a..2e823b19 100644
 +        "\t\t<dialogoption id=\"dlg_kz3_fsr_yes\" label=\"@key{menu_dialog_yes}\" value=\"yes\"/>\n"
 +        "\t\t<dialogoption id=\"dlg_kz3_fsr_no\" label=\"@key{menu_dialog_no}\" value=\"no\"/>\n"
 +        "\t</dialog>\n\n\t";
-
+ 
      /* patch 2110: the row descriptions, in the game's own tooltip panel (common/advancedcontroller.gum: a list onchange
       * fills <panel class="tooltip" y="440"><text id="tooltip_txt"> for its Zoom row); shown for the port's rows only,
-@@ -560,6 +621,8 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -552,6 +613,8 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
          "\t\t\tslc_kz3_display = \"@trl{disp.tip.display|Windowed, borderless window or exclusive fullscreen.}\",\n"
          "\t\t\tslc_kz3_scaling = \"@trl{disp.tip.scaling|Fit keeps the picture's shape with black bars. Stretch fills the whole window.}\",\n"
          "\t\t\tslc_kz3_filter = \"@trl{disp.tip.filter|Bilinear smooths the scaled picture. Nearest keeps hard pixel edges.}\",\n"
@@ -119,7 +119,7 @@ index b20fdb5a..2e823b19 100644
          "\t\t\tslc_kz3_vsync = \"@trl{disp.tip.vsync|Waits for the display's refresh to stop tearing. Off can lower input delay.}\",\n"
          "\t\t\tslc_kz3_fps = \"@trl{disp.tip.fps_lvl|Used in missions. Menus and videos stay at 30. Above 30, physics, animation and "
          "scripted events can run wrong.}\",\n"
-@@ -587,6 +650,8 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -578,6 +641,8 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
          "\t\t\tKZ3DisplayCmd(\"display " RSX_DM_DEF_MODE "\")\n"
          "\t\t\tKZ3DisplayCmd(\"scaling " RSX_DM_DEF_SCALING "\")\n"
          "\t\t\tKZ3DisplayCmd(\"filter " RSX_DM_DEF_FILTER "\")\n"
@@ -128,7 +128,7 @@ index b20fdb5a..2e823b19 100644
          "\t\t\tKZ3DisplayCmd(\"vsync " RSX_DM_DEF_VSYNC "\")\n"
          "\t\t\tKZ3DisplayCmd(\"fps " RSX_DM_DEF_FPS "\")\n"
          "\t\t\tKZ3DisplayCmd(\"unfocused " RSX_DM_DEF_UNF "\")\n"
-@@ -604,6 +669,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -595,6 +660,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
          "\t\t\tgRoot:GetTag(\"slc_kz3_display\"):SetValue(KZ3DisplayCmd(\"display\"))\n"
          "\t\t\tgRoot:GetTag(\"slc_kz3_scaling\"):SetValue(KZ3DisplayCmd(\"scaling\"))\n"
          "\t\t\tgRoot:GetTag(\"slc_kz3_filter\"):SetValue(KZ3DisplayCmd(\"filter\"))\n"
@@ -136,9 +136,9 @@ index b20fdb5a..2e823b19 100644
          "\t\t\tgRoot:GetTag(\"slc_kz3_vsync\"):SetValue(KZ3DisplayCmd(\"vsync\"))\n"
          "\t\t\tgRoot:GetTag(\"slc_kz3_fps\"):SetValue(KZ3DisplayCmd(\"fps\"))\n"
          "\t\t\tgRoot:GetTag(\"slc_kz3_unfocused\"):SetValue(KZ3DisplayCmd(\"unfocused\"))\n"
-@@ -670,6 +736,9 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -659,6 +725,9 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+     at_lua = (size_t)(cd - in);
      size_t nlm = nm ? sizeof rsx_dm_gum_lua_mb - 1 : 0;
-     const size_t nb = (opts & RSX_DM_GUM_BLOOM) ? sizeof rsx_dm_gum_row_bloom - 1 : 0, nlb = nb ? sizeof rsx_dm_gum_lua_bloom - 1 : 0;
      const size_t nf = (opts & RSX_DM_GUM_FOV) ? sizeof rsx_dm_gum_row_fov - 1 : 0, nlf = nf ? sizeof rsx_dm_gum_lua_fov - 1 : 0;
 +    const size_t nu = (opts & RSX_DM_GUM_FSR3) ? sizeof rsx_dm_gum_row_fsr3 - 1 : 0;
 +    const size_t nlu = nu ? sizeof rsx_dm_gum_lua_fsr3 - 1 : 0;
@@ -146,24 +146,24 @@ index b20fdb5a..2e823b19 100644
      /* patch 2110: the tooltip after the list, its Lua, the list's onchange and the reset call */
      static const char rsx_dm_list_on[] = " onchange=\"script(settingscript,KZ3Tooltip)\"";
      static const char rsx_dm_reset_at[] = "gPlayerProfile:SetDefaultDisplay()";
-@@ -678,7 +747,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -667,7 +736,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
      const char* rs = rsx_dm_find(in, n, (size_t)(scr - in), rsx_dm_reset_at);
      const size_t nt = sizeof rsx_dm_gum_tip - 1, nlt = sizeof rsx_dm_gum_lua_tip - 1;
      if (!le || le > scr || (rs && rs > cd)) return NULL;
--    out = (char*)malloc(n + nr + nm + nb + nf + nd + nl + nlm + nlb + nlf + nt + nlt + 128 + 1);
-+    out = (char*)malloc(n + nr + nm + nb + nf + nu + nd + ndu + nl + nlm + nlb + nlf + nlu + nt + nlt + 128 + 1);
+-    out = (char*)malloc(n + nr + nm + nf + nd + nl + nlm + nlf + nt + nlt + 128 + 1);
++    out = (char*)malloc(n + nr + nm + nf + nu + nd + ndu + nl + nlm + nlf + nlu + nt + nlt + 128 + 1);
      if (!out) return NULL;
-     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend (run r103-dpage3):
+     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend:
       * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead.
-@@ -697,6 +766,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -686,6 +755,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
          memcpy(out + o, in, at_row); o += at_row;
      }
      memcpy(out + o, rsx_dm_gum_row, nr); o += nr;
 +    memcpy(out + o, rsx_dm_gum_row_fsr3, nu); o += nu;
      memcpy(out + o, rsx_dm_gum_row_fov, nf); o += nf;                  /* patch 2109 */
-     memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;                   /* patch 2121: Motion blur and Bloom after Field of view */
-     memcpy(out + o, rsx_dm_gum_row_bloom, nb); o += nb;
-@@ -707,6 +777,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+     memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;                   /* patch 2121: Motion blur after Field of view (Bloom: patch 2206, Graphics page) */
+     {   /* patch 2110: the tooltip panel right after the list */
+@@ -695,6 +765,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
          memcpy(out + o, in + at_le, at_scr - at_le); o += at_scr - at_le;
      }
      memcpy(out + o, rsx_dm_gum_dlg, nd); o += nd;                      /* patch 2107: before <script id="settingscript"> */
@@ -171,10 +171,10 @@ index b20fdb5a..2e823b19 100644
      if (rs) {   /* patch 2110: Reset to defaults also resets the port's rows */
          const size_t at_rs = (size_t)(rs - in) + sizeof rsx_dm_reset_at - 1;
          memcpy(out + o, in + at_scr, at_rs - at_scr); o += at_rs - at_scr;
-@@ -719,6 +790,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+@@ -706,6 +777,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+     memcpy(out + o, rsx_dm_gum_lua, nl); o += nl;
      memcpy(out + o, rsx_dm_gum_lua_mb, nlm); o += nlm;
      memcpy(out + o, rsx_dm_gum_lua_fov, nlf); o += nlf;
-     memcpy(out + o, rsx_dm_gum_lua_bloom, nlb); o += nlb;              /* patch 2121 */
 +    memcpy(out + o, rsx_dm_gum_lua_fsr3, nlu); o += nlu;
      memcpy(out + o, rsx_dm_gum_lua_tip, nlt); o += nlt;               /* patch 2110 */
      memcpy(out + o, in + at_lua, n - at_lua); o += n - at_lua;
@@ -185,14 +185,14 @@ index d42705cc..b51e5445 100644
 +++ b/libs/video/rsx_upscale.c
 @@ -25,6 +25,7 @@ struct rsx_upscale {
  };
-
+ 
  static const rsx_upscale_ops* g_test_ops;
 +static const rsx_upscale_ops* g_external_ops[RSX_UPSCALE_BACKEND_COUNT];
  void rsx_upscale_set_test_ops(const rsx_upscale_ops* ops) { g_test_ops = ops; }
-
+ 
  static const char* const k_names[RSX_UPSCALE_BACKEND_COUNT] = { "none", "fsr1", "dlaa", "dlss", "fsr3", "xess" };
 @@ -52,7 +53,16 @@ rsx_upscale_backend rsx_upscale_parse_backend(const char* s)
-
+ 
  int rsx_upscale_backend_implemented(rsx_upscale_backend b)
  {
 -    return b == RSX_UPSCALE_NONE || b == RSX_UPSCALE_FSR1;
@@ -207,7 +207,7 @@ index d42705cc..b51e5445 100644
 +    g_external_ops[b] = ops;
 +    return 1;
  }
-
+ 
  float rsx_upscale_clamp_sharpness(float s)
 @@ -76,7 +86,7 @@ void rsx_upscale_config_from_env(rsx_upscale_config* out)
          else fprintf(stderr, "[upscale] RSX_UPSCALE_SHARPNESS=\"%s\" is not a number: %.1f\n", sh, out->sharpness);
@@ -227,9 +227,9 @@ index d42705cc..b51e5445 100644
      if (!ops && cfg->backend == RSX_UPSCALE_FSR1) ops = &rsx_upscale_fsr1_d3d12_ops;
  #endif
 @@ -154,6 +165,11 @@ void rsx_upscale_destroy(rsx_upscale* u)
-
+ 
  rsx_upscale_backend rsx_upscale_get_backend(const rsx_upscale* u) { return u ? u->backend : RSX_UPSCALE_NONE; }
-
+ 
 +void rsx_upscale_set_sharpness(rsx_upscale* u, float sharpness)
 +{
 +    if (u) u->sharpness = rsx_upscale_clamp_sharpness(sharpness);
@@ -262,10 +262,10 @@ index 845cf651..706ebcfc 100644
   * The pre-HUD tap. FSR 1 is designed to run on the 3D scene, before the HUD is drawn, so the HUD stays crisp. Whether
 @@ -98,11 +98,15 @@ typedef struct {
  } rsx_upscale_result;
-
+ 
  typedef struct rsx_upscale rsx_upscale;
 +typedef struct rsx_upscale_ops rsx_upscale_ops;
-
+ 
  /* ---- pure helpers (no device) ---- */
  const char* rsx_upscale_backend_name(rsx_upscale_backend b);
  rsx_upscale_backend rsx_upscale_parse_backend(const char* s);        /* NULL / "" / unknown -> NONE */
@@ -287,7 +287,7 @@ index 845cf651..706ebcfc 100644
  void  rsx_upscale_set_retire(rsx_upscale* u, void (*retire)(void* resource, void* user), void* user);
 @@ -141,12 +146,12 @@ void  rsx_upscale_frame_end(rsx_upscale* u);
  uint64_t rsx_upscale_passes(const rsx_upscale* u);                   /* evaluate calls that recorded */
-
+ 
  /* ---- backend table (internal; the host test installs a fake) ---- */
 -typedef struct {
 +struct rsx_upscale_ops {
@@ -298,5 +298,5 @@ index 845cf651..706ebcfc 100644
 -} rsx_upscale_ops;
 +};
  void rsx_upscale_set_test_ops(const rsx_upscale_ops* ops);           /* NULL = the real ones; tests only */
-
+ 
  #ifdef __cplusplus

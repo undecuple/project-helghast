@@ -66,8 +66,7 @@ def sources(sdk):
         normal=between(live, '    ID3D12Resource* srcimg = presented_surface->tex;', '    ld_flush(LD_FLUSH_PRESENT);'),
         movie=between(live, movie_marker, '    ld_flush(LD_FLUSH_MOVIE_PRESENT);'),
         input=between(null, input_marker, '\nstatic int rsx_dm_wndmsg('),
-        blit=between(live, 'static int ld_dm_blit(', '\n    int dm_filter ='),
-        upscale=between(live, '    int dm_filter = g_dm_filter;', '    const u32 base = ld_srv_take();'),
+        blit=between(live, 'static int ld_dm_blit(', '    const u32 base = ld_srv_take();'),
         swap=function(live, swap_signature), scaling=function(live, 'static int ld_dm_scaling_now(void)'),
         hud=function(live, 'static int ld_h169_factors(float* kx, float* ky)'))
 
@@ -76,17 +75,15 @@ def translation_unit(selected, helpers):
     normal_init = '' if 'rsx_present_geometry geometry;' in selected['normal'] else 'rsx_present_geometry geometry = {0};'
     movie_init = '' if 'rsx_present_geometry geometry;' in selected['movie'] else 'rsx_present_geometry geometry = {0};'
     blit = selected['blit'].replace('u32 bbi)', 'u32 bbi, int effective_scaling, rsx_present_geometry* geometry)')
-    normal = selected['normal'].replace('D3D12_RESOURCE_STATE_RENDER_TARGET, bbi);',
-        'D3D12_RESOURCE_STATE_RENDER_TARGET, bbi, ld_dm_scaling_now(), &geometry);')
+    normal = selected['normal']
     if 'D3D12_RESOURCE_DESC bd;' not in blit:
         blit += '\n    D3D12_RESOURCE_DESC bd; bb->lpVtbl->GetDesc(bb,&bd);'  # descriptor query only, for optional old baseline
-    movie = selected['movie'].replace('ld_dm_blit(dm_tex, D3D12_RESOURCE_STATE_COPY_DEST, bbi)',
-        'ld_dm_blit(dm_tex, D3D12_RESOURCE_STATE_COPY_DEST, bbi, ld_dm_scaling_now(), &geometry)')
+    movie = selected['movie']
     swap_call = 'ld_present_swap(p)' if 'ld_present_swap(const' in selected['swap'] else '(void)p, ld_present_swap()'
     return '\n'.join([
         (HERE / 'test_display_geometry.c').read_text(), selected['scaling'], selected['hud'],
         'int rsx_live_draw_hud169_factors(float* x,float* y) { return ld_h169_factors(x,y); }', helpers,
-        blit + '\n' + selected['upscale'] + '\n    (void)dm_filter; last_rect=r;blits++;\n    ld_pg_record(geometry,bb,r);\n    return 1;\n}',
+        blit + '\n    (void)dm_filter; last_rect=r;blits++;\n    ld_pg_record(geometry,bb,r);\n    return 1;\n}',
         'static rsx_present_geometry normal_route(void) { const u32 target=0; ' + normal_init + '\n' + normal + '\nreturn geometry;\n}',
         'static rsx_present_geometry movie_route(u32 w,u32 h,int composite) { const u32 pitch=(w*4+255)&~255u; ' + movie_init + '\n' + movie + '\nreturn geometry;\n}',
         selected['input'], selected['swap'],
@@ -122,10 +119,10 @@ def variants(parts, helpers):
         helpers, {'skipped-present-retains-snapshot'})]
     cases += [('omit-source-eligibility', mutate(parts, 'blit', '!ld_pg_blit_eligible(&sd, &bd) || ', ''),
         helpers, {'before-upscale-reject-typeless'})]
-    cases += [('omit-upscale-eligibility', mutate(parts, 'upscale',
-        '                if (!ld_pg_blit_eligible(&sd, &bd)) return 0;\n', ''), helpers, {'after-upscale-reject-array'})]
-    cases += [('omit-upscale-state-invalidation', mutate(parts, 'upscale', '                LD_SM_INVALIDATE();',
-        '                (void)0;'), helpers, {'rejected-upscale-output-invalidates-bindings'})]
+    # patch 2221: the upscale pass is ld_upscale_present (in the helpers); its result goes through the blit's source check
+    cases += [('omit-upscale-state-invalidation', parts, replace_once(helpers,
+        '    LD_SM_INVALIDATE(); /* upscale compute changed command-list bindings, including rejected outputs */\n', ''),
+        {'rejected-upscale-output-invalidates-bindings'})]
     cases += [('ignore-surface-owner', mutate(parts, 'normal',
         '    if (rsx_ui_read(&presented_surface->ui, &geometry.hud_kx, &geometry.hud_ky))\n        geometry.hud_provenance = RSX_PG_HUD_SURFACE_OWNER;', ''),
         helpers, {'normal-captures-surface-owner', 'normal-unit-owner-beats-current-wide-global'})]
