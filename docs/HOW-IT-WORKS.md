@@ -49,7 +49,14 @@ game code where it pays off ([roadmap](ROADMAP.md)).
 6. **Graphics.** The game builds RSX command buffers exactly as on the PS3. The runtime walks them as they are
    written and replays them on Direct3D 12: RSX vertex and fragment programs are translated to HLSL, render
    targets and textures are mirrored on the GPU, and the targets that the SPU post-processing chain reads from
-   memory (MLAA, bloom, depth of field) are written back.
+   memory (MLAA, bloom, depth of field) are written back. An opt-in experimental FSR 3.1 path selects the
+   full-resolution deferred depth, jitters deferred and depth-tested scene draws, derives camera rotation and
+   translation motion from depth, and generates a reactive mask from paired scene-composition captures before
+   temporally upscaling ahead of scan-out gamma. ps3recomp exposes a generic registered-upscaler interface and
+   metadata/action callbacks; the port-owned adapter keeps all KZ3 pass recognition and AMD FidelityFX runtime
+   use outside the generic renderer. The separate Upscaler option defaults to Off and falls back to the ordinary
+   bilinear presentation path when any required input or capability is unavailable.
+   Architecture, inputs and current limitations: [FSR-3.1.md](FSR-3.1.md).
 7. **Running.** The result is `kz3.exe`, a native Windows program. On Linux it runs under Proton, which is where it
    is mostly tested (it has also run natively on Windows 11 and on a Windows 10 test machine); a native Linux build is planned.
 

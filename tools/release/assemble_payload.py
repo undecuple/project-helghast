@@ -100,6 +100,7 @@ RULES = [
     ("re/data/overrides/ppu_overrides-114.txt", "re/data/overrides/ppu_overrides-114.txt", "file", {}),
     ("re/data/overrides/ppu_lift_fixups-114.txt", "re/data/overrides/ppu_lift_fixups-114.txt", "file", {}),
     ("port/kz3", "port/kz3", "tree", {"skip_tests": True}),
+    ("third_party/fidelityfx-sdk", "third_party/fidelityfx-sdk", "tree", {}),
     ("port/spu", "port/spu", "tree", {"skip_tests": True}),
     # the port's own UI text per language: read at <exe dir>\lang\port_ui.tsv (kz3_tr.h; net 45); firstrun/launcher place it
     ("port/text/port_ui.tsv", "lang/port_ui.tsv", "file", {}),
@@ -121,6 +122,10 @@ FONT_LICENSE = ("OFL-rajdhani.txt", "licenses/Rajdhani-OFL.txt")   # installer_a
 SDL3_DEST = ("runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt")   # payload names: the DLL (firstrun.place_sdl3 copies it next to
 SDL3_SRC = ("SDL3.dll", "LICENSE.txt")                          # kz3.exe) and SDL's zlib licence; names inside --sdl3 DIR
 SDL3_MAX_BYTES = 16 << 20                                       # a DLL is exempt from the 2 MiB binary cap, not from this one
+FIDELITYFX_DEST = ("runtime/amd_fidelityfx_dx12.dll", "licenses/AMD-FidelityFX-SDK-LICENSE.txt")
+FIDELITYFX_SRC = ("amd_fidelityfx_dx12.dll", "LICENSE.txt")
+FIDELITYFX_DLL_SHA256 = "12a5081257ec95b0b53ad51b4a87fb3c03f97fe0bbb59f9496968f8d50ef93a6"
+FIDELITYFX_DLL_BYTES = 6675664
 LAUNCHER = rnames.LAUNCHER_EXE   # --launcher: built from installer/launcher/launcher.c (pass 4), scrubbed like the rest
 TEMPLATE_SRC = "installer/pso-template.bin"   # optional release input: the shared pipeline template (RSX pass 67)
 TEMPLATE_DEST = "pso-template.bin"            # payload root; the launcher sets LD_PSO_TEMPLATE to it when present
@@ -136,8 +141,12 @@ def is_template(rel):
     return rel == TEMPLATE_DEST
 
 
-def is_sdl3(rel):
-    return rel == SDL3_DEST[0]
+def runtime_dll_limits(rel):
+    if rel == SDL3_DEST[0]:
+        return "SDL3", SDL3_MAX_BYTES, ""
+    if rel == FIDELITYFX_DEST[0]:
+        return "FidelityFX", FIDELITYFX_DLL_BYTES, FIDELITYFX_DLL_SHA256
+    return None
 
 
 def pe_x64_problem(path):
@@ -157,11 +166,16 @@ def pe_x64_problem(path):
 
 
 def scrub_ship(path, rel):
-    """-> problems for one payload file: the template and SDL3.dll get their own gates, everything else scrub_file."""
-    if is_sdl3(rel):
+    """Return problems for one payload file. Runtime DLLs and the template have stricter component-specific gates."""
+    dll = runtime_dll_limits(rel)
+    if dll:
+        name, cap, exact_hash = dll
         size = os.path.getsize(path)
         bad = pe_x64_problem(path)
-        return ([bad] if bad else []) + ([f"{size} bytes exceeds the SDL3 cap {SDL3_MAX_BYTES}"] if size > SDL3_MAX_BYTES else [])
+        problems = ([bad] if bad else []) + ([f"{size} bytes exceeds the {name} cap {cap}"] if size > cap else [])
+        if exact_hash and sha256(path) != exact_hash:
+            problems.append(f"SHA-256 differs from the pinned FidelityFX SDK v1.1.4 DLL ({exact_hash})")
+        return problems
     if is_template(rel):
         size = os.path.getsize(path)
         return [f"{size} bytes exceeds the template cap {TEMPLATE_MAX_BYTES}"] if size > TEMPLATE_MAX_BYTES else []
@@ -324,6 +338,18 @@ def collect_sdl3(sdl3_dir):
             files.append((dest, p))
         else:
             bad.append(f"{p} (SDL3 for the pads; run tools/release/stage_sdl3.py in `nix develop .#win`)")
+    return files, bad
+
+
+def collect_fidelityfx(fidelityfx_dir):
+    """Return the staged FidelityFX DX12 DLL and its MIT licence, both required for a release payload."""
+    files, bad = [], []
+    for want, dest in zip(FIDELITYFX_SRC, FIDELITYFX_DEST):
+        p = os.path.join(fidelityfx_dir, want)
+        if os.path.isfile(p) and not os.path.islink(p):
+            files.append((dest, p))
+        else:
+            bad.append(f"{p} (FSR 3.1; run tools/release/stage_fidelityfx.py)")
     return files, bad
 
 
@@ -501,13 +527,16 @@ def main(argv=None, out=sys.stdout):
     ap.add_argument("--toolchain-manifest", default="", help=argparse.SUPPRESS)
     ap.add_argument("--template", default="", help=f"the shared pipeline template (default {TEMPLATE_SRC} when present)")
     ap.add_argument("--sdl3", default="", help="stage_sdl3.py's folder, SDL3.dll + LICENSE.txt (default work/release/sdl3)")
+    ap.add_argument("--fidelityfx", default="", help="stage_fidelityfx.py's folder (default work/release/fidelityfx)")
     ap.add_argument("--fonts", default="", help="installer_art.py --fetch-fonts' folder (default work/release/fonts)")
     a = ap.parse_args(argv)
     repo = os.path.abspath(a.repo)
     files, missing = collect(repo)
     ffiles, fmissing = collect_fonts(repo, os.path.abspath(a.fonts or os.path.join(repo, "work", "release", "fonts")))
     sfiles, smissing = collect_sdl3(os.path.abspath(a.sdl3 or os.path.join(repo, "work", "release", "sdl3")))
-    files, missing = sorted(files + ffiles + sfiles), missing + fmissing + smissing
+    xfiles, xmissing = collect_fidelityfx(
+        os.path.abspath(a.fidelityfx or os.path.join(repo, "work", "release", "fidelityfx")))
+    files, missing = sorted(files + ffiles + sfiles + xfiles), missing + fmissing + smissing + xmissing
     if a.launcher:
         if os.path.isfile(a.launcher):
             files = sorted(files + [(LAUNCHER, os.path.abspath(a.launcher))])
