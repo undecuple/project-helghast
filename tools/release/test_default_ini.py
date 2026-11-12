@@ -29,7 +29,7 @@ vals = parse(la.DISPLAY_INI_TEXT)
 src = open(os.path.join(REPO, "port", "kz3", "main.cpp"), encoding="utf-8", errors="replace").read()
 patches = "".join(open(os.path.join(REPO, "port", "patches", f), encoding="utf-8", errors="replace").read()
                   for f in sorted(os.listdir(os.path.join(REPO, "port", "patches")))
-                  if f.startswith(("2095", "2103", "2107", "2109", "2113", "2121", "2126", "2160")))
+                  if f.startswith(("2095", "2103", "2107", "2109", "2113", "2121", "2126", "2167")))
 
 m = re.search(r"s_dm_saved\[4\] = \{ RSX_DM_(\w+), RSX_DM_(\w+), RSX_DM_(\w+), RSX_DM_(\w+) \}", src)
 check(bool(m), "main.cpp has the s_dm_saved initialiser")
