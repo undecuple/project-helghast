@@ -1,4 +1,4 @@
-KZ3 patch 2161 (ENHANCEMENT, experimental): publish generic temporal-upscaler inputs from the live renderer.
+KZ3 patch 2168 (ENHANCEMENT, experimental): publish generic temporal-upscaler inputs from the live renderer.
 
 The renderer exposes draw and scene-writeback metadata through optional callbacks. Ports own all game-specific
 recognition and return only generic actions: jitter this draw, snapshot this depth, capture after this draw, or

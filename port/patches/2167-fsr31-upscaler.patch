@@ -1,8 +1,8 @@
-KZ3 patch 2160 (ENHANCEMENT, experimental): let ports register temporal backends through rsx_upscale.
+KZ3 patch 2167 (ENHANCEMENT, experimental): let ports register temporal backends through rsx_upscale.
 
 Reserved backends such as FSR 3 and XeSS remain unimplemented by the generic toolkit until a port registers a
 complete create/destroy/evaluate operation table. Built-in None and FSR 1 cannot be replaced. Runtime sharpness
-changes reuse the active context, while backend changes are handled by the renderer integration in patch 2161.
+changes reuse the active context, while backend changes are handled by the renderer integration in patch 2168.
 
 Keep Scaling filter limited to Bilinear and Nearest. A separate, opt-in GUM flag adds Upscaler
 (Off / FSR 3.1 experimental), FSR sharpness, confirmation, tooltip, initialization, and reset behavior. This keeps

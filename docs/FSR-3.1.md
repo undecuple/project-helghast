@@ -62,8 +62,8 @@ Any missing or incoherent input
 | [`port/kz3/fsr31_motion.h`](../port/kz3/fsr31_motion.h) | Platform-independent reference implementation of normal-depth reconstruction and camera reprojection |
 | [`port/kz3/fsr31_inputs.h`](../port/kz3/fsr31_inputs.h) | Pure sharpness parsing plus deferred-pass, scene-resolve and capture-pair selection rules |
 | [`port/kz3/main.cpp`](../port/kz3/main.cpp) | Backend registration, camera/FOV publication, projection-plane assumption, upscaler persistence and Options-page commands |
-| [`port/patches/2160-fsr31-upscaler.patch`](../port/patches/2160-fsr31-upscaler.patch) | Generic external-backend registration and the separately flagged Upscaler/FSR sharpness UI |
-| [`port/patches/2161-fsr31-game-buffer-inputs.patch`](../port/patches/2161-fsr31-game-buffer-inputs.patch) | Generic live-renderer metadata/actions, immediate depth snapshot, temporal presentation ordering, lifecycle and fallback |
+| [`port/patches/2167-fsr31-upscaler.patch`](../port/patches/2167-fsr31-upscaler.patch) | Generic external-backend registration and the separately flagged Upscaler/FSR sharpness UI |
+| [`port/patches/2168-fsr31-game-buffer-inputs.patch`](../port/patches/2168-fsr31-game-buffer-inputs.patch) | Generic live-renderer metadata/actions, immediate depth snapshot, temporal presentation ordering, lifecycle and fallback |
 | [`third_party/fidelityfx-sdk/`](../third_party/fidelityfx-sdk/) | Minimal unchanged MIT-licensed FidelityFX C API headers needed by the adapter |
 | [`tools/release/stage_fidelityfx.py`](../tools/release/stage_fidelityfx.py) | Release-time validation and staging of AMD's official signed DirectX 12 DLL and licence |
 
@@ -147,7 +147,7 @@ late, depthless composition targets. The stable full-resolution deferred set was
 No unidentified MRT is labelled or supplied as velocity. FSR has no normal-buffer input, and slot number or
 texture format alone does not establish a motion convention or scale.
 
-Patch 2161 publishes the generic draw metadata. The KZ3 callback selects the primary deferred pass structurally:
+Patch 2168 publishes the generic draw metadata. The KZ3 callback selects the primary deferred pass structurally:
 a local, full-render-size target, a full viewport, at
 least four color targets, a bound depth slot and depth testing. It records that depth slot for the current renderer
 frame. The same FidelityFX jitter is applied to those deferred geometry draws and to later depth-tested draws into
@@ -384,7 +384,7 @@ runtime performs no network access. Licence and attribution details are in [`NOT
 | [`tools/smoke/test_fsr31.cpp`](../tools/smoke/test_fsr31.cpp) | Real hardware D3D12 device, registered operation/hook tables, exact provider query, context-gated jitter, deliberately different scene captures, generated reactivity, depth-aware motion, output readback, explicit WARP rejection and missing-DLL fallback |
 | [`tools/release/test_stage_fidelityfx.py`](../tools/release/test_stage_fidelityfx.py) | DLL/licence staging and rejection of wrong architecture, type, hash or licence |
 | Release host tests | Payload, launcher, first-run, portable ZIP, licence inventory and uninstall coverage |
-| Patch-series replay/compile | Patches 2160 and 2161 apply after the complete numbered series; the live-renderer object and KZ3 adapter translation unit compile independently |
+| Patch-series replay/compile | Patches 2167 and 2168 apply after the complete numbered series; the live-renderer object and KZ3 adapter translation unit compile independently |
 
 The portable display-mode, KZ3 input-policy and generic-upscaler host tests pass against the regenerated patches.
 The complete 321-patch series also replays from the pinned ps3recomp commit. A full local runtime build currently
