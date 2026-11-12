@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared by test_r159_native_k7a.sh and test_r159_native_k3.sh (SPU pass 159): builds tools/spu/test_r159_snd_model.c with
 # port/spu/kz3_native_snd.c twice (-O1 and -O2), runs the independent model, the negative control, then native_diff.py
 # against the lifted code (game data only). Args: KIND(k7a|k3) SLOT TWINSLOT.

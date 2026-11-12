@@ -24,7 +24,8 @@ inc=(); for d in runtime/syscalls include libs runtime runtime/ppu runtime/memor
 printf '%s\n' '#include "filesystem/cellFs.h"' \
   'const unsigned CFS_CREAT = CELL_FS_O_CREAT, CFS_EXCL = CELL_FS_O_EXCL, CFS_TRUNC = CELL_FS_O_TRUNC,' \
   '               CFS_APPEND = CELL_FS_O_APPEND;' > "$T/cellfs_vals.c"
-"$CC" -std=gnu17 -O1 -w "${inc[@]}" -o "$T/t" tools/upstream/test_sys_fs_flags.c "$T/cellfs_vals.c" $([ -f "$P/runtime/platform/ps3_dev_flash.c" ] && echo "$P/runtime/platform/ps3_dev_flash.c") -pthread 2>"$T/err" \
+extra=(); [[ -f "$P/runtime/platform/ps3_dev_flash.c" ]] && extra=("$P/runtime/platform/ps3_dev_flash.c")   # an array: paths with spaces stay one word
+"$CC" -std=gnu17 -O1 -w "${inc[@]}" -o "$T/t" tools/upstream/test_sys_fs_flags.c "$T/cellfs_vals.c" "${extra[@]}" -pthread 2>"$T/err" \
   || { head -20 "$T/err"; echo "[FAIL] test_sys_fs_flags: build"; exit 1; }
 mkdir -p "$T/root"
 out="$("$T/t" "$T/root" 2>"$T/stderr")"; rc=$?
