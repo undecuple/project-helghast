@@ -1,0 +1,367 @@
+diff --git a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
+index 2e823b19..d29d451d 100644
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -435,6 +435,7 @@ static inline const char* rsx_dm_find(const char* h, size_t n, size_t from, cons
+ #define RSX_DM_GUM_BLOOM 4   /* patch 2121: add the Bloom row */
+ #define RSX_DM_GUM_FOV   2   /* rsx_dm_patch_gum_opts: add the Field of view row (patch 2109) */
+ #define RSX_DM_GUM_FSR3  8   /* add the port-owned FSR 3.1 backend rows */
++#define RSX_DM_GUM_XESS 16   /* add XeSS to the port-owned Upscaler row */
+ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_n, unsigned opts)
+ {
+     static const char rsx_dm_gum_row[] =
+@@ -493,6 +494,8 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         "\t\t\t\t<selectitem value=\"0.9\">0.9</selectitem>\n"
+         "\t\t\t\t<selectitem value=\"1.0\">1.0</selectitem>\n"
+         "\t\t\t</select>\n\n\t\t\t";
++    static const char rsx_dm_gum_item_xess[] =
++        "\t\t\t\t<selectitem value=\"xess\">@tr{disp.v.xess|XeSS (experimental)}</selectitem>\n";
+     static const char rsx_dm_gum_row_mb[] =   /* patch 2107: only when the MotionBlur hook is in the exe */
+         "<select id=\"slc_kz3_mblur\" label=\"@tr{disp.mblur|Motion blur}\" onchange=\"script(settingscript,KZ3ChangeMBlur)\"\n"
+         "\t\t\t\tdefault-value=\"100\">\n"
+@@ -573,6 +576,8 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         "\t\t\t\tgKz3UpscalerWant = e:GetSender():GetValue()\n"
+         "\t\t\t\tif (gKz3UpscalerWant == \"fsr3\") then\n"
+         "\t\t\t\t\tgMenu:DoAction(\"dialog(dlg_kz3_fsr, settingscript, OnKZ3FsrClose)\")\n"
++        "\t\t\t\telseif (gKz3UpscalerWant == \"xess\" and KZ3XessOn) then\n"
++        "\t\t\t\t\tgMenu:DoAction(\"dialog(dlg_kz3_xess, settingscript, OnKZ3XessClose)\")\n"
+         "\t\t\t\telse\n"
+         "\t\t\t\t\tKZ3DisplayCmd(\"upscaler \"..gKz3UpscalerWant)\n"
+         "\t\t\t\tend\n"
+@@ -592,6 +597,19 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         "\t\t\te:SetHandled(true)\n"
+         "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"fsrsharpness \"..e:GetSender():GetValue()) end\n"
+         "\t\tend\n";
++    static const char rsx_dm_gum_lua_xess[] =
++        "\t\tfunction KZ3XessOn()\n"
++        "\t\tend\n\n"
++        "\t\tfunction OnKZ3XessClose(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (e:GetSender():GetValue() == \"yes\") then\n"
++        "\t\t\t\tKZ3DisplayCmd(\"upscaler xess\")\n"
++        "\t\t\telse\n"
++        "\t\t\t\tgKz3Dm = 0\n"
++        "\t\t\t\tgRoot:GetTag(\"slc_kz3_upscaler\"):SetValue(KZ3DisplayCmd(\"upscaler\"))\n"
++        "\t\t\t\tgKz3Dm = 1\n"
++        "\t\t\tend\n"
++        "\t\tend\n\n";
+     /* patch 2107: the warning for a limit above 30, shaped like the game's own confirm dialogs (No focused, cancelable;
+      * Yes/No from the game's strings), placed beside the page's dialogconfirm include */
+     static const char rsx_dm_gum_dlg[] =
+@@ -608,6 +626,13 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         "\t\t<dialogoption id=\"dlg_kz3_fsr_yes\" label=\"@key{menu_dialog_yes}\" value=\"yes\"/>\n"
+         "\t\t<dialogoption id=\"dlg_kz3_fsr_no\" label=\"@key{menu_dialog_no}\" value=\"no\"/>\n"
+         "\t</dialog>\n\n\t";
++    static const char rsx_dm_gum_dlg_xess[] =
++        "<dialog id=\"dlg_kz3_xess\" label=\"@tr{disp.xess_warn|XeSS uses an optional Intel runtime downloaded separately with your approval. If it is missing, the launcher will ask on the next start. Camera-only motion can still cause ghosting or shimmer. Enable it?}\" "
++        "default-focus=\"dlg_kz3_xess_no\"\n"
++        "\t\tcancelable=\"true\">\n"
++        "\t\t<dialogoption id=\"dlg_kz3_xess_yes\" label=\"@key{menu_dialog_yes}\" value=\"yes\"/>\n"
++        "\t\t<dialogoption id=\"dlg_kz3_xess_no\" label=\"@key{menu_dialog_no}\" value=\"no\"/>\n"
++        "\t</dialog>\n\n\t";
+
+     /* patch 2110: the row descriptions, in the game's own tooltip panel (common/advancedcontroller.gum: a list onchange
+      * fills <panel class="tooltip" y="440"><text id="tooltip_txt"> for its Zoom row); shown for the port's rows only,
+@@ -621,7 +646,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         "\t\t\tslc_kz3_display = \"@trl{disp.tip.display|Windowed, borderless window or exclusive fullscreen.}\",\n"
+         "\t\t\tslc_kz3_scaling = \"@trl{disp.tip.scaling|Fit keeps the picture's shape with black bars. Stretch fills the whole window.}\",\n"
+         "\t\t\tslc_kz3_filter = \"@trl{disp.tip.filter|Bilinear smooths the scaled picture. Nearest keeps hard pixel edges.}\",\n"
+-        "\t\t\tslc_kz3_upscaler = \"@trl{disp.tip.upscaler|Off uses the scaling filter. FSR 3.1 uses current and previous frames to produce a larger image.}\",\n"
++        "\t\t\tslc_kz3_upscaler = \"@trl{disp.tip.upscaler|Off uses the scaling filter. FSR 3.1 and XeSS use current and previous frames to produce a larger image. XeSS needs an optional Intel runtime.}\",\n"
+         "\t\t\tslc_kz3_fsr_sharpness = \"@trl{disp.tip.fsr_sharpness|Sharpening applied by FSR 3.1. It has no effect while the upscaler is off.}\",\n"
+         "\t\t\tslc_kz3_vsync = \"@trl{disp.tip.vsync|Waits for the display's refresh to stop tearing. Off can lower input delay.}\",\n"
+         "\t\t\tslc_kz3_fps = \"@trl{disp.tip.fps_lvl|Used in missions. Menus and videos stay at 30. Above 30, physics, animation and "
+@@ -737,8 +762,11 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+     const size_t nb = (opts & RSX_DM_GUM_BLOOM) ? sizeof rsx_dm_gum_row_bloom - 1 : 0, nlb = nb ? sizeof rsx_dm_gum_lua_bloom - 1 : 0;
+     const size_t nf = (opts & RSX_DM_GUM_FOV) ? sizeof rsx_dm_gum_row_fov - 1 : 0, nlf = nf ? sizeof rsx_dm_gum_lua_fov - 1 : 0;
+     const size_t nu = (opts & RSX_DM_GUM_FSR3) ? sizeof rsx_dm_gum_row_fsr3 - 1 : 0;
++    const size_t nux = (nu && (opts & RSX_DM_GUM_XESS)) ? sizeof rsx_dm_gum_item_xess - 1 : 0;
+     const size_t nlu = nu ? sizeof rsx_dm_gum_lua_fsr3 - 1 : 0;
++    const size_t nlux = nux ? sizeof rsx_dm_gum_lua_xess - 1 : 0;
+     const size_t ndu = nu ? sizeof rsx_dm_gum_dlg_fsr3 - 1 : 0;
++    const size_t ndux = nux ? sizeof rsx_dm_gum_dlg_xess - 1 : 0;
+     /* patch 2110: the tooltip after the list, its Lua, the list's onchange and the reset call */
+     static const char rsx_dm_list_on[] = " onchange=\"script(settingscript,KZ3Tooltip)\"";
+     static const char rsx_dm_reset_at[] = "gPlayerProfile:SetDefaultDisplay()";
+@@ -747,7 +775,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+     const char* rs = rsx_dm_find(in, n, (size_t)(scr - in), rsx_dm_reset_at);
+     const size_t nt = sizeof rsx_dm_gum_tip - 1, nlt = sizeof rsx_dm_gum_lua_tip - 1;
+     if (!le || le > scr || (rs && rs > cd)) return NULL;
+-    out = (char*)malloc(n + nr + nm + nb + nf + nu + nd + ndu + nl + nlm + nlb + nlf + nlu + nt + nlt + 128 + 1);
++    out = (char*)malloc(n + nr + nm + nb + nf + nu + nux + nd + ndu + ndux + nl + nlm + nlb + nlf + nlu + nlux + nt + nlt + 128 + 1);
+     if (!out) return NULL;
+     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend (run r103-dpage3):
+      * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead.
+@@ -766,7 +794,17 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+         memcpy(out + o, in, at_row); o += at_row;
+     }
+     memcpy(out + o, rsx_dm_gum_row, nr); o += nr;
+-    memcpy(out + o, rsx_dm_gum_row_fsr3, nu); o += nu;
++    if (nu && nux) {
++        const char* close = strstr(
++            rsx_dm_gum_row_fsr3, "\t\t\t</select>\n");
++        const size_t head = close ?
++            (size_t)(close - rsx_dm_gum_row_fsr3) : nu;
++        memcpy(out + o, rsx_dm_gum_row_fsr3, head); o += head;
++        memcpy(out + o, rsx_dm_gum_item_xess, nux); o += nux;
++        memcpy(out + o, rsx_dm_gum_row_fsr3 + head, nu - head); o += nu - head;
++    } else {
++        memcpy(out + o, rsx_dm_gum_row_fsr3, nu); o += nu;
++    }
+     memcpy(out + o, rsx_dm_gum_row_fov, nf); o += nf;                  /* patch 2109 */
+     memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;                   /* patch 2121: Motion blur and Bloom after Field of view */
+     memcpy(out + o, rsx_dm_gum_row_bloom, nb); o += nb;
+@@ -778,6 +816,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+     }
+     memcpy(out + o, rsx_dm_gum_dlg, nd); o += nd;                      /* patch 2107: before <script id="settingscript"> */
+     memcpy(out + o, rsx_dm_gum_dlg_fsr3, ndu); o += ndu;
++    memcpy(out + o, rsx_dm_gum_dlg_xess, ndux); o += ndux;
+     if (rs) {   /* patch 2110: Reset to defaults also resets the port's rows */
+         const size_t at_rs = (size_t)(rs - in) + sizeof rsx_dm_reset_at - 1;
+         memcpy(out + o, in + at_scr, at_rs - at_scr); o += at_rs - at_scr;
+@@ -791,6 +830,7 @@ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_
+     memcpy(out + o, rsx_dm_gum_lua_fov, nlf); o += nlf;
+     memcpy(out + o, rsx_dm_gum_lua_bloom, nlb); o += nlb;              /* patch 2121 */
+     memcpy(out + o, rsx_dm_gum_lua_fsr3, nlu); o += nlu;
++    memcpy(out + o, rsx_dm_gum_lua_xess, nlux); o += nlux;
+     memcpy(out + o, rsx_dm_gum_lua_tip, nlt); o += nlt;               /* patch 2110 */
+     memcpy(out + o, in + at_lua, n - at_lua); o += n - at_lua;
+     out[o] = 0;
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 7f0e9667..3422034e 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -13901,7 +13901,7 @@ u64 rsx_live_draw_debug_chunk_submits(void) { return g_ld_chunk_submits; }
+  * squeezed UI already). */
+ #include "rsx_hud169.h"
+ static int ld_h169_factors(float* kx, float* ky);   /* after ld_dm_scaling_now */
+-static rsx_live_upscale_hooks g_up_hooks;
++static rsx_live_upscale_hooks g_up_hooks[RSX_UPSCALE_BACKEND_COUNT];
+ static u32 g_up_depth_slot, g_up_depth_frame = UINT32_MAX;
+ static u32 g_up_jitter_frame = UINT32_MAX;
+ static float g_up_jitter_x, g_up_jitter_y;
+@@ -13909,17 +13909,51 @@ static rsx_upscale* ld_up_get(void);
+ static void ld_up_output_size(u32* width, u32* height);
+ void rsx_live_draw_set_upscale_hooks(const rsx_live_upscale_hooks* hooks)
+ {
+-    if (hooks) g_up_hooks = *hooks;
+-    else memset(&g_up_hooks, 0, sizeof g_up_hooks);
++    if (hooks && hooks->backend > RSX_UPSCALE_NONE &&
++        hooks->backend < RSX_UPSCALE_BACKEND_COUNT)
++        g_up_hooks[hooks->backend] = *hooks;
++    else if (!hooks)
++        memset(g_up_hooks, 0, sizeof g_up_hooks);
+     g_up_depth_slot = 0;
+     g_up_depth_frame = UINT32_MAX;
+     g_up_jitter_frame = UINT32_MAX;
+ }
+-static int ld_up_hooks_active(void)
++static const rsx_live_upscale_hooks* ld_up_active_hooks(void)
+ {
+     rsx_upscale* up = ld_up_get();
+-    return up && g_up_hooks.backend != RSX_UPSCALE_NONE &&
+-           rsx_upscale_get_backend(up) == g_up_hooks.backend;
++    if (!up) return NULL;
++    const rsx_upscale_backend backend = rsx_upscale_get_backend(up);
++    return backend > RSX_UPSCALE_NONE &&
++           backend < RSX_UPSCALE_BACKEND_COUNT &&
++           g_up_hooks[backend].backend == backend
++        ? &g_up_hooks[backend] : NULL;
++}
++static u32 ld_up_filter_with_bias(u32 filter, int32_t bias_fp)
++{
++    int32_t bias = (int32_t)(filter & 0x1FFFu);
++    if (bias & 0x1000) bias -= 0x2000;
++    bias += bias_fp;
++    if (bias < -0x1000) bias = -0x1000;
++    if (bias > 0x0FFF) bias = 0x0FFF;
++    return (filter & ~0x1FFFu) | ((u32)bias & 0x1FFFu);
++}
++static void ld_up_bias_samplers(
++    u32 texture_mask, u32* smp_slots, int32_t bias_fp)
++{
++    if (!bias_fp) return;
++    for (u32 u = 0; u < SMP_TABLE_SIZE; u++) {
++        if (!((texture_mask >> u) & 1u)) continue;
++        rsx_dsp_texture texture;
++        rsx_dsp_get_texture(&g.rsx, u, &texture);
++        const u32 min_filter = (texture.filter >> 16) & 0x7u;
++        if (min_filter < 3u || min_filter > 6u) continue;
++        texture.filter =
++            ld_up_filter_with_bias(texture.filter, bias_fp);
++        u32 key[4];
++        sampler_key(&texture, key);
++        const u32 slot = sampler_slot(&texture, key);
++        if (slot != SMP_DEFAULT) smp_slots[u] = slot;
++    }
+ }
+ static u32 g_h169_frame = 0xFFFFFFFFu;
+ static int g_h169_depth_seen, g_h169_disp_seen, g_h169_rt_sampled;
+@@ -14901,6 +14935,58 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         else
+             g_ld_vtex_unsupported++;
+     }
++    rsx_live_upscale_draw_info up_draw = {0};
++    rsx_live_upscale_draw_action up_action = {0};
++    const rsx_live_upscale_hooks* up_hooks = ld_up_active_hooks();
++    int up_capture_after_draw = 0;
++    u32 up_select_depth = 0;
++    if (up_hooks && up_hooks->inspect_draw) {
++        const float up_width =
++            (sf.clip_w ? (float)sf.clip_w : (float)g.width) /
++            (float)sf.aa_sx;
++        const float up_height =
++            (sf.clip_h ? (float)sf.clip_h : (float)g.height) /
++            (float)sf.aa_sy;
++        const int full =
++            vp.scale[0] == up_width * 0.5f &&
++            vp.translate[0] == up_width * 0.5f &&
++            fabsf(vp.scale[1]) == up_height * 0.5f &&
++            vp.translate[1] == up_height * 0.5f;
++        if (g_h169_frame != g_ld_frames) {
++            g_h169_frame = g_ld_frames;
++            g_h169_depth_seen = 0;
++            g_h169_disp_seen = 0;
++        }
++        ld_up_output_size(&up_draw.output_width, &up_draw.output_height);
++        up_draw.frame = g_ld_frames;
++        up_draw.render_width = g.width;
++        up_draw.render_height = g.height;
++        up_draw.target = target;
++        up_draw.target_location = g.surfaces[target].location;
++        up_draw.target_offset = g.surfaces[target].offset;
++        up_draw.target_width = g.surfaces[target].w;
++        up_draw.target_height = g.surfaces[target].h;
++        up_draw.mrt_count = n_mrt;
++        up_draw.depth_slot = current_zslot;
++        up_draw.sampled_render_target_offset = g_h169_rt_off;
++        up_draw.full_viewport = full;
++        up_draw.depth_test =
++            (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0;
++        up_draw.blend =
++            (rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u) != 0;
++        up_draw.sampled_full_size_render_target = g_h169_rt_sampled;
++        up_draw.display_target = ld_h169_is_display(target);
++        up_draw.first_display_draw =
++            up_draw.display_target && !g_h169_disp_seen;
++        up_draw.depth_draw_seen = g_h169_depth_seen;
++        up_draw.command_list = g.list;
++        up_draw.color_resource = g.surfaces[target].tex;
++        up_hooks->inspect_draw(up_hooks->user, &up_draw, &up_action);
++        up_capture_after_draw = up_action.capture_after_draw;
++        if (up_action.select_depth) up_select_depth = current_zslot;
++        ld_up_bias_samplers(
++            texture_mask, smp_slots, up_action.mip_bias_fp);
++    }
+     LDW_ADD(RSX_PERF_W_D_TEXLOOP_T, texloop_t0);
+     LDW_T0(desc_t0);   /* patch 2045 */
+     const u32 required_srv_tables = 1u + (vtex_mask != 0);
+@@ -15041,9 +15127,6 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+      * full-size render target sampled) is squeezed into the centred 16:9 box; the RE notes "Pass 162" s.4. */
+     float h_kx = 1.0f, h_ky = 1.0f;
+     int h169 = 0;
+-    rsx_live_upscale_draw_info up_draw = {0};
+-    int up_capture_after_draw = 0;
+-    u32 up_select_depth = 0;
+     {
+         const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
+                          fabsf(vp.scale[1]) == Hv * 0.5f && vp.translate[1] == Hv * 0.5f;
+@@ -15066,36 +15149,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 }
+             }
+         }
+-        if (g_up_hooks.inspect_draw && ld_up_hooks_active()) {
+-            rsx_live_upscale_draw_action action = {0};
+-            ld_up_output_size(&up_draw.output_width, &up_draw.output_height);
+-            up_draw.frame = g_ld_frames;
+-            up_draw.render_width = g.width;
+-            up_draw.render_height = g.height;
+-            up_draw.target = target;
+-            up_draw.target_location = g.surfaces[target].location;
+-            up_draw.target_offset = g.surfaces[target].offset;
+-            up_draw.target_width = g.surfaces[target].w;
+-            up_draw.target_height = g.surfaces[target].h;
+-            up_draw.mrt_count = n_mrt;
+-            up_draw.depth_slot = current_zslot;
+-            up_draw.sampled_render_target_offset = g_h169_rt_off;
+-            up_draw.full_viewport = full;
+-            up_draw.depth_test = (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0;
+-            up_draw.blend = (rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u) != 0;
+-            up_draw.sampled_full_size_render_target = g_h169_rt_sampled;
+-            up_draw.command_list = g.list;
+-            up_draw.color_resource = g.surfaces[target].tex;
+-            g_up_hooks.inspect_draw(g_up_hooks.user, &up_draw, &action);
+-            if (action.select_depth) up_select_depth = current_zslot;
+-            if (action.apply_jitter && Wv > 0.0f && Hv > 0.0f) {
+-                g_up_jitter_frame = g_ld_frames;
+-                g_up_jitter_x = action.jitter_x;
+-                g_up_jitter_y = action.jitter_y;
+-                xf[4] += 2.0f * action.jitter_x / Wv;
+-                xf[5] -= 2.0f * action.jitter_y / Hv;
+-            }
+-            up_capture_after_draw = action.capture_after_draw;
++        if (up_action.apply_jitter && Wv > 0.0f && Hv > 0.0f) {
++            g_up_jitter_frame = g_ld_frames;
++            g_up_jitter_x = up_action.jitter_x;
++            g_up_jitter_y = up_action.jitter_y;
++            xf[4] += 2.0f * up_action.jitter_x / Wv;
++            xf[5] -= 2.0f * up_action.jitter_y / Hv;
+         }
+         {   /* patch 2118 diagnostics: KZ3_HUD_169_LOG=2 KZ3_HUD_169_LOGF=<frame>: every draw of 3 frames, any target */
+             static int dl = -2; static u32 df = 0;
+@@ -15295,8 +15354,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g_up_depth_slot = up_select_depth;
+         g_up_depth_frame = g_ld_frames;
+     }
+-    if (oq_pred >= 0 && up_capture_after_draw && g_up_hooks.after_draw)
+-        g_up_hooks.after_draw(g_up_hooks.user, &up_draw);
++    if (oq_pred >= 0 && up_capture_after_draw && up_hooks &&
++        up_hooks->after_draw) {
++        up_draw.command_list = g.list;
++        up_draw.color_resource = g.surfaces[target].tex;
++        up_hooks->after_draw(up_hooks->user, &up_draw);
++    }
+     if (g_gt.on > 0) ld_gt_draw(target, n_mrt, mrt, current_zslot, n_tri, sf.clip_w * sf.clip_h, (u32)__builtin_popcount(texture_mask));   /* patch 2052 */
+     LDW_ADD(RSX_PERF_W_D_REC_T, rec_t0);
+     LDW_T0(post_t0);   /* patch 2045 */
+@@ -18195,7 +18258,8 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+          * 0x1310400, where SPU MLAA ran); the host AA pass runs on it first. */
+         if (r0 <= s0 && r1 >= s1) {
+             rsx_live_upscale_surface_action action = {0};
+-            if (g_up_hooks.before_writeback && ld_up_hooks_active()) {
++            const rsx_live_upscale_hooks* hooks = ld_up_active_hooks();
++            if (hooks && hooks->before_writeback) {
+                 rsx_live_upscale_surface_info info = {0};
+                 ld_up_output_size(&info.output_width, &info.output_height);
+                 info.frame = g_ld_frames;
+@@ -18208,7 +18272,7 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+                 info.height = sf->h;
+                 info.command_list = g.list;
+                 info.color_resource = sf->tex;
+-                g_up_hooks.before_writeback(g_up_hooks.user, &info, &action);
++                hooks->before_writeback(hooks->user, &info, &action);
+             }
+             if (!action.suppress_host_aa) ld_host_aa(i);
+         }
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index cc278ca3..941e9ba8 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -60,6 +60,9 @@ typedef struct {
+     int depth_test;
+     int blend;
+     int sampled_full_size_render_target;
++    int display_target;
++    int first_display_draw;
++    int depth_draw_seen;
+     void* command_list;
+     void* color_resource;
+ } rsx_live_upscale_draw_info;
+@@ -69,6 +72,7 @@ typedef struct {
+     int apply_jitter;
+     int capture_after_draw;
+     float jitter_x, jitter_y;
++    int32_t mip_bias_fp;
+ } rsx_live_upscale_draw_action;
+
+ typedef struct {

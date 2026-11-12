@@ -36,6 +36,8 @@ REQUIRED = ("run.cmd", "manifest.json", "VERSION.txt",
             "fonts/Rajdhani-Medium.ttf", "fonts/Rajdhani-Bold.ttf", "licenses/Rajdhani-OFL.txt",
             # SDL3 for the pads (patch 4010) and its licence (assemble_payload SDL3_DEST)
             "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt",
+            # AMD FidelityFX SDK v1.1.4 signed DX12 runtime and MIT licence
+            "runtime/amd_fidelityfx_dx12.dll", "licenses/AMD-FidelityFX-SDK-LICENSE.txt",
             # the port UI text table the runtime reads from <exe dir>\lang (net 45)
             "lang/port_ui.tsv")
 NO_SCRUB_PREFIX = "toolchain/"

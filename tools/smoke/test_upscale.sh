@@ -6,14 +6,21 @@
 #   nix develop .#re --command tools/sandbox.sh -- tools/smoke/test_upscale.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$ROOT/tools/pyresolve.sh"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/rsx_upscale.c" || ! -f "$V/fsr1/ffx_fsr1.h" ]]; then
   echo "[test_upscale] SKIP: toolkit without patch 2145 ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
 O="$ROOT/build/smoke-host/upscale"; mkdir -p "$O"
-python3 "$ROOT/tools/smoke/fsr1_embed.py" --check "$V/fsr1" || { echo "[test_upscale] FAIL: fsr1_embed.h is not what the headers generate"; exit 1; }
+$PY "$ROOT/tools/smoke/fsr1_embed.py" --check "$V/fsr1" || { echo "[test_upscale] FAIL: fsr1_embed.h is not what the headers generate"; exit 1; }
 echo "[test_upscale] fsr1_embed.h matches the vendored headers"
-for san in "" "-fsanitize=address,undefined -fno-sanitize-recover=undefined"; do
+SANS=("")
+if echo "int main(void){return 0;}" | gcc -fsanitize=address,undefined -x c - -o "$O/probe" 2>/dev/null && "$O/probe"; then
+  SANS+=("-fsanitize=address,undefined -fno-sanitize-recover=undefined")
+else
+  echo "[test_upscale] note: compiler sanitizer runtime unavailable"
+fi
+for san in "${SANS[@]}"; do
   # shellcheck disable=SC2086
   gcc -std=c99 -O1 -g -Wall -Wextra -Wno-unused-function -Wno-ignored-qualifiers $san -I "$V" \
       "$ROOT/tools/smoke/test_upscale.c" "$V/rsx_upscale.c" "$V/rsx_upscale_fsr1.c" -o "$O/t" -lm
@@ -25,6 +32,7 @@ if command -v slangc >/dev/null 2>&1; then
   cat > "$O/dump.c" <<'EOC'
 #include "rsx_upscale.h"
 #include <stdio.h>
+const rsx_upscale_ops rsx_upscale_fsr1_d3d12_ops = { 0 };
 int main(void) { size_t n; char* s = rsx_upscale_fsr1_hlsl_source(&n); fwrite(s, 1, n, stdout); return 0; }
 EOC
   gcc -std=c99 -I "$V" "$O/dump.c" "$V/rsx_upscale.c" "$V/rsx_upscale_fsr1.c" -o "$O/dump" -lm

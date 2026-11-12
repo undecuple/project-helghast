@@ -9,21 +9,61 @@
 #include <stdlib.h>
 #include <string.h>
 
+const rsx_upscale_ops rsx_upscale_fsr1_d3d12_ops = { 0 };
+
+#ifdef _WIN32
+static int test_setenv(const char* name, const char* value, int overwrite)
+{
+    return !overwrite && getenv(name) ? 0 : _putenv_s(name, value);
+}
+static int test_unsetenv(const char* name) { return _putenv_s(name, ""); }
+#define setenv test_setenv
+#define unsetenv test_unsetenv
+#endif
+
 static int fails;
 #define CHECK(c) do { if (c) printf("ok   %s\n", #c); else { printf("FAIL %s (line %d)\n", #c, __LINE__); fails++; } } while (0)
 
 static int g_create, g_destroy, g_eval;
+static int g_xess_create, g_xess_destroy, g_xess_eval;
+static float g_sharpness;
 static void* fk_create(void* dev, const rsx_upscale_config* cfg) { (void)cfg; g_create++; return dev ? dev : (void*)&g_create; }
 static void fk_destroy(void* be, void (*r)(void*, void*), void* u) { (void)be; (void)r; (void)u; g_destroy++; }
 static int fk_eval(void* be, const rsx_upscale_eval* e, float sh, rsx_upscale_result* res, void (*r)(void*, void*), void* u)
 {
     (void)be; (void)sh; (void)r; (void)u;
     g_eval++;
+    g_sharpness = sh;
     res->resource = (void*)e->input.resource;
     res->width = e->output_width; res->height = e->output_height;
     return 1;
 }
 static const rsx_upscale_ops fake = { fk_create, fk_destroy, fk_eval };
+static const rsx_upscale_ops incomplete = { fk_create, NULL, fk_eval };
+static void* xess_create(void* dev, const rsx_upscale_config* cfg)
+{
+    (void)cfg;
+    g_xess_create++;
+    return dev ? dev : (void*)&g_xess_create;
+}
+static void xess_destroy(void* be, void (*r)(void*, void*), void* u)
+{
+    (void)be; (void)r; (void)u;
+    g_xess_destroy++;
+}
+static int xess_eval(void* be, const rsx_upscale_eval* e, float sh,
+                     rsx_upscale_result* res, void (*r)(void*, void*), void* u)
+{
+    (void)be; (void)sh; (void)r; (void)u;
+    g_xess_eval++;
+    res->resource = e->input.resource;
+    res->width = e->output_width;
+    res->height = e->output_height;
+    return 1;
+}
+static const rsx_upscale_ops fake_xess = {
+    xess_create, xess_destroy, xess_eval
+};
 
 static float bits_f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static int near(float a, float b) { return fabsf(a - b) <= 1e-6f * (fabsf(b) + 1.0f); }
@@ -56,6 +96,14 @@ int main(int argc, char** argv)
         CHECK(rsx_upscale_parse_backend(rsx_upscale_backend_name((rsx_upscale_backend)i)) == (rsx_upscale_backend)i);
     CHECK(rsx_upscale_backend_implemented(RSX_UPSCALE_NONE) && rsx_upscale_backend_implemented(RSX_UPSCALE_FSR1));
     CHECK(!rsx_upscale_backend_implemented(RSX_UPSCALE_DLSS) && !rsx_upscale_backend_implemented(RSX_UPSCALE_FSR3));
+    CHECK(!rsx_upscale_register_backend(RSX_UPSCALE_NONE, &fake) &&
+          !rsx_upscale_register_backend(RSX_UPSCALE_FSR1, &fake) &&
+          !rsx_upscale_register_backend(RSX_UPSCALE_BACKEND_COUNT, &fake));
+    CHECK(!rsx_upscale_register_backend(RSX_UPSCALE_FSR3, &incomplete));
+    CHECK(rsx_upscale_register_backend(RSX_UPSCALE_FSR3, &fake));
+    CHECK(rsx_upscale_register_backend(RSX_UPSCALE_XESS, &fake_xess));
+    CHECK(rsx_upscale_backend_implemented(RSX_UPSCALE_FSR3) &&
+          rsx_upscale_backend_implemented(RSX_UPSCALE_XESS));
 
     /* environment */
     rsx_upscale_config c;
@@ -65,6 +113,12 @@ int main(int argc, char** argv)
     setenv("RSX_UPSCALE", "fsr1", 1);
     rsx_upscale_config_from_env(&c);
     CHECK(c.backend == RSX_UPSCALE_FSR1 && near(c.sharpness, 0.2f));
+    setenv("RSX_UPSCALE", "fsr3", 1);
+    rsx_upscale_config_from_env(&c);
+    CHECK(c.backend == RSX_UPSCALE_FSR3);
+    setenv("RSX_UPSCALE", "xess", 1);
+    rsx_upscale_config_from_env(&c);
+    CHECK(c.backend == RSX_UPSCALE_XESS);
     setenv("RSX_UPSCALE_SHARPNESS", "1.5", 1);
     rsx_upscale_config_from_env(&c);
     CHECK(near(c.sharpness, 1.5f));
@@ -97,6 +151,37 @@ int main(int argc, char** argv)
     rsx_upscale_render_size(RSX_UPSCALE_Q_NATIVE, 2560, 1080, &rw, &rh);        CHECK(rw == 2560 && rh == 1080);
     rsx_upscale_render_size(RSX_UPSCALE_Q_PERFORMANCE, 1, 1, &rw, &rh);         CHECK(rw == 1 && rh == 1);
 
+    /* Two port-owned temporal backends coexist and dispatch through their own operation tables. */
+    rsx_upscale_eval ev; rsx_upscale_result res;
+    memset(&ev, 0, sizeof ev);
+    ev.cmd_list = (void*)1; ev.input.resource = (void*)2;
+    ev.input.width = 1280; ev.input.height = 720;
+    ev.output_width = 1920; ev.output_height = 1080; ev.sharpness = -1.0f;
+    rsx_upscale_config ext = { RSX_UPSCALE_FSR3, 0.4f };
+    rsx_upscale* ext_u = rsx_upscale_create(&ext, (void*)7);
+    CHECK(ext_u != NULL && g_create == 1 &&
+          rsx_upscale_get_backend(ext_u) == RSX_UPSCALE_FSR3);
+    CHECK(rsx_upscale_evaluate(ext_u, &ev, &res) == 1 &&
+          g_eval == 1 && near(g_sharpness, 0.4f));
+    rsx_upscale_set_sharpness(ext_u, 0.7f);
+    CHECK(rsx_upscale_evaluate(ext_u, &ev, &res) == 1 &&
+          g_eval == 2 && near(g_sharpness, 0.7f));
+    rsx_upscale_config xess = { RSX_UPSCALE_XESS, 0.0f };
+    rsx_upscale* xess_u = rsx_upscale_create(&xess, (void*)8);
+    CHECK(xess_u != NULL && g_xess_create == 1 &&
+          rsx_upscale_get_backend(xess_u) == RSX_UPSCALE_XESS);
+    CHECK(rsx_upscale_evaluate(xess_u, &ev, &res) == 1 &&
+          g_xess_eval == 1 && g_eval == 2);
+    rsx_upscale_destroy(ext_u);
+    rsx_upscale_destroy(xess_u);
+    CHECK(g_destroy == 1);
+    CHECK(g_xess_destroy == 1);
+    CHECK(rsx_upscale_register_backend(RSX_UPSCALE_FSR3, NULL));
+    CHECK(rsx_upscale_register_backend(RSX_UPSCALE_XESS, NULL));
+    CHECK(!rsx_upscale_backend_implemented(RSX_UPSCALE_FSR3) &&
+          !rsx_upscale_backend_implemented(RSX_UPSCALE_XESS));
+    g_create = g_destroy = g_eval = 0;
+
     /* off: no context, no pass, nothing called */
     rsx_upscale_set_test_ops(&fake);
     rsx_upscale_config off = { RSX_UPSCALE_NONE, 0.2f };
@@ -104,7 +189,6 @@ int main(int argc, char** argv)
     CHECK(rsx_upscale_create(NULL, (void*)1) == NULL);
     rsx_upscale_config dl = { RSX_UPSCALE_DLSS, 0.2f };
     CHECK(rsx_upscale_create(&dl, (void*)1) == NULL && g_create == 0);
-    rsx_upscale_eval ev; rsx_upscale_result res;
     memset(&ev, 0, sizeof ev);
     ev.cmd_list = (void*)1; ev.input.resource = (void*)2; ev.input.width = 1280; ev.input.height = 720;
     ev.output_width = 1920; ev.output_height = 1080; ev.sharpness = -1.0f;

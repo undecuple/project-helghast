@@ -1,0 +1,752 @@
+KZ3 patch 2168 (ENHANCEMENT, experimental): publish generic temporal-upscaler inputs from the live renderer.
+
+The renderer exposes draw and scene-writeback metadata through optional callbacks. Ports own all game-specific
+recognition and return only generic actions: jitter this draw, snapshot this depth, capture after this draw, or
+suppress host AA before writeback. Command-list and resource handles remain opaque at the interface boundary; no
+KZ3 offsets or pass rules are compiled into ps3recomp.
+
+The selected depth is snapshotted immediately after its draw. Presentation supplies that current-frame snapshot
+and jitter through rsx_upscale, evaluates before scan-out gamma, and safely restores resource states. Temporal
+requests use bilinear output geometry and explicit bilinear fallback even when the user selected Nearest. Failed
+upscaled blits fall back to the original image, and incompatible resources are never passed to CopyResource.
+
+Backend changes drain prior GPU work, all shutdown paths destroy the active context, and frame completion resets
+the interface's pre-HUD state. These hooks are shared by the port-owned FSR 3.1 adapter and a later XeSS backend.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 252a144f..dd60d82d 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -78,6 +78,8 @@ int  rsx_live_draw_set_fullscreen(int on) { (void)on; return -1; }   /* patch 20
+ int  rsx_live_draw_is_fullscreen(void) { return 0; }
+ void rsx_live_draw_set_scaling(int s, int f) { (void)s; (void)f; }
+ void rsx_live_draw_set_vsync(int on) { (void)on; }   /* patch 2103 */
++void rsx_live_draw_set_upscale_hooks(const rsx_live_upscale_hooks* h) { (void)h; }
++void rsx_live_draw_set_upscale(rsx_upscale_backend b, float s) { (void)b; (void)s; }
+ void rsx_live_draw_set_hud169(int on) { (void)on; }   /* patch 2113 */
+ int  rsx_live_draw_hud169_factors(float* kx, float* ky) { *kx = *ky = 1.0f; return 0; }
+ u32  rsx_live_draw_get_frames(void) { return 0; }
+@@ -154,6 +156,8 @@ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context *
+ #pragma comment(lib, "dxgi.lib")
+ #pragma comment(lib, "d3dcompiler.lib")
+
++static void ld_up_frame_end(void);
++
+ /* Armed by the a010 AUTH repair only after its animation palette is resident. */
+ extern volatile LONG g_yz_a010_reference_camera_active;
+ /* Published when the Sunshine Orphanage AUTH root becomes live. */
+@@ -12295,6 +12299,7 @@ static void ld_movie_capture_overlay(void)
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+     ld_vg_frame();  /* patch 2076 */
++    ld_up_frame_end();
+     g_ld_frames++;
+     ld_movie_reset_rings();
+ }
+@@ -13805,6 +13810,26 @@ u64 rsx_live_draw_debug_chunk_submits(void) { return g_ld_chunk_submits; }
+  * squeezed UI already). */
+ #include "rsx_hud169.h"
+ static int ld_h169_factors(float* kx, float* ky);   /* after ld_dm_scaling_now */
++static rsx_live_upscale_hooks g_up_hooks;
++static u32 g_up_depth_slot, g_up_depth_frame = UINT32_MAX;
++static u32 g_up_jitter_frame = UINT32_MAX;
++static float g_up_jitter_x, g_up_jitter_y;
++static rsx_upscale* ld_up_get(void);
++static void ld_up_output_size(u32* width, u32* height);
++void rsx_live_draw_set_upscale_hooks(const rsx_live_upscale_hooks* hooks)
++{
++    if (hooks) g_up_hooks = *hooks;
++    else memset(&g_up_hooks, 0, sizeof g_up_hooks);
++    g_up_depth_slot = 0;
++    g_up_depth_frame = UINT32_MAX;
++    g_up_jitter_frame = UINT32_MAX;
++}
++static int ld_up_hooks_active(void)
++{
++    rsx_upscale* up = ld_up_get();
++    return up && g_up_hooks.backend != RSX_UPSCALE_NONE &&
++           rsx_upscale_get_backend(up) == g_up_hooks.backend;
++}
+ static u32 g_h169_frame = 0xFFFFFFFFu;
+ static int g_h169_depth_seen, g_h169_disp_seen, g_h169_rt_sampled;
+ static u32 g_h169_rt_off;
+@@ -14925,14 +14950,17 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+      * full-size render target sampled) is squeezed into the centred 16:9 box; the RE notes "Pass 162" s.4. */
+     float h_kx = 1.0f, h_ky = 1.0f;
+     int h169 = 0;
++    rsx_live_upscale_draw_info up_draw = {0};
++    int up_capture_after_draw = 0;
++    u32 up_select_depth = 0;
+     {
++        const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
++                         fabsf(vp.scale[1]) == Hv * 0.5f && vp.translate[1] == Hv * 0.5f;
+         if (g_h169_frame != g_ld_frames) { g_h169_frame = g_ld_frames; g_h169_depth_seen = 0; g_h169_disp_seen = 0; }
+         if (target < g.n_surfaces && ld_h169_is_display(target)) {
+             const int first = !g_h169_disp_seen;
+             g_h169_disp_seen = 1;
+             if (ld_h169_factors(&h_kx, &h_ky)) {
+-                const int full = vp.scale[0] == Wv * 0.5f && vp.translate[0] == Wv * 0.5f &&
+-                                 fabsf(vp.scale[1]) == Hv * 0.5f && vp.translate[1] == Hv * 0.5f;
+                 const int is169 = (u32)Wv * 9u == (u32)Hv * 16u;
+                 const int compose = first && g_h169_depth_seen;
+                 h169 = full && is169 && !compose && !g_h169_rt_sampled;
+@@ -14947,6 +14975,37 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 }
+             }
+         }
++        if (g_up_hooks.inspect_draw && ld_up_hooks_active()) {
++            rsx_live_upscale_draw_action action = {0};
++            ld_up_output_size(&up_draw.output_width, &up_draw.output_height);
++            up_draw.frame = g_ld_frames;
++            up_draw.render_width = g.width;
++            up_draw.render_height = g.height;
++            up_draw.target = target;
++            up_draw.target_location = g.surfaces[target].location;
++            up_draw.target_offset = g.surfaces[target].offset;
++            up_draw.target_width = g.surfaces[target].w;
++            up_draw.target_height = g.surfaces[target].h;
++            up_draw.mrt_count = n_mrt;
++            up_draw.depth_slot = current_zslot;
++            up_draw.sampled_render_target_offset = g_h169_rt_off;
++            up_draw.full_viewport = full;
++            up_draw.depth_test = (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0;
++            up_draw.blend = (rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u) != 0;
++            up_draw.sampled_full_size_render_target = g_h169_rt_sampled;
++            up_draw.command_list = g.list;
++            up_draw.color_resource = g.surfaces[target].tex;
++            g_up_hooks.inspect_draw(g_up_hooks.user, &up_draw, &action);
++            if (action.select_depth) up_select_depth = current_zslot;
++            if (action.apply_jitter && Wv > 0.0f && Hv > 0.0f) {
++                g_up_jitter_frame = g_ld_frames;
++                g_up_jitter_x = action.jitter_x;
++                g_up_jitter_y = action.jitter_y;
++                xf[4] += 2.0f * action.jitter_x / Wv;
++                xf[5] -= 2.0f * action.jitter_y / Hv;
++            }
++            up_capture_after_draw = action.capture_after_draw;
++        }
+         {   /* patch 2118 diagnostics: KZ3_HUD_169_LOG=2 KZ3_HUD_169_LOGF=<frame>: every draw of 3 frames, any target */
+             static int dl = -2; static u32 df = 0;
+             if (dl == -2) { const char* e = getenv("KZ3_HUD_169_LOG"); const char* f = getenv("KZ3_HUD_169_LOGF");
+@@ -15141,6 +15200,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
+     }
+     ld_oq_after_draw(oq_pred);
++    if (oq_pred >= 0 && up_select_depth && zdepth_snapshot(up_select_depth)) {
++        g_up_depth_slot = up_select_depth;
++        g_up_depth_frame = g_ld_frames;
++    }
++    if (oq_pred >= 0 && up_capture_after_draw && g_up_hooks.after_draw)
++        g_up_hooks.after_draw(g_up_hooks.user, &up_draw);
+     if (g_gt.on > 0) ld_gt_draw(target, n_mrt, mrt, current_zslot, n_tri, sf.clip_w * sf.clip_h, (u32)__builtin_popcount(texture_mask));   /* patch 2052 */
+     LDW_ADD(RSX_PERF_W_D_REC_T, rec_t0);
+     LDW_T0(post_t0);   /* patch 2045 */
+@@ -15678,15 +15743,57 @@ static ID3D12PipelineState* g_dm_pso[2];
+ /* patch 2145: the upscaler (rsx_upscale.h). NULL unless RSX_UPSCALE=fsr1; then ld_dm_blit below runs no extra pass or copy. */
+ static rsx_upscale* g_up;
+ static int g_up_read;
++static int g_up_dirty;
++static int g_up_configured;
++static rsx_upscale_config g_up_config;
+ static void ld_up_retire(void* res, void* user) { (void)user; retire_texture((ID3D12Resource*)res); }
++static void ld_up_destroy(void)
++{
++    if (g_up) {
++        rsx_upscale_set_retire(g_up, NULL, NULL);
++        rsx_upscale_destroy(g_up);
++        g_up = NULL;
++    }
++    g_up_dirty = 1;
++    g_up_depth_slot = 0;
++    g_up_depth_frame = UINT32_MAX;
++    g_up_jitter_frame = UINT32_MAX;
++}
++static void ld_up_frame_end(void)
++{
++    if (g_up) rsx_upscale_frame_end(g_up);
++}
++void rsx_live_draw_set_upscale(rsx_upscale_backend backend, float sharpness)
++{
++    const float clamped = rsx_upscale_clamp_sharpness(sharpness);
++    if (g_up_configured && g_up_config.backend == backend) {
++        g_up_config.sharpness = clamped;
++        if (g_up) rsx_upscale_set_sharpness(g_up, clamped);
++        return;
++    }
++    g_up_config.backend = backend;
++    g_up_config.sharpness = clamped;
++    g_up_configured = 1;
++    g_up_dirty = 1;
++}
+ static rsx_upscale* ld_up_get(void)
+ {
+     if (!g_up_read) {
+         g_up_read = 1;
+-        rsx_upscale_config uc;
+-        rsx_upscale_config_from_env(&uc);
+-        if (uc.backend != RSX_UPSCALE_NONE) {
+-            g_up = rsx_upscale_create(&uc, g.dev);
++        if (!g_up_configured) rsx_upscale_config_from_env(&g_up_config);
++        g_up_dirty = 1;
++    }
++    if (g_up_dirty) {
++        if (g_up) {
++            ld_wait_fence(g.fence_value);
++            ld_up_destroy();
++        }
++        g_up_dirty = 0;
++        g_up_depth_slot = 0;
++        g_up_depth_frame = UINT32_MAX;
++        g_up_jitter_frame = UINT32_MAX;
++        if (g_up_config.backend != RSX_UPSCALE_NONE) {
++            g_up = rsx_upscale_create(&g_up_config, g.dev);
+             if (g_up) rsx_upscale_set_retire(g_up, ld_up_retire, NULL);
+         }
+     }
+@@ -15967,6 +16074,41 @@ static int ld_dm_scaling_now(void)
+ {
+     return (g_dm_present_n - g_dm_wide_n <= 3 && rsx_display_view_ratio() != 1.0) ? RSX_DM_STRETCH : g_dm_scaling;
+ }
++static int ld_up_temporal_requested(void)
++{
++    if (!g_up_read) (void)ld_up_get();
++    return g_up_config.backend == RSX_UPSCALE_DLAA ||
++           g_up_config.backend == RSX_UPSCALE_DLSS ||
++           g_up_config.backend == RSX_UPSCALE_FSR3 ||
++           g_up_config.backend == RSX_UPSCALE_XESS;
++}
++static void ld_up_output_size(u32* width, u32* height)
++{
++    const u32 dw = g_dm_bb_w ? g_dm_bb_w : g.width;
++    const u32 dh = g_dm_bb_h ? g_dm_bb_h : g.height;
++    const int filter = ld_up_temporal_requested() ? RSX_DM_BILINEAR : g_dm_filter;
++    const rsx_dm_rect r = rsx_dm_rect_for(
++        (int)g.width, (int)g.height, (int)dw, (int)dh,
++        ld_dm_scaling_now(), filter);
++    if (width) *width = r.w > 0 ? (u32)r.w : 0;
++    if (height) *height = r.h > 0 ? (u32)r.h : 0;
++}
++static const rsx_upscale_image* ld_up_depth_image(
++    rsx_upscale_image* image, u32 width, u32 height)
++{
++    if (!image || g_up_depth_frame != g_ld_frames || !g_up_depth_slot ||
++        g_up_depth_slot > g.n_zdepths) return NULL;
++    zdepth_t* depth = &g.zdepths[g_up_depth_slot - 1u];
++    if (!depth->snapshot || !depth->snapshot_valid ||
++        depth->snapshot_w != width || depth->snapshot_h != height) return NULL;
++    memset(image, 0, sizeof *image);
++    image->resource = depth->snapshot;
++    image->width = depth->snapshot_w;
++    image->height = depth->snapshot_h;
++    image->format = DXGI_FORMAT_R32_FLOAT;
++    image->state = (u32)depth->snapshot_state;
++    return image;
++}
+ /* patch 2113: KZ3_HUD_169 (=0 off, else on; one run) over display.ini hud_169 (rsx_live_draw_set_hud169; default on).
+  * Active only while the present stretches the buffer to a client that is not 16:9: KZ3_ASPECT=screen and Stretch now
+  * (Fit already letterboxes the whole frame; KZ3_ASPECT=16:9 keeps the PS3 picture). */
+@@ -15994,7 +16136,44 @@ static int ld_h169_factors(float* kx, float* ky)
+ /* For the menu mouse (rsx_null_backend.c rsx_display_client_to_ui): the factors the 2D draws get now. */
+ int rsx_live_draw_hud169_factors(float* kx, float* ky) { return ld_h169_factors(kx, ky); }
+
+-static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32 bbi)
++static ID3D12Resource* ld_upscale_present(
++    ID3D12Resource* src, D3D12_RESOURCE_STATES src_state,
++    u32 output_width, u32 output_height,
++    D3D12_RESOURCE_STATES* result_state, u32* result_width, u32* result_height)
++{
++    if (!src || !result_state || !result_width || !result_height) return NULL;
++    D3D12_RESOURCE_DESC sd;
++    src->lpVtbl->GetDesc(src, &sd);
++    rsx_upscale* up = ld_up_get();
++    if (!up || !rsx_upscale_wants_pass(
++                   up, (u32)sd.Width, sd.Height, output_width, output_height)) return NULL;
++    rsx_upscale_eval ev;
++    rsx_upscale_result ur;
++    rsx_upscale_image depth;
++    memset(&ev, 0, sizeof ev);
++    ev.cmd_list = g.list;
++    ev.input.resource = src;
++    ev.input.width = (u32)sd.Width;
++    ev.input.height = sd.Height;
++    ev.input.format = (u32)sd.Format;
++    ev.input.state = (u32)src_state;
++    ev.output_width = output_width;
++    ev.output_height = output_height;
++    ev.sharpness = -1.0f;
++    ev.depth = ld_up_depth_image(&depth, ev.input.width, ev.input.height);
++    if (g_up_jitter_frame == g_ld_frames) {
++        ev.jitter_x = g_up_jitter_x;
++        ev.jitter_y = g_up_jitter_y;
++    }
++    if (!rsx_upscale_evaluate(up, &ev, &ur)) return NULL;
++    *result_state = (D3D12_RESOURCE_STATES)ur.state;
++    *result_width = ur.width;
++    *result_height = ur.height;
++    LD_SM_INVALIDATE();
++    return (ID3D12Resource*)ur.resource;
++}
++
++static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32 bbi, int filter_override)
+ {
+     g_dm_present_n++;
+     if (!src || !ld_dm_pipeline() || g.srv_ring_used >= SRV_RING_TABLES) return 0;
+@@ -16002,31 +16181,12 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
+     src->lpVtbl->GetDesc(src, &sd);
+     ID3D12Resource* bb = g.backbuf[bbi];
+     if (!bb) return 0;   /* patch 2152: no back buffer (GetBuffer failed) */
++    const int dm_filter =
++        filter_override == RSX_DM_BILINEAR || filter_override == RSX_DM_NEAREST
++            ? filter_override
++            : g_dm_filter;
+     const rsx_dm_rect r = rsx_dm_rect_for((int)sd.Width, (int)sd.Height, (int)g_dm_bb_w, (int)g_dm_bb_h, ld_dm_scaling_now(),
+-                                          g_dm_filter);
+-    int dm_filter = g_dm_filter;
+-    {   /* patch 2145: RSX_UPSCALE=fsr1 upscales the image to the rectangle's size first (EASU + RCAS compute on the
+-         * composed picture, HUD included: this game has no pre-HUD tap), and the draw below copies it 1:1 with point
+-         * sampling. ld_up_get() is NULL and wants_pass 0 with the switch off: nothing is recorded then. */
+-        rsx_upscale* up = ld_up_get();
+-        if (up && rsx_upscale_wants_pass(up, (uint32_t)sd.Width, (uint32_t)sd.Height, (uint32_t)r.w, (uint32_t)r.h)) {
+-            rsx_upscale_eval ev;
+-            rsx_upscale_result ur;
+-            memset(&ev, 0, sizeof ev);
+-            ev.cmd_list = g.list;
+-            ev.input.resource = src;
+-            ev.input.width = (uint32_t)sd.Width; ev.input.height = sd.Height;
+-            ev.input.format = (uint32_t)sd.Format; ev.input.state = (uint32_t)src_state;
+-            ev.output_width = (uint32_t)r.w; ev.output_height = (uint32_t)r.h;
+-            ev.sharpness = -1.0f;
+-            if (rsx_upscale_evaluate(up, &ev, &ur)) {
+-                src = (ID3D12Resource*)ur.resource;
+-                src_state = (D3D12_RESOURCE_STATES)ur.state;
+-                src->lpVtbl->GetDesc(src, &sd);
+-                dm_filter = 1;   /* 1:1 into the rectangle: point */
+-            }
+-        }
+-    }
++                                          dm_filter);
+     const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+@@ -16042,17 +16202,22 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
+     gpu.ptr += (u64)base * g.srv_step;
+
+     D3D12_RESOURCE_BARRIER b[2] = {0};
+-    for (int q = 0; q < 2; q++) {
+-        b[q].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-        b[q].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    u32 nb = 0;
++    if (src_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
++        b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[nb].Transition.pResource = src;
++        b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[nb].Transition.StateBefore = src_state;
++        b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        nb++;
+     }
+-    b[0].Transition.pResource = src;
+-    b[0].Transition.StateBefore = src_state;
+-    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+-    b[1].Transition.pResource = bb;
+-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+-    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[nb].Transition.pResource = bb;
++    b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++    b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    nb++;
++    g.list->lpVtbl->ResourceBarrier(g.list, nb, b);
+     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(bbi);
+     static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+     g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, black, 0, NULL);
+@@ -16069,11 +16234,22 @@ static int ld_dm_blit(ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, u32
+     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+     g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+-    b[0].Transition.StateAfter = src_state;
+-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    nb = 0;
++    if (src_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
++        b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[nb].Transition.pResource = src;
++        b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        b[nb].Transition.StateAfter = src_state;
++        nb++;
++    }
++    b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[nb].Transition.pResource = bb;
++    b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++    nb++;
++    g.list->lpVtbl->ResourceBarrier(g.list, nb, b);
+     return 1;
+ }
+
+@@ -16989,7 +17165,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
+     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+     if (!dm_tex) { if (bb) g.list->lpVtbl->ResourceBarrier(g.list, 1, &b); }   /* patch 2152: bb */
+-    else if (!ld_dm_blit(dm_tex, D3D12_RESOURCE_STATE_COPY_DEST, bbi) && g.backbuf[bbi]) {   /* patch 2095; 2152 */
++    else if (!ld_dm_blit(dm_tex, D3D12_RESOURCE_STATE_COPY_DEST, bbi, -1) && g.backbuf[bbi]) {   /* patch 2095; 2152 */
+         b.Transition.pResource = g.backbuf[bbi];         /* no scale pass: an empty (black) frame, not a stale one */
+         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+         b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+@@ -17832,22 +18008,28 @@ static int ld_gamma_pipeline(void)
+     return 1;
+ }
+
+-/* Returns the gamma-corrected copy (state COPY_SOURCE) of presented surface i, or NULL when no correction applies.
+- * The surface is left in RENDER_TARGET state. Recorded into the open list. */
+-static ID3D12Resource* ld_gamma_present(u32 i)
++/* Returns a gamma-corrected copy in COPY_SOURCE state, or NULL when no correction applies. */
++static ID3D12Resource* ld_gamma_present_resource(
++    ID3D12Resource* source, D3D12_RESOURCE_STATES source_state,
++    u32 width, u32 height, u32 location, u32 offset)
+ {
+     const float gm = cellAvconfExt_display_gamma();
+-    if (!ld_gamma_enabled() || !(gm > 0.0f) || gm == 1.0f || i >= MAX_SURFACES) return NULL;
+-    surface_t* sf = &g.surfaces[i];
+-    if (!sf->tex || sf->fmt != DXGI_FORMAT_R8G8B8A8_UNORM) return NULL;
+-    if (!ld_gamma_pipeline() || !ld_host_aa_target(sf->w, sf->h)) return NULL;
++    if (!ld_gamma_enabled() || !(gm > 0.0f) || gm == 1.0f || !source) return NULL;
++    D3D12_RESOURCE_DESC source_desc;
++    source->lpVtbl->GetDesc(source, &source_desc);
++    if (source_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM) return NULL;
++    if (!ld_gamma_pipeline() || !ld_host_aa_target(width, height)) return NULL;
+     if (g.srv_ring_used >= SRV_RING_TABLES) return NULL;
+     const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
+     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+     cpu.ptr += (size_t)base * g.srv_step;
+-    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(SRV_SURFACE_BASE + i),
+-                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {0};
++    srv.Format = source_desc.Format;
++    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    srv.Texture2D.MipLevels = 1;
++    g.dev->lpVtbl->CreateShaderResourceView(g.dev, source, &srv, cpu);
+     cpu.ptr += g.srv_step;
+     g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(UAV_HOST_AA),
+                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+@@ -17859,9 +18041,9 @@ static ID3D12Resource* ld_gamma_present(u32 i)
+     D3D12_RESOURCE_BARRIER b[2] = {0};
+     u32 nb = 0;
+     b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-    b[nb].Transition.pResource = sf->tex;
++    b[nb].Transition.pResource = source;
+     b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+-    b[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[nb].Transition.StateBefore = source_state;
+     b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+     nb++;
+     if (g_aa_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+@@ -17881,13 +18063,13 @@ static ID3D12Resource* ld_gamma_present(u32 i)
+     g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 1, gpu_uav);
+     {
+         const float inv = gm, pad = 0.0f;
+-        UINT k[4] = { sf->w, sf->h, 0, 0 };
++        UINT k[4] = { width, height, 0, 0 };
+         memcpy(&k[2], &inv, 4); memcpy(&k[3], &pad, 4);
+         g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 4, k, 0);
+     }
+-    g.list->lpVtbl->Dispatch(g.list, (sf->w + 7u) / 8u, (sf->h + 7u) / 8u, 1);
++    g.list->lpVtbl->Dispatch(g.list, (width + 7u) / 8u, (height + 7u) / 8u, 1);
+     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+-    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[0].Transition.StateAfter = source_state;
+     b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+     b[1].Transition.pResource = g_aa_tex;
+     b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+@@ -17896,8 +18078,8 @@ static ID3D12Resource* ld_gamma_present(u32 i)
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+     g_aa_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+     if (g_gm_logged++ < 3)
+-        fprintf(stderr, "[gamma] scan-out gamma %.3f on surface %u:0x%08X %ux%u (frame %u)\n", gm, sf->location, sf->offset,
+-                sf->w, sf->h, g_ld_frames);
++        fprintf(stderr, "[gamma] scan-out gamma %.3f on surface %u:0x%08X %ux%u (frame %u)\n",
++                gm, location, offset, width, height, g_ld_frames);
+     return g_aa_tex;
+ }
+
+@@ -17920,7 +18102,25 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+         /* Patch 2023: a copy of a whole frame-sized colour surface is the
+          * scene leaving for the SPU post chain (KZ3: local 0x1300000 -> main
+          * 0x1310400, where SPU MLAA ran); the host AA pass runs on it first. */
+-        if (r0 <= s0 && r1 >= s1) ld_host_aa(i);
++        if (r0 <= s0 && r1 >= s1) {
++            rsx_live_upscale_surface_action action = {0};
++            if (g_up_hooks.before_writeback && ld_up_hooks_active()) {
++                rsx_live_upscale_surface_info info = {0};
++                ld_up_output_size(&info.output_width, &info.output_height);
++                info.frame = g_ld_frames;
++                info.render_width = g.width;
++                info.render_height = g.height;
++                info.target = i;
++                info.location = sf->location;
++                info.offset = sf->offset;
++                info.width = sf->w;
++                info.height = sf->h;
++                info.command_list = g.list;
++                info.color_resource = sf->tex;
++                g_up_hooks.before_writeback(g_up_hooks.user, &info, &action);
++            }
++            if (!action.suppress_host_aa) ld_host_aa(i);
++        }
+     }
+     LDW_T0(wb_t0);
+     ld_wb_cap_note(n, 0);
+@@ -18313,36 +18513,119 @@ static void ld_present_body(u32 buffer_id)
+           last_present_target = target;
+       } }
+     ID3D12Resource* srcimg = presented_surface->tex;
+-    ID3D12Resource* gm_copy = ld_gamma_present(target);   /* patch 2070 */
+     ld_dm_sync_size();                                    /* patch 2095: back buffers at the client size */
++    u32 output_width = 0, output_height = 0;
++    ld_up_output_size(&output_width, &output_height);
++    D3D12_RESOURCE_STATES upscale_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    u32 upscale_width = presented_surface->w, upscale_height = presented_surface->h;
++    ID3D12Resource* upscale = ld_upscale_present(
++        srcimg, D3D12_RESOURCE_STATE_RENDER_TARGET,
++        output_width, output_height, &upscale_state, &upscale_width, &upscale_height);
++    ID3D12Resource* scanout = upscale ? upscale : srcimg;
++    D3D12_RESOURCE_STATES scanout_state =
++        upscale ? upscale_state : D3D12_RESOURCE_STATE_RENDER_TARGET;
++    u32 scanout_width = upscale ? upscale_width : presented_surface->w;
++    u32 scanout_height = upscale ? upscale_height : presented_surface->h;
++    ID3D12Resource* gm_copy = ld_gamma_present_resource(
++        scanout, scanout_state, scanout_width, scanout_height,
++        presented_surface->location, presented_surface->offset);
++    ID3D12Resource* present_image = gm_copy ? gm_copy : scanout;
++    D3D12_RESOURCE_STATES present_state =
++        gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : scanout_state;
+     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+     ID3D12Resource* bb = g.backbuf[bbi];
+     /* patch 2095: a client of another size gets the image scaled aspect-correct, else the old copy */
+-    const int dm_scaled = (g_dm_bb_w != g.width || g_dm_bb_h != g.height) &&
+-        ld_dm_blit(gm_copy ? gm_copy : srcimg,
+-                   gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET, bbi);
+-    if (!dm_scaled && bb) {   /* patch 2152: bb NULL = GetBuffer failed: nothing copied, the resize is retried */
++    const int upscale_is_output =
++        upscale && upscale_width == output_width && upscale_height == output_height;
++    const int temporal_requested = ld_up_temporal_requested();
++    int dm_scaled = (upscale || g_dm_bb_w != g.width || g_dm_bb_h != g.height) &&
++        ld_dm_blit(
++            present_image,
++            present_state,
++            bbi,
++            upscale_is_output
++                ? RSX_DM_NEAREST
++                : temporal_requested ? RSX_DM_BILINEAR : -1);
++    if (upscale && !dm_scaled) {
++        static u32 fallback_logs;
++        if (fallback_logs++ < 4)
++            fprintf(stderr, "[upscale] display blit failed; using the original image (frame %u)\n", g_ld_frames);
++        scanout = srcimg;
++        scanout_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        scanout_width = presented_surface->w;
++        scanout_height = presented_surface->h;
++        gm_copy = ld_gamma_present_resource(
++            scanout, scanout_state, scanout_width, scanout_height,
++            presented_surface->location, presented_surface->offset);
++        present_image = gm_copy ? gm_copy : scanout;
++        present_state = gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : scanout_state;
++        dm_scaled = (g_dm_bb_w != g.width || g_dm_bb_h != g.height) &&
++            ld_dm_blit(
++                present_image,
++                present_state,
++                bbi,
++                temporal_requested ? RSX_DM_BILINEAR : -1);
++    }
++    D3D12_RESOURCE_DESC present_desc = {0}, backbuffer_desc = {0};
++    int copy_compatible = 0;
++    if (bb) {
++        present_image->lpVtbl->GetDesc(present_image, &present_desc);
++        bb->lpVtbl->GetDesc(bb, &backbuffer_desc);
++        copy_compatible =
++            present_desc.Dimension == backbuffer_desc.Dimension &&
++            present_desc.Width == backbuffer_desc.Width &&
++            present_desc.Height == backbuffer_desc.Height &&
++            present_desc.DepthOrArraySize == backbuffer_desc.DepthOrArraySize &&
++            present_desc.MipLevels == backbuffer_desc.MipLevels &&
++            present_desc.Format == backbuffer_desc.Format &&
++            present_desc.SampleDesc.Count == backbuffer_desc.SampleDesc.Count &&
++            present_desc.SampleDesc.Quality == backbuffer_desc.SampleDesc.Quality;
++    }
++    if (!dm_scaled && bb && !copy_compatible) {
++        static u32 mismatch_logs;
++        if (mismatch_logs++ < 4)
++            fprintf(stderr,
++                    "[display] scaling failed; refusing mismatched CopyResource "
++                    "%llux%u -> %llux%u (frame %u)\n",
++                    (unsigned long long)present_desc.Width, present_desc.Height,
++                    (unsigned long long)backbuffer_desc.Width, backbuffer_desc.Height,
++                    g_ld_frames);
++    }
++    if (!dm_scaled && bb && copy_compatible) {   /* patch 2152: bb NULL = GetBuffer failed */
+
+     D3D12_RESOURCE_BARRIER bar[2] = {0};
+-    bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-    bar[0].Transition.pResource = srcimg;
+-    bar[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+-    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-    bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+-    bar[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-    bar[1].Transition.pResource = bb;
+-    bar[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+-    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+-    bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+-
+-    g.list->lpVtbl->CopyResource(g.list, bb, gm_copy ? gm_copy : srcimg);
+-
+-    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+-    bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+-    bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
++    u32 nbar = 0;
++    if (present_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
++        bar[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        bar[nbar].Transition.pResource = present_image;
++        bar[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        bar[nbar].Transition.StateBefore = present_state;
++        bar[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        nbar++;
++    }
++    bar[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    bar[nbar].Transition.pResource = bb;
++    bar[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    bar[nbar].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++    bar[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++    nbar++;
++    g.list->lpVtbl->ResourceBarrier(g.list, nbar, bar);
++
++    g.list->lpVtbl->CopyResource(g.list, bb, present_image);
++
++    nbar = 0;
++    if (present_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
++        bar[nbar].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        bar[nbar].Transition.StateAfter = present_state;
++        nbar++;
++    }
++    bar[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    bar[nbar].Transition.pResource = bb;
++    bar[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    bar[nbar].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++    bar[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++    nbar++;
++    g.list->lpVtbl->ResourceBarrier(g.list, nbar, bar);
+     }   /* patch 2095 */
+
+     ld_flush(LD_FLUSH_PRESENT);
+@@ -18443,6 +18726,7 @@ static void ld_present_body(u32 buffer_id)
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+     ld_vg_frame();  /* patch 2076 */
++    ld_up_frame_end();
+     g_ld_frames++;
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_present(g_ld_frames);
+@@ -19275,7 +19559,10 @@ unsigned long long rsx_perf_fifo_flips(void) { return g_ld_flip_consumed; }
+
+ void rsx_live_draw_shutdown(void)
+ {
+-    if (!g.ready) return;
++    if (!g.ready) {
++        ld_up_destroy();
++        return;
++    }
+     ld_vertex_diag_emit("shutdown", 1);
+     ld_present_measure_dump();
+     /* let the GPU drain, then release. (Best-effort; process teardown also
+@@ -19514,7 +19801,7 @@ void rsx_live_draw_shutdown(void)
+         g.depth_snapshot_rootsig->lpVtbl->Release(
+             g.depth_snapshot_rootsig);
+     if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
+-    if (g_up) { rsx_upscale_set_retire(g_up, NULL, NULL); rsx_upscale_destroy(g_up); g_up = NULL; }   /* patch 2145 (GPU drained above) */
++    ld_up_destroy();   /* patch 2145 (GPU drained above) */
+     if (g.swap && g_dm_fs) g.swap->lpVtbl->SetFullscreenState(g.swap, FALSE, NULL);   /* patch 2095 */
+     if (g.swap) g.swap->lpVtbl->Release(g.swap);
+     if (g_ld_info_queue) {
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index fb2cbdbf..cc278ca3 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -31,6 +31,7 @@
+ #define PS3RECOMP_RSX_LIVE_DRAW_H
+
+ #include "ps3emu/ps3types.h"
++#include "rsx_upscale.h"
+
+ #ifdef __cplusplus
+ extern "C" {
+@@ -44,6 +45,61 @@ extern "C" {
+ typedef const u8* (*rsx_live_guest_ptr_fn)(void* user, u32 location, u32 offset,
+                                            u32 min_bytes);
+
++/* Optional port hooks for temporal upscalers. The renderer publishes draw and
++ * writeback metadata; the port owns all game-specific recognition and capture
++ * policy. Resource and command-list handles are D3D12 objects on Windows. */
++typedef struct {
++    u32 frame;
++    u32 render_width, render_height;
++    u32 output_width, output_height;
++    u32 target, target_location, target_offset;
++    u32 target_width, target_height;
++    u32 mrt_count, depth_slot;
++    u32 sampled_render_target_offset;
++    int full_viewport;
++    int depth_test;
++    int blend;
++    int sampled_full_size_render_target;
++    void* command_list;
++    void* color_resource;
++} rsx_live_upscale_draw_info;
++
++typedef struct {
++    int select_depth;
++    int apply_jitter;
++    int capture_after_draw;
++    float jitter_x, jitter_y;
++} rsx_live_upscale_draw_action;
++
++typedef struct {
++    u32 frame;
++    u32 render_width, render_height;
++    u32 output_width, output_height;
++    u32 target, location, offset, width, height;
++    void* command_list;
++    void* color_resource;
++} rsx_live_upscale_surface_info;
++
++typedef struct {
++    int suppress_host_aa;
++} rsx_live_upscale_surface_action;
++
++typedef struct {
++    rsx_upscale_backend backend;
++    void* user;
++    void (*inspect_draw)(void* user, const rsx_live_upscale_draw_info* info,
++                         rsx_live_upscale_draw_action* action);
++    void (*after_draw)(void* user, const rsx_live_upscale_draw_info* info);
++    void (*before_writeback)(void* user, const rsx_live_upscale_surface_info* info,
++                             rsx_live_upscale_surface_action* action);
++} rsx_live_upscale_hooks;
++
++/* Register before renderer startup; NULL clears the hooks. */
++void rsx_live_draw_set_upscale_hooks(const rsx_live_upscale_hooks* hooks);
++/* Select a backend at runtime. Registered backend changes are applied on the
++ * render thread after draining prior GPU work. */
++void rsx_live_draw_set_upscale(rsx_upscale_backend backend, float sharpness);
++
+ /* Whether the live draw path is enabled this run (reads RSX_DRAW once).
+  * Cheap; safe to call from the hot method hook. */
+ int  rsx_live_draw_enabled(void);
