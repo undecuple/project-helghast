@@ -1,30 +1,36 @@
 # Building the port
 
-The port's executable is generated from **your own copy** of the game: the game's code is lifted to C from your
+The port's executable is generated from **your own copy** of the game. The game's code is lifted to C from your
 decrypted EBOOT and compiled on your machine. Nothing of the game is in this repository, and nothing is downloaded.
 
-**Players use the installer** (or the portable zip) from the
-[releases page](https://github.com/undecuple/project-helghast/releases); the
+Players use the installer (or the portable zip) from the
+[releases page](https://github.com/undecuple/project-helghast/releases). The
 [Windows quick start](INSTALL.md#windows-quick-start) walks through it. The installer builds natively on Windows
-with its bundled toolchain (compiler, CMake, Ninja, Python): no WSL2, no Nix. Who checked it: the maintainers ran it
-on native Windows 11 (2026-10-21; the installer's build took 422 s, then the game ran to the menus) and a player
-built and ran the port with it on native Windows 11 (issue #10). On Windows 10 the maintainers checked, in a test VM
-without a GPU, install, uninstall and portable mode (2026-10-27), and a `kz3.exe` built on Linux starting to the menus
-on Windows' software renderer (2026-10-22); a full first-run build on Windows 10 has not been reported yet. The rest of this page is for contributors.
+with its bundled toolchain (compiler, CMake, Ninja, Python). It needs no WSL2 and no Nix.
+
+Who checked it:
+
+- The maintainers ran it on native Windows 11 (2026-10-21). The installer's build took 422 s, then the game ran to the menus.
+- A player built and ran the port with it on native Windows 11 (issue #10).
+- On Windows 10, the maintainers checked install, uninstall and portable mode in a test VM without a GPU (2026-10-27).
+- A `kz3.exe` built on Linux also started to the menus on Windows' software renderer (2026-10-22).
+- A full first-run build on Windows 10 has not been reported yet.
+
+The rest of this page is for contributors.
 
 There are two ways to get a build:
 
 - **The installer or portable zip (Windows, or Linux with Proton), <!-- version -->v0.1.10<!-- /version --> pre-release.** It checks your disc dump and
-  the 1.14 update, then lifts and compiles the game's code on your machine with a bundled compiler, behind one
+  the 1.14 update. Then it lifts and compiles the game's code on your machine with a bundled compiler, behind one
   progress bar, with a full install log.
-- **A developer build from source with Nix**, described below: on Linux (how the port is developed and tested
+- **A developer build from source with Nix**, described below. It works on Linux (how the port is developed and tested
   today), on a Mac with Apple silicon, or on Windows inside WSL2. The build is the same `nix develop` steps on all
-  three; only setup and running differ (see [Building on macOS](#building-on-macos) and
+  three. Only setup and running differ (see [Building on macOS](#building-on-macos) and
   [Building from source on Windows (WSL2)](#building-from-source-on-windows-wsl2)).
 
 ## What you need
 
-From your own copy of the game (details and sizes in [requirements.md](requirements.md); what each folder must hold and what the first-run check prints: [GETTING-FILES.md](GETTING-FILES.md)):
+These come from your own copy of the game. Details and sizes are in [requirements.md](requirements.md). What each folder must hold, and what the first-run check prints, is in [GETTING-FILES.md](GETTING-FILES.md).
 
 | Item | Notes |
 |---|---|
@@ -32,17 +38,21 @@ From your own copy of the game (details and sizes in [requirements.md](requireme
 | Update **1.14** | Your own copy of the update; the port's target version. The PS3 emulator RPCS3 and its documentation are the usual place to learn how a PS3 update is installed. |
 | The **decrypted EBOOT** | `EBOOT.elf`, the decrypted form of the update's `EBOOT.BIN`, comes from your own copy of the game (this project provides no tools or instructions for it; the PS3 emulator RPCS3 and its documentation are the usual place people start). No PS3 firmware is needed. |
 
-To build: Linux with [Nix](https://nixos.org/) (flakes enabled), 16 GB RAM or more (32 GB recommended), about 60 GB
-free disk beyond the game dump. To run: an NVIDIA GPU with Direct3D 12 is the tested target; on Linux the Windows
-build runs under Proton (Experimental or GE-Proton).
+To build, you need:
 
-**Version note:** the port builds from the 1.14 update's EBOOT (the default since 2026-10-22). The disc's v1.00 EBOOT
-can still be built for comparison: set `KZ3_EBOOT_VER=100` on every step, use `work/bin/EBOOT.elf` and the v1.00
-paths noted in step 3 (no update needed).
+- Linux with [Nix](https://nixos.org/) (flakes enabled).
+- 16 GB RAM or more (32 GB recommended).
+- About 60 GB of free disk beyond the game dump.
+
+To run, an NVIDIA GPU with Direct3D 12 is the tested target. On Linux the Windows build runs under Proton (Experimental or GE-Proton).
+
+Version note: the port builds from the 1.14 update's EBOOT (the default since 2026-10-22). The disc's v1.00 EBOOT
+can still be built for comparison. Set `KZ3_EBOOT_VER=100` on every step. Use `work/bin/EBOOT.elf` and the v1.00
+paths noted in step 3. No update is needed for v1.00.
 
 ## Toolchain
 
-Everything comes from the Nix flake; nothing needs to be installed system-wide.
+Everything comes from the Nix flake. Nothing needs to be installed system-wide.
 
 ```sh
 nix develop .#re     # analysis and lifting: Python with capstone/pyelftools, bubblewrap
@@ -51,8 +61,8 @@ nix develop          # everything, plus Xvfb and steam-run for test runs under P
 nix develop .#ci     # what CI uses: lint and host tests
 ```
 
-`tools/sandbox.sh [--gpu] -- CMD` runs a command with the game and the repository read-only, only `work/` and
-`build/` writable, and no network. The steps below run inside it.
+`tools/sandbox.sh [--gpu] -- CMD` runs a command in a sandbox. The game and the repository are read-only, only `work/` and
+`build/` are writable, and there is no network. The steps below run inside it.
 
 ## Steps
 
@@ -91,82 +101,84 @@ tools/kz3-stage.sh
 nix develop --command tools/proton-test.sh --seconds 60 --name boot work/kz3-stage/kz3.exe ./PS3_GAME/USRDIR/EBOOT.elf
 ```
 
-The lift and the build are the slow parts: each of the 64 lifted PPU source chunks takes up to about 1.5 GB of
-memory to compile. After a change to a patch, rerun step 2; after a change to the override list
-(`re/data/overrides/ppu_overrides-114.txt`; `port/spu/ppu_overrides.txt` for v1.00), rerun the PPU lift (the build
-refuses a lift that does not match the override list).
+The lift and the build are the slow parts. Each of the 64 lifted PPU source chunks takes up to about 1.5 GB of
+memory to compile. After a change to a patch, rerun step 2. After a change to the override list
+(`re/data/overrides/ppu_overrides-114.txt`; `port/spu/ppu_overrides.txt` for v1.00), rerun the PPU lift. The build
+refuses a lift that does not match the override list.
 
-`tools/proton-test.sh` uses GE-Proton from Steam's `compatibilitytools.d` by default (`--proton DIR` picks
-another). The program's output is in `work/proton/NAME/app/app_stdout.txt` and a screenshot in `work/shots/NAME.png`.
+`tools/proton-test.sh` uses GE-Proton from Steam's `compatibilitytools.d` by default. `--proton DIR` picks
+another. The program's output is in `work/proton/NAME/app/app_stdout.txt` and a screenshot is in `work/shots/NAME.png`.
 Environment switches for logging and diagnostics are documented in the source where they are read (`getenv`).
 
 ## Building on macOS
 
-**Status: the macOS shells evaluate, but no build has been run on a Mac yet.** Reports are welcome (open an issue).
+Status: **the macOS shells evaluate, but no build has been run on a Mac yet.** Reports are welcome (open an issue).
 
-- **What you need:** a Mac with Apple silicon (M1 or newer; nixpkgs no longer supports Intel Macs), macOS 13 or
+- **What you need:** a Mac with Apple silicon (M1 or newer). nixpkgs no longer supports Intel Macs. You also need macOS 13 or
   newer, 16 GB of memory or more, and [Nix](https://nixos.org/download/) with flakes enabled
   (`experimental-features = nix-command flakes` in `~/.config/nix/nix.conf`). Xcode is not needed.
-- **Game files:** the same files as above (disc dump, 1.14 update, decrypted EBOOT); RPCS3 has a macOS build for installing the update.
+- **Game files:** the same files as above (disc dump, 1.14 update, decrypted EBOOT). RPCS3 has a macOS build for installing the update.
 - **Steps:** the same as [Steps](#steps), 1 to 5, with `nix develop .#re` and `nix develop .#win` as written. On
-  macOS `tools/sandbox.sh` runs each command directly (bubblewrap is Linux-only) and says so. The Windows
-  cross-compiler is built by Nix the first time, which can take a while if the binary cache has no macOS copy.
-- **Running:** `kz3.exe` is a Windows program and Proton does not run on macOS. The tested way is to copy
-  `work/kz3-stage/` to a Windows PC with an NVIDIA GPU and run it there (copy with links resolved, as in step 5 of
-  [Building from source on Windows (WSL2)](#building-from-source-on-windows-wsl2), which includes the game data).
+  macOS `tools/sandbox.sh` runs each command directly, because bubblewrap is Linux-only, and says so. Nix builds the Windows
+  cross-compiler the first time. This can take a while if the binary cache has no macOS copy.
+- **Running:** `kz3.exe` is a Windows program, and Proton does not run on macOS. The tested way is to copy
+  `work/kz3-stage/` to a Windows PC with an NVIDIA GPU and run it there. Copy with links resolved, as in step 5 of
+  [Building from source on Windows (WSL2)](#building-from-source-on-windows-wsl2). That copy includes the game data.
 - **Trying it on the Mac itself (untested):** Apple's [Game Porting Toolkit](https://developer.apple.com/games/game-porting-toolkit/)
-  and the tools built on its D3DMetal layer (CodeWeavers' CrossOver, commercial; [Mythic](https://github.com/MythicApp/Mythic),
-  free, macOS 14 or newer) run Windows x86-64 programs on Apple silicon with
-  Direct3D 12 translated to Metal and the CPU code translated by Rosetta 2. `kz3.exe` may start this way, but expect it
-  to be much slower than on a Windows PC: the port is not yet at full speed on native x86-64 hardware, and both
+  and the tools built on its D3DMetal layer run Windows x86-64 programs on Apple silicon. These tools are CodeWeavers' CrossOver (commercial)
+  and [Mythic](https://github.com/MythicApp/Mythic) (free, macOS 14 or newer). They translate Direct3D 12 to Metal
+  and the CPU code with Rosetta 2. `kz3.exe` may start this way. Expect it
+  to be much slower than on a Windows PC. The port is not yet at full speed on native x86-64 hardware, and both
   translation layers cost more. The first-run CPU check turns off FMA if Rosetta does not report it. Nobody has
-  tried this yet. If you do, please open an issue with your Mac model, macOS version, the tool and its version,
-  and how far the game got (the log in the game's folder helps).
-- **Native macOS build:** on the wanted list (a native Apple-silicon build, no translation layers); not started.
+  tried this yet. If you do, please open an issue. Include your Mac model, macOS version, the tool and its version,
+  and how far the game got. The log in the game's folder helps.
+- **Native macOS build:** on the wanted list (a native Apple-silicon build, no translation layers). It is not started.
 
 ## Building from source on Windows (WSL2)
 
-Players on Windows do not need this: the installer builds natively (see the top of this page). This section is for
-a source build from a checkout. Nix does not run on Windows itself, so the source build runs inside **WSL2** (a Linux
-system that Windows runs), and the result runs on Windows directly. **Status: the WSL2 source build follows the Linux
+Players on Windows do not need this, because the installer builds natively (see the top of this page). This section is for
+a source build from a checkout. Nix does not run on Windows itself. So the source build runs inside **WSL2**, a Linux
+system that Windows runs, and the result runs on Windows directly. Status: **the WSL2 source build follows the Linux
 steps unchanged but has not been run on WSL2 yet.**
 
 1. **Install WSL2 with Ubuntu** in an administrator terminal: `wsl --install -d Ubuntu`, then restart. In the
    Ubuntu terminal, install [Nix](https://nixos.org/download/) (multi-user install) and enable flakes as above.
-2. **Give WSL2 enough memory:** create `%UserProfile%\.wslconfig` with `[wsl2]` and `memory=24GB` (at least 16 GB),
-   then `wsl --shutdown`.
-3. **Keep the repository inside the Linux file system** (for example `~/project-helghast`, not under `/mnt/c`):
-   the build reads and writes many files and is much slower on the Windows drive. The game dump may stay on a
-   Windows drive; link it as in step 1 (`ln -s /mnt/d/KZ3 Game`).
-4. **Build:** the [Steps](#steps) 1 to 5, unchanged (bubblewrap works inside WSL2). Skip step 6 (Proton).
-5. **Run on Windows:** `tools/kz3-stage.sh`, then copy `work/kz3-stage/` to a Windows folder, for example
+2. **Give WSL2 enough memory.** Create `%UserProfile%\.wslconfig` with `[wsl2]` and `memory=24GB` (at least 16 GB),
+   then run `wsl --shutdown`.
+3. **Keep the repository inside the Linux file system** (for example `~/project-helghast`, not under `/mnt/c`).
+   The build reads and writes many files, and it is much slower on the Windows drive. The game dump may stay on a
+   Windows drive. Link it as in step 1 (`ln -s /mnt/d/KZ3 Game`).
+4. **Build** with the [Steps](#steps) 1 to 5, unchanged (bubblewrap works inside WSL2). Skip step 6 (Proton).
+5. **Run on Windows.** Run `tools/kz3-stage.sh`, then copy `work/kz3-stage/` to a Windows folder, for example
    `cp -rL work/kz3-stage /mnt/c/Games/kz3`. `-L` turns the staged links into real files, so this copies the
-   game's data too (about 32 GB): the port reads the game from that folder, laid out as on the disc. Then, in a
-   Windows terminal in that folder: `kz3.exe ./PS3_GAME/USRDIR/EBOOT.elf`. Since the folder holds `PS3_GAME`,
+   game's data too (about 32 GB). The port reads the game from that folder, laid out as on the disc. Then, in a
+   Windows terminal in that folder, run `kz3.exe ./PS3_GAME/USRDIR/EBOOT.elf`. The folder holds `PS3_GAME`, so
    double-clicking `kz3.exe` does the same (see [Running](#running)). You need an NVIDIA GPU with Direct3D 12
    and a current driver.
 
-Building from a Windows shell without WSL2 (for example Git Bash) is not a supported path. If you try it anyway:
-set `git config --global core.autocrlf false` **before** cloning (with `true`, Git rewrites line endings in the
-ps3recomp submodule and the patches no longer apply), and make sure `python3` is a real Python 3 and not the
-Microsoft Store alias (Settings > Apps > Advanced app settings > App execution aliases, turn the `python3` entry
-off, or install Python from python.org).
+Building from a Windows shell without WSL2 (for example Git Bash) is not a supported path. If you try it anyway,
+follow these two rules:
 
-The installer does all of this on Windows without WSL2 or Nix (a bundled compiler; see the releases page).
-Do not install or build inside a OneDrive folder (it syncs the build's thousands of files while they are written), and keep your game files on this device (in OneDrive: "Always keep on this device"); the installer and the first-run check refuse both.
+- Set `git config --global core.autocrlf false` **before** cloning. With `true`, Git rewrites line endings in the
+  ps3recomp submodule, and the patches no longer apply.
+- Make sure `python3` is a real Python 3 and not the Microsoft Store alias. In Settings > Apps > Advanced app settings > App execution aliases, turn the `python3` entry
+  off. Or install Python from python.org.
+
+The installer does all of this on Windows without WSL2 or Nix. It uses a bundled compiler (see the releases page).
+Do not install or build inside a OneDrive folder, because it syncs the build's thousands of files while they are written. Keep your game files on this device too. In OneDrive, choose "Always keep on this device". The installer and the first-run check refuse both.
 
 ## Running
 
-`kz3.exe` finds the game by itself, so a double-click or a Steam shortcut needs no launch options. In order:
+`kz3.exe` finds the game by itself, so a double-click or a Steam shortcut needs no launch options. It looks in this order:
 
-1. a path given on the command line (`kz3.exe path\to\EBOOT.elf`; the test scripts use this);
-2. `eboot = ...` in `kz3.ini` next to `kz3.exe`;
-3. `PS3_GAME\USRDIR\EBOOT.elf` next to `kz3.exe` (the staged folder of step 6, or a dump folder with the decrypted
-   EBOOT in it and `kz3.exe` dropped in).
+1. A path given on the command line (`kz3.exe path\to\EBOOT.elf`). The test scripts use this.
+2. `eboot = ...` in `kz3.ini` next to `kz3.exe`.
+3. `PS3_GAME\USRDIR\EBOOT.elf` next to `kz3.exe`. This is the staged folder of step 6, or a dump folder with the decrypted
+   EBOOT in it and `kz3.exe` dropped in.
 
 If none of them has the EBOOT, a notice in the game's style says so and names the log file. `kz3.ini` is plain
-text; the installer writes it, and you can write it by hand. A relative path is relative to the folder of `kz3.exe`;
-an environment variable that is already set wins over its key.
+text. The installer writes it, and you can write it by hand. A relative path is relative to the folder of `kz3.exe`.
+An environment variable that is already set wins over its key.
 
 ```ini
 [game]
@@ -190,12 +202,12 @@ window_size =
 ```
 
 The installer also fills `hdd0_root`, `edat_cache` and `shader_cache` (`PS3_HDD0_ROOT`, `PS3_EDAT_CACHE`,
-`RSX_SHADER_CACHE_DIR`). Lines starting with `;` or `#` are comments; a `;` after a value is part of the value.
+`RSX_SHADER_CACHE_DIR`). Lines starting with `;` or `#` are comments. A `;` after a value is part of the value.
 An empty value counts as unset.
 
-Display settings live in their own file, `display.ini`, beside the key bindings (`%APPDATA%\Project Helghast\` on
-Windows; under Proton the same folder inside the prefix, `C:\users\steamuser\AppData\Roaming\Project Helghast\`).
-Alt+Enter writes it, and you can edit it while the game is closed:
+Display settings live in their own file, `display.ini`, beside the key bindings. On Windows that is `%APPDATA%\Project Helghast\`.
+Under Proton it is the same folder inside the prefix, `C:\users\steamuser\AppData\Roaming\Project Helghast\`.
+Alt+Enter writes it, and you can edit it while the game is closed. Its keys are:
 
 ```ini
 [display]
@@ -210,10 +222,10 @@ filter = bilinear
 vsync = on
 ```
 
-The launcher creates this file with every display key at its default (also `motion_blur`, `fps_limit`, `fov`, `hud_169`, `bloom`, `unfocused`, `maximize`) when it is missing, and never changes an existing one. It also creates `online.ini` with every key commented out: the game stays offline until you set a server.
+When the file is missing, the launcher creates it with every display key at its default (also `motion_blur`, `fps_limit`, `fov`, `hud_169`, `bloom`, `unfocused`, `maximize`). It never changes an existing one. It also creates `online.ini` with every key commented out. The game stays offline until you set a server.
 
-`KZ3_DISPLAY=windowed|borderless|fullscreen` sets the mode for one run without saving it. `KZ3_ASPECT=16:9` (or
-`off`) keeps the PS3's 16:9 view in gameplay instead of following the window's shape.
+Two environment variables change the display for one run. Set `KZ3_DISPLAY=windowed|borderless|fullscreen` to choose the mode without saving it. Set `KZ3_ASPECT=16:9` (or
+`off`) to keep the PS3's 16:9 view in gameplay instead of following the window's shape.
 
 ## Tests without the game
 
@@ -221,19 +233,19 @@ The launcher creates this file with every display key at its default (also `moti
 nix develop .#ci --command bash -c 'tools/ps3recomp-patched.sh && tools/run-host-tests.sh'
 ```
 
-These are the checks CI runs on every push: shell lint, every patch applies to the pinned ps3recomp, and the host
+These are the checks CI runs on every push. They are shell lint, a check that every patch applies to the pinned ps3recomp, and the host
 tests in `tools/host-tests.txt` (runtime fixes, the SPU tools, the release tools). They need no game data and no GPU.
-They are written for Linux (CI runs them there): many compile a small C harness or use bubblewrap, so on Windows
-use WSL2 for them. Graphics tests that need Direct3D 12 are built by `tools/smoke/build-host.sh` and run under Proton with
+They are written for Linux, where CI runs them. Many compile a small C harness or use bubblewrap, so on Windows
+use WSL2 for them. Graphics tests that need Direct3D 12 are built by `tools/smoke/build-host.sh`. They run under Proton with
 `tools/proton-test.sh`.
 
 An index of the scripts and folders in `tools/` is in [tools/README.md](../tools/README.md).
 
 ## Building from source: the short version
 
-Players use the setup above. This section is for contributors. The port is built on [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT), pinned as a submodule at v0.18.0 (commit 4e8f3ca), with the
+Players use the setup above. This section is for contributors. The port is built on [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT). It is pinned as a submodule at v0.18.0 (commit 4e8f3ca), with the
 patches in [port/patches/](../port/patches/) applied on top. The toolchain is a Nix flake (MinGW-w64 cross build on
-Linux); Windows builds are tested mostly under Proton, plus first runs on native Windows 11 and Windows 10.
+Linux). Windows builds are tested mostly under Proton, plus first runs on native Windows 11 and Windows 10.
 
 ```sh
 git clone --recursive https://github.com/undecuple/project-helghast
@@ -245,8 +257,8 @@ nix develop .#win  --command tools/sandbox.sh -- tools/build-kz3.sh build/kz3-wi
 Full steps (game files, SPU inventory, configure, staging, running under Proton, tests without the game):
 this page.
 
-`kz3.exe` needs no launch options: next to the `PS3_GAME` folder of your dump (the staged layout) it starts as it
-is, from a double-click or a plain Steam shortcut; elsewhere it reads `kz3.ini` beside it, which names the
+`kz3.exe` needs no launch options. Next to the `PS3_GAME` folder of your dump (the staged layout), it starts as it
+is, from a double-click or a plain Steam shortcut. Elsewhere it reads `kz3.ini` beside it. That file names the
 decrypted EBOOT and the other folders ([Running](#running)).
 
 ## Repository layout

@@ -105,7 +105,7 @@ def main():
             check(yml is not None, "release.yml present")
         if yml is not None:
             release_yml(yml, iss)
-    for rel, needles in (("README.md", (names.REPO_URL, f"# {names.PRODUCT}", names.DESCRIPTION, names.CREDIT)),
+    for rel, needles in (("README.md", (names.REPO_URL, (f"# {names.PRODUCT}", f'<h1 align="center">{names.PRODUCT}</h1>'), names.DESCRIPTION, names.CREDIT)),
                          ("NOTICE.md", (names.REPO_URL, names.CREDIT)),
                          ("CITATION.cff", (f'title: "{names.PRODUCT}"', names.REPO_URL, names.DESCRIPTION)),
                          ("site/index.html", (f'<p class="desc">{names.DESCRIPTION}</p>',)),
@@ -113,8 +113,9 @@ def main():
                          ("docs/BUILDING.md", (f"{names.REPO_URL}\n", f"cd {names.REPO_SLUG}\n")),
                          (".github/ISSUE_TEMPLATE/config.yml", (names.REPO_URL,))):
         text = read(PUB / rel)
-        for n in needles:
-            check(text is not None and n in text, f"public {rel} has {n.strip()!r}")
+        for n in needles:   # a tuple: any one of them (the README title is a markdown or a centered HTML heading)
+            alts = n if isinstance(n, tuple) else (n,)
+            check(text is not None and any(a in text for a in alts), f"public {rel} has {alts[0].strip()!r}")
     # the old name may stay only where it must (the move from the old data folder; the runtime's log prefix)
     allowed = {"bug_report.yml": "Killzone3-PC-crash"}
     for old in names.OLD_DATA_FOLDERS:

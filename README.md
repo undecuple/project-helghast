@@ -3,26 +3,42 @@
        alt="Project Helghast. Killzone 3 // Unofficial PC Port (static recompilation), built on your PC from your own game">
 </p>
 
-# Project Helghast
+<h1 align="center">Project Helghast</h1>
 
-**Killzone 3 // Unofficial PC Port (static recompilation)**
+<p align="center"><b>Killzone 3 // Unofficial PC Port (static recompilation)</b></p>
 
-[![CI](https://github.com/undecuple/project-helghast/actions/workflows/ci.yml/badge.svg)](https://github.com/undecuple/project-helghast/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/undecuple/project-helghast?include_prereleases&label=release)](https://github.com/undecuple/project-helghast/releases)
-[![Downloads](https://img.shields.io/github/downloads/undecuple/project-helghast/total)](https://github.com/undecuple/project-helghast/releases)
+<p align="center">
+  <a href="https://github.com/undecuple/project-helghast/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/undecuple/project-helghast/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/undecuple/project-helghast/releases"><img alt="Release" src="https://img.shields.io/github/v/release/undecuple/project-helghast?include_prereleases&label=release"></a>
+  <a href="https://github.com/undecuple/project-helghast/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/undecuple/project-helghast/total"></a>
+  <a href="LICENSE"><img alt="Licence" src="https://img.shields.io/github/license/undecuple/project-helghast"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/undecuple/project-helghast/commits"><img alt="Last commit" src="https://img.shields.io/github/last-commit/undecuple/project-helghast"></a>
+  <a href="https://github.com/undecuple/project-helghast/issues"><img alt="Open issues" src="https://img.shields.io/github/issues/undecuple/project-helghast"></a>
+  <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows%20x64-blue">
+  <img alt="Renderer: Direct3D 12" src="https://img.shields.io/badge/renderer-Direct3D%2012-blue">
+</p>
+
+<p align="center">
+  <a href="#download-and-install">Download</a> ·
+  <a href="docs/INSTALL.md">Installing</a> ·
+  <a href="#compatibility">Compatibility</a> ·
+  <a href="#settings-and-known-issues">Known issues</a> ·
+  <a href="#reporting-bugs">Report an issue</a> ·
+  <a href="docs/BUILDING.md">Build from source</a>
+</p>
+
+---
 
 A native PC port of Killzone 3, made by static recompilation on ps3recomp; you need your own US disc (BCUS98234) dump and the 1.14 update. It is not an emulator and not a rewrite ([how it works](docs/HOW-IT-WORKS.md)).
 
 **Status: partly playable.** Version <!-- version -->0.1.10<!-- /version -->, a pre-release: levels load and play at about 16-22 frames/s (target 30) with known bugs, and the campaign has not been played start to finish. Details: [docs/STATUS.md](docs/STATUS.md); what a release must meet to be called playable: [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
-[Download](#download-and-install) · [Compatibility](#compatibility) · [Building](#building) · [Known issues](#settings-and-known-issues) · [Reporting bugs](#reporting-bugs)
+Screenshots of the current build, by milestone: [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md).
 
-<p align="center">
-  <a href="docs/SCREENSHOTS.md"><img src="docs/screenshots/20261027-191315Z_kz3-frozen-shores-firefight.webp" width="960"
-       alt="The port running Killzone 3's Frozen Shores level at 1920x1080: a mounted gun firing at an oil platform in the snow"></a><br>
-  <sub>Frozen Shores at 1920x1080 on the current build. More, by milestone: <a href="docs/SCREENSHOTS.md">screenshots</a>.
-  Game imagery © Sony Interactive Entertainment.</sub>
-</p>
+---
 
 ## Compatibility
 
@@ -33,6 +49,8 @@ A native PC port of Killzone 3, made by static recompilation on ps3recomp; you n
 | Linux, native | native build | Vulkan | planned | - |
 
 "Verified" means a run on that setup; "implemented" means the code is in but not run there; "planned" means neither. Speed figures (about 22-23 frames/s in a busy Frozen Shores window, 1920x1080, means of alternated runs on 2026-10-27, under Proton) are in [docs/STATUS.md](docs/STATUS.md). Feature by feature: [docs/FEATURES.md](docs/FEATURES.md).
+
+---
 
 ## Download and install
 
@@ -52,6 +70,8 @@ What each must contain: [docs/GETTING-FILES.md](docs/GETTING-FILES.md); regions,
 
 Do not install into a OneDrive folder. Saves and settings: [docs/INSTALL.md](docs/INSTALL.md). Changes per version: [CHANGELOG.md](CHANGELOG.md). Nothing goes online unless you turn it on: [docs/PRIVACY.md](docs/PRIVACY.md).
 
+---
+
 ## Settings and known issues
 
 Display, input and frame-rate settings are in the game's Options menu; the list is in [docs/FEATURES.md](docs/FEATURES.md).
@@ -63,13 +83,19 @@ Display, input and frame-rate settings are in the game's Options menu; the list 
 
 All of them: [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
+---
+
 ## Reporting bugs
 
 Use the [issue forms](.github/ISSUE_TEMPLATE) (bug report, performance report, feature request, feedback). Check [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) first, and leave game files, keys and links to pirated copies out of issues and logs.
 
+---
+
 ## Building
 
 Building from source is described in [docs/BUILDING.md](docs/BUILDING.md) (repository layout: [docs/BUILDING.md](docs/BUILDING.md#repository-layout)). The installer does the same build on your machine from your own game files.
+
+---
 
 ## Credits, licence and related projects
 
@@ -78,7 +104,7 @@ The port's own code, tools and documentation: [MIT](LICENSE). Third-party compon
 **[Project Pyrrhus](https://github.com/undecuple/project-pyrrhus)**: Killzone 2 (PS3) ported to PC the same way, with a Windows [pre-release](https://github.com/undecuple/project-pyrrhus/releases). Its README has the current state.
 
 <details>
-<summary>Contributing, official channels, AI use, reuse and disclaimer</summary>
+<summary>Contributing, official channels, how AI was used, reuse and disclaimer</summary>
 
 Pull requests and feature requests are welcome: [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md). For anything big, open an issue first so we can agree on the approach before you spend the time. There is no promise of a review time, or of merging every request; this is a small project.
 
@@ -91,9 +117,11 @@ Security problems: [SECURITY.md](.github/SECURITY.md). Copying or forking the pr
 
 **Official channels:** Project Helghast is made by **undecuple**: GitHub [@undecuple](https://github.com/undecuple), Reddit [u/RelationshipNo4440](https://www.reddit.com/user/RelationshipNo4440), Discord **itekso.** (on the ps3recomp server). Builds and fixes come only from this repository's [GitHub Releases](https://github.com/undecuple/project-helghast/releases); we never ask anyone to paste a command into PowerShell or a terminal. Anyone else offering builds, "fixes" or donations in this project's name is not us.
 
-**AI, licence, disclaimer**
+**How AI was used**
 
 This project is developed by one person with AI coding agents, with the maintainer reviewing and merging their work: [docs/AI.md](docs/AI.md).
+
+**Licence, reuse and disclaimer**
 
 The port's own code, tools and documentation: [MIT](LICENSE). Third-party components and credits: [NOTICE.md](NOTICE.md).
 The licence covers nothing of the game itself.
