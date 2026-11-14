@@ -66,10 +66,13 @@ PROFILE = "PROFILE.DAT"
 CROSS, START = 0x4000, 0x0008
 
 # Route timings (pad clock = seconds since the first pad poll). ASSUMPTION until the maintainer's warm-up run.
-# profile: tools/pad/menu-fast.pad (fast-1/fast-2: level load 38.0 s, level start 121/124 s)
+# profile: tools/pad/menu-fast.pad. Movement starts at 145 s. Retained cold-cache native-Windows runs stopped
+# flipping as late as 235.0 s, so the benchmark measures 265-325 s. That is five full 20-second movement cycles
+# later than the original window and preserves its periodic input sequence with a 30-second observed margin.
 MENU_FAST = [(3, CROSS), (6, CROSS), (30, CROSS), (31, CROSS), (33, CROSS), (34, CROSS), (36, CROSS), (37, CROSS),
              (39, CROSS), (40, CROSS), (42, CROSS), (43, CROSS)]
-PROFILE_LEVEL_START = 125
+PROFILE_LEVEL_START = 145
+PROFILE_ROUTE_END = 325
 # first-boot: language/settings/gamma pages take CROSS (START at 25 s as tools/kz3-check.sh's pad), the opening
 # cinematic plays in full (~10 min on 2026-10-08, at a lower frame rate than today), then title, main menu,
 # difficulty and the level load as on the profile route. CROSS every 2 s until FIRST_MENU_END covers all of it.
@@ -94,14 +97,16 @@ def route_script(route):
     if route == "profile":
         ev = [(t, f"{m:#06x}") for t, m in MENU_FAST]
         start = PROFILE_LEVEL_START
+        duration = PROFILE_ROUTE_END
     elif route == "first-boot":
         ev = [(t, f"{CROSS:#06x}") for t in range(2, FIRST_MENU_END, 2)] + [(25, f"{START:#06x}")]
         start = FIRST_LEVEL_START
+        duration = start + IN_LEVEL
     else:
         raise ValueError(route)
-    ev += in_level(start, IN_LEVEL)
+    ev += in_level(start, duration - start)
     ev.sort(key=lambda e: e[0])
-    return "\n".join(f"{t}:{b}" for t, b in ev) + "\n", start + IN_LEVEL
+    return "\n".join(f"{t}:{b}" for t, b in ev) + "\n", duration
 
 
 # ------------------------------------------------------------------------------------------------------ where
