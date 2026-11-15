@@ -103,6 +103,8 @@ The port's own code, tools and documentation: [MIT](LICENSE). Third-party compon
 
 **[Project Pyrrhus](https://github.com/undecuple/project-pyrrhus)**: Killzone 2 (PS3) ported to PC the same way, with a Windows [pre-release](https://github.com/undecuple/project-pyrrhus/releases). Its README has the current state.
 
+**[Project Vekta](https://github.com/gustavomorinaga/project-vekta)**: Killzone HD, the PS3 remaster of the first Killzone, ported to PC the same way by Gustavo Morinaga, with Windows and Linux [pre-releases](https://github.com/gustavomorinaga/project-vekta/releases). Its README has the current state.
+
 <details>
 <summary>Contributing, official channels, how AI was used, reuse and disclaimer</summary>
 
