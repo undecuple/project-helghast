@@ -117,7 +117,7 @@ Pull requests and feature requests are welcome: [.github/CONTRIBUTING.md](.githu
 
 Security problems: [SECURITY.md](.github/SECURITY.md). Copying or forking the project: [docs/FORKING.md](docs/FORKING.md). General fixes found here are offered to ps3recomp upstream. Other PS3 games: suggest one in [Game requests](https://github.com/undecuple/project-helghast/discussions/categories/game-requests); it is a wish list, not a promise. Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md).
 
-**Official channels:** Project Helghast is made by **undecuple**: GitHub [@undecuple](https://github.com/undecuple), Reddit [u/RelationshipNo4440](https://www.reddit.com/user/RelationshipNo4440), Discord **itekso.** (on the ps3recomp server). Builds and fixes come only from this repository's [GitHub Releases](https://github.com/undecuple/project-helghast/releases); we never ask anyone to paste a command into PowerShell or a terminal. Anyone else offering builds, "fixes" or donations in this project's name is not us.
+**Official channels:** Project Helghast is made by **undecuple**: GitHub [@undecuple](https://github.com/undecuple), Reddit [u/RelationshipNo4440](https://www.reddit.com/user/RelationshipNo4440) and the [undecuple Discord server](https://discord.gg/W8fMT78Q7k) (unofficial fan work), which has a Project Helghast forum. Builds and fixes come only from this repository's [GitHub Releases](https://github.com/undecuple/project-helghast/releases); we never ask anyone to paste a command into PowerShell or a terminal. Anyone else offering builds, "fixes" or donations in this project's name is not us.
 
 **How AI was used**
 

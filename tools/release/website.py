@@ -536,7 +536,8 @@ def render(root, problems, feed=()):
       f"Will it run on your machine? <a href=\"{esc(DISC_QA)}\">Ask in Q&amp;A</a>.</p>\n</section>\n"
       "<section id=\"channels\" class=\"promo\">\n<h2>Official channels</h2>\n<ul class=\"links\">\n"
       f"<li><a href=\"{REPO}\">Source on GitHub</a></li><li><a href=\"{REPO}/releases\">Releases</a></li>"
-      f"<li><a href=\"{REPO}/issues\">Report a problem</a></li><li><a href=\"https://ko-fi.com/P5P615QPPM\">Support the project</a></li>\n"
+      f"<li><a href=\"{REPO}/issues\">Report a problem</a></li><li><a href=\"https://discord.gg/W8fMT78Q7k\">Discord (undecuple server, unofficial fan work)</a></li>"
+      "<li><a href=\"https://ko-fi.com/P5P615QPPM\">Support the project</a></li>\n"
       "</ul>\n</section>\n" + community_box(feed)
       + "</aside>\n</div>\n" + button_strip() + "</div>\n")
 

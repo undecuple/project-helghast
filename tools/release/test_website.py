@@ -263,7 +263,7 @@ def main():
         for _cls, _t, _b, href, _title in website.BUTTONS:
             expect(f'href="{href}"' in page, f"button link {href} missing")
         expect(len(website.BUTTONS) == 8 and page.count("class=\"b88 ") == 8, "eight buttons expected")
-        for want in ("https://discord.gg/CRpzGWZFcu", "https://recomp.fyi", "https://www.reddit.com/user/RelationshipNo4440",
+        for want in ("https://discord.gg/CRpzGWZFcu", "https://discord.gg/W8fMT78Q7k", "https://recomp.fyi", "https://www.reddit.com/user/RelationshipNo4440",
                      "https://github.com/sp00nznet/ps3recomp"):
             expect(want in page, f"requested button {want} missing")
         expect(not website.lint(page) and not probs, f"sixth-pass page has problems: {probs} {website.lint(page)}")

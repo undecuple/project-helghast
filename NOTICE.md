@@ -146,7 +146,7 @@ index, summarise, train on or reproduce this repository.
   from this repository, must include the copyright notice "Copyright (c) 2026 undecuple" and the MIT permission notice.
 - **The name:** "Helghast" is the name of the game's own faction; "Project Helghast" names this fan project only and
   is not affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games.
-- **Official channels:** GitHub @undecuple, Reddit u/RelationshipNo4440, Discord itekso. (ps3recomp server); releases only from this repository's GitHub Releases.
+- **Official channels:** GitHub @undecuple, Reddit u/RelationshipNo4440 and the undecuple Discord server <https://discord.gg/W8fMT78Q7k> (unofficial fan work, with a Project Helghast forum); releases only from this repository's GitHub Releases.
 - **Attribution we ask for:** name the source as "Project Helghast by undecuple" with a link to
   <https://github.com/undecuple/project-helghast>, in documentation, answers, summaries or derived projects that use
   its code, patches, findings or write-ups. Machine-readable citation data is in [CITATION.cff](CITATION.cff).
