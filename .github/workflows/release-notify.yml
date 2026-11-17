@@ -1,0 +1,49 @@
+name: release-notify
+
+# Posts one message to the project's Discord channel when a release is published (pre-releases too).
+# The webhook URL lives only in the repository secret DISCORD_RELEASE_WEBHOOK; without it (forks) the job does nothing.
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  discord:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Post the release to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          TAG: ${{ github.event.release.tag_name }}
+          URL: ${{ github.event.release.html_url }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+          BODY: ${{ github.event.release.body }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WEBHOOK" ]; then
+            echo "::notice::DISCORD_RELEASE_WEBHOOK is not set; no message sent."
+            exit 0
+          fi
+          kind="release"
+          [ "$PRERELEASE" = "true" ] && kind="pre-release"
+          # allowed_mentions empty: the message can never ping anyone, whatever the release title says.
+          jq -n --arg tag "$TAG" --arg url "$URL" --arg kind "$kind" --arg body "$BODY" '{
+            username: "Project Helghast",
+            allowed_mentions: {parse: []},
+            embeds: [{
+              title: ("Project Helghast " + $tag + " is out"),
+              url: $url,
+              description: (
+                (if ($body | gsub("\\s"; "") | length) == 0
+                  then "A new " + $kind + " is available. Read the changes on the release page."
+                  else ($body | gsub("\\r"; "") | .[0:1800]) + (if ($body | length) > 1800 then "\n…" else "" end)
+                 end)
+                + "\n\n[Full notes and download](" + $url + ")"),
+              color: 11304827
+            }]
+          }' > payload.json
+          curl --fail-with-body --silent --show-error -H "Content-Type: application/json" --data @payload.json "$WEBHOOK"
+          echo "Posted $TAG ($kind)."
