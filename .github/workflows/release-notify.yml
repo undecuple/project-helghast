@@ -32,6 +32,7 @@ jobs:
           # allowed_mentions empty: the message can never ping anyone, whatever the release title says.
           jq -n --arg tag "$TAG" --arg url "$URL" --arg kind "$kind" --arg body "$BODY" '{
             username: "Project Helghast",
+            thread_name: (("Project Helghast " + $tag) | .[0:100]),
             allowed_mentions: {parse: []},
             embeds: [{
               title: ("Project Helghast " + $tag + " is out"),
