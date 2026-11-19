@@ -28,6 +28,7 @@ tools/release/test_rpcs3_import.py
 tools/release/test_assemble_payload.py
 tools/release/test_version_check.py
 tools/release/test_website.py
+tools/release/test_site.py
 tools/release/test_pages_workflow.py
 tools/release/test_export_refs.py
 tools/upstream/test_lifter_chunks.py

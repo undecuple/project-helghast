@@ -30,6 +30,7 @@ tools/spu/test_kz3_gameplay.sh
 tools/release/test_firstrun.py
 tools/release/test_assemble_payload.py
 tools/release/test_website.py
+tools/release/test_draw_dividers.py
 tools/smoke/test_kz3_log_contract.py
 tools/spu/test_kz3_fiber_stall.sh
 tools/remote/test_runner.sh

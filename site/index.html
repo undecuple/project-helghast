@@ -4,53 +4,73 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'none'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:">
+<meta name="color-scheme" content="dark light">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:">
 <title>Project Helghast (work in progress)</title>
 <meta name="description" content="Project Helghast. Killzone 3 // Unofficial PC Port (static recompilation): a fan-made PC port of the PS3 game by static recompilation. Bring your own copy of the game.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;700&amp;family=Barlow:ital,wght@0,400;0,600;1,400&amp;display=swap">
 <link rel="stylesheet" href="style.css">
+<script src="site.js"></script>
 </head>
 <body>
-<header id="top" class="box">
-<div class="logo"><span class="emblem" aria-hidden="true"><svg viewBox="0 0 100 70" focusable="false"><polygon class="e1" points="0,42 50,0 100,42 72,42 50,23.5 28,42"/><polygon class="e2" points="0,70 50,28 100,70 72,70 50,51.5 28,70"/></svg></span><div class="wm"><p class="tag">Killzone 3 // Unofficial PC Port</p><h1>PROJECT<span>HELGHAST</span></h1></div><span class="sticker wip">WIP</span><p class="slogan">Built on your PC<br>from your own game</p></div>
-<ul class="util"><li><a href="https://github.com/undecuple/project-helghast">GitHub</a></li><li><a href="https://github.com/undecuple/project-helghast/discussions">Discussions</a></li><li><a href="https://github.com/undecuple/project-helghast/releases">Releases</a></li><li><a href="#channels">Channels</a></li></ul>
-<nav class="tabs"><a class="i-home on" href="#top">Home</a><a class="i-shots" href="#shots">Screens</a><a class="i-status" href="#status">Status</a><a class="i-req" href="#requirements">Requirements</a><a class="i-inst" href="#install">Install</a><a class="i-comm" href="#discussions">Discussions</a><a class="i-git" href="https://github.com/undecuple/project-helghast">GitHub</a><a class="cta-box" href="https://github.com/undecuple/project-helghast"><b>Source on GitHub</b>Read the code, build it yourself</a></nav>
-<div class="intro">
-<p class="desc">Killzone 3 // Unofficial PC Port (static recompilation)</p>
+<a class="skip" href="#panel">Skip to the content</a>
+<div id="app">
+<header id="head">
+<div class="logo"><span class="emblem" aria-hidden="true"><svg viewBox="0 0 100 70" focusable="false"><polygon class="e1" points="0,42 50,0 100,42 72,42 50,23.5 28,42"/><polygon class="e2" points="0,70 50,28 100,70 72,70 50,51.5 28,70"/></svg></span><div class="wm"><p class="tag">Killzone 3 // Unofficial PC Port</p><h1>PROJECT<span>HELGHAST</span></h1></div><span class="sticker wip">WIP</span></div>
+<ul class="util"><li><a href="https://github.com/undecuple/project-helghast">GitHub</a></li><li><a href="https://github.com/undecuple/project-helghast/discussions">Discussions</a></li><li><a href="https://github.com/undecuple/project-helghast/releases">Releases</a></li><li><a class="plainlink" href="plain.html">Plain page</a></li></ul>
+</header>
+<div class="frontend">
+<nav id="menu" aria-label="Sections">
+<ol>
+<li><a href="#top" data-detail="Killzone 3 // Unofficial PC Port (static recompilation)"><span class="mi-n">01</span><span class="mi-l">Home</span></a></li>
+<li><a href="#shots" data-detail="11 screenshots of the port running the developer&#x27;s own copy of the game."><span class="mi-n">02</span><span class="mi-l">Screens</span></a></li>
+<li><a href="#status" data-detail="Status: Partly playable. 20 of 43 features work."><span class="mi-n">03</span><span class="mi-l">Status</span></a></li>
+<li><a href="#requirements" data-detail="What you need from your own copy, and the hardware figures (provisional)."><span class="mi-n">04</span><span class="mi-l">Requirements</span></a></li>
+<li><a href="#install" data-detail="v0.1.10 pre-release: the installer or the portable zip, built on your PC from your own copy."><span class="mi-n">05</span><span class="mi-l">Install</span></a></li>
+<li><a href="#progress" data-detail="The newest changelog entries and the objectives still open."><span class="mi-n">06</span><span class="mi-l">Progress</span></a></li>
+<li><a href="#discussions" data-detail="Questions, ideas and game requests, on GitHub Discussions."><span class="mi-n">07</span><span class="mi-l">Discussions</span></a></li>
+<li><a href="#about" data-detail="Built on ps3recomp: PPU and SPU code lifted to C, the RSX command stream replayed on Direct3D 12."><span class="mi-n">08</span><span class="mi-l">About</span></a></li>
+<li><a href="#channels" data-detail="Source, releases, bug reports and the Discord server."><span class="mi-n">09</span><span class="mi-l">Channels</span></a></li>
+<li><a href="#legal" data-detail="No game content is distributed. The port&#x27;s own code is MIT."><span class="mi-n">10</span><span class="mi-l">Legal</span></a></li>
+</ol>
+<div id="detail" class="detail" aria-live="polite"></div>
+</nav>
+<main id="panel" tabindex="-1">
+<section id="top" class="sec" aria-labelledby="h-top">
+<h2 id="h-top">Home</h2>
+<p class="lede">Killzone 3 // Unofficial PC Port (static recompilation)</p>
 <p class="what">A Windows x64 port of the 2011 PS3 game, made by static recompilation: the game&#x27;s PowerPC and SPU code is translated to C ahead of time and compiled into a native PC program, so no CPU emulator runs at play time. The GPU is still translated as it runs (RSX to Direct3D 12); native replacements come step by step.</p>
 <p class="headline">Status: <strong>Partly playable</strong></p>
 <p class="note">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>
 <p class="note">v0.1.10 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
 <p class="btns"><a class="btn" href="#status">See the status</a><a class="btn alt" href="https://github.com/undecuple/project-helghast">Source on GitHub</a></p>
-</div>
-</header>
-<div class="page wrap">
-<section id="shots" class="gallery-pod">
-<h2>Screens</h2>
-<div class="gallery">
-<figure class="tile"><div class="hudbar"><span class="rd">28.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Ultrawide 21:9</span><span class="sticker new">New</span></div><a href="../docs/screenshots/20261028-025213Z_kz3-frozen-shores-219.webp"><img src="../docs/screenshots/20261028-025213Z_kz3-frozen-shores-219.webp" alt="Frozen Shores at 21:9 (2560x1080): the 3D view fills the window, subtitles and crosshair stay centred" loading="lazy"></a><figcaption><b>Ultrawide 21:9</b>Frozen Shores at 21:9 (2560x1080): the 3D view fills the window, subtitles and crosshair stay centred<a class="learn" href="#shot-1">Learn more</a></figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">28.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Super ultrawide 32:9</span></div><a href="../docs/screenshots/20261028-030031Z_kz3-frozen-shores-329.webp"><img src="../docs/screenshots/20261028-030031Z_kz3-frozen-shores-329.webp" alt="Frozen Shores at 32:9 (3840x1080): a mounted-gun fight, subtitles and crosshair centred" loading="lazy"></a><figcaption><b>Super ultrawide 32:9</b>Frozen Shores at 32:9 (3840x1080): a mounted-gun fight, subtitles and crosshair centred</figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">28.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Botzone at 21:9</span></div><a href="../docs/screenshots/20261028-032438Z_kz3-botzone-minimap.webp"><img src="../docs/screenshots/20261028-032438Z_kz3-botzone-minimap.webp" alt="Botzone at 21:9: the minimap, score box and ammo counter in the 16:9 HUD area" loading="lazy"></a><figcaption><b>Botzone at 21:9</b>Botzone at 21:9: the minimap, score box and ammo counter in the 16:9 HUD area</figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">28.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Display options</span></div><a href="../docs/screenshots/20261028-033208Z_kz3-display-options.webp"><img src="../docs/screenshots/20261028-033208Z_kz3-display-options.webp" alt="Options &gt; Display: frame rate limit, field of view and bloom (1920x1080)" loading="lazy"></a><figcaption><b>Display options</b>Options &gt; Display: frame rate limit, field of view and bloom (1920x1080)</figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">27.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Frozen Shores: firefight</span></div><a href="../docs/screenshots/20261027-191315Z_kz3-frozen-shores-firefight.webp"><img src="../docs/screenshots/20261027-191315Z_kz3-frozen-shores-firefight.webp" alt="Frozen Shores: firefight" loading="lazy"></a><figcaption><b>Frozen Shores: firefight</b>Frozen Shores: firefight</figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">23.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Split-screen co-op</span></div><a href="../docs/screenshots/20261023-020408Z_kz3-coop-two-players.png"><img src="../docs/screenshots/20261023-020408Z_kz3-coop-two-players.png" alt="Two-player co-op on one PC, one pad each (the two views still sit slightly out of place)" loading="lazy"></a><figcaption><b>Split-screen co-op</b>Two-player co-op on one PC, one pad each (the two views still sit slightly out of place)</figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">16.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Update 1.14</span></div><a href="../docs/screenshots/20261016-141813Z_kz3-114-all-chapters.png"><img src="../docs/screenshots/20261016-141813Z_kz3-114-all-chapters.png" alt="Update 1.14: a level start (Space Station) on the update&#x27;s own data" loading="lazy"></a><figcaption><b>Update 1.14</b>Update 1.14: a level start (Space Station) on the update&#x27;s own data</figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">14.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Hammer ride</span></div><a href="../docs/screenshots/20261014-171640Z_kz3-k2-hammer-rides.png"><img src="../docs/screenshots/20261014-171640Z_kz3-k2-hammer-rides.png" alt="Pyrrhus outskirts: the Hammer ride, mounted gun" loading="lazy"></a><figcaption><b>Hammer ride</b>Pyrrhus outskirts: the Hammer ride, mounted gun</figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">12.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Flooded Pyrrhus</span></div><a href="../docs/screenshots/20261012-234643Z_kz3-level2-hud.png"><img src="../docs/screenshots/20261012-234643Z_kz3-level2-hud.png" alt="Flooded Pyrrhus with the in-level HUD" loading="lazy"></a><figcaption><b>Flooded Pyrrhus</b>Flooded Pyrrhus with the in-level HUD</figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">12.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Frozen Shores</span></div><a href="../docs/screenshots/20261012-234647Z_kz3-level5.png"><img src="../docs/screenshots/20261012-234647Z_kz3-level5.png" alt="Frozen Shores, a later level" loading="lazy"></a><figcaption><b>Frozen Shores</b>Frozen Shores, a later level</figcaption></figure>
-<figure class="tile"><div class="hudbar"><span class="rd">08.10.2026</span><span class="sl" aria-hidden="true">//</span><span class="lv">Main menu</span></div><a href="../docs/screenshots/20261008-040732Z_kz3-main-menu.png"><img src="../docs/screenshots/20261008-040732Z_kz3-main-menu.png" alt="Main menu, drawn by the port&#x27;s Direct3D 12 renderer" loading="lazy"></a><figcaption><b>Main menu</b>Main menu, drawn by the port&#x27;s Direct3D 12 renderer</figcaption></figure>
+</section>
+<section id="shots" class="sec" aria-labelledby="h-shots">
+<h2 id="h-shots">Screens</h2>
+<p class="lede">11 screenshots of the port running the developer's own copy of the game.</p>
+<div class="gallery" data-group="screens">
+<figure class="tile" id="shot-1"><a class="shot" href="../docs/screenshots/20261028-025213Z_kz3-frozen-shores-219.webp" data-title="Ultrawide 21:9" data-caption="Frozen Shores at 21:9 (2560x1080): the 3D view fills the window, subtitles and crosshair stay centred"><img src="../docs/screenshots/20261028-025213Z_kz3-frozen-shores-219.webp" alt="Frozen Shores at 21:9 (2560x1080): the 3D view fills the window, subtitles and crosshair stay centred" loading="lazy"></a><figcaption><span class="rd">28.10.2026</span> <b>Ultrawide 21:9</b><span class="sticker new">New</span> Frozen Shores at 21:9 (2560x1080): the 3D view fills the window, subtitles and crosshair stay centred</figcaption></figure>
+<figure class="tile" id="shot-2"><a class="shot" href="../docs/screenshots/20261028-030031Z_kz3-frozen-shores-329.webp" data-title="Super ultrawide 32:9" data-caption="Frozen Shores at 32:9 (3840x1080): a mounted-gun fight, subtitles and crosshair centred"><img src="../docs/screenshots/20261028-030031Z_kz3-frozen-shores-329.webp" alt="Frozen Shores at 32:9 (3840x1080): a mounted-gun fight, subtitles and crosshair centred" loading="lazy"></a><figcaption><span class="rd">28.10.2026</span> <b>Super ultrawide 32:9</b> Frozen Shores at 32:9 (3840x1080): a mounted-gun fight, subtitles and crosshair centred</figcaption></figure>
+<figure class="tile" id="shot-3"><a class="shot" href="../docs/screenshots/20261028-032438Z_kz3-botzone-minimap.webp" data-title="Botzone at 21:9" data-caption="Botzone at 21:9: the minimap, score box and ammo counter in the 16:9 HUD area"><img src="../docs/screenshots/20261028-032438Z_kz3-botzone-minimap.webp" alt="Botzone at 21:9: the minimap, score box and ammo counter in the 16:9 HUD area" loading="lazy"></a><figcaption><span class="rd">28.10.2026</span> <b>Botzone at 21:9</b> Botzone at 21:9: the minimap, score box and ammo counter in the 16:9 HUD area</figcaption></figure>
+<figure class="tile" id="shot-4"><a class="shot" href="../docs/screenshots/20261028-033208Z_kz3-display-options.webp" data-title="Display options" data-caption="Options &gt; Display: frame rate limit, field of view and bloom (1920x1080)"><img src="../docs/screenshots/20261028-033208Z_kz3-display-options.webp" alt="Options &gt; Display: frame rate limit, field of view and bloom (1920x1080)" loading="lazy"></a><figcaption><span class="rd">28.10.2026</span> <b>Display options</b> Options &gt; Display: frame rate limit, field of view and bloom (1920x1080)</figcaption></figure>
+<figure class="tile" id="shot-5"><a class="shot" href="../docs/screenshots/20261027-191315Z_kz3-frozen-shores-firefight.webp" data-title="Frozen Shores: firefight" data-caption="Frozen Shores: firefight"><img src="../docs/screenshots/20261027-191315Z_kz3-frozen-shores-firefight.webp" alt="Frozen Shores: firefight" loading="lazy"></a><figcaption><span class="rd">27.10.2026</span> <b>Frozen Shores: firefight</b> Frozen Shores: firefight</figcaption></figure>
+<figure class="tile" id="shot-6"><a class="shot" href="../docs/screenshots/20261023-020408Z_kz3-coop-two-players.png" data-title="Split-screen co-op" data-caption="Two-player co-op on one PC, one pad each (the two views still sit slightly out of place)"><img src="../docs/screenshots/20261023-020408Z_kz3-coop-two-players.png" alt="Two-player co-op on one PC, one pad each (the two views still sit slightly out of place)" loading="lazy"></a><figcaption><span class="rd">23.10.2026</span> <b>Split-screen co-op</b> Two-player co-op on one PC, one pad each (the two views still sit slightly out of place)</figcaption></figure>
+<figure class="tile" id="shot-7"><a class="shot" href="../docs/screenshots/20261016-141813Z_kz3-114-all-chapters.png" data-title="Update 1.14" data-caption="Update 1.14: a level start (Space Station) on the update&#x27;s own data"><img src="../docs/screenshots/20261016-141813Z_kz3-114-all-chapters.png" alt="Update 1.14: a level start (Space Station) on the update&#x27;s own data" loading="lazy"></a><figcaption><span class="rd">16.10.2026</span> <b>Update 1.14</b> Update 1.14: a level start (Space Station) on the update&#x27;s own data</figcaption></figure>
+<figure class="tile" id="shot-8"><a class="shot" href="../docs/screenshots/20261014-171640Z_kz3-k2-hammer-rides.png" data-title="Hammer ride" data-caption="Pyrrhus outskirts: the Hammer ride, mounted gun"><img src="../docs/screenshots/20261014-171640Z_kz3-k2-hammer-rides.png" alt="Pyrrhus outskirts: the Hammer ride, mounted gun" loading="lazy"></a><figcaption><span class="rd">14.10.2026</span> <b>Hammer ride</b> Pyrrhus outskirts: the Hammer ride, mounted gun</figcaption></figure>
+<figure class="tile" id="shot-9"><a class="shot" href="../docs/screenshots/20261012-234643Z_kz3-level2-hud.png" data-title="Flooded Pyrrhus" data-caption="Flooded Pyrrhus with the in-level HUD"><img src="../docs/screenshots/20261012-234643Z_kz3-level2-hud.png" alt="Flooded Pyrrhus with the in-level HUD" loading="lazy"></a><figcaption><span class="rd">12.10.2026</span> <b>Flooded Pyrrhus</b> Flooded Pyrrhus with the in-level HUD</figcaption></figure>
+<figure class="tile" id="shot-10"><a class="shot" href="../docs/screenshots/20261012-234647Z_kz3-level5.png" data-title="Frozen Shores" data-caption="Frozen Shores, a later level"><img src="../docs/screenshots/20261012-234647Z_kz3-level5.png" alt="Frozen Shores, a later level" loading="lazy"></a><figcaption><span class="rd">12.10.2026</span> <b>Frozen Shores</b> Frozen Shores, a later level</figcaption></figure>
+<figure class="tile" id="shot-11"><a class="shot" href="../docs/screenshots/20261008-040732Z_kz3-main-menu.png" data-title="Main menu" data-caption="Main menu, drawn by the port&#x27;s Direct3D 12 renderer"><img src="../docs/screenshots/20261008-040732Z_kz3-main-menu.png" alt="Main menu, drawn by the port&#x27;s Direct3D 12 renderer" loading="lazy"></a><figcaption><span class="rd">08.10.2026</span> <b>Main menu</b> Main menu, drawn by the port&#x27;s Direct3D 12 renderer</figcaption></figure>
 </div>
 <p class="small">Screenshots of the port running the developer's own copy of the game, kept to document progress; the game content in them belongs to Sony Interactive Entertainment and Guerrilla Games. More screenshots, by milestone: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/SCREENSHOTS.md">SCREENSHOTS.md</a>.</p>
 </section>
-<p class="divider" aria-hidden="true"><span>Latest news</span></p>
-<div class="cols">
-<main class="main">
-<article id="status" class="news">
-<h2>Status: Partly playable</h2>
-<p class="meta">by the project · generated from the records · 43 features</p>
-<div class="nb"><span class="frame pic-status" aria-hidden="true"></span><div class="nt"><p>Generated from the repository's own records (the same data as <a href="https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md">FEATURES.md</a>, where every row has its evidence). <em>Works</em> is claimed only with a recorded result.</p></div></div>
+<section id="status" class="sec" aria-labelledby="h-status">
+<h2 id="h-status">Status</h2>
+<p class="lede">Status: Partly playable. 20 of 43 features work.</p>
+<h3>Status: Partly playable</h3>
+<p class="meta">generated from the records · 43 features</p>
+<p>Generated from the repository's own records (the same data as <a href="https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md">FEATURES.md</a>, where every row has its evidence). <em>Works</em> is claimed only with a recorded result.</p>
 <ul class="portal">
 <li class="row"><span class="thumb tb-ok" aria-hidden="true">OK</span><div class="rt"><b>Title screen, main menu, attract mode</b></div><div class="stats"><span class="st st-ok">works</span></div></li>
 <li class="row"><span class="thumb tb-part" aria-hidden="true">WIP</span><div class="rt"><b>Level 1 (prologue) loads and runs</b><span class="blurb">Runs for 10+ minutes; below full speed</span></div><div class="stats"><span class="st st-part">partial</span></div></li>
@@ -59,7 +79,7 @@
 <li class="row"><span class="thumb tb-ok" aria-hidden="true">OK</span><div class="rt"><b>In-level HUD (ammo, crosshair, objective text)</b><span class="blurb">Drawn as on the PS3 (the dark SELECT square in hints is the game&#x27;s own glyph)</span></div><div class="stats"><span class="st st-ok">works</span></div></li>
 <li class="row"><span class="thumb tb-part" aria-hidden="true">WIP</span><div class="rt"><b>Update 1.14 content (balance, Motion Sensor option, DLC trophy set, MP map patch sets)</b><span class="blurb">1.14 is the base version</span></div><div class="stats"><span class="st st-part">partial</span></div></li>
 </ul>
-<h3>All features, by status</h3>
+<h4>All features, by status</h4>
 <ul class="meters">
 <li class="m-ok"><span class="ml">works</span><span class="bar" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i><i></i><i></i><i></i></span><b>20</b></li>
 <li class="m-part"><span class="ml">partial</span><span class="bar" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span><b>13</b></li>
@@ -166,7 +186,7 @@
 <tr><td>Language selection and localised text</td><td>Nine languages on the startup list; menus and level text in 20+ languages in the data</td><td><span class="st st-part">partial</span><br><span class="small">The list draws in full; menus draw in Russian and Traditional Chinese with the player&#x27;s PS3 system fonts; a level not yet played in another language</span></td></tr>
 <tr><td>Subtitles in movies and cutscenes</td><td>Subtitle cards and in-game subtitles</td><td><span class="st st-ok">works</span><br><span class="small">In-level (in-game) subtitles were not reached; the prenarrative text cards are part of the movie and show with either setting</span></td></tr>
 </tbody></table></div></details>
-<h3>What the port adds</h3>
+<h4>What the port adds</h4>
 <p>38 available now, 29 planned. Changes to gameplay stay optional.</p>
 <details><summary>All 67 features</summary>
 <div class="tw"><table>
@@ -242,146 +262,11 @@
 </tbody></table></div></details>
 <p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md">Every feature, with evidence<span aria-hidden="true"> &gt;</span></a></p>
 <p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>
-</article>
-<article id="shot-1" class="news shot">
-<h2>Ultrawide 21:9</h2>
-<p class="meta">by the port · 28 Oct 2026 · screen 1 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261028-025213Z_kz3-frozen-shores-219.webp"><img src="../docs/screenshots/20261028-025213Z_kz3-frozen-shores-219.webp" alt="" loading="lazy"><span class="sticker new">New</span></a><div class="nt"><p>Frozen Shores at 21:9 (2560x1080): the 3D view fills the window, subtitles and crosshair stay centred. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261028-025213Z_kz3-frozen-shores-219.webp">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-2" class="news shot">
-<h2>Super ultrawide 32:9</h2>
-<p class="meta">by the port · 28 Oct 2026 · screen 2 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261028-030031Z_kz3-frozen-shores-329.webp"><img src="../docs/screenshots/20261028-030031Z_kz3-frozen-shores-329.webp" alt="" loading="lazy"></a><div class="nt"><p>Frozen Shores at 32:9 (3840x1080): a mounted-gun fight, subtitles and crosshair centred. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261028-030031Z_kz3-frozen-shores-329.webp">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-3" class="news shot">
-<h2>Botzone at 21:9</h2>
-<p class="meta">by the port · 28 Oct 2026 · screen 3 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261028-032438Z_kz3-botzone-minimap.webp"><img src="../docs/screenshots/20261028-032438Z_kz3-botzone-minimap.webp" alt="" loading="lazy"></a><div class="nt"><p>Botzone at 21:9: the minimap, score box and ammo counter in the 16:9 HUD area. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261028-032438Z_kz3-botzone-minimap.webp">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-4" class="news shot">
-<h2>Display options</h2>
-<p class="meta">by the port · 28 Oct 2026 · screen 4 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261028-033208Z_kz3-display-options.webp"><img src="../docs/screenshots/20261028-033208Z_kz3-display-options.webp" alt="" loading="lazy"></a><div class="nt"><p>Options &gt; Display: frame rate limit, field of view and bloom (1920x1080). A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261028-033208Z_kz3-display-options.webp">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-5" class="news shot">
-<h2>Frozen Shores: firefight</h2>
-<p class="meta">by the port · 27 Oct 2026 · screen 5 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261027-191315Z_kz3-frozen-shores-firefight.webp"><img src="../docs/screenshots/20261027-191315Z_kz3-frozen-shores-firefight.webp" alt="" loading="lazy"></a><div class="nt"><p>Frozen Shores: firefight. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261027-191315Z_kz3-frozen-shores-firefight.webp">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-6" class="news shot">
-<h2>Split-screen co-op</h2>
-<p class="meta">by the port · 23 Oct 2026 · screen 6 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261023-020408Z_kz3-coop-two-players.png"><img src="../docs/screenshots/20261023-020408Z_kz3-coop-two-players.png" alt="" loading="lazy"></a><div class="nt"><p>Two-player co-op on one PC, one pad each (the two views still sit slightly out of place). A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261023-020408Z_kz3-coop-two-players.png">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-7" class="news shot">
-<h2>Update 1.14</h2>
-<p class="meta">by the port · 16 Oct 2026 · screen 7 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261016-141813Z_kz3-114-all-chapters.png"><img src="../docs/screenshots/20261016-141813Z_kz3-114-all-chapters.png" alt="" loading="lazy"></a><div class="nt"><p>Update 1.14: a level start (Space Station) on the update&#x27;s own data. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261016-141813Z_kz3-114-all-chapters.png">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-8" class="news shot">
-<h2>Hammer ride</h2>
-<p class="meta">by the port · 14 Oct 2026 · screen 8 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261014-171640Z_kz3-k2-hammer-rides.png"><img src="../docs/screenshots/20261014-171640Z_kz3-k2-hammer-rides.png" alt="" loading="lazy"></a><div class="nt"><p>Pyrrhus outskirts: the Hammer ride, mounted gun. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261014-171640Z_kz3-k2-hammer-rides.png">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-9" class="news shot">
-<h2>Flooded Pyrrhus</h2>
-<p class="meta">by the port · 12 Oct 2026 · screen 9 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261012-234643Z_kz3-level2-hud.png"><img src="../docs/screenshots/20261012-234643Z_kz3-level2-hud.png" alt="" loading="lazy"></a><div class="nt"><p>Flooded Pyrrhus with the in-level HUD. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261012-234643Z_kz3-level2-hud.png">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-10" class="news shot">
-<h2>Frozen Shores</h2>
-<p class="meta">by the port · 12 Oct 2026 · screen 10 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261012-234647Z_kz3-level5.png"><img src="../docs/screenshots/20261012-234647Z_kz3-level5.png" alt="" loading="lazy"></a><div class="nt"><p>Frozen Shores, a later level. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261012-234647Z_kz3-level5.png">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="shot-11" class="news shot">
-<h2>Main menu</h2>
-<p class="meta">by the port · 8 Oct 2026 · screen 11 of 11</p>
-<div class="nb"><a class="frame" href="../docs/screenshots/20261008-040732Z_kz3-main-menu.png"><img src="../docs/screenshots/20261008-040732Z_kz3-main-menu.png" alt="" loading="lazy"></a><div class="nt"><p>Main menu, drawn by the port&#x27;s Direct3D 12 renderer. A screenshot of the port running on Windows x64 (tested under Proton), drawn by its Direct3D 12 renderer.</p><p class="more"><a href="../docs/screenshots/20261008-040732Z_kz3-main-menu.png">Full size<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<article id="discussions" class="news board">
-<h2>Discussions</h2>
-<p class="meta">on GitHub · General and game requests</p>
-<p>Questions, ideas and screenshots of your own runs are welcome in the project's discussions on GitHub (posting needs a GitHub account).</p>
-<p class="btns"><a class="btn" href="https://github.com/undecuple/project-helghast/discussions/categories/general">Start a discussion</a><a class="btn alt" href="https://github.com/undecuple/project-helghast/discussions">All discussions</a></p>
-<p class="small">Game requests: <a href="https://github.com/undecuple/project-helghast/discussions/categories/game-requests">ask for another game</a>. Install and hardware questions: <a href="https://github.com/undecuple/project-helghast/discussions/categories/q-a">Q&amp;A</a>.</p>
-</article>
-<article id="about" class="news">
-<h2>About the port</h2>
-<p class="meta">by the project · how it works · 67 port features</p>
-<div class="nb"><span class="frame pic-about" aria-hidden="true"></span><div class="nt"><p>The port is built on <a href="https://github.com/sp00nznet/ps3recomp">ps3recomp</a> (MIT): the PPU code and the game's SPU programs are lifted to C, the PS3 system libraries the game calls are reimplemented, and the game's RSX command stream is replayed on Direct3D 12. The game's archive is read in place from your dump. It is tested on Windows x64 under Proton; a native Linux build is planned. What comes next: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/ROADMAP.md">the roadmap</a>.</p>
-<p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/HOW-IT-WORKS.md">The technical overview<span aria-hidden="true"> &gt;</span></a></p>
-<p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>
-</div></div>
-</article>
-<p class="divider" aria-hidden="true"><span>Progress</span></p>
-<div class="notes2">
-<section id="changelog" class="promo term">
-<h2>Changelog</h2>
-<ul class="clog">
-<li><time datetime="2026-11-09">11-09</time><span>On Windows, game files with long names could not be written to the port&#x27;s disk cache when the full path went...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The launcher creates `display.ini` (every display setting at its default) and `online.ini` (every key...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The 3-bone vertex skinning of the animation SPU job runs as native code by default with the 1.14 update...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The Options &gt; Display page keeps labels and values apart in languages with long labels: the value column is...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The frame rate limit&#x27;s tooltip on the Options &gt; Display page now says the limit applies in missions, while...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The log names the frame rate limit in force and its pacing tick (`[pace]` line) at the start and whenever...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>After a language change, the menu pages the port rewrites (the Options pages) are no longer read back from...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>If the graphics driver cannot hand over the window&#x27;s image for a frame, that frame is skipped and the window...</span></li>
-</ul>
-<p class="small">Newest first; the full list is in <a href="https://github.com/undecuple/project-helghast/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
 </section>
-<section id="todo" class="promo obj">
-<h2>Objectives</h2>
-<ul class="todo">
-<li class="o-not-yet"><span class="box" aria-hidden="true"></span>Full campaign, start to finish <em>(not yet)</em></li>
-<li class="o-not-yet"><span class="box" aria-hidden="true"></span>Motion-sensor sections (valves, demolition charges) <em>(not yet)</em></li>
-<li class="o-not-yet"><span class="box" aria-hidden="true"></span>SIXAXIS motion input <em>(not yet)</em></li>
-<li class="o-not-yet"><span class="box" aria-hidden="true"></span>Online multiplayer (Warzone, Guerrilla Warfare, Operations) <em>(not yet)</em></li>
-<li class="o-not-yet"><span class="box" aria-hidden="true"></span>Voice chat <em>(not yet)</em></li>
-</ul>
-<p class="small">The next objectives still open; all of them: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md">FEATURES.md</a>.</p>
-</section>
-</div>
-</main>
-<aside class="side">
-<a class="promo pic" href="#install"><img src="../docs/screenshots/20261028-030031Z_kz3-frozen-shores-329.webp" alt="" loading="lazy"><span class="pt">Bring your own copy</span><span class="pb">How to install</span></a>
-<section class="promo">
-<h2>At a glance</h2>
-<p class="headline">Status: <strong>Partly playable</strong></p>
-<ul class="glance">
-<li><span class="st st-ok">works</span> <b>20</b></li>
-<li><span class="st st-part">partial</span> <b>13</b></li>
-<li><span class="st st-no">not yet</span> <b>8</b></li>
-<li><span class="st st-unv">not yet verified</span> <b>0</b></li>
-<li><span class="st st-dec">declined</span> <b>0</b></li>
-<li><span class="st st-na">not applicable</span> <b>2</b></li>
-</ul>
-<p class="small"><a href="#status">Full status</a></p>
-</section>
-<section id="install" class="promo">
-<h2>Install</h2>
-<p class="headline"><strong>v0.1.10 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
-<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.10">v0.1.10</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10 minutes on a fast PC, longer on slower ones. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
-<p>You can also build the port from source: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md">building</a>.</p>
-<h3>What goes online</h3>
-<p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/PRIVACY.md">privacy page</a>.</p>
-<p class="small">The original PS3 game's online play is kept running by the PS Rewired community (<a href="https://psrewired.com/servers/23044">their Killzone 3 page</a>). This port is not affiliated with or endorsed by PS Rewired and does not connect to their servers.</p>
-<p class="small">Viewing this website loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit; the repository, installer and game do not.</p>
-<p class="small">Install questions: <a href="https://github.com/undecuple/project-helghast/discussions/categories/q-a">Q&amp;A discussions</a>.</p>
-</section>
-<section id="requirements" class="promo">
-<h2>Requirements</h2>
-<h3>From your own copy of the game</h3>
+<section id="requirements" class="sec" aria-labelledby="h-requirements">
+<h2 id="h-requirements">Requirements</h2>
+<p class="lede">What you need from your own copy, and the hardware figures (provisional).</p>
+<h4>From your own copy of the game</h4>
 <div class="tw"><table>
 <thead><tr><th>Item</th><th>Required</th></tr></thead>
 <tbody>
@@ -393,7 +278,7 @@
 <tr><td><strong>DLC map packs</strong></td><td>optional (not supported yet)</td></tr>
 <tr><td><strong>PlayStation Move, 3D TV</strong></td><td>no</td></tr>
 </tbody></table></div>
-<h3>Hardware to play (provisional)</h3>
+<h4>Hardware to play (provisional)</h4>
 <div class="tw"><table>
 <thead><tr><th></th><th>Minimum (provisional)</th><th>Recommended (provisional)</th></tr></thead>
 <tbody>
@@ -407,19 +292,77 @@
 </tbody></table></div>
 <p class="small">Details and the reasons behind each figure: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/requirements.md">docs/requirements.md</a>. Hardware figures are provisional until the game runs at full speed. Will it run on your machine? <a href="https://github.com/undecuple/project-helghast/discussions/categories/q-a">Ask in Q&amp;A</a>.</p>
 </section>
-<section id="channels" class="promo">
-<h2>Official channels</h2>
-<ul class="links">
-<li><a href="https://github.com/undecuple/project-helghast">Source on GitHub</a></li><li><a href="https://github.com/undecuple/project-helghast/releases">Releases</a></li><li><a href="https://github.com/undecuple/project-helghast/issues">Report a problem</a></li><li><a href="https://discord.gg/W8fMT78Q7k">Discord (undecuple server, unofficial fan work)</a></li><li><a href="https://ko-fi.com/P5P615QPPM">Support the project</a></li>
-</ul>
+<section id="install" class="sec" aria-labelledby="h-install">
+<h2 id="h-install">Install</h2>
+<p class="lede">v0.1.10 pre-release: the installer or the portable zip, built on your PC from your own copy.</p>
+<p class="headline"><strong>v0.1.10 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
+<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.10">v0.1.10</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10 minutes on a fast PC, longer on slower ones. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
+<p>You can also build the port from source: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md">building</a>.</p>
+<h4>What goes online</h4>
+<p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/PRIVACY.md">privacy page</a>.</p>
+<p class="small">The original PS3 game's online play is kept running by the PS Rewired community (<a href="https://psrewired.com/servers/23044">their Killzone 3 page</a>). This port is not affiliated with or endorsed by PS Rewired and does not connect to their servers.</p>
+<p class="small">Viewing this website loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit; the repository, installer and game do not. The plain page loads no fonts.</p>
+<p class="small">Install questions: <a href="https://github.com/undecuple/project-helghast/discussions/categories/q-a">Q&amp;A discussions</a>.</p>
 </section>
+<section id="progress" class="sec" aria-labelledby="h-progress">
+<h2 id="h-progress">Progress</h2>
+<p class="lede">The newest changelog entries and the objectives still open.</p>
+<section id="changelog" class="promo term">
+<h3>Changelog</h3>
+<ul class="clog">
+<li><time datetime="2026-11-09">11-09</time><span>On Windows, game files with long names could not be written to the port&#x27;s disk cache when the full path went...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The launcher creates `display.ini` (every display setting at its default) and `online.ini` (every key...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The 3-bone vertex skinning of the animation SPU job runs as native code by default with the 1.14 update...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The Options &gt; Display page keeps labels and values apart in languages with long labels: the value column is...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The frame rate limit&#x27;s tooltip on the Options &gt; Display page now says the limit applies in missions, while...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>The log names the frame rate limit in force and its pacing tick (`[pace]` line) at the start and whenever...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>After a language change, the menu pages the port rewrites (the Options pages) are no longer read back from...</span></li>
+<li><time datetime="2026-11-04">11-04</time><span>If the graphics driver cannot hand over the window&#x27;s image for a frame, that frame is skipped and the window...</span></li>
+</ul>
+<p class="small">Newest first; the full list is in <a href="https://github.com/undecuple/project-helghast/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
+</section>
+<section id="todo" class="promo obj">
+<h3>Objectives</h3>
+<ul class="todo">
+<li class="o-not-yet"><span class="box" aria-hidden="true"></span>Full campaign, start to finish <em>(not yet)</em></li>
+<li class="o-not-yet"><span class="box" aria-hidden="true"></span>Motion-sensor sections (valves, demolition charges) <em>(not yet)</em></li>
+<li class="o-not-yet"><span class="box" aria-hidden="true"></span>SIXAXIS motion input <em>(not yet)</em></li>
+<li class="o-not-yet"><span class="box" aria-hidden="true"></span>Online multiplayer (Warzone, Guerrilla Warfare, Operations) <em>(not yet)</em></li>
+<li class="o-not-yet"><span class="box" aria-hidden="true"></span>Voice chat <em>(not yet)</em></li>
+</ul>
+<p class="small">The next objectives still open; all of them: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md">FEATURES.md</a>.</p>
+</section>
+</section>
+<section id="discussions" class="sec" aria-labelledby="h-discussions">
+<h2 id="h-discussions">Discussions</h2>
+<p class="lede">Questions, ideas and game requests, on GitHub Discussions.</p>
+<article class="news board">
+<h3>Discussions</h3>
+<p class="meta">on GitHub · General and game requests</p>
+<p>Questions, ideas and screenshots of your own runs are welcome in the project's discussions on GitHub (posting needs a GitHub account).</p>
+<p class="btns"><a class="btn" href="https://github.com/undecuple/project-helghast/discussions/categories/general">Start a discussion</a><a class="btn alt" href="https://github.com/undecuple/project-helghast/discussions">All discussions</a></p>
+<p class="small">Game requests: <a href="https://github.com/undecuple/project-helghast/discussions/categories/game-requests">ask for another game</a>. Install and hardware questions: <a href="https://github.com/undecuple/project-helghast/discussions/categories/q-a">Q&amp;A</a>.</p>
+</article>
 <section id="community" class="promo">
-<h2>From the community</h2>
+<h3>From the community</h3>
 <p>Questions, ideas and screenshots of your own runs are welcome in the project's discussions.</p>
 <p class="small"><a href="https://github.com/undecuple/project-helghast/discussions">Join the discussion</a> (posting needs a GitHub account).</p>
 </section>
-</aside>
-</div>
+</section>
+<section id="about" class="sec" aria-labelledby="h-about">
+<h2 id="h-about">About</h2>
+<p class="lede">Built on ps3recomp: PPU and SPU code lifted to C, the RSX command stream replayed on Direct3D 12.</p>
+<p class="meta">how it works · 67 port features</p>
+<p>The port is built on <a href="https://github.com/sp00nznet/ps3recomp">ps3recomp</a> (MIT): the PPU code and the game's SPU programs are lifted to C, the PS3 system libraries the game calls are reimplemented, and the game's RSX command stream is replayed on Direct3D 12. The game's archive is read in place from your dump. It is tested on Windows x64 under Proton; a native Linux build is planned. What comes next: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/ROADMAP.md">the roadmap</a>.</p>
+<p class="more"><a href="https://github.com/undecuple/project-helghast/blob/main/docs/HOW-IT-WORKS.md">The technical overview<span aria-hidden="true"> &gt;</span></a></p>
+<p class="more disc"><a href="https://github.com/undecuple/project-helghast/discussions/categories/announcements">Discuss<span aria-hidden="true"> &gt;</span></a></p>
+</section>
+<section id="channels" class="sec" aria-labelledby="h-channels">
+<h2 id="h-channels">Channels</h2>
+<p class="lede">Source, releases, bug reports and the Discord server.</p>
+<ul class="links">
+<li><a href="https://github.com/undecuple/project-helghast">Source on GitHub</a></li><li><a href="https://github.com/undecuple/project-helghast/releases">Releases</a></li><li><a href="https://github.com/undecuple/project-helghast/issues">Report a problem</a></li><li><a href="https://discord.gg/W8fMT78Q7k">Discord (undecuple server, unofficial fan work)</a></li><li><a href="https://ko-fi.com/P5P615QPPM">Support the project</a></li>
+</ul>
 <p class="divider" aria-hidden="true"><span>Links and friends</span></p>
 <ul class="b88s" aria-label="Buttons">
 <li><a class="b88 b-recomp" href="https://github.com/sp00nznet/ps3recomp" title="ps3recomp, the recompilation toolkit this port is built on" aria-label="ps3recomp, the recompilation toolkit this port is built on"><span>made with</span><b>ps3recomp</b></a></li>
@@ -431,17 +374,21 @@
 <li><a class="b88 b-nogame" href="#legal" title="Nothing of the game is shipped" aria-label="Nothing of the game is shipped"><span>no game</span><b>shipped</b></a></li>
 <li><a class="b88 b-mit" href="https://github.com/undecuple/project-helghast/blob/main/LICENSE" title="The MIT licence" aria-label="The MIT licence"><span>MIT</span><b>licence</b></a></li>
 </ul>
-</div>
-<footer><div class="wrap"><div class="fcols">
-<div><h4 class="h-git">Project</h4><a href="https://github.com/undecuple/project-helghast">Repository</a><a href="https://github.com/undecuple/project-helghast/releases">Releases</a><a href="https://github.com/undecuple/project-helghast/issues">Issues</a></div>
-<div><h4 class="h-req">Docs</h4><a href="https://github.com/undecuple/project-helghast/blob/main/docs/FEATURES.md">Features</a><a href="https://github.com/undecuple/project-helghast/blob/main/docs/ROADMAP.md">Roadmap</a><a href="https://github.com/undecuple/project-helghast/blob/main/docs/HOW-IT-WORKS.md">How it works</a><a href="https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md">Building</a></div>
-<div><h4 class="h-inst">Play</h4><a href="#install">Install</a><a href="#requirements">Requirements</a><a href="https://github.com/undecuple/project-helghast/blob/main/docs/SCREENSHOTS.md">Screenshots</a></div>
-<div><h4 class="h-comm">About</h4><a href="https://github.com/undecuple/project-helghast/blob/main/NOTICE.md">Notice and credits</a><a href="https://github.com/undecuple/project-helghast/blob/main/LICENSE">Licence (MIT)</a><a href="https://ko-fi.com/P5P615QPPM">Support</a></div>
-</div>
-<div id="legal" class="legal">
+</section>
+<section id="legal" class="sec" aria-labelledby="h-legal">
+<h2 id="h-legal">Legal</h2>
+<p class="lede">No game content is distributed. The port's own code is MIT.</p>
 <p>Killzone and Killzone 3 are trademarks of Sony Interactive Entertainment. This project is not affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games; the names are used only to say which game the port runs. &quot;Helghast&quot; is the name of the game&#x27;s own faction; Project Helghast is a fan project, not affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games. No game content is distributed: no disc files, no decrypted or translated game code, no assets and no keys. Players supply their own copy of the game and its 1.14 update.</p>
-<p>The port's own code, tools and documentation are <a href="https://github.com/undecuple/project-helghast/blob/main/LICENSE">MIT</a>. Third-party components and credits: <a href="https://github.com/undecuple/project-helghast/blob/main/NOTICE.md">NOTICE.md</a>.</p>
+<p>The port's own code, tools and documentation are <a href="https://github.com/undecuple/project-helghast/blob/main/LICENSE">MIT</a>. Third-party components and credits: <a href="https://github.com/undecuple/project-helghast/blob/main/NOTICE.md">NOTICE.md</a>. <a href="https://github.com/undecuple/project-helghast/blob/main/docs/PRIVACY.md">Privacy</a>.</p>
 <ul class="marks" aria-label="Platform"><li><b>Windows</b>x64</li><li><b>D3D12</b>renderer</li><li><b>Proton</b>tested</li><li><b>NVIDIA</b>GPUs</li><li><b>MIT</b>licence</li><li><b>No game</b>files shipped</li></ul>
-<p class="credit">Project Helghast by undecuple</p></div></div></footer>
+<p class="credit">Project Helghast by undecuple</p>
+</section>
+</main>
+</div>
+<footer id="foot">
+<p class="legend" aria-hidden="true"><span><kbd>&uarr;</kbd><kbd>&darr;</kbd> select</span><span><kbd>Enter</kbd> open</span><span><kbd>Esc</kbd> back</span></p>
+<p class="fl"><a href="#legal">Legal</a> <a href="https://github.com/undecuple/project-helghast/blob/main/NOTICE.md">Notice and credits</a> <a href="plain.html">Plain page</a></p>
+</footer>
+</div>
 </body>
 </html>

@@ -108,7 +108,8 @@ def main():
     for rel, needles in (("README.md", (names.REPO_URL, (f"# {names.PRODUCT}", f'<h1 align="center">{names.PRODUCT}</h1>'), names.DESCRIPTION, names.CREDIT)),
                          ("NOTICE.md", (names.REPO_URL, names.CREDIT)),
                          ("CITATION.cff", (f'title: "{names.PRODUCT}"', names.REPO_URL, names.DESCRIPTION)),
-                         ("site/index.html", (f'<p class="desc">{names.DESCRIPTION}</p>',)),
+                         ("site/index.html", (f'<p class="lede">{names.DESCRIPTION}</p>',)),
+                         ("site/plain.html", (f'<p class="lede">{names.DESCRIPTION}</p>',)),
                          (".recomp.json", (f'"project": "{names.PRODUCT}"', names.SITE_URL)),
                          ("docs/BUILDING.md", (f"{names.REPO_URL}\n", f"cd {names.REPO_SLUG}\n")),
                          (".github/ISSUE_TEMPLATE/config.yml", (names.REPO_URL,))):

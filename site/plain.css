@@ -1,0 +1,22 @@
+/* plain.html: minimal styling, system fonts, no motion */
+:root { color-scheme: light dark; }
+body { max-width: 52rem; margin: 0 auto; padding: 1rem; font: 1rem/1.5 system-ui, sans-serif; overflow-wrap: anywhere; }
+a { text-underline-offset: 2px; }
+:focus-visible { outline: 3px solid currentColor; outline-offset: 2px; }
+img { max-width: 100%; height: auto; }
+.tw { overflow-x: auto; }
+table { border-collapse: collapse; }
+th, td { border: 1px solid; padding: .2rem .4rem; text-align: left; vertical-align: top; }
+figure { margin: 1rem 0; }
+.gallery { display: block; }
+.sec { margin-top: 2rem; border-top: 1px solid; }
+.bar i { display: inline-block; width: .6em; height: .8em; border: 1px solid; margin-right: 1px; }
+.bar i.on { background: currentColor; }
+.meters, .portal, .clog, .todo, .links, .feed, .marks { padding-left: 1.2rem; }
+.meters li, .marks li { margin: .2rem 0; }
+.box { display: none; }
+.sticker { font-weight: bold; }
+.small, .meta { font-size: .9rem; }
+.thumb { font-weight: bold; margin-right: .5rem; }
+.rt b, .blurb { display: block; }
+.st { font-weight: bold; }

@@ -6,6 +6,7 @@ project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEA
 ## [Unreleased]
 
 ### Added
+- The project website is a console-style front-end menu (sections in a left-hand list, a details panel, controls legend; arrow keys, Enter, Esc, a game pad or touch), and every screenshot opens in an in-page viewer with previous and next, swipe, a counter and a shareable `#shot-N` link. A plain page (`plain.html`) carries the same content with no script and no animation. Without script the main page is still complete. The README follows the same style: red, amber and dark badge colours and divider images between its sections (drawn by `tools/release/draw_dividers.py`, original art).
 - With the 1.14 update, keyboard and mouse players can turn the valve and place the charge in the motion sections (Flooded Pyrrhus burning gate, for example): the mouse points a virtual right stick and Mouse1 grabs, through the game's own controller code (`KZ3_MOUSE_STICK=0` turns this off). Checked with host tests only; not yet tried at the valve in the game.
 - Optional autocomplete for those sections, off by default: set `autocomplete = hold` under `[motion]` in `keybinds.ini`, then holding L3 and R3 together for half a second finishes the valve or charge through the game's own completion, and releasing them returns the normal controls.
 
