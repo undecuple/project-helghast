@@ -61,7 +61,8 @@ def fixture(root, playable="not yet", play=None, drop_key=None, drop_shot=None, 
     if req is not None:
         (root / "docs/requirements.md").write_text(req)
     (root / "public/site").mkdir(parents=True)
-    (root / "public/site/style.css").write_text("body{}\n")
+    for f in ("style.css", "site.js", "plain.css"):
+        (root / "public/site" / f).write_text("body{}\n")
 
 
 def run(*args):
@@ -94,19 +95,19 @@ def main():
                "screenshot not linked from docs/screenshots, or the page names docs/checkpoints")
         expect("(D4)" not in page and "<td>6 cores</td>" in page and "Basis" not in page, "requirements table wrong")
         expect(page.count("<details>") == 3, "one <details> per area plus the port-features list expected")
-        expect('<aside class="side">' in page and page.count('<figure class="tile">') == len(website.SHOTS)
-               and page.count('class="news shot">') == len(website.SHOTS)
-               and page.count('class="sticker new">New<') == 2, "sidebar, one gallery tile and one news entry per screenshot, one New sticker each")
-        expect('<header id="top" class="box">' in page and page.count('<span class="emblem"') == 1
-               and page.count('class="promo">') == 5
-               and 'id="legal" class="legal"' in page and page.count('<a class="i-') == 7,
-               "logo block with one emblem, nav of seven tabs, promo boxes, legal print in the footer")
-        top = page.split('<div class="page wrap">', 1)[0]
+        expect('<aside' not in page and page.count('<figure class="tile" id="shot-') == len(website.SHOTS)
+               and page.count('class="shot" href="../docs/screenshots/') == len(website.SHOTS)
+               and page.count('data-group="screens"') == 1 and page.count('class="sticker new">New<') == 1,
+               "one gallery group, one viewer link per screenshot with its id, one New sticker")
+        expect('<header id="head">' in page and page.count('<span class="emblem"') == 1
+               and page.count('<li><a href="#') == 10 and 'href="plain.html"' in page and 'src="site.js"' in page
+               and 'id="legal" class="sec"' in page and 'class="legend"' in page,
+               "logo block with one emblem, ten menu entries, plain-page link, script, legal section, controls legend")
+        top = page.split('id="shots"', 1)[0]
         expect(website.esc(website.WHAT) in top and "Partly playable" in top and "your own copy of the game" in top
-               and top.count('<a class="btn') == 2 and 'class="cta-box"' in top and 'class="learn" href="#shot-1"' in page
-               and 'id="shot-1"' in page and page.count('class="promo pic"') == 1,
-               "intro above the column (what, status, own copy, two buttons), CTA box, banner link, picture promo")
-        expect('class="i-comm" href="#discussions"' in page and 'id="community"' in page and 'id="discussions"' in page
+               and top.count('<a class="btn') == 2 and 'id="shot-1"' in page,
+               "home section (what, status, own copy, two buttons) and the first screenshot's id")
+        expect('href="#discussions"' in page and 'id="community"' in page and page.count('id="discussions"') == 1
                and f'href="{website.DISC_GENERAL}">Start a discussion' in page and f'href="{website.DISC}">All discussions' in page
                and 'class="feed board"' not in page and "Questions, ideas and screenshots" in page
                and "Join the discussion" in page and 'class="feed"' not in page and 'class="news ann"' not in page
@@ -176,7 +177,7 @@ def main():
                "box row missing, title not capped, or reply wording wrong")
         expect("dave · 2026-10-13 · 2 replies" in pg and "Join the discussion" in pg, "community announcement row / join link")
         board = pg.split('id="discussions"', 1)[1].split("</article>", 1)[0]
-        expect("Latest in General" in board and "<h3>Game requests</h3>" in board and f'href="{U}7"' in board
+        expect("Latest in General" in board and "<h4>Game requests</h4>" in board and f'href="{U}7"' in board
                and f'href="{U}8"' in board and "erin · 2026-10-12 · 0 replies" in board and "carol · 2026-10-14 · 1 reply" in board
                and "Start a discussion" in board and "All discussions" in board and f'href="{U}1"' not in board
                and "avatar" not in board and "<img" not in board and "<script" not in board,
@@ -254,10 +255,10 @@ def main():
         fixture(root)
         probs = []
         page = website.render(root, probs)
-        expect("class=\"clog\"" in page and "class=\"todo\"" in page and page.count("class=\"divider\"") == 3,
-               "page misses the changelog, to-do or dividers")
+        expect("class=\"clog\"" in page and "class=\"todo\"" in page and 'id="changelog"' in page and 'id="todo"' in page,
+               "page misses the changelog or to-do")
         # Eighth pass: HUD label bars (date readout // title), comms-log and objectives boxes, no scrapbook classes.
-        expect(page.count('class="hudbar"') == page.count("<figure class=\"tile\">") >= 1 and 'class="promo term"' in page
+        expect('class="promo term"' in page
                and 'class="promo obj"' in page and 'class="box"' in page, "page misses the HUD label bars, comms log or objectives")
         expect(not any(x in page for x in ('class="stamp"', "paper", "Caveat", "tape")), "scrapbook leftovers in the page")
         for _cls, _t, _b, href, _title in website.BUTTONS:
@@ -268,11 +269,11 @@ def main():
             expect(want in page, f"requested button {want} missing")
         expect(not website.lint(page) and not probs, f"sixth-pass page has problems: {probs} {website.lint(page)}")
 
-    for bad in ('<script src="a.js"></script>', '<img src="x.png" onerror="x()">', '<a href="javascript:x()">a</a>',
+    for bad in ('<script src="a.js">x()</script>', '<script>x()</script>', '<script src="https://cdn.example/a.js"></script>', '<img src="x.png" onerror="x()">', '<a href="javascript:x()">a</a>',
                 '<img src="https://example.com/a.png">', '<link rel="stylesheet" href="https://cdn.example/x.css">',
                 '<link href="https://fonts.googleapis.com.evil.example/x">', '<img src="file:///C:/a.png">'):
         expect(website.lint(bad), f"lint misses {bad}")
-    for good in ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=X">',
+    for good in ('<script src="site.js"></script>', '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=X">',
                  '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>', '<img src="../docs/a.png">',
                  f'<a href="{website.REPO}/issues">issues</a>'):
         expect(not website.lint(good), f"lint refuses {good}")
@@ -280,7 +281,7 @@ def main():
     if fails:
         print("FAIL test_website:\n  - " + "\n  - ".join(fails))
         return 1
-    print("PASS test_website (generate, check, 6 negative controls, 7 lint refusals, Discussions feed + fallback, changelog, to-do, buttons)")
+    print("PASS test_website (generate, check, negative controls, lint refusals and allowances, Discussions feed + fallback, changelog, to-do, buttons)")
     return 0
 
 

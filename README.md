@@ -8,17 +8,17 @@
 <p align="center"><b>Killzone 3 // Unofficial PC Port (static recompilation)</b></p>
 
 <p align="center">
-  <a href="https://github.com/undecuple/project-helghast/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/undecuple/project-helghast/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://github.com/undecuple/project-helghast/releases"><img alt="Release" src="https://img.shields.io/github/v/release/undecuple/project-helghast?include_prereleases&label=release"></a>
-  <a href="https://github.com/undecuple/project-helghast/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/undecuple/project-helghast/total"></a>
-  <a href="LICENSE"><img alt="Licence" src="https://img.shields.io/github/license/undecuple/project-helghast"></a>
+  <a href="https://github.com/undecuple/project-helghast/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/undecuple/project-helghast/ci.yml?label=CI&style=flat-square&labelColor=0a0909"></a>
+  <a href="https://github.com/undecuple/project-helghast/releases"><img alt="Release" src="https://img.shields.io/github/v/release/undecuple/project-helghast?include_prereleases&label=release&style=flat-square&labelColor=0a0909&color=d9a21b"></a>
+  <a href="https://github.com/undecuple/project-helghast/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/undecuple/project-helghast/total?style=flat-square&labelColor=0a0909&color=d61c14"></a>
+  <a href="LICENSE"><img alt="Licence" src="https://img.shields.io/github/license/undecuple/project-helghast?style=flat-square&labelColor=0a0909&color=d61c14"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/undecuple/project-helghast/commits"><img alt="Last commit" src="https://img.shields.io/github/last-commit/undecuple/project-helghast"></a>
-  <a href="https://github.com/undecuple/project-helghast/issues"><img alt="Open issues" src="https://img.shields.io/github/issues/undecuple/project-helghast"></a>
-  <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows%20x64-blue">
-  <img alt="Renderer: Direct3D 12" src="https://img.shields.io/badge/renderer-Direct3D%2012-blue">
+  <a href="https://github.com/undecuple/project-helghast/commits"><img alt="Last commit" src="https://img.shields.io/github/last-commit/undecuple/project-helghast?style=flat-square&labelColor=0a0909&color=d61c14"></a>
+  <a href="https://github.com/undecuple/project-helghast/issues"><img alt="Open issues" src="https://img.shields.io/github/issues/undecuple/project-helghast?style=flat-square&labelColor=0a0909&color=d61c14"></a>
+  <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows%20x64-d61c14?style=flat-square&labelColor=0a0909">
+  <img alt="Renderer: Direct3D 12" src="https://img.shields.io/badge/renderer-Direct3D%2012-d61c14?style=flat-square&labelColor=0a0909">
 </p>
 
 <p align="center">
@@ -30,7 +30,7 @@
   <a href="docs/BUILDING.md">Build from source</a>
 </p>
 
----
+<p align="center"><img src="docs/assets/divider-frame.png" width="900" alt=""></p>
 
 A native PC port of Killzone 3, made by static recompilation on ps3recomp; you need your own US disc (BCUS98234) dump and the 1.14 update. It is not an emulator and not a rewrite ([how it works](docs/HOW-IT-WORKS.md)).
 
@@ -38,7 +38,7 @@ A native PC port of Killzone 3, made by static recompilation on ps3recomp; you n
 
 Screenshots of the current build, by milestone: [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md).
 
----
+<p align="center"><img src="docs/assets/divider-rule.png" width="900" alt=""></p>
 
 ## Compatibility
 
@@ -50,7 +50,7 @@ Screenshots of the current build, by milestone: [docs/SCREENSHOTS.md](docs/SCREE
 
 "Verified" means a run on that setup; "implemented" means the code is in but not run there; "planned" means neither. Speed figures (about 22-23 frames/s in a busy Frozen Shores window, 1920x1080, means of alternated runs on 2026-10-27, under Proton) are in [docs/STATUS.md](docs/STATUS.md). Feature by feature: [docs/FEATURES.md](docs/FEATURES.md).
 
----
+<p align="center"><img src="docs/assets/divider-rule.png" width="900" alt=""></p>
 
 ## Download and install
 
@@ -70,7 +70,7 @@ What each must contain: [docs/GETTING-FILES.md](docs/GETTING-FILES.md); regions,
 
 Do not install into a OneDrive folder. Saves and settings: [docs/INSTALL.md](docs/INSTALL.md). Changes per version: [CHANGELOG.md](CHANGELOG.md). Nothing goes online unless you turn it on: [docs/PRIVACY.md](docs/PRIVACY.md).
 
----
+<p align="center"><img src="docs/assets/divider-rule.png" width="900" alt=""></p>
 
 ## Settings and known issues
 
@@ -83,19 +83,19 @@ Display, input and frame-rate settings are in the game's Options menu; the list 
 
 All of them: [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
----
+<p align="center"><img src="docs/assets/divider-rule.png" width="900" alt=""></p>
 
 ## Reporting bugs
 
 Use the [issue forms](.github/ISSUE_TEMPLATE) (bug report, performance report, feature request, feedback). Check [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) first, and leave game files, keys and links to pirated copies out of issues and logs.
 
----
+<p align="center"><img src="docs/assets/divider-rule.png" width="900" alt=""></p>
 
 ## Building
 
 Building from source is described in [docs/BUILDING.md](docs/BUILDING.md) (repository layout: [docs/BUILDING.md](docs/BUILDING.md#repository-layout)). The installer does the same build on your machine from your own game files.
 
----
+<p align="center"><img src="docs/assets/divider-hazard.png" width="900" alt=""></p>
 
 ## Credits, licence and related projects
 

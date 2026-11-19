@@ -6,7 +6,8 @@ it; public/site/style.css is hand-written. The export ships public/site/ as site
 docs/screenshots/ (public/docs/screenshots/: the curated copies of chosen checkpoints, listed in
 public/docs/SCREENSHOTS.md), which the page's screenshots point at (../docs/screenshots/); docs/checkpoints/ stays
 private. Publishing happens at the public release.
-item 3. The page loads no scripts; the only outside resource is the Google Fonts stylesheet (and its font files).
+item 3. The only script is the same-origin site.js (optional: the page is complete without it); the only outside resource
+is the Google Fonts stylesheet (and its font files). plain.html (same sections, plain.css, no script, no fonts) is written next to it.
 
     python3 tools/release/website.py            # regenerate public/site/index.html
     python3 tools/release/website.py --check    # exit 1 when the page is stale, a screenshot or key feature row is
@@ -29,6 +30,7 @@ import names  # noqa: E402  (product name, wordmark, links: tools/release/names.
 import discussions_feed  # noqa: E402  (validated Discussions snapshot: tools/release/discussions_feed.py)
 
 PAGE = "public/site/index.html"
+PLAIN = "plain.html"   # next to the index page: the same sections as a simple document
 REQ = "docs/requirements.md"
 REPO = names.REPO_URL
 DESC = names.DESCRIPTION   # the findable description line
@@ -177,7 +179,7 @@ def feed_news(items):
         if i["category"] != "Announcements" or i["author"].lower() != names.OWNER.lower():
             continue
         n = i["replies"]
-        out += (f"<article class=\"news ann\">\n<h2>{esc(i['title'])}</h2>\n"
+        out += (f"<article class=\"news ann\">\n<h3>{esc(i['title'])}</h3>\n"
                 f"<p class=\"meta\">by {esc(i['author'])} · {esc(i['created'])} · {n} comment{'' if n == 1 else 's'}</p>\n"
                 + discuss(i["url"]) + "</article>\n")
     return out
@@ -199,13 +201,13 @@ def board_list(items, category, n):
 def discussions_board(items):
     """The Discussions tab's section: latest General threads and a smaller Game Requests list, from the validated snapshot
     (titles, logins, dates, counts only; no bodies, avatars, images or scripts). Without a snapshot: the static links."""
-    w = ["<article id=\"discussions\" class=\"news board\">\n<h2>Discussions</h2>\n"
+    w = ["<article class=\"news board\">\n<h3>Discussions</h3>\n"
          "<p class=\"meta\">on GitHub · General and game requests</p>\n"]
     gen, req = board_list(items, "General", 6), board_list(items, "Game Requests", 4)
     if gen:
-        w.append("<h3>Latest in General</h3>\n" + gen)
+        w.append("<h4>Latest in General</h4>\n" + gen)
     if req:
-        w.append("<h3>Game requests</h3>\n" + req)
+        w.append("<h4>Game requests</h4>\n" + req)
     if not (gen or req):
         w.append("<p>Questions, ideas and screenshots of your own runs are welcome in the project's discussions on GitHub "
                  "(posting needs a GitHub account).</p>\n")
@@ -219,7 +221,7 @@ def discussions_board(items):
 def community_box(items):
     """Sidebar box: the latest allowlisted discussions as plain rows, or the static link when there are none."""
     items = [i for i in items if i["category"] in ("Announcements", "Q&A")][:5]    # General and requests are on the board
-    w = ["<section id=\"community\" class=\"promo\">\n<h2>From the community</h2>\n"]
+    w = ["<section id=\"community\" class=\"promo\">\n<h3>From the community</h3>\n"]
     if items:
         w.append("<ul class=\"feed\">\n")
         for i in items:
@@ -297,14 +299,14 @@ EMBLEM_SVG = ("<svg viewBox=\"0 0 100 70\" focusable=\"false\"><polygon class=\"
 
 def hud_boxes(root, rows):
     """The 'Changelog' comms log and the 'Objectives' list (the ids keep the old anchors #changelog and #todo)."""
-    o = ["<section id=\"changelog\" class=\"promo term\">\n<h2>Changelog</h2>\n<ul class=\"clog\">\n"]
+    o = ["<section id=\"changelog\" class=\"promo term\">\n<h3>Changelog</h3>\n<ul class=\"clog\">\n"]
     log = changelog(root)
     for d, t in log:
         o.append(f"<li><time datetime=\"{d}\">{d[5:]}</time><span>{esc(t)}</span></li>\n")
     if not log:
         o.append("<li>No dated entries yet.</li>\n")
     o.append(f"</ul>\n<p class=\"small\">Newest first; the full list is in <a href=\"{REPO}/blob/main/CHANGELOG.md\">CHANGELOG.md</a>.</p>\n</section>\n"
-             "<section id=\"todo\" class=\"promo obj\">\n<h2>Objectives</h2>\n<ul class=\"todo\">\n")
+             "<section id=\"todo\" class=\"promo obj\">\n<h3>Objectives</h3>\n<ul class=\"todo\">\n")
     for f, st in todo(rows):
         o.append(f"<li class=\"o-{esc(st.replace(' ', '-'))}\"><span class=\"box\" aria-hidden=\"true\"></span>{esc(f)} <em>({esc(st)})</em></li>\n")
     o.append("</ul>\n<p class=\"small\">The next objectives still open; all of them: "
@@ -321,66 +323,8 @@ def button_strip():
     return "".join(o)
 
 
-def render(root, problems, feed=()):
-    rows = features.read_rows(root)
-    cps = features.checkpoints(root)
-    ps3 = [r for r in rows if r["kind"] == "ps3"]
-    port = [r for r in rows if r["kind"] == "port"]
-    by_name = {r["feature"]: r for r in ps3}
-    counts = {s: sum(1 for r in ps3 if r["status"] == s) for s in features.PS3_ORDER}
-    playable = by_name.get(PLAYABLE_ROW)
-    if playable is None:
-        problems.append(f"feature row '{PLAYABLE_ROW}' missing in {features.DATA}")
-    headline = headline_for(by_name)
-    readme = pub(root, "public/README.md")
-    if readme.exists():   # the public README says the same as the site
-        line = next((l for l in readme.read_text(encoding="utf-8").splitlines() if "**Status:" in l), "")
-        if headline.lower() not in line.lower():
-            problems.append(f"public/README.md status line does not say '{headline}' (from {features.DATA}): {line[:80]!r}")
-
-    o = []
-    w = o.append
-    w("<!DOCTYPE html>\n" + HEADER + "\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
-      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-      "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; script-src 'none'; "
-      "style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:\">\n"
-      f"<title>{esc(names.PRODUCT)} (work in progress)</title>\n"
-      f"<meta name=\"description\" content=\"{esc(names.PRODUCT)}. {esc(DESC)}: a fan-made PC port of the PS3 game by static recompilation. "
-      "Bring your own copy of the game.\">\n"
-      "<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n"
-      "<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n"
-      f"<link rel=\"stylesheet\" href=\"{esc(FONTS)}\">\n"
-      "<link rel=\"stylesheet\" href=\"style.css\">\n</head>\n<body>\n")
-    # Layout (fifth pass layout, seventh pass brand): a dark logo band (emblem, red tag box, PROJECT HELGHAST wordmark,
-    # tagline), a slim utility bar above it, one wide nav bar of
-    # text tabs ending in a lit call-to-action box, then the framed intro (what this is, status, own-copy
-    # line, two buttons) so all of it sits above the fold. Then one framed column: the screens (newest as a large
-    # feature banner with a caption overlay and a "Learn more" button, the others large below it), news-style
-    # entries (main) and framed promo boxes (sidebar), and a footer with four link columns, legal print and the
-    # platform marks. Everything stacks on phones (style.css).
-    tabs = (("i-home on", "#top", "Home"), ("i-shots", "#shots", "Screens"), ("i-status", "#status", "Status"),
-            ("i-req", "#requirements", "Requirements"), ("i-inst", "#install", "Install"),
-            ("i-comm", "#discussions", "Discussions"), ("i-git", REPO, "GitHub"))
-    links = "".join(f"<a class=\"{c}\" href=\"{esc(h)}\">{t}</a>" for c, h, t in tabs)
-    w("<header id=\"top\" class=\"box\">\n<div class=\"logo\"><span class=\"emblem\" aria-hidden=\"true\">" + EMBLEM_SVG + "</span>"
-      f"<div class=\"wm\"><p class=\"tag\">{esc(names.TAG)}</p>"
-      f"<h1>{esc(names.WORDMARK[0])}<span>{esc(names.WORDMARK[1])}</span></h1></div>"
-      "<span class=\"sticker wip\">WIP</span>"
-      "<p class=\"slogan\">Built on your PC<br>from your own game</p></div>\n"
-      f"<ul class=\"util\"><li><a href=\"{REPO}\">GitHub</a></li><li><a href=\"{esc(DISC)}\">Discussions</a></li>"
-      f"<li><a href=\"{REPO}/releases\">Releases</a></li><li><a href=\"#channels\">Channels</a></li></ul>\n"
-      f"<nav class=\"tabs\">{links}<a class=\"cta-box\" href=\"{REPO}\"><b>Source on GitHub</b>"
-      "Read the code, build it yourself</a></nav>\n"
-      f"<div class=\"intro\">\n<p class=\"desc\">{esc(DESC)}</p>\n<p class=\"what\">{esc(WHAT)}</p>\n"
-      f"<p class=\"headline\">Status: <strong>{esc(headline)}</strong></p>\n"
-      "<p class=\"note\">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>\n"
-      f"<p class=\"note\">v{names.VERSION} is a pre-release; calling a release playable waits for the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>.</p>\n"
-      f"<p class=\"btns\"><a class=\"btn\" href=\"#status\">See the status</a><a class=\"btn alt\" href=\"{REPO}\">"
-      "Source on GitHub</a></p>\n</div>\n</header>\n<div class=\"page wrap\">\n")
-
-    # Screens, newest first, across the whole column: the newest as the feature banner (caption overlay, "Learn
-    # more" to its news entry), the others as large HUD-framed tiles below it, each with a label bar (date readout // title); each screen
-    # also gets a news entry below the status entry.
+def shot_list(root, cps, problems):
+    """The curated screenshots, newest first: [((y, m, d), '../docs/screenshots/<file>', title, caption)]."""
     shots = []
     for name, title, caption in SHOTS:
         # The public tree ships no checkpoint log (cps is None): every shot is then found in the public collection by
@@ -404,32 +348,63 @@ def render(root, problems, feed=()):
         day = re.match(r"docs/checkpoints/(\d{4})(\d\d)(\d\d)", ref)
         shots.append((day.groups() if day else ("", "", ""), "../docs/screenshots/" + fname, title, caption))
     shots.sort(key=lambda s: s[0], reverse=True)
-    w("<section id=\"shots\" class=\"gallery-pod\">\n<h2>Screens</h2>\n<div class=\"gallery\">\n")
+    return shots
+
+
+def more(href, label="More"):
+    return f"<p class=\"more\"><a href=\"{esc(href)}\">{label}<span aria-hidden=\"true\"> &gt;</span></a></p>\n"
+
+
+def sections(root, problems, feed, plain):
+    """The page's content, once, for both pages: [(id, menu label, detail line, inner html)]. The index shows them as
+    the front-end menu's panels, plain.html as one document; the ids and every link come from here, so the two cannot
+    disagree (tools/release/test_site.py checks the files anyway). plain only changes how a screenshot is drawn."""
+    rows = features.read_rows(root)
+    cps = features.checkpoints(root)
+    ps3 = [r for r in rows if r["kind"] == "ps3"]
+    port = [r for r in rows if r["kind"] == "port"]
+    by_name = {r["feature"]: r for r in ps3}
+    counts = {s: sum(1 for r in ps3 if r["status"] == s) for s in features.PS3_ORDER}
+    playable = by_name.get(PLAYABLE_ROW)
+    if playable is None:
+        problems.append(f"feature row '{PLAYABLE_ROW}' missing in {features.DATA}")
+    headline = headline_for(by_name)
+    readme = pub(root, "public/README.md")
+    if readme.exists():   # the public README says the same as the site
+        line = next((l for l in readme.read_text(encoding="utf-8").splitlines() if "**Status:" in l), "")
+        if headline.lower() not in line.lower():
+            problems.append(f"public/README.md status line does not say '{headline}' (from {features.DATA}): {line[:80]!r}")
+    shots = shot_list(root, cps, problems)
+    secs = []
+
+    # Home: what this is, status, own-copy line, two buttons.
+    secs.append(("top", "Home", esc(DESC),
+                 f"<p class=\"what\">{esc(WHAT)}</p>\n"
+                 f"<p class=\"headline\">Status: <strong>{esc(headline)}</strong></p>\n"
+                 "<p class=\"note\">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>\n"
+                 f"<p class=\"note\">v{names.VERSION} is a pre-release; calling a release playable waits for the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>.</p>\n"
+                 f"<p class=\"btns\"><a class=\"btn\" href=\"#status\">See the status</a><a class=\"btn alt\" href=\"{REPO}\">"
+                 "Source on GitHub</a></p>\n"))
+
+    # Screens, newest first. Each thumbnail is a plain link to the image; site.js turns it into the viewer.
+    g = ["<div class=\"gallery\" data-group=\"screens\">\n"]
     for i, ((y, m, d), src, title, caption) in enumerate(shots):
-        readout = f"{esc(d)}.{esc(m)}.{esc(y)}" if y else "date unknown"
+        date = f"{d}.{m}.{y}" if y else "date unknown"
         new = "<span class=\"sticker new\">New</span>" if i == 0 else ""
-        w(f"<figure class=\"tile\"><div class=\"hudbar\"><span class=\"rd\">{readout}</span><span class=\"sl\" aria-hidden=\"true\">//</span>"
-          f"<span class=\"lv\">{esc(title)}</span>{new}</div>"
-          f"<a href=\"{esc(src)}\"><img src=\"{esc(src)}\" alt=\"{esc(caption)}\" loading=\"lazy\"></a>"
-          f"<figcaption><b>{esc(title)}</b>{esc(caption)}"
-          + ("<a class=\"learn\" href=\"#shot-1\">Learn more</a>" if i == 0 else "") + "</figcaption></figure>\n")
-    w("</div>\n<p class=\"small\">Screenshots of the port running the developer's own copy of the game, kept to "
-      "document progress; the game content in them belongs to Sony Interactive Entertainment and Guerrilla Games. "
-      f"More screenshots, by milestone: <a href=\"{REPO}/blob/main/docs/SCREENSHOTS.md\">SCREENSHOTS.md</a>.</p>\n</section>\n" + divider("Latest news") + "<div class=\"cols\">\n<main class=\"main\">\n")
+        g.append(f"<figure class=\"tile\" id=\"shot-{i + 1}\"><a class=\"shot\" href=\"{esc(src)}\" data-title=\"{esc(title)}\" "
+                 f"data-caption=\"{esc(caption)}\"><img src=\"{esc(src)}\" alt=\"{esc(caption)}\" loading=\"lazy\"></a>"
+                 f"<figcaption><span class=\"rd\">{date}</span> <b>{esc(title)}</b>{new} {esc(caption)}</figcaption></figure>\n")
+    g.append("</div>\n<p class=\"small\">Screenshots of the port running the developer's own copy of the game, kept to "
+             "document progress; the game content in them belongs to Sony Interactive Entertainment and Guerrilla Games. "
+             f"More screenshots, by milestone: <a href=\"{REPO}/blob/main/docs/SCREENSHOTS.md\">SCREENSHOTS.md</a>.</p>\n")
+    secs.append(("shots", "Screens", f"{len(shots)} screenshots of the port running the developer's own copy of the game.", "".join(g)))
 
-    # News entries (title, a "by / date / count" meta line, framed thumbnail at left, short text, "More >" link),
-    # separated by thin rules. The status entry comes first: the key rows as a dense list (framed status block,
-    # title, note, status badge), then the counts as ten-segment bar meters (whole segments, rounded; the number is
-    # always printed) and the full tables.
-    def more(href, label="More"):
-        return f"<p class=\"more\"><a href=\"{esc(href)}\">{label}<span aria-hidden=\"true\"> &gt;</span></a></p>\n"
-
-    w(f"<article id=\"status\" class=\"news\">\n<h2>Status: {esc(headline)}</h2>\n"
-      f"<p class=\"meta\">by the project · generated from the records · {sum(counts.values())} features</p>\n"
-      "<div class=\"nb\"><span class=\"frame pic-status\" aria-hidden=\"true\"></span><div class=\"nt\">"
-      "<p>Generated from the repository's own records (the same data as "
-      f"<a href=\"{REPO}/blob/main/docs/FEATURES.md\">FEATURES.md</a>, where every row has its evidence). "
-      "<em>Works</em> is claimed only with a recorded result.</p></div></div>\n<ul class=\"portal\">\n")
+    # Status: the key rows, the counts as ten-segment bar meters, the full tables, what the port adds.
+    w = [f"<h3>Status: {esc(headline)}</h3>\n"
+         f"<p class=\"meta\">generated from the records · {sum(counts.values())} features</p>\n"
+         "<p>Generated from the repository's own records (the same data as "
+         f"<a href=\"{REPO}/blob/main/docs/FEATURES.md\">FEATURES.md</a>, where every row has its evidence). "
+         "<em>Works</em> is claimed only with a recorded result.</p>\n<ul class=\"portal\">\n"]
     for k in KEY_ROWS:
         r = by_name.get(k)
         if r is None:
@@ -437,138 +412,191 @@ def render(root, problems, feed=()):
             continue
         cls = STATUS_CLASS[r["status"]]
         note = f"<span class=\"blurb\">{inline(r['note'])}</span>" if r["note"] else ""
-        w(f"<li class=\"row\"><span class=\"thumb tb-{cls}\" aria-hidden=\"true\">{STATUS_TAG[r['status']]}</span>"
-          f"<div class=\"rt\"><b>{esc(r['feature'])}</b>{note}</div><div class=\"stats\">{status_badge(r['status'])}</div></li>\n")
-    w("</ul>\n<h3>All features, by status</h3>\n<ul class=\"meters\">\n")
+        w.append(f"<li class=\"row\"><span class=\"thumb tb-{cls}\" aria-hidden=\"true\">{STATUS_TAG[r['status']]}</span>"
+                 f"<div class=\"rt\"><b>{esc(r['feature'])}</b>{note}</div><div class=\"stats\">{status_badge(r['status'])}</div></li>\n")
+    w.append("</ul>\n<h4>All features, by status</h4>\n<ul class=\"meters\">\n")
     total = max(1, sum(counts.values()))
     for s in features.PS3_ORDER:
         lit = round(10 * counts[s] / total)
         if counts[s] and not lit:
             lit = 1
         segs = "<i class=\"on\"></i>" * lit + "<i></i>" * (10 - lit)
-        w(f"<li class=\"m-{STATUS_CLASS[s]}\"><span class=\"ml\">{esc(features.PS3_STATUS[s])}</span>"
-          f"<span class=\"bar\" aria-hidden=\"true\">{segs}</span><b>{counts[s]}</b></li>\n")
-    w("</ul>\n")
+        w.append(f"<li class=\"m-{STATUS_CLASS[s]}\"><span class=\"ml\">{esc(features.PS3_STATUS[s])}</span>"
+                 f"<span class=\"bar\" aria-hidden=\"true\">{segs}</span><b>{counts[s]}</b></li>\n")
+    w.append("</ul>\n")
     areas = []
     for r in ps3:
         if r["area"] not in areas:
             areas.append(r["area"])
     for a in areas:
-        w(f"<details><summary>{esc(a)}</summary>\n<div class=\"tw\"><table>\n"
-          "<thead><tr><th>Feature</th><th>On the PS3</th><th>In the port</th></tr></thead>\n<tbody>\n")
+        w.append(f"<details><summary>{esc(a)}</summary>\n<div class=\"tw\"><table>\n"
+                 "<thead><tr><th>Feature</th><th>On the PS3</th><th>In the port</th></tr></thead>\n<tbody>\n")
         for r in (x for x in ps3 if x["area"] == a):
             note = f"<br><span class=\"small\">{inline(r['note'])}</span>" if r["note"] else ""
-            w(f"<tr><td>{esc(r['feature'])}</td><td>{inline(r['detail'])}</td><td>{status_badge(r['status'])}{note}</td></tr>\n")
-        w("</tbody></table></div></details>\n")
+            w.append(f"<tr><td>{esc(r['feature'])}</td><td>{inline(r['detail'])}</td><td>{status_badge(r['status'])}{note}</td></tr>\n")
+        w.append("</tbody></table></div></details>\n")
     avail = [r for r in port if r["status"] == "available"]
     planned = [r for r in port if r["status"] == "planned"]
-    w(f"<h3>What the port adds</h3>\n<p>{len(avail)} available now, {len(planned)} planned. Changes to gameplay "
-      f"stay optional.</p>\n<details><summary>All {len(avail) + len(planned)} features</summary>\n<div class=\"tw\"><table>\n"
-      "<thead><tr><th>Feature</th><th>State</th><th>Default</th></tr>"
-      "</thead>\n<tbody>\n")
+    w.append(f"<h4>What the port adds</h4>\n<p>{len(avail)} available now, {len(planned)} planned. Changes to gameplay "
+             f"stay optional.</p>\n<details><summary>All {len(avail) + len(planned)} features</summary>\n<div class=\"tw\"><table>\n"
+             "<thead><tr><th>Feature</th><th>State</th><th>Default</th></tr>"
+             "</thead>\n<tbody>\n")
     for r in avail + planned:
-        w(f"<tr><td>{esc(r['feature'])}</td><td>{esc(r['status'])}</td><td>{inline(r['evidence'])}</td></tr>\n")
-    w("</tbody></table></div></details>\n" + more(f"{REPO}/blob/main/docs/FEATURES.md", "Every feature, with evidence")
-      + discuss(DISC_ANN) + "</article>\n" + feed_news(feed))
+        w.append(f"<tr><td>{esc(r['feature'])}</td><td>{esc(r['status'])}</td><td>{inline(r['evidence'])}</td></tr>\n")
+    w.append("</tbody></table></div></details>\n" + more(f"{REPO}/blob/main/docs/FEATURES.md", "Every feature, with evidence")
+             + discuss(DISC_ANN) + feed_news(feed))
+    secs.append(("status", "Status", f"Status: {headline}. {counts['works']} of {sum(counts.values())} features work.", "".join(w)))
 
-    for i, ((y, m, d), src, title, caption) in enumerate(shots):
-        new = "<span class=\"sticker new\">New</span>" if i == 0 else ""
-        date = f"{int(d)} {MONTHS[int(m) - 1]} {y}" if y else "date unknown"
-        w(f"<article id=\"shot-{i + 1}\" class=\"news shot\">\n<h2>{esc(title)}</h2>\n"
-          f"<p class=\"meta\">by the port · {esc(date)} · screen {i + 1} of {len(shots)}</p>\n"
-          f"<div class=\"nb\"><a class=\"frame\" href=\"{esc(src)}\"><img src=\"{esc(src)}\" alt=\"\" loading=\"lazy\">{new}</a>"
-          f"<div class=\"nt\"><p>{esc(caption)}. A screenshot of the port running on Windows x64 (tested under "
-          "Proton), drawn by its Direct3D 12 renderer.</p>" + more(src, "Full size") + "</div></div>\n</article>\n")
-
-    w(discussions_board(feed))
-    w("<article id=\"about\" class=\"news\">\n<h2>About the port</h2>\n"
-      f"<p class=\"meta\">by the project · how it works · {len(port)} port features</p>\n"
-      "<div class=\"nb\"><span class=\"frame pic-about\" aria-hidden=\"true\"></span><div class=\"nt\">"
-      "<p>The port is built on <a href=\"https://github.com/sp00nznet/ps3recomp\">ps3recomp</a> (MIT): the PPU code "
-      "and the game's SPU programs are lifted to C, the PS3 system libraries the game calls are reimplemented, and "
-      "the game's RSX command stream is replayed on Direct3D 12. The game's archive is read in place from your dump. "
-      "It is tested on Windows x64 under Proton; a native Linux build is planned. "
-      f"What comes next: <a href=\"{REPO}/blob/main/docs/ROADMAP.md\">the roadmap</a>.</p>\n"
-      + more(f"{REPO}/blob/main/docs/HOW-IT-WORKS.md", "The technical overview")
-      + discuss(DISC_ANN) + "</div></div>\n</article>\n"
-      + divider("Progress") + "<div class=\"notes2\">\n" + hud_boxes(root, rows) + "</div>\n")
-
-    # Sidebar: a large picture promo (the second-newest screen, to the install box), then framed promo boxes:
-    # status at a glance, install, requirements, official channels, the community box.
-    pic = shots[1][1] if len(shots) > 1 else (shots[0][1] if shots else "")
-    w("</main>\n<aside class=\"side\">\n"
-      + (f"<a class=\"promo pic\" href=\"#install\"><img src=\"{esc(pic)}\" alt=\"\" loading=\"lazy\">"
-         "<span class=\"pt\">Bring your own copy</span><span class=\"pb\">How to install</span></a>\n" if pic else "")
-      + "<section class=\"promo\">\n<h2>At a glance</h2>\n"
-      f"<p class=\"headline\">Status: <strong>{esc(headline)}</strong></p>\n<ul class=\"glance\">\n")
-    for s in features.PS3_ORDER:
-        w(f"<li>{status_badge(s)} <b>{counts[s]}</b></li>\n")
-    w("</ul>\n<p class=\"small\"><a href=\"#status\">Full status</a></p>\n</section>\n")
-
-    w("<section id=\"install\" class=\"promo\">\n<h2>Install</h2>\n"
-      f"<p class=\"headline\"><strong>v{names.VERSION} pre-release</strong>, partly playable (see the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>).</p>\n"
-      f"<p>Download the installer (recommended) or the portable zip from the <a href=\"{REPO}/releases\">releases page</a> "
-      f"(the <a href=\"{REPO}/releases/tag/v{names.VERSION}\">v{names.VERSION}</a> page lists both). Check the download against SHA256SUMS on the same page. "
-      "You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your "
-      "machine with a bundled compiler, with one progress bar and a full install log; allow about 10 minutes on a fast PC, longer on slower ones. "
-      "Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>\n"
-      f"<p>You can also build the port from source: <a href=\"{REPO}/blob/main/docs/BUILDING.md\">building</a>.</p>\n"
-      "<h3>What goes online</h3>\n<p>Nothing, unless you ask for it: an optional new-version check (one anonymous "
-      "request to GitHub, only when you turn it on), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server "
-      f"you choose. The full list is in the <a href=\"{REPO}/blob/main/docs/PRIVACY.md\">privacy page</a>.</p>\n"
-      "<p class=\"small\">The original PS3 game's online play is kept running by the PS Rewired community "
-      f"(<a href=\"{PSREWIRED}\">their Killzone 3 page</a>). This port is not affiliated with or endorsed by PS Rewired "
-      "and does not connect to their servers.</p>\n"
-      "<p class=\"small\">Viewing this website loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit; "
-      "the repository, installer and game do not.</p>\n"
-      f"<p class=\"small\">Install questions: <a href=\"{esc(DISC_QA)}\">Q&amp;A discussions</a>.</p>\n</section>\n")
-
-    w("<section id=\"requirements\" class=\"promo\">\n<h2>Requirements</h2>\n")
-    reqs = req_tables(root, problems)
-    for title, head, rws in reqs:
-        w(f"<h3>{esc(title)}</h3>\n<div class=\"tw\"><table>\n<thead><tr>"
-          + "".join(f"<th>{inline(h)}</th>" for h in head) + "</tr></thead>\n<tbody>\n")
+    # Requirements.
+    w = []
+    for title, head, rws in req_tables(root, problems):
+        w.append(f"<h4>{esc(title)}</h4>\n<div class=\"tw\"><table>\n<thead><tr>"
+                 + "".join(f"<th>{inline(h)}</th>" for h in head) + "</tr></thead>\n<tbody>\n")
         for rw in rws:
-            w("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in rw) + "</tr>\n")
-        w("</tbody></table></div>\n")
-    w(f"<p class=\"small\">Details and the reasons behind each figure: <a href=\"{REPO}/blob/main/docs/requirements.md\">"
-      "docs/requirements.md</a>. Hardware figures are provisional until the game runs at full speed. "
-      f"Will it run on your machine? <a href=\"{esc(DISC_QA)}\">Ask in Q&amp;A</a>.</p>\n</section>\n"
-      "<section id=\"channels\" class=\"promo\">\n<h2>Official channels</h2>\n<ul class=\"links\">\n"
-      f"<li><a href=\"{REPO}\">Source on GitHub</a></li><li><a href=\"{REPO}/releases\">Releases</a></li>"
-      f"<li><a href=\"{REPO}/issues\">Report a problem</a></li><li><a href=\"https://discord.gg/W8fMT78Q7k\">Discord (undecuple server, unofficial fan work)</a></li>"
-      "<li><a href=\"https://ko-fi.com/P5P615QPPM\">Support the project</a></li>\n"
-      "</ul>\n</section>\n" + community_box(feed)
-      + "</aside>\n</div>\n" + button_strip() + "</div>\n")
+            w.append("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in rw) + "</tr>\n")
+        w.append("</tbody></table></div>\n")
+    w.append(f"<p class=\"small\">Details and the reasons behind each figure: <a href=\"{REPO}/blob/main/docs/requirements.md\">"
+             "docs/requirements.md</a>. Hardware figures are provisional until the game runs at full speed. "
+             f"Will it run on your machine? <a href=\"{esc(DISC_QA)}\">Ask in Q&amp;A</a>.</p>\n")
+    secs.append(("requirements", "Requirements", "What you need from your own copy, and the hardware figures (provisional).", "".join(w)))
 
-    w("<footer><div class=\"wrap\"><div class=\"fcols\">\n"
-      f"<div><h4 class=\"h-git\">Project</h4><a href=\"{REPO}\">Repository</a><a href=\"{REPO}/releases\">Releases</a>"
-      f"<a href=\"{REPO}/issues\">Issues</a></div>\n"
-      f"<div><h4 class=\"h-req\">Docs</h4><a href=\"{REPO}/blob/main/docs/FEATURES.md\">Features</a>"
-      f"<a href=\"{REPO}/blob/main/docs/ROADMAP.md\">Roadmap</a><a href=\"{REPO}/blob/main/docs/HOW-IT-WORKS.md\">How it works</a>"
-      f"<a href=\"{REPO}/blob/main/docs/BUILDING.md\">Building</a></div>\n"
-      f"<div><h4 class=\"h-inst\">Play</h4><a href=\"#install\">Install</a><a href=\"#requirements\">Requirements</a>"
-      f"<a href=\"{REPO}/blob/main/docs/SCREENSHOTS.md\">Screenshots</a></div>\n"
-      f"<div><h4 class=\"h-comm\">About</h4><a href=\"{REPO}/blob/main/NOTICE.md\">Notice and credits</a>"
-      f"<a href=\"{REPO}/blob/main/LICENSE\">Licence (MIT)</a><a href=\"https://ko-fi.com/P5P615QPPM\">Support</a></div>\n"
-      "</div>\n<div id=\"legal\" class=\"legal\">\n<p>Killzone and Killzone 3 are trademarks of Sony Interactive Entertainment. "
-      "This project is not affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games; the names "
-      "are used only to say which game the port runs. " + esc(names.NAME_NOTE) + " No game content is distributed: no "
-      "disc files, no decrypted or translated game code, no assets and no keys. Players supply their own copy of the "
-      "game and its 1.14 update.</p>\n"
-      f"<p>The port's own code, tools and documentation are <a href=\"{REPO}/blob/main/LICENSE\">MIT</a>. "
-      f"Third-party components and credits: <a href=\"{REPO}/blob/main/NOTICE.md\">NOTICE.md</a>.</p>\n"
-      "<ul class=\"marks\" aria-label=\"Platform\"><li><b>Windows</b>x64</li><li><b>D3D12</b>renderer</li>"
-      "<li><b>Proton</b>tested</li><li><b>NVIDIA</b>GPUs</li><li><b>MIT</b>licence</li><li><b>No game</b>files shipped</li></ul>\n"
-      f"<p class=\"credit\">{esc(names.CREDIT)}</p></div></div></footer>\n</body>\n</html>\n")
-    return "".join(o)
+    # Install.
+    secs.append(("install", "Install", f"v{names.VERSION} pre-release: the installer or the portable zip, built on your PC from your own copy.",
+        f"<p class=\"headline\"><strong>v{names.VERSION} pre-release</strong>, partly playable (see the <a href=\"{REPO}/blob/main/docs/RELEASE-CRITERIA.md\">release criteria</a>).</p>\n"
+        f"<p>Download the installer (recommended) or the portable zip from the <a href=\"{REPO}/releases\">releases page</a> "
+        f"(the <a href=\"{REPO}/releases/tag/v{names.VERSION}\">v{names.VERSION}</a> page lists both). Check the download against SHA256SUMS on the same page. "
+        "You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your "
+        "machine with a bundled compiler, with one progress bar and a full install log; allow about 10 minutes on a fast PC, longer on slower ones. "
+        "Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>\n"
+        f"<p>You can also build the port from source: <a href=\"{REPO}/blob/main/docs/BUILDING.md\">building</a>.</p>\n"
+        "<h4>What goes online</h4>\n<p>Nothing, unless you ask for it: an optional new-version check (one anonymous "
+        "request to GitHub, only when you turn it on), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server "
+        f"you choose. The full list is in the <a href=\"{REPO}/blob/main/docs/PRIVACY.md\">privacy page</a>.</p>\n"
+        "<p class=\"small\">The original PS3 game's online play is kept running by the PS Rewired community "
+        f"(<a href=\"{PSREWIRED}\">their Killzone 3 page</a>). This port is not affiliated with or endorsed by PS Rewired "
+        "and does not connect to their servers.</p>\n"
+        + ("" if plain else "<p class=\"small\">Viewing this website loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit; "
+           "the repository, installer and game do not. The plain page loads no fonts.</p>\n")
+        + f"<p class=\"small\">Install questions: <a href=\"{esc(DISC_QA)}\">Q&amp;A discussions</a>.</p>\n"))
+
+    # Progress: changelog and objectives.
+    secs.append(("progress", "Progress", "The newest changelog entries and the objectives still open.", hud_boxes(root, rows)))
+
+    # Discussions and the community box.
+    secs.append(("discussions", "Discussions", "Questions, ideas and game requests, on GitHub Discussions.",
+                 discussions_board(feed) + community_box(feed)))
+
+    # About.
+    secs.append(("about", "About", "Built on ps3recomp: PPU and SPU code lifted to C, the RSX command stream replayed on Direct3D 12.",
+        f"<p class=\"meta\">how it works · {len(port)} port features</p>\n"
+        "<p>The port is built on <a href=\"https://github.com/sp00nznet/ps3recomp\">ps3recomp</a> (MIT): the PPU code "
+        "and the game's SPU programs are lifted to C, the PS3 system libraries the game calls are reimplemented, and "
+        "the game's RSX command stream is replayed on Direct3D 12. The game's archive is read in place from your dump. "
+        "It is tested on Windows x64 under Proton; a native Linux build is planned. "
+        f"What comes next: <a href=\"{REPO}/blob/main/docs/ROADMAP.md\">the roadmap</a>.</p>\n"
+        + more(f"{REPO}/blob/main/docs/HOW-IT-WORKS.md", "The technical overview") + discuss(DISC_ANN)))
+
+    # Channels and the link buttons.
+    secs.append(("channels", "Channels", "Source, releases, bug reports and the Discord server.",
+        "<ul class=\"links\">\n"
+        f"<li><a href=\"{REPO}\">Source on GitHub</a></li><li><a href=\"{REPO}/releases\">Releases</a></li>"
+        f"<li><a href=\"{REPO}/issues\">Report a problem</a></li><li><a href=\"https://discord.gg/W8fMT78Q7k\">Discord (undecuple server, unofficial fan work)</a></li>"
+        "<li><a href=\"https://ko-fi.com/P5P615QPPM\">Support the project</a></li>\n</ul>\n" + button_strip()))
+
+    # Legal.
+    secs.append(("legal", "Legal", "No game content is distributed. The port's own code is MIT.",
+        "<p>Killzone and Killzone 3 are trademarks of Sony Interactive Entertainment. "
+        "This project is not affiliated with or endorsed by Sony Interactive Entertainment or Guerrilla Games; the names "
+        "are used only to say which game the port runs. " + esc(names.NAME_NOTE) + " No game content is distributed: no "
+        "disc files, no decrypted or translated game code, no assets and no keys. Players supply their own copy of the "
+        "game and its 1.14 update.</p>\n"
+        f"<p>The port's own code, tools and documentation are <a href=\"{REPO}/blob/main/LICENSE\">MIT</a>. "
+        f"Third-party components and credits: <a href=\"{REPO}/blob/main/NOTICE.md\">NOTICE.md</a>. "
+        f"<a href=\"{REPO}/blob/main/docs/PRIVACY.md\">Privacy</a>.</p>\n"
+        "<ul class=\"marks\" aria-label=\"Platform\"><li><b>Windows</b>x64</li><li><b>D3D12</b>renderer</li>"
+        "<li><b>Proton</b>tested</li><li><b>NVIDIA</b>GPUs</li><li><b>MIT</b>licence</li><li><b>No game</b>files shipped</li></ul>\n"
+        f"<p class=\"credit\">{esc(names.CREDIT)}</p>\n"))
+    return secs, headline
+
+
+def head(title_extra, csp_fonts, css, script):
+    return ("<!DOCTYPE html>\n" + HEADER + "\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "<meta name=\"color-scheme\" content=\"dark light\">\n"
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; script-src 'self'; "
+            + ("style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; " if csp_fonts else "style-src 'self'; ")
+            + "img-src 'self' data:\">\n"
+            f"<title>{esc(names.PRODUCT)}{title_extra}</title>\n"
+            f"<meta name=\"description\" content=\"{esc(names.PRODUCT)}. {esc(DESC)}: a fan-made PC port of the PS3 game by static recompilation. "
+            "Bring your own copy of the game.\">\n"
+            + ("<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n"
+               "<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n"
+               f"<link rel=\"stylesheet\" href=\"{esc(FONTS)}\">\n" if csp_fonts else "")
+            + f"<link rel=\"stylesheet\" href=\"{css}\">\n"
+            + (f"<script src=\"{script}\"></script>\n" if script else "") + "</head>\n")
+
+
+UTIL = (("GitHub", REPO), ("Discussions", DISC), ("Releases", REPO + "/releases"))
+
+
+def render(root, problems, feed=()):
+    """The index page: a console-style front-end menu. Without script every section is shown in one column under a
+    plain list of section links; site.js (same origin, optional) turns the list into the menu and shows one section
+    at a time, adds the screenshot viewer, and reads the arrow keys and a game pad."""
+    secs, headline = sections(root, problems, feed, plain=False)
+    w = [head(" (work in progress)", True, "style.css", "site.js")]
+    w.append("<body>\n<a class=\"skip\" href=\"#panel\">Skip to the content</a>\n<div id=\"app\">\n"
+             "<header id=\"head\">\n<div class=\"logo\"><span class=\"emblem\" aria-hidden=\"true\">" + EMBLEM_SVG + "</span>"
+             f"<div class=\"wm\"><p class=\"tag\">{esc(names.TAG)}</p>"
+             f"<h1>{esc(names.WORDMARK[0])}<span>{esc(names.WORDMARK[1])}</span></h1></div>"
+             "<span class=\"sticker wip\">WIP</span></div>\n<ul class=\"util\">"
+             + "".join(f"<li><a href=\"{esc(h)}\">{t}</a></li>" for t, h in UTIL)
+             + "<li><a class=\"plainlink\" href=\"plain.html\">Plain page</a></li></ul>\n</header>\n"
+             "<div class=\"frontend\">\n<nav id=\"menu\" aria-label=\"Sections\">\n<ol>\n")
+    for i, (sid, label, detail, _body) in enumerate(secs):
+        w.append(f"<li><a href=\"#{sid}\" data-detail=\"{esc(detail)}\"><span class=\"mi-n\">{i + 1:02d}</span>"
+                 f"<span class=\"mi-l\">{esc(label)}</span></a></li>\n")
+    w.append("</ol>\n<div id=\"detail\" class=\"detail\" aria-live=\"polite\"></div>\n</nav>\n<main id=\"panel\" tabindex=\"-1\">\n")
+    for sid, label, detail, body in secs:
+        w.append(f"<section id=\"{sid}\" class=\"sec\" aria-labelledby=\"h-{sid}\">\n<h2 id=\"h-{sid}\">{esc(label)}</h2>\n"
+                 f"<p class=\"lede\">{detail}</p>\n{body}</section>\n")
+    w.append("</main>\n</div>\n<footer id=\"foot\">\n"
+             "<p class=\"legend\" aria-hidden=\"true\"><span><kbd>&uarr;</kbd><kbd>&darr;</kbd> select</span>"
+             "<span><kbd>Enter</kbd> open</span><span><kbd>Esc</kbd> back</span></p>\n"
+             f"<p class=\"fl\"><a href=\"#legal\">Legal</a> <a href=\"{REPO}/blob/main/NOTICE.md\">Notice and credits</a> "
+             f"<a href=\"plain.html\">Plain page</a></p>\n</footer>\n</div>\n</body>\n</html>\n")
+    return "".join(w)
+
+
+def render_plain(root, problems, feed=()):
+    """plain.html: the same sections as one simple document (own stylesheet plain.css, no script, no web fonts)."""
+    secs, headline = sections(root, problems, feed, plain=True)
+    w = [head(" (plain page)", False, "plain.css", None)]
+    w.append("<body>\n<header id=\"head\">\n"
+             f"<h1>{esc(names.WORDMARK[0])} {esc(names.WORDMARK[1])}</h1>\n<p>{esc(names.TAG)}. "
+             "This is the plain page: the same content as the <a href=\"index.html\">main page</a>, with no menu, "
+             "no script and no animation.</p>\n<p><a href=\"index.html\">Main page</a> · "
+             + " · ".join(f"<a href=\"{esc(h)}\">{t}</a>" for t, h in UTIL) + "</p>\n<nav aria-label=\"Sections\"><ul>\n")
+    for sid, label, _d, _b in secs:
+        w.append(f"<li><a href=\"#{sid}\">{esc(label)}</a></li>\n")
+    w.append("</ul></nav>\n</header>\n<main>\n")
+    for sid, label, detail, body in secs:
+        w.append(f"<section id=\"{sid}\" class=\"sec\" aria-labelledby=\"h-{sid}\">\n<h2 id=\"h-{sid}\">{esc(label)}</h2>\n"
+                 f"<p class=\"lede\">{detail}</p>\n{body}</section>\n")
+    w.append("</main>\n<footer><p><a href=\"index.html\">Back to the main page</a> · <a href=\"#head\">Top</a></p></footer>\n</body>\n</html>\n")
+    return "".join(w)
 
 
 def lint(page):
-    """Problems with what the page would load: scripts, and resources from anywhere but itself and Google Fonts."""
+    """Problems with what a page would load: scripts other than a same-origin file, inline handlers, and resources from
+    anywhere but itself and Google Fonts."""
     problems = []
-    if re.search(r"<script\b|\bon\w+\s*=|javascript:", page, re.I):
-        problems.append("page contains a script or an event handler")
+    if re.search(r"\bon\w+\s*=|javascript:", page, re.I):
+        problems.append("page contains an inline event handler or a javascript: URL")
+    for m in re.finditer(r"<script\b([^>]*)>(.*?)</script>|<script\b[^>]*>", page, re.I | re.S):
+        src = re.search(r"\bsrc=\"([^\"]+)\"", m.group(1) or "")
+        if not src or re.match(r"[a-z]+:|//", src.group(1), re.I) or (m.group(2) or "").strip():
+            problems.append("page has an inline script or one that is not a same-origin file")
     for m in re.finditer(r"<(link|img|iframe|source|video|audio|embed|object)\b[^>]*?\b(?:href|src)=\"([^\"]+)\"", page, re.I):
         tag, url = m.group(1).lower(), m.group(2)
         if re.match(r"[a-z]+:|//", url, re.I) and not ALLOWED_EXTERNAL.match(url):
@@ -593,20 +621,28 @@ def main(argv=None):
     except (ValueError, OSError) as e:
         print(f"website: {e}", file=sys.stderr)
         return 1
-    problems += lint(page)
+    try:
+        plain = render_plain(root, [], discussions_feed.load(a.feed) if a.feed else ())
+    except (ValueError, OSError) as e:
+        print(f"website: {e}", file=sys.stderr)
+        return 1
+    problems += lint(page) + ["plain.html: " + p for p in lint(plain)]
     out = pub(root, PAGE)   # the public tree: public/site/ is site/ there
     if a.feed and not a.out:
         print("website: --feed needs --out (the committed page is always the static one)", file=sys.stderr)
         return 1
     if a.out:
         out = pathlib.Path(a.out)
+    plain_out = out.parent / PLAIN
     if a.check:
-        if not out.exists():
-            problems.append(f"{PAGE} missing (run tools/release/website.py)")
-        elif out.read_text(encoding="utf-8") != page:
-            problems.append(f"{PAGE} is stale (run tools/release/website.py)")
-        if not (out.parent / "style.css").exists():
-            problems.append(f"{out.parent.relative_to(root)}/style.css missing")
+        for f, text in ((out, page), (plain_out, plain)):
+            if not f.exists():
+                problems.append(f"{f.name} missing (run tools/release/website.py)")
+            elif f.read_text(encoding="utf-8") != text:
+                problems.append(f"{f.name} is stale (run tools/release/website.py)")
+        for extra in ("style.css", "site.js", "plain.css"):
+            if not (out.parent / extra).exists():
+                problems.append(f"{out.parent.relative_to(root)}/{extra} missing")
     if problems:
         print("website: problems:", file=sys.stderr)
         for p in problems:
@@ -615,8 +651,9 @@ def main(argv=None):
     if not a.check:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(page, encoding="utf-8")
+        plain_out.write_text(plain, encoding="utf-8")
     if not a.q:
-        print(f"website: {'OK' if a.check else PAGE} ({len(page)} bytes)")
+        print(f"website: {'OK' if a.check else PAGE} ({len(page)} bytes, plain.html {len(plain)} bytes)")
     return 0
 
 

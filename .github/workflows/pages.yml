@@ -53,7 +53,7 @@ jobs:
           mkdir -p _site/docs && cp -a docs/screenshots _site/docs/screenshots
           touch _site/.nojekyll
           printf '%s\n' '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=site/"><title>Redirect</title><a href="site/">site/</a>' > _site/index.html
-          test -s _site/site/index.html
+          test -s _site/site/index.html && test -s _site/site/plain.html && test -s _site/site/site.js
       - name: Discussions board snapshot (optional, never fails the build)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # read by discussions_feed.py only
