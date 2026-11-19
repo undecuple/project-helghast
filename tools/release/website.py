@@ -318,7 +318,7 @@ def button_strip():
     o = [divider("Links and friends") + "<ul class=\"b88s\" aria-label=\"Buttons\">\n"]
     for cls, top, bot, href, title in BUTTONS:
         o.append(f"<li><a class=\"b88 {cls}\" href=\"{esc(href)}\" title=\"{esc(title)}\" aria-label=\"{esc(title)}\">"
-                 f"<span>{esc(top)}</span><b>{esc(bot)}</b></a></li>\n")
+                 f"<span>{esc(top)}</span> <b>{esc(bot)}</b></a></li>\n")
     o.append("</ul>\n")
     return "".join(o)
 

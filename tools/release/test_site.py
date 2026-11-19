@@ -74,10 +74,11 @@ def main():
     mutate("css import", "style.css", lambda t: '@import url("https://x.example/a.css");\n' + t, "@import")
     mutate("css external url", "style.css", lambda t: t + "\nbody{background:url(https://x.example/a.png)}\n", "url(")
     mutate("no reduced motion", "style.css", lambda t: t.replace("prefers-reduced-motion", "prefers-x"), "reduced-motion")
+    mutate("button rules dropped", "style.css", lambda t: re.sub(r"\.b88\b", ".gone88", t), "class 'b88' is used")
     if fails:
         print("FAIL test_site:\n  - " + "\n  - ".join(fails))
         return 1
-    print("PASS test_site (committed site clean, 19 planted faults caught; " + "; ".join(notes) + ")")
+    print("PASS test_site (committed site clean, 20 planted faults caught; " + "; ".join(notes) + ")")
     return 0
 
 

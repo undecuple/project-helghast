@@ -17,6 +17,9 @@ project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEA
 - The first-run check names a wrong region, a wrong game version, an encrypted file, or an unknown or modified `EBOOT` in plain words, and refuses unsupported or unknown ones.
 - Online play: an `online.ini` whose server selection is ambiguous, or credentials without a clean configuration, are refused and the game stays offline. The network capture log no longer records tokens, certificate hashes or ticket offsets; `KZ3_NET_CAPTURE_PAYLOAD=1` logs the payload bytes again (#39, thanks @Tzeentchnet).
 
+### Fixed
+- Website: the link buttons on the Channels page render as buttons again, and the section dividers are styled; the site check now fails when the page uses a class the stylesheet does not define.
+
 ## [0.1.10] - 2026-11-09 (pre-release)
 
 ### Fixed

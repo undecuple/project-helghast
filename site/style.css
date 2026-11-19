@@ -207,3 +207,24 @@ body.v-open { overflow: hidden; }
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
 @media print { #menu, .legend, .viewer { display: none; } .js .sec { display: block; } }
+
+/* link buttons (88x31): small top word, bold word below; one accent per kind of link */
+.b88s { display: flex; flex-wrap: wrap; gap: .6rem; list-style: none; margin: 0; padding: 0; }
+.b88s li { margin: 0; }
+.b88 { --bc: var(--line); display: flex; flex-direction: column; align-items: center; justify-content: center; width: 88px; height: 31px;
+  overflow: hidden; text-decoration: none; text-align: center; line-height: 1; color: var(--text);
+  background: linear-gradient(var(--glow), var(--panel)); border: 1px solid var(--bc); border-bottom: 2px solid var(--bc); }
+.b88 span { font: 600 .52rem var(--head); letter-spacing: .06em; text-transform: uppercase; color: var(--dim); max-width: 100%; white-space: nowrap; }
+.b88 b { font: 700 .8rem var(--head); letter-spacing: .04em; text-transform: uppercase; color: var(--strong); max-width: 100%; white-space: nowrap; }
+.b88:hover, .b88:focus-visible { --bc: var(--acc); background: var(--glow); }
+.b88:hover b, .b88:focus-visible b { color: var(--acc); }
+.b-recomp, .b-discord, .b-fyi { --bc: var(--amber); }
+.b-git, .b-mit, .b-nogame { --bc: var(--frame); }
+.b-reddit, .b-proton { --bc: var(--acc); }
+.b-recomp:hover, .b-discord:hover, .b-fyi:hover, .b-recomp:focus-visible, .b-discord:focus-visible, .b-fyi:focus-visible { --bc: var(--amber-hi); }
+@media (max-width: 420px) { .b88s { gap: .5rem; justify-content: center; } }
+
+/* section divider: a rule with a label box (decoration only) */
+.divider { display: flex; align-items: center; gap: .6rem; margin: 1.4rem 0 .8rem; }
+.divider::after { content: ""; flex: 1; height: 2px; background: repeating-linear-gradient(135deg, var(--line) 0 6px, transparent 6px 12px); }
+.divider span { font: 700 .8rem var(--head); letter-spacing: .14em; text-transform: uppercase; padding: .1em .7em; background: var(--red); color: var(--white); }

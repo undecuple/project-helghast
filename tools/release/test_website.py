@@ -264,6 +264,7 @@ def main():
         for _cls, _t, _b, href, _title in website.BUTTONS:
             expect(f'href="{href}"' in page, f"button link {href} missing")
         expect(len(website.BUTTONS) == 8 and page.count("class=\"b88 ") == 8, "eight buttons expected")
+        expect("<span>made with</span> <b>ps3recomp</b>" in page, "button words need a space between them (no-CSS reading)")
         for want in ("https://discord.gg/CRpzGWZFcu", "https://discord.gg/W8fMT78Q7k", "https://recomp.fyi", "https://www.reddit.com/user/RelationshipNo4440",
                      "https://github.com/sp00nznet/ps3recomp"):
             expect(want in page, f"requested button {want} missing")
