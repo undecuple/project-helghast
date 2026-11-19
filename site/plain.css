@@ -12,7 +12,7 @@ figure { margin: 1rem 0; }
 .sec { margin-top: 2rem; border-top: 1px solid; }
 .bar i { display: inline-block; width: .6em; height: .8em; border: 1px solid; margin-right: 1px; }
 .bar i.on { background: currentColor; }
-.meters, .portal, .clog, .todo, .links, .feed, .marks { padding-left: 1.2rem; }
+.b88s, .meters, .portal, .clog, .todo, .links, .feed, .marks { padding-left: 1.2rem; }
 .meters li, .marks li { margin: .2rem 0; }
 .box { display: none; }
 .sticker { font-weight: bold; }

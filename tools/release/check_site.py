@@ -9,6 +9,7 @@ Run on the staged layout, which is the repo layout: site/ next to docs/screensho
      @import or external url() in the CSS, no inline script, no inline event handler;
   4. plain.html and index.html agree: the same sections in the same order with the same headings, and the same set of
      links inside them (the two pages come from one generator; this keeps a hand edit from drifting);
+  4b. every class used in index.html has a selector in style.css (NO_RULE_OK lists the JS-only exceptions);
   5. site.js: no network, storage or eval calls, no outside URL, balanced brackets, and `node --check` when node is on
      PATH (SKIP otherwise, said on stdout).
 
@@ -22,6 +23,9 @@ import subprocess
 import sys
 
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+# Classes the markup may use without a style.css rule: hooks that are deliberately unstyled (their element is styled by
+# tag or by its parent: .mi-l inside #menu, .promo/.news boxes) or that only site.js / a reader of the markup uses.
+NO_RULE_OK = {"board", "disc", "mi-l", "o-not-yet", "obj", "term", "wip"}
 FONT_CSS = re.compile(r"https://fonts\.googleapis\.com(/|$)")
 
 
@@ -29,6 +33,7 @@ class Page(html.parser.HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.stack, self.problems, self.ids, self.refs, self.scripts, self.links = [], [], [], [], [], []
+        self.classes = set()     # every class used in the markup
         self.secs = []           # [(id, heading text)] of top-level section.sec
         self.sec_hrefs = {}      # section id -> set of hrefs
         self._sec = None
@@ -36,6 +41,7 @@ class Page(html.parser.HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        self.classes.update((a.get("class") or "").split())
         if "id" in a:
             self.ids.append(a["id"])
         for k in a:
@@ -219,6 +225,10 @@ def check(site):
         check_css(site / f, problems)
     check_js(site / "site.js", problems, notes)
     a, b = pages["index.html"], pages["plain.html"]
+    css = re.sub(r"/\*.*?\*/", "", (site / "style.css").read_text(encoding="utf-8"), flags=re.S)
+    have = set(re.findall(r"\.([A-Za-z_][\w-]*)", css))
+    for c in sorted(a.classes - have - NO_RULE_OK):
+        problems.append(f"class {c!r} is used in index.html but style.css has no selector for it")
     if a.secs != b.secs:
         problems.append(f"sections differ: index {[s[0] for s in a.secs]} vs plain {[s[0] for s in b.secs]} (or their headings)")
     if not a.secs:
