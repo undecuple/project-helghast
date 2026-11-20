@@ -4,7 +4,7 @@ Rebased on ps3recomp v0.15.0 (SPU pass 81): partly absorbed, PR290 registry list
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): largely absorbed by 81344af1 (`SPU_EVENT_SET/CLEAR`); 1052's raise/ack helpers and KZ3_SPU_RACE_OLD kept (1064 etc. use them); the WrEventAck path gains upstream's "list stall still pending re-raises Sn".
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 index 427fb9c..14b8774 100644

@@ -130,3 +130,8 @@ tools/upstream/test_sys_fs_flags.sh
 tools/spu/test_r118_walltime.sh
 tools/smoke/test_window_place.sh
 tools/spu/test_ppu_resv_registry.sh
+tools/smoke/test_pub_replay.sh
+tools/smoke/test_pub_locks.sh
+tools/smoke/test_gfx_mutants.sh
+tools/smoke/test_gfx_links.sh
+tools/smoke/test_gfx_callsites.sh

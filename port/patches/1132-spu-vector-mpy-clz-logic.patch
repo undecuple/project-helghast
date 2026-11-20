@@ -3,7 +3,7 @@ __SSE4_1__ (the loops stay for other builds).
 - mpy, mpya, mpys, mpyi, mpyh, mpyhh, mpyhha (signed 16 x 16) as pmaddwd with the other halfword of one operand
   zeroed; mpyu, mpyui, mpyhhu, mpyhhau (unsigned) as pmulld on zero-extended halves. GCC vectorized the loops through a
   pshufb gather of the even halfwords, two sign extensions and two pmulld on half vectors; spu_mpya alone was 4.6 % of
-  the K4 SPU samples (SPU pass 111 profile, runs spu-r110-p*b).
+  the K4 SPU samples (SPU pass 111 profile).
 - clz: per-lane bsr loop (four lane stores, then a 16-byte reload = a failed store-to-load forward) replaced by the
   float-exponent form on x & ~(x >> 1) (cannot round up to the next power of two).
 - cntb (nibble pshufb table), gb/gbh/gbb (movemask), fsm/fsmh (compare against bit masks).

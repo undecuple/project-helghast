@@ -1,0 +1,271 @@
+KZ3 patch 2166 (RSX pass 154): the pipeline template finder sees fragment programs at 8 mod 16.
+Fragment programs at 8 mod 16 were missed: rsx_pt_scan probed
+only addresses that are 0 mod 16, so a fragment program at 8 mod 16 (in the EBOOT's
+writable data segment) was invisible until the game copied it 16-aligned elsewhere.
+- runtime/ppu/ppu_loader.cpp: ppu_image_ranges(out, max) exports the loaded PT_LOAD ranges (generic, no behaviour change).
+- libs/video/rsx_pso_template.h: rsx_pt_scan_step(base, len, t, hit, user, step, kind_mask) with RSX_PT_KIND_VP/FP; rsx_pt_scan
+  is step 16, both kinds (unchanged).
+- libs/video/rsx_live_draw.c: rsx_live_draw_set_image_ranges(pairs, n) (up to 8; ld_pt_start pulls the loader's through a weak
+  ppu_image_ranges when nobody set them); the scout runs ONE step-8 pass over the committed parts of those ranges on its first
+  scan after the guest base resolves, queues what it completed, and runs the general (step 16) pass only while records are still
+  unqueued. Zero ranges = the old scout. Diagnostic: hits counted by guest address mod 16 (0/4/8/12), per kind, image pass vs
+  general pass, printed after the scan lines as "[pso-template] found by guest address mod 16 (image pass/general pass): ...";
+  the image pass has its own line. The general step is NOT changed (K4 evidence decides whether FPs need step 8 there).
+Host test: tools/smoke/test_pso_template.sh.
+
+diff --git a/libs/video/rsx_pso_template.h b/libs/video/rsx_pso_template.h
+--- a/libs/video/rsx_pso_template.h
++++ b/libs/video/rsx_pso_template.h
+@@ -161,24 +161,34 @@
+     while (t->e[i].q) i = (i + 1u) & (t->cap - 1u);
+     t->e[i].q = q; t->e[i].kind = kind; t->e[i].id = id;
+ }
+-/* Calls hit(user, ptr, remaining_bytes, kind, id) for every 16-byte aligned block whose fingerprint is in the
+- * table. Returns the number of blocks inspected. */
++/* Calls hit(user, ptr, remaining_bytes, kind, id) for every block, `step` bytes apart from base, whose fingerprint is in the
++ * table and whose kind bit is set in kind_mask (RSX_PT_KIND_VP / RSX_PT_KIND_FP). Returns the number of blocks inspected.
++ * Patch 2166: step 8 finds fragment programs that sit at 8 mod 16 (such programs live
++ * at 8 mod 16 in the EBOOT's writable data segment; a step-16 probe never lands on them). */
++#define RSX_PT_KIND_VP 1u
++#define RSX_PT_KIND_FP 2u
+ typedef void (*rsx_pt_hit_fn)(void* user, const uint8_t* p, size_t remaining, uint32_t kind, uint32_t id);
+-static inline size_t rsx_pt_scan(const uint8_t* base, size_t len, const rsx_pt_qtab* t, rsx_pt_hit_fn hit, void* user)
++static inline size_t rsx_pt_scan_step(const uint8_t* base, size_t len, const rsx_pt_qtab* t, rsx_pt_hit_fn hit, void* user,
++                                      size_t step, uint32_t kind_mask)
+ {
+-    if (!t->cap) return 0;
++    if (!t->cap || !step) return 0;
+     const uint32_t mask = t->cap - 1u;
+     size_t blocks = 0;
+-    for (size_t o = 0; o + 16u <= len; o += 16u, blocks++) {
++    for (size_t o = 0; o + 16u <= len; o += step, blocks++) {
+         const uint8_t* p = base + o;
+         const uint64_t q = rsx_pt_quick(p);
+         uint32_t i = (uint32_t)(q ^ (q >> 31)) & mask;
+         while (t->e[i].q) {
+-            if (t->e[i].q == q) hit(user, p, len - o, t->e[i].kind, t->e[i].id);
++            if (t->e[i].q == q && ((kind_mask >> t->e[i].kind) & 1u) ) hit(user, p, len - o, t->e[i].kind, t->e[i].id);
+             i = (i + 1u) & mask;
+         }
+     }
+     return blocks;
+ }
++/* The general pass: every 16 bytes, both kinds (unchanged behaviour). */
++static inline size_t rsx_pt_scan(const uint8_t* base, size_t len, const rsx_pt_qtab* t, rsx_pt_hit_fn hit, void* user)
++{
++    return rsx_pt_scan_step(base, len, t, hit, user, 16u, RSX_PT_KIND_VP | RSX_PT_KIND_FP);
++}
+ 
+ #endif /* RSX_PSO_TEMPLATE_H */
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -9137,6 +9137,11 @@
+     volatile LONG built, failed_xlate, failed_blob, failed_pso, failed_key, lib_hits, staged;
+     volatile LONG used;                          /* walker lookups that found a template pipeline ready */
+     unsigned passes; unsigned long long scan_us, xlate_us, compile_us, create_us;
++    /* patch 2166: loaded-image ranges (guest vaddr begin/end), the one-off step-8 image pass, and which guest address
++     * (mod 16) and which pass each found program came from (diagnostic for the "does the general pass need step 8 for
++     * fragment programs" question). Written by the scout thread only. */
++    u64 img[8][2]; u32 n_img; int img_done, cur_img; const u8* gbase;
++    unsigned mod_hits[2][4][2];                   /* [kind: 0 vp, 1 fp][guest addr mod 16 / 4][0 general, 1 image] */
+ } g_pt;
+ 
+ static LONGLONG ld_pt_qpc(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart; }
+@@ -9354,8 +9359,10 @@
+             host[4*k] = p[4*k+3]; host[4*k+1] = p[4*k+2]; host[4*k+2] = p[4*k+1]; host[4*k+3] = p[4*k];
+         }
+         memset(host + t->size, 0, LD_PT_FP_PAD);
+-        if (fnv1a(host, t->size, 1469598103934665603ull) == t->hash) { t->bytes = host; g_pt.vp_found++; }
+-        else free(host);
++        if (fnv1a(host, t->size, 1469598103934665603ull) == t->hash) {
++            t->bytes = host; g_pt.vp_found++;
++            if (g_pt.gbase) g_pt.mod_hits[0][(((size_t)(p - g_pt.gbase)) & 15u) >> 2][g_pt.cur_img]++;
++        } else free(host);
+     } else {
+         ld_pt_prog* t = &g_pt.fp[id];
+         if (t->bytes) return;
+@@ -9367,9 +9374,56 @@
+         if (!c) return;
+         memcpy(c, p, sz); memset(c + sz, 0, LD_PT_FP_PAD);
+         t->bytes = c; g_pt.fp_found++;
++        if (g_pt.gbase) g_pt.mod_hits[1][(((size_t)(p - g_pt.gbase)) & 15u) >> 2][g_pt.cur_img]++;
+     }
+ }
+ 
++/* Patch 2166: the guest address space's host base (the VirtualAlloc'd reservation), or NULL until cellGcm resolved it. */
++static const u8* ld_pt_guest_base(void)
++{
++    const u8* any = g.guest_ptr ? g.guest_ptr(g.guest_user, 0u, 0u, 1u) : NULL;
++    if (!any) any = g.guest_ptr ? g.guest_ptr(g.guest_user, 1u, 0u, 1u) : NULL;
++    if (!any) return NULL;
++    MEMORY_BASIC_INFORMATION mi;
++    if (!VirtualQuery(any, &mi, sizeof mi) || !mi.AllocationBase) return NULL;
++    return (const u8*)mi.AllocationBase;
++}
++
++/* The loader's image ranges (guest addresses). Zero ranges: no image pass, the scout behaves as before patch 2166. */
++void rsx_live_draw_set_image_ranges(const u64* pairs, u32 n)
++{
++    if (n > 8u) n = 8u;
++    for (u32 i = 0; i < n; i++) { g_pt.img[i][0] = pairs[2 * i]; g_pt.img[i][1] = pairs[2 * i + 1]; }
++    g_pt.n_img = n;
++}
++extern uint32_t ppu_image_ranges(uint64_t* out, uint32_t max) __attribute__((weak));   /* ppu_loader.cpp, patch 2166 */
++
++/* One-off pass over the loaded image's ranges at step 8, both kinds: fragment programs the image carries sit at 8 mod 16.
++ * Scans only committed, readable parts of each range. Returns the bytes scanned. */
++static size_t ld_pt_scan_image(const rsx_pt_qtab* qt, const u8* base)
++{
++    size_t total = 0;
++    g_pt.cur_img = 1;
++    for (u32 r = 0; r < g_pt.n_img && !g_pt.stop; r++) {
++        const u8* p = base + g_pt.img[r][0];
++        const u8* end = base + g_pt.img[r][1];
++        while (p < end && !g_pt.stop) {
++            MEMORY_BASIC_INFORMATION mi;
++            if (!VirtualQuery(p, &mi, sizeof mi)) break;
++            const u8* re = (const u8*)mi.BaseAddress + mi.RegionSize;
++            if (re > end) re = end;
++            if (mi.State == MEM_COMMIT && (mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
++                                                          PAGE_WRITECOPY)) && !(mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
++                total += (size_t)(re - p);
++                rsx_pt_scan_step(p, (size_t)(re - p), qt, ld_pt_hit, NULL, 8u, RSX_PT_KIND_VP | RSX_PT_KIND_FP);
++            }
++            p = re;
++        }
++    }
++    g_pt.cur_img = 0;
++    return total;
++}
++
+ /* One pass over the committed pages of the guest's address space (host base = the VirtualAlloc'd reservation,
+  * found through any guest pointer). Returns the bytes scanned. */
+ static size_t ld_pt_scan_pass(const rsx_pt_qtab* qt)
+@@ -9380,6 +9434,7 @@
+     MEMORY_BASIC_INFORMATION mi;
+     if (!VirtualQuery(any, &mi, sizeof mi) || !mi.AllocationBase) return 0;
+     const u8* base = (const u8*)mi.AllocationBase;
++    g_pt.gbase = base;
+     size_t total = 0;
+     const u8* p = base + 0x10000u;
+     const u8* end = base + 0xE0000000ull;
+@@ -9400,6 +9455,21 @@
+     return total;
+ }
+ 
++/* Queue every record whose two programs are known. Returns how many were queued now. */
++static u32 ld_pt_queue_ready(u32* queued)
++{
++    u32 newq = 0;
++    EnterCriticalSection(&g_pt.cs);
++    for (u32 i = 0; i < g_pt.n_in; i++) {
++        if (g_pt.rec_state[i] || !g_pt.vp[g_pt.rec_vp[i]].bytes || !g_pt.fp[g_pt.rec_fp[i]].bytes) continue;
++        g_pt.rec_state[i] = 1;
++        g_pt.q[g_pt.q_tail++] = i; newq++; (*queued)++;
++    }
++    LeaveCriticalSection(&g_pt.cs);
++    if (newq) ReleaseSemaphore(g_pt.sem, (LONG)newq, NULL);
++    return newq;
++}
++
+ static DWORD WINAPI ld_pt_scout(LPVOID arg)
+ {
+     (void)arg;
+@@ -9410,26 +9480,48 @@
+     for (u32 i = 0; i < g_pt.n_fp; i++) rsx_pt_qtab_add(&qt, g_pt.fp[i].first, 1, i);
+     u32 last_vp = 0, last_fp = 0, queued = 0;
+     while (!g_pt.stop && queued < g_pt.n_in) {
+-        const LONGLONG t0 = ld_pt_qpc();
+-        const size_t bytes = ld_pt_scan_pass(&qt);
+-        const unsigned long long us = (unsigned long long)((ld_pt_qpc() - t0) * 1000000 / g_pt.qpf);
+-        g_pt.scan_us += us; g_pt.passes++;
+-        /* Queue every record whose two programs are known. */
+         u32 newq = 0;
+-        EnterCriticalSection(&g_pt.cs);
+-        for (u32 i = 0; i < g_pt.n_in; i++) {
+-            if (g_pt.rec_state[i] || !g_pt.vp[g_pt.rec_vp[i]].bytes || !g_pt.fp[g_pt.rec_fp[i]].bytes) continue;
+-            g_pt.rec_state[i] = 1;
+-            g_pt.q[g_pt.q_tail++] = i; newq++; queued++;
++        /* Patch 2166: the step-8 image pass, once, on the first scan after the guest base resolves. */
++        int image_ran = 0;
++        if (!g_pt.img_done && g_pt.n_img) {
++            const u8* gb = ld_pt_guest_base();
++            if (gb) {
++                const LONGLONG ti = ld_pt_qpc();
++                g_pt.gbase = gb;
++                const size_t ib = ld_pt_scan_image(&qt, gb);
++                const unsigned long long ius = (unsigned long long)((ld_pt_qpc() - ti) * 1000000 / g_pt.qpf);
++                g_pt.img_done = 1; image_ran = 1; g_pt.scan_us += ius;
++                newq += ld_pt_queue_ready(&queued);
++                fprintf(stderr, "[pso-template] image pass at %.1f s: %u ranges, %.2f MB at step 8 in %.2f ms; programs found "
++                                "vp %u/%u fp %u/%u; %u/%u pipelines queued (+%u)\n",
++                        ld_pt_secs(), g_pt.n_img, ib / 1048576.0, ius / 1e3, g_pt.vp_found, g_pt.n_vp, g_pt.fp_found, g_pt.n_fp,
++                        queued, g_pt.n_in, newq);
++            }
+         }
+-        LeaveCriticalSection(&g_pt.cs);
+-        if (newq) ReleaseSemaphore(g_pt.sem, (LONG)newq, NULL);
+-        if (g_pt.passes <= 3 || g_pt.vp_found != last_vp || g_pt.fp_found != last_fp)
++        size_t bytes = 0; unsigned long long us = 0;
++        if (!(image_ran && queued >= g_pt.n_in)) {   /* the general pass runs only while records are unqueued */
++            const LONGLONG t0 = ld_pt_qpc();
++            bytes = ld_pt_scan_pass(&qt);
++            us = (unsigned long long)((ld_pt_qpc() - t0) * 1000000 / g_pt.qpf);
++            g_pt.scan_us += us; g_pt.passes++;
++            newq += ld_pt_queue_ready(&queued);
++        }
++        if (g_pt.passes && (g_pt.passes <= 3 || g_pt.vp_found != last_vp || g_pt.fp_found != last_fp) &&
++            !(image_ran && queued >= g_pt.n_in)) {
+             fprintf(stderr, "[pso-template] scan %u at %.1f s: %.0f MB in %.0f ms; programs found vp %u/%u fp %u/%u; "
+                             "%u/%u pipelines queued (+%u)\n",
+                     g_pt.passes, ld_pt_secs(), bytes / 1048576.0, us / 1e3, g_pt.vp_found, g_pt.n_vp, g_pt.fp_found,
+                     g_pt.n_fp, queued, g_pt.n_in, newq);
++        }
++        if (image_ran || (g_pt.passes && (g_pt.passes <= 3 || g_pt.vp_found != last_vp || g_pt.fp_found != last_fp)))
++            fprintf(stderr, "[pso-template] found by guest address mod 16 (image pass/general pass): "
++                            "vp 0:%u/%u 4:%u/%u 8:%u/%u 12:%u/%u fp 0:%u/%u 4:%u/%u 8:%u/%u 12:%u/%u\n",
++                    g_pt.mod_hits[0][0][1], g_pt.mod_hits[0][0][0], g_pt.mod_hits[0][1][1], g_pt.mod_hits[0][1][0],
++                    g_pt.mod_hits[0][2][1], g_pt.mod_hits[0][2][0], g_pt.mod_hits[0][3][1], g_pt.mod_hits[0][3][0],
++                    g_pt.mod_hits[1][0][1], g_pt.mod_hits[1][0][0], g_pt.mod_hits[1][1][1], g_pt.mod_hits[1][1][0],
++                    g_pt.mod_hits[1][2][1], g_pt.mod_hits[1][2][0], g_pt.mod_hits[1][3][1], g_pt.mod_hits[1][3][0]);
+         last_vp = g_pt.vp_found; last_fp = g_pt.fp_found;
++        if (queued >= g_pt.n_in) break;
+         unsigned wait_ms = 1500;
+         if (g_pt.passes > 200) wait_ms = 15000; else if (g_pt.passes > 40) wait_ms = 5000;
+         if ((unsigned)(us / 1000 * 3) > wait_ms) wait_ms = (unsigned)(us / 1000 * 3);
+@@ -9524,6 +9616,11 @@
+         g_pt.workers[g_pt.n_workers] = CreateThread(NULL, 0, ld_pt_worker, NULL, 0, NULL);
+         if (g_pt.workers[g_pt.n_workers]) g_pt.n_workers++;
+     }
++    if (!g_pt.n_img && ppu_image_ranges) {   /* patch 2166: the loader's ranges when nobody set them */
++        u64 pr[16]; u32 n = ppu_image_ranges(pr, 8u);
++        rsx_live_draw_set_image_ranges(pr, n);
++    }
++    fprintf(stderr, "[pso-template] image ranges for the step-8 pass: %u\n", g_pt.n_img);
+     g_pt.scout = CreateThread(NULL, 0, ld_pt_scout, NULL, 0, NULL);
+ }
+ 
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3861,6 +3861,19 @@
+ static std::vector<ppu_image_range> g_ppu_image_ranges;
+ extern "C" void sys_memory_set_image_query(uint64_t (*query)(uint64_t, uint64_t));
+ 
++/* Patch 2166: the loaded PT_LOAD ranges (vaddr .. vaddr + max(memsz, filesz)) for finders that look for data the
++ * image itself carries (RSX pipeline template prewarm). Writes up to `max` {begin, end} pairs to out, returns the
++ * number of ranges (0 before an image is loaded). */
++extern "C" uint32_t ppu_image_ranges(uint64_t* out, uint32_t max)
++{
++    uint32_t n = 0;
++    for (const auto& r : g_ppu_image_ranges) {
++        if (n < max && out) { out[2 * n] = r.begin; out[2 * n + 1] = r.end; }
++        n++;
++    }
++    return n < max ? n : max;
++}
++
+ static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
+ {
+     uint64_t next = addr;

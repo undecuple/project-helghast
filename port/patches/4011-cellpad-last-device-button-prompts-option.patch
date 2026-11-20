@@ -1,6 +1,6 @@
 Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): three-way merged into cellPad.c after upstream #612 (PADKEY_*, pad_key_down) and Toro's 4010 (SDL3 names); the option and prompt logic is unchanged.
+Rebased on ps3recomp v0.19.0 (SPU pass 153): three-way merged into cellPad.c after upstream #612 (PADKEY_*, pad_key_down) and patch 4010 (SDL3 names); the option and prompt logic is unchanged.
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index 49ba9d2..e18987c 100644

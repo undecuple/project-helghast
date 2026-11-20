@@ -31,7 +31,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 # Build lock: a build globs work/recomp, which this script replaces (see tools/build-kz3.sh).
 LOCKS="${KZ3_MAIN:-$ROOT}/work/locks"; mkdir -p "$LOCKS"
-# Every build slot (2026-10-11: KZ3_BUILD_SLOTS builds may run at once; a lift must wait for all of them): tools/agents/slotlock.sh.
+# Every build slot (KZ3_BUILD_SLOTS builds may run at once; a lift must wait for all of them): tools/agents/slotlock.sh.
 source "$ROOT/tools/agents/slotlock.sh"; slot_take_all "$LOCKS" build "${KZ3_BUILD_SLOTS:-1}"
 PT=work/ps3recomp-patched
 # Version and output directory from the one place that decides them (tools/spu/kz3ver.py; exit 2 on a bad version).

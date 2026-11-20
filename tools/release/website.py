@@ -116,7 +116,7 @@ def esc(s):
 
 def inline(text):
     """A cell of Markdown text -> HTML: links (relative ones point at the repository on GitHub), `code`, **bold**;
-    decision references like (D40) are dropped as the export drops them."""
+    decision references like (D<n>) are dropped as the export drops them."""
     text = re.sub(r"\s*\(D\d{1,2}(?:,\s*D\d{1,2})*\)", "", text)
     out = []
     pos = 0

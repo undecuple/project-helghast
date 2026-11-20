@@ -71,7 +71,7 @@ MENU_FAST = [(3, CROSS), (6, CROSS), (30, CROSS), (31, CROSS), (33, CROSS), (34,
              (39, CROSS), (40, CROSS), (42, CROSS), (43, CROSS)]
 PROFILE_LEVEL_START = 125
 # first-boot: language/settings/gamma pages take CROSS (START at 25 s as tools/kz3-check.sh's pad), the opening
-# cinematic plays in full (~10 min on 2026-10-08, at a lower frame rate than today), then title, main menu,
+# cinematic plays in full (~10 min, at a lower frame rate than today), then title, main menu,
 # difficulty and the level load as on the profile route. CROSS every 2 s until FIRST_MENU_END covers all of it.
 FIRST_MENU_END = 720
 FIRST_LEVEL_START = 810

@@ -123,7 +123,7 @@ index 692f5f2..9116798 100644
 + * (no flip) keeps every count: the motion of a slow frame is applied in full, once.
   *
   * Switches (read once; pad_mouse.c):
-  *   KZ3_MOUSE_LOOK=0        off (default on since patch 2097, project decision 2026-10-21; kz3.ini
+  *   KZ3_MOUSE_LOOK=0        off (default on since patch 2097; kz3.ini
   *                           `mouse_look = 0` does the same, the environment wins). A pad works the same either way:
   *                           no counts = the game's own look values untouched.
   *   KZ3_CURSOR_HIDE=0       keep the cursor visible over the game window (patch 2097; default hidden, below).

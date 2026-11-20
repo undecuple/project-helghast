@@ -1,0 +1,538 @@
+KZ3 patch 2187 (rsx stutter Task 0, diagnostics only, guest-invisible, every output behind a switch, default OFF):
+whole-run attribution of long frames. Off = no new output and no new work beyond a few cached-int tests; the four
+changes below touch no guest state.
+1. RSX_PRESENT_QPC_STREAM=1: ported from Killzone 2 patch 6073 (same author, MIT; port/patches/6073-present-qpc-stream-whole-run.patch
+   of the Killzone 2 port). New libs/video/rsx_present_stream.h (pure C, host-tested): the CSV scratch\present_qpc_<pid>.csv
+   is opened at renderer init and each batch of 64 presents is appended and flushed on the present thread, so a killed
+   run keeps all but its last 63 presents (the guest-frame-2293 endpoint of the one-shot dump is dropped while the stream
+   is on). Extra comment line '# clock qpc=<ticks> filetime=<100 ns since 1601 UTC>' ties the QPC to the wall clock.
+   Columns are those of the shutdown dump (the dump itself is untouched).
+2. RSX_ATTRIB=1 (one switch for all attribution lines, QPC ticks everywhere = the CSV's clock):
+   [pso-await] qpc= key= packed=0|1|2 ms= class=warm-unbuilt|unknown   (rsx_live_draw.c, ld_apso_await(idx, packed))
+   [pso-cover] <frame|exit> ...  (every 256 frames and at ld_pl_shutdown; counters in g_ld_cov + g_pt/g_ld_pl)
+   [vblank] ...  every 10 s (cellGcmSys.c + new libs/video/rsx_stutter_diag.h, pure C, host-tested; printed by port/kz3/main.cpp)
+   [pump] gap lines get qpc= and the frame thread's time per call (drain/present/pump/idle) (port/kz3/main.cpp, same patch set)
+Host test: tools/smoke/test_stutter_diag.sh.
+--- /dev/null
++++ b/libs/video/rsx_present_stream.h
+@@ -0,0 +1,89 @@
++/* KZ3 patch 2187 (stutter Task 0): whole-run per-present QPC stream. Pure C (no OS calls), so tools/smoke builds it on
++ * the host.
++ *
++ * Idea and shape from Killzone 2 patch 6073 (same author, MIT; port/patches/6073-present-qpc-stream-whole-run.patch):
++ * upstream's ld_present_measure_record dumped the ring once at guest frame 2293 and a run ended by a kill never reached
++ * the shutdown dump. With RSX_PRESENT_QPC_STREAM=1 the CSV is opened at init and each batch of RSX_PS_BATCH samples is
++ * appended and flushed when it fills (on the present thread, after that present's QPC was read), so a kill loses at
++ * most the last RSX_PS_BATCH - 1 presents. The stream file has a second comment line
++ *   # clock qpc=<ticks> filetime=<100 ns since 1601 UTC>
++ * tying the QPC to the wall clock. Columns are those of the shutdown dump (present_id,guest_frame,qpc, plus the five
++ * schedule columns with RSX_SCHEDULE_DIAG). A sample the ring already overwrote is never fabricated. */
++#ifndef RSX_PRESENT_STREAM_H
++#define RSX_PRESENT_STREAM_H
++#include <stdatomic.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#define RSX_PS_BATCH 64u
++
++typedef struct {
++    uint64_t present_id;
++    uint32_t guest_frame;
++    int64_t  qpc;
++    uint64_t process_kernel_100ns, process_user_100ns, present_thread_kernel_100ns, present_thread_user_100ns;
++    uint32_t present_thread_id;
++} rsx_ps_sample;
++
++typedef struct {
++    FILE* f;
++    uint64_t written;      /* presents already in the file (ids 1..written, minus ones the ring lost) */
++    atomic_flag lock;
++    int diag;              /* schedule columns */
++} rsx_ps_stream;
++
++static void rsx_ps_columns(FILE* f, int diag)
++{
++    if (diag)
++        fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,process_user_100ns,"
++                   "present_thread_kernel_100ns,present_thread_user_100ns,present_thread_id\n");
++    else
++        fprintf(f, "present_id,guest_frame,qpc\n");
++}
++
++static void rsx_ps_row(FILE* f, int diag, const rsx_ps_sample* s)
++{
++    if (diag)
++        fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u\n", (unsigned long long)s->present_id, s->guest_frame,
++                (long long)s->qpc, (unsigned long long)s->process_kernel_100ns,
++                (unsigned long long)s->process_user_100ns, (unsigned long long)s->present_thread_kernel_100ns,
++                (unsigned long long)s->present_thread_user_100ns, s->present_thread_id);
++    else
++        fprintf(f, "%llu,%u,%lld\n", (unsigned long long)s->present_id, s->guest_frame, (long long)s->qpc);
++}
++
++/* Takes ownership of f (already open for writing). clock_qpc/filetime tie the QPC to the wall clock. */
++static void rsx_ps_open(rsx_ps_stream* st, FILE* f, int64_t freq, int64_t clock_qpc, uint64_t filetime, int diag)
++{
++    st->f = f;
++    st->written = 0;
++    st->diag = diag;
++    atomic_flag_clear(&st->lock);
++    fprintf(f, "# qpc_frequency=%lld\n", (long long)freq);
++    fprintf(f, "# clock qpc=%lld filetime=%llu\n", (long long)clock_qpc, (unsigned long long)filetime);
++    rsx_ps_columns(f, diag);
++    fflush(f);
++}
++
++/* Write the samples recorded since the last flush; ring has cap entries (power of two), total presents so far. */
++static void rsx_ps_flush(rsx_ps_stream* st, const rsx_ps_sample* ring, uint32_t cap, uint64_t total)
++{
++    while (atomic_flag_test_and_set_explicit(&st->lock, memory_order_acquire)) {}
++    if (st->f) {
++        uint64_t id = st->written + 1u;
++        if (total > cap && id < total - cap + 1u) id = total - cap + 1u;
++        for (; id <= total; ++id) {
++            const rsx_ps_sample* s = &ring[(id - 1u) & (cap - 1u)];
++            if (s->present_id == id) rsx_ps_row(st->f, st->diag, s);
++        }
++        st->written = total;
++        fflush(st->f);
++    }
++    atomic_flag_clear_explicit(&st->lock, memory_order_release);
++}
++
++static int rsx_ps_due(const rsx_ps_stream* st, uint64_t total)
++{
++    return st->f && total - st->written >= RSX_PS_BATCH;
++}
++#endif
+--- /dev/null
++++ b/libs/video/rsx_stutter_diag.h
+@@ -0,0 +1,145 @@
++/* KZ3 patch 2187 (stutter Task 0): vblank/flip timing statistics for the RSX_ATTRIB=1 attribution lines. Pure C
++ * (no OS calls: the caller passes QPC ticks), so tools/smoke builds it on the host. All counters are updated only when
++ * the caller found the switch on; with it off nothing here runs.
++ *
++ * One window (10 s) is reported by one reader thread (the frame thread) with rsx_sd_vb_report, which also resets it.
++ * Writers: the frame thread (ticks, passes, lateness, flip completion), the thread that delivers the guest's vblank
++ * handler (a guest thread at an HLE boundary or the interrupt thread), the walker (flip marker). Sample arrays take
++ * an atomic index; a writer racing the reset may drop or misplace one sample (a diagnostic, not an accounting). */
++#ifndef RSX_STUTTER_DIAG_H
++#define RSX_STUTTER_DIAG_H
++#include <stdatomic.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define RSX_SD_CAP 8192u
++typedef struct { double v[RSX_SD_CAP]; atomic_uint n; } rsx_sd_samples;
++
++typedef struct {
++    double n, p50, p95, max;
++} rsx_sd_stat;
++
++static void rsx_sd_add(rsx_sd_samples* s, double v)
++{
++    const unsigned i = atomic_fetch_add_explicit(&s->n, 1u, memory_order_relaxed);
++    if (i < RSX_SD_CAP) s->v[i] = v;
++}
++
++static int rsx_sd_cmp(const void* a, const void* b)
++{
++    const double x = *(const double*)a, y = *(const double*)b;
++    return x < y ? -1 : x > y;
++}
++
++/* Statistics of the window's samples (nearest rank: the smallest value with at least q of the samples at or below
++ * it), then reset. n counts every add, also those past the capacity. */
++static rsx_sd_stat rsx_sd_take(rsx_sd_samples* s)
++{
++    static double tmp[RSX_SD_CAP];   /* one reader */
++    rsx_sd_stat r = {0, 0, 0, 0};
++    unsigned n = atomic_exchange(&s->n, 0u);
++    r.n = n;
++    if (n > RSX_SD_CAP) n = RSX_SD_CAP;
++    if (!n) return r;
++    memcpy(tmp, s->v, n * sizeof(double));
++    qsort(tmp, n, sizeof(double), rsx_sd_cmp);
++    unsigned i50 = (n + 1u) / 2u, i95 = (unsigned)((19u * n + 19u) / 20u);   /* ceil(q n) */
++    if (i50 < 1) i50 = 1;
++    if (i95 < 1) i95 = 1;
++    r.p50 = tmp[i50 - 1u];
++    r.p95 = tmp[i95 - 1u];
++    r.max = tmp[n - 1u];
++    return r;
++}
++
++typedef struct {
++    rsx_sd_samples late_ms;       /* each fired tick: QPC now minus its ideal time */
++    rsx_sd_samples deliver_ms;    /* oldest tick not yet delivered to the guest handler -> delivery */
++    rsx_sd_samples flip_ms;       /* flip marker executed by the drain -> completion by the vblank beat */
++    atomic_ullong ticks;          /* vblank ticks fired (frame thread) */
++    atomic_ullong calls;          /* guest vblank handler calls */
++    atomic_ullong passes;         /* frame-thread passes that fired at least one tick */
++    atomic_ullong burst_passes;   /* passes that fired two or more ticks */
++    atomic_ullong burst_ticks;    /* ticks past the first, summed over burst passes */
++    atomic_uint   max_fired;
++    atomic_uint   max_merged;     /* most ticks one handler call stood for */
++    atomic_uint   since_call;     /* ticks since the previous handler call */
++    atomic_llong  oldest_tick;    /* QPC of the oldest undelivered tick, 0 = none */
++    atomic_llong  marker_qpc;     /* QPC of the oldest unmatched flip marker, 0 = none */
++    atomic_ullong poll_waiting, poll_done;   /* cellGcmGetFlipStatus results */
++    atomic_ullong ref_pub_last;   /* gcm_ref_publish_one counter at the last report */
++} rsx_sd_vb;
++
++static double rsx_sd_ms(int64_t dq, int64_t freq) { return freq > 0 ? 1000.0 * (double)dq / (double)freq : 0.0; }
++
++static void rsx_sd_tick(rsx_sd_vb* v, int64_t qpc)
++{
++    atomic_fetch_add(&v->ticks, 1u);
++    atomic_fetch_add(&v->since_call, 1u);
++    int64_t z = 0;
++    atomic_compare_exchange_strong(&v->oldest_tick, &z, qpc);
++}
++
++static void rsx_sd_late(rsx_sd_vb* v, int64_t qpc_now, int64_t qpc_ideal, int64_t freq)
++{
++    rsx_sd_add(&v->late_ms, rsx_sd_ms(qpc_now - qpc_ideal, freq));
++}
++
++static void rsx_sd_pass(rsx_sd_vb* v, unsigned fired)
++{
++    if (!fired) return;
++    atomic_fetch_add(&v->passes, 1u);
++    if (fired >= 2u) {
++        atomic_fetch_add(&v->burst_passes, 1u);
++        atomic_fetch_add(&v->burst_ticks, fired - 1u);
++    }
++    unsigned m = atomic_load(&v->max_fired);
++    while (fired > m && !atomic_compare_exchange_weak(&v->max_fired, &m, fired)) {}
++}
++
++static void rsx_sd_deliver(rsx_sd_vb* v, int64_t qpc_now, int64_t freq)
++{
++    atomic_fetch_add(&v->calls, 1u);
++    const unsigned merged = atomic_exchange(&v->since_call, 0u);
++    unsigned m = atomic_load(&v->max_merged);
++    while (merged > m && !atomic_compare_exchange_weak(&v->max_merged, &m, merged)) {}
++    const int64_t t = atomic_exchange(&v->oldest_tick, 0);
++    if (t) rsx_sd_add(&v->deliver_ms, rsx_sd_ms(qpc_now - t, freq));
++}
++
++static void rsx_sd_marker(rsx_sd_vb* v, int64_t qpc)
++{
++    int64_t z = 0;
++    atomic_compare_exchange_strong(&v->marker_qpc, &z, qpc);
++}
++
++static void rsx_sd_flip_done(rsx_sd_vb* v, int64_t qpc_now, int64_t freq)
++{
++    const int64_t t = atomic_exchange(&v->marker_qpc, 0);
++    if (t) rsx_sd_add(&v->flip_ms, rsx_sd_ms(qpc_now - t, freq));
++}
++
++/* The [vblank] line for the window that ended at qpc_now (win_s seconds long); resets the window. ref_pub_total is
++ * the running count of gcm_ref_publish_one calls (the per-second figure is its difference since the last report). */
++static int rsx_sd_report(rsx_sd_vb* v, char* buf, size_t cap, int64_t qpc_now, double win_s, unsigned long long ref_pub_total)
++{
++    const rsx_sd_stat l = rsx_sd_take(&v->late_ms), d = rsx_sd_take(&v->deliver_ms), f = rsx_sd_take(&v->flip_ms);
++    const unsigned long long ticks = atomic_exchange(&v->ticks, 0ull), calls = atomic_exchange(&v->calls, 0ull);
++    const unsigned long long passes = atomic_exchange(&v->passes, 0ull), bp = atomic_exchange(&v->burst_passes, 0ull),
++                             bt = atomic_exchange(&v->burst_ticks, 0ull);
++    const unsigned mf = atomic_exchange(&v->max_fired, 0u), mm = atomic_exchange(&v->max_merged, 0u);
++    const unsigned long long pw = atomic_exchange(&v->poll_waiting, 0ull), pd = atomic_exchange(&v->poll_done, 0ull);
++    const unsigned long long rp = ref_pub_total - atomic_exchange(&v->ref_pub_last, ref_pub_total);
++    const double w = win_s > 0 ? win_s : 1.0;
++    return snprintf(buf, cap,
++        "[vblank] qpc=%lld win=%.1fs ticks=%llu late_ms p50=%.2f p95=%.2f max=%.2f | passes=%llu burst_passes=%llu "
++        "burst_ticks=%llu max_fired=%u | handler_calls=%llu ticks_per_call=%.2f max_merged=%u tick_to_handler_ms "
++        "n=%.0f p50=%.2f p95=%.2f max=%.2f | flip_marker_to_done_ms n=%.0f p50=%.2f p95=%.2f max=%.2f | "
++        "ref_publish_per_s=%.1f | flip_status_polls waiting=%llu done=%llu",
++        (long long)qpc_now, win_s, ticks, l.p50, l.p95, l.max, passes, bp, bt, mf, calls,
++        calls ? (double)ticks / (double)calls : 0.0, mm, d.n, d.p50, d.p95, d.max, f.n, f.p50, f.p95, f.max,
++        (double)rp / w, pw, pd);
++}
++#endif
+
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -252,6 +252,7 @@
+ /* patch 2048: asynchronous PSO build bookkeeping */
+ #include "rsx_pso_template.h"   /* patch 2071 */
+ #include "rsx_pace.h"           /* patch 2072 */
++#include "rsx_present_stream.h"  /* patch 2187: RSX_PRESENT_QPC_STREAM */
+ #include "rsx_pso_keys_hdr.h"   /* patch 2141: key file header with the translator id */
+ #include "rsx_tex_lru.h"        /* patch 2075 */
+ #include "rsx_smp_index.h"      /* patch 2161 */
+@@ -1051,21 +1052,15 @@
+  * configuration lookup, sorting, or logging in the presentation path.
+  */
+ #define LD_PRESENT_RING_CAP 16384u
+-typedef struct {
+-    u64 present_id;
+-    u32 guest_frame;
+-    LONGLONG qpc;
+-    u64 process_kernel_100ns;
+-    u64 process_user_100ns;
+-    u64 present_thread_kernel_100ns;
+-    u64 present_thread_user_100ns;
+-    u32 present_thread_id;
+-} ld_present_sample;
++typedef rsx_ps_sample ld_present_sample;   /* patch 2187: the sample type lives in rsx_present_stream.h */
+ static ld_present_sample g_ld_present_ring[LD_PRESENT_RING_CAP];
+ static u64 g_ld_present_total = 0;
+ static LONGLONG g_ld_qpc_frequency = 0;
+ static int g_ld_present_dumped = 0;
+ static int g_ld_schedule_diag = 0;
++/* KZ3 patch 2187 (idea and shape: Killzone 2 patch 6073, same author, MIT): RSX_PRESENT_QPC_STREAM=1 appends every sample
++ * to the CSV in batches of RSX_PS_BATCH as it fills (a killed run keeps all but its last 63 presents); default off. */
++static rsx_ps_stream g_ld_present_stream = {NULL, 0, ATOMIC_FLAG_INIT, 0};
+ #if defined(YZ_PPU_SAMPLE)
+ static HANDLE g_ld_present_thread_handle = NULL;
+ #endif
+@@ -1093,6 +1088,24 @@
+         g_ld_qpc_frequency = frequency.QuadPart;
+     else
+         g_ld_qpc_frequency = 0;
++    {   /* patch 2187 */
++        const char* stream = getenv("RSX_PRESENT_QPC_STREAM");
++        if (stream && *stream && strcmp(stream, "0") != 0 && !g_ld_present_stream.f && g_ld_qpc_frequency > 0) {
++            char path[256];
++            snprintf(path, sizeof(path), "scratch\\present_qpc_%lu.csv", (unsigned long)GetCurrentProcessId());
++            FILE* f = fopen(path, "wb");
++            if (!f) {
++                fprintf(stderr, "[present-qpc] stream: cannot open %s\n", path);
++            } else {
++                LARGE_INTEGER a, b; FILETIME ft; ULARGE_INTEGER wall;
++                QueryPerformanceCounter(&a); GetSystemTimePreciseAsFileTime(&ft); QueryPerformanceCounter(&b);
++                wall.LowPart = ft.dwLowDateTime; wall.HighPart = ft.dwHighDateTime;
++                rsx_ps_open(&g_ld_present_stream, f, g_ld_qpc_frequency, a.QuadPart + (b.QuadPart - a.QuadPart) / 2,
++                            wall.QuadPart, g_ld_schedule_diag);
++                fprintf(stderr, "[present-qpc] streaming every %u presents to %s\n", RSX_PS_BATCH, path);
++            }
++        }
++    }
+ }
+ 
+ static void ld_present_measure_record(u32 guest_frame)
+@@ -1208,13 +1221,25 @@
+      * already-recorded fixed ring exactly at that endpoint so an unrelated
+      * host-window teardown cannot truncate the authoritative raw samples.
+      * This is outside the measured timestamp operation and runs once.
++     * Patch 2187: with RSX_PRESENT_QPC_STREAM=1 the stream writes every batch as it fills and this endpoint is dropped.
+      */
+-    if (guest_frame == 2293u)
++    if (g_ld_present_stream.f) {
++        if (rsx_ps_due(&g_ld_present_stream, present_id))
++            rsx_ps_flush(&g_ld_present_stream, g_ld_present_ring, LD_PRESENT_RING_CAP, present_id);
++    } else if (guest_frame == 2293u)
+         ld_present_measure_dump();
+ }
+ 
+ static void ld_present_measure_dump(void)
+ {
++    if (g_ld_present_stream.f) {   /* patch 2187 */
++        rsx_ps_flush(&g_ld_present_stream, g_ld_present_ring, LD_PRESENT_RING_CAP, g_ld_present_total);
++        if (!g_ld_present_dumped)
++            fprintf(stderr, "[present-qpc] streamed %llu successful presents at %lld Hz\n",
++                    (unsigned long long)g_ld_present_stream.written, g_ld_qpc_frequency);
++        g_ld_present_dumped = 1;
++        return;
++    }
+     if (g_ld_present_dumped || g_ld_present_total == 0 ||
+         g_ld_qpc_frequency <= 0)
+         return;
+@@ -4018,6 +4043,7 @@
+ static u32 g_ld_pg_stamp[2][LD_TD_WORDS * 32u];  /* patch 2047: per 64 KB page, 1 + the last frame a tracked write hit it */
+ static void ld_vc_stat_print(void);              /* patch 2047 */
+ static void ld_apso_stat_print(void);            /* patch 2048 */
++static void ld_pso_cover_print(const char* when);   /* patch 2187 (RSX_ATTRIB=1) */
+ static int g_ld_tex_hash_span = -1;
+ static struct { u64 hashes, skipped, changes, tracked, untracked, hashed_bytes, flip_flags, dyn_forced, wr_unchanged; } g_ld_th;
+ 
+@@ -4402,7 +4428,7 @@
+         rsx_vd_reclaim(&g_vd.a, done); rsx_vd_reclaim(&g_vd.sa, done);
+     }
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) ld_vc_stat_print();   /* patch 2047 */
+-    if ((g_ld_frames % 256u) == 255u) ld_apso_stat_print();   /* patch 2048 (prints only once builds ran) */
++    if ((g_ld_frames % 256u) == 255u) { ld_apso_stat_print(); ld_pso_cover_print("frame"); }   /* patch 2048 (prints only once builds ran); 2187 */
+     if (rsx_perf_enabled() && (g_ld_frames % 256u) == 255u) {
+         fprintf(stderr, "[tex-hash] span=%d big=%u frame=%u hashes=%llu skipped=%llu bytes=%.1fMB changes=%llu tracked=%llu"
+                         " untracked=%llu flip-flags=%llu wr-unchanged=%llu dyn-forced=%llu inplace=%llu b8-direct=%llu"
+@@ -9050,6 +9076,7 @@
+     fprintf(stderr, "[pso-preload] used %u of the preloaded PSOs, %u duplicates of walker builds, walker library hits %u\n",
+             g_ld_pl_used, g_ld_pl.n_dup, g_ld_pl.n_lib_hit_walker);
+     ld_pl_print_lib_stats("end");
++    ld_pso_cover_print("exit");   /* patch 2187 */
+     if (g_ld_pl.lib) { g_ld_pl.lib->lpVtbl->Release(g_ld_pl.lib); g_ld_pl.lib = NULL; }
+     if (g_ld_pl.dev1) { g_ld_pl.dev1->lpVtbl->Release(g_ld_pl.dev1); g_ld_pl.dev1 = NULL; }
+     free(g_ld_pl.lib_blob); g_ld_pl.lib_blob = NULL;
+@@ -10270,7 +10297,56 @@
+  * keeps its content across frames. KZ3's text is such a target: glyphs are rendered once (stencil-then-cover) into
+  * the glyph cache at 0x3A00000 and sampled from there afterwards, so a glyph whose draws were skipped stayed blank
+  * (whole menu lists, capital C/A) or kept the glyph that held its slot before (arrows in "For less"). */
+-static ID3D12PipelineState* ld_apso_await(u32 idx)
++/* KZ3 patch 2187 (stutter Task 0, RSX_ATTRIB=1, default off): attribution of every walker wait on a pending PSO build.
++ *   [pso-await] qpc=<ticks> key=<hex> packed=0|1|2 ms=<wait> class=warm-unbuilt|unknown
++ * warm-unbuilt: the key is in the template or the preload records read at start (a build was promised and was not
++ * ready yet); unknown: no record named it (a first-seen pipeline). packed: 0 literal-stride layout, 1 packed layout,
++ * 2 GPU-fetch form. [pso-cover] (every 256 frames and at exit) sums the counters. Off: one cached getenv, no more. */
++static int ld_attrib_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_ATTRIB"); on = e && *e && strcmp(e, "0") != 0; }
++    return on;
++}
++static struct { unsigned long long miss[3], await_n[3][2], await_us[3][2]; double max_ms[2]; unsigned n_class[2]; } g_ld_cov;
++static int ld_cov_warm(u64 key)
++{
++    for (u32 i = 0; g_pt.in && i < g_pt.n_in; i++) if (g_pt.in[i].key == key) return 1;
++    for (u32 i = 0; g_ld_pl.recs && i < g_ld_pl.n_recs; i++) if (g_ld_pl.recs[i].key == key) return 1;
++    return 0;
++}
++static void ld_cov_await(u32 idx, int packed, u64 us, LONGLONG qpc)
++{
++    const int pk = packed < 0 ? 0 : packed > 2 ? 2 : packed;
++    const u64 key = g.psos[idx].key;
++    const int cls = ld_cov_warm(key) ? 0 : 1;
++    g_ld_cov.await_n[pk][cls]++; g_ld_cov.await_us[pk][cls] += us;
++    if (us / 1e3 > g_ld_cov.max_ms[cls]) g_ld_cov.max_ms[cls] = (double)us / 1e3;
++    fprintf(stderr, "[pso-await] qpc=%lld key=%016llx packed=%d ms=%.2f class=%s\n", (long long)qpc,
++            (unsigned long long)key, pk, (double)us / 1e3, cls ? "unknown" : "warm-unbuilt");
++}
++static void ld_pso_cover_print(const char* when)
++{
++    if (!ld_attrib_on()) return;
++    unsigned never = 0;
++    for (u32 i = 0; g_pt.in && g_pt.rec_state && i < g_pt.n_in; i++) never += g_pt.rec_state[i] == 0;
++    unsigned long long an[2] = {0, 0}, au[2] = {0, 0};
++    for (int p = 0; p < 3; p++) for (int c = 0; c < 2; c++) { an[c] += g_ld_cov.await_n[p][c]; au[c] += g_ld_cov.await_us[p][c]; }
++    LARGE_INTEGER q; QueryPerformanceCounter(&q);
++    fprintf(stderr, "[pso-cover] %s qpc=%lld frame=%u records template=%u (dropped %u) library=%u (shipped/own split: n/a before the own template) "
++                    "keys-seen=%u queued=%u built=%ld (library %ld) walker-used template=%ld preload=%u "
++                    "never-found-by-scout=%u blobs-missing preload=%u template=%ld failed xlate=%ld pso=%ld key=%ld | "
++                    "misses packed0=%llu packed1=%llu fetch2=%llu | awaits warm-unbuilt n=%llu ms=%.1f max=%.1f, unknown n=%llu ms=%.1f max=%.1f | "
++                    "await packed0 w/u=%llu/%llu packed1 w/u=%llu/%llu fetch2 w/u=%llu/%llu\n",
++            when, (long long)q.QuadPart, g_ld_frames, g_pt.n_in, g_pt.n_dropped, g_ld_pl.n_recs, g_ld_pl.keyset_n, g_pt.n_queued,
++            (long)g_pt.built, (long)g_pt.lib_hits, (long)g_pt.used, g_ld_pl_used, never, g_ld_pl.n_missing, (long)g_pt.failed_blob,
++            (long)g_pt.failed_xlate, (long)g_pt.failed_pso, (long)g_pt.failed_key,
++            g_ld_cov.miss[0], g_ld_cov.miss[1], g_ld_cov.miss[2], an[0], au[0] / 1e3, g_ld_cov.max_ms[0], an[1], au[1] / 1e3, g_ld_cov.max_ms[1],
++            g_ld_cov.await_n[0][0], g_ld_cov.await_n[0][1], g_ld_cov.await_n[1][0], g_ld_cov.await_n[1][1],
++            g_ld_cov.await_n[2][0], g_ld_cov.await_n[2][1]);
++}
++
++static ID3D12PipelineState* ld_apso_await(u32 idx, int packed)
+ {
+     LARGE_INTEGER t0, t1, f; QueryPerformanceCounter(&t0);
+     ld_apso_drain();
+@@ -10284,6 +10360,7 @@
+     QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
+     const u64 us = (u64)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);
+     g_apso.awaits++; g_apso.await_us += us; if (us > g_apso.max_await_us) g_apso.max_await_us = us;
++    if (ld_attrib_on()) ld_cov_await(idx, packed, us, t1.QuadPart);   /* patch 2187 */
+     return g.psos[idx].pso;
+ }
+ 
+@@ -10889,7 +10966,7 @@
+ #endif
+             if (g.psos[i].preloaded) { if (g.psos[i].preloaded == 2) g_pt.used++; g.psos[i].preloaded = 0; g_ld_pl_used++; }
+             LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
+-            if (g.psos[i].pending) return ld_apso_await(i);   /* RSX pass 57: wait, never skip */
++            if (g.psos[i].pending) return ld_apso_await(i, packed_payload);   /* RSX pass 57: wait, never skip */
+             return g.psos[i].pso;
+         }
+     }
+@@ -11026,11 +11103,12 @@
+         g_ld_pstat.tot_miss++; g_ld_pstat.tot_miss_us += us;
+         g_ld_pstat.over4 += us > 4000; g_ld_pstat.over16 += us > 16000; g_ld_pstat.over50 += us > 50000;
+     }
++    g_ld_cov.miss[packed_payload < 0 ? 0 : packed_payload > 2 ? 2 : packed_payload]++;   /* patch 2187: new key by form (cheap, always counted) */
+     g.psos[g.n_psos].key = key;
+     g.psos[g.n_psos].pso = pso;
+     g.psos[g.n_psos].pending = (u8)apso_pending;   /* patch 2048 */
+     g.n_psos++;
+-    if (apso_pending) return ld_apso_await(g.n_psos - 1u);   /* RSX pass 57: the draw waits for its build */
++    if (apso_pending) return ld_apso_await(g.n_psos - 1u, packed_payload);   /* RSX pass 57: the draw waits for its build */
+     return pso;
+ }
+ 
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -11,6 +11,7 @@
+ #include "rsx_live_draw.h"
+ #include "rsx_nv3089_rows.h"   /* patch 2080 */
+ #include "rsx_sync_hist.h"     /* patch 2164: LD_SYNC_HIST */
++#include "rsx_stutter_diag.h"  /* patch 2187: RSX_ATTRIB vblank/flip timing */
+ #include "rsx_front_probe.h"   /* patch 2172: LD_FRONT_PROBE */
+ #include "rsx_dispatch.h"
+ #include "rsx_fifo_capture.h"  /* patch 2164: LD_FIFO_CAPTURE */
+@@ -351,6 +352,27 @@
+ 
+ /* VBlank counter (incremented on each flip as approximation) */
+ static u32 s_vblank_count = 0;
++/* KZ3 patch 2187 (stutter Task 0): RSX_ATTRIB=1 (default off) records vblank tick lateness, tick-to-handler delivery,
++ * flip marker -> completion and flip-status polls, reported as one [vblank] line every 10 s by the frame thread
++ * (kz3_vbd_report, port/kz3/main.cpp). Off: one cached int test per site. */
++static rsx_sd_vb s_vbd;
++static int s_vbd_on = -1;
++static int vbd_init(void) { const char* e = getenv("RSX_ATTRIB"); s_vbd_on = e && *e && strcmp(e, "0") != 0; return s_vbd_on; }
++#define VBD_ON() (s_vbd_on > 0 || (s_vbd_on < 0 && vbd_init()))
++static int64_t vbd_qpc(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart; }
++static int64_t vbd_freq(void) { static int64_t f; if (!f) { LARGE_INTEGER x; QueryPerformanceFrequency(&x); f = x.QuadPart; } return f; }
++int kz3_vbd_on(void) { return VBD_ON(); }
++void kz3_vbd_late(long long qpc_now, long long qpc_ideal) { if (VBD_ON()) rsx_sd_late(&s_vbd, qpc_now, qpc_ideal, vbd_freq()); }
++void kz3_vbd_pass(int fired) { if (VBD_ON() && fired > 0) rsx_sd_pass(&s_vbd, (unsigned)fired); }
++extern volatile long long g_gcm_ref_pub_count;
++/* Writes the window's [vblank] line to stderr and resets it (frame thread, every 10 s). */
++void kz3_vbd_report(long long qpc_now, double win_s)
++{
++    if (!VBD_ON()) return;
++    char buf[1024];
++    rsx_sd_report(&s_vbd, buf, sizeof buf, qpc_now, win_s, (unsigned long long)g_gcm_ref_pub_count);
++    fprintf(stderr, "%s\n", buf);
++}
+ 
+ /* IO map reservation tracking */
+ static u32 s_io_map_reserved = 0;  /* bytes reserved for IO mapping */
+@@ -854,6 +876,7 @@
+       if (fd && PS3_LOG_FIRST(n, 24))
+           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
+                   s_flip_status, 10); }
++    if (VBD_ON()) { if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING) atomic_fetch_add(&s_vbd.poll_waiting, 1ull); else atomic_fetch_add(&s_vbd.poll_done, 1ull); }   /* patch 2187 */
+     return s_flip_status;
+ }
+ 
+@@ -1023,6 +1046,7 @@
+                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
+                            calls, nv, nf, s_vblank_count, 10); } }
+     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
++        if (VBD_ON()) rsx_sd_deliver(&s_vbd, vbd_qpc(), vbd_freq());   /* patch 2187 */
+         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
+                            0, 0, 0, 0, 0, 0, 0);
+@@ -1059,7 +1083,7 @@
+ 
+ /* Back-compat: the old direct entry points now just mark a tick pending (so any
+  * caller other than the ticker still works) -- delivery stays on the main thread. */
+-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
++void cellGcmTickVBlank(void) { s_vblank_count++; if (VBD_ON()) rsx_sd_tick(&s_vbd, vbd_qpc()); GCM_PENDING_SET(1); }
+ /* Only deliver a flip completion when a flip is actually outstanding.
+  *
+  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
+@@ -1080,6 +1104,7 @@
+     const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
+     if (waiting) s_flip_tick_seq = s_flip_req_seq;
+     FLIP_UNLOCK();
++    if (waiting && VBD_ON()) rsx_sd_flip_done(&s_vbd, vbd_qpc(), vbd_freq());   /* patch 2187 */
+     if (waiting) GCM_PENDING_SET(2);
+ }
+ 
+@@ -3955,7 +3980,7 @@
+                 s_flip_request_count++;
+                 /* Not past `queued`: a resync may already have written off
+                  * this flip. */
+-                if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
++                if (s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; if (VBD_ON()) rsx_sd_marker(&s_vbd, vbd_qpc()); }
+             } else {
+                 cellGcmSetFlipCommand(w & 0xFFu);
+             }

@@ -13,7 +13,7 @@ keys and data folder are port-specific).
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
 
-Rebased on ps3recomp v0.19.0 (shared v0.19 group C): upstream #612 (24c702ae) split the keyboard fallback into key sources (XInput, macOS, SDL) with one fixed table. The binding file stays Windows-only (PAD_BACKEND_XINPUT; it reuses upstream's pad_host_window_focused and pad_key_down), where it replaces the fixed table and merges with the pad; the macOS and SDL sources keep upstream's table and its no-pad-only rule.
+Rebased on ps3recomp v0.19.0: upstream #612 (24c702ae) split the keyboard fallback into key sources (XInput, macOS, SDL) with one fixed table. The binding file stays Windows-only (PAD_BACKEND_XINPUT; it reuses upstream's pad_host_window_focused and pad_key_down), where it replaces the fixed table and merges with the pad; the macOS and SDL sources keep upstream's table and its no-pad-only rule.
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index bdbe0162..88c6d198 100644

@@ -9,7 +9,7 @@ writes the layout into the PlayerProfile's action table that ControlScheme::GetA
 actions move, vehicles / exo / turrets keep the scheme's own. KZ3_PAD_ACTIONS=0 turns the table writes off.
 Host test: tools/net/test_pad_actions.c. Notes: the RE notes s.28.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (the v0.19.0 chain files where available; originals for the rest, three-way merged where they did not apply).
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index 44812f7..463a68c 100644

@@ -69,6 +69,7 @@ add_library(kz3_spu OBJECT
     kz3_ama_probe.c       # KZ3_AMA_PROBE=1: Amadeus mixer job-group wait / push dump (quit hang, RE pass 114 s.1, SPU pass 52)
     kz3_pool_probe.c      # KZ3_POOL_PROBE=1: GPU-pool handle registration / allocation (K2 unready ids, SPU pass 54)
     kz3_frame_trace.c     # KZ3_FRAME_TRACE=FROM,TO: event timeline file for tools/spu/frame_trace.py (patch 1085, SPU pass 66)
+    kz3_gpost.c           # GPU post plan P1: batch runner claim/plan core (SPU pass 163)
     kz3_jobhook.c         # KZ3_JOB_CAPTURE / KZ3_NATIVE_JOB: job I/O capture + native-job hook (patch 1141, SPU pass 120)
     kz3_native_post.c     # Gfx.Post native kernels (SPU pass 122)
     kz3_native_dof.c      # DepthOfField native kernels (SPU pass 122)

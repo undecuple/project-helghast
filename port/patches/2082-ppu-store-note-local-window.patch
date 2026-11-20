@@ -16,7 +16,7 @@ Host test: tools/smoke/test_ppu_store_note.sh (compiles the patch's own blocks; 
 Refreshed for v0.15.0 (SPU pass 85): upstream's lifter writes the byte-reversed and vector stores through
 VM_RAW_ST / vm_raw_st16 (aligned single-copy atomic) instead of memcpy; the notes follow those, and the two direct
 vm_base stores v0.15.0 added (stdbrx, stvlx/stvrx) note too.
-Rebased on ps3recomp v0.19.0 (Toro, group C): upstream cellGcmInit now sets s_config.localSize = 0x0F900000u (249 MB, retail value; 256 MB overflowed the 28-bit heap size field). Upstream's line is kept; the patch's cellGcm_ppu_store_note_install() call follows it (the patch's old 256 MB line is dropped, upstream's value wins). gcm_ppu_note_pages_ea and the install function read s_config.localSize at call time, so they follow the 249 MB window. ppu_loader.cpp and ppu_lifter.py apply without change.
+Rebased on ps3recomp v0.19.0: upstream cellGcmInit now sets s_config.localSize = 0x0F900000u (249 MB, retail value; 256 MB overflowed the 28-bit heap size field). Upstream's line is kept; the patch's cellGcm_ppu_store_note_install() call follows it (the patch's old 256 MB line is dropped, upstream's value wins). gcm_ppu_note_pages_ea and the install function read s_config.localSize at call time, so they follow the 249 MB window. ppu_loader.cpp and ppu_lifter.py apply without change.
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 index 2b7677b7..90367216 100644

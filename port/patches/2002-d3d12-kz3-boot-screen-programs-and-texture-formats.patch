@@ -25,7 +25,7 @@ Rebased on ps3recomp v0.17.0 (SPU pass 95): partly absorbed: the FP export-width
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): DRAWLOG block after upstream's OMSetStencilRef; its /s<idx> sampler field dropped (2001's samp index gone).
 
-Rebased on ps3recomp v0.19.0 (shared v0.19 group C): upstream #635 added vp_tex_dxgi (the same decoded-format map as tex_decoded_dxgi, which is dropped) and widened the bound formats to B8, A8R8G8B8, G8B8, DXT, W16Z16Y16X16, X16, Y16X16, X32F and Y16X16F; tex_fmt_uploadable keeps the rest (packed 16-bit colours, D8R8G8B8, HILO, depth, W32Z32Y32X32F) and gates both checks. PSO-failure print stays under PS3_LOG_FIRST.
+Rebased on ps3recomp v0.19.0: upstream #635 added vp_tex_dxgi (the same decoded-format map as tex_decoded_dxgi, which is dropped) and widened the bound formats to B8, A8R8G8B8, G8B8, DXT, W16Z16Y16X16, X16, Y16X16, X32F and Y16X16F; tex_fmt_uploadable keeps the rest (packed 16-bit colours, D8R8G8B8, HILO, depth, W32Z32Y32X32F) and gates both checks. PSO-failure print stays under PS3_LOG_FIRST.
 
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
 index 4a53c08f..8e93df71 100644

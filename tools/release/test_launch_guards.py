@@ -80,7 +80,18 @@ def main():
                   "3 no folder recorded or folder gone: not this check's case (decide names it)")
             os.remove(os.path.join(upd, "USRDIR", tfc.fc.UPDATE_EDAT))
             m = la.update_problem(upd)
-            check("no longer holds the update" in m and "Pick" in m and "added_data" in m, f"3 data archive gone: {m[:110]}")
+            check("does not hold the complete update" in m and "Pick" in m and "added_data" in m and "no longer" not in m,
+                  f"3 data archive gone: {m[:110]}")
+            upd2 = tfc.make_update(os.path.join(tmp, "u2"))
+            shutil.rmtree(os.path.join(upd2, "USRDIR", "patch_data_ps3_sp"))
+            shutil.rmtree(os.path.join(upd2, "USRDIR", "patch_data_ps3_mp"))
+            m = la.update_problem(upd2)
+            check("patch_data_ps3_sp" in m and "patch_data_ps3_mp" in m and "does not hold" in m,
+                  f"3 both patch folders gone: both named: {m[:300]!r}")
+            os.remove(os.path.join(upd2, "USRDIR", tfc.fc.UPDATE_EDAT))
+            m = la.update_problem(upd2)
+            check("added_data" in m and "patch_data_ps3_sp" in m and m.count("\n- ") == 2,
+                  f"3 archive and patch folders gone: every FAIL is listed, not only the first: {m[:300]!r}")
             shutil.rmtree(upd)
             os.makedirs(upd)
             m = la.update_problem(upd)

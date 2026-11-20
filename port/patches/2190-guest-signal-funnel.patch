@@ -1,0 +1,646 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index e32f1139..6e36272a 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -25,6 +25,7 @@ static rsx_lgs s_lgs;   /* patch 2189: legacy-skip counters, walker thread only
+ #include "cellGcmSys.h"
+ #include "../../runtime/platform/win32_compat.h"
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
++#include "rsx_guest_signal.h"   /* patch 2190: the guest-signal funnel */
+ #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+ #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+ #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+@@ -38,7 +39,6 @@ static void gcm_fcap_pass_begin(u32 put);
+ static void gcm_fcap_cmd(u32 getoff, u32 w_raw, int is_method);
+ static void gcm_fcap_nop_run(u32 getoff, u32 words);
+ /* patch 2171: walker-side / ring-callback guest writes as WORD write records (tag 12 ring JUMP, 13 context word, 14 put). */
+-#define GCM_FC_WR(tag, ea, val) do { if (g_rsx_fcap_on) rsx_fcap_word(1, (tag), (ea), (val)); } while (0)
+ static void gcm_fcap_pass_end(const char* why, u32 getoff, u32 calloff);
+ static void gcm_fcap_nv3089(int phase);
+ static void gcm_fcap_copy_geom(u32 kind, u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g, u32 h, u32 i, u32 j, u32 k);
+@@ -1439,12 +1439,23 @@ static u8* gcm_rows(u32 bytes)
+ }
+ 
+ static void nv3089_blit_body(void);
++/* patch 2190: the declared destination extent of one NV3089 blit: from the resolved destination to the end of the larger of the
++ * linear rows (clip origin + height x pitch) and the swizzled w*h*4 block */
++static u32 gcm_nv3089_span_ea(void) { return cellGcmResolveLocated(s_gcm2d.dst_dma != 0xFEED0001u, s_gcm2d.dst_offset); }
++static u32 gcm_nv3089_span_len(void)
++{
++    const u32 out_w = s_nv3089.out_sz & 0xFFFFu, out_h = s_nv3089.out_sz >> 16, out_x = s_nv3089.out_pt & 0xFFFFu, out_y = s_nv3089.out_pt >> 16;
++    const u64 lin = (u64)(out_y + out_h) * (s_gcm2d.pitch >> 16) + (u64)(out_x + out_w) * 4u, swz = (u64)out_w * out_h * 4u;
++    const u64 m = lin > swz ? lin : swz;
++    return m > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)m;
++}
+ /* KZ3 patch 2080: NV3089 time and bytes per RSX_PERF period ([perf-nv3089]); the body is the original blit. */
+ static void nv3089_blit(void)
+ {
+     const long long t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;
+     GCM_SPLIT_PUSH(nv3_st, RSX_SB_WB);   /* patch 2188 */
+     if (g_rsx_fcap_on) gcm_fcap_nv3089(0);   /* patch 2164 */
++    gcm_guest_signal_span(RSX_GS_COPY_3089, gcm_nv3089_span_ea(), gcm_nv3089_span_len());   /* patch 2190: E9, the destination extent (superset of the linear and the swizzled store) */
+     nv3089_blit_body();
+     if (g_rsx_fcap_on) gcm_fcap_nv3089(1);
+     GCM_SPLIT_POP(nv3_st);
+@@ -1778,6 +1789,7 @@ static u32 nv0039_rows(const u32* p, int verify)
+     extern u8* vm_base;
+     const u32 src = p[0], dst = p[1], len = p[2], n = p[3], in_inc = p[6], out_inc = p[7];
+     const s64 pin = (s32)p[4], pout = (s32)p[5];
++    gcm_guest_signal_span(RSX_GS_WBD_DRAIN, dst, len * n);   /* patch 2190: E13, the deferred row copy retires here (also the verify run, which only reads) */
+     for (u32 y = 0; y < n; y++) {
+         u8* d = vm_base + (u32)((s64)dst + (s64)y * pout);
+         const u8* sp = vm_base + (u32)((s64)src + (s64)y * pin);
+@@ -1844,6 +1856,7 @@ static void nv0039_copy(u32 notify)
+         wbd_deferred = rsx_live_draw_wbd_defer_move(sl ? 0u : 1u, wbd_so, (u32)(hi_in - lo_in), dl ? 0u : 1u, wbd_do,
+                                                     (u32)(hi_out - lo_out), wp, nv0039_rows);
+     }
++    if (!wbd_deferred) gcm_guest_signal_span(RSX_GS_COPY_0039, (u32)lo_out, (u32)(hi_out - lo_out));   /* patch 2190: E8, the immediate row copy below (a deferred one is E13 at its drain) */
+     for (u32 y = 0; y < n && !wbd_deferred; y++) {
+         u8* d = vm_base + (u32)((s64)dst + (s64)y * pout);
+         const u8* sp = vm_base + (u32)((s64)src + (s64)y * pin);
+@@ -1982,10 +1995,11 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+             const u32 at = s_gcm2d.dst_offset + py * dst_pitch + px * 4;
+             if (gcm_rect_tiled(local, at, 4, 1)) {
+                 const u8 word[4] = { (u8)(data >> 24), (u8)(data >> 16), (u8)(data >> 8), (u8)data };
++                gcm_guest_signal_span(RSX_GS_STORE_308A, at, 4u);   /* patch 2190: E9, the tiled store (location main) */
+                 rsx_tiled_write(&s_gcm_mem, RSX_LOCATION_MAIN, at, word, 4);
+                 return;
+             }
+-            vm_write32(base + py * dst_pitch + px * 4, data);
++            gcm_guest_signal(RSX_GS_STORE_308A, base + py * dst_pitch + px * 4, data);   /* patch 2190: E9 */
+             rsx_live_draw_set_write_source(5u);   /* patch 2081 diagnostic tag: NV308A */
+             gcm_note_pages_ea(base + py * dst_pitch + px * 4, 4u);   /* patch 2033 */
+             rsx_live_draw_set_write_source(0u);
+@@ -2367,7 +2381,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+                 if (m == 0x64u) s_sema_offset = v;
+                 else if (m == 0x6Cu) {
+                     atomic_thread_fence(memory_order_release);
+-                    vm_write32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);
++                    gcm_guest_signal(RSX_GS_RESYNC_LABEL, GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);   /* patch 2190: E12 */
+                     labels++;
+                 } else if (m == 0x01A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) {
+                     rsx_process_method(&s_resync_state, m, v);
+@@ -2419,6 +2433,7 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
+         static int _o = 0;
+         if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+     }
++    gcm_guest_signal_note(RSX_GS_REF_PUSH, v, getoff);   /* patch 2190: E1, the host queue the guest sees at the next publication */
+     s_ref_q[t % GCM_REF_QLEN] = v;
+     s_ref_qtail = t + 1;
+     if (g_rsx_o0.on) { const long long dep = (long long)(t + 1 - s_ref_qhead);   /* patch 2188: queue depth after the push */
+@@ -2445,8 +2460,7 @@ static void gcm_ref_publish_one(void)
+     u32 h = s_ref_qhead;
+     if (h == s_ref_qtail) return;
+     if (g_rsx_o0.on) { RSX_O0_ADD(g_rsx_o0.ref_pub, 1); RSX_O0_ADD(g_rsx_o0.ref_pub_sum, (long long)(s_ref_qtail - h)); }   /* patch 2188 */
+-    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
+-    if (g_rsx_fcap_on) rsx_fcap_word(1, 6, GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);   /* patch 2164 */
++    gcm_guest_signal(RSX_GS_REF, GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);   /* patch 2190: E1 (capture tag 6 of patch 2164 is emitted there) */
+     /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
+      * when redirected, so its interleaving with an stderr probe is not a
+      * timeline. Same stream = same ordering. */
+@@ -2474,7 +2488,9 @@ static void gcm_ref_publish_one(void)
+  * poll-path below. TryAcquire on the poll path avoids re-entrancy (the walker
+  * itself performs guest reads) and never blocks a spinning game thread. */
+ static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
+-static void gcm_rsx_process_fifo_unlocked(void);
++static void gcm_rsx_process_fifo_body(void);
++/* patch 2190: the thread inside a walker pass is "R" for the guest-signal funnel (on= vs offr= counters) */
++static void gcm_rsx_process_fifo_unlocked(void) { const int gs_prev = rsx_gs_walker_enter(); gcm_rsx_process_fifo_body(); rsx_gs_walker_leave(gs_prev); }
+ 
+ /* Kick event: a game thread whose fence wait finds the queue DRY signals the
+  * present thread to run the FIFO walker NOW instead of on its next 16 ms
+@@ -3353,6 +3369,12 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+                 char ln[1024];
+                 rsx_o0_fmt_state(ln, sizeof ln, tnow, &cur, &prev); fprintf(stderr, "%s\n", ln);
+                 rsx_o0_fmt_4b(ln, sizeof ln, tnow, tk, &cur, &prev); fprintf(stderr, "%s\n", ln);
++                {   /* patch 2190: [gsig] guest-signal funnel counters per kind, on = walker thread, offr = any other thread */
++                    static unsigned long long gcur[RSX_GS_N][2], gprev[RSX_GS_N][2];
++                    for (unsigned k = 0; k < RSX_GS_N; k++) { gcur[k][0] = __atomic_load_n(&g_rsx_gs_n[k][0], __ATOMIC_RELAXED); gcur[k][1] = __atomic_load_n(&g_rsx_gs_n[k][1], __ATOMIC_RELAXED); }
++                    rsx_gs_fmt(ln, sizeof ln, tnow, (const unsigned long long (*)[2])gcur, (const unsigned long long (*)[2])gprev); fprintf(stderr, "%s\n", ln);
++                    memcpy(gprev, gcur, sizeof gprev);
++                }
+                 rsx_o0_fmt_ref(ln, sizeof ln, tnow, &cur, &prev); fprintf(stderr, "%s\n", ln);
+                 rsx_o0_fmt_seg(ln, sizeof ln, tnow, &cur, &prev); fprintf(stderr, "%s\n", ln);
+                 rsx_o0_fmt_tex(ln, sizeof ln, tnow, &cur, &prev); fprintf(stderr, "%s\n", ln);
+@@ -3757,14 +3779,14 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
+             const u32 rea = gcm_io2ea(off);
+             if (rea) {
+-                vm_write32(rea, (u32)(ts >> 32));
+-                vm_write32(rea + 4u, (u32)ts);
+-                vm_write32(rea + 8u, val);
+-                vm_write32(rea + 12u, 0u);
+-                if (g_rsx_fcap_on) { rsx_fcap_word(1, 5, rea, (u32)(ts >> 32)); rsx_fcap_word(1, 5, rea + 4u, (u32)ts);
+-                                     rsx_fcap_word(1, 5, rea + 8u, val); rsx_fcap_word(1, 5, rea + 12u, 0u); }   /* patch 2164 */
++                /* patch 2190: E2 through the funnel, kind 5 (the capture words of patch 2164 are emitted there) */
++                gcm_guest_signal(RSX_GS_REPORT, rea, (u32)(ts >> 32));
++                gcm_guest_signal(RSX_GS_REPORT, rea + 4u, (u32)ts);
++                gcm_guest_signal(RSX_GS_REPORT, rea + 8u, val);
++                gcm_guest_signal(RSX_GS_REPORT, rea + 12u, 0u);
+             } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+         } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
++            gcm_guest_signal_note(RSX_GS_REPORT_LOCAL, idx, val);   /* patch 2190: E2, a host table the guest reads through cellGcmGetReportData */
+             s_report_data[idx].timestamp = ts;
+             s_report_data[idx].value = val;
+         }
+@@ -3815,7 +3837,7 @@ static int gcm_report_hold(void)
+ /* The diagnostic switches below are tested on every drain pass, and GCM_RECDBG
+  * on every semaphore method. getenv walks the whole environment and showed in
+  * RSX-thread profiles, so each is read once and cached, like the other knobs. */
+-static void gcm_rsx_process_fifo_unlocked(void)
++static void gcm_rsx_process_fifo_body(void)
+ {
+     const long long o_pre0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] pre */
+     { static unsigned _n = 0; static unsigned long long _t0 = 0;
+@@ -4111,6 +4133,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 /* Queued by _cellGcmSetFlipCommand, which already did the
+                  * guest-visible half of the request. */
+                 gcm_set_current_display_buffer(w & 7u);
++                gcm_guest_signal_note(RSX_GS_FLIP, w & 7u, 2u);   /* patch 2190: E6, the queued flip reaches the walker (s_flip_pending) */
+                 s_flip_pending = 1;
+                 s_flip_request_count++;
+                 /* Not past `queued`: a resync may already have written off
+@@ -4276,7 +4299,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                * The end of the pass, where get is otherwise published, can
+                * come tens of milliseconds later. GCM_GET_EQ_PUT keeps its
+                * own value. */
+-              if (!gcm_get_eq_put()) { vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); if (g_rsx_fcap_on) rsx_fcap_word(1, 1, GCM_CONTROL_GUEST_ADDR + 4, tgt); } }
++              if (!gcm_get_eq_put()) gcm_guest_signal(RSX_GS_GET_JUMP, GCM_CONTROL_GUEST_ADDR + 4, tgt); }   /* patch 2190: E5 */
+             continue;
+         }
+         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+@@ -4385,12 +4408,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                          * before the RELEASE never does. GCM_GET_EQ_PUT keeps
+                          * publishing put at the end of the pass instead. */
+                         if (!gcm_get_eq_put()) {
+-                            vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
+-                            if (g_rsx_fcap_on) rsx_fcap_word(1, 2, GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);   /* patch 2164 */
++                            gcm_guest_signal(RSX_GS_GET_REL, GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);   /* patch 2190: E3 get before the label */
+                         }
+                         atomic_thread_fence(memory_order_release);
+-                        vm_write32(la, v);
+-                        if (g_rsx_fcap_on) rsx_fcap_word(1, 3, la, v);   /* patch 2164 */
++                        gcm_guest_signal(RSX_GS_LABEL, la, v);   /* patch 2190: E3 */
+                         if (g_rsx_o0.on && ((s_sema_offset & 0xFFFFu) >> 4) == 0x4Bu)   /* patch 2188: [o0-4b] */
+                             rsx_o0_q4b(&g_rsx_o0, s_fifo_getoff, s_fifo_getoff + 4 + count * 4, vm_read32(GCM_CONTROL_GUEST_ADDR + 0), rsx_perf_now());
+                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
+@@ -4509,6 +4530,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                               m, vm_read32(dea)); }
+                 if (subch == 7 && m == 0x0B00u) {
+                     extern void rsx_raise_user_cmd(u32 arg);
++                    gcm_guest_signal_note(RSX_GS_USERCMD, vm_read32(dea), 2u);   /* patch 2190: E7, the lv2 queue raise */
+                     rsx_raise_user_cmd(vm_read32(dea));
+                     /* A title that registered its handler through the HLE
+                      * cellGcmSetUserHandler (Killzone 3: one per frame, the
+@@ -4831,12 +4853,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             u32 io_begin = gcm_ea2io(begin);
+             if (io_begin != 0xFFFFFFFFu) {
+                 u32 jmp_at = (cur <= end) ? cur : end;   /* `end` is the JUMP's own slot */
+-                vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
+-                vm_write32(ctx + 0x8, begin);                 /* current = begin */
+-                vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
+-                GCM_FC_WR(12, jmp_at, 0x20000000u | io_begin); GCM_FC_WR(13, ctx + 0x8, begin);   /* patch 2171 */
++                /* patch 2190: E11 through the funnel; the writes keep their order (JUMP, current, put), the capture tags 12, 13, 14 of patch 2171 are emitted there */
++                gcm_guest_signal(RSX_GS_RING_JUMP, jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
++                gcm_guest_signal(RSX_GS_CTX_WORD, ctx + 0x8, begin);                  /* current = begin */
++                gcm_guest_signal(RSX_GS_PUT_RECYCLE, GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
+                 if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.ring_drain, 1);   /* patch 2188: the drain recycled the title's ring itself */
+-                GCM_FC_WR(14, GCM_CONTROL_GUEST_ADDR + 0, io_begin);
+                 s_fifo_getoff = io_begin;                          /* get */
+                 put = io_begin;
+                 /* Count it as the walker taking the JUMP to begin. The title's
+@@ -4863,8 +4884,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * to answer one question for a title that reports its ring full while the
+      * walker says it is drained: is the title reading `get`, or something else?
+      * If the overflow survives this, `get` is not what it consults. */
+-    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);
+-    if (g_rsx_fcap_on) rsx_fcap_word(1, 4, GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);   /* patch 2164 */
++    gcm_guest_signal(RSX_GS_GET_END, GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);   /* patch 2190: E5 */
+ 
+     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
+     gcm_ref_publish_one();
+@@ -4905,12 +4925,10 @@ static void gcm_fifo_next_segment(u32 ctx)
+     const u32 io_cur = gcm_ea2io(cur), io_next = gcm_ea2io(next);
+     if (io_cur == 0xFFFFFFFFu || io_next == 0xFFFFFFFFu || cur > end) return;
+     if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.seg_acted, 1);   /* patch 2188 */
+-    vm_write32(cur, 0x20000000u | io_next);              /* JUMP -> next segment */
+-    GCM_FC_WR(12, cur, 0x20000000u | io_next);           /* patch 2171 */
++    gcm_guest_signal(RSX_GS_RING_JUMP, cur, 0x20000000u | io_next);   /* JUMP -> next segment; patch 2190: E11, off the walker (title callback) */
+     /* The JUMP has to be in memory before `put` lets the walker reach it. */
+     atomic_thread_fence(memory_order_release);
+-    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_cur);      /* put: up to the JUMP */
+-    GCM_FC_WR(14, GCM_CONTROL_GUEST_ADDR + 0, io_cur);   /* patch 2171 */
++    gcm_guest_signal(RSX_GS_PUT_RECYCLE, GCM_CONTROL_GUEST_ADDR + 0, io_cur);   /* put: up to the JUMP; patch 2190 */
+     if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);          /* start the walker now */
+     /* The walker is a whole lap behind only if it is still inside the next
+      * segment. Bounded on no progress, like the recycle wait below. */
+@@ -4927,10 +4945,9 @@ static void gcm_fifo_next_segment(u32 ctx)
+             printf("[cellGcmSys] fifo segment: walker stalled in the next segment (get=0x%08X)%c",
+                    s_fifo_getoff, 10);
+     }
+-    vm_write32(ctx + 0x0, next);
+-    vm_write32(ctx + 0x8, next);
+-    vm_write32(ctx + 0x4, next + s_seg_size - 4);
+-    GCM_FC_WR(13, ctx + 0x0, next); GCM_FC_WR(13, ctx + 0x8, next); GCM_FC_WR(13, ctx + 0x4, next + s_seg_size - 4);   /* patch 2171 */
++    gcm_guest_signal(RSX_GS_CTX_WORD, ctx + 0x0, next);   /* patch 2190 */
++    gcm_guest_signal(RSX_GS_CTX_WORD, ctx + 0x8, next);
++    gcm_guest_signal(RSX_GS_CTX_WORD, ctx + 0x4, next + s_seg_size - 4);
+ }
+ 
+ /* Room for `bytes` more at the context's write head. On the segmented ring a
+@@ -4973,15 +4990,13 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+     u32 io_begin = gcm_ea2io(begin);
+     const u32 back_jumps0 = s_fifo_back_jumps;
+     if (io_begin != 0xFFFFFFFFu) {
+-        vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
+-        GCM_FC_WR(12, current, 0x20000000u | io_begin);         /* patch 2171 */
++        gcm_guest_signal(RSX_GS_RING_JUMP, current, 0x20000000u | io_begin);   /* JUMP begin; patch 2190: E11 (title callback) */
+         /* The jump has to be in guest memory before `put` moves behind the
+          * walker's `get`. Program order is not enough on arm64: the walker
+          * may observe the new `put`, find `get` != `put`, and read the old
+          * word at `current` before the jump lands there. */
+         atomic_thread_fence(memory_order_release);
+-        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
+-        GCM_FC_WR(14, GCM_CONTROL_GUEST_ADDR + 0, io_begin);     /* patch 2171 */
++        gcm_guest_signal(RSX_GS_PUT_RECYCLE, GCM_CONTROL_GUEST_ADDR + 0, io_begin);   /* put = begin; patch 2190 */
+     }
+ 
+     /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
+@@ -5016,8 +5031,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+                    g_gcm_fifo_drained_ea, begin, spins);
+     }
+ 
+-    vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
+-    GCM_FC_WR(13, ctx_ea + 0x8, begin);                 /* patch 2171 */
++    gcm_guest_signal(RSX_GS_CTX_WORD, ctx_ea + 0x8, begin);   /* recycle ring to base; patch 2190 */
+     s_fifo_recycle_waiting = 0;                          /* current no longer reads end */
+ 
+     if (s_recdbg)
+@@ -5195,6 +5209,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+      * the drain does this half when it reaches it (see the 0xFEAD case). */
+     if (!in_fifo) {
+         gcm_set_current_display_buffer(bufferId);
++        gcm_guest_signal_note(RSX_GS_FLIP, bufferId, 3u);   /* patch 2190: E6, the direct flip request */
+         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
+         s_flip_request_count++;
+         s_flip_direct_pending = 1;
+@@ -6625,6 +6640,7 @@ static void gcm_walker_user_command(u32 cmd)
+ 
+ void cellGcmQueueUserCommand(u32 cmd)
+ {
++    gcm_guest_signal_note(RSX_GS_USERCMD, cmd, 0u);   /* patch 2190: E7, the queued user command the handler thread takes */
+     GCM_USER_STORE(cmd);
+     GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
+ #ifdef _WIN32
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index e63e0e84..36ad1c7c 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -16,6 +16,7 @@
+ 
+ #include "rsx_commands.h"
+ #include "rsx_o0.h"   /* patch 2188: RSX_O0=1 legacy-state reader probe */
++#include "rsx_guest_signal.h"   /* patch 2190: the guest-signal funnel (defined at the end of this file) */
+ #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
+ #include <stdio.h>
+ #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+@@ -514,7 +515,6 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+       if (method == 0x0180) s_notify_ctx = data;
+       if (method == 0x0104) {
+           if ((s_notify_ctx & ~7u) == (0x6660420Fu & ~7u)) {
+-              extern void vm_write32(uint32_t a, uint32_t v);
+               extern u32 gcm_io_offset_to_ea(u32 io);
+               extern unsigned long long ps3_ms_now(void);
+               u32 ea = gcm_io_offset_to_ea(0x0F100000u + ((s_notify_ctx & 7u) ^ 7u) * 0x40u);
+@@ -522,11 +522,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+                   fprintf(stderr, "[RSX] NOTIFY slot %u -> ea 0x%08X\n", (s_notify_ctx & 7u) ^ 7u, ea); }
+               if (ea) {
+                   unsigned long long ts = ps3_ms_now() * 1000000ull;
+-                  vm_write32(ea, (u32)(ts >> 32)); vm_write32(ea + 4, (u32)ts);
+-                  vm_write32(ea + 8, 0); vm_write32(ea + 12, 0);
+-                  { extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);   /* patch 2164 */
+-                    if (g_rsx_fcap_on) { rsx_fcap_word(1, 10, ea, (u32)(ts >> 32)); rsx_fcap_word(1, 10, ea + 4, (u32)ts);
+-                                         rsx_fcap_word(1, 10, ea + 8, 0); rsx_fcap_word(1, 10, ea + 12, 0); } }
++                  /* patch 2190: E4 NOTIFY slot through the funnel (kind 10; the capture words of patch 2164 are emitted there) */
++                  gcm_guest_signal(RSX_GS_NOTIFY, ea, (u32)(ts >> 32)); gcm_guest_signal(RSX_GS_NOTIFY, ea + 4, (u32)ts);
++                  gcm_guest_signal(RSX_GS_NOTIFY, ea + 8, 0); gcm_guest_signal(RSX_GS_NOTIFY, ea + 12, 0);
+               }
+           }
+           return 0;
+@@ -551,18 +549,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         if (g_rsx_sh_on | g_rsx_fp_on) rsx_sync_hist_event(3 /* RSX_SH_REL4097 */, sh_dirty != 0);
+       }
+       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
+-        extern void vm_write32(uint32_t a, uint32_t v);
+         extern u32 gcm_io_offset_to_ea(u32 io);
+         u32 ea = gcm_io_offset_to_ea(s_sem_off);
+         u32 val = method == 0x1D74 ? data
+                 : (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+-        if (ea) vm_write32(ea, val);
+-        { extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);   /* patch 2164 */
+-          if (g_rsx_fcap_on && ea) rsx_fcap_word(1, 9, ea, val); }
++        if (ea) gcm_guest_signal(RSX_GS_SEM_BE, ea, val);   /* patch 2190: E4, kind 9 */
+         return 0;
+       }
+       if (method == 0x1D70) {
+-        extern void vm_write32(uint32_t a, uint32_t v);
+         /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
+          * quirk); libgcm's cellGcmSetWriteBackEndLabel PRE-swaps to compensate
+          * (SDK gcm_implementation_sub.h: "// swap byte 0 and 2"). Writing the
+@@ -571,9 +565,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+          * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
+          * Apply the same swap the hardware does so the pre-swap cancels out. */
+         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+-        { extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);   /* patch 2164 */
+-          if (g_rsx_fcap_on) rsx_fcap_word(1, 9, VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val); }
++        gcm_guest_signal(RSX_GS_SEM_BE, VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);   /* patch 2190: E4, kind 9 */
+         { static u32 seen[64]; static int ns = 0; int k = 0;   /* TEMP: distinct release offsets */
+           for (; k < ns; k++) if (seen[k] == s_sem_off) break;
+           if (k == ns && ns < 64) { seen[ns++] = s_sem_off;
+@@ -582,14 +574,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         return 0;
+       }
+       if (method == 0x1D74) {
+-        extern void vm_write32(uint32_t a, uint32_t v);
+         /* KZ3 patch 2026: game-frame marker = the back-end release of label 0x4A
+          * (SET_SEMAPHORE_OFFSET 0x4A0, then 0x1D74), right before the G-buffer clears
+          * Counted only; key on the offset, not the value. */
+         if (s_sem_off == 0x4A0u) g_rsx_game_frame_marks++;
+-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
+-        { extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);   /* patch 2164 */
+-          if (g_rsx_fcap_on) rsx_fcap_word(1, 9, VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data); }
++        gcm_guest_signal(RSX_GS_SEM_BE, VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);   /* patch 2190: E4, kind 9 */
+         return 0;
+       } }
+     if ((method >= 0x200 && method <= 0x23C) ||
+@@ -1063,3 +1052,54 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
+ 
+     return methods_processed;
+ }
++
++/* ---- Patch 2190: the guest-signal funnel. GS_FUNNEL_BEGIN ---------------------------------------------------------
++ * Every guest-visible walker effect is written here, with the value and at the position the call site had. The capture
++ * record a site used to emit by hand is emitted here (kinds 1..6, 9..14 keep their WORD tag; kinds >= 15 are annotation
++ * words). tools/smoke/test_guest_signal_order.py lints that no walker-path function stores to guest memory outside this
++ * region. */
++unsigned long long g_rsx_gs_n[RSX_GS_N][2];
++void (*g_rsx_gs_trace)(unsigned kind, uint32_t ea, uint32_t n, int on_walker);
++static
++#ifdef _MSC_VER
++__declspec(thread)
++#else
++__thread
++#endif
++int t_rsx_gs_walker;
++int rsx_gs_walker_enter(void) { const int p = t_rsx_gs_walker; t_rsx_gs_walker = 1; return p; }
++void rsx_gs_walker_leave(int prev) { t_rsx_gs_walker = prev; }
++static inline void rsx_gs_count(unsigned kind, uint32_t ea, uint32_t n)
++{
++    const int onw = t_rsx_gs_walker;
++    __atomic_fetch_add(&g_rsx_gs_n[kind < RSX_GS_N ? kind : 0][onw ? 0 : 1], 1ull, __ATOMIC_RELAXED);
++    if (__builtin_expect(g_rsx_gs_trace != NULL, 0)) g_rsx_gs_trace(kind, ea, n, onw);
++}
++void gcm_guest_signal(unsigned kind, uint32_t ea, uint32_t val)
++{
++    extern void vm_write32(uint32_t a, uint32_t v);
++    extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);
++    rsx_gs_count(kind, ea, 4u);
++    vm_write32(ea, val);
++    if (g_rsx_fcap_on) rsx_fcap_word(1, kind, ea, val);
++}
++void gcm_guest_signal_hostbe(unsigned kind, uint8_t* p, uint32_t tag_ea, uint32_t val)
++{
++    extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);
++    rsx_gs_count(kind, tag_ea, 4u);
++    p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16); p[2] = (uint8_t)(val >> 8); p[3] = (uint8_t)val;
++    if (g_rsx_fcap_on) rsx_fcap_word(1, kind, tag_ea, val);
++}
++void gcm_guest_signal_span(unsigned kind, uint32_t ea, uint32_t n)
++{
++    extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);
++    rsx_gs_count(kind, ea, n);
++    if (g_rsx_fcap_on) rsx_fcap_word(1, kind, ea, n);
++}
++void gcm_guest_signal_note(unsigned kind, uint32_t a, uint32_t b)
++{
++    extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);
++    rsx_gs_count(kind, a, 0u);
++    if (g_rsx_fcap_on) rsx_fcap_word(1, kind, a, b);
++}
++/* GS_FUNNEL_END */
+diff --git a/libs/video/rsx_fifo_capture.h b/libs/video/rsx_fifo_capture.h
+index 2f7b3fa6..3c9f4128 100644
+--- a/libs/video/rsx_fifo_capture.h
++++ b/libs/video/rsx_fifo_capture.h
+@@ -14,7 +14,8 @@
+  *   check = FNV-1a 64 over (type, len, seq as little-endian bytes) then the payload.
+  *   The END record's payload is u64 record_count (records before it) and u64 total_payload_bytes; a file without a
+  *   valid END (truncated, crashed) reads as an error, never as a short capture.
+- * Version history: 1 = this layout.
++ * Version history: 1 = this layout. 2 (patch 2190) = same layout; WORD tags >= 15 are annotation words naming the guest-signal kind of an
++ *   effect the walker wrote (rsx_guest_signal.h): they are not part of the event identity, a reader that compares streams ignores them.
+  *
+  * Record payloads (u32 fields little endian; "w32" = a 32-bit FIFO / guest word as the guest sees it, numeric value):
+  *   RSX_FC_CONFIG (1)    u32 local_addr, local_size, vm_size, put, getoff, calloff, label_base, ctrl_addr, n_io;
+@@ -44,6 +45,10 @@
+  *                        9 0x1D70/0x1D74 write, 10 report notify (timestamp words), patch 2171: 11 report value written by the
+  *                        renderer's query drain (ea = main-memory IO OFFSET + 8, not an EA), 12 ring JUMP written by a recycle /
+  *                        segment-next, 13 command-context word (ctx+0 begin, +4 end, +8 current), 14 put written by a recycle.
++ *                        Version 2 (patch 2190, kinds of rsx_guest_signal.h; ea / value as the call passed them): 15 resync label, 16 NV0039
++ *                        copy span (ea, n), 17 NV3089 span (ea, n), 18 NV308A word, 19 surface write-back span ((location << 30) | offset, n),
++ *                        20 deferred-store span (ea, n), 21 flip note (buffer, src 0 sink 2 queued 3 direct), 22 user command note (cmd, 0 queue 2 raise),
++ *                        23 present note, 24 ref push note (value, getoff), 25 local report note (index, value).
+  *   RSX_FC_COPY (8)      u32 kind (0 NV0039, 1 NV3089), src_ea, dst_ea, line_len, line_count, pitch_in, pitch_out,
+  *                        format, wb, aux0 (src dma), aux1 (dst dma), aux2 (0).  The geometry of a walker copy; its source
+  *                        bytes and result are the RANGE records around it.  kind 1 (NV3089) continues with 15 more words:
+@@ -65,7 +70,8 @@
+ #include <string.h>
+ 
+ #define RSX_FC_MAGIC "KZ3FIFOC"
+-#define RSX_FC_VERSION 1u
++#define RSX_FC_VERSION 2u   /* patch 2190: written version; the reader accepts 1..2 */
++#define RSX_FC_VERSION_MIN 1u
+ #define RSX_FC_HEADER_SIZE 32u
+ #define RSX_FC_REC_HEAD 24u
+ 
+@@ -240,7 +246,7 @@ static inline int rsx_fc_r_open(rsx_fc_reader* r, const char* path)
+     if (fread(h, 1, sizeof h, r->f) != sizeof h) { fclose(r->f); r->f = NULL; return -1; }
+     if (memcmp(h, RSX_FC_MAGIC, 8) != 0) { fclose(r->f); r->f = NULL; return -2; }
+     r->version = rsx_fc_get32(h + 8);
+-    if (r->version != RSX_FC_VERSION || rsx_fc_get32(h + 12) != RSX_FC_HEADER_SIZE) { fclose(r->f); r->f = NULL; return -3; }
++    if (r->version < RSX_FC_VERSION_MIN || r->version > RSX_FC_VERSION || rsx_fc_get32(h + 12) != RSX_FC_HEADER_SIZE) { fclose(r->f); r->f = NULL; return -3; }
+     r->frame_start = rsx_fc_get32(h + 16); r->frame_count = rsx_fc_get32(h + 20);
+     return 0;
+ }
+diff --git a/b/libs/video/rsx_guest_signal.h b/libs/video/rsx_guest_signal.h
+new file mode 100644
+index 00000000..444c00a4
+--- /dev/null
++++ b/libs/video/rsx_guest_signal.h
+@@ -0,0 +1,102 @@
++/* KZ3 patch 2190: the guest-signal funnel.
++ * Every guest-visible effect of the FIFO walker (E1..E14, plus E15..E19 found while anchoring) goes
++ * through gcm_guest_signal*(kind, ...) at the position and with the value it had before. Code motion only: the funnel
++ * writes exactly what the site wrote, in the same order, and emits the fcap record the site emitted (kinds 1..6, 9..14
++ * keep their capture word tag; kinds >= 15 are version-2 annotation words, see rsx_fifo_capture.h). It counts per kind
++ * and per thread: `on` = the thread is inside a walker pass (the R thread), `offr` = any other thread
++ * (guest poll, recycle callback, renderer thread), which writes directly exactly as before and is never queued.
++ *
++ * Pure header (stdint/stdio only) so host tests include it without the runtime. The funnel functions are defined in
++ * rsx_commands.c (linked wherever the walker or the method processor is, including the replay harness).
++ *
++ * Kind classes:  W = one guest word store (gcm_guest_signal);  H = one big-endian word the renderer stores through a host
++ * pointer (gcm_guest_signal_hostbe);  S = a bulk store whose bytes the site writes itself, declared once before it
++ * (gcm_guest_signal_span, ea = guest EA or, for a renderer write-back, (location << 30) | offset);  N = host-state effect
++ * the guest observes through an API or a later poll, no guest-memory store (gcm_guest_signal_note). */
++#ifndef RSX_GUEST_SIGNAL_H
++#define RSX_GUEST_SIGNAL_H
++
++#include <stdint.h>
++#include <stdio.h>
++
++/* Kind numbers 1..6 and 9..14 are the existing FIFO-capture WORD tags (writes, dir 1). 7 and 8 are not funnel kinds (8 is
++ * the acquire compare READ, tag dir 0, still emitted by the walker itself). */
++enum rsx_gs_kind {
++    RSX_GS_NONE = 0,
++    RSX_GS_GET_JUMP = 1,       /* E5  get published at a JUMP out of a segment */
++    RSX_GS_GET_REL = 2,        /* E3  get published ahead of a 0x6C label release */
++    RSX_GS_LABEL = 3,          /* E3  NV406E semaphore release word */
++    RSX_GS_GET_END = 4,        /* E5  get at the pass end */
++    RSX_GS_REPORT = 5,         /* E2  GET_REPORT into main memory (4 words) */
++    RSX_GS_REF = 6,            /* E1  ref publication to the control page (guest poll or pass end) */
++    RSX_GS_SEM_BE = 9,         /* E4  NV4097 0x1D70/0x1D74 semaphore write */
++    RSX_GS_NOTIFY = 10,        /* E4  NV4097 NOTIFY slot (4 words) */
++    RSX_GS_REPORT_RB = 11,     /* E2  report value the renderer's query drain stores into the guest report */
++    RSX_GS_RING_JUMP = 12,     /* E11 recycle / segment-next JUMP word */
++    RSX_GS_CTX_WORD = 13,      /* E11 command-context word (begin / end / current) */
++    RSX_GS_PUT_RECYCLE = 14,   /* E11 put written by a recycle */
++    RSX_GS_RESYNC_LABEL = 15,  /* E12 label release replayed by the resync sweep */
++    RSX_GS_COPY_0039 = 16,     /* E8  NV0039 row copy (immediate) */
++    RSX_GS_COPY_3089 = 17,     /* E9  NV3089 scaled/swizzled image store */
++    RSX_GS_STORE_308A = 18,    /* E9  NV308A inline point store */
++    RSX_GS_SURF_WB = 19,       /* E10 colour-surface write-back */
++    RSX_GS_WBD_DRAIN = 20,     /* E13 deferred (2185) store: surface or NV0039 move */
++    RSX_GS_FLIP = 21,          /* E6  flip request (sink_flip, FEAD word, E920/E924) */
++    RSX_GS_USERCMD = 22,       /* E7  user command (0xEB00 / 0x0B00) */
++    RSX_GS_PRESENT = 23,       /* E14 present */
++    RSX_GS_REF_PUSH = 24,      /* E1  ref queue push (host queue, published later as kind 6) */
++    RSX_GS_REPORT_LOCAL = 25,  /* E2  GET_REPORT into the local report table (host struct) */
++    RSX_GS_N = 26
++};
++#define RSX_GS_FIRST_ANNOT 15u   /* kinds >= this are version-2 annotation records, ignored by the replay's event identity */
++
++typedef struct { const char* name; char cls; unsigned char exempt, range; } rsx_gs_info;
++/* exempt: the lint does not require the site to be walker-path (it may run on a guest thread: ref poll, the title's recycle
++ * callback and the in-pass recycle that emulates it). range: the effect also leaves a fcap RANGE record (WR_WALKER 1 or WR_RENDERER 2). */
++static inline const rsx_gs_info* rsx_gs_info_of(unsigned k)
++{
++    static const rsx_gs_info t[RSX_GS_N] = {
++        [RSX_GS_GET_JUMP] = { "get_jump", 'W', 0, 0 },     [RSX_GS_GET_REL] = { "get_rel", 'W', 0, 0 },
++        [RSX_GS_LABEL] = { "label", 'W', 0, 0 },           [RSX_GS_GET_END] = { "get_end", 'W', 0, 0 },
++        [RSX_GS_REPORT] = { "report", 'W', 0, 0 },         [RSX_GS_REF] = { "ref", 'W', 1, 0 },
++        [RSX_GS_SEM_BE] = { "sem_be", 'W', 0, 0 },         [RSX_GS_NOTIFY] = { "notify", 'W', 0, 0 },
++        [RSX_GS_REPORT_RB] = { "report_rb", 'H', 0, 0 },   [RSX_GS_RING_JUMP] = { "ring_jump", 'W', 1, 0 },
++        [RSX_GS_CTX_WORD] = { "ctx_word", 'W', 1, 0 },     [RSX_GS_PUT_RECYCLE] = { "put_recycle", 'W', 1, 0 },
++        [RSX_GS_RESYNC_LABEL] = { "resync_label", 'W', 0, 0 },
++        [RSX_GS_COPY_0039] = { "copy0039", 'S', 0, 1 },    [RSX_GS_COPY_3089] = { "copy3089", 'S', 0, 1 },
++        [RSX_GS_STORE_308A] = { "store308a", 'W', 0, 0 },  [RSX_GS_SURF_WB] = { "surf_wb", 'S', 0, 2 },
++        [RSX_GS_WBD_DRAIN] = { "wbd_drain", 'S', 0, 0 },   [RSX_GS_FLIP] = { "flip", 'N', 0, 0 },
++        [RSX_GS_USERCMD] = { "usercmd", 'N', 0, 0 },       [RSX_GS_PRESENT] = { "present", 'N', 0, 0 },
++        [RSX_GS_REF_PUSH] = { "ref_push", 'N', 0, 0 },     [RSX_GS_REPORT_LOCAL] = { "report_local", 'N', 0, 0 },
++    };
++    return k > 0 && k < RSX_GS_N && t[k].name ? &t[k] : NULL;
++}
++
++/* counters: [kind][0] = on the walker thread, [kind][1] = off the walker thread (offr) */
++extern unsigned long long g_rsx_gs_n[RSX_GS_N][2];
++/* host tests only: called for every funnel call with (kind, ea, n bytes or 0, on_walker); NULL = off */
++extern void (*g_rsx_gs_trace)(unsigned kind, uint32_t ea, uint32_t n, int on_walker);
++
++/* The walker pass brackets: the thread is "R" between enter and leave (nesting-safe: leave takes enter's return). */
++int  rsx_gs_walker_enter(void);
++void rsx_gs_walker_leave(int prev);
++
++void gcm_guest_signal(unsigned kind, uint32_t ea, uint32_t val);                          /* W */
++void gcm_guest_signal_hostbe(unsigned kind, uint8_t* p, uint32_t tag_ea, uint32_t val);   /* H */
++void gcm_guest_signal_span(unsigned kind, uint32_t ea, uint32_t n);                       /* S */
++void gcm_guest_signal_note(unsigned kind, uint32_t a, uint32_t b);                        /* N */
++
++/* `[gsig] t=.. kind=on/offr ...` per-second delta line (RSX_O0=1), only the kinds that moved. Returns the length. */
++static inline int rsx_gs_fmt(char* out, size_t n, double t, const unsigned long long cur[][2], const unsigned long long prev[][2])
++{
++    int w = snprintf(out, n, "[gsig] t=%.0f", t);
++    for (unsigned k = 1; k < RSX_GS_N && w > 0 && (size_t)w < n; k++) {
++        const rsx_gs_info* i = rsx_gs_info_of(k);
++        const unsigned long long a = cur[k][0] - prev[k][0], b = cur[k][1] - prev[k][1];
++        if (!i || (!a && !b)) continue;
++        w += snprintf(out + w, n - (size_t)w, " %s=%llu/offr=%llu", i->name, a, b);
++    }
++    return w;
++}
++
++#endif
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index afa1681f..02ceb570 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -21,6 +21,7 @@
+ 
+ #include "rsx_live_draw.h"
+ #include "rsx_o0.h"   /* patch 2188 */
++#include "rsx_guest_signal.h"   /* patch 2190: the guest-signal funnel, defined in rsx_commands.c */
+ /* Patch 2188 (RSX_PERF_SPLIT=1): exclusive buckets, rsx_o0.h. One int test when off. LDS_POP also closes anything opened
+  * after its token that an early return left open. */
+ #define LDS_PUSH(tok, b) const int tok = g_rsx_split_act ? rsx_split_push_w(b) : 0
+@@ -14274,9 +14275,8 @@ static void ld_rb_drain(void)
+         if (g_rb.e[k].guest) {
+             u8* p = (u8*)guest_ptr(1u, g_rb.e[k].off, 16u);   /* location 1: IO offset in main memory */
+             if (p) {
+-                p[8] = (u8)(v >> 24); p[9] = (u8)(v >> 16); p[10] = (u8)(v >> 8); p[11] = (u8)v;
+                 g_rb.n_written++; if (!v) g_rb.n_zero++;
+-                if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_word(1, 11, g_rb.e[k].off + 8u, v);   /* patch 2171: renderer report write, ea = main-memory IO offset */
++                gcm_guest_signal_hostbe(RSX_GS_REPORT_RB, p + 8, g_rb.e[k].off + 8u, v);   /* patch 2190: E2, the renderer report write; capture tag 11 (patch 2171), ea = main-memory IO offset */
+             }
+         }
+         g_rb.tail++;
+@@ -16503,6 +16503,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+     (void)user; (void)r;
+     const u32 buffer_id = arg & 7u;
+     if (__builtin_expect(g_rsx_fcap_cfg, 0)) rsx_fcap_flip(buffer_id, 0);   /* patch 2164 */
++    gcm_guest_signal_note(RSX_GS_FLIP, buffer_id, 0u);   /* patch 2190: E6, the renderer sees the flip request */
+     g_ld_flip_requested++;
+     g_ld_last_requested_buffer = buffer_id;
+     if (g_ld_movie_mode) {
+@@ -18476,6 +18477,7 @@ static int ld_writeback_surface(u32 i, u32 for_off, u32 for_size)
+      * live-draw) go into the surface first, so the write-back keeps them. */
+     ld_gv_validate(i);
+     u8* gm = (u8*)guest_ptr(location, sf->offset, (u32)(s1 - s0));
++    if (gm) gcm_guest_signal_span(RSX_GS_SURF_WB, (location << 30) | sf->offset, (u32)(s1 - s0));   /* patch 2190: E10, the blocking write-back below */
+     t_ld_ws = LD_WS_WB;   /* patch 2081 diagnostic tag */
+     ld_td_mark(location, sf->offset, (u32)(s1 - s0));   /* patch 2033: the walker writes guest bytes */
+     t_ld_ws = 0;
+@@ -18586,6 +18588,7 @@ static int ld_rb_store(u32 i, u32 k, u32 for_off, u32 for_size)
+     const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
+     const u32 pitch = (sf->w * texel + 255u) & ~255u;
+     u8* gm = (u8*)guest_ptr(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel);
++    if (gm) gcm_guest_signal_span(RSX_GS_SURF_WB, (sf->location << 30) | sf->offset, gp * (sf->h - 1u) + sf->w * texel);   /* patch 2190: E10 */
+     t_ld_ws = LD_WS_WB;   /* patch 2081 diagnostic tag */
+     ld_td_mark(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel);   /* patch 2033 */
+     t_ld_ws = 0;
+@@ -18701,6 +18704,7 @@ static void ld_wbd_store_surf(rsx_wbd_ent* e)
+     const u32 i = e->p[0], w = e->p[1], h = e->p[2], fmt = e->p[3], gp = e->p[4];
+     const u32 texel = fmt == (u32)DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+     u8* gm = (u8*)guest_ptr(e->wloc, e->woff, e->wsize);
++    if (gm) gcm_guest_signal_span(RSX_GS_WBD_DRAIN, (e->wloc << 30) | e->woff, e->wsize);   /* patch 2190: E13, the deferred surface store */
+     t_ld_ws = LD_WS_WB;
+     ld_td_mark(e->wloc, e->woff, e->wsize);   /* patch 2033: the walker writes guest bytes (now) */
+     t_ld_ws = 0;
+@@ -19611,6 +19615,7 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
+ static void ld_present_body(u32 buffer_id)
+ {
+     if (!g.ready) return;
++    gcm_guest_signal_note(RSX_GS_PRESENT, buffer_id, 0u);   /* patch 2190: E14 (stays on the walker thread) */
+ 
+     /* LD_SURF_DUMP=<dir>: dump EVERY live surface once, with its non-black
+      * count, at LD_SURF_DUMP_FRAME (default 1200).

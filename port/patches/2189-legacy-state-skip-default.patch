@@ -1,0 +1,283 @@
+KZ3 patch 2189 (RSX pass 167, command-thread overhaul O1): legacy rsx_state machine off the FIFO walker under live draw, GCM_FAST_METHODS default on.
+
+GCM_LEGACY_STATE_SKIP: unset/1 = skip (default; before: off), 0 = off, verify = the machine runs for every method (shadow) and the
+backend callbacks it makes after a method outside the effect list are counted per method ([legacy-skip] line, READER line).
+Skip applies when live draw is up and the backend is none or the null backend. Effect list (rsx_legacy_skip.h, reasons there):
+0x50, 0x104, 0x180, 0x1A4, 0x1D6C, 0x1D70, 0x1D74 + 0x1A8, SET_OBJECT, 0xE920/E924. GCM_FAST_METHODS now defaults to 1 (0 = off).
+Host test tools/smoke/test_legacy_skip.sh (core, static checks, replay skip/off/verify identical, negative control, play-through capture).
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -10,6 +10,8 @@
+ 
+ #include "rsx_live_draw.h"
+ #include "rsx_o0.h"   /* patch 2188: RSX_PERF_SPLIT / RSX_O0 */
++#include "rsx_legacy_skip.h"   /* patch 2189 */
++static rsx_lgs s_lgs;   /* patch 2189: legacy-skip counters, walker thread only */
+ #define GCM_SPLIT_PUSH(tok, b) const int tok = g_rsx_split_act ? rsx_split_push_w(b) : 0
+ #define GCM_SPLIT_POP(tok) do { if (tok && g_rsx_split_act) rsx_split_pop_w(tok); } while (0)
+ #include "rsx_nv3089_rows.h"   /* patch 2080 */
+@@ -3340,6 +3342,11 @@
+                 }
+                 unw_prev = unw; ovf_prev = ovf;
+             }
++            if (s_lgs.verify || g_rsx_o0.on) {   /* patch 2189: [legacy-skip] counters of this second (verify, or with RSX_O0) */
++                static rsx_lgs lprev; char ln[512];
++                rsx_lgs_fmt(ln, sizeof ln, tnow, &s_lgs, &lprev); fprintf(stderr, "%s\n", ln);
++                lprev = s_lgs;
++            }
+             if (g_rsx_o0.on) {   /* patch 2188: the O0 counters, deltas of this second; the source table every 5th */
+                 static rsx_o0 cur, prev; static unsigned o0_n;
+                 memcpy(&cur, &g_rsx_o0, sizeof cur);
+@@ -3609,13 +3616,7 @@
+  * updates state for a vtable backend. */
+ static int gcm_legacy_method_has_effect(u32 m)
+ {
+-    switch (m) {
+-    case 0x0050u: case 0x0104u: case 0x0180u: case 0x01A4u:
+-    case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
+-        return 1;
+-    default:
+-        return 0;
+-    }
++    return rsx_lgs_effect(m);   /* patch 2189: the list and its reasons live in rsx_legacy_skip.h (adds 0x1A8, SET_OBJECT, 0xE920/E924) */
+ }
+ 
+ /* The [perf-flush] line (patch 2045): flushes by reason (n/ms) and the texture upload half; patch 2147 appends the
+@@ -3679,22 +3680,27 @@
+ {
+     return gcm_word_diag_only() || gcm_word_live();
+ }
+-/* GCM_FAST_METHODS=1 (default off): a method header whose data words lie in one 1 MB IO page is walked with one address
++/* GCM_FAST_METHODS (default 1 since patch 2189, 0 = off): a method header whose data words lie in one 1 MB IO page is walked with one address
+  * translation and a plain word loop, also under live draw, as long as no diagnostic switch is set. */
+ /* Patch 2150: GCM_LEGACY_STATE_SKIP=1 (default off): with live draw up, the null backend (a window and a suppressed
+  * present, rsx_null_backend.c sets the flag) is no consumer of rsx_state, so only methods with effects reach it. */
+ int g_gcm_null_backend_active;
+ void gcm_note_null_backend(int on) { g_gcm_null_backend_active = on; }
++/* Patch 2189: GCM_LEGACY_STATE_SKIP unset/1 = skip (default), 0 = off, verify = shadow machine + reader count; see rsx_legacy_skip.h. */
+ static int gcm_legacy_state_skip(void)
+ {
+-    static int on = -1;
+-    if (on < 0) { const char* e = getenv("GCM_LEGACY_STATE_SKIP"); on = e && *e ? atoi(e) != 0 : 0; }
+-    return on;
++    static int mode = -1;
++    if (mode < 0) {
++        mode = rsx_lgs_mode(getenv("GCM_LEGACY_STATE_SKIP"));
++        fprintf(stderr, "[legacy-skip] GCM_LEGACY_STATE_SKIP mode=%s (patch 2189)\n", mode == RSX_LGS_VERIFY ? "verify" : mode ? "skip" : "off");
++    }
++    return mode;
+ }
++extern volatile unsigned long long g_rsx_lg_rd_state, g_rsx_lg_rd_param;
+ static int gcm_fast_methods(void)
+ {
+     static int on = -1;
+-    if (on < 0) { const char* e = getenv("GCM_FAST_METHODS"); on = e && *e ? atoi(e) != 0 : 0; }
++    if (on < 0) { const char* e = getenv("GCM_FAST_METHODS"); on = e && *e ? atoi(e) != 0 : 1; }   /* patch 2189: default on */
+     return on;
+ }
+ 
+@@ -3712,10 +3718,16 @@
+     if (g_rsx_o0.on) {   /* patch 2188: [o0-state] */
+         RSX_O0_ADD(g_rsx_o0.m3d, 1); g_rsx_o0.legacy_live = legacy_state_live; g_rsx_o0.be_seen = rsx_get_backend() != NULL;
+     }
++    s_lgs.m3d++;
+     if (legacy_state_live || gcm_legacy_method_has_effect(m)) {
+         if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.m3d_legacy, 1);
+-        rsx_process_method(st, m, v);
+-    }
++        if (s_lgs.verify) {   /* patch 2189: shadow run, count the backend callbacks a method outside the list causes */
++            const unsigned long long s0 = g_rsx_lg_rd_state, p0 = g_rsx_lg_rd_param;
++            rsx_process_method(st, m, v);
++            if (rsx_lgs_note(&s_lgs, m, gcm_legacy_method_has_effect(m), g_rsx_lg_rd_state - s0, g_rsx_lg_rd_param - p0, g_gcm_null_backend_active))
++                fprintf(stderr, "[legacy-skip] READER: method 0x%04X reached a backend callback; add it to the effect list (rsx_legacy_skip.h)\n", m);
++        } else { s_lgs.ran++; rsx_process_method(st, m, v); }
++    } else s_lgs.skipped++;
+     /* NV406E_SET_REFERENCE: queue the fence value for PACED
+      * publication (gcm_ref_publish below) instead of letting a
+      * later fence in the same batch overwrite it. */
+@@ -3839,8 +3851,11 @@
+      * (gcm_legacy_method_has_effect). RSX_TRACE still sees every method. */
+     static int s_rsx_trace = -1;
+     if (s_rsx_trace < 0) s_rsx_trace = getenv("RSX_TRACE") ? 1 : 0;
+-    const int legacy_skip = gcm_legacy_state_skip() && g_gcm_null_backend_active && rsx_live_draw_enabled();
+-    const int legacy_state_live = s_rsx_trace || (!legacy_skip && (rsx_get_backend() != NULL || !rsx_draw_engine_enabled()));
++    /* Patch 2189: skip (default) when live draw is up and the backend is none or the null backend; verify runs the machine. */
++    const int lgs_mode = gcm_legacy_state_skip();
++    const int legacy_skip = lgs_mode == RSX_LGS_SKIP && rsx_live_draw_enabled() && (rsx_get_backend() == NULL || g_gcm_null_backend_active);
++    s_lgs.verify = lgs_mode == RSX_LGS_VERIFY && rsx_live_draw_enabled();
++    const int legacy_state_live = s_rsx_trace || s_lgs.verify || (!legacy_skip && (rsx_get_backend() != NULL || !rsx_draw_engine_enabled()));
+ 
+ 
+     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -34,6 +34,9 @@
+  * reports it as reached; cellGcmSys mirrors this into the guest control
+  * register after each drain so those waits (cellGcmFinish / wait-label) unblock. */
+ u32 g_rsx_last_reference = 0;
++/* Patch 2189: backend callbacks run by the legacy machine (GCM_LEGACY_STATE_SKIP=verify counts them per method):
++ * the ones handed the rsx_state pointer, and clear / draws (plain parameters). Walker thread only. */
++volatile unsigned long long g_rsx_lg_rd_state, g_rsx_lg_rd_param;
+ /* KZ3 patch 1007: NV4097 SET_SEMAPHORE_OFFSET (0x1D6C), exported so the FIFO
+  * diagnostics can read it. RSX_SEMA_LOG=<N> logs the first N NV4097 semaphore
+  * methods (offset, value, guest address) and every 500th after that. */
+@@ -690,7 +693,7 @@
+         if (s_backend && s_backend->clear) {
+             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
+             u8 stencil = state->zstencil_clear_value & 0xFF;
+-            s_backend->clear(s_backend->userdata, data,
++            g_rsx_lg_rd_param++, s_backend->clear(s_backend->userdata, data,
+                            state->color_clear_value, depth, stencil);
+         }
+         return 0;
+@@ -882,27 +885,27 @@
+             if (s_backend) {
+                 if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.be_flush, 1);   /* patch 2188 */
+                 if (state->surface_dirty && s_backend->set_render_target)
+-                    s_backend->set_render_target(s_backend->userdata, state);
++                    g_rsx_lg_rd_state++, s_backend->set_render_target(s_backend->userdata, state);   /* patch 2189 */
+                 if (state->viewport_dirty && s_backend->set_viewport)
+-                    s_backend->set_viewport(s_backend->userdata, state);
++                    g_rsx_lg_rd_state++, s_backend->set_viewport(s_backend->userdata, state);   /* patch 2189 */
+                 if (state->blend_dirty && s_backend->set_blend)
+-                    s_backend->set_blend(s_backend->userdata, state);
++                    g_rsx_lg_rd_state++, s_backend->set_blend(s_backend->userdata, state);   /* patch 2189 */
+                 if ((state->depth_dirty || state->stencil_dirty) && s_backend->set_depth_stencil)
+-                    s_backend->set_depth_stencil(s_backend->userdata, state);
++                    g_rsx_lg_rd_state++, s_backend->set_depth_stencil(s_backend->userdata, state);   /* patch 2189 */
+                 if (state->color_mask_dirty && s_backend->set_color_mask)
+-                    s_backend->set_color_mask(s_backend->userdata, state);
++                    g_rsx_lg_rd_state++, s_backend->set_color_mask(s_backend->userdata, state);   /* patch 2189 */
+                 if (state->alpha_dirty && s_backend->set_alpha_test)
+-                    s_backend->set_alpha_test(s_backend->userdata, state);
++                    g_rsx_lg_rd_state++, s_backend->set_alpha_test(s_backend->userdata, state);   /* patch 2189 */
+                 if (state->shader_dirty && s_backend->set_shader)
+-                    s_backend->set_shader(s_backend->userdata, state);
++                    g_rsx_lg_rd_state++, s_backend->set_shader(s_backend->userdata, state);   /* patch 2189 */
+                 if (state->vertex_dirty && s_backend->set_vertex_attribs)
+-                    s_backend->set_vertex_attribs(s_backend->userdata, state);
++                    g_rsx_lg_rd_state++, s_backend->set_vertex_attribs(s_backend->userdata, state);   /* patch 2189 */
+ 
+                 /* Bind dirty textures */
+                 if (state->texture_dirty && s_backend->bind_texture) {
+                     for (u32 i = 0; i < RSX_MAX_TEXTURES; i++) {
+                         if (state->textures[i].dirty) {
+-                            s_backend->bind_texture(s_backend->userdata, i, &state->textures[i]);
++                            g_rsx_lg_rd_state++, s_backend->bind_texture(s_backend->userdata, i, &state->textures[i]);
+                             state->textures[i].dirty = 0;
+                         }
+                     }
+@@ -951,7 +954,7 @@
+         ps3_ms("rsx:draw_arrays");
+         if (g_rsx_o0.on && s_backend && s_backend->draw_arrays) RSX_O0_ADD(g_rsx_o0.be_draw, 1);   /* patch 2188 */
+         if (s_backend && s_backend->draw_arrays)
+-            s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
++            g_rsx_lg_rd_param++, s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
+         return 0;
+     }
+ 
+@@ -978,7 +981,7 @@
+         ps3_ms("rsx:draw_indexed");
+         if (g_rsx_o0.on && s_backend && s_backend->draw_indexed) RSX_O0_ADD(g_rsx_o0.be_draw, 1);   /* patch 2188 */
+         if (s_backend && s_backend->draw_indexed)
+-            s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
++            g_rsx_lg_rd_param++, s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
+                                     first, count);
+         return 0;
+     }
+diff --git a/libs/video/rsx_legacy_skip.h b/libs/video/rsx_legacy_skip.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_legacy_skip.h
+@@ -0,0 +1,88 @@
++/* KZ3 patch 2189 (command-thread overhaul O1): the legacy rsx_state machine off the FIFO walker under live draw.
++ * Pure core (no toolkit headers), host-tested by tools/smoke/test_legacy_skip.sh.
++ *
++ *   GCM_LEGACY_STATE_SKIP   unset / "" / 1  = skip (default since patch 2189; before: off)
++ *                           0               = off (the old gate: the machine runs whenever a backend is set)
++ *                           verify          = the machine runs for every method (the shadow) and the readers are counted
++ *   Skip applies when live draw is up and the backend is none or the null backend (the window); a real vtable backend
++ *   (D3D12 / Vulkan rsx_state path) keeps the machine.
++ *
++ * Effect list = the methods whose handler in rsx_process_method does more than update rsx_state, plus the ones the walker
++ * answers itself. Reasons:
++ *   0x0050 NV406E_SET_REFERENCE      g_rsx_last_reference (the ref publication reads it)
++ *   0x0104 NV4097_NOTIFY             writes the notify slot to guest memory (rsx_commands.c)
++ *   0x0180 SET_CONTEXT_DMA_NOTIFIES  s_notify_ctx, picks the notify slot
++ *   0x01A4 SET_CONTEXT_DMA_SEMAPHORE s_sem_ctx, picks where a semaphore lands
++ *   0x1D6C SET_SEMAPHORE_OFFSET      g_rsx_sem_off_4097
++ *   0x1D70 BACK_END_WRITE_SEMAPHORE  guest label write (+ fcap tag 9)
++ *   0x1D74 TEXTURE_READ_SEMAPHORE    guest label write, game frame marks
++ *   0x01A8 SET_CONTEXT_DMA_REPORT    s_report_dma is set by the walker after the gate; kept on the list so a later move of that
++ *                                    line cannot lose it
++ *   0x0000 SET_OBJECT                the walker's subchannel table; kept for the same reason
++ *   0xE920/0xE924                    the flip-command words, the walker handles them before this gate; kept for the same reason
++ * Every reader found by `verify` adds its method here; the copy is never deleted blind. */
++#ifndef RSX_LEGACY_SKIP_H
++#define RSX_LEGACY_SKIP_H
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum { RSX_LGS_OFF = 0, RSX_LGS_SKIP = 1, RSX_LGS_VERIFY = 2 };
++
++static inline int rsx_lgs_mode(const char* e)
++{
++    if (!e || !*e) return RSX_LGS_SKIP;
++    if (!strcmp(e, "verify")) return RSX_LGS_VERIFY;
++    return atoi(e) != 0 ? RSX_LGS_SKIP : RSX_LGS_OFF;
++}
++
++/* Test hook (compile time only, never defined in the toolkit build): drops one method from the list, the negative control. */
++static inline int rsx_lgs_effect(unsigned m)
++{
++#ifdef RSX_LGS_NEG_DROP
++    if (m == (unsigned)(RSX_LGS_NEG_DROP)) return 0;
++#endif
++    switch (m) {
++    case 0x0050u: case 0x0104u: case 0x0180u: case 0x01A4u: case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
++    case 0x01A8u: case 0x0000u: case 0xE920u: case 0xE924u:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++enum { RSX_LGS_RD_MAX = 16 };
++typedef struct rsx_lgs {
++    unsigned long long m3d, ran, skipped;       /* methods seen, run through the machine, left out */
++    unsigned long long readers;                 /* verify: backend state callbacks after a method outside the list, backend not null */
++    unsigned long long null_state, null_param;  /* verify: calls into the null backend (log-only readers), by kind */
++    unsigned rd_m[RSX_LGS_RD_MAX]; unsigned long long rd_n[RSX_LGS_RD_MAX]; int rd_cnt;
++    int verify;
++} rsx_lgs;
++
++/* One method run through the shadow machine. d_state = backend callbacks that receive the rsx_state pointer, d_param = the
++ * ones that get plain parameters (clear, draws), both during this one method. Returns 1 when this is a new reader method. */
++static inline int rsx_lgs_note(rsx_lgs* s, unsigned m, int in_list, unsigned long long d_state, unsigned long long d_param, int null_backend)
++{
++    s->ran++;
++    if (in_list || (!d_state && !d_param)) return 0;
++    if (null_backend) { s->null_state += d_state; s->null_param += d_param; return 0; }
++    s->readers += d_state + d_param;
++    for (int i = 0; i < s->rd_cnt; i++) if (s->rd_m[i] == m) { s->rd_n[i] += d_state + d_param; return 0; }
++    if (s->rd_cnt < RSX_LGS_RD_MAX) { s->rd_m[s->rd_cnt] = m; s->rd_n[s->rd_cnt] = d_state + d_param; s->rd_cnt++; }
++    return 1;
++}
++
++/* [legacy-skip] t= mode= m3d= ran= skipped= readers= null_state= null_param= by_method=0x1808:12,0x1D94:3 (deltas of one period) */
++static inline int rsx_lgs_fmt(char* out, size_t n, double t, const rsx_lgs* c, const rsx_lgs* p)
++{
++    int o = snprintf(out, n, "[legacy-skip] t=%.0f mode=%s m3d=%llu ran=%llu skipped=%llu readers=%llu null_state=%llu null_param=%llu by_method=",
++                     t, c->verify ? "verify" : "skip", c->m3d - p->m3d, c->ran - p->ran, c->skipped - p->skipped,
++                     c->readers - p->readers, c->null_state - p->null_state, c->null_param - p->null_param);
++    if (o < 0) return o;
++    if (!c->rd_cnt && (size_t)o + 2 < n) o += snprintf(out + o, n - (size_t)o, "-");
++    for (int i = 0; i < c->rd_cnt && (size_t)o + 24 < n; i++)
++        o += snprintf(out + o, n - (size_t)o, "%s0x%04X:%llu", i ? "," : "", c->rd_m[i], c->rd_n[i]);
++    return o;
++}
++#endif

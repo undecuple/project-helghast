@@ -17,7 +17,7 @@ Merge tool: tools/smoke/pso_template.py; host test tools/smoke/test_pso_template
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ld_xlate/ld_pso_key_tail (2071's shared translator) take upstream's VP branch bits (new ld_xl_in.vp_branch_bits, set_branch_bits in ld_xlate, hashed when the VP uses them; prewarm passes 0) and unnorm_dim[16][3] (records keep [16][2]; key hashes w,h only as before).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 index 1b1611c..d96f9a7 100644
@@ -78,7 +78,7 @@ index 1b1611c..d96f9a7 100644
          g.n_psos++;
      }
      g_ld_pl.n_staged = 0;
-@@ -7611,6 +7614,588 @@ static void ld_pl_shutdown(void)
+@@ -7611,6 +7614,590 @@ static void ld_pl_shutdown(void)
  }
  /* ===================== end of patch 2031 block ===================== */
  
@@ -313,7 +313,9 @@ index 1b1611c..d96f9a7 100644
 +        memcpy(r->attrs, xi->layout->attrs, sizeof r->attrs);
 +    }
 +    r->rs_words = (u32)(sizeof(render_state_t) / 4u);
-+    memcpy(r->rs, xi->rs, sizeof(render_state_t));
++    /* Canonical record (v2 merge normalisation): alpha_ref_raw/_format are not pipeline state on the buffered path
++     * (the reference is a pixel-shader constant, and the key leaves them out), so store zero, not the last M_ALPHA_REF. */
++    { render_state_t rs0 = *xi->rs; rs0.alpha_ref_raw = 0; rs0.alpha_ref_format = 0; memcpy(r->rs, &rs0, sizeof rs0); }
 +    memcpy(r->shadow_zfunc, xi->shadow_zfunc, 16);
 +    memcpy(r->argb_remap, xi->argb_remap, sizeof r->argb_remap);
 +    for (int u = 0; u < 16; u++) { r->unnorm_dim[u][0] = xi->unnorm_dim[u][0]; r->unnorm_dim[u][1] = xi->unnorm_dim[u][1]; }

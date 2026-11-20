@@ -89,7 +89,7 @@ def check():
         if not vals["en"]:
             errs.append(f"{key}: empty en")
         for c, s in vals.items():
-            if not s:   # an empty cell shows English in that language (2026-11-03: 11 keys had none in 18 languages)
+            if not s:   # an empty cell shows English in that language (11 keys had none in 18 languages)
                 errs.append(f"{key} [{c}]: empty (no translation)")
                 continue
             if s.startswith("@game:"):

@@ -29,7 +29,7 @@ Rebased on ps3recomp v0.15.0 (SPU pass 81): context only.
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): SPU_ABI on upstream's new signatures (`spu_take_interrupt`, `tramp`, the stack-reset cast); upstream's per-file `SPU_SETJMP` definitions (plain `setjmp` on Windows) would have overridden 1099's frameless `_setjmp(b, NULL)`: now guarded (`#ifndef` on Windows, `#undef` + `_setjmp` on POSIX). Upstream's `spu_jmp_no_unwind` is MSVC-only, a no-op here; part 3: also `spu_check_stack_reset`'s extern in spu_drain.c, `spu_drain_hop`/`spu_drain_hop_inline` and `spu_check_stack_reset_scan` (the MinGW build failed on them: sysv_abi vs plain pointers; Linux host tests cannot see it).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
 index 139c357..fd45f1f 100644

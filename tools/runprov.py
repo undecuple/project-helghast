@@ -12,7 +12,7 @@ sha256, git revision/dirty/branch, patch-set stamp, game version, toolchain), co
 Proton, run seconds, display) and fixtures (savedata hash, pad script hash and event count, cache state).
 `finish` runs after the run and fills `outcome` from the log: last flip, flips, early stop, the first stop signature,
 plus tools/kz3_metrics.py's numbers (reused, not reparsed). Hooked into tools/proton-test.sh, so every run gets one.
-Both phases sample the host (`config.host` at start, `outcome.host_end` at finish): the 1-minute load average and
+Both phases sample the host (load 1/5/15 and nproc; the loadlog summary is `outcome.load`, tools/loadlog.py) (`config.host` at start, `outcome.host_end` at finish): the 1-minute load average and
 whether the build lock (profile `build_lock`, tools/build-kz3.sh's flock) was held, by a non-blocking flock test;
 `outcome.build_lock_held` is true when either sample saw it held (boot checks taken next to a
 build drift in fps and flips; a comparison treats a held lock as fatal for perf/ab, disclosed for regression).
@@ -198,13 +198,38 @@ class Prov:
                     os.close(fd)
                 lock_src = f"flock -n on {lock} at {when}"
         try:
-            load = round(os.getloadavg()[0], 2)
-            load_src = f"os.getloadavg()[0] at {when}"
+            la = os.getloadavg()
+            load, load_5m, load_15m = round(la[0], 2), round(la[1], 2), round(la[2], 2)
+            load_src = f"os.getloadavg() at {when}"
         except OSError as e:
-            load, load_src = None, f"getloadavg failed: {e}"
-        return known({"load_avg_1m": load, "load_source": load_src, "build_lock_held": held,
+            load = load_5m = load_15m = None
+            load_src = f"getloadavg failed: {e}"
+        return known({"load_avg_1m": load, "load_avg_5m": load_5m, "load_avg_15m": load_15m, "nproc": os.cpu_count(),
+                      "load_source": load_src, "build_lock_held": held,
                       "build_lock_source": lock_src, "sampled_at": now_iso()},
                      f"host sampled at {when} (load: {load_src}; lock: {lock_src})")
+
+    def load_summary(self):
+        """Window mean/max load from <run>/loadlog.tsv (tools/loadlog.py, started by tools/proton-test.sh outside the
+        sandbox, one sample per 10 s: loadavg, CPU busy %, top 3 other processes). The window is KZ3_PROF (the profile's
+        prof_env) in the run's env, else the whole run."""
+        path = self.run_path("loadlog.tsv")
+        if not os.path.isfile(path):
+            return unknown("no loadlog.tsv in the run dir (run made before load logging, or the sampler did not start)")
+        import loadlog
+        window = None
+        env = val(self.doc["config"].get("env")) or {}
+        s = env.get(self.p.get("prof_env", "")) if isinstance(env, dict) else None
+        if s and "," in s:
+            try:
+                window = tuple(int(x) for x in s.split(",")[:2])
+            except ValueError:
+                window = None
+        try:
+            r = loadlog.summarize(path, window)
+        except (ValueError, OSError) as e:
+            return unknown(f"loadlog.tsv unreadable: {e}")
+        return known(r, "tools/loadlog.py over loadlog.tsv (samples every 10 s outside the sandbox)")
 
     # -- start phase -----------------------------------------------------------------------------------------------
     def start(self, exe, seconds, display, proton):
@@ -425,6 +450,7 @@ class Prov:
         # Host at the end of the run; build_lock_held = held at start or at the end (a build that started and ended
         # inside the run escapes both samples: the load average still shows it).
         self.step("outcome", "host_end", lambda: self.host_sample("finish"))
+        self.step("outcome", "load", self.load_summary)
         samples = [(w, val(d[s].get(n))) for s, n, w in (("config", "host", "start"), ("outcome", "host_end", "finish"))
                    if is_known(d[s].get(n))]
         states = [(n, v.get("build_lock_held")) for n, v in samples if isinstance(v, dict) and v.get("build_lock_held") is not None]

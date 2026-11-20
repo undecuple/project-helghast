@@ -11,7 +11,7 @@ Also a bounded diagnostic for the Wine Wayland question (RSX pass 98): "[mouse] 
 C counts, max M in one report, A counts/report" per motion burst (first 30 lines), so a hand log shows what the driver
 delivers per report (compare PROTON_ENABLE_WAYLAND=1 with the default driver over the same physical mouse move).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (the v0.19.0 chain files where available; originals for the rest, three-way merged where they did not apply).
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index 7843ddc..44812f7 100644

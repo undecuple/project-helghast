@@ -6,7 +6,7 @@ thread start, so after ~127 starts the 128 places were full and ppu_resv_break_*
 Registration now deduplicates under a mutex, publishes with a release count that readers load with acquire, and a
 genuine 129th distinct context aborts with a message. Capacity unchanged.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
 index 95a4541..0ea412e 100644

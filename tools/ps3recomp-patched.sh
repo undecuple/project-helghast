@@ -25,8 +25,8 @@ if [[ "${crlf_bad:-0}" != 0 ]]; then
 fi
 
 # Build the patched tree in a scratch copy, then sync it into $PT replacing only files whose content changed, so
-# unchanged files keep their mtimes and the build recompiles only what the patch set really changed (2026-10-09:
-# re-creating the whole tree forced a ~20 min full rebuild after every regeneration). A reverted or removed patch
+# unchanged files keep their mtimes and the build recompiles only what the patch set really changed (re-creating the whole tree forced a
+# ~20 min full rebuild after every regeneration). A reverted or removed patch
 # still rebuilds the files it touched, because their content changes back. A plain copy, no git metadata (so this
 # works inside the sandbox where .git is read-only).
 NEW="$PT.new"
@@ -63,6 +63,6 @@ for d, _, files in os.walk(pt):
 print(f"synced: {changed} file(s) changed, {removed} removed")
 PY
 "$ROOT/tools/safe_rm.sh" "$NEW"
-# Stamp the patch set this tree was made from; tools/build-kz3.sh refuses a stale tree (2026-10-09: a build run
+# Stamp the patch set this tree was made from; tools/build-kz3.sh refuses a stale tree (a build run
 # directly, without kz3-check.sh's regeneration, silently left patch 3003 out of a 1.14 test).
 echo "$(cat port/patches/*.patch | sha256sum | cut -c1-16)-$(git -C third_party/ps3recomp rev-parse --short HEAD)" > "$PT/.kz3-patchset"

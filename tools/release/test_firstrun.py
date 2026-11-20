@@ -212,7 +212,7 @@ def main():
                   "[1/9] Building C object <path>\\x.c.obj", "8 redacts CMake's mangled user path")
             check(red(r"# dump C:\Users\Other Name\Downloads\b") == r"# dump <path>\b",
                   "8 redacts another account's folder")
-            # D:/Games/kz3 etc: every other absolute path keeps only its last component (2026-11-02)
+            # D:/Games/kz3 etc: every other absolute path keeps only its last component
             check(red("D:/Games/kz3") == "<path>\\kz3", "8 other drive path -> <path>\\last")
             check(red(r"d:\Games\KZ3\PS3_GAME\USRDIR\EBOOT.BIN") == "<path>\\EBOOT.BIN", "8 mixed-case drive, backslashes")
             check(red("E:/PS3/BCUS98234") == "<path>\\BCUS98234", "8 forward slashes, other drive")
@@ -421,18 +421,31 @@ def main():
 
         a12 = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t12, "b"), portable=False)
         res = iter([(1, "FAIL U0: update folder not found\n"), (0, "OK   D1: fine\n")])
-        answers = eof_iter([d12, u12, "", "", "", "y", "y", "", "n"])
+        # installer simplification pass 1: no prompt for the version check, the every-start check, the shader warm-up,
+        # the fonts or the RPCS3 saves; the ini keys and their defaults stay. Only the folders, the check and the build.
+        answers = eof_iter([d12, u12, "", "", "n"])
+        asked12, vcalls = [], []
         notes, o12 = [], io.StringIO()
-        go = fr.interactive(a12, root12, "x.log", notes, ask=lambda q: next(answers), out=o12,
+
+        def ask12(q):
+            asked12.append(q)
+            return next(answers)
+        go = fr.interactive(a12, root12, "x.log", notes, ask=ask12, out=o12,
                             check=lambda *x: next(res),
-                            vcheck=lambda cur: {"status": "newer", "current": cur, "latest": "v9.0.0",
-                                                "url": "https://example.invalid/r", "detail": ""})
+                            vcheck=lambda cur: vcalls.append(cur) or {"status": "newer", "current": cur, "latest": "v9.0.0",
+                                                                      "url": "https://example.invalid/r", "detail": ""})
         o = o12.getvalue()
-        check(go is False and "own console" in o and "v9.0.0" in o and a12.update == u12, "12 failed check, help, retry")
-        check(any("version check (player asked): status=newer" in n for n in notes), f"12 version check logged {notes}")
+        check(go is False and "own console" in o and a12.update == u12, "12 failed check, help, retry")
+        check(not vcalls and not any(w in q.lower() for q in asked12 for w in ("github", "shader", "font", "every start", "save")),
+              f"12 the optional prompts are not asked: {asked12}")
+        check(any("optional prompts not asked" in n for n in notes), f"12 the skipped prompts are noted {notes}")
         ini = open(os.path.join(root12, "kz3-install.ini")).read()
-        check("portable = 0" in ini and "check_updates = 1" in ini and "prepare = 0" in ini,
-              f"12 ini after opt-in (Enter at the shader question = warm while playing): {ini!r}")
+        check("portable = 0" in ini and "check_updates = 0" in ini and "prepare = 0" in ini,
+              f"12 ini keys keep their defaults (off): {ini!r}")
+        a12s = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t12, "b"), portable=False, shaders="on")
+        answers = eof_iter([d12, u12, "", "n"])
+        fr.interactive(a12s, root12, "x.log", [], ask=lambda q: next(answers), out=io.StringIO(), check=lambda *x: (0, "OK   D1: fine\n"))
+        check("prepare = 1" in open(os.path.join(root12, "kz3-install.ini")).read(), "12 --shaders on still sets the key")
         answers = eof_iter([d12, u12, "", "q"])
         go = fr.interactive(a12, root12, "x.log", [], ask=lambda q: next(answers), out=io.StringIO(),
                             check=lambda *x: (1, "FAIL D1: x\n"))
@@ -447,6 +460,15 @@ def main():
         o = o12d.getvalue()
         check(got == [os.path.abspath(os.path.join(u12, "USRDIR", "EBOOT.elf"))] and "is a folder without" in o
               and "using " in o, f"12d EBOOT folder answer: {got} {o[-300:]!r}")
+
+        # 12e. the update help follows the FAIL codes (U3/U4 included), not every code that appears in the text
+        for code, want in (("U3", True), ("U4", True), ("D1", False)):
+            o12e = io.StringIO()
+            answers = eof_iter([d12, u12, "", "q"])
+            fr.interactive(a12, root12, "x.log", [], ask=lambda q: next(answers), out=o12e,
+                           check=lambda *x, c=code: (1, f"FAIL {c}: x\nOK   U1: fine\nOK   U3: fine\n"))
+            check(("The 1.14 update is required" in o12e.getvalue()) == want,
+                  f"12e update help after FAIL {code}: {want} {o12e.getvalue()[-200:]!r}")
 
         # 12b. --check-first: the folders from setup are checked before any folder question
         a12b = types.SimpleNamespace(dump=d12, update=u12, eboot="", build=os.path.join(t12, "b"), portable=False,

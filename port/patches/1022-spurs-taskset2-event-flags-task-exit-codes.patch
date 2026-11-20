@@ -4,7 +4,7 @@ Rebased on ps3recomp v0.15.0 (SPU pass 81): upstream PR283 added a different spu
 
 Rebased on ps3recomp v0.17.0 (SPU pass 95): #381's Taskset2 helpers (spu_taskset2_register/set_exit; nothing registers a taskset in v0.17.0) kept next to spu_task2_exit_code_set; task_exited keeps #388's lock-line externs and s_ts_held.
 
-Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): follows KZ3's r152 merge shape (explore/1022)
+Rebased on ps3recomp v0.19.0: follows KZ3's r152 merge shape (explore/1022)
 so group A's 1056 applies: spu_task2_exit_code_set, spu_taskset_line_scan and the exit_code argument of
 spu_taskset_task_exited as in v0.18. Dropped: the event-flag hunk (#629's CreateTaskset2 creates both flags at +0x1898/+0x189C)
 and the CreateTask2 hunk on our old CreateTask2 (#629 has its own). Two fixes for v0.19: upstream's cellSpursCreateTask2

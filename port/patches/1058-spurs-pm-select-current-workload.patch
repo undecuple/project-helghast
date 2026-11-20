@@ -1,6 +1,6 @@
 KZ3 patch 1058 (SPU pass 40, RE pass 86): the selectWorkload intercept answers the current workload id (wklCurrentId, LS 0x1DC) instead of 0, so the WWS job-manager policy module (every KZ3 job manager) runs jobs back to back instead of one job per kernel run; another id only when the port's kernel wants the SPU elsewhere (over KZ3_SPURS_RUN_MS, another kicked workload waits unclaimed, or every kernel thread is busy and the run is past KZ3_PM_QUANTUM_US, default 8000). off by default (KZ3_PM_SELECT=1 = on, KZ3_PM_SELECT=2 = the bare upstream form: always answer the current id, no budget/kick/quantum switch (SPU pass 75), KZ3_PM_SELECT_OLD=1 = force old), KZ3_PM_SELECT_TRACE=1 = [pm-sel] lines. Upstream candidate.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 index 80a7ad4..2295786 100644

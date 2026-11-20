@@ -1,6 +1,6 @@
 KZ3 patch 4019: cellPad loads XInput at run time instead of importing it, and the runtime no longer links xinput.
 MinGW's libxinput is xinput1_3.dll, which only the DirectX June 2010 redistributable installs: on a stock Windows 10
-22H2 (fresh VM, no redistributable) kz3.exe did not start at all, exit 0xC0000135 STATUS_DLL_NOT_FOUND (2026-10-22).
+22H2 (fresh VM, no redistributable) kz3.exe did not start at all, exit 0xC0000135 STATUS_DLL_NOT_FOUND.
 Stock Windows 10/11 ship XInput1_4.dll and XInput9_1_0.dll. pad_xinput_load() (at cellPadInit when SDL does not serve
 the pads) tries XInput1_4.dll, XInput1_3.dll, XInput9_1_0.dll from System32 only, resolves XInputGetState and
 XInputSetState (the only two calls; 9_1_0 exports both), logs "[pad] XInput from <dll>" or "[pad] no XInput DLL ...",
@@ -9,7 +9,7 @@ and without one every slot reads as unplugged (keyboard on port 0 still works). 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): shrunk: upstream #494 (our own PR) has the run-time XInput load; 4019 keeps the comments and the lazy load in 4010's pad_init_backend (only when SDL3 is not used).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (the v0.19.0 chain files where available; originals for the rest, three-way merged where they did not apply).
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index 75fb2fa..7843ddc 100644

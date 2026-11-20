@@ -10,11 +10,11 @@ H="$PT/libs/input/pad_keybinds.h"
 if [[ ! -f "$H" ]]; then echo "[test_pad_keybinds] SKIP: no patched toolkit ($H; run tools/ps3recomp-patched.sh)"; exit 0; fi
 O="$ROOT/build/smoke-host/pad_keybinds"; mkdir -p "$O"
 CC="${CC:-cc}"
-W="-std=c11 -Wall -Wextra -Werror -Wno-unused-function -O2 -I$PT/libs/input"
-$CC $W "$ROOT/tools/smoke/test_pad_keybinds.c" -o "$O/test_pad_keybinds"
+W=(-std=c11 -Wall -Wextra -Werror -Wno-unused-function -O2 -I"$PT/libs/input")
+$CC "${W[@]}" "$ROOT/tools/smoke/test_pad_keybinds.c" -o "$O/test_pad_keybinds"
 "$O/test_pad_keybinds" | grep -v "^\[PASS\]"
 if echo "int main(void){return 0;}" | $CC -fsanitize=address,undefined -x c - -o "$O/probe" 2>/dev/null && "$O/probe"; then
-  $CC $W -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$ROOT/tools/smoke/test_pad_keybinds.c" -o "$O/test_asan"
+  $CC "${W[@]}" -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$ROOT/tools/smoke/test_pad_keybinds.c" -o "$O/test_asan"
   "$O/test_asan" >/dev/null && echo "[PASS] ASan/UBSan pass" || { echo "[FAIL] ASan/UBSan pass"; exit 1; }
 fi
 if command -v x86_64-w64-mingw32-gcc >/dev/null; then

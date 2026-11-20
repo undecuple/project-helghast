@@ -40,7 +40,7 @@ diff -ruN a/libs/input/pad_mouse.h b/libs/input/pad_mouse.h
 + * not taken yet, with the same scale as pad_mouse_look_apply (k = rad per count incl. ADS/zoom) and the same clamps:
 + * pitch to [pmin, pmax] from the logic pitch p0, yaw to [ymin, ymax] from the logic yaw y0 when ymin <= ymax (a gun's
 + * limited range; ymin > ymax = free). pad_look_latch_rotate: yaw dyaw about world +Z, then pitch dpitch about the
-+ * rotated right axis (forward x up; positive = up: run r103-k4m1 showed a lower pitch argument lowering row1.z). Row 3 (position)
++ * rotated right axis (forward x up; positive = up: a K4 run showed a lower pitch argument lowering row1.z). Row 3 (position)
 + * is not touched. */
 +static inline void pad_look_latch_delta(float k, int invert, int dx, int dy, float y0, float ymin, float ymax,
 +                                        float p0, float pmin, float pmax, float* dyaw, float* dpitch)

@@ -5,6 +5,7 @@ Section 1 lists the PS3 game's features with the port's status (works / partial 
 not applicable) and the evidence each status rests on; section 2 lists what the port adds (available now / planned).
 
     python3 tools/features.py            # regenerate public/docs/FEATURES.md
+    python3 tools/features.py --data-only  # only features.tsv and the enhancement entries (no page compare; for branches)
     python3 tools/features.py --check    # exit 1 when the page is stale, the data is malformed, a cp:NAME checkpoint
                                          # does not exist, a link leaves the public export, or an entry of
                                          # docs/completed/enhancements.md has no port row (docs-check check 7)
@@ -54,7 +55,9 @@ PUBLIC_PREFIXES = ("docs/checkpoints/", "docs/requirements.md", "docs/BUILDING.m
                    ".github/CONTRIBUTING.md")
 # enhancements.md paragraphs that open with a bold title but are not features.
 IGNORED_ENTRIES = ("Facts from the RPCS3 wiki", "No console window", "Present never blocks the frame thread",
-                   "Split-screen upgrades")  # its public row waits for the gate (2026-10-22); remove once the row lands
+                   "Split-screen upgrades",  # no public row yet; remove this entry once the row lands
+                   "DSU (cemuhook) gyro client",  # covered by the SIXAXIS rows' notes (ps3 Controls, port Planned)
+                   "Mission unlock switch")  # a test aid, not a player feature
 
 PS3_STATUS = {"works": "works", "partial": "partial", "not yet": "not yet", "unverified": "not yet verified",
               "declined": "declined", "n/a": "not applicable"}
@@ -250,6 +253,7 @@ def check_entries(rows, entries):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--check", action="store_true", help="verify instead of writing; exit 1 on any problem")
+    ap.add_argument("--data-only", action="store_true", help="validate features.tsv and the enhancement entries only: no page is read, written or compared (a branch may not carry FEATURES.md)")
     ap.add_argument("--root", default=str(pathlib.Path(__file__).resolve().parents[1]), help="repo root")
     ap.add_argument("-q", action="store_true", help="print only problems")
     a = ap.parse_args(argv)
@@ -267,7 +271,7 @@ def main(argv=None):
     out = root / PAGE
     if not (root / "public").is_dir() and (root / "docs" / "FEATURES.md").exists():
         out = root / "docs" / "FEATURES.md"
-    if a.check:
+    if a.check and not a.data_only:
         if not out.exists():
             problems.append(f"{PAGE} missing (run tools/features.py)")
         elif out.read_text(encoding="utf-8") != page:
@@ -277,6 +281,10 @@ def main(argv=None):
         for p in problems:
             print("  - " + p, file=sys.stderr)
         return 1
+    if a.data_only:
+        if not a.q:
+            print("features: data OK (page not compared)")
+        return 0
     if not a.check:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(page, encoding="utf-8")

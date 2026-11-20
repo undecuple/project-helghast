@@ -1,0 +1,330 @@
+KZ3 patch 2202 (RSX pass 173): RSX_VIEWS=1, the split-screen per-view counter (diagnostic, default off).
+Per flip that had draws, one `[views] flip=N views=V draws=D words=W binds=B surf=S scis=C hist=0:a 1:b 2:c 3+:d | v0 WxH
+rect=x0,y0-x1,y1 draws=.. words=.. binds=.. | v1 ... | rest draws=.. words=.. binds=.. tail_words=..` line on stderr; after
+RSX_VIEWS_N lines (default 100) only a hist line every 300 flips. RSX_VIEWS_MIN = draw packets a rect needs to count as a
+view (default 8).
+View boundary signal: the guest scissor (NV4097 SET_SCISSOR 0x08C0/0x08C4) read at each draw packet (sink_draw_arrays,
+sink_draw_index, sink_inline_array). Both views of a split screen draw into the same colour/zeta targets (so a target
+change does not separate them), the port's draw viewport is always the whole surface, and the game's per-view loop
+(SceneRenderer::RenderFrame 0x1F5030) is PPU code that the RSX command stream does not carry, so the walker cannot see its
+markers. The scissor is the one per-view state in the stream. Draws are grouped by (target size, clamped scissor rect);
+view-like = >= RSX_VIEWS_MIN draws and >= 25 % of the target area; the largest set of pairwise non-overlapping view-like
+rects within one target size is the view set (light and UI scissors are small, shadow maps and post targets are other
+sizes). Surface/zeta change count (surf) and scissor change count (scis) are logged as the alternative signals. Method words
+(rsx_live_draw_method entries) are attributed to the next draw; enabled fragment texture units per draw are the binds.
+libs/video/rsx_views.h is pure C (host test tools/smoke/test_views.sh: 1, 2 and 3-view synthetic streams and negative
+controls); the instance and RSX_VIEWS switch live in cellGcmSys.c beside g_rsx_o0 (enabled at walk-pass begin); the hooks are in
+rsx_live_draw.c only (rsx_live_draw_method for the words, the three draw-packet sinks, sink_flip), so host tests that link
+rsx_dispatch.c alone are unaffected. Off: one
+predicted-not-taken test of g_rsx_views.on per method word, draw packet and flip. ASSUMPTION (not run in the game): views
+do not overlap and each covers >= 25 % of the target.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 0089a10b..09ad4084 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -10,6 +10,7 @@
+ 
+ #include "rsx_live_draw.h"
+ #include "rsx_o0.h"   /* patch 2188: RSX_PERF_SPLIT / RSX_O0 */
++#include "rsx_views.h"   /* patch 2202 */
+ #include "rsx_legacy_skip.h"   /* patch 2189 */
+ static rsx_lgs s_lgs;   /* patch 2189: legacy-skip counters, walker thread only */
+ #define GCM_SPLIT_PUSH(tok, b) const int tok = g_rsx_split_act ? rsx_split_push_w(b) : 0
+@@ -2604,9 +2605,27 @@ int rsx_perf_o0_on(void)
+     if (on < 0) { on = gcm_env_on("RSX_O0"); if (on) rsx_o0v_init(&g_rsx_o0v, getenv("RSX_O0_VTX_RANGE")); g_rsx_o0.on = on; if (on) { fprintf(stderr, "[o0] O0 live counters on (RSX_O0=1, patch 2188); [o0-vtx] range 0x%08llX..0x%08llX (RSX_O0_VTX_RANGE, patch 2195)\n", g_rsx_o0v.lo, g_rsx_o0v.hi); } }
+     return on;
+ }
++/* Patch 2202: RSX_VIEWS=1, the split-screen per-view counter (rsx_views.h). Walker thread only; the instance lives here beside
++ * g_rsx_o0 (host tests that link rsx_dispatch.c alone never reference it: the hooks are in rsx_live_draw.c). */
++rsx_views g_rsx_views;
++int rsx_perf_views_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        on = gcm_env_on("RSX_VIEWS");
++        if (on) {
++            const char* n = getenv("RSX_VIEWS_N"); const char* m = getenv("RSX_VIEWS_MIN");
++            rsx_views_init(&g_rsx_views, m ? (uint32_t)strtoul(m, NULL, 10) : 8u, n ? (uint32_t)strtoul(n, NULL, 10) : 100u);
++            fprintf(stderr, "[views] per-view counter on (RSX_VIEWS=1, patch 2202): min %u draws per view, %u detailed lines\n",
++                    g_rsx_views.min_draws, g_rsx_views.max_lines);
++        }
++    }
++    return on;
++}
+ static void gcm_split_begin(long long t0)   /* the walk lock is held */
+ {
+     (void)rsx_perf_o0_on();
++    (void)rsx_perf_views_on();   /* patch 2202 */
+     if (!rsx_perf_split_on() || !rsx_perf_walk_on()) return;
+     rsx_split_begin(&s_split, t0);
+     s_split_owner = RSX_SPLIT_TID();
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 863687fa..4da458d1 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -21,6 +21,7 @@
+ 
+ #include "rsx_live_draw.h"
+ #include "rsx_o0.h"   /* patch 2188 */
++#include "rsx_views.h"   /* patch 2202 */
+ #include "rsx_guest_signal.h"   /* patch 2190: the guest-signal funnel, defined in rsx_commands.c */
+ /* Patch 2188 (RSX_PERF_SPLIT=1): exclusive buckets, rsx_o0.h. One int test when off. LDS_POP also closes anything opened
+  * after its token that an early return left open. */
+@@ -13133,9 +13134,28 @@ static void ld_movie_capture_overlay(void)
+ }
+ 
+ static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
++/* Patch 2202 (RSX_VIEWS=1): one draw packet for the per-view counter (rsx_views.h). The state is the dispatch state at the
++ * draw, read before any early-out of the packet sinks; texture binds = enabled fragment texture units. */
++static void ld_views_note_draw(const rsx_dispatch* r)
++{
++    rsx_dsp_surface sf;
++    rsx_dsp_get_surface(r, &sf);
++    const u32 ax = sf.aa_sx ? sf.aa_sx : 1u, ay = sf.aa_sy ? sf.aa_sy : 1u;
++    u32 binds = 0;
++    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
++        rsx_dsp_texture t;
++        rsx_dsp_get_texture(r, u, &t);
++        binds += t.enabled ? 1u : 0u;
++    }
++    rsx_views_draw(&g_rsx_views, sf.color_offset[0], sf.zeta_offset, sf.clip_w ? sf.clip_w / ax : g.width,
++                   sf.clip_h ? sf.clip_h / ay : g.height, rsx_dsp_reg(r, M_SCISSOR_HORIZONTAL),
++                   rsx_dsp_reg(r, M_SCISSOR_VERTICAL),
++                   r->seen[M_SCISSOR_HORIZONTAL >> 2] != 0 || r->seen[M_SCISSOR_VERTICAL >> 2] != 0, binds);
++}
+ static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
+ {
+     (void)u; (void)r; g_ld_stats.packets_seen++;
++    if (__builtin_expect(g_rsx_views.on, 0)) ld_views_note_draw(r);   /* patch 2202 */
+     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) {
+         g_ld_stats.packets_movie++;
+         return;
+@@ -13155,6 +13175,7 @@ static void sink_inline_array(void* u, const rsx_dispatch* r,
+ {
+     (void)u; (void)r;
+     g_ld_stats.packets_seen++;
++    if (__builtin_expect(g_rsx_views.on, 0)) ld_views_note_draw(r);   /* patch 2202 */
+     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) {
+         g_ld_stats.packets_movie++;
+         return;
+@@ -13174,6 +13195,7 @@ static void sink_inline_array(void* u, const rsx_dispatch* r,
+ static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count)
+ {
+     (void)u; (void)r; g_ld_stats.packets_seen++;
++    if (__builtin_expect(g_rsx_views.on, 0)) ld_views_note_draw(r);   /* patch 2202 */
+     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) {
+         g_ld_stats.packets_movie++;
+         return;
+@@ -16650,6 +16672,10 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+ {
+     (void)user; (void)r;
+     const u32 buffer_id = arg & 7u;
++    if (__builtin_expect(g_rsx_views.on, 0)) {   /* patch 2202: one [views] line per flip that had draws */
++        char vb[1024]; uint32_t nv;
++        if (rsx_views_flip(&g_rsx_views, vb, sizeof vb, &nv)) fprintf(stderr, "%s\n", vb);
++    }
+     if (__builtin_expect(g_rsx_fcap_cfg, 0)) rsx_fcap_flip(buffer_id, 0);   /* patch 2164 */
+     gcm_guest_signal_note(RSX_GS_FLIP, buffer_id, 0u);   /* patch 2190: E6, the renderer sees the flip request */
+     g_ld_flip_requested++;
+@@ -17914,6 +17940,7 @@ static void ld_dispatch_timed(u32 method, u32 arg)
+ }
+ void rsx_live_draw_method(u32 method, u32 arg)
+ {
++    if (__builtin_expect(g_rsx_views.on, 0)) rsx_views_word(&g_rsx_views);   /* patch 2202 */
+     if (__builtin_expect(g_rsx_fp_on, 0) && g_rsx_fp->sampling) rsx_fp_word(g_rsx_fp, method, arg);   /* patch 2172: the sampled flip's words */
+     /* Bounded ingress trace for the a010 live-vs-capture comparison.  Keep the
+      * raw method (including its FIFO subchannel bits) visible: if an SPU-built
+diff --git a/libs/video/rsx_views.h b/libs/video/rsx_views.h
+new file mode 100644
+index 00000000..a4a39822
+--- /dev/null
++++ b/libs/video/rsx_views.h
+@@ -0,0 +1,187 @@
++/* KZ3 patch 2202 (RSX pass 173): RSX_VIEWS=1, the split-screen per-view counter. Pure C (no OS calls, no globals other
++ * than the instance the caller owns), so tools/smoke/test_views.c builds it on the host. Default off.
++ *
++ * What it answers: how many views does the walker see per flip, and how many draw packets, method words and enabled
++ * texture units does each view cost. The game renders split screen as the normal per-view loop (SceneRenderer::RenderFrame
++ * 0x1F5030 with 2 views), into the SAME colour/zeta targets, and the port's draw viewport is always the whole surface, so
++ * neither a target change nor the viewport separates the views. The one per-view state the walker sees is the guest
++ * SET_SCISSOR rectangle (NV4097 0x08C0/0x08C4); the game's own loop markers are PPU code the RSX command stream does
++ * not carry. So a view is a scissor rectangle:
++ *   - draws are grouped by (target width, target height, clamped scissor rect); an unwritten scissor is the whole target;
++ *   - a group is view-like when it has >= min_draws draw packets and its rect covers >= RSX_VIEWS_AREA_PCT % of the target
++ *     (light-volume and UI scissors are small; shadow maps and the post chain are other target sizes);
++ *   - within one target size the view-like rects are taken greedily by draw count, keeping only rects that do not overlap
++ *     one already taken (passes with a slightly different full-screen scissor overlap, split-screen halves do not);
++ *   - views = the largest such set over all target sizes. The surface/zeta change count and the scissor change count are
++ *     logged next to it as the alternative signals.
++ * Method words are attributed to the next draw (a word that sets state is counted for the draw it prepares); words after
++ * the last draw of a flip are `tail`. ASSUMPTION: a view's scissor is a rectangle at least 25 % of the target and the
++ * two views of a split do not overlap (3D-TV eyes or a game that scissors per effect to a large overlapping rect would
++ * count as one view; a full-screen overlay scissor with more draw packets than a view would hide the views, the greedy order
++ * is by draw count). Verified only on the synthetic streams of tools/smoke/test_views.c; no game run. */
++#ifndef RSX_VIEWS_H
++#define RSX_VIEWS_H
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#define RSX_VIEWS_MAXG 64
++#define RSX_VIEWS_AREA_PCT 25u
++#define RSX_VIEWS_MAXSEL 8
++
++typedef struct {
++    uint32_t tw, th;           /* target size in pixels */
++    int32_t x0, y0, x1, y1;    /* clamped scissor rect, x1/y1 exclusive */
++    uint32_t draws, words, binds;
++} rsx_views_grp;
++
++typedef struct {
++    int on;
++    uint32_t min_draws;        /* RSX_VIEWS_MIN, default 8 */
++    uint32_t max_lines;        /* RSX_VIEWS_N detailed lines, default 100; then one summary every 300 flips */
++    /* this flip */
++    rsx_views_grp g[RSX_VIEWS_MAXG];
++    uint32_t ng;
++    uint32_t draws, words, binds, tail_words, ovf_draws, ovf_words, ovf_binds;
++    uint32_t pend_words;       /* words since the previous draw */
++    uint32_t surf_changes, scissor_changes;
++    uint32_t last_col, last_zeta, last_valid;
++    int32_t last_rect[4];
++    /* run totals */
++    uint32_t flips, lines, hist[4];   /* hist[v] flips with v views (3 = 3 or more), hist[0] = flips with no draw */
++} rsx_views;
++
++static inline void rsx_views_init(rsx_views* v, uint32_t min_draws, uint32_t max_lines)
++{
++    memset(v, 0, sizeof(*v));
++    v->on = 1;
++    v->min_draws = min_draws ? min_draws : 8u;
++    v->max_lines = max_lines ? max_lines : 100u;
++}
++
++/* one method word was dispatched */
++static inline void rsx_views_word(rsx_views* v) { v->pend_words++; }
++
++/* one draw packet. col/zeta = surface offsets, tw/th = target size in pixels, sh/sv = raw SCISSOR_HORIZONTAL/VERTICAL
++ * (x | w << 16, y | h << 16), written = the scissor registers were ever written, binds = enabled fragment texture units */
++static inline void rsx_views_draw(rsx_views* v, uint32_t col, uint32_t zeta, uint32_t tw, uint32_t th, uint32_t sh,
++                                  uint32_t sv, int written, uint32_t binds)
++{
++    int32_t x0 = 0, y0 = 0, x1 = (int32_t)tw, y1 = (int32_t)th;
++    if (written) {
++        const int32_t sx = (int32_t)(sh & 0xFFFFu), sw = (int32_t)(sh >> 16);
++        const int32_t sy = (int32_t)(sv & 0xFFFFu), shh = (int32_t)(sv >> 16);
++        if (sx > x0) x0 = sx;
++        if (sy > y0) y0 = sy;
++        if (sx + sw < x1) x1 = sx + sw;
++        if (sy + shh < y1) y1 = sy + shh;
++        if (x1 < x0) x1 = x0;
++        if (y1 < y0) y1 = y0;
++    }
++    if (v->last_valid) {
++        if (col != v->last_col || zeta != v->last_zeta) v->surf_changes++;
++        if (v->last_rect[0] != x0 || v->last_rect[1] != y0 || v->last_rect[2] != x1 || v->last_rect[3] != y1) v->scissor_changes++;
++    }
++    v->last_valid = 1; v->last_col = col; v->last_zeta = zeta;
++    v->last_rect[0] = x0; v->last_rect[1] = y0; v->last_rect[2] = x1; v->last_rect[3] = y1;
++    v->draws++; v->words += v->pend_words; v->binds += binds;
++    uint32_t i = 0;
++    for (; i < v->ng; i++) {
++        rsx_views_grp* g = &v->g[i];
++        if (g->tw == tw && g->th == th && g->x0 == x0 && g->y0 == y0 && g->x1 == x1 && g->y1 == y1) break;
++    }
++    if (i == v->ng) {
++        if (v->ng == RSX_VIEWS_MAXG) { v->ovf_draws++; v->ovf_words += v->pend_words; v->ovf_binds += binds; v->pend_words = 0; return; }
++        rsx_views_grp* g = &v->g[v->ng++];
++        memset(g, 0, sizeof(*g));
++        g->tw = tw; g->th = th; g->x0 = x0; g->y0 = y0; g->x1 = x1; g->y1 = y1;
++    }
++    v->g[i].draws++; v->g[i].words += v->pend_words; v->g[i].binds += binds;
++    v->pend_words = 0;
++}
++
++static inline int rsx_views_overlap(const rsx_views_grp* a, const rsx_views_grp* b)
++{
++    return a->x0 < b->x1 && b->x0 < a->x1 && a->y0 < b->y1 && b->y0 < a->y1;
++}
++
++/* the view set of the groups so far: fills sel[] (indices into g[], ordered by x0 then y0), returns the count */
++static inline uint32_t rsx_views_select(const rsx_views* v, uint32_t sel[RSX_VIEWS_MAXSEL])
++{
++    uint32_t best = 0, best_draws = 0;
++    for (uint32_t c = 0; c < v->ng; c++) {
++        int seen = 0;
++        for (uint32_t k = 0; k < c; k++) if (v->g[k].tw == v->g[c].tw && v->g[k].th == v->g[c].th) { seen = 1; break; }
++        if (seen) continue;   /* one pass per target size */
++        uint32_t cand[RSX_VIEWS_MAXG], nc = 0;
++        for (uint32_t i = 0; i < v->ng; i++) {
++            const rsx_views_grp* g = &v->g[i];
++            if (g->tw != v->g[c].tw || g->th != v->g[c].th) continue;
++            const uint64_t area = (uint64_t)(g->x1 - g->x0) * (uint64_t)(g->y1 - g->y0);
++            if (g->draws < v->min_draws) continue;
++            if (area * 100u < (uint64_t)g->tw * g->th * RSX_VIEWS_AREA_PCT) continue;
++            cand[nc++] = i;
++        }
++        for (uint32_t a = 0; a + 1 < nc; a++)   /* by draws, descending (stable on index) */
++            for (uint32_t b = a + 1; b < nc; b++)
++                if (v->g[cand[b]].draws > v->g[cand[a]].draws) { uint32_t t = cand[a]; cand[a] = cand[b]; cand[b] = t; }
++        uint32_t take[RSX_VIEWS_MAXSEL], nt = 0, td = 0;
++        for (uint32_t a = 0; a < nc && nt < RSX_VIEWS_MAXSEL; a++) {
++            int clash = 0;
++            for (uint32_t k = 0; k < nt; k++) if (rsx_views_overlap(&v->g[cand[a]], &v->g[take[k]])) { clash = 1; break; }
++            if (clash) continue;
++            take[nt++] = cand[a]; td += v->g[cand[a]].draws;
++        }
++        if (nt > best || (nt == best && nt && td > best_draws)) {
++            best = nt; best_draws = td;
++            for (uint32_t k = 0; k < nt; k++) sel[k] = take[k];
++        }
++    }
++    for (uint32_t a = 0; a + 1 < best; a++)
++        for (uint32_t b = a + 1; b < best; b++) {
++            const rsx_views_grp *ga = &v->g[sel[a]], *gb = &v->g[sel[b]];
++            if (gb->x0 < ga->x0 || (gb->x0 == ga->x0 && gb->y0 < ga->y0)) { uint32_t t = sel[a]; sel[a] = sel[b]; sel[b] = t; }
++        }
++    return best;
++}
++
++/* The flip: formats this flip's line into buf (returns its length, 0 = print nothing) and resets the per-flip state.
++ * *views_out receives the view count. A flip with no draw prints nothing. */
++static inline size_t rsx_views_flip(rsx_views* v, char* buf, size_t cap, uint32_t* views_out)
++{
++    uint32_t sel[RSX_VIEWS_MAXSEL];
++    const uint32_t nv = v->draws ? rsx_views_select(v, sel) : 0;
++    const uint32_t nvc = nv > 3u ? 3u : nv;
++    v->flips++;
++    v->hist[nvc]++;
++    v->tail_words = v->pend_words;
++    size_t n = 0;
++    const int detailed = v->draws && v->lines < v->max_lines;
++    const int summary = v->draws && !detailed && (v->flips % 300u) == 0;
++    if (detailed || summary) {
++        n += (size_t)snprintf(buf + n, cap - n, "[views] flip=%u views=%u draws=%u words=%u binds=%u surf=%u scis=%u hist=0:%u 1:%u 2:%u 3+:%u",
++                              v->flips, nv, v->draws, v->words, v->binds, v->surf_changes, v->scissor_changes,
++                              v->hist[0], v->hist[1], v->hist[2], v->hist[3]);
++        if (detailed) {
++            uint32_t sd = 0, sw = 0, sb = 0;
++            for (uint32_t k = 0; k < nv && n < cap; k++) {
++                const rsx_views_grp* g = &v->g[sel[k]];
++                n += (size_t)snprintf(buf + n, cap - n, " | v%u %ux%u rect=%d,%d-%d,%d draws=%u words=%u binds=%u", k, g->tw, g->th,
++                                      (int)g->x0, (int)g->y0, (int)g->x1, (int)g->y1, g->draws, g->words, g->binds);
++                sd += g->draws; sw += g->words; sb += g->binds;
++            }
++            if (n < cap) n += (size_t)snprintf(buf + n, cap - n, " | rest draws=%u words=%u binds=%u tail_words=%u", v->draws - sd,
++                                               v->words - sw, v->binds - sb, v->tail_words);
++        }
++        if (n >= cap) n = cap - 1;
++        v->lines++;
++    }
++    *views_out = nv;
++    v->ng = 0; v->draws = v->words = v->binds = 0; v->ovf_draws = v->ovf_words = v->ovf_binds = 0;
++    v->pend_words = 0; v->surf_changes = v->scissor_changes = 0; v->last_valid = 0;
++    return n;
++}
++/* the instance and its switch live in cellGcmSys.c (beside g_rsx_o0) */
++extern rsx_views g_rsx_views;
++int rsx_perf_views_on(void);   /* RSX_VIEWS=1 (cached; RSX_VIEWS_N detailed lines, RSX_VIEWS_MIN draws per view) */
++#endif

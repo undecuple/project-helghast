@@ -3,7 +3,7 @@ KZ3 patch 1086 (SPU pass 66): spu_depth_guard (spu_drain.c, on every full drain 
 the cores of the five HiPrio kernel threads. spu_depth_guard was 2.3 % of the K4 SPU samples (run spu-66-trace2,
 KZ3_PROF 131-180 s) for a limit test and two stores. The ring is gone; the depth report (the only reader) prints the
 tripping context's own step ring (ctx->recent_pc, written per drain step by spu_task_launch_check and patch 1068's
-marks), which names that SPU's loop instead of a mix of all SPUs' sites. Host microbenchmark (work/spu/r66/mb.c, not
+marks), which names that SPU's loop instead of a mix of all SPUs' sites. Host microbenchmark (a local mb.c, not
 committed): 6 threads, 1.8 -> 10.3 ns per call with the shared ring vs 0.4 ns without. Upstream candidate.
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (no shared ring) over upstream's upper-half ring.

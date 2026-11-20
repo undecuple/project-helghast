@@ -1,0 +1,235 @@
+KZ3 patch 2182 (RSX pass 158): per-key lock around the pipeline-library Load + create + Store (rsx_pl_lock.h).
+ld_pl_create is reached from the preload workers, the template workers, the async compile workers and the walker, with
+overlapping keys by design. Two threads missing the library for one key both compiled it and both called StorePipeline
+(a Store of an existing name fails with E_INVALIDARG); a Load concurrent with the Store of that name has no defined
+result. Load + create + Store now run under one of 64 stripe locks chosen by the key and the Load is re-run under the
+lock, so a waiting thread gets the first thread's stored pipeline instead of compiling again. The lock is a leaf: only
+D3D12 calls run inside it. New [pso-lib] line (per minute with the [pso-stat] line once the library was used, and at
+shutdown): calls, lock-waits, second-thread-hits, loads/hits, creates, stores, store-rejects. Host test
+tools/smoke/test_pl_lock.sh (threads, TSan, negative control).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -235,6 +235,7 @@
+ #include "rsx_tex_lru.h"        /* patch 2075 */
+ #include "rsx_smp_index.h"      /* patch 2161 */
+ #include "rsx_pso_memo.h"       /* patch 2163 */
++#include "rsx_pl_lock.h"        /* patch 2182 */
+ #include "rsx_gpupass.h"        /* patch 2086 */
+ #include "rsx_upscale.h"        /* patch 2145: RSX_UPSCALE=fsr1 */
+ #include <sys/stat.h>
+@@ -8397,6 +8398,7 @@
+     return (unsigned)((q.QuadPart - t0) * 1000000 / (g_ld_pstat.qpf ? g_ld_pstat.qpf : 1)); }
+ static LONGLONG ld_pstat_qpc(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart; }
+ /* Called on every PSO miss: closes the previous minute's line when the minute changed. */
++static void ld_pl_print_lib_stats(const char* when);
+ static void ld_pstat_flush_if_new_minute(void)
+ {
+     const long long b = ld_pstat_now_ms() / 60000;
+@@ -8412,6 +8414,7 @@
+                 g_ld_pstat.disk_v, g_ld_pstat.disk_p,
+                 g_ld_pstat.create.n, g_ld_pstat.create.us / 1e3, g_ld_pstat.create.max_us / 1e3,
+                 g_ld_pstat.tot_miss, g_ld_pstat.tot_compile, g_ld_pstat.tot_miss_us / 1e3, g_ld_pl_used);
++    ld_pl_print_lib_stats("run total");   /* patch 2182 */
+     memset(&g_ld_pstat.miss, 0, sizeof g_ld_pstat.miss); memset(&g_ld_pstat.vsc, 0, sizeof g_ld_pstat.vsc);
+     memset(&g_ld_pstat.psc, 0, sizeof g_ld_pstat.psc); memset(&g_ld_pstat.create, 0, sizeof g_ld_pstat.create);
+     g_ld_pstat.disk_v = g_ld_pstat.disk_p = g_ld_pstat.over4 = g_ld_pstat.over16 = g_ld_pstat.over50 = 0;
+@@ -8471,6 +8474,7 @@
+     LONGLONG t0, qpf;
+     unsigned n_lib_hit, n_created, n_failed, n_missing, n_dup, n_lib_stored, n_lib_hit_walker;
+     unsigned long long create_us, lib_us, blob_us;
++    rsx_pl_locks klock;                         /* patch 2182: per-key lock around library Load+create+Store (leaf lock, rsx_pl_lock.h) */
+ } g_ld_pl;
+ static u32 g_ld_pl_last_vs_len, g_ld_pl_last_ps_len;
+ static u64 g_ld_pl_last_vs_hash, g_ld_pl_last_ps_hash;
+@@ -8502,6 +8506,7 @@
+ /* Read the key file (init thread, before the walker runs); a header mismatch starts a fresh file. */
+ static void ld_pl_open(void)
+ {
++    rsx_pl_locks_init(&g_ld_pl.klock);   /* patch 2182: before any worker can call ld_pl_create (open runs single-threaded) */
+     if (g_ld_pl.opened) return;
+     ld_pl_enabled();
+     g_ld_pl.opened = 1;
+@@ -8641,26 +8646,45 @@
+     return (rs->depth_bounds || rs->stencil_per_face) && g_ld_caps.dev2 && pd->DSVFormat;
+ }
+ 
+-/* Create through the pipeline library when there is one (named by the PSO key); stream PSOs stay on ld_create_pso. */
++/* Create through the pipeline library when there is one (named by the PSO key); stream PSOs stay on ld_create_pso.
++ * Patch 2182: Load + create + Store of one key run under that key's stripe lock (rsx_pl_get), so the library never sees
++ * two threads on one name (a Store of an existing name fails with E_INVALIDARG, Load concurrent with Store of one name
++ * is undefined) and a thread that waited gets the first thread's pipeline from the library instead of compiling again.
++ * The lock is a leaf: the callbacks call only D3D12 (library, device) and take no LD lock. */
++typedef struct {
++    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd; const render_state_t* rs; WCHAR name[24]; HRESULT hr;
++} ld_pl_ctx;
++static int ld_pl_op_load(void* c, void** out)
++{
++    ld_pl_ctx* x = (ld_pl_ctx*)c;
++    x->hr = g_ld_pl.lib->lpVtbl->LoadGraphicsPipeline(g_ld_pl.lib, x->name, x->pd, &IID_ID3D12PipelineState, out);
++    return SUCCEEDED(x->hr) && *out;
++}
++static int ld_pl_op_create(void* c, void** out)
++{
++    ld_pl_ctx* x = (ld_pl_ctx*)c;
++    x->hr = ld_create_pso(x->pd, x->rs, (ID3D12PipelineState**)out);
++    return SUCCEEDED(x->hr) && *out;
++}
++static int ld_pl_op_store(void* c, void* obj)
++{
++    ld_pl_ctx* x = (ld_pl_ctx*)c;
++    if (FAILED(g_ld_pl.lib->lpVtbl->StorePipeline(g_ld_pl.lib, x->name, (ID3D12PipelineState*)obj))) return 0;
++    InterlockedExchange(&g_ld_pl.lib_dirty, 1);
++    InterlockedIncrement((volatile LONG*)&g_ld_pl.n_lib_stored);
++    return 1;
++}
+ static HRESULT ld_pl_create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const render_state_t* rs, u64 key,
+                             ID3D12PipelineState** out, int* lib_hit)
+ {
+     *lib_hit = 0;
+     if (g_ld_pl.lib && !ld_pso_needs_stream(pd, rs)) {
+-        WCHAR name[24];
+-        for (int i = 0; i < 16; i++) name[i] = L"0123456789ABCDEF"[(key >> (60 - 4 * i)) & 15];
+-        name[16] = 0;
+-        HRESULT hr = g_ld_pl.lib->lpVtbl->LoadGraphicsPipeline(g_ld_pl.lib, name, pd, &IID_ID3D12PipelineState, (void**)out);
+-        if (SUCCEEDED(hr) && *out) { *lib_hit = 1; return hr; }
+-        *out = NULL;
+-        hr = ld_create_pso(pd, rs, out);
+-        if (SUCCEEDED(hr) && *out) {
+-            if (SUCCEEDED(g_ld_pl.lib->lpVtbl->StorePipeline(g_ld_pl.lib, name, *out))) {
+-                InterlockedExchange(&g_ld_pl.lib_dirty, 1);
+-                InterlockedIncrement((volatile LONG*)&g_ld_pl.n_lib_stored);
+-            }
+-        }
+-        return hr;
++        static const rsx_pl_ops ops = { ld_pl_op_load, ld_pl_op_create, ld_pl_op_store };
++        ld_pl_ctx x; x.pd = pd; x.rs = rs; x.hr = S_OK;
++        for (int i = 0; i < 16; i++) x.name[i] = L"0123456789ABCDEF"[(key >> (60 - 4 * i)) & 15];
++        x.name[16] = 0;
++        const int ok = rsx_pl_get(&g_ld_pl.klock, key, &ops, &x, (void**)out, lib_hit);
++        return ok ? S_OK : (FAILED(x.hr) ? x.hr : E_FAIL);
+     }
+     return ld_create_pso(pd, rs, out);
+ }
+@@ -8840,6 +8864,14 @@
+         ld_pl_save_library(0);
+ }
+ 
++static void ld_pl_print_lib_stats(const char* when)
++{
++    const rsx_pl_locks* k = &g_ld_pl.klock;
++    if (!k->n_calls && when[0] != 'e') return;   /* per-minute line only once the library has been used */
++    fprintf(stderr, "[pso-lib] %s: calls %u lock-waits %u second-thread-hits %u (loads %u hits %u) creates %u stores %u store-rejects %u\n",
++            when, k->n_calls, k->n_waits, k->n_second_hits, k->n_loads, k->n_load_hits, k->n_creates, k->n_stores, k->n_store_rejects);
++}
++
+ static void ld_pl_shutdown(void)
+ {
+     if (!g_ld_pl.started) return;
+@@ -8850,6 +8882,7 @@
+     ld_pl_drain();
+     fprintf(stderr, "[pso-preload] used %u of the preloaded PSOs, %u duplicates of walker builds, walker library hits %u\n",
+             g_ld_pl_used, g_ld_pl.n_dup, g_ld_pl.n_lib_hit_walker);
++    ld_pl_print_lib_stats("end");
+     if (g_ld_pl.lib) { g_ld_pl.lib->lpVtbl->Release(g_ld_pl.lib); g_ld_pl.lib = NULL; }
+     if (g_ld_pl.dev1) { g_ld_pl.dev1->lpVtbl->Release(g_ld_pl.dev1); g_ld_pl.dev1 = NULL; }
+     free(g_ld_pl.lib_blob); g_ld_pl.lib_blob = NULL;
+diff --git a/libs/video/rsx_pl_lock.h b/libs/video/rsx_pl_lock.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_pl_lock.h
+@@ -0,0 +1,93 @@
++/* KZ3 patch 2182 (RSX pass 158): per-key lock around the pipeline-library Load + create + Store of one PSO key.
++ * GPU-free so a host test can drive it with threads (tools/smoke/test_pl_lock.c).
++ *
++ * Why: ld_pl_create is reached from the preload workers, the template workers, the async compile workers and the
++ * walker, and their key sets overlap by design. Two threads missing the library for one key both compiled it and both
++ * called StorePipeline (the second fails; ID3D12PipelineLibrary names are unique), and a Load concurrent with the
++ * Store of the same name has no defined result. rsx_pl_get takes a lock chosen by the key, re-runs the Load under it
++ * (so the thread that waited gets the first thread's stored pipeline instead of compiling again), and creates + stores
++ * only on a miss.
++ *
++ * Lock order: the stripe lock is a LEAF. Inside it only the three callbacks run (library Load, device create, library
++ * Store: D3D12 calls that take no lock of ours). Callers must hold no other LD lock around rsx_pl_get that a callback
++ * could want, and the callbacks must not take any LD lock. Keys of different stripes never wait for each other.
++ */
++#ifndef RSX_PL_LOCK_H
++#define RSX_PL_LOCK_H
++#include <stdint.h>
++#include <string.h>
++#ifdef _WIN32
++#include <windows.h>
++typedef SRWLOCK rsx_pl_mutex;
++#define RSX_PL_MUTEX_INIT(m) InitializeSRWLock(m)
++#define RSX_PL_MUTEX_LOCK(m) AcquireSRWLockExclusive(m)
++#define RSX_PL_MUTEX_TRY(m)  (TryAcquireSRWLockExclusive(m) != 0)
++#define RSX_PL_MUTEX_UNLOCK(m) ReleaseSRWLockExclusive(m)
++#else
++#include <pthread.h>
++typedef pthread_mutex_t rsx_pl_mutex;
++#define RSX_PL_MUTEX_INIT(m) pthread_mutex_init((m), NULL)
++#define RSX_PL_MUTEX_LOCK(m) pthread_mutex_lock(m)
++#define RSX_PL_MUTEX_TRY(m)  (pthread_mutex_trylock(m) == 0)
++#define RSX_PL_MUTEX_UNLOCK(m) pthread_mutex_unlock(m)
++#endif
++
++#define RSX_PL_STRIPES 64u
++
++typedef struct {
++    rsx_pl_mutex mu[RSX_PL_STRIPES];
++    int off;                      /* test-only: 1 = no locking (negative control); the game never sets it */
++    /* run totals ([pso-lib] line); updated with atomic adds */
++    unsigned n_calls;             /* rsx_pl_get calls that reached the library */
++    unsigned n_waits;             /* stripe lock was held by another thread: this caller waited */
++    unsigned n_second_hits;       /* caller had waited and its Load then hit (the first thread's pipeline: no compile) */
++    unsigned n_loads, n_load_hits, n_creates, n_stores, n_store_rejects;
++} rsx_pl_locks;
++
++typedef struct {
++    int (*load)(void* ctx, void** out);          /* 1 = library hit, *out set */
++    int (*create)(void* ctx, void** out);        /* 1 = created, *out set */
++    int (*store)(void* ctx, void* obj);          /* 1 = stored */
++} rsx_pl_ops;
++
++static inline void rsx_pl_locks_init(rsx_pl_locks* L)
++{
++    memset(L, 0, sizeof *L);
++    for (unsigned i = 0; i < RSX_PL_STRIPES; i++) RSX_PL_MUTEX_INIT(&L->mu[i]);
++}
++
++static inline unsigned rsx_pl_stripe(uint64_t key)
++{
++    uint64_t h = key * 0x9E3779B97F4A7C15ull;     /* keys are hashes already; the multiply mixes the low bits */
++    return (unsigned)(h >> 58);                   /* top 6 bits = 64 stripes */
++}
++
++#define RSX_PL_ADD(p) __atomic_fetch_add((p), 1u, __ATOMIC_RELAXED)
++
++/* Returns 1 when *out holds a pipeline (hit_lib = 1 when it came from the library), 0 when the create failed. */
++static inline int rsx_pl_get(rsx_pl_locks* L, uint64_t key, const rsx_pl_ops* ops, void* ctx, void** out, int* hit_lib)
++{
++    rsx_pl_mutex* mu = &L->mu[rsx_pl_stripe(key)];
++    int waited = 0, ok = 0;
++    *hit_lib = 0; *out = NULL;
++    RSX_PL_ADD(&L->n_calls);
++    if (!L->off) {
++        if (!RSX_PL_MUTEX_TRY(mu)) { waited = 1; RSX_PL_ADD(&L->n_waits); RSX_PL_MUTEX_LOCK(mu); }
++    }
++    RSX_PL_ADD(&L->n_loads);
++    if (ops->load(ctx, out) && *out) {
++        RSX_PL_ADD(&L->n_load_hits);
++        if (waited) RSX_PL_ADD(&L->n_second_hits);
++        *hit_lib = 1; ok = 1;
++    } else {
++        *out = NULL;
++        RSX_PL_ADD(&L->n_creates);
++        if (ops->create(ctx, out) && *out) {
++            ok = 1;
++            if (ops->store(ctx, *out)) RSX_PL_ADD(&L->n_stores); else RSX_PL_ADD(&L->n_store_rejects);
++        }
++    }
++    if (!L->off) RSX_PL_MUTEX_UNLOCK(mu);
++    return ok;
++}
++#endif

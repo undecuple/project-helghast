@@ -3,6 +3,7 @@
  * guest mouse mapping, display.ini text, and the Options row's GUM patch (on a synthetic page; KZ3_DM_GUM=<file> also
  * patches a real displaysettings.gum when given). Platform-free; run by test_display_mode.sh. */
 #include "rsx_display_mode.h"
+#include "rsx_gfx_page.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -364,40 +365,35 @@ static void test_gum(void)
         CHECK(!strcmp(rsx_dm_fov_name(0, fb, sizeof fb), "default") && !strcmp(rsx_dm_fov_name(105, fb, sizeof fb), "105"),
               "2109: names");
     }
-    /* patch 2121 (RSX pass 114): Motion blur and Bloom as 0..100 % rows after Field of view, display.ini numbers */
+    /* patch 2121 (RSX pass 114): Motion blur as a 0..100 % row after Field of view, display.ini numbers. Patch 2206: Bloom moved
+     * to Options > Graphics, so the Display page never has a Bloom row (with or without the BuildPost hook), and its Reset to
+     * defaults resets the Graphics rows through "gfx reset". */
     out = rsx_dm_patch_gum_opts(page, sizeof page - 1, &n, RSX_DM_GUM_MBLUR | RSX_DM_GUM_FOV | RSX_DM_GUM_BLOOM);
-    CHECK(out && n == strlen(out), "2121: page with Field of view, Motion blur and Bloom rows patched");
+    CHECK(out && n == strlen(out), "2121: page with Field of view and Motion blur rows patched (Bloom flag set)");
+    const char* rf = NULL;
     if (out) {
         const char* gam = strstr(out, "<listitem id=\"lst_gamma_screen\"");
-        const char* cd = strstr(out, "]]>");
         const char* fv = strstr(out, "<select id=\"slc_kz3_fov\"");
         const char* mb = strstr(out, "<select id=\"slc_kz3_mblur\"");
-        const char* bl = strstr(out, "<select id=\"slc_kz3_bloom\"");
-        CHECK(fv && mb && bl && fv < mb && mb < bl && bl < gam, "2121: order Field of view, Motion blur, Bloom (right after Field of view)");
+        CHECK(fv && mb && fv < mb && mb < gam, "2121: order Field of view, Motion blur");
         char want[64];
-        int ok = bl != NULL && mb != NULL;
+        int ok = mb != NULL;
         for (int v = 0; v <= 100 && ok; v += 10) {
             snprintf(want, sizeof want, "<selectitem value=\"%d\">%d%%</selectitem>", v, v);
             const char* a = strstr(mb, want);
-            const char* b = strstr(bl, want);
-            ok = a && a < bl && b && b < gam;   /* 11 values 0,10..100 in each row */
+            ok = a && a < gam;   /* 11 values 0,10..100 */
         }
-        CHECK(ok && !strstr(out, "<selectitem value=\"5\">") && !strstr(out, "value=\"on\">On</selectitem>\n\t\t\t\t<selectitem value=\"off\">Off</selectitem>\n\t\t\t</select>\n\n\t\t\t<select id=\"slc_kz3_fov\""),
-              "2121: both rows offer exactly 0, 10 .. 100 percent (no on / off)");
-        CHECK(mb && bl && strstr(mb, "default-value=\"100\"") && strstr(mb, "default-value=\"100\"") < bl &&
-                  strstr(bl, "default-value=\"100\"") && strstr(bl, "label=\"Bloom\"") && strstr(mb, "label=\"Motion blur\"") &&
-                  strstr(out, "function KZ3BloomOn") && strstr(out, "function KZ3BloomOn") < cd && strstr(out, "\"bloom \"..e") &&
-                  strstr(out, "KZ3DisplayCmd(\"bloom\")") && strstr(out, "if (KZ3BloomOn) then KZ3BloomOn() end"),
-              "2121: default 100, Bloom functions and OnPageOn refresh");
-        const char* rf = strstr(out, "function KZ3ResetDisplay()");
-        CHECK(rf && strstr(rf, "\"bloom 100\"") && strstr(rf, "\"motionblur 100\"") && strstr(out, "slc_kz3_bloom = \"") &&
-                  strstr(out, "slc_kz3_mblur = \"Strength"),
-              "2121: Reset to defaults sets both to 100, tooltips for both rows");
+        CHECK(ok && !strstr(out, "<selectitem value=\"5\">"), "2121: Motion blur offers exactly 0, 10 .. 100 percent (no on / off)");
+        CHECK(mb && strstr(mb, "default-value=\"100\"") && strstr(mb, "label=\"Motion blur\""), "2121: Motion blur default 100");
+        CHECK(!strstr(out, "slc_kz3_bloom") && !strstr(out, "KZ3BloomOn") && !strstr(out, "KZ3ChangeBloom") && !strstr(out, "label=\"Bloom\""),
+              "2206: no Bloom row, function or tooltip on the Display page (it moved to Graphics)");
+        rf = strstr(out, "function KZ3ResetDisplay()");
+        CHECK(rf && strstr(rf, "\"gfx reset\"") && strstr(rf, "\"motionblur 100\"") && strstr(out, "slc_kz3_mblur = \"Strength"),
+              "2206: Reset to defaults resets Motion blur and, through the Graphics command, the Graphics rows (Bloom)");
         free(out);
     }
     out = rsx_dm_patch_gum_opts(page, sizeof page - 1, &n, RSX_DM_GUM_MBLUR | RSX_DM_GUM_FOV);
-    CHECK(out && !strstr(out, "<select id=\"slc_kz3_bloom\"") && !strstr(out, "function KZ3BloomOn") && strstr(out, "if (KZ3BloomOn) then"),
-          "2121: no Bloom row without the BuildPost hook");
+    CHECK(out && !strstr(out, "slc_kz3_bloom") && !strstr(out, "function KZ3BloomOn"), "2206: no Bloom row on Display without the BuildPost hook either");
     free(out);
     {
         char ib[2048];
@@ -552,6 +548,306 @@ static void test_aspect(void)
     CHECK(!strcmp(rsx_dm_aspect_name(RSX_DM_ASPECT_16_9), "16:9") && !strcmp(rsx_dm_aspect_name(0), "screen"), "aspect names");
 }
 
+/* patch 2206: Options > Graphics, the Quality preset. Pure logic (rsx_gfx_page.h), the ini key, the page text. */
+static int count_str(const char* h, const char* needle)
+{
+    int n = 0;
+    for (const char* p = h; (p = strstr(p, needle)) != NULL; p += strlen(needle)) n++;
+    return n;
+}
+static void test_gfx(void)
+{
+    char ib[2048], rp[64];
+    /* 1. names and parsing: the same shape as the other parsers (unknown = -1, NULL = -1, case and blanks ignored) */
+    CHECK(rsx_gfx_quality_parse("high") == RSX_GFX_HIGH && rsx_gfx_quality_parse("HIGH") == RSX_GFX_HIGH &&
+              rsx_gfx_quality_parse(" Ultra ") == RSX_GFX_ULTRA && rsx_gfx_quality_parse("custom\r\n") == RSX_GFX_CUSTOM,
+          "2206: quality parse: high, ultra, custom in any case, blanks ignored");
+    CHECK(rsx_gfx_quality_parse("") == -1 && rsx_gfx_quality_parse("x") == -1 && rsx_gfx_quality_parse(NULL) == -1 &&
+              rsx_gfx_quality_parse("ultra2") == -1 && rsx_gfx_quality_parse("ultr") == -1 && rsx_gfx_quality_parse("auto") == -1,
+          "2206: quality parse: empty, NULL, unknown words are -1 (never Ultra; Auto is not a state)");
+    for (int q = 0; q < 3; q++)
+        CHECK(rsx_gfx_quality_parse(rsx_gfx_quality_name(q)) == q, "2206: quality name round trip %d", q);
+    CHECK(!strcmp(rsx_gfx_quality_name(77), "high"), "2206: an out-of-range state names as high");
+
+    /* 2. display.ini: the key, the writer, the older readers */
+    CHECK(rsx_dm_ini_quality("[display]\nquality = ultra\n") == RSX_GFX_ULTRA && rsx_dm_ini_quality("[display]\nquality=custom\n") == RSX_GFX_CUSTOM &&
+              rsx_dm_ini_quality("[display]\nquality = High\n") == RSX_GFX_HIGH,
+          "2206: quality key read");
+    CHECK(rsx_dm_ini_quality("[display]\nbloom = 50\n") == -1 && rsx_dm_ini_quality("") == -1 && rsx_dm_ini_quality("[input]\nquality = ultra\n") == -1,
+          "2206: missing key, empty file, key in another section: -1");
+    CHECK(rsx_dm_ini_quality("[display]\nquality = ultraa\n") == -1 && rsx_dm_ini_quality("[display]\nquality = \n") == -1 &&
+              rsx_dm_ini_quality("[display]\nquality = 2\n") == -1,
+          "2206: unknown value never reads as Ultra (negative control)");
+    int k = rsx_dm_ini_write_ext5(ib, sizeof ib, RSX_DM_FULLSCREEN, RSX_DM_FIT, RSX_DM_NEAREST, 0, 30, RSX_DM_FPS_60, 95, 1, 70, RSX_GFX_CUSTOM);
+    CHECK(k > 0 && k < (int)sizeof ib && (size_t)k == strlen(ib) && strstr(ib, "quality = custom\n") && rsx_dm_ini_quality(ib) == RSX_GFX_CUSTOM,
+          "2206: ext5 writes quality = custom and reads it back");
+    CHECK(rsx_dm_ini_parse(ib) == RSX_DM_FULLSCREEN && rsx_dm_ini_scaling(ib) == RSX_DM_FIT && rsx_dm_ini_filter(ib) == RSX_DM_NEAREST &&
+              rsx_dm_ini_vsync(ib) == 0 && rsx_dm_ini_motion_blur(ib) == 30 && rsx_dm_ini_fps(ib) == RSX_DM_FPS_60 && rsx_dm_ini_fov(ib) == 95 &&
+              rsx_dm_ini_hud169(ib) == 1 && rsx_dm_ini_bloom(ib) == 70,
+          "2206: the ext4 readers still parse an ext5 file, every key kept");
+    rsx_dm_ini_write_ext4(ib, sizeof ib, RSX_DM_WINDOWED, RSX_DM_FIT, RSX_DM_BILINEAR, 1, 100, RSX_DM_FPS_30, 0, 1, 100);
+    CHECK(rsx_dm_ini_quality(ib) == -1 && rsx_dm_ini_bloom(ib) == 100, "2206: an ext4 file has no quality key (High applies)");
+    rsx_dm_ini_write_ext5(ib, sizeof ib, RSX_DM_WINDOWED, RSX_DM_FIT, RSX_DM_BILINEAR, 1, 100, RSX_DM_FPS_30, 0, 1, 100, RSX_GFX_HIGH);
+    CHECK(strstr(ib, "quality = high\n") && !strstr(ib, "quality = ultra"), "2206: a default file says quality = high");
+
+    /* 3. the tables: High is today's default Bloom, Ultra differs from High in exactly the landed Ultra levers */
+    {
+        const rsx_gfx_vals h = rsx_gfx_table(RSX_GFX_HIGH, RSX_GFX_L_BLOOM);
+        CHECK(h.v[0] == rsx_dm_parse_pct(RSX_DM_DEF_BLOOM) && h.v[0] == 100, "2206: the High table equals today's default Bloom (100)");
+        const rsx_gfx_vals h4 = rsx_gfx_table(RSX_GFX_HIGH, 15);
+        CHECK(h4.v[1] == 100 && h4.v[2] == 0 && h4.v[3] == 0, "2206: High keeps the game's own resolution, anti-aliasing and sampling");
+    }
+    CHECK(!rsx_gfx_ultra_offered(0) && !rsx_gfx_ultra_offered(RSX_GFX_L_BLOOM), "2206: with only Bloom landed Ultra is not offered (it would equal High)");
+    {
+        int ok = 1;
+        for (unsigned lv = 0; lv < 16; lv++) {
+            const rsx_gfx_vals h = rsx_gfx_table(RSX_GFX_HIGH, lv), u = rsx_gfx_table(RSX_GFX_ULTRA, lv);
+            unsigned diff = 0;
+            for (int i = 0; i < RSX_GFX_NLEVERS; i++) if (h.v[i] != u.v[i]) diff |= 1u << i;
+            if (diff != (lv & ~(unsigned)RSX_GFX_L_BLOOM)) ok = 0;   /* Bloom is the one lever Ultra never changes */
+            if (diff != rsx_gfx_ultra_levers(lv)) ok = 0;
+            if (rsx_gfx_ultra_offered(lv) != (diff != 0)) ok = 0;
+        }
+        CHECK(ok, "2206: for every set of landed levers the Ultra table differs from High in exactly those levers and nothing else");
+    }
+
+    /* 4. the Custom rule */
+    {
+        rsx_gfx_vals v = rsx_gfx_table(RSX_GFX_HIGH, RSX_GFX_L_BLOOM);
+        CHECK(rsx_gfx_classify(&v, RSX_GFX_L_BLOOM) == RSX_GFX_HIGH, "2206: the High table classifies as High");
+        v.v[0] = 50;
+        CHECK(rsx_gfx_classify(&v, RSX_GFX_L_BLOOM) == RSX_GFX_CUSTOM, "2206: High + Bloom 50 = Custom");
+        v.v[0] = 100;
+        CHECK(rsx_gfx_classify(&v, RSX_GFX_L_BLOOM) == RSX_GFX_HIGH, "2206: Custom + Bloom back to 100 = High again");
+        const unsigned lv = RSX_GFX_L_BLOOM | RSX_GFX_L_AA;
+        v = rsx_gfx_table(RSX_GFX_ULTRA, lv);
+        CHECK(rsx_gfx_classify(&v, lv) == RSX_GFX_ULTRA, "2206: the Ultra table classifies as Ultra when a lever landed");
+        v.v[0] = 40;
+        CHECK(rsx_gfx_classify(&v, lv) == RSX_GFX_CUSTOM, "2206: Ultra + Bloom 40 = Custom");
+        v.v[0] = 100;
+        CHECK(rsx_gfx_classify(&v, lv) == RSX_GFX_ULTRA, "2206: and back to Ultra when the values match again");
+        v.v[2] = 0;
+        CHECK(rsx_gfx_classify(&v, lv) == RSX_GFX_HIGH, "2206: Ultra with the anti-aliasing lever set back is exactly High");
+        v = rsx_gfx_table(RSX_GFX_ULTRA, lv);
+        CHECK(rsx_gfx_classify(&v, RSX_GFX_L_BLOOM) == RSX_GFX_HIGH, "2206: the Ultra values read with that lever not landed are High (negative control)");
+        v.v[1] = 150;   /* a lever that has not landed never counts */
+        CHECK(rsx_gfx_classify(&v, lv) == RSX_GFX_ULTRA, "2206: values of a lever that has not landed are ignored");
+    }
+    {   /* load: quality from the file against the values */
+        const unsigned lv = RSX_GFX_L_BLOOM | RSX_GFX_L_AA;
+        rsx_gfx_vals h = rsx_gfx_table(RSX_GFX_HIGH, lv), u = rsx_gfx_table(RSX_GFX_ULTRA, lv), c = h;
+        c.v[0] = 30;
+        CHECK(rsx_gfx_load_state(RSX_GFX_ULTRA, &h, lv) == RSX_GFX_CUSTOM, "2206: hand-edited quality = ultra with the High values loads as Custom");
+        CHECK(rsx_gfx_load_state(RSX_GFX_ULTRA, &u, lv) == RSX_GFX_ULTRA && rsx_gfx_load_state(RSX_GFX_HIGH, &h, lv) == RSX_GFX_HIGH,
+              "2206: matching quality and values load as that preset");
+        CHECK(rsx_gfx_load_state(-1, &h, lv) == RSX_GFX_HIGH && rsx_gfx_load_state(-1, &c, lv) == RSX_GFX_CUSTOM,
+              "2206: a missing key is High, and edited values then show as Custom");
+        CHECK(rsx_gfx_load_state(RSX_GFX_HIGH, &c, lv) == RSX_GFX_CUSTOM && rsx_gfx_load_state(RSX_GFX_CUSTOM, &h, lv) == RSX_GFX_HIGH,
+              "2206: quality = high over edited values is Custom; quality = custom over the High values is High");
+        CHECK(rsx_gfx_load_state(RSX_GFX_ULTRA, &u, RSX_GFX_L_BLOOM) == RSX_GFX_CUSTOM,
+              "2206: quality = ultra after the Ultra lever was removed: Custom, never a silent Ultra");
+    }
+    /* the file is not rewritten on load: the loader only reads, the host writes on a change (rsx_gfx_cmd's return value) */
+
+    /* 5. the multiplayer lock */
+    {
+        rsx_gfx_vals s = rsx_gfx_table(RSX_GFX_ULTRA, 15);
+        s.v[0] = 40;
+        const rsx_gfx_vals before = s, h = rsx_gfx_table(RSX_GFX_HIGH, 15);
+        int ok = 1;
+        for (int t = 1; t <= 3; t++) {
+            const rsx_gfx_vals e = rsx_gfx_effective(&s, t, 15);
+            ok = ok && !memcmp(&e, &h, sizeof e) && rsx_gfx_effective_bloom(40, t) == 100 && rsx_gfx_locked(t);
+        }
+        CHECK(ok, "2206: game types 1, 2 and 3 get the High table and Bloom 100");
+        ok = 1;
+        const int open[] = { 0, -1, 4, -2 };
+        for (int i = 0; i < 4; i++) {
+            const rsx_gfx_vals e = rsx_gfx_effective(&s, open[i], 15);
+            ok = ok && !memcmp(&e, &s, sizeof e) && rsx_gfx_effective_bloom(40, open[i]) == 40 && !rsx_gfx_locked(open[i]);
+        }
+        CHECK(ok, "2206: campaign (0), no session (-1) and other types keep the saved values (negative control)");
+        CHECK(!memcmp(&s, &before, sizeof s), "2206: the saved values are untouched by the lock and unlock");
+    }
+    {   /* the bridge: commands on a state, the lock, the reset */
+        rsx_gfx_state st = { rsx_gfx_table(RSX_GFX_HIGH, 15), RSX_GFX_HIGH, 15 };
+        int ch = rsx_gfx_cmd(&st, "quality", 0, rp, sizeof rp);
+        CHECK(!ch && !strcmp(rp, "high"), "2206: cmd quality reads High");
+        ch = rsx_gfx_cmd(&st, "quality ultra", 0, rp, sizeof rp);
+        CHECK(ch == 1 && !strcmp(rp, "ultra") && st.v.v[1] == 150 && st.v.v[2] == 1 && st.v.v[3] == 1 && st.v.v[0] == 100,
+              "2206: cmd quality ultra writes every landed lever at once");
+        ch = rsx_gfx_cmd(&st, "bloom 50", 0, rp, sizeof rp);
+        CHECK(ch == 1 && !strcmp(rp, "50") && st.quality == RSX_GFX_CUSTOM, "2206: a manual change leaves the preset (Custom)");
+        ch = rsx_gfx_cmd(&st, "quality custom", 0, rp, sizeof rp);
+        CHECK(!ch && !strcmp(rp, "custom") && st.v.v[0] == 50, "2206: picking Custom by hand changes nothing");
+        ch = rsx_gfx_cmd(&st, "bloom 100", 0, rp, sizeof rp);
+        CHECK(ch == 1 && st.quality == RSX_GFX_ULTRA, "2206: Bloom back to 100 returns to Ultra (the other levers are at Ultra)");
+        ch = rsx_gfx_cmd(&st, "quality high", 0, rp, sizeof rp);
+        CHECK(ch == 1 && !strcmp(rp, "high") && st.v.v[1] == 100 && st.v.v[2] == 0, "2206: cmd quality high");
+        ch = rsx_gfx_cmd(&st, "bloom 77", 0, rp, sizeof rp);
+        CHECK(ch == 1 && !strcmp(rp, "80"), "2206: a bloom value rounds to the step like the Display row did");
+        ch = rsx_gfx_cmd(&st, "bloom banana", 0, rp, sizeof rp);
+        CHECK(!ch && !strcmp(rp, "80") && st.quality == RSX_GFX_CUSTOM, "2206: an unreadable value changes nothing");
+        ch = rsx_gfx_cmd(&st, "res 133", 0, rp, sizeof rp);
+        CHECK(!ch && !strcmp(rp, "100"), "2206: a value outside a lever's list is refused");
+        ch = rsx_gfx_cmd(&st, "reset", 0, rp, sizeof rp);
+        CHECK(ch == 1 && !strcmp(rp, "high") && st.v.v[0] == 100 && st.quality == RSX_GFX_HIGH, "2206: reset gives the High table");
+        ch = rsx_gfx_cmd(&st, "reset", 0, rp, sizeof rp);
+        CHECK(!ch, "2206: reset on High changes nothing (no needless save)");
+        /* lock */
+        rsx_gfx_cmd(&st, "quality ultra", 0, rp, sizeof rp);
+        rsx_gfx_cmd(&st, "bloom 30", 0, rp, sizeof rp);
+        const rsx_gfx_state keep = st;
+        for (int t = 1; t <= 3; t++) {
+            ch = rsx_gfx_cmd(&st, "lock", t, rp, sizeof rp);
+            CHECK(!ch && !strcmp(rp, "1"), "2206: lock reads 1 in game type %d", t);
+            ch = rsx_gfx_cmd(&st, "quality ultra", t, rp, sizeof rp);
+            int a = !ch && !strcmp(rp, "high");
+            ch = rsx_gfx_cmd(&st, "bloom 90", t, rp, sizeof rp);
+            a = a && !ch && !strcmp(rp, "100");
+            ch = rsx_gfx_cmd(&st, "res 100", t, rp, sizeof rp);
+            a = a && !ch && !strcmp(rp, "100");
+            ch = rsx_gfx_cmd(&st, "reset", t, rp, sizeof rp);
+            a = a && !ch;
+            CHECK(a && !memcmp(&st, &keep, sizeof st), "2206: in game type %d every answer is High and nothing is written or changed", t);
+        }
+        ch = rsx_gfx_cmd(&st, "lock", 0, rp, sizeof rp);
+        CHECK(!ch && !strcmp(rp, "0"), "2206: lock reads 0 in the campaign");
+        ch = rsx_gfx_cmd(&st, "bloom", -1, rp, sizeof rp);
+        CHECK(!strcmp(rp, "30"), "2206: unlocked, the player's choice comes back (negative control for the lock)");
+        /* levers that have not landed */
+        rsx_gfx_state only = { rsx_gfx_table(RSX_GFX_HIGH, RSX_GFX_L_BLOOM), RSX_GFX_HIGH, RSX_GFX_L_BLOOM };
+        ch = rsx_gfx_cmd(&only, "quality ultra", 0, rp, sizeof rp);
+        CHECK(!ch && !strcmp(rp, "high"), "2206: Ultra is refused while no Ultra lever landed");
+        ch = rsx_gfx_cmd(&only, "aa 1", 0, rp, sizeof rp);
+        CHECK(!ch && !strcmp(rp, "0") && only.v.v[2] == 0, "2206: a lever that has not landed cannot be set");
+        ch = rsx_gfx_cmd(&only, "nonsense", 0, rp, sizeof rp);
+        CHECK(!ch && !rp[0], "2206: an unknown command answers empty");
+    }
+    {   /* KZ3_QUALITY for one run */
+        rsx_gfx_vals o;
+        CHECK(rsx_gfx_env_vals(15, "ultra", &o) == 1 && o.v[1] == 150 && rsx_gfx_env_vals(15, "HIGH", &o) == 1 && o.v[1] == 100,
+              "2206: KZ3_QUALITY=ultra / high pick the table");
+        CHECK(rsx_gfx_env_vals(RSX_GFX_L_BLOOM, "ultra", &o) == -1 && rsx_gfx_env_vals(15, "", &o) == 0 && rsx_gfx_env_vals(15, NULL, &o) == 0 &&
+                  rsx_gfx_env_vals(15, "custom", &o) == 0 && rsx_gfx_env_vals(15, "x", &o) == 0,
+              "2206: KZ3_QUALITY=ultra without an Ultra lever is reported, unset / custom / unknown do nothing");
+    }
+
+    /* 6. the page text */
+    {
+        size_t n = 0;
+        const int base_markers = g_markers;   /* the Display page's count (below) is kept */
+        char* raw = rsx_gfx_page_gum(RSX_GFX_L_BLOOM, &n);
+        CHECK(raw && n == strlen(raw), "2206: the page is generated (Bloom only)");
+        if (raw) {
+            const int markers = count_str(raw, "@tr");
+            char* pg = tr_english(raw, &n);
+            const char* pre = strstr(pg, "<select id=\"slc_kz3_gfx_preset\"");
+            const char* blo = strstr(pg, "<select id=\"slc_kz3_gfx_bloom\"");
+            CHECK(pre && blo && pre < blo && strstr(pg, "default-focus=\"slc_kz3_gfx_preset\"") && count_str(pg, "<select ") == 2,
+                  "2206: Quality first, then Bloom, and nothing else (one select per landed lever)");
+            CHECK(strstr(pg, "label=\"Quality\"") && strstr(pg, "label=\"Bloom\"") && strstr(pg, ">Change the graphics settings</text>") &&
+                      strstr(pg, "@key{menu_options}") && strstr(pg, "class=\"PEDS\""),
+                  "2206: labels, subtitle in the siblings' form, the PEDS list");
+            CHECK(!strstr(pg, "slc_kz3_mblur") && !strstr(pg, "Motion blur") && !strstr(pg, "slc_kz3_fov") && !strstr(pg, "slc_kz3_fps") &&
+                      !strstr(pg, "Field of view") && !strstr(pg, "Frame rate"),
+                  "2206: no motion blur row, no Field of view or Frame rate limit (they stay on Display)");
+            CHECK(!strstr(pg, "value=\"ultra\"") && !strstr(pg, ">Ultra<") && strstr(pg, "value=\"high\">High<") && strstr(pg, "value=\"custom\">Custom<"),
+                  "2206: negative control: with no Ultra lever there is no Ultra item, only High and Custom");
+            const char* oa = strstr(pg, "function OnPageOn()");
+            const char* g0 = oa ? strstr(oa, "gKz3G = 0") : NULL;
+            const char* c1 = oa ? strstr(oa, "KZ3GfxCmd(") : NULL;
+            const char* g1 = oa ? strstr(oa, "gKz3G = 1") : NULL;
+            CHECK(strstr(pg, "gKz3G = 0\n\t\tgKz3Lock = 0") && g0 && c1 && g1 && g0 < c1 && c1 < g1 && strstr(pg, "if (gKz3G == 1)"),
+                  "2206: the guard is 0 before any KZ3GfxCmd of OnPageOn and set to 1 after the rows are filled");
+            const char* rfsh = strstr(pg, "function KZ3Refresh()");
+            CHECK(rfsh && strstr(rfsh, "gKz3G = 0") && strstr(rfsh, "gKz3G = 0") < strstr(rfsh, "KZ3GfxShow()") &&
+                      strstr(rfsh, "KZ3GfxShow()") < strstr(rfsh, "gKz3G = 1"),
+                  "2206: a refresh after a change keeps the guard at 0 while the rows are set");
+            CHECK(strstr(pg, "labelcancel=\"@key{menu_legend_back}\"") && strstr(pg, "labeloptions=\"@key{menu_legend_default}\"") &&
+                      strstr(pg, "oncancel=\"back()\"") && !strstr(pg, "onstart"),
+                  "2206: the game's two legend prompts, Back and Default");
+            CHECK(strstr(pg, "class=\"tooltip\" y=\"440\"") && strstr(pg, "dialogconfirm.gum") && strstr(pg, "dlg_confirmdefaults") &&
+                      strstr(pg, "class=\"background\"") && strstr(pg, "MenuBackground.bik") && strstr(pg, "type3.gum"),
+                  "2206: tooltip panel, the game's confirm dialog, background and movie as the sibling pages");
+            CHECK(strstr(pg, "KZ3GfxCmd(\"lock\") == \"1\"") && strstr(pg, "Fixed to High in multiplayer so everyone sees the same picture.") &&
+                      strstr(pg, "kb:gfx "),
+                  "2206: the lock is asked at OnPageOn; the lock line is the tooltip when locked; bridge prefix gfx");
+            CHECK(strstr(pg, "Your own mix. Pick High to reset the rows below.") && !strstr(pg, "Pick High or Ultra") &&
+                      strstr(pg, "High is the game's own look. Changing a setting below makes it Custom.") &&
+                      !strstr(pg, "Applies at the next level load") && !strstr(pg, "Applies after restarting") && !strstr(pg, "apply later"),
+                  "2206: tooltips for Bloom only: High wording, no status sentence (Bloom applies at once)");
+            CHECK(markers >= 8 && g_markers - base_markers == markers && !strstr(pg, "@tr"), "2206: every player-visible string carries a kz3_tr marker (%d)", markers);
+            free(pg);
+        }
+        /* with levers: Ultra offered, the status line per row, the row cap */
+        raw = rsx_gfx_page_gum(RSX_GFX_L_BLOOM | RSX_GFX_L_RES | RSX_GFX_L_AA | RSX_GFX_L_SHARP, &n);
+        CHECK(raw != NULL, "2206: the page with every lever is generated");
+        if (raw) {
+            char* pg = tr_english(raw, &n);
+            CHECK(count_str(pg, "<select ") == 5 && rsx_gfx_page_rows(15) == 5 && rsx_gfx_page_rows(15) <= RSX_GFX_ROWS_MAX &&
+                      rsx_gfx_page_rows(RSX_GFX_L_BLOOM) == 2,
+                  "2206: one select per landed lever, at most %d rows", RSX_GFX_ROWS_MAX);
+            CHECK(strstr(pg, "value=\"ultra\">Ultra<") && strstr(pg, "Ultra adds PC picture improvements.") &&
+                      strstr(pg, "Pick High or Ultra to reset the rows below.") && strstr(pg, "Some changes apply later. Each row says when."),
+                  "2206: with levers landed Ultra is offered and the preset tooltip says some changes apply later");
+            const char* bl = strstr(pg, "slc_kz3_gfx_bloom = \"");
+            const char* rs = strstr(pg, "slc_kz3_gfx_res = \"");
+            const char* aa = strstr(pg, "slc_kz3_gfx_aa = \"");
+            const char* sh = strstr(pg, "slc_kz3_gfx_sharp = \"");
+            const char* nl = rs ? strstr(rs, "Applies at the next level load.") : NULL;
+            const char* rt = aa ? strstr(aa, "Applies after restarting the game.") : NULL;
+            CHECK(bl && rs && aa && sh && bl < rs && rs < aa && aa < sh && nl && nl < aa && rt && rt < sh,
+                  "2206: the status line (next level load / restart) is in the tooltip of a not-live row");
+            const char* st = bl ? strstr(bl, "Applies") : NULL;
+            CHECK(bl && rs && st && st > rs, "2206: Bloom's own tooltip has no status sentence (it applies at once)");
+            free(pg);
+        }
+    }
+    {   /* the Bloom row: 0..100 in tens, default 100 (moved from Display, patch 2121) */
+        size_t n = 0;
+        char* raw = rsx_gfx_page_gum(RSX_GFX_L_BLOOM, &n);
+        char* pg = raw ? tr_english(raw, &n) : NULL;
+        const char* bl = pg ? strstr(pg, "<select id=\"slc_kz3_gfx_bloom\"") : NULL;
+        int ok = bl != NULL;
+        char want[64];
+        for (int v = 0; v <= 100 && ok; v += 10) {
+            snprintf(want, sizeof want, "<selectitem value=\"%d\">%d%%</selectitem>", v, v);
+            ok = strstr(bl, want) != NULL;
+        }
+        CHECK(ok && strstr(bl, "default-value=\"100\"") && !strstr(pg, "<selectitem value=\"5\">"), "2206: the Bloom row offers 0, 10 .. 100 percent and defaults to 100");
+        free(pg);
+    }
+    {   /* the Default legend: on while the page can change, off when a multiplayer match locks it */
+        size_t n = 0, nl = 0;
+        char* un = rsx_gfx_page_gum_l(RSX_GFX_L_BLOOM, 0, &n);
+        char* lk = rsx_gfx_page_gum_l(RSX_GFX_L_BLOOM, 1, &nl);
+        char* wr = rsx_gfx_page_gum(RSX_GFX_L_BLOOM, &n);
+        CHECK(un && lk && wr && !strcmp(un, wr) && strstr(un, "labeloptions=\"@key{menu_legend_default}\"") &&
+                  strstr(un, "onoptions=\"script(settingscript, SetToDefault)\""),
+              "2206: unlocked page has the Default legend (and the plain generator is the unlocked page)");
+        CHECK(lk && !strstr(lk, "labeloptions") && !strstr(lk, "onoptions=") && strstr(lk, "labelcancel=\"@key{menu_legend_back}\"") &&
+                  strstr(lk, "<panel id=\"pnl_main\" class=\"safearea\"") && strstr(lk, "SetToDefault") &&
+                  count_str(lk, "<select ") == 2,
+              "2206: locked page has Back but no Default legend; the rest of the page is the same");
+        free(un); free(lk); free(wr);
+    }
+    {   /* a Bloom value that is not a step of 10 shows as the nearest step the row has (never from the ini, which rounds) */
+        char rp[32];
+        rsx_gfx_state st = { rsx_gfx_table(RSX_GFX_HIGH, RSX_GFX_L_BLOOM), RSX_GFX_CUSTOM, RSX_GFX_L_BLOOM };
+        int ok = 1;
+        for (int v = 0; v <= 100; v++) {
+            st.v.v[0] = v;
+            (void)rsx_gfx_cmd(&st, "bloom", 0, rp, sizeof rp);
+            ok = ok && atoi(rp) == rsx_dm_pct_round(v) && atoi(rp) % 10 == 0 && st.v.v[0] == v;
+        }
+        CHECK(ok, "2206: every Bloom value 0..100 shows as a step of 10 on the row and the saved value is untouched");
+        st.v.v[0] = 55;
+        (void)rsx_gfx_cmd(&st, "bloom", 0, rp, sizeof rp);
+        CHECK(!strcmp(rp, "60") && rsx_dm_parse_pct("55") == 60, "2206: bloom 55 shows 60, as the ini parse rounds it");
+    }
+}
+
 int main(void)
 {
     test_names();
@@ -563,6 +859,7 @@ int main(void)
     test_gum();
     test_aspect();
     CHECK(g_markers >= 60, "patch 2131: the Display page rows, values, dialog and tooltips carry @tr markers (%d seen)", g_markers);
+    test_gfx();
     printf("%s: %d failure(s)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

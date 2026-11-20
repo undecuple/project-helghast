@@ -1,0 +1,59 @@
+KZ3 patch 1164: EDAT reader seeks and reads the cache size with 64 bits.
+
+edat_decrypt_file seeked with fseek(in, (long)offset): a long is 32 bits on Windows, so the first block past 2 GiB failed
+(rc -9, half-written cache removed). Fix: edat_seek (_fseeki64 / fseeko) for both seeks. KZ3's packs are probably below
+2 GiB (ASSUMPTION), so no KZ3 gain is expected; for large DLC/EDATs and as an upstream candidate. Not in this patch:
+edat_cache_valid's st_size compare (vekta 4016, 32-bit _off_t on MinGW): that function comes from patch 5002, which sorts
+after 1xxx, so the one-line change (a 64-bit size compare there) is still to be made in that patch. Test:
+tools/spu/test_vekta_helpers.sh (sparse 3 GiB file, marker at 2.5 GiB) with a negative control.
+Credit: after project-vekta patch 4015 and 4016 MIT, Copyright (c) 2026 Gustavo Morinaga and the Project Vekta contributors. Permission notice: Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files, to deal in the Software without restriction, subject to the above copyright notice and this permission notice being included in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. Written here, not copied literally. Full text: the LICENSE file of project-vekta.
+
+--- a/libs/filesystem/edat.c
++++ b/libs/filesystem/edat.c
+@@ -18,6 +18,10 @@
+  * vectors before anything is decrypted -- see the note in edat.h.
+  */
+ 
++/* KZ3 patch 1164: fseeko/off_t under a strict -std=c11 build (a no-op where _GNU_SOURCE or _DEFAULT_SOURCE is on). */
++#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE) && !defined(_GNU_SOURCE) && !defined(_DEFAULT_SOURCE)
++#  define _POSIX_C_SOURCE 200809L
++#endif
+ #include "edat.h"
+ 
+ #include <stdio.h>
+@@ -403,6 +407,17 @@
+ /* ---------------------------------------------------------------------------
+  * EDAT
+  * -----------------------------------------------------------------------*/
++/* KZ3 patch 1164 (after project-vekta patch 4015): a 64-bit seek. fseek takes a long, which is 32 bits on Windows: past
++ * 2 GiB (a 3 GB data archive) it fails and every later block read with it. */
++static int edat_seek(FILE* f, uint64_t off)
++{
++#ifdef _WIN32
++    return _fseeki64(f, (__int64)off, SEEK_SET);
++#else
++    return fseeko(f, (off_t)off, SEEK_SET);
++#endif
++}
++
+ int edat_is_npd(const char* host_path)
+ {
+     FILE* f = fopen(host_path, "rb");
+@@ -592,7 +607,7 @@
+                                        : data_base + (uint64_t)b * block_size;
+ 
+         uint8_t meta[0x20];
+-        if (fseek(in, (long)meta_off, SEEK_SET) != 0 ||
++        if (edat_seek(in, meta_off) != 0 ||
+             fread(meta, 1, meta_size, in) != meta_size) { rc = -9; break; }
+ 
+         /* With FLAG_0x20 the stored hash is the xor of the two halves. */
+@@ -607,7 +622,7 @@
+             len = file_size % block_size;
+         uint64_t padded = (len + 15) & ~(uint64_t)15;
+ 
+-        if (fseek(in, (long)data_off, SEEK_SET) != 0 ||
++        if (edat_seek(in, data_off) != 0 ||
+             fread(enc, 1, (size_t)padded, in) != padded) { rc = -10; break; }
+ 
+         /* Block key. Version 0/1 seeds from zero and uses a zero CBC IV;

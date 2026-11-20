@@ -1,7 +1,9 @@
 /* kz3_native_snd.c -- Snd.Mixer (ovl259 "synth_submix": 1.14 job_0125e300, 1.00 twin job_011e1180, byte-identical
  * kernels at the same LS addresses) kernels as native host code (SPU pass 159, plan: the RE notes "Native audio
- * plan" of pass 157). The 1.14 K7a gain ramp (slot 26) is on by default since 2026-11-11 (same-run toggle A/B: about
- * 14 % faster per call; native_diff on 24 real records: equal); K3 and the 1.00 twins stay opt-in. KZ3_NATIVE_JOB_SNDMIX=1/0
+ * plan" of pass 157). The 1.14 K7a gain ramp (slot 26) is on by default (same-run toggle A/B: about
+ * 14 % faster per call; native_diff on 24 real records: equal); the 1.14 K3 resampler (slot 28) too since SPU pass 160
+ * (toggle A/B 0.931 and 0.925 of the lifted median per mixer call, 5/5 phases lower in both runs, 0 fallbacks;
+ * 24 real records equal); the 1.00 twins stay opt-in. KZ3_NATIVE_JOB_SNDMIX=1/0
  * turns every kernel below on/off, _SND_K7A / _SND_K3 one each (a single switch beats the group one).
  *
  * Every float op is the runtime's SPU helper (spu_fa/fm/fma/cfltu/cuflt, FTZ, exact-zero sums, extended-range
@@ -23,17 +25,18 @@
 static inline u128 ldq(const spu_context* ctx, uint32_t a)
 {
     const uint8_t* p = ctx->ls + (a & SPU_LS_MASK & ~0xFu);
+    uint32_t w[4];
     u128 v;
-    for (int i = 0; i < 4; i++) v._u32[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+    memcpy(w, p, 16);
+    for (int i = 0; i < 4; i++) v._u32[i] = __builtin_bswap32(w[i]);
     return v;
 }
 static inline void stq(spu_context* ctx, uint32_t a, u128 v)
 {
     uint8_t* p = ctx->ls + (a & SPU_LS_MASK & ~0xFu);
-    for (int i = 0; i < 4; i++) {
-        p[4 * i] = (uint8_t)(v._u32[i] >> 24); p[4 * i + 1] = (uint8_t)(v._u32[i] >> 16);
-        p[4 * i + 2] = (uint8_t)(v._u32[i] >> 8); p[4 * i + 3] = (uint8_t)v._u32[i];
-    }
+    uint32_t w[4];
+    for (int i = 0; i < 4; i++) w[i] = __builtin_bswap32(v._u32[i]);
+    memcpy(p, w, 16);
 }
 
 static inline int ovl(uint64_t a, uint64_t an, uint64_t b, uint64_t bn) { return a < b + bn && b < a + an; }
@@ -92,56 +95,89 @@ static int mix_mono_ramp_DD80(spu_context* ctx)
  * r7 quad (the SPU's other lanes), i.e. the fractional part of the end phase.
  * The SPU loads the windows of a group before the previous groups are stored: dst must not overlap any window read
  * (checked by a position pre-pass) nor the constants and the tap table (LS 0x15600..0x16760). */
+/* K3 group loop (SPU pass 160): groups [0, ng) from phase vector *pp (advanced by step4 per group, accumulated), results
+ * in out[g] (when out != NULL), min / max byte range of the window reads in *lo / *hi. Returns 0 if a window would wrap
+ * round the local store. The per-group work is the SPU's: three cfltu of the phase, per output a tap row and a window
+ * (two quads, shifted by the pattern row), four fm, the transposition and the (t1 + t3) + (t2 + t0) sum. Pass 160:
+ * quads are loaded as one 16-byte load and swizzle, the window shift is one unaligned copy of the pair, the transposition
+ * is the SSE one; before, each was a per-byte / per-word scalar loop and the group loop ran twice (a position pre-pass
+ * for the dst overlap check, which cost one more cfltu + fa per group); now the outputs are held in a stack buffer and
+ * the check runs once at the end (nothing is stored before it, so declining leaves the local store untouched). */
+static inline int k3_groups(const spu_context* ctx, u128* pp, u128 step4, uint32_t base, uint32_t off4, uint32_t ng, u128* out,
+                            uint64_t* lo, uint64_t* hi)
+{
+    u128 p = *pp;
+    uint64_t l = *lo, h = *hi;
+    for (uint32_t g = 0; g < ng; g++) {
+        const u128 f161 = spu_cfltu(p, 161), f169 = spu_cfltu(p, 169), f171 = spu_cfltu(p, 171);
+        u128 m[4];
+        for (int k = 0; k < 4; k++) {
+            const u128 taps = ldq(ctx, 0x15600u + (f161._u32[k] & 4095u));
+            const uint32_t A = f171._u32[k] + base;
+            if ((uint64_t)A + 32 > SPU_LS_SIZE) return 0; /* a window would wrap round the local store: the lifted code */
+            const uint32_t Aq = A & ~0xFu;
+            if (Aq < l) l = Aq;
+            if ((uint64_t)Aq + 32 > h) h = (uint64_t)Aq + 32;
+            const u128 pr[2] = { ldq(ctx, Aq), ldq(ctx, Aq + 16u) };
+            const uint32_t sh = ((f169._u32[k] + off4) & 63u) >> 4;
+            u128 w;
+            memcpy(&w, (const uint32_t*)pr + sh, 16);
+            m[k] = spu_fm(w, taps);
+        }
+        u128 t[4];
+#if defined(__SSE2__)
+        {
+            __m128 a, b, c, d;
+            memcpy(&a, &m[0], 16); memcpy(&b, &m[1], 16); memcpy(&c, &m[2], 16); memcpy(&d, &m[3], 16);
+            _MM_TRANSPOSE4_PS(a, b, c, d);
+            memcpy(&t[0], &a, 16); memcpy(&t[1], &b, 16); memcpy(&t[2], &c, 16); memcpy(&t[3], &d, 16);
+        }
+#else
+        for (int j = 0; j < 4; j++)
+            for (int k = 0; k < 4; k++) t[j]._u32[k] = m[k]._u32[j];
+#endif
+#ifdef KZ3_NATIVE_NEGCTL /* negative control: the spec's (t0 + t1) + (t2 + t3) pairing */
+        const u128 o = spu_fa(spu_fa(t[0], t[1]), spu_fa(t[2], t[3]));
+#else
+        const u128 o = spu_fa(spu_fa(t[1], t[3]), spu_fa(t[2], t[0]));
+#endif
+        if (out) out[g] = o;
+        p = spu_fa(step4, p);
+    }
+    *pp = p; *lo = l; *hi = h;
+    return 1;
+}
+
+#define K3_BUF 512u /* groups held before the stores (2048 outputs); longer calls take a position pass first */
+
 static int resample_CF80(spu_context* ctx)
 {
     const uint32_t src = ctx->gpr[5]._u32[0], dst = ctx->gpr[6]._u32[0], n = ctx->gpr[7]._u32[0];
     if (n == 0 || (n & 7u) || n > 0x10000u || (dst & 15u) || (src & 3u) || src < 16u) return 0;
     if ((uint64_t)dst + 4ull * n > SPU_LS_SIZE || ovl(dst, 4ull * n, 0x15600u, 0x1160u)) return 0;
     const u128 step = spu_splat_u32(ctx->gpr[3]._u32[0]), phase0 = spu_splat_u32(ctx->gpr[4]._u32[0]);
-    const uint32_t base = src - 12u, off4 = 4u * (base & 15u);
+    const uint32_t base = src - 12u, off4 = 4u * (base & 15u), ng = n / 4;
     const u128 tab = ldq(ctx, 0x16740u);
     const u128 step4 = spu_fm(spu_splat_u32(0x40800000u), step);
     const u128 p0 = spu_fma(tab, step, phase0);
-    /* pre-pass: the byte range of every window read (addresses cfltu(p,171) + base, two quads each), by the
-     * monotone-or-not accumulation itself (min and max over all groups and lanes) */
-    {
-        uint64_t lo = ~0ull, hi = 0;
+    u128 buf[K3_BUF];
+    uint64_t lo = ~0ull, hi = 0;
+    if (ng <= K3_BUF) {
         u128 p = p0;
-        for (uint32_t g = 0; g < n / 4; g++) {
-            const u128 a = spu_cfltu(p, 171);
-            for (int k = 0; k < 4; k++) {
-                if ((uint64_t)a._u32[k] + base + 32 > SPU_LS_SIZE) return 0; /* a window would wrap round the local store: the lifted code */
-                const uint64_t A = (uint64_t)((a._u32[k] + base) & ~0xFu);
-                if (A < lo) lo = A;
-                if (A + 32 > hi) hi = A + 32;
-            }
-            p = spu_fa(step4, p);
-        }
+        if (!k3_groups(ctx, &p, step4, base, off4, ng, buf, &lo, &hi)) return 0;
         if (ovl(dst, 4ull * n, lo, hi - lo)) return 0;
-    }
-    u128 p = p0;
-    for (uint32_t g = 0; g < n / 4; g++) {
-        const u128 f161 = spu_cfltu(p, 161), f169 = spu_cfltu(p, 169), f171 = spu_cfltu(p, 171);
-        u128 m[4];
-        for (int k = 0; k < 4; k++) {
-            const u128 taps = ldq(ctx, 0x15600u + (f161._u32[k] & 4095u));
-            const uint32_t A = f171._u32[k] + base;
-            const u128 q0 = ldq(ctx, A), q1 = ldq(ctx, A + 16u);
-            const uint32_t sh = ((f169._u32[k] + off4) & 63u) >> 4;
-            u128 w;
-            for (uint32_t i = 0; i < 4; i++) w._u32[i] = (i + sh < 4) ? q0._u32[i + sh] : q1._u32[i + sh - 4];
-            m[k] = spu_fm(w, taps);
+        for (uint32_t g = 0; g < ng; g++) stq(ctx, dst + 16u * g, buf[g]);
+    } else {
+        u128 p = p0;
+        for (uint32_t g = 0; g < ng; g += K3_BUF)
+            if (!k3_groups(ctx, &p, step4, base, off4, ng - g < K3_BUF ? ng - g : K3_BUF, NULL, &lo, &hi)) return 0;
+        if (ovl(dst, 4ull * n, lo, hi - lo)) return 0;
+        p = p0;
+        for (uint32_t g = 0; g < ng; g += K3_BUF) {
+            const uint32_t c = ng - g < K3_BUF ? ng - g : K3_BUF;
+            k3_groups(ctx, &p, step4, base, off4, c, buf, &lo, &hi);
+            for (uint32_t i = 0; i < c; i++) stq(ctx, dst + 16u * (g + i), buf[i]);
         }
-        u128 t[4];
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 4; k++) t[j]._u32[k] = m[k]._u32[j];
-#ifdef KZ3_NATIVE_NEGCTL /* negative control: the spec's (t0 + t1) + (t2 + t3) pairing */
-        const u128 out = spu_fa(spu_fa(t[0], t[1]), spu_fa(t[2], t[3]));
-#else
-        const u128 out = spu_fa(spu_fa(t[1], t[3]), spu_fa(t[2], t[0]));
-#endif
-        stq(ctx, dst + 16u * g, out);
-        p = spu_fa(step4, p);
     }
     const u128 pend = spu_fma(step, spu_cuflt(ctx->gpr[7], 155), phase0);
     ctx->gpr[3] = spu_fs(pend, spu_cuflt(spu_cfltu(pend, 173), 155));
@@ -158,7 +194,7 @@ static int resample_CF80(spu_context* ctx)
 const kz3_native_entry kz3_native_snd[] = {
     {26, SND_ENV_K7A, "Snd.Mixer", "job_0125e300", 0xDD80u, mix_mono_ramp_DD80, "snd_k7a", POOL_K7A, 1},
     {27, SND_ENV_K7A, "Snd.Mixer", "job_011e1180", 0xDD80u, mix_mono_ramp_DD80, "snd_k7a", POOL_K7A, 0},
-    {28, SND_ENV_K3, "Snd.Mixer", "job_0125e300", 0xCF80u, resample_CF80, "snd_k3", POOL_K3, 0},
+    {28, SND_ENV_K3, "Snd.Mixer", "job_0125e300", 0xCF80u, resample_CF80, "snd_k3", POOL_K3, 1},
     {29, SND_ENV_K3, "Snd.Mixer", "job_011e1180", 0xCF80u, resample_CF80, "snd_k3", POOL_K3, 0},
 };
 const unsigned kz3_native_snd_n = sizeof kz3_native_snd / sizeof kz3_native_snd[0];

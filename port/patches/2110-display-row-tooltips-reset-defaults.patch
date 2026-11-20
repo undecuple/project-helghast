@@ -86,11 +86,11 @@ diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
 +    if (!le || le > scr || (rs && rs > cd)) return NULL;
 +    out = (char*)malloc(n + nr + nm + nf + nd + nl + nlm + nlf + nt + nlt + 128 + 1);
      if (!out) return NULL;
-     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend (run r103-dpage3):
+     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend:
 -     * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead. */
 +     * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead.
 +     * Patch 2110: always (1.14 has 11 rows without Motion blur and Field of view): 400 = the game's longest options
-+     * list, common/advancedcontroller.gum, 10 rows ending above its tooltip and legend (run r104-advc2). */
++     * list, common/advancedcontroller.gum, 10 rows ending above its tooltip and legend. */
      static const char rsx_dm_list_tag[] = "<list id=\"lst_options\" class=\"PEDS\"";
      static const char rsx_dm_list_h[] = " height=\"400\"";
 -    const char* lt = nf ? rsx_dm_find(in, n, 0, rsx_dm_list_tag) : NULL;

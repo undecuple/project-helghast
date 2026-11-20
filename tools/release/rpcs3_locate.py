@@ -378,8 +378,14 @@ def game_path(root, serial) -> dict:
         return _err("not_found", f"{serial} is not in games.yml", serial=serial)
     d = _norm(_expand(games[serial], c["root"]))
     dp = Path(d)
+    if dp.is_file() and dp.name.lower().endswith(".iso"):
+        # from the Killzone 2 port's rpcs3_locate.py (MIT). RPCS3 can list a game as a disc ISO file (RPCS3 PR #17855).
+        # The caller reads it with the ISO checks of firstrun_check.check_dump_iso; no second reader here.
+        return {"ok": True, "serial": serial, "disc_dir": d, "is_iso": True, "has_ps3_game": True,
+                "has_psn_game": False, "title_id": None, "version": None, "app_ver": None}
     if not dp.is_dir():
-        return _err("missing_disc", f"games.yml points at {d}, which is not a folder",
+        what = "a file that is not an .iso disc image" if dp.is_file() else "not there"
+        return _err("missing_disc", f"games.yml points at {d}, which is {what}, not a folder or an .iso file",
                     serial=serial, disc_dir=d)
     ps3 = (dp / "PS3_GAME").is_dir()
     psn = (not ps3) and (dp / "USRDIR").is_dir()
@@ -707,7 +713,7 @@ def locate(rpcs3_dir=None, wants=None, extra_eboots=None) -> dict:
         dirs = []
         if upd and upd.get("ok") or (upd and upd.get("code") == "wrong_version"):
             dirs.append(upd["path"])  # game data and bad folders are never EBOOT sources
-        if disc["ok"]:
+        if disc["ok"] and not disc.get("is_iso"):   # an ISO file holds no loose EBOOT.elf (the update's folder has it)
             dirs.append(disc["disc_dir"])
         dirs += list(extra_eboots or [])
         eb = decrypted_eboot(dirs)

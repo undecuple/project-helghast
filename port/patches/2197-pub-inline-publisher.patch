@@ -1,0 +1,685 @@
+KZ3 patch 2197: RSX_PUB=1|verify, the ordered publisher P inline on the walker thread. Every walker-thread guest signal (rsx_guest_signal.h kinds) becomes a kzr record that P retires in strict seq order at today's position with today's value; RSX_PUB_LAG=N holds records back (diagnostics); [pub] line; log-empty asserts at the call boundary, the pass end and set_movie_mode (lock-free); the report value computed once and counted; ref-queue drop-oldest kept and counted; the 2185 pending-store table's thread rule counted. Unset = the funnel's direct path, unchanged.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 219dd13e..b826d409 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -44,6 +44,16 @@ file(GLOB_RECURSE HLE_SOURCES
+ # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
+ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
+ 
++# KZ3 patch 2197: libs/kzr (the renderer module's sync core, patch 2191) is used by libs/video/rsx_pub.c (RSX_PUB, the ordered publisher).
++# Pure C11: core/sync, the common event code and one platform file; no Win32 / D3D12 types in the public surface.
++file(GLOB KZR_SOURCES "libs/kzr/core/sync/*.c" "libs/kzr/platform/common/*.c")
++if(WIN32)
++    list(APPEND KZR_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/kzr/platform/win32/kzr_platform_win32.c")
++else()
++    list(APPEND KZR_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/kzr/platform/posix/kzr_platform_posix.c")
++endif()
++list(APPEND HLE_SOURCES ${KZR_SOURCES})
++
+ # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
+ # It loads libvulkan at run time, so building needs only the Vulkan headers --
+ # no target-architecture libvulkan, which keeps cross-compiling simple.
+@@ -123,6 +133,7 @@ target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_LL_STRIPED=1)
+ 
+ # HLE modules include their own headers
+ target_include_directories(ps3recomp_runtime PRIVATE
++    "${CMAKE_CURRENT_SOURCE_DIR}/libs/kzr/include"   # KZ3 patch 2197: kzr/kzr_platform.h
+     "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
+     "${CMAKE_CURRENT_SOURCE_DIR}/libs/filesystem"
+     "${CMAKE_CURRENT_SOURCE_DIR}/libs/input"
+diff --git a/libs/kzr/core/sync/kzr_sync.c b/libs/kzr/core/sync/kzr_sync.c
+index 8726a290..940b51c4 100644
+--- a/libs/kzr/core/sync/kzr_sync.c
++++ b/libs/kzr/core/sync/kzr_sync.c
+@@ -101,6 +101,19 @@ unsigned kzr_pub_retire_ready(kzr_pub* p)
+     return n;
+ }
+ 
++unsigned kzr_pub_retire_ready_upto(kzr_pub* p, uint64_t seq)
++{
++    unsigned n = 0;
++    while (p->head != p->tail) {
++        kzr_rec* h = pub_at(p, p->head);
++        if (h->seq > seq) break;
++        if (!kzr_sync_gate_ok(p->sync, h->gate, h->seq)) { p->st.hol_blocked++; break; }
++        pub_retire_one(p);
++        n++;
++    }
++    return n;
++}
++
+ void kzr_pub_push(kzr_pub* p, const kzr_rec* r)
+ {
+     if (r->seq <= p->last_seq) abort();   /* seq must increase: a bug in the caller, never a runtime condition */
+diff --git a/libs/kzr/core/sync/kzr_sync.h b/libs/kzr/core/sync/kzr_sync.h
+index d344d83e..32faceaa 100644
+--- a/libs/kzr/core/sync/kzr_sync.h
++++ b/libs/kzr/core/sync/kzr_sync.h
+@@ -123,6 +123,9 @@ void kzr_pub_destroy(kzr_pub* p);
+ void kzr_pub_push(kzr_pub* p, const kzr_rec* r);
+ /* Retire in strict seq order while the head's gate holds; never blocks. Returns the number retired. */
+ unsigned kzr_pub_retire_ready(kzr_pub* p);
++/* Like retire_ready, but stops before the first record with seq > seq: the bounded retire a lagging publisher uses to hold the newest
++ * records back (patch 2197, RSX_PUB_LAG). Never blocks. Returns the number retired. */
++unsigned kzr_pub_retire_ready_upto(kzr_pub* p, uint64_t seq);
+ /* Block (event wait) until everything with seq <= seq is retired. */
+ void kzr_pub_retire_upto(kzr_pub* p, uint64_t seq);
+ void kzr_pub_drain(kzr_pub* p);
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 0a02a579..0089a10b 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -26,6 +26,7 @@ static rsx_lgs s_lgs;   /* patch 2189: legacy-skip counters, walker thread only
+ #include "../../runtime/platform/win32_compat.h"
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
+ #include "rsx_guest_signal.h"   /* patch 2190: the guest-signal funnel */
++#include "rsx_pub.h"   /* patch 2197: RSX_PUB, the ordered publisher */
+ #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+ #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+ #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+@@ -2430,6 +2431,7 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
+     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
+         if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.ref_over, 1);   /* patch 2188 */
+         s_ref_qhead++;
++        rsx_pub_note_refq_drop();   /* patch 2197 (C8): drop-oldest is kept; the [pub] line counts it */
+         static int _o = 0;
+         if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+     }
+@@ -2490,7 +2492,16 @@ static void gcm_ref_publish_one(void)
+ static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
+ static void gcm_rsx_process_fifo_body(void);
+ /* patch 2190: the thread inside a walker pass is "R" for the guest-signal funnel (on= vs offr= counters) */
+-static void gcm_rsx_process_fifo_unlocked(void) { const int gs_prev = rsx_gs_walker_enter(); gcm_rsx_process_fifo_body(); rsx_gs_walker_leave(gs_prev); }
++static void gcm_pub_pass_begin(void);   /* patch 2197 */
++static void gcm_pub_pass_end(void);
++static void gcm_rsx_process_fifo_unlocked(void)
++{
++    const int gs_prev = rsx_gs_walker_enter();
++    gcm_pub_pass_begin();   /* patch 2197: RSX_PUB decided once; P binds to this thread and checks the pass boundary */
++    gcm_rsx_process_fifo_body();
++    gcm_pub_pass_end();     /* patch 2197: every record retired, log empty */
++    rsx_gs_walker_leave(gs_prev);
++}
+ 
+ /* Kick event: a game thread whose fence wait finds the queue DRY signals the
+  * present thread to run the FIFO walker NOW instead of on its next 16 ms
+@@ -3364,6 +3375,12 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+                 rsx_lgs_fmt(ln, sizeof ln, tnow, &s_lgs, &lprev); fprintf(stderr, "%s\n", ln);
+                 lprev = s_lgs;
+             }
++            if (rsx_pub_mode() || g_rsx_o0.on) {   /* patch 2197: [pub] of this second (RSX_PUB on, or RSX_O0 for the always-on refq_drop / report counters) */
++                static rsx_pub_stats pcur, pprev; char ln[512];
++                rsx_pub_stats_snapshot(&pcur);
++                rsx_pub_fmt(ln, sizeof ln, tnow, rsx_pub_mode(), rsx_pub_lag(), &pcur, &pprev); fprintf(stderr, "%s\n", ln);
++                pprev = pcur;
++            }
+             if (g_rsx_o0.on) {   /* patch 2188: the O0 counters, deltas of this second; the source table every 5th */
+                 static rsx_o0 cur, prev; static unsigned o0_n;
+                 memcpy(&cur, &g_rsx_o0, sizeof cur);
+@@ -3686,6 +3703,24 @@ static int gcm_get_eq_put(void)
+     return eq;
+ }
+ 
++/* Patch 2197: RSX_PUB = 0 | 1 | verify (default 0), RSX_PUB_LAG = N (default 0, diagnostics). The pass brackets bind the publisher to the
++ * walker thread and drain it; the stream position and the guest reader are handed over once. Forced off under GCM_GET_EQ_PUT. */
++static u32 gcm_pub_rd32(u32 ea) { return vm_read32(ea); }
++static void gcm_pub_pass_begin(void)
++{
++    static int init;
++    if (__builtin_expect(!init, 0)) {
++        init = 1;
++        rsx_pub_set_stream_src((const volatile uint32_t*)&s_fifo_getoff);
++        rsx_pub_set_reader(gcm_pub_rd32);
++        rsx_pub_init_env(gcm_get_eq_put());
++    }
++    if (__builtin_expect(g_rsx_pub_mode != 0, 0)) rsx_pub_pass_begin();
++}
++static void gcm_pub_pass_end(void) { if (__builtin_expect(g_rsx_pub_mode != 0, 0)) rsx_pub_pass_end(); }
++/* C4: the report value is computed once, here, at today's position; the record carries it. Counted; verify flags a second call. */
++static u32 gcm_report_value_once(u32 off, u32 dflt) { rsx_pub_note_report(1); return rsx_live_draw_report_value(off, dflt); }
++
+ /* Any per-word FIFO switch set, or a mirrored draw engine on. Read once per
+  * drain: the walker hands every data word through these checks, a million a
+  * second in God of War HD gameplay, and it used to test each switch on its
+@@ -3776,7 +3811,7 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+         /* KZ3 patch 2027: ZPASS counts from the live engine's occlusion queries (0 / last count
+          * now, the real count a frame later); 0xFFFF stays when it has none. */
+         const u32 o0_dflt = val;   /* patch 2188 */
+-        if (main_mem && (v >> 24) == 1u && rsx_live_draw_enabled()) val = rsx_live_draw_report_value(off, val);
++        if (main_mem && (v >> 24) == 1u && rsx_live_draw_enabled()) { rsx_pub_note_report(0); val = gcm_report_value_once(off, val); }   /* patch 2197: counted, C4 */
+         if (g_rsx_o0.on) {   /* patch 2188: [o0-ref] default vs real report answers */
+             RSX_O0_ADD(g_rsx_o0.rep_n, 1); if ((v >> 24) == 1u) RSX_O0_ADD(g_rsx_o0.rep_zpass, 1);
+             if (main_mem && (v >> 24) == 1u && rsx_live_draw_enabled()) { RSX_O0_ADD(g_rsx_o0.rep_real, 1); if (val != o0_dflt) RSX_O0_ADD(g_rsx_o0.rep_real_ne, 1); }
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index 36ad1c7c..934e1229 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -17,6 +17,7 @@
+ #include "rsx_commands.h"
+ #include "rsx_o0.h"   /* patch 2188: RSX_O0=1 legacy-state reader probe */
+ #include "rsx_guest_signal.h"   /* patch 2190: the guest-signal funnel (defined at the end of this file) */
++#include "rsx_pub.h"   /* patch 2197: RSX_PUB, the ordered publisher the funnel hands walker-thread signals to */
+ #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
+ #include <stdio.h>
+ #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+@@ -1075,31 +1076,38 @@ static inline void rsx_gs_count(unsigned kind, uint32_t ea, uint32_t n)
+     __atomic_fetch_add(&g_rsx_gs_n[kind < RSX_GS_N ? kind : 0][onw ? 0 : 1], 1ull, __ATOMIC_RELAXED);
+     if (__builtin_expect(g_rsx_gs_trace != NULL, 0)) g_rsx_gs_trace(kind, ea, n, onw);
+ }
++/* patch 2197: a walker-thread signal goes to P while RSX_PUB is on (or a host test hooks the trace). Off the walker thread it never does:
++ * the write happens directly, exactly as before (counted as offr). One load of two globals when RSX_PUB is unset. */
++static inline int rsx_pub_routes(void) { return (g_rsx_pub_mode | (g_rsx_pub_trace != NULL)) && t_rsx_gs_walker; }
+ void gcm_guest_signal(unsigned kind, uint32_t ea, uint32_t val)
+ {
+     extern void vm_write32(uint32_t a, uint32_t v);
+     extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);
+     rsx_gs_count(kind, ea, 4u);
+-    vm_write32(ea, val);
+-    if (g_rsx_fcap_on) rsx_fcap_word(1, kind, ea, val);
++    if (!(rsx_pub_routes() && rsx_pub_take('W', kind, ea, val, NULL))) vm_write32(ea, val);   /* patch 2197: P makes the store with RSX_PUB on */
++    if (g_rsx_fcap_on) rsx_fcap_word(1, kind, ea, val);   /* the capture word is emitted at the record (the walker's stream position); equals the retire at lag 0 */
+ }
+ void gcm_guest_signal_hostbe(unsigned kind, uint8_t* p, uint32_t tag_ea, uint32_t val)
+ {
+     extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);
+     rsx_gs_count(kind, tag_ea, 4u);
+-    p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16); p[2] = (uint8_t)(val >> 8); p[3] = (uint8_t)val;
++    if (!(rsx_pub_routes() && rsx_pub_take('H', kind, tag_ea, val, p))) {   /* patch 2197 */
++        p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16); p[2] = (uint8_t)(val >> 8); p[3] = (uint8_t)val;
++    }
+     if (g_rsx_fcap_on) rsx_fcap_word(1, kind, tag_ea, val);
+ }
+ void gcm_guest_signal_span(unsigned kind, uint32_t ea, uint32_t n)
+ {
+     extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);
+     rsx_gs_count(kind, ea, n);
++    if (rsx_pub_routes()) rsx_pub_take('S', kind, ea, n, NULL);   /* patch 2197: a record without a store (the site writes its bytes itself) */
+     if (g_rsx_fcap_on) rsx_fcap_word(1, kind, ea, n);
+ }
+ void gcm_guest_signal_note(unsigned kind, uint32_t a, uint32_t b)
+ {
+     extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);
+     rsx_gs_count(kind, a, 0u);
++    if (rsx_pub_routes()) rsx_pub_take('N', kind, a, b, NULL);   /* patch 2197 */
+     if (g_rsx_fcap_on) rsx_fcap_word(1, kind, a, b);
+ }
+ /* GS_FUNNEL_END */
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 2684815b..32081801 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -135,6 +135,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ #include "rsx_ceil.h"   /* KZ3 patch 2183: LD_CEIL ceiling probes (diagnostic) */
+ #include "rsx_wb_probe.h"   /* KZ3 patch 2184: LD_WB_READ / LD_WB_SKIP / LD_WB_HASH (diagnostic) */
+ #include "rsx_wb_defer.h"   /* KZ3 patch 2185: LD_WB_DEFER pending-store queue */
++#include "rsx_pub.h"   /* KZ3 patch 2197: the publisher owns the walker-side ordering; this file asserts its thread rules */
+ /* patch 2185 state (walker thread, except the published snapshot and the two SPU counters; see guest_ptr below) */
+ static rsx_wbd g_wbd;
+ static rsx_wbd_snap g_wbd_snap;
+@@ -17995,6 +17996,7 @@ void rsx_live_draw_set_movie_mode(int on)
+             SwitchToThread();
+         AcquireSRWLockExclusive(&g_ld_access_lock);
+     }
++    rsx_pub_movie_check();   /* patch 2197 (C7, H7): the publisher's log is empty at a call boundary; lock-free, nothing taken under g_ld_access_lock */
+     if (on) {
+         suppressed_at_start = g_ld_stats.packets_movie;
+         if (composite) ld_movie_overlay_begin();
+@@ -18917,6 +18919,7 @@ static u32 ld_wbd_drain(int reason)
+ 
+ static void ld_wbd_touch(u32 location, u32 offset, u32 size, int reason)
+ {
++    rsx_pub_check_owner("2185 pending-store touch from a thread that is not P's owner");   /* patch 2197 (C7): counted, behaviour unchanged */
+     if (g_wbd_owner != GetCurrentThreadId()) return;
+     if (rsx_wbd_touch(&g_wbd, location, offset, size, reason, ld_wbd_wait, ld_wbd_store, NULL))
+         rsx_wbd_snap_publish(&g_wbd_snap, &g_wbd);
+@@ -18924,6 +18927,7 @@ static void ld_wbd_touch(u32 location, u32 offset, u32 size, int reason)
+ 
+ static void ld_wbd_push(const rsx_wbd_ent* e)
+ {
++    rsx_pub_check_owner("2185 pending-store push from a thread that is not P's owner");   /* patch 2197 (C7): counted, behaviour unchanged */
+     if (!rsx_wbd_push(&g_wbd, e)) { ld_wbd_drain(RSX_WBD_R_FULL); rsx_wbd_push(&g_wbd, e); }
+     g_wbd_owner = GetCurrentThreadId();
+     rsx_wbd_snap_publish(&g_wbd_snap, &g_wbd);
+diff --git a/libs/video/rsx_pub.c b/libs/video/rsx_pub.c
+new file mode 100644
+index 00000000..1d14f2a2
+--- /dev/null
++++ b/libs/video/rsx_pub.c
+@@ -0,0 +1,324 @@
++/* KZ3 patch 2197: the ordered publisher P, inline on the walker thread R. See rsx_pub.h.
++ *
++ * Every walker-thread guest signal becomes a kzr_rec {seq, kind, ea, val, aux = stream offset} that is pushed into the kzr log (patch
++ * 2191) and retired in strict seq order on R: the store happens at retire, at the position and with the value the call site had. With
++ * RSX_PUB_LAG = 0 the log is empty at every call boundary; with a lag, P holds the newest N records, except barrier-class records (the
++ * walker re-reads their guest bytes itself: the control page, labels, ring and context words) which retire through themselves, and
++ * the pass end, which drains. Nothing here takes a lock (a kzr_pub_quiesce under s_gcm_fifo_lock would be an ABBA deadlock).
++ *
++ * Mutants for tools/smoke/test_pub_replay.sh and test_pub_locks.sh (each must make a named check fail): RSX_PUB_MUTANT_VAL (retire stores a
++ * wrong label word), _REC (the record truncates val), _NOBARRIER (barrier kinds are held like the rest), _NODRAIN (the pass end does not
++ * drain), _NOLAG (lag ignored), _OWNER (no owner check), _MOVIE (movie check never fires), _TOUCH (touch retires nothing), _LOCK (the movie
++ * check takes a lock through g_rsx_pub_mutant_lock: a lock-taking quiesce). */
++#include "rsx_pub.h"
++#include "rsx_guest_signal.h"
++#include "../kzr/core/sync/kzr_sync.h"
++#include <stdlib.h>
++#include <string.h>
++
++extern void vm_write32(uint32_t a, uint32_t v);
++
++void (*g_rsx_pub_trace)(uint64_t seq, unsigned kind, uint32_t ea, uint32_t val, uint32_t stream_off);
++int g_rsx_pub_mode;
++#ifdef RSX_PUB_MUTANT_LOCK
++void (*g_rsx_pub_mutant_lock)(void);
++#endif
++
++#define PUB_FLAG_STORE_W 1u   /* the retire stores a guest word */
++#define PUB_FLAG_STORE_H 2u   /* ... a big-endian word through a host pointer */
++#define PUB_FLAG_BARRIER 4u
++
++typedef struct { uint32_t kind, ea, val, aux; uintptr_t ptr; } pub_shadow;   /* what the direct path would have stored (verify) */
++typedef _Atomic unsigned long long cnt_t;
++typedef struct {
++    cnt_t rec, retired, stores, barriers, held_max, stalls, bad, empty_bad, owner_bad, refq_drop, rep, repcalc, touch, touch_ret, passes;
++} pub_cnt;
++
++static struct {
++    _Atomic int live; int env_done;           /* live/lag/owner: read by other threads (rsx_pub_check_owner, pass_begin) while R writes them */
++    _Atomic unsigned lag; uint32_t cap;
++    kzr_sync sync; kzr_pub pub; kzr_seq seq;
++    _Atomic uintptr_t owner;               /* kzr_thread_id of R; 0 = unbound */
++    uintptr_t* ptr; pub_shadow* sh;        /* per log slot (index = seq - 1 mod cap): the H-kind host pointer, the verify shadow */
++    const volatile uint32_t* stream;
++    uint32_t (*rd32)(uint32_t);
++    uint64_t tseq;                         /* the direct path's trace seq */
++    kzr_au64 begun, done;                  /* call counters: R is inside a call while begun != done (lock-free movie check) */
++    kzr_au32 pending;                      /* published by R after every push and retire */
++    pub_cnt c;
++} P;
++
++#define CADD(c, n) atomic_store_explicit(&(c), atomic_load_explicit(&(c), memory_order_relaxed) + (n), memory_order_relaxed)   /* single writer */
++#define CINC(c) atomic_fetch_add_explicit(&(c), 1ull, memory_order_relaxed)                                                  /* any thread */
++#define CGET(c) atomic_load_explicit(&(c), memory_order_relaxed)
++
++/* Kinds whose guest bytes the walker itself re-reads (ACQUIRE compares labels and semaphores, the pass start reads put, the ring
++ * recycle re-reads the JUMP and context words it wrote, the NV3089 source read can overlap a 308A store): they retire through
++ * themselves, which is the touch rule of C3 by construction. REPORT, NOTIFY and REF words are only read by the guest. */
++static int pub_kind_holds(unsigned kind)
++{
++    switch (kind) {
++    case RSX_GS_REPORT: case RSX_GS_NOTIFY: case RSX_GS_REF: case RSX_GS_REPORT_RB: return 1;
++    default: break;
++    }
++    const rsx_gs_info* i = rsx_gs_info_of(kind);
++    return !i || i->cls != 'W';   /* S and N records carry no store: nothing to read back, they may wait */
++}
++
++static uint32_t pub_stream_off(void) { return P.stream ? *P.stream : 0u; }
++
++static void pub_bad(const char* what, uint64_t seq, unsigned kind, uint32_t ea, uint32_t want, uint32_t got)
++{
++    const unsigned long long n = atomic_fetch_add_explicit(&P.c.bad, 1ull, memory_order_relaxed);
++    if (n < 16) fprintf(stderr, "[pub-bad] seq=%llu kind=%u ea=0x%08X want=0x%08X got=0x%08X (%s)\n", (unsigned long long)seq, kind, ea, want, got, what);
++}
++static void pub_viol(cnt_t* c, const char* what, unsigned long long pend)
++{
++    const unsigned long long n = atomic_fetch_add_explicit(c, 1ull, memory_order_relaxed);
++    if (n < 8) fprintf(stderr, "[pub-bad] %s (pending %llu)\n", what, pend);
++}
++
++static void pub_retire(void* ctx, const kzr_rec* r)
++{
++    (void)ctx;
++    const uint32_t slot = (uint32_t)((r->seq - 1u) % P.cap);
++    uint32_t val = r->val;
++#ifdef RSX_PUB_MUTANT_VAL
++    if (r->kind == RSX_GS_LABEL) val ^= 1u;
++#endif
++    if (r->flags & PUB_FLAG_STORE_W) { vm_write32(r->ea, val); CADD(P.c.stores, 1); }
++    else if (r->flags & PUB_FLAG_STORE_H) {
++        uint8_t* p = (uint8_t*)P.ptr[slot];
++        p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16); p[2] = (uint8_t)(val >> 8); p[3] = (uint8_t)val;
++        CADD(P.c.stores, 1);
++    }
++    if (g_rsx_pub_trace) g_rsx_pub_trace(r->seq, r->kind, r->ea, r->val, r->aux);
++    CADD(P.c.retired, 1);
++    if (g_rsx_pub_mode == RSX_PUB_VERIFY) {   /* the record against the shadow of the direct path, then the store against the shadow's value */
++        const pub_shadow* s = &P.sh[slot];
++        if (s->kind != r->kind) pub_bad("kind", r->seq, r->kind, r->ea, s->kind, r->kind);
++        else if (s->ea != r->ea) pub_bad("ea", r->seq, r->kind, s->ea, s->ea, r->ea);
++        else if (s->val != r->val) pub_bad("value", r->seq, r->kind, r->ea, s->val, r->val);
++        else if (s->aux != r->aux) pub_bad("stream offset", r->seq, r->kind, r->ea, s->aux, r->aux);
++        else if ((r->flags & PUB_FLAG_STORE_W) && P.rd32) {
++            const uint32_t got = P.rd32(r->ea);
++            if (got != s->val) pub_bad("guest word after the store", r->seq, r->kind, r->ea, s->val, got);
++        } else if (r->flags & PUB_FLAG_STORE_H) {
++            const uint8_t* p = (const uint8_t*)s->ptr;
++            const uint32_t got = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++            if (got != s->val) pub_bad("report word after the store", r->seq, r->kind, r->ea, s->val, got);
++        }
++    }
++}
++
++static void pub_publish_pending(void)
++{
++    const uint32_t n = kzr_pub_pending(&P.pub);
++    atomic_store_explicit(&P.pending, n, memory_order_release);
++}
++
++int rsx_pub_configure(int mode, unsigned lag)
++{
++    rsx_pub_shutdown();
++    memset(&P.c, 0, sizeof P.c);
++    P.tseq = 0; P.owner = 0;
++    if (lag > RSX_PUB_LAG_MAX) lag = RSX_PUB_LAG_MAX;
++    P.lag = lag;
++#ifdef RSX_PUB_MUTANT_NOLAG
++    P.lag = 0;
++#endif
++    if (mode <= RSX_PUB_OFF) { g_rsx_pub_mode = RSX_PUB_OFF; return 0; }
++    P.cap = lag * 2u + 1024u;
++    P.ptr = (uintptr_t*)calloc(P.cap, sizeof *P.ptr);
++    P.sh = (pub_shadow*)calloc(P.cap, sizeof *P.sh);
++    if (!P.ptr || !P.sh) { free(P.ptr); free(P.sh); P.ptr = NULL; P.sh = NULL; return -1; }
++    kzr_sync_init(&P.sync, 0);
++    if (kzr_pub_init(&P.pub, &P.sync, P.cap, pub_retire, NULL)) { kzr_sync_destroy(&P.sync); free(P.ptr); free(P.sh); P.ptr = NULL; P.sh = NULL; return -1; }
++    kzr_seq_init(&P.seq);
++    atomic_store_explicit(&P.begun, 0, memory_order_relaxed); atomic_store_explicit(&P.done, 0, memory_order_relaxed);
++    atomic_store_explicit(&P.pending, 0, memory_order_relaxed);
++    P.live = 1;
++    g_rsx_pub_mode = mode;
++    return 0;
++}
++
++void rsx_pub_shutdown(void)
++{
++    g_rsx_pub_mode = RSX_PUB_OFF;
++    if (!P.live) return;
++    P.live = 0;
++    kzr_pub_destroy(&P.pub); kzr_sync_destroy(&P.sync);
++    free(P.ptr); free(P.sh); P.ptr = NULL; P.sh = NULL;
++}
++
++void rsx_pub_init_env(int force_off)
++{
++    if (P.env_done) return;
++    P.env_done = 1;
++    const char* e = getenv("RSX_PUB");
++    int bad = 0, mode = rsx_pub_mode_parse(e, &bad);
++    const char* l = getenv("RSX_PUB_LAG");
++    unsigned lag = l && *l ? (unsigned)strtoul(l, NULL, 0) : 0u;
++    if (bad) fprintf(stderr, "[pub] RSX_PUB=%s is not 0, 1 or verify: off\n", e);
++    if (mode && force_off) { fprintf(stderr, "[pub] RSX_PUB=%s ignored: GCM_GET_EQ_PUT=1 forces it off\n", e); mode = RSX_PUB_OFF; }
++    if (rsx_pub_configure(mode, lag)) { fprintf(stderr, "[pub] RSX_PUB: log allocation failed, off\n"); return; }
++    if (mode) fprintf(stderr, "[pub] RSX_PUB=%s: guest signals go through the ordered publisher inline on the walker (patch 2197)%s; lag=%u\n",
++                      mode == RSX_PUB_VERIFY ? "verify" : "1", mode == RSX_PUB_VERIFY ? ", every retire checked against a shadow" : "", P.lag);
++}
++
++int rsx_pub_mode(void) { return g_rsx_pub_mode; }
++unsigned rsx_pub_lag(void) { return P.lag; }
++void rsx_pub_set_stream_src(const volatile uint32_t* p) { P.stream = p; }
++void rsx_pub_set_reader(uint32_t (*rd32)(uint32_t)) { P.rd32 = rd32; }
++unsigned long rsx_pub_owner_tid(void) { return (unsigned long)P.owner; }
++unsigned rsx_pub_pending(void) { return atomic_load_explicit(&P.pending, memory_order_relaxed); }
++
++int rsx_pub_take(char cls, unsigned kind, uint32_t ea, uint32_t val, uint8_t* hp)
++{
++    if (!P.live || g_rsx_pub_mode == RSX_PUB_OFF) {   /* the direct path: the funnel stores; the trace hook sees the same tuple */
++        if (g_rsx_pub_trace) g_rsx_pub_trace(++P.tseq, kind, ea, val, pub_stream_off());
++        return 0;
++    }
++    const uintptr_t self = kzr_thread_id();
++#ifndef RSX_PUB_MUTANT_OWNER
++    if (P.owner != self) {
++        if (kzr_pub_pending(&P.pub) == 0) P.owner = self;   /* the walker thread changed between passes: nothing pending, rebind */
++        else {   /* C7: P belongs to R. Another thread in a walker pass while records are pending: store directly, as before the publisher */
++            pub_viol(&P.c.owner_bad, "P used from a thread that is not R with records pending", kzr_pub_pending(&P.pub));
++            return 0;
++        }
++    }
++#else
++    P.owner = self;
++#endif
++    atomic_store_explicit(&P.begun, atomic_load_explicit(&P.begun, memory_order_relaxed) + 1, memory_order_release);
++    if (!P.lag && kzr_pub_pending(&P.pub)) pub_viol(&P.c.empty_bad, "log not empty at a call boundary", kzr_pub_pending(&P.pub));
++
++    const uint64_t seq = kzr_seq_alloc(&P.seq);
++    const uint32_t slot = (uint32_t)((seq - 1u) % P.cap);
++    const uint32_t aux = pub_stream_off();
++    kzr_rec r; memset(&r, 0, sizeof r);
++    r.seq = seq; r.gate = KZR_GATE(KZR_GATE_READS, 0);   /* G_READS: with no worker, reads are done once R has resolved the record */
++    r.ea = ea; r.val = val; r.aux = aux; r.kind = (uint8_t)kind;
++    r.flags = cls == 'W' ? PUB_FLAG_STORE_W : cls == 'H' ? PUB_FLAG_STORE_H : 0u;
++    const int holds = pub_kind_holds(kind);
++#ifdef RSX_PUB_MUTANT_NOBARRIER
++    const int barrier = 0;
++#else
++    const int barrier = !holds;
++#endif
++    if (barrier) r.flags |= PUB_FLAG_BARRIER;
++#ifdef RSX_PUB_MUTANT_REC
++    r.val = val & 0xFFFFu;
++#endif
++    P.ptr[slot] = (uintptr_t)hp;
++    if (g_rsx_pub_mode == RSX_PUB_VERIFY) { pub_shadow* s = &P.sh[slot]; s->kind = kind; s->ea = ea; s->val = val; s->aux = aux; s->ptr = (uintptr_t)hp; }
++    kzr_sync_prep_publish(&P.sync, seq);   /* everything <= seq is resolved: the record is complete */
++    const unsigned long long st0 = P.pub.st.stalls;
++    kzr_pub_push(&P.pub, &r);
++    CADD(P.c.rec, 1);
++    if (P.pub.st.stalls != st0) CADD(P.c.stalls, P.pub.st.stalls - st0);
++    const unsigned pend = kzr_pub_pending(&P.pub);
++    if (pend > CGET(P.c.held_max)) atomic_store_explicit(&P.c.held_max, pend, memory_order_relaxed);
++    pub_publish_pending();
++    if (barrier) CADD(P.c.barriers, 1);
++    kzr_pub_retire_ready_upto(&P.pub, barrier ? seq : (seq > P.lag ? seq - P.lag : 0u));
++    pub_publish_pending();
++    atomic_store_explicit(&P.done, atomic_load_explicit(&P.begun, memory_order_relaxed), memory_order_release);
++    return cls == 'W' || cls == 'H';   /* S and N sites have no store to skip: the funnel does what it did (count, capture word) */
++}
++
++void rsx_pub_drain(void)
++{
++    if (!P.live) return;
++    kzr_pub_drain(&P.pub);
++    pub_publish_pending();
++}
++
++void rsx_pub_pass_begin(void)
++{
++    if (!P.live || g_rsx_pub_mode == RSX_PUB_OFF) return;
++    CADD(P.c.passes, 1);
++    const uintptr_t self = kzr_thread_id();
++    if (P.owner != self) {
++        if (kzr_pub_pending(&P.pub) == 0) P.owner = self;
++        else pub_viol(&P.c.owner_bad, "walker pass started on a thread that is not P's owner with records pending", kzr_pub_pending(&P.pub));
++    }
++    if (kzr_pub_pending(&P.pub)) pub_viol(&P.c.empty_bad, "log not empty at pass start", kzr_pub_pending(&P.pub));
++}
++
++void rsx_pub_pass_end(void)
++{
++    if (!P.live || g_rsx_pub_mode == RSX_PUB_OFF) return;
++    if (!P.lag && kzr_pub_pending(&P.pub)) pub_viol(&P.c.empty_bad, "log not empty at pass end", kzr_pub_pending(&P.pub));
++#ifndef RSX_PUB_MUTANT_NODRAIN
++    rsx_pub_drain();
++#endif
++    if (kzr_pub_pending(&P.pub)) pub_viol(&P.c.empty_bad, "log not empty after the pass-end drain", kzr_pub_pending(&P.pub));
++    {   /* C4: one rsx_live_draw_report_value call per answered GET_REPORT; a surplus call (it clears slot.rb and bumps counters) is a bug */
++        static unsigned long long seen;
++        const unsigned long long rep = CGET(P.c.rep), calc = CGET(P.c.repcalc);
++        if (calc != rep && calc + rep != seen) { seen = calc + rep; pub_bad("report value computed more than once (C4)", 0, RSX_GS_REPORT, 0, (uint32_t)rep, (uint32_t)calc); }
++    }
++}
++
++void rsx_pub_touch(uint32_t ea, uint32_t len)
++{
++    if (!P.live || !len || !kzr_pub_pending(&P.pub)) return;
++    CADD(P.c.touch, 1);
++    uint64_t last = 0;
++    const uint64_t e1 = (uint64_t)ea + len;
++    for (uint64_t i = P.pub.head; i != P.pub.tail; i++) {
++        const kzr_rec* r = &P.pub.log[i % P.pub.cap];
++        if (!(r->flags & PUB_FLAG_STORE_W)) continue;   /* only word stores are guest bytes at an EA; H and S carry no EA span here */
++        if ((uint64_t)r->ea < e1 && (uint64_t)r->ea + 4u > ea) last = r->seq;
++    }
++#ifdef RSX_PUB_MUTANT_TOUCH
++    last = 0;
++#endif
++    if (!last) return;
++    CADD(P.c.touch_ret, 1);
++    kzr_pub_retire_ready_upto(&P.pub, last);
++    pub_publish_pending();
++}
++
++int rsx_pub_movie_check(void)
++{
++    if (!P.live || g_rsx_pub_mode == RSX_PUB_OFF || P.lag) return 0;
++#ifdef RSX_PUB_MUTANT_LOCK
++    if (g_rsx_pub_mutant_lock) g_rsx_pub_mutant_lock();   /* a lock-taking quiesce: a lock the walker holds while it takes the one we hold */
++#endif
++#ifdef RSX_PUB_MUTANT_MOVIE
++    return 0;
++#endif
++    /* No call in flight (done == begun) before the read and none started after it (begun unchanged): pending is a leftover. */
++    const uint64_t d = atomic_load_explicit(&P.done, memory_order_acquire);
++    const uint64_t b1 = atomic_load_explicit(&P.begun, memory_order_acquire);
++    if (d != b1) return 0;
++    const uint32_t pend = atomic_load_explicit(&P.pending, memory_order_acquire);
++    const uint64_t b2 = atomic_load_explicit(&P.begun, memory_order_acquire);
++    if (b2 != b1 || !pend) return 0;
++    pub_viol(&P.c.empty_bad, "log not empty in set_movie_mode (a record outlived its call)", pend);
++    return 1;
++}
++
++void rsx_pub_check_owner(const char* where)
++{
++    if (!P.live || g_rsx_pub_mode == RSX_PUB_OFF) return;
++#ifdef RSX_PUB_MUTANT_OWNER
++    (void)where; return;
++#endif
++    if (atomic_load_explicit(&P.pending, memory_order_acquire) && P.owner && P.owner != kzr_thread_id())
++        pub_viol(&P.c.owner_bad, where, atomic_load_explicit(&P.pending, memory_order_relaxed));
++}
++
++void rsx_pub_note_refq_drop(void) { CINC(P.c.refq_drop); }
++void rsx_pub_note_report(int calc) { if (!P.live) return; /* default off: no atomic read-modify-write on the ZPASS path */ if (calc) CINC(P.c.repcalc); else CINC(P.c.rep); }
++
++void rsx_pub_stats_snapshot(rsx_pub_stats* o)
++{
++    o->rec = CGET(P.c.rec); o->retired = CGET(P.c.retired); o->stores = CGET(P.c.stores); o->barriers = CGET(P.c.barriers);
++    o->held_max = CGET(P.c.held_max); o->stalls = CGET(P.c.stalls); o->bad = CGET(P.c.bad); o->empty_bad = CGET(P.c.empty_bad);
++    o->owner_bad = CGET(P.c.owner_bad); o->refq_drop = CGET(P.c.refq_drop); o->rep = CGET(P.c.rep); o->repcalc = CGET(P.c.repcalc);
++    o->touch = CGET(P.c.touch); o->touch_ret = CGET(P.c.touch_ret); o->passes = CGET(P.c.passes);
++}
+diff --git a/libs/video/rsx_pub.h b/libs/video/rsx_pub.h
+new file mode 100644
+index 00000000..977ee726
+--- /dev/null
++++ b/libs/video/rsx_pub.h
+@@ -0,0 +1,105 @@
++/* KZ3 patch 2197: the ordered publisher P,
++ * inline on the walker thread R. RSX_PUB=1 routes every walker-thread guest signal of rsx_guest_signal.h through a kzr record
++ * (kzr/core/sync, patch 2191) that P retires in strict seq order at today's position with today's value; RSX_PUB=verify also
++ * checks each retired record against a shadow of what the direct path would have stored ([pub-bad] on a difference). Unset or
++ * 0 = the funnel's direct path, unchanged. RSX_PUB_LAG=N holds N records before retiring (host shake / lag measurement only).
++ *
++ * Pure header (stdint/stdio/string only) so host tests include it without the runtime. The implementation is rsx_pub.c. */
++#ifndef RSX_PUB_H
++#define RSX_PUB_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <stddef.h>
++
++enum { RSX_PUB_OFF = 0, RSX_PUB_ON = 1, RSX_PUB_VERIFY = 2 };
++#define RSX_PUB_LAG_MAX 4096u
++
++/* RSX_PUB parsing: unset / "" / "0" = off, "1" = on, "verify" = verify; anything else = off (flagged in *bad so the caller can say so). */
++static inline int rsx_pub_mode_parse(const char* s, int* bad)
++{
++    if (bad) *bad = 0;
++    if (!s || !*s || (s[0] == '0' && !s[1])) return RSX_PUB_OFF;
++    if (s[0] == '1' && !s[1]) return RSX_PUB_ON;
++    if (!strcmp(s, "verify")) return RSX_PUB_VERIFY;
++    if (bad) *bad = 1;
++    return RSX_PUB_OFF;
++}
++
++/* Counters (single writer R unless noted). Other threads read them with relaxed atomic loads (rsx_pub_stats_snapshot). */
++typedef struct rsx_pub_stats {
++    unsigned long long rec;          /* records pushed by R */
++    unsigned long long retired;      /* records retired by P */
++    unsigned long long stores;       /* guest word / report stores P made (W and H kinds) */
++    unsigned long long barriers;     /* barrier-class records: retire through themselves (see pub_kind_holds in rsx_pub.c) */
++    unsigned long long held_max;     /* most records pending at once (gauge) */
++    unsigned long long stalls;       /* pushes that found the log full (kzr stall counter) */
++    unsigned long long bad;          /* [pub-bad] verify differences (any thread) */
++    unsigned long long empty_bad;    /* log not empty where the contract says it is: call boundary, pass end, movie mode (any thread) */
++    unsigned long long owner_bad;    /* P or the 2185 table used from a thread that is not R while records were pending (C7) */
++    unsigned long long refq_drop;    /* ref-queue overflow: the oldest fence was dropped, kept behaviour (any thread) */
++    unsigned long long rep;          /* GET_REPORT main-memory ZPASS answers computed at the walker */
++    unsigned long long repcalc;      /* rsx_live_draw_report_value calls for them: must equal rep (C4, computed once) */
++    unsigned long long touch;        /* rsx_pub_touch calls */
++    unsigned long long touch_ret;    /* ... that had a pending store to retire first */
++    unsigned long long passes;       /* walker passes that ran P */
++} rsx_pub_stats;
++
++/* host tests only: called for every walker-thread signal at its store (the retire with RSX_PUB!=0, the direct store with RSX_PUB=0) with
++ * (seq, kind, ea, val, stream_off); NULL = off. seq counts walker-thread signals from 1 in both modes. */
++extern void (*g_rsx_pub_trace)(uint64_t seq, unsigned kind, uint32_t ea, uint32_t val, uint32_t stream_off);
++extern int g_rsx_pub_mode;           /* RSX_PUB_OFF .. RSX_PUB_VERIFY; read by the funnel on every call */
++
++/* rsx_pub_init_env reads RSX_PUB and RSX_PUB_LAG once (later calls do nothing); force_off = GCM_GET_EQ_PUT (forced to 0).
++ * rsx_pub_configure is for host tests: (re)creates the log, 0 on success. */
++void rsx_pub_init_env(int force_off);
++int  rsx_pub_configure(int mode, unsigned lag);
++void rsx_pub_shutdown(void);
++int  rsx_pub_mode(void);
++unsigned rsx_pub_lag(void);
++/* The walker's stream position (s_fifo_getoff) for the record's stream_off, and a guest word reader for verify's read-back: both set by
++ * cellGcmSys.c, which owns the variable and the guest access; NULL = stream_off 0 / no read-back. */
++void rsx_pub_set_stream_src(const volatile uint32_t* p);
++void rsx_pub_set_reader(uint32_t (*rd32)(uint32_t ea));
++
++/* Called by the funnel for a walker-thread signal. cls = 'W','H','S','N' (rsx_gs_info). W: store val at ea. H: store val big-endian through
++ * hp (ea is only the capture tag). S: a bulk store the site makes itself (ea, val = n bytes). N: host-state effect (ea, val = a, b). Returns
++ * 1 when P made the store (the funnel must not), 0 when the funnel stores directly (RSX_PUB off; the trace hook, if any, was called). */
++int  rsx_pub_take(char cls, unsigned kind, uint32_t ea, uint32_t val, uint8_t* hp);
++
++/* Walker pass brackets (cellGcmSys.c): begin binds P's owner thread (R) and checks the boundary; end drains everything and asserts the
++ * log is empty. Both no-ops with RSX_PUB off. */
++void rsx_pub_pass_begin(void);
++void rsx_pub_pass_end(void);
++/* Retire every pending record (inline, on R). For events ordered after everything R recorded so far (a harness-injected renderer write;
++ * a quiesce serviced at pass end). Takes no lock. */
++void rsx_pub_drain(void);
++/* C3: a read of guest bytes [ea, ea+len) by R sees every pending P store to the span: retire up to the last overlapping one. */
++void rsx_pub_touch(uint32_t ea, uint32_t len);
++/* C7 / H7: the log is empty at a call boundary. Lock-free, callable from any thread (set_movie_mode runs on the host thread under
++ * g_ld_access_lock and must take no walker lock). Returns 1 and counts [pub-bad] when a record outlived its call. With RSX_PUB_LAG > 0
++ * records are legitimately pending between calls, so it checks nothing there. */
++int  rsx_pub_movie_check(void);
++/* C7: the 2185 pending-store table and P belong to R: count a use from another thread while records are pending. */
++void rsx_pub_check_owner(const char* where);
++unsigned long rsx_pub_owner_tid(void);   /* P's thread (kzr_thread_id of R), 0 before the first pass */
++
++void rsx_pub_note_refq_drop(void);       /* any thread */
++void rsx_pub_note_report(int calc);      /* calc = 0: one GET_REPORT answered (rep); 1: one value() call (repcalc) */
++void rsx_pub_stats_snapshot(rsx_pub_stats* out);
++unsigned rsx_pub_pending(void);          /* records pending now (any thread, relaxed) */
++
++/* `[pub] t=.. mode=on lag=N rec=.. ret=.. ...`: deltas of this second for the flow counters, absolute for the gauges and the violation counters. */
++static inline int rsx_pub_fmt(char* out, size_t n, double t, int mode, unsigned lag, const rsx_pub_stats* c, const rsx_pub_stats* p)
++{
++    return snprintf(out, n,
++        "[pub] t=%.0f mode=%s lag=%u rec=%llu ret=%llu store=%llu barr=%llu held_max=%llu stall=%llu bad=%llu empty_bad=%llu owner_bad=%llu "
++        "refq_drop=%llu rep=%llu repcalc=%llu touch=%llu/%llu passes=%llu",
++        t, mode == RSX_PUB_VERIFY ? "verify" : mode == RSX_PUB_ON ? "on" : "off", lag,
++        c->rec - p->rec, c->retired - p->retired, c->stores - p->stores, c->barriers - p->barriers, c->held_max, c->stalls - p->stalls,
++        c->bad, c->empty_bad, c->owner_bad, c->refq_drop - p->refq_drop, c->rep - p->rep, c->repcalc - p->repcalc,
++        c->touch_ret - p->touch_ret, c->touch - p->touch, c->passes - p->passes);
++}
++
++#endif

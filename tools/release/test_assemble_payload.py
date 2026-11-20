@@ -57,7 +57,7 @@ def fake_repo(root):
                 "port/spu/ppu_overrides.txt", "port/text/port_ui.tsv", "port/vfs/kz3_overlay.c", "port/vfs/test_vfs_overlay.c",
                 "port/net/kz3_net.c", "port/net/test_kz3_net.c",
                 "port/kz3/__pycache__/x.pyc", "cmake/mingw-w64.cmake", "cmake/notes.txt",
-                "public/LICENSE", "public/README.md", "public/NOTICE.md", "installer/run.cmd",
+                "public/LICENSE", "public/README.md", "public/NOTICE.md", "installer/run.cmd", "installer/recomplauncher.json",
                 "work/ps3recomp-patched/LICENSE", "work/ps3recomp-patched/CMakeLists.txt",
                 "work/ps3recomp-patched/.kz3-patchset", "work/ps3recomp-patched/tools/ppu_lifter.py",
                 "work/ps3recomp-patched/runtime/a.c", "work/ps3recomp-patched/tests/sync/CMakeLists.txt",
@@ -141,7 +141,7 @@ def main():
                 "ps3recomp/tools/ppu_lifter.py", "ps3recomp/runtime/a.c", "ps3recomp/tests/sync/CMakeLists.txt",
                 "ps3recomp/third_party/at3_standalone/COPYING.LGPLv2.1", "ps3recomp/libs/video/fsr1/LICENSE.txt", "licenses/LICENSE.txt",
                 "licenses/ps3recomp-LICENSE.txt", "licenses/at3_standalone-COPYING.LGPLv2.1.txt", "licenses/FidelityFX-FSR1-LICENSE.txt",
-                "README.md", "NOTICE.md", "run.cmd", "manifest.json", "VERSION.txt",
+                "README.md", "NOTICE.md", "recomplauncher.json", "run.cmd", "manifest.json", "VERSION.txt",
                 "fonts/Rajdhani-Medium.ttf", "fonts/Rajdhani-Bold.ttf", "licenses/Rajdhani-OFL.txt",
                 "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt"}
         check(got == want, "payload holds exactly the allowlisted files",

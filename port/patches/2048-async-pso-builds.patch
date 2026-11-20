@@ -11,7 +11,7 @@ The bookkeeping is platform-neutral in libs/video/rsx_pso_async.h (host test too
 Aim: the cold-cache level-start stall (K4: 245 misses = 16.4 s of walker time, RSX pass 48).
 Statistics: [pso-async] every 256 frames once builds ran.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 index d04d08c..c976c55 100644

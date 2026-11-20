@@ -16,7 +16,7 @@ the PPU lift in DIR (its .lift-stamp, else the directory name, else the selected
 Inputs per version:
   100: work/bin/EBOOT.elf,     work/bin/spu/spu_<fo>.elf,                work/analysis/jobmods.tsv,     re/data/spu_coverage_seeds.tsv
   114: work/bin/EBOOT-114.elf, work/analysis-114/spu_images/spu_<fo>.elf, work/analysis-114/jobmods.tsv, re/data/spu_seeds_114.tsv
-A lane worktree has no work/analysis-114 link; the main checkout's copy ($KZ3_MAIN, set by tools/sandbox.sh) is used.
+A linked worktree has no work/analysis-114 link; the main checkout's copy ($KZ3_MAIN, set by tools/sandbox.sh) is used.
 Release first-run overrides: KZ3_EBOOT_ELF (the EBOOT) and KZ3_ANALYSIS_DIR (jobmods.tsv, functions.json and
 spu_images/ under it), set by tools/release/firstrun.py; tools/spu/test_kz3ver.py checks them.
 """
@@ -39,7 +39,7 @@ MAP_TSV = os.path.join(ROOT, "re/data/spu_map_114.tsv")
 
 
 def work(rel):
-    """Path of a shared work/ input: this checkout's, else the main checkout's (lane worktrees)."""
+    """Path of a shared work/ input: this checkout's, else the main checkout's (linked worktrees)."""
     local = os.path.join(ROOT, rel)
     main = os.environ.get("KZ3_MAIN")
     if os.path.exists(local) or not main:

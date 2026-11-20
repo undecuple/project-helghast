@@ -3,7 +3,7 @@ JUMP (offset | 1, RPCS3's NEW_JUMP_CMD) as a JUMP. v0.18.0's resync scan and par
 main loop decoded the word as a method header (seen in another port, 2026-10-26: junk registers). A method header never
 has bit 0 set, and IO offsets fit in 29 bits, so the word is rewritten to the old form (0x20000000 | offset) before
 the decode. The flip word 0xFEADxxxx is excluded: buffer 1's (0xFEAD0101) has bit 0 set as well, and without the
-exclusion KZ3 froze at its first flip on buffer 1 (SPU pass 108 part 3, run spu-r108-k0: "FIFO resync (unmapped-JUMP)
+exclusion KZ3 froze at its first flip on buffer 1 (SPU pass 108 part 3, a run: "FIFO resync (unmapped-JUMP)
 0x000A0550", label 0x4A stuck). KZ3 emits old-style jumps only.
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c

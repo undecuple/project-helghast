@@ -10,7 +10,7 @@ DIAGONAL_CENTERED_2, 1280x720 pixels) with scissor 1280x720 every frame: only th
 the right half kept old depth, the G-buffer pass failed the depth test there (only the first-person weapon, nearer
 than the stale depth, was drawn), and the lighting and the resolve showed last frames' white. The draw path already
 scales the scissor by aa_sx/aa_sy; the clear now does the same.
-From our Killzone 2 port (its patch 2089). KZ3: both RPCS3 level captures (2026-10-08) issue no CLEAR_SURFACE while
+From our Killzone 2 port (its patch 2089). KZ3: both RPCS3 level captures issue no CLEAR_SURFACE while
 an antialiased format is set; the 320x180 SQUARE_ROTATED_4 pass is cleared (mask 0x01) through a 640x360 1x1 view of
 the same memory (format 0x128, colour 0x16C0000, zeta 0x2980000, scissor 640x360), so KZ3's clears do not change.
 Log: `[clear-aa]` once with the switch state, then the first 8 clears of an antialiased surface (offset, mask, clip,

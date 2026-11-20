@@ -55,7 +55,7 @@ int main(void)
 }
 EOC
 CC="${CC:-cc}"
-W="-std=c11 -Wall -Wno-unused-function -Wno-format-truncation -I$O -I$V -I$PT/include"
-$CC $W -O2 "$O/t.c" "$V/rsx_fp_decompiler.c" -o "$O/t" -lm
+W=(-std=c11 -Wall -Wno-unused-function -Wno-format-truncation -I"$O" -I"$V" -I"$PT/include")
+$CC "${W[@]}" -O2 "$O/t.c" "$V/rsx_fp_decompiler.c" -o "$O/t" -lm
 "$O/t" 2>/dev/null
 echo "[test_fp_deriv] PASS"

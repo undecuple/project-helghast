@@ -1,0 +1,80 @@
+KZ3 patch 2199 (first-run UX): ONE default-on log line,
+printed exactly once per process when the first frame reaches the screen:
+   [frame] first frame presented at <N> ms        (N = ms since process creation)
+so the launcher can tell "the game never showed a frame" (marker absent) from a slow start. Where: ld_present_swap in
+libs/video/rsx_live_draw.c, right after the DXGI Present succeeded and was not occluded (a skipped present, ld_present_slot,
+or a failed/occluded one is not a frame). New libs/video/rsx_first_frame.h (pure C, host-tested): the per-present cost is one
+relaxed atomic load; the line is guarded by an atomic exchange, so two presenting threads still print once. GCM_FLIPCOUNT's
+[flip] lines are untouched (still opt-in). Only the live-draw renderer is covered (rsx_d3d12_backend.c is not the KZ3 path).
+Host test: tools/smoke/test_first_frame.sh.
+diff --git a/libs/video/rsx_first_frame.h b/libs/video/rsx_first_frame.h
+new file mode 100644
+index 00000000..ab4f4e6c
+--- /dev/null
++++ b/libs/video/rsx_first_frame.h
+@@ -0,0 +1,37 @@
++/* KZ3 patch 2199 (first-run UX): one default-on log line when the first frame is presented, so the launcher (and a
++ * person reading the log) can tell "the game never showed a frame" from a crash or a slow start. Pure C (no OS
++ * calls), so tools/smoke builds it on the host.
++ *
++ *   [frame] first frame presented at <N> ms
++ *
++ * N is milliseconds since the process was created (the call site passes it; rsx_ff_ms converts FILETIME 100 ns
++ * ticks). Printed exactly once per process, from whichever thread presents first: the per-present cost is one relaxed
++ * atomic load (rsx_first_frame_pending). Independent of GCM_FLIPCOUNT ([flip] lines are still opt-in). */
++#ifndef RSX_FIRST_FRAME_H
++#define RSX_FIRST_FRAME_H
++#include <stdatomic.h>
++#include <stdio.h>
++
++static atomic_int s_rsx_ff_done;
++
++/* 1 until the line has been printed; the only per-present cost. */
++static inline int rsx_first_frame_pending(void)
++{
++    return atomic_load_explicit(&s_rsx_ff_done, memory_order_relaxed) == 0;
++}
++
++/* Print the line the first time it is called (any thread); later calls do nothing. */
++static inline void rsx_first_frame_note(unsigned long long ms)
++{
++    if (atomic_exchange(&s_rsx_ff_done, 1) == 0) {
++        fprintf(stderr, "[frame] first frame presented at %llu ms\n", ms);
++        fflush(stderr);
++    }
++}
++
++/* Milliseconds from process creation to now, both as FILETIME 100 ns ticks; 0 when the clock went backwards. */
++static inline unsigned long long rsx_ff_ms(unsigned long long creation_100ns, unsigned long long now_100ns)
++{
++    return now_100ns > creation_100ns ? (now_100ns - creation_100ns) / 10000ull : 0ull;
++}
++#endif
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index e42edd97..96d52bad 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -253,6 +253,7 @@ static uint8_t* ld_prompt_remap_cells(const uint8_t* cur, uint32_t w, uint32_t h
+ #include "rsx_pso_template.h"   /* patch 2071 */
+ #include "rsx_pace.h"           /* patch 2072 */
+ #include "rsx_present_stream.h"  /* patch 2187: RSX_PRESENT_QPC_STREAM */
++#include "rsx_first_frame.h"     /* patch 2199: "[frame] first frame presented" */
+ #include "rsx_pso_keys_hdr.h"   /* patch 2141: key file header with the translator id */
+ #include "rsx_tex_lru.h"        /* patch 2075 */
+ #include "rsx_smp_index.h"      /* patch 2161 */
+@@ -16902,6 +16903,15 @@ static HRESULT ld_present_swap(const rsx_present_geometry* geometry)
+     if (!ld_present_slot()) return S_OK;   /* patch 2127 */
+     const HRESULT hr = g.swap->lpVtbl->Present(g.swap, interval, tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+     if (SUCCEEDED(hr) && hr != DXGI_STATUS_OCCLUDED) ld_pg_commit(geometry);
++    /* patch 2199: the first Present that reaches the screen (not occluded, not skipped above). */
++    if (SUCCEEDED(hr) && hr != DXGI_STATUS_OCCLUDED && rsx_first_frame_pending()) {
++        FILETIME c = {0}, x = {0}, k = {0}, u = {0}, n = {0};
++        ULARGE_INTEGER cv, nv;
++        GetSystemTimeAsFileTime(&n);
++        cv.QuadPart = 0; nv.LowPart = n.dwLowDateTime; nv.HighPart = n.dwHighDateTime;
++        if (GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u)) { cv.LowPart = c.dwLowDateTime; cv.HighPart = c.dwHighDateTime; }
++        rsx_first_frame_note(cv.QuadPart ? rsx_ff_ms(cv.QuadPart, nv.QuadPart) : 0ull);
++    }
+     return hr;
+ }
+ 

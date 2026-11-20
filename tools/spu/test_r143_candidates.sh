@@ -4,7 +4,7 @@
 # PUTLLC fast-path semantics test (tools/spu/test_r143_putllc_fast.c) in both modes. SKIP without the patched toolkit.
 #   nix develop --command tools/sandbox.sh -- tools/spu/test_r143_candidates.sh
 set -uo pipefail
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/r143-tests"; T="$O/tree"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/host-tests/candidates"; T="$O/tree"
 SRC="$ROOT/work/ps3recomp-patched"
 [[ -f "$SRC/runtime/spu/spu_coherency.c" ]] || { echo "SKIP: no patched toolkit at $SRC"; exit 0; }
 mkdir -p "$O"; [[ -d "$T" ]] && "$ROOT/tools/safe_rm.sh" "$T"; mkdir -p "$T"

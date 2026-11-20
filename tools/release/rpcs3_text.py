@@ -5,9 +5,21 @@ reviewed as a whole. rpcs3_import.py and firstrun.py only format these; they wri
 FOUND = "Found your RPCS3 folder: {root}"
 FOUND_DISC = "  Game disc folder: {path}"
 FOUND_UPDATE = "  Update {ver}: {path}"
+FOUND_DISC_ISO = "  Game disc image (.iso): {path}"
+ISO_REFUSED = "  RPCS3 lists the game as a disc image, {path}, but it cannot be used: {why}. You can type the folder yourself."
 NO_DISC = "  RPCS3 has no Killzone 3 disc game listed. You can type the folder yourself."
 NO_UPDATE = "  RPCS3 has no update for Killzone 3. You can type the folder yourself."
 WRONG_UPDATE = "  RPCS3 has update {have}, but the port needs {want}. Update the game in RPCS3 first."
+HELP_ENCRYPTED = ("This EBOOT is still encrypted. The port cannot decrypt it. It needs a decrypted EBOOT.elf, made from "
+                  "your own copy, in the same folder.")
+HELP_NO_ELF = ("No decrypted EBOOT.elf was found in the update's USRDIR folder. The port cannot decrypt it. It needs a "
+               "decrypted EBOOT.elf, made from your own copy, in that folder. This project ships no decryption tools.")
+HELP_UPDATE = ("RPCS3 has no Killzone 3 update 1.14 installed for this disc. Install the update in RPCS3 (see RPCS3's "
+               "documentation: https://rpcs3.net/quickstart), then check again.")
+HELP_VERSION = ("The update RPCS3 has for Killzone 3 is not 1.14 (1.00 is the disc's own version). Install the 1.14 update "
+                "in RPCS3 (see RPCS3's documentation: https://rpcs3.net/quickstart), then check again.")
+HELP_DISC = ("RPCS3 does not list a Killzone 3 disc (BCUS98234, BCES01007, BCAS25008 or BCJS30066), or its folder is gone. "
+             "Add the game in RPCS3 (see its documentation) from the disc dump, or pick the folders yourself.")
 USE_RPCS3 = "Use these folders as the starting answers?"
 
 ENCRYPTED = ("The update's EBOOT.BIN is still encrypted, and there is no EBOOT.elf next to it.\n"

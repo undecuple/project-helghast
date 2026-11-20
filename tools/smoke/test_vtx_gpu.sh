@@ -15,11 +15,11 @@ if [[ ! -f "$G/rsx_vtx_gpu.h" ]]; then
   echo "[test_vtx_gpu] SKIP: toolkit without patch 2076 (no rsx_vtx_gpu.h)"; exit 0; fi
 O="$ROOT/build/smoke-host/vtx_gpu"; mkdir -p "$O"
 CC="${CC:-cc}"
-W="-std=c11 -Wall -Wextra -Werror -Wno-unused-function -I$G -I$V -I$PT/include"
-$CC $W -O2 "$ROOT/tools/smoke/test_vtx_gpu.c" "$V/rsx_vertex_compact.c" -o "$O/test_vtx_gpu" -lm
+W=(-std=c11 -Wall -Wextra -Werror -Wno-unused-function -I"$G" -I"$V" -I"$PT/include")
+$CC "${W[@]}" -O2 "$ROOT/tools/smoke/test_vtx_gpu.c" "$V/rsx_vertex_compact.c" -o "$O/test_vtx_gpu" -lm
 "$O/test_vtx_gpu" | grep -v "^\[PASS\] part"
 if echo "int main(void){return 0;}" | $CC -fsanitize=address,undefined -x c - -o "$O/probe" 2>/dev/null && "$O/probe"; then
-  $CC $W -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$ROOT/tools/smoke/test_vtx_gpu.c" \
+  $CC "${W[@]}" -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$ROOT/tools/smoke/test_vtx_gpu.c" \
     "$V/rsx_vertex_compact.c" -o "$O/test_asan" -lm
   "$O/test_asan" >/dev/null && echo "[PASS] ASan/UBSan pass" || { echo "[FAIL] ASan/UBSan pass"; exit 1; }
 fi

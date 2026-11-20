@@ -15,7 +15,7 @@ from another layout or another translator is deleted together with the pipeline 
 [pso-preload] line; the compiled shader blobs are keyed by their HLSL text and stay. Header layout: 32 bytes,
 id_lo at byte offset 24, id_hi at 28.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 index 1a3d716..c0e99f8 100644

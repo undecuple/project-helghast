@@ -30,6 +30,7 @@ static void setup_valve(float angle_deg, float disable)
     putf(RES + 0x1A0, 360.0f);
     putf(RES + 0x1A8, disable);
     putf(CTRL + 0x10C, 1.0f); putf(CTRL + 0x110, 1.0f);
+    mem[ENT + 0x268] = 1;      /* entity enabled byte (1.14 0x619A28: the valve moves only while it is != 0) */
 }
 
 /* The entity update as s.14.2 describes it: the hand moves toward the controller target at speed*dt, clamped to the
@@ -40,14 +41,15 @@ static void entity_update(float dt, float hand_sign, int always_grab)
     const float tgt = pas_rf(mem, CTRL + 0x108), spd = pas_rf(mem, RES + 0x1A0) * PAS_DEG2RAD;
     float hand = pas_rf(mem, ENT + 0x290), ang = pas_rf(mem, ENT + 0x288), d, nh;
     const float lo = pas_rf(mem, RES + 0x198) * PAS_DEG2RAD, hi = pas_rf(mem, RES + 0x19C) * PAS_DEG2RAD;
-    const float g = pas_rf(mem, CTRL + 0x10C);
+    const float g = pas_rf(mem, CTRL + 0x10C), g2 = pas_rf(mem, CTRL + 0x110);
     d = tgt - hand;
     if (d > spd * dt) d = spd * dt;
     if (d < -spd * dt) d = -spd * dt;
     nh = hand + d;
     if (nh < lo) nh = lo;
     if (nh > hi) nh = hi;
-    if (g < 0.5f || always_grab) {
+    /* 0x619A28: angle += hand delta only while +0x268 != 0 and BOTH gains are below the float at 0x13F7568 (0.05) */
+    if (mem[ENT + 0x268] && ((g < 0.05f && g2 < 0.05f) || always_grab)) {
         ang += hand_sign * (nh - hand);
         if (ang < 0) ang = 0;
         if (ang > 200.0f * PAS_DEG2RAD) ang = 200.0f * PAS_DEG2RAD;
@@ -185,7 +187,7 @@ int main(void)
               "target is a hand limit: %f", (double)pas_rf(mem, CTRL + 0x108));
     }
 
-    /* charge: windows alternate, grab byte, gate bit */
+    /* charge: windows alternate, trigger byte, gate bit */
     {
         PasState st;
         PasDrive dr;
@@ -197,7 +199,7 @@ int main(void)
         memset(mem, 0, sizeof mem);
         put32(CTRL + 0x20, ENT); put32(ENT + 0xE4, RES);
         putf(RES + 0x190, -45.0f); putf(RES + 0x194, 45.0f); putf(RES + 0x198, 360.0f);
-        put32(RES + 0x200, ARR); put32(RES + 0x204, 2); putf(RES + 0x20C, 0.0f);
+        put32(RES + 0x200, 2); put32(RES + 0x204, ARR); putf(RES + 0x20C, 0.0f);   /* count at +0x200, pointer at +0x204 (1.14 0x60F2B8) */
         putf(ARR, 0.741765f); putf(ARR + 4, 0.829031f); putf(ARR + 8, -0.829031f); putf(ARR + 12, -0.741765f);
         put32(CTRL + 0x24, 8);
         CHECK(pas_charge_post(&st, &dr, mem, CTRL, now) == 0 && !pas_charge_live(&st, now), "bit 8 set: not placing, nothing");
@@ -206,12 +208,132 @@ int main(void)
             const float t = (now += 33, pas_charge_post(&st, &dr, mem, CTRL, now), pas_rf(mem, CTRL + 0x108));
             if (fabsf(t - 0.785398f) < 1e-3f) seen_hi = 1;
             if (fabsf(t + 0.785398f) < 1e-3f) seen_lo = 1;
-            CHECK(mem[CTRL + 0x114] == 1, "grab byte");
+            CHECK(mem[CTRL + 0x114] == 1, "trigger byte");
         }
         CHECK(seen_hi && seen_lo, "both arm windows visited in 3 s (hi %d lo %d)", seen_hi, seen_lo);
         CHECK(pas_charge_live(&st, now), "charge section stamp");
         dr.combo.engaged = 0;
         { uint8_t c2[sizeof mem]; memcpy(c2, mem, sizeof mem); pas_charge_post(&st, &dr, mem, CTRL, now + 33); CHECK(!memcmp(c2, mem, sizeof mem), "released: nothing written"); }
+    }
+
+    /* ArmRanges layout (pass 19 fix): count +0x200, pointer +0x204. Negative control: the round-16 order (pointer first)
+     * on the real layout reads count = ARR and pointer = 2: no window is taken, so the section line would show windows=0. */
+    {
+        PasState st;
+        PasView v;
+        memset(&st, 0, sizeof st);
+        memset(mem, 0, sizeof mem);
+        put32(CTRL + 0x20, ENT); put32(ENT + 0xE4, RES);
+        putf(RES + 0x190, -45.0f); putf(RES + 0x194, 45.0f); putf(RES + 0x198, 360.0f);
+        put32(RES + 0x200, 2); put32(RES + 0x204, ARR);
+        putf(ARR, 0.741765f); putf(ARR + 4, 0.829031f); putf(ARR + 8, -0.829031f); putf(ARR + 12, -0.741765f);
+        CHECK(pas_charge_mark(&st, mem, CTRL, 100, &v) == 1 && v.nwin == 2, "windows read with the real layout: %d", v.nwin);
+        CHECK(fabsf(v.cen[0] - 0.785398f) < 1e-3f && fabsf(v.cen[1] + 0.785398f) < 1e-3f, "window centres");
+        put32(RES + 0x200, ARR); put32(RES + 0x204, 2);   /* the round-16 (wrong) layout must NOT be understood */
+        memset(&st, 0, sizeof st);
+        CHECK(pas_charge_mark(&st, mem, CTRL, 200, &v) == 1 && v.nwin == 0, "swapped layout gives no windows (negative control), got %d", v.nwin);
+        /* trigger byte edge is read from ctrl+0x114 */
+        put32(RES + 0x200, 2); put32(RES + 0x204, ARR);
+        mem[CTRL + 0x114] = 1;
+        memset(&st, 0, sizeof st);
+        pas_charge_mark(&st, mem, CTRL, 300, &v);
+        CHECK(v.trig == 1 && st.c_trig == 1, "trigger byte seen");
+    }
+
+    /* charge: Mouse1 held in a charge section feeds left stick down; negative controls for every other case */
+    {
+        uint8_t out = 77;
+        CHECK(pas_charge_feed(1, 0, 1, 128, 0, &out) == 1 && out == 255, "charge + Mouse1 + idle stick: down, got %u", out);
+        out = 77;
+        CHECK(pas_charge_feed(1, 0, 1, 128, 1, &out) == 1 && out == 0, "up switch: byte 0");
+        out = 77;
+        CHECK(pas_charge_feed(1, 0, 0, 128, 0, &out) == 0 && out == 77, "no Mouse1: untouched (negative control)");
+        CHECK(pas_charge_feed(0, 0, 1, 128, 0, &out) == 0 && out == 77, "not in a charge section: untouched (negative control)");
+        CHECK(pas_charge_feed(1, 1, 1, 128, 0, &out) == 0 && out == 77, "a valve section is live too: untouched (negative control)");
+        CHECK(pas_charge_feed(1, 0, 1, 200, 0, &out) == 0 && out == 77, "a real stick wins (negative control)");
+        CHECK(pas_charge_feed(1, 0, 1, 40, 0, &out) == 0 && out == 77, "a real stick wins, other way (negative control)");
+        CHECK(pas_charge_feed(1, 0, 1, 133, 0, &out) == 1, "a resting stick within drift counts as idle");
+    }
+
+    /* valve hold-and-move: Mouse1 held for the whole run, the mouse goes back and forth; the port releases on the return */
+    {
+        int hold_on, m1, en, r;
+        int done_n[8];
+        for (r = 0; r < 4; r++) {
+            static const float hand_sign = 1.0f;
+            int upd, completed = -1;
+            PasState st;
+            unsigned long long now = 50000;
+            float last_n = 1.0f;
+            hold_on = r != 1;               /* r=1: gate off */
+            m1 = r != 2;                    /* r=2: Mouse1 not held (the hold state never set) */
+            en = r != 3;                    /* r=3: entity +0x268 == 0 */
+            memset(&st, 0, sizeof st);
+            setup_valve(180.0f, 0.0f);
+            mem[ENT + 0x268] = (uint8_t)en;
+            st.hold_on = hold_on; st.m1 = m1;
+            for (upd = 0; upd < 1500; upd++) {
+                /* the mouse: the stick points hard right for 15 updates, hard left for 15 (clamped by the hand limits) */
+                const float tgt = ((upd / 15) & 1) ? -80.0f * PAS_DEG2RAD : 80.0f * PAS_DEG2RAD;
+                float g = m1 ? 0.0f : 1.0f;     /* the game's own controller: Mouse1 = the grab button = gains 0.0 */
+                uint8_t before[sizeof mem];
+                putf(CTRL + 0x108, tgt);
+                putf(CTRL + 0x10C, g); putf(CTRL + 0x110, g);
+                memcpy(before, mem, sizeof mem);
+                now += 33;
+                {
+                    PasView v;
+                    const int ok = pas_valve_mark(&st, mem, CTRL, now, &v);
+                    CHECK(ok, "mark");
+                    if (ok) pas_valve_hold_apply(&st, mem, CTRL, &v);
+                }
+                if (r == 2 || r == 3 || r == 1) CHECK(pas_rf(mem, CTRL + 0x10C) == g && pas_rf(mem, CTRL + 0x110) == g, "run %d: gains untouched", r);
+                entity_update(1.0f / 30.0f, hand_sign, 0);
+                last_n = vn();
+                if (last_n <= 0.0f) { completed = upd; break; }
+            }
+            done_n[r] = completed;
+            if (r == 0) {
+                CHECK(completed > 0 && completed < 900, "hold-and-move reaches the end: %d updates", completed);
+                printf("[test] valve hold-and-move (Mouse1 held, 15-update back-and-forth, 180 -> 0): %d updates (%.1f s at 30/s)\n", completed, completed / 30.0);
+            }
+            if (r == 1) CHECK(completed == -1, "gate off, grab held both ways: no net progress (negative control), n=%.3f", (double)last_n);
+            if (r == 2) CHECK(completed == -1 && fabsf(last_n - 0.9f) < 1e-4f, "Mouse1 up: the valve does not move (negative control), n=%.3f", (double)last_n);
+            if (r == 3) CHECK(completed == -1 && fabsf(last_n - 0.9f) < 1e-4f, "+0x268 == 0: the valve does not move and the gate stays out (negative control), n=%.3f", (double)last_n);
+        }
+        (void)done_n;
+        /* opposite polarity: DisableValue above the start -> the winding direction is the other hand direction */
+        {
+            PasState st;
+            unsigned long long now = 90000;
+            int upd, completed = -1;
+            memset(&st, 0, sizeof st);
+            setup_valve(20.0f, 1.0f);
+            st.hold_on = 1; st.m1 = 1;
+            for (upd = 0; upd < 1500; upd++) {
+                const float tgt = ((upd / 15) & 1) ? -80.0f * PAS_DEG2RAD : 80.0f * PAS_DEG2RAD;
+                PasView v;
+                putf(CTRL + 0x108, tgt); putf(CTRL + 0x10C, 0.0f); putf(CTRL + 0x110, 0.0f);
+                now += 33;
+                if (pas_valve_mark(&st, mem, CTRL, now, &v)) pas_valve_hold_apply(&st, mem, CTRL, &v);
+                entity_update(1.0f / 30.0f, 1.0f, 0);
+                if (vn() >= 1.0f) { completed = upd; break; }
+            }
+            CHECK(completed > 0 && completed < 900, "hold-and-move toward DisableValue above the start: %d updates", completed);
+        }
+        /* a decision that does not apply writes nothing: byte for byte (hand at rest on the target) */
+        {
+            PasState st;
+            PasView v;
+            uint8_t copy[sizeof mem];
+            memset(&st, 0, sizeof st);
+            setup_valve(180.0f, 0.0f);
+            st.hold_on = 1; st.m1 = 1;
+            putf(CTRL + 0x108, 0.0f); putf(CTRL + 0x10C, 0.0f); putf(CTRL + 0x110, 0.0f);
+            pas_valve_mark(&st, mem, CTRL, 1000, &v);
+            memcpy(copy, mem, sizeof mem);
+            CHECK(pas_valve_hold_apply(&st, mem, CTRL, &v) == 0 && memcmp(copy, mem, sizeof mem) == 0, "hand on target: no write");
+        }
     }
 
     if (fails) { printf("test_motion_assist: %d FAILED\n", fails); return 1; }

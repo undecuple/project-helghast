@@ -55,6 +55,7 @@ def make_rpcs3(base, app_ver="01.14", with_update=True, with_elf=False, saves=("
         os.makedirs(os.path.join(upd, "USRDIR"))
         open(os.path.join(upd, "USRDIR", "EBOOT.BIN"), "wb").write(fc.SELF_MAGIC + b"\0" * 60)
         tfc.add_update_edat(upd)
+        tfc.add_update_patches(upd)
         if with_elf:
             tfc.write_elf(os.path.join(upd, "USRDIR", "EBOOT.elf"), 21_228_256)
     for n in saves:
@@ -208,9 +209,10 @@ def main():
         snap8 = snapshot(r8)
         root8 = os.path.join(tmp, "root8")
         os.makedirs(root8)
-        go, a8, o8, n8 = run_wizard(r8, ["", "", "", "", "y", "-", "n", "n"], root8)
-        check(os.path.isfile(os.path.join(ri.save_dest(root8, "BCUS98234-AUTO"), "GAME.DAT")) and any("saves: copied 1" in n for n in n8),
-              f"8 wizard copied the save: {n8}")
+        # since installer simplification pass 1 the wizard no longer asks about saves (default no): nothing is copied
+        go, a8, o8, n8 = run_wizard(r8, ["", "", "", "", ""], root8)
+        check(go is True and not os.path.exists(ri.save_dest(root8, "BCUS98234-AUTO")) and any("saves: 1 found, not asked" in n for n in n8),
+              f"8 wizard did not ask about or copy the save: {go} {n8}")
         check(snapshot(r8) == snap8, "8 RPCS3 tree unchanged by the wizard")
         # 9. the old prompts stay: --rpcs3 off, and nothing found
         for want in ("off", e):
@@ -221,6 +223,128 @@ def main():
         # 10. every line the import prints comes from rpcs3_text
         src = open(os.path.join(HERE, "rpcs3_import.py")).read()
         check('say("' not in src and "say(f\"" not in src, "10 rpcs3_import.py has no prose of its own")
+        # 11. games.yml lists the disc as an ISO file (RPCS3 PR #17855): decrypted .iso and .dec.iso offered, encrypted refused,
+        # folder entry unchanged; the old game_path (negative control) refuses the ISO entry
+        from iso_fixture import build_iso
+        import rpcs3_locate as RL
+        sfo = os.path.join(tmp, "iso.sfo")
+        tfc.write_sfo(sfo, {"APP_VER": "01.00", "CATEGORY": "DG", "TITLE": "Synthetic", "TITLE_ID": "BCUS98234", "VERSION": "01.01"})
+        files = {"PS3_DISC.SFB": b".SFB" + b"\0" * 8, "PS3_GAME/PARAM.SFO": open(sfo, "rb").read(),
+                 "PS3_GAME/USRDIR/EBOOT.BIN": fc.SELF_MAGIC + b"\0" * 60,
+                 "PS3_GAME/USRDIR/data_ps3.psarc": fc.PSARC_MAGIC + b"\0" * 6000}
+        bad = dict(files, **{"PS3_GAME/USRDIR/EBOOT.BIN": b"\x11\x22\x33\x44" + b"\0" * 60})
+        for tag, name, fl, good in (("a", "kz3.iso", files, True), ("b", "kz3.dec.iso", files, True), ("c", "kz3-enc.iso", bad, False)):
+            r11, _, _ = make_rpcs3(os.path.join(tmp, "t11" + tag))
+            iso = build_iso(os.path.join(tmp, "t11" + tag, name), fl)
+            open(os.path.join(r11, "config", "games.yml"), "w").write(f"BCUS98234: {iso}\n")
+            gp = RL.game_path(r11, "BCUS98234")
+            check(gp["ok"] and gp.get("is_iso"), f"11{tag} game_path ok with is_iso for {name}: {gp}")
+            f11 = ri.discover(r11)
+            if good:
+                check(f11["disc"] == iso and f11["disc_iso"] and any(iso in ln for ln in ri.describe(f11)), f"11{tag} ISO offered: {f11}")
+            else:
+                check(f11["disc"] == "" and "encrypted" in f11["disc_problem"] and any("cannot be used" in ln for ln in ri.describe(f11)),
+                      f"11{tag} encrypted ISO refused with a reason: {f11}")
+            check(f11["update"], f"11{tag} the update is still found")
+            tx = RL.locate(r11, {"BCUS98234": "01.14"})
+            check(tx["ok"], f"11{tag} locate ok")
+        # folder entry unchanged
+        f11 = ri.discover(r)
+        check(f11["disc"] == dump and not f11["disc_iso"] and not f11["disc_problem"], "11d folder entry unchanged")
+        # a non-ISO file is still refused with a plain text
+        odd = os.path.join(tmp, "odd.bin")
+        open(odd, "wb").write(b"x")
+        open(os.path.join(r, "config", "games.yml"), "w").write(f"BCUS98234: {odd}\n")
+        gp = RL.game_path(r, "BCUS98234")
+        check(not gp["ok"] and gp["code"] == "missing_disc" and ".iso" in gp["text"], f"11e non-iso file refused: {gp}")
+        # negative control: the old game_path logic (is_dir only) refuses an ISO entry
+        check(not os.path.isdir(iso) and os.path.isfile(iso), "11f negative control: the old is_dir test rejects the ISO file")
+        # 12. wizard modes (ported from the Killzone 2 port's tests): --eboot-kind / --identify / --resolve / --detect
+        out = os.path.join(tmp, "res.txt")
+
+        def kv(argv):
+            rc = ri.main(argv + ["--out", out])
+            d = {}
+            for ln in open(out, encoding="utf-8-sig").read().splitlines():
+                k, _, v = ln.partition("=")
+                d.setdefault(k, []).append(v)
+            return rc, {k: v[0] for k, v in d.items()}, d
+        e12 = os.path.join(tmp, "e12")
+        tfc.write_elf(os.path.join(e12, "good.elf"), 21_228_256)     # 1.14 size
+        tfc.write_elf(os.path.join(e12, "old.elf"), 20_745_952)      # the disc's 1.00 EBOOT size
+        tfc.write_elf(os.path.join(e12, "odd.elf"), 12_345)
+        open(os.path.join(e12, "sce.elf"), "wb").write(fc.SELF_MAGIC + b"\0" * 60)
+        open(os.path.join(e12, "junk.elf"), "wb").write(b"junk" * 16)
+        rc, d, _ = kv(["--eboot-kind", os.path.join(e12, "sce.elf"), "--identify"])
+        check(rc == 1 and d["status"] == "encrypted" and "decrypted" in d["help"] and "level" not in d, f"12 SCE file: {d}")
+        rc, d, _ = kv(["--eboot-kind", os.path.join(e12, "old.elf"), "--identify", "--sha256", "--title", "BCUS98234"])
+        check(rc == 0 and d["status"] == "ok" and d["version"] == "1.00" and d["level"] == "FAIL" and d["code"] == "E1"
+              and "1.00" in d["text"] and d["size"] == "20745952" and len(d["sha256"]) == 64, f"12 1.00 EBOOT refused: {d}")
+        rc, d, _ = kv(["--eboot-kind", os.path.join(e12, "good.elf"), "--identify"])
+        check(d["version"] == "1.14" and d["level"] in ("OK", "WARN") and d["level"] != "FAIL", f"12 1.14-size EBOOT not refused: {d}")
+        rc, d, _ = kv(["--eboot-kind", os.path.join(e12, "odd.elf"), "--identify"])
+        check(d["level"] == "WARN", f"12 unknown size warns: {d}")
+        rc, d, _ = kv(["--eboot-kind", os.path.join(e12, "junk.elf"), "--identify"])
+        check(d["level"] == "FAIL", f"12 not an ELF fails: {d}")
+        rc, d, _ = kv(["--eboot-kind", os.path.join(e12, "good.elf")])      # no --identify: kind only
+        check(rc == 0 and d == {"status": "ok"}, f"12 plain --eboot-kind: {d}")
+        # resolve: everything there
+        r12, dump12, upd12 = make_rpcs3(os.path.join(tmp, "t12"), with_elf=True)
+        rc, d, _ = kv(["--resolve", "--rpcs3", r12])
+        check(rc == 0 and d["status"] == "ok" and d["dump"] == dump12 and d["update"] == upd12
+              and d["eboot"] == os.path.join(upd12, "USRDIR", "EBOOT.elf") and d["title"] == "BCUS98234", f"12 resolve ok: {d}")
+        # update with only the encrypted EBOOT.BIN
+        r12b, _, _ = make_rpcs3(os.path.join(tmp, "t12b"))
+        rc, d, dd = kv(["--resolve", "--rpcs3", r12b])
+        check(rc == 1 and d["status"] == "problems" and dd["problem"] == ["encrypted_eboot|"] and "encrypted" in d["help"], f"12 encrypted: {dd}")
+        # the 1.00 EBOOT sitting as the update's EBOOT.elf
+        r12c, _, u12c = make_rpcs3(os.path.join(tmp, "t12c"))
+        tfc.write_elf(os.path.join(u12c, "USRDIR", "EBOOT.elf"), 20_745_952)
+        rc, d, dd = kv(["--resolve", "--rpcs3", r12c])
+        check(rc == 1 and d["status"] == "problems" and d["eboot"] == "" and dd["problem"][0].startswith("eboot_e1|")
+              and "1.00" in dd["problem"][0], f"12 1.00 EBOOT as update elf refused: {dd}")
+        # RPCS3 found but the update is 1.00
+        r12d, _, _ = make_rpcs3(os.path.join(tmp, "t12d"), app_ver="01.00")
+        rc, d, dd = kv(["--resolve", "--rpcs3", r12d])
+        check(rc == 1 and d["status"] == "problems" and d["update"] == "" and dd["problem"][0].startswith("wrong_version|")
+              and "01.00" in dd["problem"][0] and "not 1.14" in d["help"], f"12 wrong-version update: {dd}")
+        # RPCS3 found, no update at all
+        r12e, _, _ = make_rpcs3(os.path.join(tmp, "t12e"), with_update=False)
+        rc, d, dd = kv(["--resolve", "--rpcs3", r12e])
+        check(d["status"] == "problems" and any(x.startswith("missing_update|") for x in dd["problem"]), f"12 no update: {dd}")
+        # no RPCS3 in the folder
+        rc, d, _ = kv(["--resolve", "--rpcs3", e])
+        check(rc == 1 and d["status"] == "not_found", f"12 not found: {d}")
+        rc, d, _ = kv(["--detect", "--rpcs3", r12])
+        check(rc == 0 and d["status"] == "ok" and d["root"], f"12 detect: {d}")
+        saved = {k: os.environ.get(k) for k in ("HOME", "XDG_CONFIG_HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA")}
+        try:
+            os.environ.update(HOME=e, USERPROFILE=e)
+            for k in ("XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"):
+                os.environ.pop(k, None)
+            rc, d, _ = kv(["--detect"])
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        check(rc == 1 and d["status"] == "not_found", f"12 detect none: {d}")
+        # the result file is UTF-8 with BOM (Inno reads it), and the RPCS3 tree is untouched by every mode
+        check(open(out, "rb").read(3) == b"\xef\xbb\xbf", "12 --out has a BOM")
+        snap = snapshot(r12)
+        kv(["--resolve", "--rpcs3", r12])
+        check(snapshot(r12) == snap, "12 resolve writes nothing in the RPCS3 tree")
+        # an unexpected error still leaves status=error in --out
+        orig = ri.resolve
+        ri.resolve = lambda h: 1 / 0
+        try:
+            import contextlib
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = ri.main(["--resolve", "--rpcs3", r12, "--out", out])
+        finally:
+            ri.resolve = orig
+        check(rc == 3 and "status=error" in open(out, encoding="utf-8-sig").read(), "12 error -> status=error")
+        # the help texts hold no decryption tool or menu path
+        low = (T.HELP_ENCRYPTED + T.HELP_NO_ELF + T.HELP_UPDATE + T.HELP_VERSION + T.HELP_DISC).lower()
+        check(not any(w in low for w in ("file >", "install packages", "keys", "decrypt it with")), "12 help names no tool/menu")
     print("test_rpcs3_import:", "FAIL (%d)" % len(FAILS) if FAILS else "PASS")
     return 1 if FAILS else 0
 

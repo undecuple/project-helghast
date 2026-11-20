@@ -89,9 +89,14 @@ def main():
         with open(page_path, "a", encoding="utf-8") as f:
             f.write("\nhand edit\n")
         expect(features.main(["--root", root, "--check", "-q"]) == 1, "stale page caught")
+        expect(features.main(["--root", root, "--data-only", "-q"]) == 0, "--data-only ignores a stale page (a branch may not carry FEATURES.md)")
+        os.remove(page_path)
+        expect(features.main(["--root", root, "--data-only", "-q"]) == 0 and features.main(["--root", root, "--check", "-q"]) == 1,
+               "--data-only passes without the page, --check does not")
         features.main(["--root", root, "-q"])
 
         w(root, features.ENH, ENH + "\n## Ray tracing (wanted backlog)\nShadows first.\n")
+        expect(features.main(["--root", root, "--data-only", "-q"]) == 1, "--data-only still catches a missing enhancements.md entry")
         expect(features.main(["--root", root, "--check", "-q"]) == 1, "missing enhancements.md entry caught")
         w(root, features.ENH, ENH)
 

@@ -1,5 +1,5 @@
 KZ3 patch 2143 (RSX pass 133): fragment DDX and DDY (screen-space derivatives) are decompiled instead of dropped.
-Design and code from the Killzone 2 port (its patch 2096); both projects are MIT and have the same owner.
+Design and code from the Killzone 2 port (its patch 2096); both projects are MIT and have the same author.
 
 The decompiler had no case for DDX (0x15) or DDY (0x16): it emitted nothing, so the destination register kept 0 and a
 program dividing by fwidth(uv) (Killzone 2's anti-aliased menu panels, which blended away to transparent) got NaN, which
@@ -11,7 +11,7 @@ in every pipeline key, so no key changes. Not ported: the Killzone 2 port's DDY 
 window (needs its patch 2090, WPOS origin, which this port does not have). ASSUMPTION: DDY follows the window y.
 Host test: tools/smoke/test_fp_deriv.sh. Upstream candidate (DDX/DDY are general NV40 ops).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
 index 719ada0..dd965db 100644

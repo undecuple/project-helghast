@@ -7,7 +7,7 @@ while it runs and until everything is released, saves keybinds.ini after a chang
 Custom), KZ3_PM_TEST_BTN=<ps3 button> answers a waiting capture (Xvfb runs), the pad family comes from port 0.
 Host test: tools/net/test_pad_remap_ui.c. Page: port/net/kz3_padpage.h.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (the v0.19.0 chain files where available; originals for the rest, three-way merged where they did not apply).
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index 4141af8..e4a5fe2 100644

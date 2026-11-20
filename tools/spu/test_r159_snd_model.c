@@ -60,6 +60,52 @@ static void model_k3(spu_context* c)
     c->gpr[3]._u32[0] = fs(pend, F(spu_cuflt(spu_cfltu(S(pend), 173), 155)));
 }
 
+
+/* Pass 160: K3 calls longer than the kernel's stack buffer (512 groups = 2048 outputs): n = 2056 (the first long one),
+ * 4096, 0x8000 (dst = 128 KB; 0x10000 outputs would be a 256 KB dst = the whole local store, which the kernel refuses
+ * as past the LS / over the tap table, so 0x8000 is the largest testable), steps up to 1.0 so the window stays near
+ * the source, plus dst overlapping the LAST windows (the long path must decline with the local store untouched). */
+static int long_k3(kz3_native_fn fn)
+{
+    static const uint32_t ns[] = {2048, 2056, 4096, 0x4000, 0x7FF8, 0x8000};
+    int bad = 0, n = 0, refused = 0;
+    for (int t = 0; t < 36; t++) {
+        const uint32_t cnt = ns[t % 6];
+        const int overlap = t >= 24 && t % 6 >= 1, raw = t % 9 == 8;
+        memset(&O, 0, sizeof O);
+        O.ls = O.ls_store;
+        for (uint32_t i = 0; i < 0x40000; i++) O.ls[i] = (uint8_t)rnd();
+        for (int r = 0; r < 128; r++) for (int k = 0; k < 4; k++) O.gpr[r]._u32[k] = rnd();
+        for (int i = 0; i < 4; i++) st32(O.ls, 0x16740 + 4 * i, bits((float)i));
+        for (int i = 0; i < 1024; i++) st32(O.ls, 0x15600 + 4 * i, bits(rf() * 0.5f + (i % 4 == 1 ? 0.5f : 0.0f)));
+        float step = 0.05f + (float)(rnd() & 0xFFFF) / 65536.0f * (t % 3 == 0 ? 0.25f : 0.95f), phase0 = (float)(rnd() & 0xFFFF) / 65536.0f;
+        if (!overlap && step * (float)cnt > 18000.0f) step = 18000.0f / (float)cnt;   /* windows stay below the tap table, dst above it */
+        const uint32_t src = overlap ? 0x17000 : 0x1000 + (rnd() % 0x400 & ~3u);
+        const uint32_t span = (uint32_t)((float)cnt * step) + 128;
+        for (uint32_t i = 0; i < span && !raw; i++) st32(O.ls, src - 16 + 4 * i, t % 6 == 0 ? ((rnd() & 3) ? 0 : 0x80000000u) : bits(rf()));
+        uint32_t dst = 0x16B80;
+        if (overlap) dst = (src - 12 + 4 * ((uint32_t)((float)cnt * step * 0.98f)) - 64) & ~15u;   /* inside the windows of the last groups */
+        O.gpr[3]._u32[0] = bits(step); O.gpr[4]._u32[0] = bits(phase0); O.gpr[5]._u32[0] = src; O.gpr[6]._u32[0] = dst; O.gpr[7]._u32[0] = cnt;
+        B = O; B.ls = B.ls_store;
+        const int took = fn(&B);
+        if (overlap) {
+            if (took || memcmp(B.ls_store, O.ls_store, sizeof O.ls_store) || memcmp(B.gpr, O.gpr, sizeof O.gpr)) { bad++; printf("long overlap t=%d n=%u not declined cleanly (took=%d)\n", t, cnt, took); }
+            refused++;
+            continue;
+        }
+        if (!took) { bad++; printf("long declined t=%d n=%u\n", t, cnt); continue; }
+        A = O; A.ls = A.ls_store;
+        model_k3(&A);
+        int diff = memcmp(A.ls_store, B.ls_store, sizeof A.ls_store) != 0;
+        for (int r = 0; r < 128; r++) if (r != 3 && memcmp(&A.gpr[r], &B.gpr[r], 16)) diff = 1;
+        if (A.gpr[3]._u32[0] != B.gpr[3]._u32[0]) diff = 1;
+        if (diff) { bad++; printf("long differs t=%d n=%u\n", t, cnt); }
+        n++;
+    }
+    printf("k3 long (n 2048..0x8000): %d equal-checked, %d overlap declines (LS untouched), %d bad\n", n, refused, bad);
+    return bad;
+}
+
 int main(int argc, char** argv)
 {
     const int k7 = argc > 1 && !strcmp(argv[1], "k7a");
@@ -153,5 +199,6 @@ int main(int argc, char** argv)
         n_ok++;
     }
     printf("%s: %d equal-checked (%d early returns), %d refusals, %d bad\n", k7 ? "k7a" : "k3", n_ok, n_early, n_refused, bad);
+    if (!k7) bad += long_k3(fn);
     return bad != 0;
 }

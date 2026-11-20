@@ -9,6 +9,7 @@
 #include "rsx_hud169.h"
 #include "rsx_present_geometry.h"
 #include "rsx_ui_provenance.h"
+#include "rsx_first_frame.h"  /* patch 2199: ld_present_swap notes the first presented frame */
 
 typedef unsigned u32;
 typedef unsigned long long u64;
@@ -130,6 +131,13 @@ static int GetClientRect(void* hwnd, RECT* out)
     *out = client;
     return 1;
 }
+/* patch 2199 stubs: first-frame timing in ld_present_swap (Windows clock types; GetProcessTimes fails = "no time"). */
+typedef struct { unsigned dwLowDateTime, dwHighDateTime; } FILETIME;
+typedef union { struct { unsigned LowPart, HighPart; }; unsigned long long QuadPart; } ULARGE_INTEGER;
+typedef void* HANDLE;
+static HANDLE GetCurrentProcess(void) { return 0; }
+static void GetSystemTimeAsFileTime(FILETIME* f) { f->dwLowDateTime = f->dwHighDateTime = 0; }
+static int GetProcessTimes(HANDLE h, FILETIME* c, FILETIME* x, FILETIME* k, FILETIME* u) { (void)h;(void)c;(void)x;(void)k;(void)u; return 0; }
 typedef pthread_rwlock_t SRWLOCK;
 #define SRWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
 #define AcquireSRWLockShared(p) ((void)pthread_rwlock_rdlock(p))

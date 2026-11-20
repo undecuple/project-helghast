@@ -39,7 +39,7 @@ build "$P" "$O" || { echo "FAIL: build of the patched runtime test"; exit 1; }
 run_all "$O" || { echo "FAIL: patched tree"; exit 1; }
 # negative control: reverse patch 3009 in a scratch copy of ppu_loader.cpp
 N="$O/neg"; mkdir -p "$N/runtime/ppu"; cp "$P/runtime/ppu/ppu_loader.cpp" "$N/runtime/ppu/"
-# GNU patch, not git apply: in lane worktrees work/spu is a symlink to the main checkout's, and git apply refuses
+# GNU patch, not git apply: in linked worktrees work/spu is a symlink to the main checkout's, and git apply refuses
 # paths "beyond a symbolic link" (lane/rsx merge, 2026-11-11).
 if ! patch -s -R -p1 --no-backup-if-mismatch -d "$N" < "$ROOT/port/patches/3009-ppu-reservation-registry-idempotent.patch" >"$O/rev.err" 2>&1; then
   echo "FAIL: cannot reverse patch 3009 for the negative control: $(head -2 "$O/rev.err")"; exit 1; fi

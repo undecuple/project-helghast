@@ -143,8 +143,8 @@ mapfile -d '' -t GCM_INC < <(awk '/cellGcmSys\.c\.obj: /{f=1} f&&/INCLUDES =/{su
 # Independent of later patches: reverse, newest first, the cellGcmSys.c part of every patch from 1027 on (in the
 # series order of tools/ps3recomp-patched.sh), so the file ends as "series up to but excluding 1027".
 cp "$S/libs/video/cellGcmSys.c" "$O/cellGcmSys_no1027.c"
-# A file section starts at its "--- a/PATH" line (some patches have "diff --git" headers, some not).
-gcm_part() { awk '/^diff --git /{f=0; next} /^--- a\//{f=($2=="a/libs/video/cellGcmSys.c")} f' "$1"; }
+# A file section starts at its "--- a/PATH" (or "--- /dev/null", a new file) line (some patches have "diff --git" headers, some not; 2188 adds rsx_o0.h without one, and that section must not be taken for the cellGcmSys.c one).
+gcm_part() { awk '/^diff --git /{f=0; next} /^--- (a\/|\/dev\/null)/{f=($2=="a/libs/video/cellGcmSys.c")} f' "$1"; }
 mapfile -t _later < <(printf '%s\n' port/patches/*.patch | awk '/\/1027-/{f=1} f' | sort -r)
 for p in "${_later[@]}"; do
   part="$(gcm_part "$p")"; [[ -n "$part" ]] || continue
@@ -155,10 +155,20 @@ done
 for ((k=${#_later[@]}-1; k>=0; k--)); do
   p="${_later[k]}"; [[ "$p" == *"/1027-"* ]] && continue
   part="$(gcm_part "$p")"; [[ -n "$part" ]] || continue
-  # A later part that instruments 1027's own code (1029's frame-chain trace) cannot exist without it: skip it.
+  # A later part that instruments 1027's own code cannot exist without it. Old parts (1029's frame-chain trace and the
+  # patches stacked on it) are left out whole: a half-applied 1085 would call helpers 1029 defines. From 2100 on
+  # (2184/2185 hook the write-back copy 1027 sits beside) apply the hunks that still apply exactly (-F0, no fuzz) and
+  # drop the others: skipping a whole part (2188) also drops the definitions (g_rsx_o0, the split funnel) that other
+  # runtime objects need, and the archive's cellGcmSys object would be pulled into the link.
+  pn="${p##*/}"; pn="${pn%%-*}"
   if ! patch -s --dry-run "$O/cellGcmSys_no1027.c" <<<"$part" >/dev/null 2>&1; then
-    echo "no-1027 control: cellGcmSys.c part of $p depends on 1027, left out"; continue; fi
-  patch -s "$O/cellGcmSys_no1027.c" <<<"$part"
+    if (( 10#$pn < 2100 )); then
+      echo "no-1027 control: cellGcmSys.c part of $p depends on 1027, left out"; continue; fi
+    echo "no-1027 control: cellGcmSys.c part of $p depends on 1027 in some hunks, those are left out"
+    patch -s -F0 -N --no-backup-if-mismatch -r /dev/null "$O/cellGcmSys_no1027.c" <<<"$part" >/dev/null || true
+  else
+    patch -s "$O/cellGcmSys_no1027.c" <<<"$part"
+  fi
 done
 rm -f "$O/cellGcmSys_no1027.c.orig"
 ! grep -q gcm_walker_user_command "$O/cellGcmSys_no1027.c" || { echo "1027 did not reverse" >&2; exit 1; }

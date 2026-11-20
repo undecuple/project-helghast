@@ -52,4 +52,4 @@ def zip_name(version):
 # ASSUMPTION: the runtime (port/net/kz3_net.c online.ini, patch 2037 keybinds.ini) names the same folder; a rename
 # changes those strings too (outside this module: a maintainer request).
 DATA_FOLDER = PRODUCT
-OLD_DATA_FOLDERS = ("Killzone 3 PC",)        # the name before the rename to Project Helghast (2026-10-12)
+OLD_DATA_FOLDERS = ("Killzone 3 PC",)        # the name before the rename to Project Helghast

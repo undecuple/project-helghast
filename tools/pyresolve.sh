@@ -3,8 +3,7 @@
 # Order: python3, then `py -3` (the Windows launcher), then python. A candidate counts only if it prints version 3 and is
 # not the Microsoft Store alias (a WindowsApps stub that opens the Store and exits non-zero or prints nothing); on
 # Git Bash that stub is what `python3` resolves to when no real Python is installed (issue #9 of the sibling port
-# project-pyrrhus, reported by feanor-noldorin). KZ3_PYTHON overrides. See
-# docs/in-progress/reports/release.md r71.
+# project-pyrrhus, reported by feanor-noldorin). KZ3_PYTHON overrides.
 kz3_pick_python() {
   local c p
   # shellcheck disable=SC2034

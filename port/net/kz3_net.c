@@ -762,9 +762,18 @@ void kz3_net_register(void)
         }
         else log_line("KZ3_NET_CAPTURE ignored: the server is not on 127.0.0.0/8");
     }
+    /* Test only, diagnostic log: the passive listener (records connections and frame headers, sends nothing); never with the capture. */
+    e = getenv("KZ3_NET_PASSIVE");
+    if (e && *e && strcmp(e, "0")) {
+        const char* c = getenv("KZ3_NET_CAPTURE");
+        if (c && *c && strcmp(c, "0")) log_line("KZ3_NET_PASSIVE ignored: KZ3_NET_CAPTURE is set");
+        else if (ip[0] != 127) log_line("KZ3_NET_PASSIVE ignored: the server is not on 127.0.0.0/8");
+        else kz3_net_passive_from_env(log_line);
+    }
 }
 
 /* The loopback capture is its own file; included here so the exe's source list (port/kz3/CMakeLists.txt) and the
  * host test (tools/net/test_kz3_net.c includes this file) need no change. */
 #include "kz3_online_cfg.c"
 #include "rt_capture.c"
+#include "rt_passive.c"

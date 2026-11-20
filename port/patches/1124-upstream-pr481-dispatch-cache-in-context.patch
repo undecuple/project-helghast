@@ -21,7 +21,7 @@ Upstream candidate: the context-resident variant (no TLS).
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (cache in the context, default off) over upstream's TLS cache (on by default upstream). TODO fixup: upstream's `dcache_id, dcache_residency` field in spu_context.h duplicates 1124's `dcache_residency` (compile error until removed).
 
-Rebased on ps3recomp v0.19.0 (group B, R&C 2026-11-09): builds on #636 (b3bfd018, relocatable lifts): spu_dcache_ent gains
+Rebased on ps3recomp v0.19.0: builds on #636 (b3bfd018, relocatable lifts): spu_dcache_ent gains
 `reloc, reloc_delta` (entries are 40 bytes now, 20 KiB per context), a miss records the &reloc out-parameter of the
 3-argument spu_lifted_lookup_full and the reloc_delta it set, a hit repeats ctx->reloc_delta, the shadow compare passes NULL.
 Upstream's dcache_id/dcache_residency field and t_dcache stay replaced (no TLS, no context id); default still off.

@@ -18,11 +18,11 @@ elif ! grep -q rsx_vp_set_branch_bits "$D/rsx_vp_decompiler.h"; then
   echo "[test_vp_branch_bits] SKIP: toolkit without patch 2100 (no rsx_vp_set_branch_bits)"; exit 0; fi
 O="$ROOT/build/smoke-host/vp_branch_bits"; mkdir -p "$O"
 CC="${CC:-cc}"
-W="-std=c11 -Wall -Wextra -Werror -Wno-unused-function -Wno-format-truncation -I$D -I$V -I$PT/include $OLD"
-$CC $W -O2 "$ROOT/tools/smoke/test_vp_branch_bits.c" "$D/rsx_vp_decompiler.c" -o "$O/test_vp_branch_bits" -lm
+W=(-std=c11 -Wall -Wextra -Werror -Wno-unused-function -Wno-format-truncation -I"$D" -I"$V" -I"$PT/include" ${OLD:+"$OLD"})
+$CC "${W[@]}" -O2 "$ROOT/tools/smoke/test_vp_branch_bits.c" "$D/rsx_vp_decompiler.c" -o "$O/test_vp_branch_bits" -lm
 "$O/test_vp_branch_bits"
 if echo "int main(void){return 0;}" | $CC -fsanitize=address,undefined -x c - -o "$O/probe" 2>/dev/null && "$O/probe"; then
-  $CC $W -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$ROOT/tools/smoke/test_vp_branch_bits.c" \
+  $CC "${W[@]}" -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$ROOT/tools/smoke/test_vp_branch_bits.c" \
     "$D/rsx_vp_decompiler.c" -o "$O/test_asan" -lm
   "$O/test_asan" >/dev/null && echo "[PASS] ASan/UBSan pass" || { echo "[FAIL] ASan/UBSan pass"; exit 1; }
 fi

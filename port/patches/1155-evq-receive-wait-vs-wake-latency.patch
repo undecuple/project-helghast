@@ -5,7 +5,7 @@ Walker-plan step 8c: pass 131 measured 0.22 ms per receive x ~300/s on ppu-main 
 max 2.8 ms: a spread far wider than one wake path, so mostly sender lateness; this table settles it per queue). Off (default) = no clock reads,
 no prints. Helper header runtime/platform/kz3_evq_lat.h; host test tools/spu/test_evq_lat.sh.
 
-Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): KZ3's patch (not in R&C's series before), applied
+Rebased on ps3recomp v0.19.0: KZ3's patch, applied
 after 1144/1149: the untimed receive loop gained upstream's `q->waiters--` on cancel (context only). Plain git diff format.
 
 diff --git a/runtime/platform/kz3_evq_lat.h b/runtime/platform/kz3_evq_lat.h

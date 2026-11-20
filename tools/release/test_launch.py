@@ -72,6 +72,7 @@ def make_tree(tmp):
                                                        "TITLE_ID": "BCUS98234"})
     write(os.path.join(update, "USRDIR", "EBOOT.BIN"))
     tfc.add_update_edat(update)
+    tfc.add_update_patches(update)
     write(os.path.join(root, "port", "spu", "ppu_overrides.txt"), "a\n")
     write(os.path.join(root, "VERSION.txt"), "0.1.0")
     os.makedirs(os.path.join(root, "ps3recomp", "tools"))
@@ -211,6 +212,43 @@ def main():
         check(rc == 0 and calls and calls[0][0] == [os.path.join(root, "build", "kz3.exe")]
               and calls[0][1]["cwd"] == root and "PS3_VFS_ROOT" not in calls[0][1]["env"]
               and calls[0][1]["env"]["PATH"] == "/bin", f"8 run game: kz3.exe alone, plain env {calls[:1]}")
+        # 8b. the game ended (B2): the launcher reads the exit code and the game's log and says why, naming the log
+        glog = os.path.join(root, "build", "logs", "Killzone3-PC-20261118-120000.log")
+
+        def end_run(rc_, text):
+            def r(argv, **kw):
+                if text is not None:
+                    write(glog, text)
+                return rc_
+            ui_ = FakeUI([])
+            rc2 = la.main(["--root", root], ui=ui_, run=r, environ=env)
+            if os.path.exists(glog):
+                os.remove(glog)
+            return rc2, ui_.infos
+        OVL_BAD = "[overlay] /u: added yes, patches no -> on\n"
+        rc2, infos = end_run(0, OVL_BAD)
+        check(rc2 == 0 and len(infos) == 1 and "patch_data_ps3_sp" in infos[0] and "Killzone3-PC-20261118-120000.log" in infos[0]
+              and "menu stays black" in infos[0] and "Copy the complete installed update folder" in infos[0], f"8b exit 0 + patches no: {infos}")
+        rc2, infos = end_run(0, "[overlay] /u: added yes, patches yes -> on\n[rsx] D3D12 adapter: X (vendor 0x10DE NVIDIA device 0x1), 8192 MB, hardware\n")
+        check(rc2 == 0 and infos == [], f"8b control: exit 0 and a healthy log: no message {infos}")
+        rc2, infos = end_run(0, "[D3D12] device (a, b): \"WARP\" vendor=0x1414 device=0x8C software=1 VRAM 0 MB\n")
+        check(infos == [], f"8b control: exit 0 on the software device alone: no message {infos}")
+        rc2, infos = end_run(3, "[D3D12] ERROR: no D3D12 device on any adapter (x)\n")
+        check(rc2 == 3 and "code 3" in infos[0] and "no Direct3D 12 graphics device" in infos[0] and "driver" in infos[0], f"8b no device: {infos}")
+        rc2, infos = end_run(1, "[D3D12] device (a, b): \"WARP\" vendor=0x1414 device=0x8C software=1 VRAM 0 MB\n")
+        check("software renderer" in infos[0], f"8b exit 1 on the software device: {infos}")
+        rc2, infos = end_run(7, "nothing known here\n")
+        check("code 7" in infos[0] and "does not name a cause" in infos[0] and "Killzone3-PC-20261118-120000.log" in infos[0], f"8b exit 7, unknown cause: {infos}")
+        rc2, infos = end_run(7, None)
+        check("code 7" in infos[0] and "No game log was written" in infos[0], f"8b exit 7, no log: {infos}")
+        rc2, infos = end_run(la.CONSOLE_CLOSED[0], None)
+        check(infos == [], f"8b control: the console closed by the player: no message {infos}")
+        old = os.path.join(root, "build", "logs", "Killzone3-PC-20200101-000000.log")
+        write(old, OVL_BAD)
+        os.utime(old, (1000, 1000))
+        rc2, infos = end_run(0, None)
+        check(infos == [], f"8b control: a log from an earlier run is not read {infos}")
+        os.remove(old)
         gi = la.read_game_ini(os.path.join(root, "build", "kz3.ini"))
         check(gi.get("vfs_root") == "../vfs" and gi.get("data_dir") == ".."
               and gi.get("window_size") == "1080p", f"8 kz3.ini rewritten (portable data_dir, hand edit kept) {gi}")

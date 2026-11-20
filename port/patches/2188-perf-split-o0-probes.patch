@@ -1,0 +1,1176 @@
+KZ3 patch 2188 (RSX pass 166, command-thread overhaul O0: probes; diagnostics only, guest-invisible, every output behind a switch, default OFF):
+1. RSX_PERF_SPLIT=1: [perf-split] (+ [perf-split-d], [perf-split-o]) per [perf-walk] window, the line format is shared with the Killzone 2 port. Exclusive
+   buckets from a stack in new libs/video/rsx_o0.h: the walker's clock is charged to the innermost open bucket, so the buckets add
+   up to the pass time by construction; decode_f (CG word loop) and decode_d (rsx_dispatch_method minus its sinks) are separate in
+   [perf-split-d] and summed in decode=. Needs RSX_PERF's reporter (implied); without RSX_PERF_PROF=A,B it measures the whole run.
+   gpu= is the RSX_PERF_GPU=1 fence poller's busy time (-1 when it is off).
+2. RSX_O0=1: [o0-state] [o0-4b] [o0-ref] [o0-seg] [o0-tex] [o0-tex-src] [o0-wbov] once per second (tex-src every 5th).
+Off = one int test per hook (g_rsx_split_act / g_rsx_o0.on) and the sink wrappers are not installed.
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "rsx_commands.h"
++#include "rsx_o0.h"   /* patch 2188: RSX_O0=1 legacy-state reader probe */
+ #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
+ #include <stdio.h>
+ #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+@@ -685,6 +686,7 @@
+           if (k == ns && ns < 16) { seen[ns++] = data;
+               if (!_first) fprintf(stderr, "[RSX] CLEAR_SURFACE new mask=0x%X color=0x%08X\n",
+                                    data, state->color_clear_value); } }
++        if (g_rsx_o0.on && s_backend && s_backend->clear) RSX_O0_ADD(g_rsx_o0.be_clear, 1);   /* patch 2188 */
+         if (s_backend && s_backend->clear) {
+             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
+             u8 stencil = state->zstencil_clear_value & 0xFF;
+@@ -878,6 +880,7 @@
+ 
+             /* Flush dirty state to backend before drawing */
+             if (s_backend) {
++                if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.be_flush, 1);   /* patch 2188 */
+                 if (state->surface_dirty && s_backend->set_render_target)
+                     s_backend->set_render_target(s_backend->userdata, state);
+                 if (state->viewport_dirty && s_backend->set_viewport)
+@@ -946,6 +949,7 @@
+             }
+         }
+         ps3_ms("rsx:draw_arrays");
++        if (g_rsx_o0.on && s_backend && s_backend->draw_arrays) RSX_O0_ADD(g_rsx_o0.be_draw, 1);   /* patch 2188 */
+         if (s_backend && s_backend->draw_arrays)
+             s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
+         return 0;
+@@ -972,6 +976,7 @@
+         u32 count = ((data >> 24) & 0xFF) + 1;
+         { static int _d=0; if (PS3_LOG_FIRST(_d, 8)) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
+         ps3_ms("rsx:draw_indexed");
++        if (g_rsx_o0.on && s_backend && s_backend->draw_indexed) RSX_O0_ADD(g_rsx_o0.be_draw, 1);   /* patch 2188 */
+         if (s_backend && s_backend->draw_indexed)
+             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
+                                     first, count);
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -20,6 +20,11 @@
+  */
+ 
+ #include "rsx_live_draw.h"
++#include "rsx_o0.h"   /* patch 2188 */
++/* Patch 2188 (RSX_PERF_SPLIT=1): exclusive buckets, rsx_o0.h. One int test when off. LDS_POP also closes anything opened
++ * after its token that an early return left open. */
++#define LDS_PUSH(tok, b) const int tok = g_rsx_split_act ? rsx_split_push_w(b) : 0
++#define LDS_POP(tok) do { if (tok && g_rsx_split_act) rsx_split_pop_w(tok); } while (0)
+ #include "rsx_present_geometry.h"
+ #include "rsx_ui_provenance.h"
+ #include "rsx_cb_reuse.h"
+@@ -1763,6 +1768,7 @@
+ {
+     const u8* p = s_ld_fc_inner(user, location, offset, min_bytes);
+     if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_range(0 /* RSX_FC_RD_RENDERER */, location == 0 ? 1 : 2, offset, p, min_bytes, 1);
++    if (g_rsx_o0.on) rsx_o0_read(&g_rsx_o0, RSX_O0_RK_RENDERER, location ? 1u : 0u, offset, min_bytes);   /* patch 2188 */
+     return p;
+ }
+ /* Patch 2185 (LD_WB_DEFER): guest stores of the write-backs can be pending (g_wbd.n != 0). Every renderer read of guest bytes
+@@ -2857,7 +2863,9 @@
+         return 0;
+     }
+     const long long w0 = rsx_perf_now();
++    LDS_PUSH(s_fw2, RSX_SB_X_WAITO);   /* patch 2188 */
+     const DWORD wait_rc = WaitForSingleObject(g.fence_event, INFINITE);
++    LDS_POP(s_fw2);
+     rsx_perf_add(RSX_PERF_GPUWAIT_T, rsx_perf_now() - w0);
+     /* patch 2157: a wait that did not signal, or a fence that did not reach v (device removal completes the event
+      * with an all-ones value), is a failure: the caller must not treat the range as free. */
+@@ -2890,6 +2898,10 @@
+ /* Patch 2029: walker split timers (RSX_PERF=1 + RSX_PERF_PROF=A,B window). */
+ #define LDW_T0(name) const long long name = rsx_perf_walk_on() ? rsx_perf_now() : 0
+ #define LDW_ADD(idx, t0) do { if (t0) rsx_perf_add((idx), rsx_perf_now() - (t0)); } while (0)
++/* Patch 2188 (RSX_PERF_SPLIT=1): exclusive buckets, rsx_o0.h. One int test when off. LDS_POP also closes anything opened
++ * after its token that an early return left open. */
++#define LDS_PUSH(tok, b) const int tok = g_rsx_split_act ? rsx_split_push_w(b) : 0
++#define LDS_POP(tok) do { if (tok && g_rsx_split_act) rsx_split_pop_w(tok); } while (0)
+ /* Patch 2051: RSX_PERF_GPU=1 measures how long the GPU is busy per second, from outside:
+  * every submit (chunk or frame list) notes its QPC time under its fence value; a 1 ms
+  * poller of the fence turns completions into busy intervals [max(previous completion,
+@@ -3182,6 +3194,7 @@
+             if (st < prev) st = prev;
+             const double d = now > st ? (double)(now - st) * tk : 0.0;
+             busy += d; if (d > longest) longest = d;
++            rsx_perf_add(RSX_PERF_S_GPU_T, now > st ? now - st : 0); rsx_perf_add(RSX_PERF_S_GPU_N, 1);   /* patch 2188 */
+             lists++; prev = now;
+             if (g_gt.on > 0 && g_gt.fr[v & 1023].v == v) ld_gt_consume(g_gt.fr[v & 1023].first, g_gt.fr[v & 1023].n, g_gt.fr[v & 1023].c);
+         }
+@@ -3426,6 +3439,7 @@
+ {
+     g_ld_unsubmitted = 0;
+     LDW_T0(submit_t0);
++    LDS_PUSH(s_sub, RSX_SB_SUBMIT);   /* patch 2188 */
+ #if defined(YZ_PERF_PROFILE)
+     const LONGLONG flush_begin = ld_profile_qpc();
+     g_ld_profile.total.flush_reason[reason]++;
+@@ -3461,6 +3475,7 @@
+         return;
+     }
+     ld_rb_stamp(v);   /* patch 2027 */
++    LDS_POP(s_sub);
+     LDW_ADD(RSX_PERF_W_SUBMIT_T, submit_t0);
+     if (g.fif_n > 1 && reason == LD_FLUSH_PRESENT) {
+         /* Frame N is queued; recycle frame N-1's slot once its fence passes,
+@@ -3510,7 +3525,9 @@
+             return;
+         }
+         { const long long w0 = rsx_perf_now();
++          LDS_PUSH(s_fw, reason == LD_FLUSH_READBACK ? RSX_SB_RBWAIT : RSX_SB_X_WAITO);   /* patch 2188 */
+           WaitForSingleObject(g.fence_event, INFINITE);
++          LDS_POP(s_fw);
+           rsx_perf_add(RSX_PERF_GPUWAIT_T, rsx_perf_now() - w0);
+           if (rsx_perf_walk_on())   /* patch 2029: which flushes wait */
+               rsx_perf_add(reason == LD_FLUSH_READBACK ? RSX_PERF_W_WAIT_RB_T : RSX_PERF_W_WAIT_OTHER_T,
+@@ -6052,6 +6069,7 @@
+ static u32 texture_srv_slot_entry(const rsx_dsp_texture* t, u32 i)
+ {
+     ld_wbh_bind(t);   /* patch 2184 diagnostic */
++    if (g_rsx_o0.on) rsx_o0_tex_bind(&g_rsx_o0, t->location ? 1u : 0u, t->offset);   /* patch 2188 */
+     const u32 remap = t->remap & 0xFFFF;
+     static int refresh_enabled = -1;
+     if (refresh_enabled < 0)
+@@ -6101,6 +6119,7 @@
+             const u64 hash = texture_content_hash(t, &readable);
+             LDW_ADD(RSX_PERF_W_TEX_HASH_T, th_t0);
+             ld_redecode_note(1, t, entry->span, th_t0 ? rsx_perf_now() - th_t0 : 0);   /* patch 2045 diagnostic */
++            if (g_rsx_o0.on) rsx_o0_tex_hash(&g_rsx_o0, t->location ? 1u : 0u, t->offset, readable && hash != entry->content_hash, entry->written != 0);   /* patch 2188 */
+             ld_tex_hash_note(readable, hash != entry->content_hash, &entry->quiet, &entry->written, &entry->dyn,
+                              t->location, t->offset, t->width, t->height, t->format, entry->span);
+             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
+@@ -11602,6 +11621,7 @@
+     }
+     LDW_ADD(RSX_PERF_W_VTX_REMAP_T, remap_t0);
+     LDW_T0(fetch_t0);
++    LDS_PUSH(s_ft, RSX_SB_FILL);   /* patch 2188 */
+     dc.layout = *layout;
+     rsx_vertex_fetch_plan_init(
+         &dc.fetch_plan, &g.rsx, layout,
+@@ -11621,6 +11641,7 @@
+             dc.vg = 1;
+             g_vg.draws++; g_vg.verts += dc.n_refs; g_vg.block_bytes += dc.vg_d.block_bytes;
+             dc.n_verts = dc.n_refs;
++            LDS_POP(s_ft);
+             if (fetch_t0) {
+                 LDW_ADD(RSX_PERF_W_VTX_FETCH_T, fetch_t0);
+                 rsx_perf_add(RSX_PERF_W_VTX_REF_N, dc.n_source_refs);
+@@ -11681,6 +11702,7 @@
+         }
+     }
+     dc.n_verts = dc.n_refs;
++    LDS_POP(s_ft);
+     if (fetch_t0) {
+         LDW_ADD(RSX_PERF_W_VTX_FETCH_T, fetch_t0);
+         rsx_perf_add(RSX_PERF_W_VTX_REF_N, dc.n_source_refs);
+@@ -14542,6 +14564,7 @@
+ {
+     if (!g.ready || !g_ld_unsubmitted || g_oq.open) return;
+     LDW_T0(t0);
++    LDS_PUSH(s_sub2, RSX_SB_SUBMIT);   /* patch 2188 */
+     ld_gt_close();   /* patch 2052 */
+     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+     if (FAILED(close_hr)) {
+@@ -14569,6 +14592,7 @@
+     g.list->lpVtbl->Reset(g.list, g.alloc, NULL); LD_SM_INVALIDATE(); ld_gt_begin();   /* patches 2045, 2052 */
+     g_ld_unsubmitted = 0;
+     g_ld_chunk_submits++;
++    LDS_POP(s_sub2);
+     if (t0) { LDW_ADD(RSX_PERF_W_SUBMIT_T, t0); rsx_perf_add(RSX_PERF_W_CHUNK_N, 1); }
+ }
+ void rsx_live_draw_submit_pending(void)
+@@ -14987,6 +15011,7 @@
+     if (ld_submit_chunk() && ++g_ld_unsubmitted > (u32)ld_submit_chunk())
+         ld_submit_nowait();   /* patch 2029: before this draw records anything */
+     LDW_T0(pre_t0);   /* patch 2045: draw split */
++    LDS_PUSH(s_pre, RSX_SB_X_PRE);   /* patch 2188 */
+     /*
+      * a010's native per-mesh constant builder can overwrite the otherwise
+      * valid reconstructed camera with NaNs after the ordinary camera upload.
+@@ -15043,8 +15068,10 @@
+         g_ld_profile.total_used_attribute_max = used_layout.count;
+     const LONGLONG fetch_pack_begin = ld_profile_qpc();
+ #endif
++    LDS_POP(s_pre);
+     LDW_ADD(RSX_PERF_W_D_PRE_T, pre_t0);
+     LDW_T0(vtx_t0);
++    LDS_PUSH(s_vp, RSX_SB_VPLAN);   /* patch 2188 */
+     ld_vc_entry* vc_hit = NULL; ld_vc_entry* vc_fill = NULL; int vc_verify = 0;   /* patch 2047 */
+     if (ld_vertex_compact_payload() && ld_vc_mode() && !ld_vtx_gpu_on()) {   /* 2076: no payload to cache */
+         vc_hit = ld_vc_lookup(prim, &used_layout, &vc_fill);
+@@ -15065,6 +15092,7 @@
+     }
+     if (!dc.n_source_refs)
+         dc.n_source_refs = dc.n_verts;
++    LDS_POP(s_vp);
+     LDW_ADD(RSX_PERF_W_VTX_T, vtx_t0);
+     ld_vr_draw(prim, &used_layout, vc_hit != NULL);   /* patch 2160: counters only, after the timed region */
+ #if defined(YZ_PERF_PROFILE)
+@@ -15129,6 +15157,7 @@
+         g.smp_ring_used = 0;
+     }
+     LDW_T0(vcopy_t0);
++    LDS_PUSH(s_vc, RSX_SB_FILL);   /* patch 2188 */
+     if (vc_fill && !vc_hit) g_vc_st.miss_bytes += draw_vb_bytes + draw_ib_bytes;   /* patch 2092 */
+     if (vc_hit) g_vc_st.hit_draw_bytes += draw_vb_bytes + draw_ib_bytes;
+     g_vc_st.all_bytes += draw_vb_bytes + draw_ib_bytes; g_vc_st.all_draws++;
+@@ -15157,13 +15186,16 @@
+             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
+         VDP_ADD(VDP_IDX, ix_t0);
+     }
++    LDS_POP(s_vc);
+     LDW_ADD(RSX_PERF_W_VTX_T, vcopy_t0);
+     LDW_ADD(RSX_PERF_W_VTX_COPY_T, vcopy_t0);   /* patch 2033 */
+ 
+     LDW_T0(pso_t0);
++    LDS_PUSH(s_pso, RSX_SB_PSO);   /* patch 2188 */
+     ID3D12PipelineState* pso = get_pso(
+         ld_vertex_mask_signature() ? &used_layout : NULL,
+         ld_vertex_compact_payload() ? (dc.vg ? 2 : 1) : 0);   /* patch 2076: 2 = GPU fetch variant */
++    LDS_POP(s_pso);
+     LDW_ADD(RSX_PERF_W_PSO_T, pso_t0);
+     if (__builtin_expect(g_rsx_fp_on, 0)) ld_fp_draw(vc_hit);   /* patch 2172 */
+     if (dc.vg) {   /* patch 2076: the shader compiler must take the GPU-fetch vertex shaders, or the mode goes off */
+@@ -15211,7 +15243,9 @@
+     g.cb_used = vertex_cb_offset;
+     u32 ps_cb_offset = 0;
+     LDW_T0(pcb_t0);
++    LDS_PUSH(s_pcb, RSX_SB_FILL);   /* patch 2188: constant ring upload = ring copy */
+     const int pcb_ok = ld_upload_pixel_constants(&ps_cb_offset);
++    LDS_POP(s_pcb);
+     LDW_ADD(RSX_PERF_W_CONST_T, pcb_t0);
+     if (!pcb_ok) {
+         live_draw_csv_emit(prim, n_tri, "drop_ps_cbring");
+@@ -15220,6 +15254,7 @@
+     }
+ 
+     LDW_T0(surf_t0);   /* patch 2045 */
++    LDS_PUSH(s_surf, RSX_SB_X_SURF);   /* patch 2188 */
+     const u32 target = current_surface();
+     if (target == LD_INVALID_SURFACE) {
+         live_draw_csv_emit(prim, n_tri, "drop_surface");
+@@ -15349,7 +15384,9 @@
+         ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h)
+         : 0;
+     if (current_zslot) g.zdepths[current_zslot - 1].depth_format = sf.depth_format;
++    LDS_POP(s_surf);
+     LDW_ADD(RSX_PERF_W_D_SURF_T, surf_t0);
++    LDS_PUSH(s_tl, RSX_SB_TEX);   /* patch 2188 */
+     LDW_T0(texloop_t0);   /* patch 2045: the texture loop, TEX_T binds included */
+     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
+     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
+@@ -15869,8 +15906,10 @@
+         else
+             g_ld_vtex_unsupported++;
+     }
++    LDS_POP(s_tl);
+     LDW_ADD(RSX_PERF_W_D_TEXLOOP_T, texloop_t0);
+     LDW_T0(desc_t0);   /* patch 2045 */
++    LDS_PUSH(s_desc, RSX_SB_DESC);   /* patch 2188 */
+     const u32 required_srv_tables = 1u + (vtex_mask != 0);
+     const int srv_ring_full = g.srv_ring_used + required_srv_tables > SRV_RING_TABLES;
+     const int smp_ring_full = !srv_ring_full && sampler_table_needs_flush(smp_slots);
+@@ -15992,7 +16031,9 @@
+     if (vtex_mask)
+         descriptor_signature =
+             fnv1a(vtex_slots, sizeof(vtex_slots), descriptor_signature);
++    LDS_POP(s_desc);
+     LDW_ADD(RSX_PERF_W_D_DESC_T, desc_t0);
++    LDS_PUSH(s_rec, RSX_SB_REC);   /* patch 2188 */
+     LDW_T0(rec_t0);   /* patch 2045: recording, CONST_T (the VS constant copy) included */
+ 
+     const float W = sf.clip_w ? (float)sf.clip_w : (float)g.width;
+@@ -16069,6 +16110,7 @@
+     u32 cb_slot = g.cb_used;   /* ring offset this draw's root CBV points at */
+     int cb_reused = 0;
+     LDW_T0(vcb_t0);
++    LDS_PUSH(s_vcb, RSX_SB_FILL);   /* patch 2188 */
+     if (ld_cb_reuse() && ld_cbr_can_reuse(&g_ld_cbr, g.cb_used, CB_BLOCK_ALIGNED, g.rsx.const_gen, xf, sizeof(xf))) {
+         cb_slot = g_ld_cbr.off; cb_reused = 1;   /* patch 2148: the slot already holds these bytes */
+     } else {
+@@ -16077,6 +16119,7 @@
+         memcpy(cbdst + 512 * 16, xf, sizeof(xf));
+         ld_cbr_filled(&g_ld_cbr, g.cb_used, g.rsx.const_gen, xf, sizeof(xf));
+     }
++    LDS_POP(s_vcb);
+     LDW_ADD(RSX_PERF_W_CONST_T, vcb_t0);
+     if (rsx_perf_walk_on()) rsx_perf_add(cb_reused ? RSX_PERF_W_CB_REUSE_N : RSX_PERF_W_CB_COPY_N, 1);
+ 
+@@ -16235,8 +16278,10 @@
+     }
+     ld_oq_after_draw(oq_pred);
+     if (g_gt.on > 0) ld_gt_draw(target, n_mrt, mrt, current_zslot, n_tri, sf.clip_w * sf.clip_h, (u32)__builtin_popcount(texture_mask));   /* patch 2052 */
++    LDS_POP(s_rec);
+     LDW_ADD(RSX_PERF_W_D_REC_T, rec_t0);
+     LDW_T0(post_t0);   /* patch 2045 */
++    LDS_PUSH(s_post, RSX_SB_X_POST);   /* patch 2188 */
+     ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
+     for (u32 r = 1; r < n_mrt; r++)
+         ld_surface_note_write(mrt[r], LD_SURFACE_WRITE_DRAW);
+@@ -16339,6 +16384,7 @@
+             fflush(stderr);
+         }
+     }
++    LDS_POP(s_post);
+     LDW_ADD(RSX_PERF_W_D_POST_T, post_t0);
+     if (!vd_hit) {   /* patch 2092: a device-cache hit used no ring bytes */
+     g.vb_used += (u32)draw_vb_bytes;
+@@ -16353,6 +16399,7 @@
+     const LONGLONG begin = ld_profile_qpc();
+ #endif
+     LDW_T0(draw_t0);
++    LDS_PUSH(s_dr, RSX_SB_X_DRAW);   /* patch 2188 */
+     const int fp_on = __builtin_expect(g_rsx_fp_on, 0);   /* patch 2172 */
+     if (fp_on) ld_fp_draw_begin(r);
+     if (__builtin_expect(g_rsx_fcap_on, 0)) g_rsx_fcap_in_draw = 1;   /* patch 2171 */
+@@ -16360,6 +16407,7 @@
+     else sink_end_impl(user, r);
+     if (__builtin_expect(g_rsx_fcap_in_draw, 0)) g_rsx_fcap_in_draw = 0;
+     if (fp_on && g_rsx_fp_on) rsx_fp_draw_end(g_rsx_fp, RSX_FP_CLOCK());   /* patch 2172 */
++    LDS_POP(s_dr);
+     LDW_ADD(RSX_PERF_W_DRAW_T, draw_t0);
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.sink_end_qpc += (u64)(ld_profile_qpc() - begin);
+@@ -16370,7 +16418,9 @@
+ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+ {
+     LDW_T0(clear_t0);   /* patch 2029 */
++    LDS_PUSH(s_cl, RSX_SB_X_CLEAR);   /* patch 2188 */
+     sink_clear_impl(user, r, mask);
++    LDS_POP(s_cl);
+     LDW_ADD(RSX_PERF_W_CLEAR_T, clear_t0);
+ }
+ static void sink_clear_impl(void* user, const rsx_dispatch* r, u32 mask)
+@@ -16531,6 +16581,14 @@
+     }
+ }
+ 
++static void sink_flip(void* user, const rsx_dispatch* r, u32 arg);
++static void sink_report(void* user, const rsx_dispatch* r, u32 method, u32 arg);
++/* Patch 2188: with RSX_PERF_SPLIT=1 the sink callbacks that are not the draw or the clear run inside an `other` sub-bucket,
++ * so the decode_d bucket (rsx_dispatch_method) excludes them. Installed only when the switch is set. */
++static void ldsx_flip(void* user, const rsx_dispatch* r, u32 arg) { LDS_PUSH(t, RSX_SB_X_FLIP); sink_flip(user, r, arg); LDS_POP(t); }
++static void ldsx_report(void* user, const rsx_dispatch* r, u32 m, u32 arg) { LDS_PUSH(t, RSX_SB_X_REPORT); sink_report(user, r, m, arg); LDS_POP(t); }
++static void ldsx_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count) { LDS_PUSH(t, RSX_SB_X_SINK); sink_draw_arrays(u, r, first, count); LDS_POP(t); }
++static void ldsx_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count) { LDS_PUSH(t, RSX_SB_X_SINK); sink_draw_index(u, r, first, count); LDS_POP(t); }
+ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+ {
+     (void)user; (void)r;
+@@ -17382,7 +17440,7 @@
+ #endif
+     g.width = width; g.height = height;
+     g.guest_ptr = guest_fn; g.guest_user = guest_user;
+-    if (rsx_fcap_configured() && guest_fn) { s_ld_fc_inner = guest_fn; g.guest_ptr = ld_fc_guest_ptr; }   /* patch 2164 */
++    if ((rsx_fcap_configured() || rsx_perf_o0_on()) && guest_fn) { s_ld_fc_inner = guest_fn; g.guest_ptr = ld_fc_guest_ptr; }   /* patch 2164, 2188 */
+     {
+         const char* requested = getenv("RSX_FP_CONSTANT_MODE");
+         char mode = 'B';
+@@ -17740,6 +17798,9 @@
+     sink.draw_index_array = sink_draw_index;
+     sink.flip = sink_flip;
+     sink.report = sink_report;   /* patch 2025 */
++    if (rsx_perf_split_on()) {   /* patch 2188 */
++        sink.flip = ldsx_flip; sink.report = ldsx_report; sink.draw_arrays = ldsx_draw_arrays; sink.draw_index_array = ldsx_draw_index;
++    }
+     rsx_dispatch_init(&g.rsx, &sink);
+ 
+     g.ready = 1;
+@@ -17777,6 +17838,13 @@
+             buffer_id, location, offset, pitch, width, height);
+ }
+ 
++/* Patch 2188: rsx_dispatch_method inside the decode_d bucket (RSX_PERF_SPLIT=1); the sink callbacks it calls open their own. */
++static void ld_dispatch_timed(u32 method, u32 arg)
++{
++    LDS_PUSH(t, RSX_SB_DECODE_D);
++    rsx_dispatch_method(&g.rsx, method, arg);
++    LDS_POP(t);
++}
+ void rsx_live_draw_method(u32 method, u32 arg)
+ {
+     if (__builtin_expect(g_rsx_fp_on, 0) && g_rsx_fp->sampling) rsx_fp_word(g_rsx_fp, method, arg);   /* patch 2172: the sampled flip's words */
+@@ -17828,7 +17896,7 @@
+                         return;
+                     }
+                 }
+-                rsx_dispatch_method(&g.rsx, method, arg);
++                ld_dispatch_timed(method, arg);
+                 ReleaseSRWLockExclusive(&g_ld_access_lock);
+                 return;
+             }
+@@ -17836,7 +17904,7 @@
+             MemoryBarrier();
+             if (!g_ld_movie_mode && !g_ld_host_waiting) {
+                 if (g.ready)
+-                    rsx_dispatch_method(&g.rsx, method, arg);
++                    ld_dispatch_timed(method, arg);
+                 InterlockedDecrement(&g_ld_guest_active);
+                 return;
+             }
+@@ -17850,7 +17918,7 @@
+             g_ld_movie_track_rsx = getenv("RSX_MOVIE_TRACK") ? 1 : 0;
+         if (!g_ld_movie_track_rsx) return;
+     }
+-    rsx_dispatch_method(&g.rsx, method, arg);
++    ld_dispatch_timed(method, arg);
+ }
+ 
+ void rsx_live_draw_set_movie_mode(int on)
+@@ -18524,6 +18592,7 @@
+         }
+         ok = 1;
+         if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_range(3 /* RSX_FC_WR_RENDERER */, location == 0 ? 1 : 2, sf->offset, gm, (u32)(s1 - s0), 0);   /* patch 2171 */
++        if (g_rsx_o0.on) rsx_o0_wb_store(&g_rsx_o0, location ? 1u : 0u, sf->offset, (u32)(s1 - s0));   /* patch 2188 */
+         g.surfaces[i].gv_gpu_dirty = 0;
+         ld_pwd_note_writeback(i);   /* patch 2084 */
+         ld_wbp_store(&g.surfaces[i]);   /* patch 2184 */
+@@ -18631,6 +18700,7 @@
+     D3D12_RANGE wr = {0, 0};
+     g_ld_rb[k]->lpVtbl->Unmap(g_ld_rb[k], 0, &wr);
+     if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_range(3 /* RSX_FC_WR_RENDERER */, sf->location == 0 ? 1 : 2, sf->offset, gm, gp * (sf->h - 1u) + sf->w * (sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u), 0);   /* patch 2171 */
++    if (g_rsx_o0.on) rsx_o0_wb_store(&g_rsx_o0, sf->location ? 1u : 0u, sf->offset, gp * (sf->h - 1u) + sf->w * (sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u));   /* patch 2188 */
+     g.surfaces[i].gv_gpu_dirty = 0;
+     ld_pwd_note_writeback(i);   /* patch 2084 */
+     ld_wbp_store(&g.surfaces[i]);   /* patch 2184 */
+@@ -18782,8 +18852,10 @@
+ {
+     if (!g_wbd.n) return 0;
+     LDW_T0(st_t0);
++    LDS_PUSH(s_wb3, RSX_SB_WB);   /* patch 2188 */
+     const u32 r = rsx_wbd_drain(&g_wbd, reason, ld_wbd_wait, ld_wbd_store, NULL);
+     rsx_wbd_snap_publish(&g_wbd_snap, &g_wbd);
++    LDS_POP(s_wb3);
+     LDW_ADD(RSX_PERF_W_WB_STORE_T, st_t0);
+     return r;
+ }
+@@ -19005,8 +19077,10 @@
+             g_ld_wb.waits++;
+             if (!g.ready) break;
+             LDW_T0(st_t0);
++            LDS_PUSH(s_wb4, RSX_SB_WB);   /* patch 2188 */
+             for (u32 k = 0; k < nrec; k++)
+                 done += (u32)ld_rb_store(rec[k], k, for_off ? for_off : g.surfaces[rec[k]].offset, for_size);
++            LDS_POP(s_wb4);
+             LDW_ADD(RSX_PERF_W_WB_STORE_T, st_t0);
+         }
+     }
+@@ -19442,8 +19516,10 @@
+         if (r0 <= s0 && r1 >= s1) ld_host_aa(i);
+     }
+     LDW_T0(wb_t0);
++    LDS_PUSH(s_wb1, RSX_SB_WB);   /* patch 2188 */
+     ld_wb_cap_note(n, 0);
+     done = ld_writeback_batch(idx, n, offset, size, 1);
++    LDS_POP(s_wb1);
+     if (wb_t0 && n) { LDW_ADD(RSX_PERF_W_WB_NV0039_T, wb_t0); rsx_perf_add(RSX_PERF_W_WB_NV0039_N, 1); }
+     return done;
+ }
+@@ -19478,7 +19554,9 @@
+     if (!n) return 0;
+     ld_wb_cap_note(n, 1);
+     LDW_T0(wb_t0);
++    LDS_PUSH(s_wb2, RSX_SB_WB);   /* patch 2188 */
+     const u32 done = ld_writeback_batch(idx, n, 0, 0, g_wbd_site);   /* patch 2018: one GPU wait; 2185: the 0x4A release may defer */
++    LDS_POP(s_wb2);
+     if (wb_t0) { LDW_ADD(RSX_PERF_W_WB_SYNC_T, wb_t0); rsx_perf_add(RSX_PERF_W_WB_SYNC_N, 1); }
+     if (done) {
+         static u64 total; total += done;
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -310,9 +310,18 @@
+     RSX_PERF_O_LOCK_T, RSX_PERF_O_PRE_T, RSX_PERF_O_SEMA_T, RSX_PERF_O_SEMA_N, RSX_PERF_O_SEMA_BGS_T,
+     RSX_PERF_O_PARK_T, RSX_PERF_O_PARK_N, RSX_PERF_O_FLIP_T, RSX_PERF_O_FLIP_N,
+     RSX_PERF_O_EOP_T, RSX_PERF_O_EOP_SUB_T, RSX_PERF_O_PW_T, RSX_PERF_O_PW_N,
++    /* patch 2188 (RSX_PERF_SPLIT=1): GPU busy ticks / lists seen by the RSX_PERF_GPU=1 fence poller (the gpu= key of [perf-split]) */
++    RSX_PERF_S_GPU_T, RSX_PERF_S_GPU_N,
+     RSX_PERF_COUNT
+ };
+ int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
++/* patch 2188: RSX_PERF_SPLIT=1 exclusive buckets (rsx_o0.h). g_rsx_split_act is 1 only inside a walker pass that began with the
++ * split on; push returns a token (0 = nothing opened) for pop; both ignore any thread but the pass's owner. */
++extern volatile int g_rsx_split_act;
++int       rsx_split_push_w(int bucket);
++void      rsx_split_pop_w(int token);
++int       rsx_perf_split_on(void);             /* RSX_PERF_SPLIT=1 (cached) */
++int       rsx_perf_o0_on(void);                /* RSX_O0=1 (cached) */
+ /* patch 2164: LD_SYNC_HIST=1 (P4) hooks, defined in cellGcmSys.c; the flag is 0 unless the switch is set. */
+ extern volatile int g_rsx_sh_on;
+ extern volatile int g_rsx_fp_on;   /* patch 2172: LD_FRONT_PROBE=1 */
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -9,6 +9,9 @@
+  */
+ 
+ #include "rsx_live_draw.h"
++#include "rsx_o0.h"   /* patch 2188: RSX_PERF_SPLIT / RSX_O0 */
++#define GCM_SPLIT_PUSH(tok, b) const int tok = g_rsx_split_act ? rsx_split_push_w(b) : 0
++#define GCM_SPLIT_POP(tok) do { if (tok && g_rsx_split_act) rsx_split_pop_w(tok); } while (0)
+ #include "rsx_nv3089_rows.h"   /* patch 2080 */
+ #include "rsx_sync_hist.h"     /* patch 2164: LD_SYNC_HIST */
+ #include "rsx_stutter_diag.h"  /* patch 2187: RSX_ATTRIB vblank/flip timing */
+@@ -1438,9 +1441,11 @@
+ static void nv3089_blit(void)
+ {
+     const long long t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;
++    GCM_SPLIT_PUSH(nv3_st, RSX_SB_WB);   /* patch 2188 */
+     if (g_rsx_fcap_on) gcm_fcap_nv3089(0);   /* patch 2164 */
+     nv3089_blit_body();
+     if (g_rsx_fcap_on) gcm_fcap_nv3089(1);
++    GCM_SPLIT_POP(nv3_st);
+     if (t0) { rsx_perf_add(RSX_PERF_W_NV3089_T, rsx_perf_now() - t0); rsx_perf_add(RSX_PERF_W_NV3089_N, 1); }
+ }
+ /* Upstream PR #334 (adapted): NV3089_ROWCOPY=1 copies an unscaled blit a row at a time; here it drives
+@@ -1820,6 +1825,7 @@
+         rsx_live_draw_wbd_touch(sl ? 0u : 1u, wbd_so, (u32)(hi_in - lo_in));
+         rsx_live_draw_wbd_touch(dl ? 0u : 1u, wbd_do, (u32)(hi_out - lo_out));
+     }
++    if (g_rsx_o0.on) rsx_o0_read(&g_rsx_o0, RSX_O0_RK_NV0039, sl ? 0u : 1u, wbd_so, (u32)(hi_in - lo_in));   /* patch 2188: before the source write-back */
+     const uint64_t fp_t0 = g_rsx_fp_on ? RSX_FP_CLOCK() : 0;   /* patch 2172 */
+     if (rsx_live_draw_enabled())
+         wb = rsx_live_draw_writeback_range(sl ? 0u : 1u, (u32)(lo_in - (s64)src) + s_nv0039.off_in,
+@@ -1829,6 +1835,7 @@
+     if ((g_rsx_sh_on | g_rsx_fp_on) && rsx_live_draw_enabled()) rsx_sync_hist_event(RSX_SH_NV0039, wb != 0);   /* patch 2164, 2172 */
+     if (g_rsx_fcap_on) rsx_fcap_range(RSX_FC_RD_WALKER, RSX_FC_EA, (u32)lo_in, vm_base + lo_in, (u32)(hi_in - lo_in), 1);   /* patch 2164 */
+     const long long m2mf_t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;   /* patch 2029 */
++    GCM_SPLIT_PUSH(m2mf_st, RSX_SB_WB);   /* patch 2188 */
+     int wbd_deferred = 0;   /* patch 2185: the row copy waits for a pending store of its source */
+     if (rsx_live_draw_enabled() && rsx_live_draw_wbd_active()) {
+         const u32 wp[8] = { src, dst, len, n, (u32)(s32)pin, (u32)(s32)pout, in_inc, out_inc };
+@@ -1842,6 +1849,7 @@
+         else  /* ASSUMPTION: FORMAT is the byte increment on each side (NV m2mf). */
+             for (u32 x = 0; x < len; x++) d[(size_t)x * out_inc] = sp[(size_t)x * in_inc];
+     }
++    GCM_SPLIT_POP(m2mf_st);
+     if (m2mf_t0) rsx_perf_add(RSX_PERF_W_M2MF_T, rsx_perf_now() - m2mf_t0);
+     if (!dl && !wbd_deferred && rsx_live_draw_enabled()) rsx_live_draw_wbp_copy_done((u32)(lo_out - (s64)dst) + s_nv0039.off_out, (u32)(hi_out - lo_out));   /* patch 2184: LD_WB_READ, the idx0 store is done */
+     if (g_rsx_fcap_on) {   /* patch 2164: the copy's geometry and the result span (digest only) */
+@@ -2404,12 +2412,15 @@
+       if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
+     u32 t = s_ref_qtail;
+     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
++        if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.ref_over, 1);   /* patch 2188 */
+         s_ref_qhead++;
+         static int _o = 0;
+         if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+     }
+     s_ref_q[t % GCM_REF_QLEN] = v;
+     s_ref_qtail = t + 1;
++    if (g_rsx_o0.on) { const long long dep = (long long)(t + 1 - s_ref_qhead);   /* patch 2188: queue depth after the push */
++        RSX_O0_ADD(g_rsx_o0.ref_push, 1); RSX_O0_ADD(g_rsx_o0.ref_depth_sum, dep); rsx_o0_max(&g_rsx_o0.ref_depth_max, dep); }
+ }
+ 
+ /* Global fence-publication counter: lets the lwmutex convoy trace correlate a
+@@ -2431,6 +2442,7 @@
+ {
+     u32 h = s_ref_qhead;
+     if (h == s_ref_qtail) return;
++    if (g_rsx_o0.on) { RSX_O0_ADD(g_rsx_o0.ref_pub, 1); RSX_O0_ADD(g_rsx_o0.ref_pub_sum, (long long)(s_ref_qtail - h)); }   /* patch 2188 */
+     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
+     if (g_rsx_fcap_on) rsx_fcap_word(1, 6, GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);   /* patch 2164 */
+     /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
+@@ -2533,6 +2545,66 @@
+  *            start address (+RVA in the exe; resolve with nm/addr2line).
+  * -----------------------------------------------------------------------*/
+ static volatile long long g_rsx_perf[RSX_PERF_COUNT];
++/* ---------------------------------------------------------------------------
++ * Patch 2188 (command-thread overhaul O0). RSX_PERF_SPLIT=1: the exclusive walker split [perf-split] (rsx_o0.h); RSX_O0=1:
++ * the O0 live counters. Both imply RSX_PERF=1's reporter thread and counters; RSX_PERF_SPLIT without RSX_PERF_PROF=A,B
++ * measures the whole run. Off: every hook is one int test (g_rsx_split_act, g_rsx_o0.on).
++ * -------------------------------------------------------------------------*/
++rsx_o0 g_rsx_o0;
++volatile int g_rsx_split_act;
++static rsx_split s_split;                 /* the pass in progress; owner thread only */
++static unsigned long s_split_owner;
++static volatile long long g_rsx_split_acc[RSX_SB_N];
++static volatile unsigned long long g_rsx_split_unw, g_rsx_split_ovf;
++#ifdef _WIN32
++#define RSX_SPLIT_TID() ((unsigned long)GetCurrentThreadId())
++#else
++#define RSX_SPLIT_TID() 1ul
++#endif
++static int gcm_env_on(const char* name) { const char* e = getenv(name); return e && *e && *e != '0'; }
++int rsx_perf_split_on(void)
++{
++    static int on = -1;
++    if (on < 0) { on = gcm_env_on("RSX_PERF_SPLIT"); if (on) fprintf(stderr, "[perf-split] exclusive walker split on (RSX_PERF_SPLIT=1, patch 2188)\n"); }
++    return on;
++}
++int rsx_perf_o0_on(void)
++{
++    static int on = -1;
++    if (on < 0) { on = gcm_env_on("RSX_O0"); g_rsx_o0.on = on; if (on) fprintf(stderr, "[o0] O0 live counters on (RSX_O0=1, patch 2188)\n"); }
++    return on;
++}
++static void gcm_split_begin(long long t0)   /* the walk lock is held */
++{
++    (void)rsx_perf_o0_on();
++    if (!rsx_perf_split_on() || !rsx_perf_walk_on()) return;
++    rsx_split_begin(&s_split, t0);
++    s_split_owner = RSX_SPLIT_TID();
++    g_rsx_split_act = 1;
++}
++static void gcm_split_end(long long now)    /* the walk lock is still held */
++{
++    if (!g_rsx_split_act) return;
++    g_rsx_split_act = 0;
++    rsx_split_end(&s_split, now);
++    for (int i = 0; i < RSX_SB_N; i++) if (s_split.acc[i]) __atomic_fetch_add(&g_rsx_split_acc[i], s_split.acc[i], __ATOMIC_RELAXED);
++    if (s_split.unwound) { __atomic_fetch_add(&g_rsx_split_unw, s_split.unwound, __ATOMIC_RELAXED); s_split.unwound = 0; }
++    if (s_split.overflow) { __atomic_fetch_add(&g_rsx_split_ovf, s_split.overflow, __ATOMIC_RELAXED); s_split.overflow = 0; }
++}
++int rsx_split_push_w(int bucket)
++{
++    if (!g_rsx_split_act || RSX_SPLIT_TID() != s_split_owner) return 0;
++    return rsx_split_push(&s_split, bucket, rsx_perf_now());
++}
++void rsx_split_pop_w(int token)
++{
++    if (!g_rsx_split_act || RSX_SPLIT_TID() != s_split_owner) return;
++    rsx_split_pop(&s_split, token, rsx_perf_now());
++}
++static void gcm_split_base(int bucket)
++{
++    if (g_rsx_split_act && RSX_SPLIT_TID() == s_split_owner) rsx_split_base(&s_split, bucket, rsx_perf_now());
++}
+ _Static_assert(RSX_PERF_USLEEP_GCM_N == 13 && RSX_PERF_USLEEP_GCM_T == 14 && RSX_PERF_USLEEP_OTHER_T == 15,
+                "sys_timer.c mirrors the RSX_PERF_USLEEP_* indices");
+ static unsigned long long s_rsx_perf_methods;      /* walker thread only */
+@@ -2540,7 +2612,8 @@
+ int rsx_perf_enabled(void)
+ {
+     static int on = -1;
+-    if (on < 0) { const char* e = getenv("RSX_PERF"); on = (e && *e && *e != '0') ? 1 : 0; }
++    if (on < 0) { const char* e = getenv("RSX_PERF"); on = (e && *e && *e != '0') ? 1 : 0;
++                  if (rsx_perf_split_on() | rsx_perf_o0_on()) on = 1; }   /* patch 2188: both ride on the RSX_PERF reporter */
+     return on;
+ }
+ long long rsx_perf_now(void)
+@@ -3129,7 +3202,8 @@
+     const int sampling = pse && *pse && *pse != '0';
+     const int sample_rsx = sampling && atoi(pse) == 2;   /* patch 2029: the walker thread only, in the window */
+     { const char* pp = getenv("RSX_PERF_PROF");
+-      if (pp && sscanf(pp, "%lf,%lf", &s_perf_prof_a, &s_perf_prof_b) != 2) s_perf_prof_a = s_perf_prof_b = -1; }
++      if (pp && sscanf(pp, "%lf,%lf", &s_perf_prof_a, &s_perf_prof_b) != 2) s_perf_prof_a = s_perf_prof_b = -1;
++      if (s_perf_prof_a < 0 && rsx_perf_split_on()) { s_perf_prof_a = 0; s_perf_prof_b = 1e9; } }   /* patch 2188: no window = whole run */
+     unsigned secs = 0;
+     (void)unused;
+     enum { MAXT = 512, TOP = 10 };
+@@ -3249,6 +3323,36 @@
+                     d[RSX_PERF_X_FPH_N], d[RSX_PERF_X_FPH_B] / 1048576.0, d[RSX_PERF_X_FPH_T] * tk, d[RSX_PERF_X_FPH_HIT],
+                     d[RSX_PERF_X_FPCC_N], d[RSX_PERF_X_FPCC_T] * tk);
+             }
++            if (rsx_perf_split_on() && d[RSX_PERF_W_ON]) {   /* patch 2188: [perf-split], same window as [perf-walk] */
++                static long long sp_prev[RSX_SB_N]; static unsigned long long unw_prev, ovf_prev;
++                long long sa[RSX_SB_N], tot = 0; double b[RSX_SB_N];
++                for (int i = 0; i < RSX_SB_N; i++) { const long long c = __atomic_load_n(&g_rsx_split_acc[i], __ATOMIC_RELAXED); sa[i] = c - sp_prev[i]; sp_prev[i] = c; tot += sa[i]; }
++                const unsigned long long unw = __atomic_load_n(&g_rsx_split_unw, __ATOMIC_RELAXED), ovf = __atomic_load_n(&g_rsx_split_ovf, __ATOMIC_RELAXED);
++                const long long fl = d[RSX_PERF_FLIPS];
++                if (fl > 0) {   /* ms per flip; a window second with no flip prints nothing */
++                    for (int i = 0; i < RSX_SB_N; i++) b[i] = (double)sa[i] * tk / (double)fl;
++                    char ln[640];
++                    rsx_split_fmt(ln, sizeof ln, "perf-split", tnow, fl, wall / (double)fl, (double)tot * tk / (double)fl, b,
++                                  d[RSX_PERF_S_GPU_N] ? (double)d[RSX_PERF_S_GPU_T] * tk / (double)fl : -1.0, -1.0);
++                    fprintf(stderr, "%s\n", ln);
++                    rsx_split_fmt_d(ln, sizeof ln, tnow, b); fprintf(stderr, "%s\n", ln);
++                    rsx_split_fmt_o(ln, sizeof ln, tnow, b, unw - unw_prev, ovf - ovf_prev); fprintf(stderr, "%s\n", ln);
++                }
++                unw_prev = unw; ovf_prev = ovf;
++            }
++            if (g_rsx_o0.on) {   /* patch 2188: the O0 counters, deltas of this second; the source table every 5th */
++                static rsx_o0 cur, prev; static unsigned o0_n;
++                memcpy(&cur, &g_rsx_o0, sizeof cur);
++                char ln[1024];
++                rsx_o0_fmt_state(ln, sizeof ln, tnow, &cur, &prev); fprintf(stderr, "%s\n", ln);
++                rsx_o0_fmt_4b(ln, sizeof ln, tnow, tk, &cur, &prev); fprintf(stderr, "%s\n", ln);
++                rsx_o0_fmt_ref(ln, sizeof ln, tnow, &cur, &prev); fprintf(stderr, "%s\n", ln);
++                rsx_o0_fmt_seg(ln, sizeof ln, tnow, &cur, &prev); fprintf(stderr, "%s\n", ln);
++                rsx_o0_fmt_tex(ln, sizeof ln, tnow, &cur, &prev); fprintf(stderr, "%s\n", ln);
++                rsx_o0_fmt_wbov(ln, sizeof ln, tnow, &cur, &prev); fprintf(stderr, "%s\n", ln);
++                if (++o0_n % 5 == 0) { rsx_o0_tsrc_top(&g_rsx_o0, ln, sizeof ln, tnow, 8); fprintf(stderr, "%s\n", ln); }
++                memcpy(&prev, &cur, sizeof prev);
++            }
+             { const int was = s_perf_walk_on;
+               s_perf_walk_on = s_perf_prof_a >= 0 && tnow >= s_perf_prof_a && tnow < s_perf_prof_b;
+               if (was && !s_perf_walk_on) rsx_live_draw_perf_dump(); }   /* patch 2045 */
+@@ -3490,7 +3594,9 @@
+     const long long t0 = rsx_perf_now();
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+     if (s_perf_walk_on) rsx_perf_add(RSX_PERF_O_LOCK_T, rsx_perf_now() - t0);   /* patch 2164 */
++    gcm_split_begin(t0);   /* patch 2188 */
+     gcm_rsx_process_fifo_unlocked();
++    gcm_split_end(rsx_perf_now());
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+     rsx_perf_add(RSX_PERF_WALK_T, rsx_perf_now() - t0);
+     rsx_perf_add(RSX_PERF_WALK_N, 1);
+@@ -3603,8 +3709,13 @@
+      * The gate lives here rather than at the call sites because #554 funnelled
+      * every 3D method through this function -- there are two callers, and a
+      * gate at one of them only would be a silent half-measure. */
+-    if (legacy_state_live || gcm_legacy_method_has_effect(m))
++    if (g_rsx_o0.on) {   /* patch 2188: [o0-state] */
++        RSX_O0_ADD(g_rsx_o0.m3d, 1); g_rsx_o0.legacy_live = legacy_state_live; g_rsx_o0.be_seen = rsx_get_backend() != NULL;
++    }
++    if (legacy_state_live || gcm_legacy_method_has_effect(m)) {
++        if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.m3d_legacy, 1);
+         rsx_process_method(st, m, v);
++    }
+     /* NV406E_SET_REFERENCE: queue the fence value for PACED
+      * publication (gcm_ref_publish below) instead of letting a
+      * later fence in the same batch overwrite it. */
+@@ -3622,7 +3733,13 @@
+         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
+         /* KZ3 patch 2027: ZPASS counts from the live engine's occlusion queries (0 / last count
+          * now, the real count a frame later); 0xFFFF stays when it has none. */
++        const u32 o0_dflt = val;   /* patch 2188 */
+         if (main_mem && (v >> 24) == 1u && rsx_live_draw_enabled()) val = rsx_live_draw_report_value(off, val);
++        if (g_rsx_o0.on) {   /* patch 2188: [o0-ref] default vs real report answers */
++            RSX_O0_ADD(g_rsx_o0.rep_n, 1); if ((v >> 24) == 1u) RSX_O0_ADD(g_rsx_o0.rep_zpass, 1);
++            if (main_mem && (v >> 24) == 1u && rsx_live_draw_enabled()) { RSX_O0_ADD(g_rsx_o0.rep_real, 1); if (val != o0_dflt) RSX_O0_ADD(g_rsx_o0.rep_real_ne, 1); }
++            else RSX_O0_ADD(g_rsx_o0.rep_dflt, 1);
++        }
+         { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+         if (main_mem) {
+             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
+@@ -3839,6 +3956,8 @@
+      * catch up, and the reason is the whole diagnosis. */
+     const char* why = "caught-up";
+     if (o_pre0) rsx_perf_add(RSX_PERF_O_PRE_T, rsx_perf_now() - o_pre0);
++    gcm_split_base(RSX_SB_DECODE_F);   /* patch 2188: the word loop below is the CG-side decode unless a bucket is open */
++    if (g_rsx_o0.on) rsx_o0_pass(&g_rsx_o0, put, rsx_perf_now());
+     while (s_fifo_getoff != put && budget-- > 0) {
+         u32 ea = gcm_io2ea(s_fifo_getoff);
+         if (!ea) {
+@@ -3949,6 +4068,7 @@
+ 
+         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
+             const long long o_fl0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] flip word */
++            GCM_SPLIT_PUSH(o_flt, RSX_SB_X_FLIPW);   /* patch 2188 */
+             if (g_rsx_fcap_cfg) rsx_fcap_flip(w & 7u, 1);   /* patch 2164 */
+             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
+              * this word into the FIFO instead of calling any import. Fire the
+@@ -3998,6 +4118,7 @@
+              * 3 MB ring at boot, wraps, and a walker stopping at every flip
+              * then crawled ~1 KB a tick while the title wrote over the
+              * commands ahead of it. */
++            GCM_SPLIT_POP(o_flt);
+             if (o_fl0) { rsx_perf_add(RSX_PERF_O_FLIP_T, rsx_perf_now() - o_fl0); rsx_perf_add(RSX_PERF_O_FLIP_N, 1); }
+             if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
+                 { why = "flip"; break; }
+@@ -4043,7 +4164,9 @@
+                       else if (put != s_park_put) { s_park_put = put; s_park_putchg++; }
+                       if (pw > 0 && now - s_park_t0 < (u64)pw * 1000000ull) {
+                           const long long o_pk0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] park */
++                          GCM_SPLIT_PUSH(o_pkt, RSX_SB_PARK);   /* patch 2188 */
+                           const int o_pk = gcm_park_wake_wait(s_fifo_getoff);
++                          GCM_SPLIT_POP(o_pkt);
+                           if (o_pk0) { rsx_perf_add(RSX_PERF_O_PARK_T, rsx_perf_now() - o_pk0); rsx_perf_add(RSX_PERF_O_PARK_N, 1); }
+                           if (o_pk) continue;   /* KZ3 patch 1087: re-read the park */
+                           why = "park-wait"; s_park_pass = 1; break; }
+@@ -4194,6 +4317,7 @@
+             }
+             if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
+                 const long long o_sm0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] sema */
++                GCM_SPLIT_PUSH(o_smt, RSX_SB_X_SEMA);   /* patch 2188 */
+                 int sem_blocked = 0;
+                 for (u32 i = 0; i < count; i++) {
+                     u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+@@ -4252,6 +4376,8 @@
+                         atomic_thread_fence(memory_order_release);
+                         vm_write32(la, v);
+                         if (g_rsx_fcap_on) rsx_fcap_word(1, 3, la, v);   /* patch 2164 */
++                        if (g_rsx_o0.on && ((s_sema_offset & 0xFFFFu) >> 4) == 0x4Bu)   /* patch 2188: [o0-4b] */
++                            rsx_o0_q4b(&g_rsx_o0, s_fifo_getoff, s_fifo_getoff + 4 + count * 4, vm_read32(GCM_CONTROL_GUEST_ADDR + 0), rsx_perf_now());
+                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
+                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
+                     }
+@@ -4285,6 +4411,7 @@
+             }
+         }
+                 }
++                GCM_SPLIT_POP(o_smt);
+                 if (o_sm0) { rsx_perf_add(RSX_PERF_O_SEMA_T, rsx_perf_now() - o_sm0); rsx_perf_add(RSX_PERF_O_SEMA_N, 1); }
+                 if (sem_blocked) { s_sema_blocked_pass = 1; break; }
+                 s_fifo_getoff += 4 + count * 4;
+@@ -4526,6 +4653,7 @@
+     }
+ 
+     const long long o_eop0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] end of pass */
++    gcm_split_base(RSX_SB_OTHER);   /* patch 2188 */
+     /* Walker watchdog. Everything above recovers from a *recognised* stall --
+      * a branch we cannot take, a park the title abandoned. A walker that stops
+      * for any other reason simply freezes `get` for the rest of the run and
+@@ -4692,6 +4820,7 @@
+                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
+                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
+                 GCM_FC_WR(12, jmp_at, 0x20000000u | io_begin); GCM_FC_WR(13, ctx + 0x8, begin);   /* patch 2171 */
++                if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.ring_drain, 1);   /* patch 2188: the drain recycled the title's ring itself */
+                 GCM_FC_WR(14, GCM_CONTROL_GUEST_ADDR + 0, io_begin);
+                 s_fifo_getoff = io_begin;                          /* get */
+                 put = io_begin;
+@@ -4754,11 +4883,13 @@
+  * lap behind), and point the context at the next segment. */
+ static void gcm_fifo_next_segment(u32 ctx)
+ {
++    if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.seg_calls, 1);   /* patch 2188 */
+     const u32 cur = vm_read32(ctx + 0x8), end = vm_read32(ctx + 0x4);
+     u32 next = end + 4;
+     if (next < s_ring_begin || next + s_seg_size > s_ring_end) next = s_ring_begin;
+     const u32 io_cur = gcm_ea2io(cur), io_next = gcm_ea2io(next);
+     if (io_cur == 0xFFFFFFFFu || io_next == 0xFFFFFFFFu || cur > end) return;
++    if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.seg_acted, 1);   /* patch 2188 */
+     vm_write32(cur, 0x20000000u | io_next);              /* JUMP -> next segment */
+     GCM_FC_WR(12, cur, 0x20000000u | io_next);           /* patch 2171 */
+     /* The JUMP has to be in memory before `put` lets the walker reach it. */
+@@ -4801,6 +4932,7 @@
+ 
+ void cellGcm_fifo_recycle(u32 ctx_ea)
+ {
++    if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.ring_cb, 1);   /* patch 2188: the title's own buffer-full callback ran */
+     if (!ctx_ea) return;
+     if (s_seg_size && ctx_ea == s_gcm_context_ea) { gcm_fifo_next_segment(ctx_ea); return; }
+     u32 begin   = vm_read32(ctx_ea + 0x0);
+@@ -4967,6 +5099,7 @@
+ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+ {
+     rsx_perf_add(RSX_PERF_FLIPS, 1);
++    if (g_rsx_o0.on) g_rsx_o0.flip_n++;   /* patch 2188 */
+     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
+      * which answers "did it ever flip?" and not "is it still flipping, and how
+      * fast?" -- the question that matters when a title stops appearing on
+--- /dev/null
++++ b/libs/video/rsx_o0.h
+@@ -0,0 +1,332 @@
++/* KZ3 patch 2188 (command-thread overhaul O0): the shared walker-split line and the O0 live counters. Pure C (no OS calls,
++ * time is passed in), so tools/smoke builds and tests it on the host. Everything is default off:
++ *   RSX_PERF_SPLIT=1  [perf-split] (the line format is shared with the Killzone 2 port): exclusive buckets that add up to the
++ *                     walker's pass time. A stack of "which bucket owns the clock" charges every tick to the innermost
++ *                     open bucket, so nesting never double-counts and the buckets sum to walk by construction; the time
++ *                     with no bucket open is `other`, printed so a missing timer shows up.
++ *   RSX_O0=1          the O0 counters ([o0-state], [o0-4b], [o0-ref], [o0-seg], [o0-tex], [o0-tex-src], [o0-wbov]).
++ * The instance (g_rsx_o0) lives in cellGcmSys.c. */
++#ifndef RSX_O0_H
++#define RSX_O0_H
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++/* ---- exclusive buckets -------------------------------------------------------------------------------------------- */
++enum {
++    RSX_SB_OTHER = 0,      /* no bucket open: lock, pass entry/exit, and the whole pass when the split is off */
++    RSX_SB_DECODE_F,       /* CG side: the FIFO word loop in cellGcmSys.c, header parse, legacy gcm_3d_method */
++    RSX_SB_DECODE_D,       /* dispatch: rsx_dispatch_method, minus the sink callbacks it calls */
++    RSX_SB_TEX,            /* the texture loop (binds, hash, decode, upload) */
++    RSX_SB_PSO,            /* get_pso, translation included */
++    RSX_SB_DESC,           /* descriptors: SRV/sampler tables, barriers, RTV/DSV, SetDescriptorHeaps */
++    RSX_SB_VPLAN,          /* the vertex plan: layout, refs, remap */
++    RSX_SB_FILL,           /* vertex fetch/convert, ring copy, index write, constant uploads */
++    RSX_SB_REC,            /* D3D12 list calls of a draw (viewport .. DrawIndexedInstanced) */
++    RSX_SB_WB,             /* write-back stores, NV0039/NV3089 moves */
++    RSX_SB_RBWAIT,         /* fence waits of readback flushes */
++    RSX_SB_SUBMIT,         /* ExecuteCommandLists + Signal */
++    RSX_SB_PARK,           /* the walker waiting for FIFO work */
++    RSX_SB_NAMED,          /* first bucket that folds into `other` in the shared line */
++    RSX_SB_X_PRE = RSX_SB_NAMED, RSX_SB_X_SURF, RSX_SB_X_POST,   /* the unnamed parts of one draw */
++    RSX_SB_X_DRAW,         /* sink_end outside every named bucket and X_PRE/SURF/POST */
++    RSX_SB_X_CLEAR, RSX_SB_X_FLIP, RSX_SB_X_REPORT, RSX_SB_X_SINK,   /* other sink callbacks; FLIP = sink_flip (present) */
++    RSX_SB_X_SEMA,         /* NV406E semaphore commands (the write-back inside them is WB) */
++    RSX_SB_X_FLIPW,        /* the in-FIFO 0xFEADxxxx flip word */
++    RSX_SB_X_WAITO,        /* fence waits of flushes that are not readbacks */
++    RSX_SB_N
++};
++#define RSX_SPLIT_DEPTH 24
++
++typedef struct {
++    long long acc[RSX_SB_N];   /* ticks of this pass (flushed to the global counters at the pass end) */
++    long long last;
++    int cur, sp;
++    int stk[RSX_SPLIT_DEPTH];
++    unsigned long long unwound, overflow;
++} rsx_split;
++
++static inline void rsx_split_begin(rsx_split* s, long long now)
++{
++    memset(s->acc, 0, sizeof s->acc);
++    s->last = now; s->cur = RSX_SB_OTHER; s->sp = 0;
++}
++static inline void rsx_split_charge(rsx_split* s, long long now)
++{
++    s->acc[s->cur] += now - s->last; s->last = now;
++}
++/* Open bucket b; the returned token is passed to pop (0 = nothing opened). */
++static inline int rsx_split_push(rsx_split* s, int b, long long now)
++{
++    if (s->sp >= RSX_SPLIT_DEPTH) { s->overflow++; return 0; }
++    rsx_split_charge(s, now);
++    s->stk[s->sp++] = s->cur; s->cur = b;
++    return s->sp;
++}
++/* Close the bucket opened with `tok`, and anything opened after it that was never closed (an early return). A token that
++ * was already unwound (tok > sp) is ignored. */
++static inline void rsx_split_pop(rsx_split* s, int tok, long long now)
++{
++    if (tok <= 0 || tok > s->sp) return;
++    rsx_split_charge(s, now);
++    if (s->sp > tok) s->unwound += (unsigned long long)(s->sp - tok);
++    s->sp = tok - 1; s->cur = s->stk[s->sp];
++}
++/* Set the bucket that owns the clock when nothing is open (the walker loop's own work = DECODE_F). */
++static inline void rsx_split_base(rsx_split* s, int b, long long now)
++{
++    rsx_split_charge(s, now);
++    if (s->sp) { s->unwound += (unsigned long long)s->sp; s->sp = 0; }
++    s->cur = b;
++}
++static inline void rsx_split_end(rsx_split* s, long long now) { rsx_split_charge(s, now); s->sp = 0; s->cur = RSX_SB_OTHER; }
++static inline long long rsx_split_total(const rsx_split* s)
++{
++    long long t = 0; for (int i = 0; i < RSX_SB_N; i++) t += s->acc[i]; return t;
++}
++
++/* ---- the [perf-split] line ---------------------------------------------------------------------------------------- */
++/* One window's values in ms per flip. b[] is indexed by RSX_SB_*; the line folds decode_f + decode_d into `decode` and
++ * every bucket from RSX_SB_NAMED up, plus the base, into `other` = walk - the named buckets (so it also absorbs what no
++ * timer covers). gpu < 0 prints -1 (no GPU poller). `bar` < 0 leaves bar= out (the ordered-thread line). */
++static inline double rsx_split_named_sum(const double* b)
++{
++    double s = 0;
++    for (int i = RSX_SB_DECODE_F; i < RSX_SB_NAMED; i++) s += b[i];
++    return s;
++}
++static inline int rsx_split_fmt(char* out, size_t n, const char* tag, double t, long long flips, double frame, double walk,
++                                const double* b, double gpu, double bar)
++{
++    const double decode = b[RSX_SB_DECODE_F] + b[RSX_SB_DECODE_D];
++    const double other = walk - rsx_split_named_sum(b);
++    int o = snprintf(out, n,
++        "[%s] t=%.0f flips=%lld frame=%.2f walk=%.2f decode=%.2f tex=%.2f pso=%.2f desc=%.2f vplan=%.2f fill=%.2f rec=%.2f"
++        " wb=%.2f rbwait=%.2f submit=%.2f park=%.2f other=%.2f gpu=%.2f",
++        tag, t, flips, frame, walk, decode, b[RSX_SB_TEX], b[RSX_SB_PSO], b[RSX_SB_DESC], b[RSX_SB_VPLAN], b[RSX_SB_FILL],
++        b[RSX_SB_REC], b[RSX_SB_WB], b[RSX_SB_RBWAIT], b[RSX_SB_SUBMIT], b[RSX_SB_PARK], other, gpu);
++    if (bar >= 0 && o > 0 && (size_t)o < n) o += snprintf(out + o, n - (size_t)o, " bar=%.2f", bar);
++    return o;
++}
++/* The two extra lines: decode split, and what is inside `other`. */
++static inline int rsx_split_fmt_d(char* out, size_t n, double t, const double* b)
++{
++    return snprintf(out, n, "[perf-split-d] t=%.0f decode_f=%.2f decode_d=%.2f", t, b[RSX_SB_DECODE_F], b[RSX_SB_DECODE_D]);
++}
++static inline int rsx_split_fmt_o(char* out, size_t n, double t, const double* b, unsigned long long unwound,
++                                  unsigned long long overflow)
++{
++    return snprintf(out, n,
++        "[perf-split-o] t=%.0f base=%.2f pre=%.2f surf=%.2f post=%.2f draw_rest=%.2f clear=%.2f flip=%.2f report=%.2f sink=%.2f"
++        " sema=%.2f flipword=%.2f wait_other=%.2f unwound=%llu overflow=%llu",
++        t, b[RSX_SB_OTHER], b[RSX_SB_X_PRE], b[RSX_SB_X_SURF], b[RSX_SB_X_POST], b[RSX_SB_X_DRAW], b[RSX_SB_X_CLEAR],
++        b[RSX_SB_X_FLIP], b[RSX_SB_X_REPORT], b[RSX_SB_X_SINK], b[RSX_SB_X_SEMA], b[RSX_SB_X_FLIPW], b[RSX_SB_X_WAITO],
++        unwound, overflow);
++}
++
++/* ---- the O0 counters ---------------------------------------------------------------------------------------------- */
++enum { RSX_O0_RK_RENDERER = 0, RSX_O0_RK_NV0039, RSX_O0_RK_N };
++#define RSX_O0_PASSES 64
++#define RSX_O0_WBR 64
++#define RSX_O0_TEXN 2048   /* texture source table (power of two) */
++typedef struct { unsigned long long key, binds, hashed, changed, written; } rsx_o0_tsrc;
++typedef struct { unsigned loc, off, end, flip, mask; int live, idx3; } rsx_o0_wbr;
++#define RSX_O0_IDX3 0x01892400u   /* post-chain surface idx3 (re-data E1: read by Upsample add and DoF when far DoF is on) */
++
++typedef struct rsx_o0 {
++    volatile int on;
++    volatile int lock;
++    /* legacy s_state reader probe */
++    long long m3d, m3d_legacy, be_flush, be_draw, be_clear; int be_seen, legacy_live;
++    /* 0x4B release */
++    long long q_n, q_idle, q_unk, q_backlog_sum, q_backlog_max, q_lag_n, q_lag_sum, q_lag_max, q_per_n, q_per_sum, q_last_t;
++    struct { long long t; unsigned put; } pass[RSX_O0_PASSES]; unsigned pass_n;
++    /* ref queue and reports */
++    long long ref_push, ref_depth_sum, ref_depth_max, ref_over, ref_pub, ref_pub_sum;
++    long long rep_n, rep_zpass, rep_real, rep_real_ne, rep_dflt;
++    /* segments and ring recycle */
++    long long seg_calls, seg_acted, ring_drain, ring_cb;
++    /* textures */
++    long long t_binds[2], t_hashed[2], t_changed[2], t_written[2][2];   /* [loc]; t_written[loc][changed] = tracker flagged */
++    rsx_o0_tsrc tsrc[RSX_O0_TEXN];
++    /* write-back destinations vs later reads */
++    unsigned flip_n; rsx_o0_wbr wb[RSX_O0_WBR]; unsigned wb_i;
++    long long wb_stores, wb_bytes, wb_stores_read, wb_stores_never, wb_idx3, rd_idx3[RSX_O0_RK_N], rd_n[RSX_O0_RK_N], rd_ov[RSX_O0_RK_N], rd_ov_age[RSX_O0_RK_N][3];
++} rsx_o0;
++
++static inline void rsx_o0_lock(rsx_o0* o) { while (__atomic_exchange_n(&o->lock, 1, __ATOMIC_ACQUIRE)) { } }
++static inline void rsx_o0_unlock(rsx_o0* o) { __atomic_store_n(&o->lock, 0, __ATOMIC_RELEASE); }
++#define RSX_O0_ADD(f, v) __atomic_fetch_add(&(f), (long long)(v), __ATOMIC_RELAXED)
++
++static inline void rsx_o0_max(long long* f, long long v)
++{
++    long long c = __atomic_load_n(f, __ATOMIC_RELAXED);
++    while (v > c && !__atomic_compare_exchange_n(f, &c, v, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
++}
++
++/* A walker pass starts with this put (called once per pass). */
++static inline void rsx_o0_pass(rsx_o0* o, unsigned put, long long now)
++{
++    const unsigned i = o->pass_n++ % RSX_O0_PASSES;
++    o->pass[i].t = now; o->pass[i].put = put;
++}
++/* The label 0x4B release was written at FIFO offset `at` (the command's own offset), `next` the get after it, `put` the
++ * live PUT register. Idle-at-put = the walker has caught up with put right after the write (backlog 0). The release lag
++ * is the time since the first pass whose put had already passed `at` (ASSUMPTION: the pass ring has not wrapped; a put
++ * that wrapped is not newer than `at` and ends the scan, so the lag can only be short, never long). */
++static inline void rsx_o0_q4b(rsx_o0* o, unsigned at, unsigned next, unsigned put, long long now)
++{
++    RSX_O0_ADD(o->q_n, 1);
++    if (put >= next) {
++        const long long bl = (long long)(put - next);
++        if (bl == 0) RSX_O0_ADD(o->q_idle, 1);
++        RSX_O0_ADD(o->q_backlog_sum, bl); rsx_o0_max(&o->q_backlog_max, bl);
++    } else RSX_O0_ADD(o->q_unk, 1);
++    long long t_vis = -1;
++    for (unsigned k = 0; k < RSX_O0_PASSES && k < o->pass_n; k++) {
++        const unsigned i = (o->pass_n - 1u - k) % RSX_O0_PASSES;
++        if (o->pass[i].put > at) t_vis = o->pass[i].t; else break;
++    }
++    if (t_vis >= 0 && now >= t_vis) { RSX_O0_ADD(o->q_lag_n, 1); RSX_O0_ADD(o->q_lag_sum, now - t_vis); rsx_o0_max(&o->q_lag_max, now - t_vis); }
++    if (o->q_last_t) { RSX_O0_ADD(o->q_per_n, 1); RSX_O0_ADD(o->q_per_sum, now - o->q_last_t); }
++    o->q_last_t = now;
++}
++
++/* Texture sources: key = (location, offset). */
++static inline rsx_o0_tsrc* rsx_o0_tfind(rsx_o0* o, unsigned loc, unsigned off)
++{
++    const unsigned long long key = ((unsigned long long)(loc & 1u) << 32 | off) + 1ull;
++    unsigned h = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 40) & (RSX_O0_TEXN - 1u);
++    for (unsigned k = 0; k < RSX_O0_TEXN; k++, h = (h + 1u) & (RSX_O0_TEXN - 1u)) {
++        if (o->tsrc[h].key == key) return &o->tsrc[h];
++        if (!o->tsrc[h].key) { o->tsrc[h].key = key; return &o->tsrc[h]; }
++    }
++    return NULL;   /* full: only the per-location totals still count */
++}
++static inline void rsx_o0_tex_bind(rsx_o0* o, unsigned loc, unsigned off)
++{
++    rsx_o0_lock(o);
++    o->t_binds[loc & 1u]++;
++    rsx_o0_tsrc* e = rsx_o0_tfind(o, loc, off); if (e) e->binds++;
++    rsx_o0_unlock(o);
++}
++/* A content hash was computed for this bind; `written` = the write tracker had flagged the texture, `changed` = the hash
++ * differs from the cached one. */
++static inline void rsx_o0_tex_hash(rsx_o0* o, unsigned loc, unsigned off, int changed, int written)
++{
++    rsx_o0_lock(o);
++    o->t_hashed[loc & 1u]++;
++    if (changed) o->t_changed[loc & 1u]++;
++    o->t_written[loc & 1u][changed ? 1 : 0] += written ? 1 : 0;
++    rsx_o0_tsrc* e = rsx_o0_tfind(o, loc, off);
++    if (e) { e->hashed++; e->changed += changed ? 1u : 0u; e->written += written ? 1u : 0u; }
++    rsx_o0_unlock(o);
++}
++/* Top n sources by hashed count; clears the table. Returns the number of lines written to out. */
++static inline int rsx_o0_tsrc_top(rsx_o0* o, char* out, size_t n, double t, int top)
++{
++    rsx_o0_lock(o);
++    int o_n = snprintf(out, n, "[o0-tex-src] t=%.0f", t);
++    for (int r = 0; r < top; r++) {
++        int best = -1;
++        for (int i = 0; i < RSX_O0_TEXN; i++)
++            if (o->tsrc[i].key && (best < 0 || o->tsrc[i].hashed > o->tsrc[best].hashed)) best = i;
++        if (best < 0 || !o->tsrc[best].hashed || o_n < 0 || (size_t)o_n >= n) break;
++        const unsigned long long k = o->tsrc[best].key - 1ull;
++        o_n += snprintf(out + o_n, n - (size_t)o_n, " %u:0x%08X=%llu/%llu/%llu", (unsigned)(k >> 32), (unsigned)k,
++                        o->tsrc[best].hashed, o->tsrc[best].changed, o->tsrc[best].written);
++        o->tsrc[best].hashed = 0;   /* printed: out of the next round of this scan */
++    }
++    memset(o->tsrc, 0, sizeof o->tsrc);
++    rsx_o0_unlock(o);
++    return o_n;
++}
++
++/* Write-back stores and the reads that overlap them later. A read is overlapping when a store of the last 64 overlaps its
++ * (location, range); age = flips between the store and the read (0, 1, 2+). A store is "read" once any read overlapped it
++ * and "never" when its slot is reused unread. SPU/PPU reads of the destination are LD_WB_READ's job (patch 2184). */
++static inline void rsx_o0_wb_store(rsx_o0* o, unsigned loc, unsigned off, unsigned bytes)
++{
++    rsx_o0_lock(o);
++    rsx_o0_wbr* w = &o->wb[o->wb_i++ % RSX_O0_WBR];
++    if (w->live) { if (w->mask) o->wb_stores_read++; else o->wb_stores_never++; }
++    w->loc = loc & 1u; w->off = off; w->end = off + bytes; w->flip = o->flip_n; w->mask = 0; w->live = 1; w->idx3 = off <= RSX_O0_IDX3 && RSX_O0_IDX3 < off + bytes; o->wb_idx3 += w->idx3;
++    o->wb_stores++; o->wb_bytes += bytes;
++    rsx_o0_unlock(o);
++}
++static inline void rsx_o0_read(rsx_o0* o, int kind, unsigned loc, unsigned off, unsigned bytes)
++{
++    if (kind < 0 || kind >= RSX_O0_RK_N || !bytes) return;
++    const unsigned end = off + bytes;
++    rsx_o0_lock(o);
++    o->rd_n[kind]++;
++    int hit = 0; unsigned age = 0;
++    for (unsigned i = 0; i < RSX_O0_WBR; i++) {
++        rsx_o0_wbr* w = &o->wb[i];
++        if (!w->live || w->loc != (loc & 1u) || off >= w->end || end <= w->off) continue;
++        w->mask |= 1u << kind;
++        if (w->idx3) o->rd_idx3[kind]++;   /* a read of a write-back range that holds idx3 */
++        if (!hit) age = o->flip_n - w->flip; else if (o->flip_n - w->flip < age) age = o->flip_n - w->flip;
++        hit = 1;
++    }
++    if (hit) { o->rd_ov[kind]++; o->rd_ov_age[kind][age > 2 ? 2 : age]++; }
++    rsx_o0_unlock(o);
++}
++
++/* ---- the O0 lines (deltas of one period; `p` = the previous snapshot, filled by the caller with a plain copy) ----------- */
++static inline double rsx_o0_div(long long a, long long b) { return b > 0 ? (double)a / (double)b : 0.0; }
++static inline int rsx_o0_fmt_state(char* out, size_t n, double t, const rsx_o0* c, const rsx_o0* p)
++{
++    return snprintf(out, n, "[o0-state] t=%.0f m3d=%lld legacy_calls=%lld legacy_live=%d backend_set=%d be_flush=%lld be_draw=%lld be_clear=%lld",
++                    t, c->m3d - p->m3d, c->m3d_legacy - p->m3d_legacy, c->legacy_live, c->be_seen, c->be_flush - p->be_flush,
++                    c->be_draw - p->be_draw, c->be_clear - p->be_clear);
++}
++static inline int rsx_o0_fmt_4b(char* out, size_t n, double t, double tk, const rsx_o0* c, const rsx_o0* p)
++{
++    const long long N = c->q_n - p->q_n, I = c->q_idle - p->q_idle;
++    return snprintf(out, n,
++        "[o0-4b] t=%.0f writes=%lld idle_at_put=%lld idle_frac=%.2f backlog_mean=%.0fB backlog_max=%lldB put_behind=%lld"
++        " lag_n=%lld lag_mean=%.2fms lag_max=%.2fms period_mean=%.2fms",
++        t, N, I, rsx_o0_div(I, N), rsx_o0_div(c->q_backlog_sum - p->q_backlog_sum, N - (c->q_unk - p->q_unk)), c->q_backlog_max,
++        c->q_unk - p->q_unk, c->q_lag_n - p->q_lag_n, rsx_o0_div(c->q_lag_sum - p->q_lag_sum, c->q_lag_n - p->q_lag_n) * tk,
++        (double)c->q_lag_max * tk, rsx_o0_div(c->q_per_sum - p->q_per_sum, c->q_per_n - p->q_per_n) * tk);
++}
++static inline int rsx_o0_fmt_ref(char* out, size_t n, double t, const rsx_o0* c, const rsx_o0* p)
++{
++    return snprintf(out, n,
++        "[o0-ref] t=%.0f push=%lld depth_mean=%.2f depth_max=%lld overflow=%lld published=%lld pub_depth_mean=%.2f"
++        " reports=%lld zpass=%lld answered_real=%lld real_differs=%lld answered_default=%lld",
++        t, c->ref_push - p->ref_push, rsx_o0_div(c->ref_depth_sum - p->ref_depth_sum, c->ref_push - p->ref_push),
++        c->ref_depth_max, c->ref_over - p->ref_over, c->ref_pub - p->ref_pub,
++        rsx_o0_div(c->ref_pub_sum - p->ref_pub_sum, c->ref_pub - p->ref_pub), c->rep_n - p->rep_n, c->rep_zpass - p->rep_zpass,
++        c->rep_real - p->rep_real, c->rep_real_ne - p->rep_real_ne, c->rep_dflt - p->rep_dflt);
++}
++static inline int rsx_o0_fmt_seg(char* out, size_t n, double t, const rsx_o0* c, const rsx_o0* p)
++{
++    return snprintf(out, n, "[o0-seg] t=%.0f next_segment=%lld acted=%lld title_ring_recycle_drain=%lld cb_recycle=%lld",
++                    t, c->seg_calls - p->seg_calls, c->seg_acted - p->seg_acted, c->ring_drain - p->ring_drain, c->ring_cb - p->ring_cb);
++}
++static inline int rsx_o0_fmt_tex(char* out, size_t n, double t, const rsx_o0* c, const rsx_o0* p)
++{
++    return snprintf(out, n,
++        "[o0-tex] t=%.0f loc0 binds=%lld hashed=%lld changed=%lld written_changed=%lld written_same=%lld"
++        " | loc1 binds=%lld hashed=%lld changed=%lld written_changed=%lld written_same=%lld",
++        t, c->t_binds[0] - p->t_binds[0], c->t_hashed[0] - p->t_hashed[0], c->t_changed[0] - p->t_changed[0],
++        c->t_written[0][1] - p->t_written[0][1], c->t_written[0][0] - p->t_written[0][0],
++        c->t_binds[1] - p->t_binds[1], c->t_hashed[1] - p->t_hashed[1], c->t_changed[1] - p->t_changed[1],
++        c->t_written[1][1] - p->t_written[1][1], c->t_written[1][0] - p->t_written[1][0]);
++}
++static inline int rsx_o0_fmt_wbov(char* out, size_t n, double t, const rsx_o0* c, const rsx_o0* p)
++{
++    return snprintf(out, n,
++        "[o0-wbov] t=%.0f wb_stores=%lld wb_bytes=%lld stores_read=%lld stores_never_read=%lld"
++        " idx3_stores=%lld idx3_read_by_renderer=%lld idx3_read_by_nv0039=%lld | renderer reads=%lld overlap=%lld age0/1/2+=%lld/%lld/%lld | nv0039 reads=%lld overlap=%lld age0/1/2+=%lld/%lld/%lld",
++        t, c->wb_stores - p->wb_stores, c->wb_bytes - p->wb_bytes, c->wb_stores_read - p->wb_stores_read,
++        c->wb_stores_never - p->wb_stores_never, c->wb_idx3 - p->wb_idx3, c->rd_idx3[0] - p->rd_idx3[0], c->rd_idx3[1] - p->rd_idx3[1],
++        c->rd_n[0] - p->rd_n[0], c->rd_ov[0] - p->rd_ov[0], c->rd_ov_age[0][0] - p->rd_ov_age[0][0],
++        c->rd_ov_age[0][1] - p->rd_ov_age[0][1], c->rd_ov_age[0][2] - p->rd_ov_age[0][2],
++        c->rd_n[1] - p->rd_n[1], c->rd_ov[1] - p->rd_ov[1], c->rd_ov_age[1][0] - p->rd_ov_age[1][0],
++        c->rd_ov_age[1][1] - p->rd_ov_age[1][1], c->rd_ov_age[1][2] - p->rd_ov_age[1][2]);
++}
++extern rsx_o0 g_rsx_o0;   /* cellGcmSys.c */
++#endif

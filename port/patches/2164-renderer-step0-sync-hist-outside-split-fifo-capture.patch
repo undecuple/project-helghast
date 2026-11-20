@@ -1,0 +1,1270 @@
+KZ3 patch 2164 (RSX pass 152, renderer step 0): LD_SYNC_HIST=1 sync-point histogram (probe P4), the split of the walker time outside
+the method loop ([perf-out], leaf rows under RSX_PERF + RSX_PERF_PROF), and LD_FIFO_CAPTURE=dir capture writer (format in
+libs/video/rsx_fifo_capture.h). Every new path is off unless its switch is set; with the switches unset the walker's call stream is
+unchanged (host test) and each hook costs one load and a predicted branch.
+LD_SYNC_HIST=1 (+ LD_SYNC_HIST_N=flips per line, default 100): rsx_sync_hist.h classifies NV0039 copies, NV406E 0x6C and NV4097
+0x1D70/0x1D74 releases, flips with a dirty main-surface write-back, reports and SET_REFERENCE per flip and prints draws between
+consecutive resolve points, a chunk estimate (seal at each sync event and each 128 draws) and a summary at exit ([sync-hist] lines).
+[perf-out]: outside-loop remainder (walk - meth) = lock + pre + sema (before-sync inside) + park + flipword + eop (submit inside) + rest;
+present-wait (ld_present_slot) is counted inside the method loop (sink_flip), shown separately.
+LD_FIFO_CAPTURE=dir with a 'work' path segment (+ LD_FIFO_CAPTURE_FRAME=start,count): walker words, renderer guest_ptr reads
+(first-sight bytes), walker guest reads and writes, NV0039/NV3089 copies, SPU notes and drains, initial IO/VRAM images.
+Host tests tools/smoke/test_sync_hist.sh, tools/smoke/test_fifo_capture_format.sh.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index ee441a2b..3a5d0bd1 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -10,6 +10,8 @@
+ 
+ #include "rsx_live_draw.h"
+ #include "rsx_nv3089_rows.h"   /* patch 2080 */
++#include "rsx_sync_hist.h"     /* patch 2164: LD_SYNC_HIST */
++#include "rsx_fifo_capture.h"  /* patch 2164: LD_FIFO_CAPTURE */
+ #include "rsx_draw_engine.h"
+ #include "rsx_tiling.h"
+ #include "cellGcmSys.h"
+@@ -18,6 +20,17 @@
+ #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+ #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+ #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
++/* Patch 2164 flags, read by the hooks (one load + predicted branch when off). g_rsx_sh_on: LD_SYNC_HIST=1.
++ * g_rsx_fcap_cfg: LD_FIFO_CAPTURE set and valid (flips are counted); g_rsx_fcap_on: a capture window is open. */
++volatile int g_rsx_sh_on, g_rsx_fcap_cfg, g_rsx_fcap_on;
++_Static_assert(RSX_SH_FLIP == 4 && RSX_SH_REL4097 == 3, "rsx_live_draw.c / rsx_commands.c pass RSX_SH_FLIP / RSX_SH_REL4097 as literals");
++static void gcm_fcap_pass_begin(u32 put);
++static void gcm_fcap_cmd(u32 getoff, u32 w_raw, int is_method);
++static void gcm_fcap_nop_run(u32 getoff, u32 words);
++static void gcm_fcap_pass_end(const char* why, u32 getoff, u32 calloff);
++static void gcm_fcap_nv3089(int phase);
++static void gcm_fcap_copy_geom(u32 kind, u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g, u32 h, u32 i, u32 j, u32 k);
++static void gcm_sh_init_once(void);
+ void cellGcm_spu_guest_write_hook_install(void);   /* patch 2033 */
+ void cellGcm_ppu_store_note_install(void);         /* patch 2082 */
+ static void gcm_note_pages_ea(u32 ea, u32 size);           /* patch 2033 */
+@@ -46,6 +59,7 @@ static int kz3_ft_on(void) { static int on = -1; if (on < 0) { const char* e = g
+ #include <windows.h>
+ #else
+ #include <time.h>
++#include <sys/stat.h>   /* patch 2164: mkdir for LD_FIFO_CAPTURE */
+ #endif
+ 
+ /* ---------------------------------------------------------------------------
+@@ -1392,7 +1406,9 @@ static void nv3089_blit_body(void);
+ static void nv3089_blit(void)
+ {
+     const long long t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;
++    if (g_rsx_fcap_on) gcm_fcap_nv3089(0);   /* patch 2164 */
+     nv3089_blit_body();
++    if (g_rsx_fcap_on) gcm_fcap_nv3089(1);
+     if (t0) { rsx_perf_add(RSX_PERF_W_NV3089_T, rsx_perf_now() - t0); rsx_perf_add(RSX_PERF_W_NV3089_N, 1); }
+ }
+ /* Upstream PR #334 (adapted): NV3089_ROWCOPY=1 copies an unscaled blit a row at a time; here it drives
+@@ -1748,6 +1764,8 @@ static void nv0039_copy(u32 notify)
+         wb = rsx_live_draw_writeback_range(sl ? 0u : 1u, (u32)(lo_in - (s64)src) + s_nv0039.off_in,
+                                            (u32)(hi_in - lo_in));
+     s_nv0039_wb += wb;
++    if (g_rsx_sh_on && rsx_live_draw_enabled()) rsx_sync_hist_event(RSX_SH_NV0039, wb != 0);   /* patch 2164 */
++    if (g_rsx_fcap_on) rsx_fcap_range(RSX_FC_RD_WALKER, RSX_FC_EA, (u32)lo_in, vm_base + lo_in, (u32)(hi_in - lo_in), 1);   /* patch 2164 */
+     const long long m2mf_t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;   /* patch 2029 */
+     for (u32 y = 0; y < n; y++) {
+         u8* d = vm_base + (u32)((s64)dst + (s64)y * pout);
+@@ -1757,6 +1775,10 @@ static void nv0039_copy(u32 notify)
+             for (u32 x = 0; x < len; x++) d[(size_t)x * out_inc] = sp[(size_t)x * in_inc];
+     }
+     if (m2mf_t0) rsx_perf_add(RSX_PERF_W_M2MF_T, rsx_perf_now() - m2mf_t0);
++    if (g_rsx_fcap_on) {   /* patch 2164: the copy's geometry and the result span (digest only) */
++        rsx_fcap_range(RSX_FC_WR_WALKER, RSX_FC_EA, (u32)lo_out, vm_base + lo_out, (u32)(hi_out - lo_out), 0);
++        gcm_fcap_copy_geom(0, src, dst, len, n, (u32)pin, (u32)pout, s_nv0039.format, wb, s_nv0039.src_dma, s_nv0039.dst_dma, 0);
++    }
+     u32 marked = 0;
+     if (rsx_live_draw_enabled()) {
+         rsx_live_draw_set_write_source(3u);   /* patch 2081 diagnostic tag: NV0039 */
+@@ -2340,6 +2362,7 @@ static void gcm_ref_publish_one(void)
+     u32 h = s_ref_qhead;
+     if (h == s_ref_qtail) return;
+     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
++    if (g_rsx_fcap_on) rsx_fcap_word(1, 6, GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);   /* patch 2164 */
+     /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
+      * when redirected, so its interleaving with an stderr probe is not a
+      * timeline. Same stream = same ordering. */
+@@ -2533,6 +2556,312 @@ void rsx_perf_add(int idx, long long v)
+         __atomic_fetch_add(&g_rsx_perf[idx], v, __ATOMIC_RELAXED);
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Patch 2164: LD_SYNC_HIST=1 (renderer step 0, probe P4). The classifier is rsx_sync_hist.h (host-tested); this
++ * file feeds it from the walker thread: draws (sink_end_impl), NV0039 copies (nv0039_copy), NV406E 0x6C releases
++ * (the walker's semaphore block), NV4097 0x1D70/0x1D74 releases (rsx_commands.c), flips (ld_present_body's
++ * before-sync write-back; KZ3 flips through 0xE944), reports (0x1800) and SET_REFERENCE (0x50). One line per
++ * LD_SYNC_HIST_N flips (default 100) and a summary at exit, on stderr. Off: one load + branch per hook.
++ * -----------------------------------------------------------------------*/
++static rsx_sh s_sh;
++static void gcm_sh_summary(void)
++{
++    char line[2048];
++    if (!g_rsx_sh_on) return;
++    g_rsx_sh_on = 0;
++    if (s_sh.win.flips) { rsx_sh_line(&s_sh, line, sizeof line); fprintf(stderr, "%s\n", line); }
++    rsx_sh_fmt(&s_sh.tot, "summary", line, sizeof line);
++    fprintf(stderr, "%s\n", line);
++}
++void rsx_sync_hist_draw(void) { if (g_rsx_sh_on) rsx_sh_draw(&s_sh); }
++void rsx_sync_hist_event(int kind, unsigned dirty)
++{
++    if (!g_rsx_sh_on) return;
++    if (rsx_sh_event(&s_sh, kind, dirty)) {
++        char line[2048];
++        rsx_sh_line(&s_sh, line, sizeof line);
++        fprintf(stderr, "%s\n", line);
++    }
++}
++
++/* ---------------------------------------------------------------------------
++ * Patch 2164: LD_FIFO_CAPTURE=dir (+ LD_FIFO_CAPTURE_FRAME=start,count, default 0,1): renderer step 0 capture writer
++ * (format and reader: rsx_fifo_capture.h). Frames are flips
++ * the walker consumed (sink_flip, the 0xFEAD word, E920/E924). The file <dir>/fifo-capture.kz3fc holds GAME DATA: dir
++ * must have a "work" path segment, never commit it. Capture slows the walker (every guest_ptr range is hashed),
++ * so a capture window is not a timing run. ASSUMPTION: the images of item (e) are a best-effort snapshot taken while
++ * the guest runs; the RANGE records, not the images, are the authority for what a draw read.
++ * -----------------------------------------------------------------------*/
++static rsx_fc_writer s_fc;
++static SRWLOCK s_fc_lock = SRWLOCK_INIT;
++static int s_fc_cfg_done, s_fc_state;            /* state: 0 waiting for the window, 1 open, 2 closed */
++static u32 s_fc_start, s_fc_count, s_fc_frames, s_fc_pass, s_fc_last_off = 0xFFFFFFFFu, s_fc_last_hdr;
++static char s_fc_path[400];
++static uint8_t s_fc_seen_blk[8192];              /* 64 KB blocks of the 4 GB guest space already imaged */
++
++static int gcm_fcap_work_segment(const char* p)
++{
++    for (const char* q = p; *q; ) {
++        const char* e = q;
++        while (*e && *e != '/' && *e != '\\') e++;
++        if (e - q == 4 && (q[0] | 0x20) == 'w' && (q[1] | 0x20) == 'o' && (q[2] | 0x20) == 'r' && (q[3] | 0x20) == 'k') return 1;
++        q = *e ? e + 1 : e;
++    }
++    return 0;
++}
++int rsx_fcap_configured(void)
++{
++    if (s_fc_cfg_done) return g_rsx_fcap_cfg;
++    s_fc_cfg_done = 1;
++    const char* dir = getenv("LD_FIFO_CAPTURE");
++    if (!dir || !*dir) return 0;
++    if (!gcm_fcap_work_segment(dir)) {
++        fprintf(stderr, "[fifo-capture] refused: LD_FIFO_CAPTURE=%s has no 'work' path segment (captures hold game data); capture off\n", dir);
++        return 0;
++    }
++    const char* fr = getenv("LD_FIFO_CAPTURE_FRAME");
++    unsigned a = 0, b = 1;
++    if (fr && *fr && sscanf(fr, "%u,%u", &a, &b) != 2) { a = 0; b = 1; }
++    if (!b) b = 1;
++    s_fc_start = a; s_fc_count = b;
++#ifdef _WIN32
++    CreateDirectoryA(dir, NULL);
++#else
++    mkdir(dir, 0777);
++#endif
++    snprintf(s_fc_path, sizeof s_fc_path, "%s/fifo-capture.kz3fc", dir);
++    g_rsx_fcap_cfg = 1;
++    fprintf(stderr, "[fifo-capture] configured: %s frames %u..%u (LD_FIFO_CAPTURE, patch 2164, format v%u)\n", s_fc_path,
++            s_fc_start, s_fc_start + s_fc_count - 1u, RSX_FC_VERSION);
++    return 1;
++}
++
++static int gcm_fcap_blk_zero(const uint8_t* p, size_t n)
++{
++    for (size_t i = 0; i + 8 <= n; i += 8) { uint64_t v; memcpy(&v, p + i, 8); if (v) return 0; }
++    return 1;
++}
++/* Item (e): non-zero 64 KB blocks of [ea, ea+len) as IMAGE records (each block once). Caller holds s_fc_lock. */
++static void gcm_fcap_image_locked(u32 ea, u32 len)
++{
++    extern u8* vm_base;
++    const u64 vmsz = ppu_vm_size ? ppu_vm_size : VM_TOTAL_SIZE;
++    for (u64 a = (u64)ea & ~0xFFFFull; a < (u64)ea + len; a += 0x10000) {
++        if (a + 0x10000 > vmsz) break;
++        const u32 blk = (u32)(a >> 16);
++        if (s_fc_seen_blk[blk >> 3] & (1u << (blk & 7))) continue;
++        s_fc_seen_blk[blk >> 3] |= (uint8_t)(1u << (blk & 7));
++        if (gcm_fcap_blk_zero(vm_base + a, 0x10000)) continue;
++        uint8_t head[12];
++        rsx_fc_put32(head, RSX_FC_EA); rsx_fc_put32(head + 4, (u32)a); rsx_fc_put32(head + 8, 0x10000u);
++        rsx_fc_w_rec2(&s_fc, RSX_FC_IMAGE, head, sizeof head, vm_base + a, 0x10000u);
++    }
++}
++static void gcm_fcap_atexit(void);
++static void gcm_fcap_open_locked(void)
++{
++    extern u8* vm_base;
++    s_fc_state = 2;                                   /* closed unless the open below succeeds */
++    if (!vm_base) return;
++    if (rsx_fc_w_open(&s_fc, s_fc_path, s_fc_start, s_fc_count) != 0) {
++        fprintf(stderr, "[fifo-capture] cannot create %s; capture off\n", s_fc_path);
++        return;
++    }
++    memset(s_fc_seen_blk, 0, sizeof s_fc_seen_blk);
++    rsx_fc_buf b = {0};
++    const u32 vmsz = (u32)(ppu_vm_size ? ppu_vm_size : VM_TOTAL_SIZE);
++    u32 n_io = 0;
++    for (u32 p = 0; p < 65536; p++) if (s_ea_address_table[p] != 0xFFFF) n_io++;
++    rsx_fc_buf_u32(&b, s_config.localAddress); rsx_fc_buf_u32(&b, s_config.localSize); rsx_fc_buf_u32(&b, vmsz);
++    rsx_fc_buf_u32(&b, vm_read32(GCM_CONTROL_GUEST_ADDR + 0)); rsx_fc_buf_u32(&b, s_fifo_getoff); rsx_fc_buf_u32(&b, s_fifo_calloff);
++    rsx_fc_buf_u32(&b, GCM_LABEL_GUEST_BASE); rsx_fc_buf_u32(&b, GCM_CONTROL_GUEST_ADDR); rsx_fc_buf_u32(&b, n_io);
++    for (u32 p = 0; p < 65536; p++) if (s_ea_address_table[p] != 0xFFFF) rsx_fc_buf_u32(&b, (p << 16) | s_ea_address_table[p]);
++    for (u32 i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++) {
++        rsx_fc_buf_u32(&b, (u32)s_display_buffer_set[i]); rsx_fc_buf_u32(&b, s_display_buffers[i].offset);
++        rsx_fc_buf_u32(&b, s_display_buffers[i].pitch); rsx_fc_buf_u32(&b, s_display_buffers[i].width);
++        rsx_fc_buf_u32(&b, s_display_buffers[i].height);
++    }
++    if (!b.err) rsx_fc_w_rec(&s_fc, RSX_FC_CONFIG, b.p, b.n);
++    rsx_fc_buf_free(&b);
++    for (u32 p = 0; p < 65536; p++)                  /* every IO-mapped 1 MB page of main memory */
++        if (s_ea_address_table[p] != 0xFFFF) gcm_fcap_image_locked((u32)s_ea_address_table[p] << 20, 0x100000u);
++    if (s_config.localSize) gcm_fcap_image_locked(s_config.localAddress, s_config.localSize);   /* the RSX local window */
++    gcm_fcap_image_locked(GCM_LABEL_GUEST_BASE & ~0xFFFFu, 0x10000u);                            /* labels */
++    gcm_fcap_image_locked(GCM_CONTROL_GUEST_ADDR & ~0xFFFFu, 0x10000u);                          /* control register page */
++    { u32 v[2] = { s_fc_frames, 1u }; rsx_fc_w_words(&s_fc, RSX_FC_FRAME, v, 2); }
++    s_fc_state = 1; s_fc_last_off = 0xFFFFFFFFu;
++    atexit(gcm_fcap_atexit);
++    g_rsx_fcap_on = 1;
++    fprintf(stderr, "[fifo-capture] open at frame %u: config + images written (%llu payload bytes so far)\n", s_fc_frames,
++            (unsigned long long)s_fc.payload_bytes);
++}
++static void gcm_fcap_close_locked(void)
++{
++    if (s_fc_state != 1) return;
++    g_rsx_fcap_on = 0;
++    { u32 v[2] = { s_fc_frames, 0u }; rsx_fc_w_words(&s_fc, RSX_FC_FRAME, v, 2); }
++    const unsigned long long recs = s_fc.seq, bytes = s_fc.payload_bytes, nr = s_fc.n_range, nrb = s_fc.n_range_bytes;
++    const int rc = rsx_fc_w_close(&s_fc);
++    s_fc_state = 2;
++    fprintf(stderr, "[fifo-capture] closed at frame %u: %s, %llu records, %.1f MB payload, %llu guest ranges (%.1f MB of bytes)%s\n",
++            s_fc_frames, s_fc_path, recs, (double)bytes / 1048576.0, nr, (double)nrb / 1048576.0, rc ? " WRITE ERROR" : "");
++}
++static void gcm_fcap_atexit(void)
++{
++    AcquireSRWLockExclusive(&s_fc_lock);
++    gcm_fcap_close_locked();
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++static void gcm_fcap_update_locked(void)
++{
++    if (s_fc_state == 0 && s_fc_frames >= s_fc_start && s_fc_frames - s_fc_start < s_fc_count) gcm_fcap_open_locked();
++    else if (s_fc_state == 1 && s_fc_frames - s_fc_start >= s_fc_count) gcm_fcap_close_locked();
++}
++static void gcm_fcap_pass_begin(u32 put)
++{
++    if (s_fc_state == 2) return;
++    AcquireSRWLockExclusive(&s_fc_lock);
++    gcm_fcap_update_locked();
++    if (s_fc_state == 1) { u32 v[4] = { put, s_fifo_getoff, s_fifo_calloff, ++s_fc_pass }; rsx_fc_w_words(&s_fc, RSX_FC_PASS, v, 4); }
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++static void gcm_fcap_nop_run(u32 getoff, u32 words)
++{
++    AcquireSRWLockExclusive(&s_fc_lock);
++    if (s_fc_state == 1) { u32 v[4] = { getoff, 0u, 1u, words }; rsx_fc_w_words(&s_fc, RSX_FC_CMD, v, 4); s_fc_last_off = 0xFFFFFFFFu; }
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++/* CMD with header 0 = a run of NOP words: payload is (getoff, 0, 1, run_words). Any other header: (getoff, header, n, n words). */
++static void gcm_fcap_cmd(u32 getoff, u32 w_raw, int is_method)
++{
++    static u32 words[0x800];
++    AcquireSRWLockExclusive(&s_fc_lock);
++    if (s_fc_state == 1 && !(s_fc_last_off == getoff && s_fc_last_hdr == w_raw)) {
++        s_fc_last_off = getoff; s_fc_last_hdr = w_raw;
++        if (w_raw == 0) {
++            u32 v[4] = { getoff, 0u, 1u, 1u }; rsx_fc_w_words(&s_fc, RSX_FC_CMD, v, 4);
++        } else {
++            u32 n = is_method ? (w_raw >> 18) & 0x7FFu : 0u, got = 0;
++            for (; got < n; got++) { const u32 ea = gcm_io2ea(getoff + 4u + got * 4u); if (!ea) break; words[got] = vm_read32(ea); }
++            rsx_fc_buf b = {0};
++            rsx_fc_buf_u32(&b, getoff); rsx_fc_buf_u32(&b, w_raw); rsx_fc_buf_u32(&b, got);
++            for (u32 i = 0; i < got; i++) rsx_fc_buf_u32(&b, words[i]);
++            if (!b.err) rsx_fc_w_rec(&s_fc, RSX_FC_CMD, b.p, b.n);
++            rsx_fc_buf_free(&b);
++        }
++    }
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++static void gcm_fcap_pass_end(const char* why, u32 getoff, u32 calloff)
++{
++    uint8_t b[24] = {0};
++    AcquireSRWLockExclusive(&s_fc_lock);
++    if (s_fc_state == 1) {
++        rsx_fc_put32(b, getoff); rsx_fc_put32(b + 4, calloff);
++        if (why) strncpy((char*)b + 8, why, 15);
++        rsx_fc_w_rec(&s_fc, RSX_FC_PASS_END, b, sizeof b);
++    }
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++static void gcm_fcap_copy_geom(u32 kind, u32 a, u32 b_, u32 c, u32 d, u32 e, u32 f, u32 g, u32 h, u32 i, u32 j, u32 k)
++{
++    uint8_t p[48];
++    const u32 v[12] = { kind, a, b_, c, d, e, f, g, h, i, j, k };
++    for (int q = 0; q < 12; q++) rsx_fc_put32(p + q * 4, v[q]);
++    AcquireSRWLockExclusive(&s_fc_lock);
++    if (s_fc_state == 1) rsx_fc_w_rec(&s_fc, RSX_FC_COPY, p, sizeof p);
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++/* NV3089: phase 0 = before the blit (the source surface as a walker read, bytes), 1 = after (the result span as a
++ * digest, and the COPY record: 12 common words then in_off, in_fmt, in_sz, in_uv, out_pt, out_sz, clip_pt, clip_sz,
++ * dst_offset, dst_dma, dst colour format, ds_dx, dt_dy, fmt, op). The source extent is the whole input surface
++ * (in_pitch x in_height), an over-approximation of what the blit reads. */
++static void gcm_fcap_nv3089(int phase)
++{
++    extern u8* vm_base;
++    const u64 vmsz = ppu_vm_size ? ppu_vm_size : VM_TOTAL_SIZE;
++    const u32 in_pitch = s_nv3089.in_fmt & 0xFFFFu, in_h = s_nv3089.in_sz >> 16;
++    const u32 out_w = s_nv3089.out_sz & 0xFFFFu, out_h = s_nv3089.out_sz >> 16;
++    const u32 out_x = s_nv3089.out_pt & 0xFFFFu, out_y = s_nv3089.out_pt >> 16;
++    const u32 dst_pitch = s_gcm2d.pitch >> 16;
++    const int sl = s_nv3089.src_dma != 0xFEED0001u, dl = s_gcm2d.dst_dma != 0xFEED0001u;
++    const u32 src = cellGcmResolveLocated(sl, s_nv3089.in_off), dst = cellGcmResolveLocated(dl, s_gcm2d.dst_offset);
++    if (!vm_base) return;
++    if (phase == 0) {
++        const u64 len = (u64)in_pitch * in_h;
++        if (src && len && (u64)src + len <= vmsz && len <= (64u << 20)) rsx_fcap_range(RSX_FC_RD_WALKER, RSX_FC_EA, src, vm_base + src, (u32)len, 1);
++        return;
++    }
++    if (!out_w || !out_h || !dst_pitch) return;
++    const u64 start = (u64)dst + (u64)out_y * dst_pitch + (u64)out_x * 4u, len = (u64)(out_h - 1u) * dst_pitch + (u64)out_w * 4u;
++    if (dst && start + len <= vmsz && len <= (64u << 20)) rsx_fcap_range(RSX_FC_WR_WALKER, RSX_FC_EA, (u32)start, vm_base + start, (u32)len, 0);
++    rsx_fc_buf b = {0};
++    const u32 v[27] = { 1u, src, dst, out_w, out_h, in_pitch, dst_pitch, s_nv3089.fmt, 0u, s_nv3089.src_dma, s_gcm2d.dst_dma, 0u,
++                        s_nv3089.in_off, s_nv3089.in_fmt, s_nv3089.in_sz, s_nv3089.in_uv, s_nv3089.out_pt, s_nv3089.out_sz,
++                        s_nv3089.clip_pt, s_nv3089.clip_sz, s_gcm2d.dst_offset, s_gcm2d.dst_dma, s_gcm2d.color_fmt,
++                        s_nv3089.ds_dx, s_nv3089.dt_dy, s_nv3089.fmt, s_nv3089.op };
++    for (int i = 0; i < 27; i++) rsx_fc_buf_u32(&b, v[i]);
++    AcquireSRWLockExclusive(&s_fc_lock);
++    if (s_fc_state == 1 && !b.err) rsx_fc_w_rec(&s_fc, RSX_FC_COPY, b.p, b.n);
++    ReleaseSRWLockExclusive(&s_fc_lock);
++    rsx_fc_buf_free(&b);
++}
++void rsx_fcap_range(int kind, int space, u32 addr, const void* p, u32 len, int with_bytes)
++{
++    if (!g_rsx_fcap_on) return;
++    AcquireSRWLockExclusive(&s_fc_lock);
++    if (s_fc_state == 1) rsx_fc_w_range(&s_fc, (u32)kind, (u32)space, addr, p, len, with_bytes);
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value)
++{
++    if (!g_rsx_fcap_on) return;
++    const u32 v[4] = { (u32)dir, tag, ea, value };
++    AcquireSRWLockExclusive(&s_fc_lock);
++    if (s_fc_state == 1) rsx_fc_w_words(&s_fc, RSX_FC_WORD, v, 4);
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++void rsx_fcap_flip(u32 buffer, u32 src)
++{
++    if (!g_rsx_fcap_cfg) return;
++    AcquireSRWLockExclusive(&s_fc_lock);
++    s_fc_frames++;
++    if (s_fc_state == 1) { const u32 v[3] = { buffer, src, s_fc_frames }; rsx_fc_w_words(&s_fc, RSX_FC_FLIP, v, 3); }
++    gcm_fcap_update_locked();
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++void rsx_fcap_spu_note(u32 location, u32 offset, u32 size, int async)
++{
++    if (!g_rsx_fcap_on) return;
++    const u32 v[5] = { location, offset, size, (u32)async, (u32)GetCurrentThreadId() };
++    AcquireSRWLockExclusive(&s_fc_lock);
++    if (s_fc_state == 1) rsx_fc_w_words(&s_fc, RSX_FC_SPU_NOTE, v, 5);
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++void rsx_fcap_drain(u32 tail, u32 head, u32 overflow)
++{
++    if (!g_rsx_fcap_on) return;
++    const u32 v[3] = { tail, head, overflow };
++    AcquireSRWLockExclusive(&s_fc_lock);
++    if (s_fc_state == 1) rsx_fc_w_words(&s_fc, RSX_FC_DRAIN, v, 3);
++    ReleaseSRWLockExclusive(&s_fc_lock);
++}
++
++/* Reads the switches once, at the first walker pass (the capture's own configuration may already have run from
++ * rsx_live_draw_init). */
++static void gcm_sh_init_once(void)
++{
++    const char* e = getenv("LD_SYNC_HIST");
++    if (e && *e && *e != '0') {
++        const char* n = getenv("LD_SYNC_HIST_N");
++        rsx_sh_init(&s_sh, n && atoi(n) > 0 ? (uint32_t)atoi(n) : 100u);
++        atexit(gcm_sh_summary);
++        g_rsx_sh_on = 1;
++        fprintf(stderr, "[sync-hist] on (LD_SYNC_HIST=1, one line per %u flips, patch 2164)\n", s_sh.every);
++    }
++    rsx_fcap_configured();
++}
++
+ #ifdef _WIN32
+ #include <tlhelp32.h>
+ extern const char* ppu_thread_name_for_os_tid(unsigned long os_tid);
+@@ -2728,6 +3057,17 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+                     d[RSX_PERF_W_D_POST_T] * tk, d[RSX_PERF_W_D_RS_T] * tk,
+                     d[RSX_PERF_W_D_BAR_N], d[RSX_PERF_W_D_BAR_T] * tk, d[RSX_PERF_W_D_OMRT_T] * tk, d[RSX_PERF_W_D_SM_HIT_N],
+                     d[RSX_PERF_W_D_UNIT_SKIP_N]);
++            if (d[RSX_PERF_W_ON]) {   /* patch 2164: the walk outside the method loop, split into non-overlapping leaf rows */
++                const double walk = d[RSX_PERF_WALK_T] * tk, meth = d[RSX_PERF_W_METH_T] * tk, outside = walk - meth;
++                const double lk = d[RSX_PERF_O_LOCK_T] * tk, pre = d[RSX_PERF_O_PRE_T] * tk, sema = d[RSX_PERF_O_SEMA_T] * tk,
++                             park = d[RSX_PERF_O_PARK_T] * tk, flw = d[RSX_PERF_O_FLIP_T] * tk, eop = d[RSX_PERF_O_EOP_T] * tk;
++                fprintf(stderr, "[perf-out] t=%.0fs walk %.1fms meth %.1f outside %.1f = lock %.1f + pre %.1f + sema %.1f"
++                                " (before-sync %.1f, n %lld) + park %.1f (n %lld) + flipword %.1f (n %lld) + eop %.1f (submit %.1f)"
++                                " + loop-rest %.1f | present-wait %.1fms n %lld (inside meth, under present)\n",
++                        tnow, walk, meth, outside, lk, pre, sema, d[RSX_PERF_O_SEMA_BGS_T] * tk, d[RSX_PERF_O_SEMA_N], park,
++                        d[RSX_PERF_O_PARK_N], flw, d[RSX_PERF_O_FLIP_N], eop, d[RSX_PERF_O_EOP_SUB_T] * tk,
++                        outside - lk - pre - sema - park - flw - eop, d[RSX_PERF_O_PW_T] * tk, d[RSX_PERF_O_PW_N]);
++            }
+             if (d[RSX_PERF_W_ON])   /* patch 2080: NV3089 blits (whole method, its GPU mirror, the guest copy) */
+                 fprintf(stderr, "[perf-nv3089] t=%.0fs n=%lld blit %.1fms (gpu %.1fms, copy %.1fms rows %lld)"
+                                 " bytes %.2fMB\n", tnow, d[RSX_PERF_W_NV3089_N], d[RSX_PERF_W_NV3089_T] * tk,
+@@ -3010,6 +3350,7 @@ void cellGcm_rsx_process_fifo(void)
+ #endif
+     const long long t0 = rsx_perf_now();
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
++    if (s_perf_walk_on) rsx_perf_add(RSX_PERF_O_LOCK_T, rsx_perf_now() - t0);   /* patch 2164 */
+     gcm_rsx_process_fifo_unlocked();
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+     rsx_perf_add(RSX_PERF_WALK_T, rsx_perf_now() - t0);
+@@ -3128,13 +3469,14 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+     /* NV406E_SET_REFERENCE: queue the fence value for PACED
+      * publication (gcm_ref_publish below) instead of letting a
+      * later fence in the same batch overwrite it. */
+-    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
++    if (m == 0x50) { gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff); if (g_rsx_sh_on) rsx_sync_hist_event(RSX_SH_REF, 0); }   /* 2164 */
+     /* NV4097_GET_REPORT: (type << 24) | offset into the report
+      * area. Sample counts are not measured, so a ZPASS query
+      * reports "visible" -- the conservative answer; reading 0
+      * tells the title every queried object is occluded. */
+     if (m == 0x1A8) s_report_dma = v;
+     if (m == 0x1800) {
++        if (g_rsx_sh_on) rsx_sync_hist_event(RSX_SH_REPORT, 0);   /* patch 2164 */
+         const u32 off = v & 0xFFFFFFu, idx = off / 16u;
+         u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+         const u64 ts = gcm_report_timestamp();
+@@ -3151,6 +3493,8 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+                 vm_write32(rea + 4u, (u32)ts);
+                 vm_write32(rea + 8u, val);
+                 vm_write32(rea + 12u, 0u);
++                if (g_rsx_fcap_on) { rsx_fcap_word(1, 5, rea, (u32)(ts >> 32)); rsx_fcap_word(1, 5, rea + 4u, (u32)ts);
++                                     rsx_fcap_word(1, 5, rea + 8u, val); rsx_fcap_word(1, 5, rea + 12u, 0u); }   /* patch 2164 */
+             } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+         } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+             s_report_data[idx].timestamp = ts;
+@@ -3205,6 +3549,7 @@ static int gcm_report_hold(void)
+  * RSX-thread profiles, so each is read once and cached, like the other knobs. */
+ static void gcm_rsx_process_fifo_unlocked(void)
+ {
++    const long long o_pre0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] pre */
+     { static unsigned _n = 0; static unsigned long long _t0 = 0;
+       extern unsigned long long ps3_ms_now(void);
+       _n++;
+@@ -3250,6 +3595,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * own command ring, so everything after the jump (including the reference
+      * writes its waits spin on) silently never executed. */
+     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
++    { static int s_h_once; if (!s_h_once) { s_h_once = 1; gcm_sh_init_once(); } }   /* patch 2164: read the switches once */
++    if (g_rsx_fcap_cfg) gcm_fcap_pass_begin(put);
+     /* The words behind `put` were stored by another thread (the title, or the
+      * recycle below) before it stored `put`. On x86 the hardware keeps loads
+      * in order; on arm64 it does not, so without an acquire here the ring
+@@ -3352,6 +3699,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * short of `put` every tick is the signature of a FIFO that can never
+      * catch up, and the reason is the whole diagnosis. */
+     const char* why = "caught-up";
++    if (o_pre0) rsx_perf_add(RSX_PERF_O_PRE_T, rsx_perf_now() - o_pre0);
+     while (s_fifo_getoff != put && budget-- > 0) {
+         u32 ea = gcm_io2ea(s_fifo_getoff);
+         if (!ea) {
+@@ -3380,6 +3728,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             break;
+         }
+         u32 w = vm_read32(ea);
++        const u32 w_raw = w;   /* patch 2164 */
+         /* Only remember offsets BELOW put -- those are positions in the
+          * ring the title is writing. A park in another region is where the
+          * walker gave up, not how far it got through the ring. */
+@@ -3432,6 +3781,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             u32 off = s_fifo_getoff + 4u, nea = ea + 4u;
+             while (off < lim && budget > 0 && !vm_read32(nea)) { off += 4u; nea += 4u; budget--; }
+             if (s_fifo_getoff < put) s_last_ring_off = off;
++            if (g_rsx_fcap_on) gcm_fcap_nop_run(s_fifo_getoff, (off - s_fifo_getoff) / 4u);   /* patch 2164 */
+             s_fifo_getoff = off;
+             continue;
+         }
+@@ -3454,8 +3804,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
+         const int is_jump = gcm_fifo_jump_target(w, &jump_tgt);
+         if (park_off && (s_fifo_getoff != park_off || !is_jump || jump_tgt != park_off))
+             park_off = 0;
++        if (g_rsx_fcap_on)   /* patch 2164: item (a), the command as consumed after park/patch resolution */
++            gcm_fcap_cmd(s_fifo_getoff, w_raw, !is_jump && (w & 3u) != 2u && w != 0x00020000u &&
++                         (w_raw & 0xFFFF0000u) != 0xFEAD0000u && (type == 0 || type == 2));
+ 
+         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
++            const long long o_fl0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] flip word */
++            if (g_rsx_fcap_cfg) rsx_fcap_flip(w & 7u, 1);   /* patch 2164 */
+             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
+              * this word into the FIFO instead of calling any import. Fire the
+              * flip (status/count/handler) and STOP this drain so the ticker's
+@@ -3504,6 +3859,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+              * 3 MB ring at boot, wraps, and a walker stopping at every flip
+              * then crawled ~1 KB a tick while the title wrote over the
+              * commands ahead of it. */
++            if (o_fl0) { rsx_perf_add(RSX_PERF_O_FLIP_T, rsx_perf_now() - o_fl0); rsx_perf_add(RSX_PERF_O_FLIP_N, 1); }
+             if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
+                 { why = "flip"; break; }
+             continue;
+@@ -3547,7 +3903,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                                                    s_fifo_getoff, gcm_io2ea(s_fifo_getoff), put); }
+                       else if (put != s_park_put) { s_park_put = put; s_park_putchg++; }
+                       if (pw > 0 && now - s_park_t0 < (u64)pw * 1000000ull) {
+-                          if (gcm_park_wake_wait(s_fifo_getoff)) continue;   /* KZ3 patch 1087: re-read the park */
++                          const long long o_pk0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] park */
++                          const int o_pk = gcm_park_wake_wait(s_fifo_getoff);
++                          if (o_pk0) { rsx_perf_add(RSX_PERF_O_PARK_T, rsx_perf_now() - o_pk0); rsx_perf_add(RSX_PERF_O_PARK_N, 1); }
++                          if (o_pk) continue;   /* KZ3 patch 1087: re-read the park */
+                           why = "park-wait"; s_park_pass = 1; break; }
+                       /* v0.18.0 (upstream f8255191): read the park again before giving up on it; an SPU job
+                        * filling a command-buffer hole may land between this pass's read and the resync. */
+@@ -3640,7 +3999,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                * The end of the pass, where get is otherwise published, can
+                * come tens of milliseconds later. GCM_GET_EQ_PUT keeps its
+                * own value. */
+-              if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); }
++              if (!gcm_get_eq_put()) { vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); if (g_rsx_fcap_on) rsx_fcap_word(1, 1, GCM_CONTROL_GUEST_ADDR + 4, tgt); } }
+             continue;
+         }
+         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+@@ -3695,6 +4054,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 break;
+             }
+             if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
++                const long long o_sm0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] sema */
+                 int sem_blocked = 0;
+                 for (u32 i = 0; i < count; i++) {
+                     u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+@@ -3702,6 +4062,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                     u32 m = (type == 0) ? method + i * 4 : method;
+                     u32 v = vm_read32(dea);
+                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
++                    if (g_rsx_fcap_on && m == 0x68u) rsx_fcap_word(0, 8, la, vm_read32(la));   /* patch 2164: the acquire's compare */
+                     { static int sn = 0, recdbg = -1; if (recdbg < 0) recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+                       if (recdbg && PS3_LOG_FIRST(sn, 12))
+                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
+@@ -3730,7 +4091,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                     }
+                     if (m == 0x64u)      s_sema_offset = v;
+                     else if (m == 0x6Cu) {   /* patch 2017: RSX output in main memory first */
+-                        if (rsx_live_draw_enabled()) rsx_live_draw_before_guest_sync();
++                        { const long long o_bg0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164 */
++                          const u32 o_bgs = rsx_live_draw_enabled() ? rsx_live_draw_before_guest_sync() : 0;
++                          if (o_bg0) rsx_perf_add(RSX_PERF_O_SEMA_BGS_T, rsx_perf_now() - o_bg0);
++                          if (g_rsx_sh_on) rsx_sync_hist_event(RSX_SH_REL406E, o_bgs != 0); }
+                         /* The RSX has fetched past a RELEASE before its
+                          * semaphore write lands, so a guest that sees the
+                          * label must also see `get` past the command. `get`
+@@ -3740,10 +4104,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                          * its own `put` equals it, which a snapshot from
+                          * before the RELEASE never does. GCM_GET_EQ_PUT keeps
+                          * publishing put at the end of the pass instead. */
+-                        if (!gcm_get_eq_put())
++                        if (!gcm_get_eq_put()) {
+                             vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
++                            if (g_rsx_fcap_on) rsx_fcap_word(1, 2, GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);   /* patch 2164 */
++                        }
+                         atomic_thread_fence(memory_order_release);
+                         vm_write32(la, v);
++                        if (g_rsx_fcap_on) rsx_fcap_word(1, 3, la, v);   /* patch 2164 */
+                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
+                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
+                     }
+@@ -3777,6 +4144,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             }
+         }
+                 }
++                if (o_sm0) { rsx_perf_add(RSX_PERF_O_SEMA_T, rsx_perf_now() - o_sm0); rsx_perf_add(RSX_PERF_O_SEMA_N, 1); }
+                 if (sem_blocked) { s_sema_blocked_pass = 1; break; }
+                 s_fifo_getoff += 4 + count * 4;
+                 continue;
+@@ -4016,6 +4384,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+         s_fifo_getoff += 4;                    /* unknown word: skip */
+     }
+ 
++    const long long o_eop0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] end of pass */
+     /* Walker watchdog. Everything above recovers from a *recognised* stall --
+      * a branch we cannot take, a park the title abandoned. A walker that stops
+      * for any other reason simply freezes `get` for the rest of the run and
+@@ -4090,7 +4459,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+     /* KZ3 patch 2029: the walker is about to idle (caught up with put, or parked
+      * on a JUMP-to-self the SPU has not patched yet): hand the GPU what it has
+      * recorded so far instead of letting it sit until the next sync point. */
+-    if (strcmp(why, "flip") != 0 && rsx_live_draw_enabled()) rsx_live_draw_submit_pending();
++    { const long long o_sb0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: submit inside the end-of-pass row */
++      if (strcmp(why, "flip") != 0 && rsx_live_draw_enabled()) rsx_live_draw_submit_pending();
++      if (o_sb0) rsx_perf_add(RSX_PERF_O_EOP_SUB_T, rsx_perf_now() - o_sb0); }
+ 
+     /* Publish progress: get chases put; ref advances at most ONE queued fence
+      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
+@@ -4206,10 +4577,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * walker says it is drained: is the title reading `get`, or something else?
+      * If the overflow survives this, `get` is not what it consults. */
+     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);
++    if (g_rsx_fcap_on) rsx_fcap_word(1, 4, GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);   /* patch 2164 */
+ 
+     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
+     gcm_ref_publish_one();
+     ReleaseSRWLockExclusive(&s_ref_pub_lock);
++    if (o_eop0) rsx_perf_add(RSX_PERF_O_EOP_T, rsx_perf_now() - o_eop0);   /* patch 2164 */
++    if (g_rsx_fcap_on) gcm_fcap_pass_end(why, s_fifo_getoff, s_fifo_calloff);   /* patch 2164 */
+ }
+ 
+ /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 30a99d7d..1d2052b7 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1598,6 +1598,16 @@ static SRWLOCK g_ld_access_lock = SRWLOCK_INIT;
+ static volatile LONG g_ld_guest_active = 0;
+ static volatile LONG g_ld_host_waiting = 0;
+ 
++/* Patch 2164 (LD_FIFO_CAPTURE): every renderer guest read goes through g.guest_ptr; with the switch set, rsx_live_draw_init
++ * installs this wrapper in front of the host's provider (the vertex-compact path gets the same pointer). With the switch
++ * unset g.guest_ptr is the provider itself. The range logged is min_bytes (ASSUMPTION: callers read at most that). */
++static rsx_live_guest_ptr_fn s_ld_fc_inner;
++static const u8* ld_fc_guest_ptr(void* user, u32 location, u32 offset, u32 min_bytes)
++{
++    const u8* p = s_ld_fc_inner(user, location, offset, min_bytes);
++    if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_range(0 /* RSX_FC_RD_RENDERER */, location == 0 ? 1 : 2, offset, p, min_bytes, 1);
++    return p;
++}
+ static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
+ {
+     if (!g.guest_ptr) return NULL;
+@@ -5598,6 +5608,7 @@ static void ld_gv_mark(u32 location, u32 offset, u32 size);
+ void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size)
+ {
+     if (!g.ready || !size) return;
++    if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_spu_note(location, offset, size, 1);   /* patch 2164 */
+     ld_td_mark(location, offset, size);   /* patch 2033: SPU DMA puts, any thread */
+     if (!ld_gv_enabled()) return;
+     LONG slot;
+@@ -5616,6 +5627,7 @@ void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size)
+ 
+ static void ld_gv_drain(void)
+ {
++    if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_drain((u32)g_gv_ring_tail, (u32)g_gv_ring_head, (u32)g_gv_ring_overflow);   /* patch 2164 */
+     if (g_gv_ring_overflow) {
+         InterlockedExchange(&g_gv_ring_overflow, 0);
+         ld_gv_mark(0, 0, 0xFFFFFFFFu); ld_gv_mark(1, 0, 0xFFFFFFFFu);
+@@ -12670,7 +12682,8 @@ static void ld_movie_capture_overlay(void)
+ 
+     /* A guest flip still marks a new texture-generation boundary even though
+      * the guest surface is not sent to the swap chain. */
+-    rsx_live_draw_before_guest_sync();   /* patch 2017 */
++    { const u32 sh_dirty = rsx_live_draw_before_guest_sync();   /* patch 2017 */
++      if (__builtin_expect(g_rsx_sh_on, 0)) rsx_sync_hist_event(4 /* RSX_SH_FLIP */, sh_dirty != 0); }   /* patch 2164 */
+     ld_pwd_flip();   /* patch 2084 diagnostic */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+@@ -15793,6 +15806,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         ld_zp_finish(current_zslot, &zp_state);
+     }
+     g_ld_stats.groups_executed++;
++    if (__builtin_expect(g_rsx_sh_on, 0)) rsx_sync_hist_draw();   /* patch 2164 */
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.input_vertices += dc.n_source_refs;
+     g_ld_profile.total.expanded_vertices += n_tri;
+@@ -16037,6 +16051,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+ {
+     (void)user; (void)r;
+     const u32 buffer_id = arg & 7u;
++    if (__builtin_expect(g_rsx_fcap_cfg, 0)) rsx_fcap_flip(buffer_id, 0);   /* patch 2164 */
+     g_ld_flip_requested++;
+     g_ld_last_requested_buffer = buffer_id;
+     if (g_ld_movie_mode) {
+@@ -16363,7 +16378,10 @@ static int ld_present_slot(void)
+     static ULONGLONG s_t0;
+     const int ms = ld_present_wait_ms();
+     if (ms < 0 || !g_ld_latency_ev) return 1;
+-    if (WaitForSingleObject(g_ld_latency_ev, (DWORD)ms) == WAIT_OBJECT_0) {
++    const long long pw0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;   /* patch 2164: [perf-out] present wait */
++    const DWORD pw_r = WaitForSingleObject(g_ld_latency_ev, (DWORD)ms);
++    if (pw0) { rsx_perf_add(RSX_PERF_O_PW_T, rsx_perf_now() - pw0); rsx_perf_add(RSX_PERF_O_PW_N, 1); }
++    if (pw_r == WAIT_OBJECT_0) {
+         if (s_skip_win) {
+             fprintf(stderr, "[present] presenting again after %u skipped (no free swap-chain slot; %u in all)\n", s_skip_win, s_skip);
+             s_skip_win = 0;
+@@ -16880,6 +16898,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+ #endif
+     g.width = width; g.height = height;
+     g.guest_ptr = guest_fn; g.guest_user = guest_user;
++    if (rsx_fcap_configured() && guest_fn) { s_ld_fc_inner = guest_fn; g.guest_ptr = ld_fc_guest_ptr; }   /* patch 2164 */
+     {
+         const char* requested = getenv("RSX_FP_CONSTANT_MODE");
+         char mode = 'B';
+@@ -19181,7 +19200,8 @@ static void ld_present_body(u32 buffer_id)
+     { static unsigned long long packets_at_last_frame = 0;
+       g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
+       packets_at_last_frame = g_ld_stats.packets_seen; }
+-    rsx_live_draw_before_guest_sync();   /* patch 2017 */
++    { const u32 sh_dirty = rsx_live_draw_before_guest_sync();   /* patch 2017 */
++      if (__builtin_expect(g_rsx_sh_on, 0)) rsx_sync_hist_event(4 /* RSX_SH_FLIP */, sh_dirty != 0); }   /* patch 2164 */
+     ld_pwd_flip();   /* patch 2084 diagnostic */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index 729dc3ea..81101877 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -520,6 +520,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+                   unsigned long long ts = ps3_ms_now() * 1000000ull;
+                   vm_write32(ea, (u32)(ts >> 32)); vm_write32(ea + 4, (u32)ts);
+                   vm_write32(ea + 8, 0); vm_write32(ea + 12, 0);
++                  { extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);   /* patch 2164 */
++                    if (g_rsx_fcap_on) { rsx_fcap_word(1, 10, ea, (u32)(ts >> 32)); rsx_fcap_word(1, 10, ea + 4, (u32)ts);
++                                         rsx_fcap_word(1, 10, ea + 8, 0); rsx_fcap_word(1, 10, ea + 12, 0); } }
+               }
+           }
+           return 0;
+@@ -539,7 +542,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+       if (method == 0x1D70 || method == 0x1D74) {   /* patch 2017: RSX output in main memory first */
+         extern u32 rsx_live_draw_before_guest_sync(void);
+         extern int rsx_live_draw_enabled(void);
+-        if (rsx_live_draw_enabled()) rsx_live_draw_before_guest_sync();
++        extern volatile int g_rsx_sh_on; extern void rsx_sync_hist_event(int kind, unsigned dirty);   /* patch 2164 */
++        const u32 sh_dirty = rsx_live_draw_enabled() ? rsx_live_draw_before_guest_sync() : 0;
++        if (g_rsx_sh_on) rsx_sync_hist_event(3 /* RSX_SH_REL4097 */, sh_dirty != 0);
+       }
+       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
+         extern void vm_write32(uint32_t a, uint32_t v);
+@@ -548,6 +553,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         u32 val = method == 0x1D74 ? data
+                 : (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+         if (ea) vm_write32(ea, val);
++        { extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);   /* patch 2164 */
++          if (g_rsx_fcap_on && ea) rsx_fcap_word(1, 9, ea, val); }
+         return 0;
+       }
+       if (method == 0x1D70) {
+@@ -561,6 +568,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+          * Apply the same swap the hardware does so the pre-swap cancels out. */
+         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
++        { extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);   /* patch 2164 */
++          if (g_rsx_fcap_on) rsx_fcap_word(1, 9, VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val); }
+         { static u32 seen[64]; static int ns = 0; int k = 0;   /* TEMP: distinct release offsets */
+           for (; k < ns; k++) if (seen[k] == s_sem_off) break;
+           if (k == ns && ns < 64) { seen[ns++] = s_sem_off;
+@@ -575,6 +584,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+          * Counted only; key on the offset, not the value. */
+         if (s_sem_off == 0x4A0u) g_rsx_game_frame_marks++;
+         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
++        { extern volatile int g_rsx_fcap_on; extern void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);   /* patch 2164 */
++          if (g_rsx_fcap_on) rsx_fcap_word(1, 9, VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data); }
+         return 0;
+       } }
+     if ((method >= 0x200 && method <= 0x23C) ||
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 197a229f..6e162752 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -287,9 +287,32 @@ enum {
+      * every unit (rsx_tex_l1_hit), the register decode of a unit that missed the row (ld_tex_get), and the sampler
+      * key + slot lookup of an enabled unit that missed the row. */
+     RSX_PERF_W_TL_L1_T, RSX_PERF_W_TL_GET_T, RSX_PERF_W_TL_SMP_T,
++    /* patch 2164: the walker time OUTSIDE the method loop ([perf-out]); walk total minus RSX_PERF_W_METH_T. Leaf rows
++     * of that remainder, none nested in another: LOCK = s_gcm_fifo_lock acquire, PRE = pass entry to the first
++     * word, SEMA = the NV406E 0x64/0x68/0x6C command handling (BGS = rsx_live_draw_before_guest_sync inside it, so
++     * the write-back wait is inside SEMA), PARK = gcm_park_wake_wait, FLIP = the in-FIFO 0xFEADxxxx flip word
++     * (flip bookkeeping and the guest flip handler), EOP = loop exit to function end (SUB = rsx_live_draw_submit_pending
++     * inside it). PW = ld_present_slot's WaitForSingleObject, which sits INSIDE the method loop (sink_flip ->
++     * rsx_live_draw_present, under the 'present' row), listed to show it is not part of the outside remainder. */
++    RSX_PERF_O_LOCK_T, RSX_PERF_O_PRE_T, RSX_PERF_O_SEMA_T, RSX_PERF_O_SEMA_N, RSX_PERF_O_SEMA_BGS_T,
++    RSX_PERF_O_PARK_T, RSX_PERF_O_PARK_N, RSX_PERF_O_FLIP_T, RSX_PERF_O_FLIP_N,
++    RSX_PERF_O_EOP_T, RSX_PERF_O_EOP_SUB_T, RSX_PERF_O_PW_T, RSX_PERF_O_PW_N,
+     RSX_PERF_COUNT
+ };
+ int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
++/* patch 2164: LD_SYNC_HIST=1 (P4) hooks, defined in cellGcmSys.c; the flag is 0 unless the switch is set. */
++extern volatile int g_rsx_sh_on;
++void      rsx_sync_hist_event(int kind, unsigned dirty);   /* kinds: rsx_sync_hist.h RSX_SH_* */
++void      rsx_sync_hist_draw(void);
++/* patch 2164: LD_FIFO_CAPTURE=dir hooks (rsx_fifo_capture.h). cfg = configured (flip counting), on = a capture window
++ * is open (every other hook). Spaces of a range: 1 = RSX local (location 0), 2 = main through IO (location 1). */
++extern volatile int g_rsx_fcap_cfg, g_rsx_fcap_on;
++int       rsx_fcap_configured(void);
++void      rsx_fcap_range(int kind, int space, u32 addr, const void* p, u32 len, int with_bytes);
++void      rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);
++void      rsx_fcap_flip(u32 buffer, u32 src);
++void      rsx_fcap_spu_note(u32 location, u32 offset, u32 size, int async);
++void      rsx_fcap_drain(u32 tail, u32 head, u32 overflow);
+ long long rsx_perf_get(int idx);               /* patch 2135: current value of a counter (0 unless RSX_PERF=1) */
+ int       rsx_perf_draw_on(void);              /* patch 2135: RSX_PERF_DRAW=1 and inside the window */
+ int       rsx_perf_x_on(void);                 /* patch 2125: RSX_PERF_X=1 and inside the window */
+diff --git a/libs/video/rsx_sync_hist.h b/libs/video/rsx_sync_hist.h
+new file mode 100644
+index 00000000..ef65e22f
+--- /dev/null
++++ b/libs/video/rsx_sync_hist.h
+@@ -0,0 +1,190 @@
++/* KZ3 patch 2164 (renderer step 0, probe P4): LD_SYNC_HIST=1 sync-point histogram classifier.
++ *
++ * Pure C, no globals: the walker's hooks (cellGcmSys.c) feed events, the host test feeds a synthetic stream.
++ * Question it answers (a design question): how many resolve points does a flip
++ * hold, and how many draws sit between two of them? A worker thread that records draws can run ahead only up to the
++ * next resolve point, so the draws per interval bound what a front/worker split can overlap.
++ *
++ * Events and their classes:
++ *   RSX_SH_DRAW      a draw recorded (sink_end_impl, groups_executed++). Counted, never a sync point.
++ *   RSX_SH_NV0039    an NV0039 copy that reached its write-back call (cellGcmSys.c nv0039_copy). RESOLVE point (all tier);
++ *                    `dirty` = the write-back wrote something (a real GPU wait): hard tier too.
++ *   RSX_SH_REL406E   NV406E RELEASE 0x6C label write in the walker. RESOLVE point (all tier); dirty = the main-surface
++ *                    write-back at that sync point had a non-empty dirty set: hard tier too.
++ *   RSX_SH_REL4097   NV4097 0x1D70 / 0x1D74 release (rsx_commands.c). Same classes as REL406E.
++ *   RSX_SH_FLIP      a flip. Always ends the frame; a RESOLVE point only when the main-surface write-back at the flip
++ *                    had a non-empty dirty set (so it is in both tiers only when dirty).
++ *   RSX_SH_REPORT    GET_REPORT 0x1800. Information only (counted, closes a chunk, not a resolve point).
++ *   RSX_SH_REF       NV406E SET_REFERENCE 0x50. Information only (counted, closes a chunk, not a resolve point).
++ * "all" tier = NV0039 + REL406E + REL4097 (dirty or not) + dirty FLIP. It over-counts: the guest does not wait on
++ * every release. "hard" tier = the dirty ones only: those pay a write-back and a GPU wait today.
++ *
++ * A draw interval is the number of draws since the previous resolve point of that tier (or since the previous flip
++ * when no resolve point lies between): an interval closes at every resolve point and at every flip.
++ * Chunk estimate (design section 3): a chunk seals at every sync event (any kind above except DRAW) and every
++ * RSX_SH_CHUNK_DRAWS draws; a seal with no draw open adds no chunk. */
++#ifndef RSX_SYNC_HIST_H
++#define RSX_SYNC_HIST_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++enum { RSX_SH_DRAW = 0, RSX_SH_NV0039, RSX_SH_REL406E, RSX_SH_REL4097, RSX_SH_FLIP, RSX_SH_REPORT, RSX_SH_REF,
++       RSX_SH_KINDS };
++enum { RSX_SH_CHUNK_DRAWS = 128, RSX_SH_BUCKETS = 11, RSX_SH_TIERS = 2 };   /* tier 0 = all, 1 = hard */
++
++typedef struct rsx_sh_acc {
++    uint64_t flips, draws;
++    uint64_t ev[RSX_SH_KINDS];          /* events by kind (dirty or not) */
++    uint64_t dirty[RSX_SH_KINDS];       /* of which dirty */
++    uint64_t rp[RSX_SH_TIERS];          /* resolve points by tier */
++    uint64_t rp_max[RSX_SH_TIERS];      /* most resolve points in one flip */
++    uint64_t iv_n[RSX_SH_TIERS], iv_sum[RSX_SH_TIERS], iv_max[RSX_SH_TIERS];
++    uint64_t iv_hist[RSX_SH_TIERS][RSX_SH_BUCKETS];
++    uint64_t chunks, chunk_max;         /* chunks, most chunks in one flip */
++} rsx_sh_acc;
++
++typedef struct rsx_sh {
++    rsx_sh_acc win, tot;                /* window since the last line, whole run */
++    /* state of the open frame */
++    uint32_t since_rp[RSX_SH_TIERS];    /* draws since the last resolve point of the tier */
++    uint32_t frame_rp[RSX_SH_TIERS];
++    uint32_t open_draws;                /* draws in the open chunk */
++    uint32_t frame_chunks;
++    uint32_t every;                     /* flips per line */
++    uint64_t line_from;                 /* first flip of the window */
++} rsx_sh;
++
++/* Bucket: 0, 1, 2-3, 4-7, ... 512+ (11 buckets). */
++static inline unsigned rsx_sh_bucket(uint32_t n)
++{
++    unsigned b = 0;
++    if (!n) return 0;
++    while (n) { b++; n >>= 1; }          /* n=1 -> 1, 2-3 -> 2, 4-7 -> 3 ... */
++    return b >= RSX_SH_BUCKETS ? RSX_SH_BUCKETS - 1 : b;
++}
++
++static inline void rsx_sh_init(rsx_sh* s, uint32_t every_flips)
++{
++    memset(s, 0, sizeof *s);
++    s->every = every_flips ? every_flips : 100;
++}
++
++static inline void rsx_sh_iv(rsx_sh* s, int t)
++{
++    const uint32_t n = s->since_rp[t];
++    rsx_sh_acc* a[2] = { &s->win, &s->tot };
++    for (int i = 0; i < 2; i++) {
++        a[i]->iv_n[t]++; a[i]->iv_sum[t] += n;
++        if (n > a[i]->iv_max[t]) a[i]->iv_max[t] = n;
++        a[i]->iv_hist[t][rsx_sh_bucket(n)]++;
++    }
++    s->since_rp[t] = 0;
++}
++
++static inline void rsx_sh_seal(rsx_sh* s)
++{
++    if (s->open_draws) { s->frame_chunks++; s->open_draws = 0; }
++}
++
++static inline void rsx_sh_draw(rsx_sh* s)
++{
++    s->win.draws++; s->tot.draws++;
++    for (int t = 0; t < RSX_SH_TIERS; t++) s->since_rp[t]++;
++    if (++s->open_draws >= RSX_SH_CHUNK_DRAWS) rsx_sh_seal(s);
++}
++
++/* Returns 1 when a window of `every` flips just closed (the caller formats and prints with rsx_sh_line, which also
++ * resets the window). `dirty` is meaningful for NV0039, REL406E, REL4097 and FLIP. */
++static inline int rsx_sh_event(rsx_sh* s, int kind, unsigned dirty)
++{
++    if (kind <= RSX_SH_DRAW || kind >= RSX_SH_KINDS) return 0;
++    dirty = dirty ? 1u : 0u;
++    rsx_sh_acc* a[2] = { &s->win, &s->tot };
++    for (int i = 0; i < 2; i++) { a[i]->ev[kind]++; if (dirty) a[i]->dirty[kind]++; }
++    rsx_sh_seal(s);                                   /* every sync event seals the open chunk */
++    int all_rp = 0, hard_rp = 0;
++    switch (kind) {
++    case RSX_SH_NV0039: case RSX_SH_REL406E: case RSX_SH_REL4097: all_rp = 1; hard_rp = (int)dirty; break;
++    case RSX_SH_FLIP:                                  all_rp = (int)dirty; hard_rp = (int)dirty; break;
++    default: break;
++    }
++    const int is_flip = kind == RSX_SH_FLIP;
++    const int rp[RSX_SH_TIERS] = { all_rp, hard_rp };
++    for (int t = 0; t < RSX_SH_TIERS; t++) {
++        if (rp[t]) {
++            s->frame_rp[t]++;
++            for (int i = 0; i < 2; i++) a[i]->rp[t]++;
++        }
++        if (rp[t] || is_flip) rsx_sh_iv(s, t);
++    }
++    if (!is_flip) return 0;
++    for (int i = 0; i < 2; i++) {
++        a[i]->flips++;
++        for (int t = 0; t < RSX_SH_TIERS; t++) if (s->frame_rp[t] > a[i]->rp_max[t]) a[i]->rp_max[t] = s->frame_rp[t];
++        a[i]->chunks += s->frame_chunks;
++        if (s->frame_chunks > a[i]->chunk_max) a[i]->chunk_max = s->frame_chunks;
++    }
++    for (int t = 0; t < RSX_SH_TIERS; t++) s->frame_rp[t] = 0;
++    s->frame_chunks = 0;
++    return s->win.flips >= s->every;
++}
++
++/* Interval percentile from the bucket histogram: upper edge of the bucket holding the p-th percentile (0 for the
++ * zero bucket, 2^b - 1 otherwise; the last bucket prints its lower edge with a '+' in the line). */
++static inline uint32_t rsx_sh_pct(const rsx_sh_acc* a, int t, unsigned pct)
++{
++    uint64_t need = (a->iv_n[t] * pct + 99) / 100, run = 0;
++    if (!a->iv_n[t]) return 0;
++    if (!need) need = 1;
++    for (unsigned b = 0; b < RSX_SH_BUCKETS; b++) {
++        run += a->iv_hist[t][b];
++        if (run >= need) return b == 0 ? 0u : (b >= RSX_SH_BUCKETS - 1 ? 512u : (1u << b) - 1u);
++    }
++    return 512u;
++}
++
++/* One line for an accumulator. `tag` = "flips A-B" or "summary"; per-flip means are over a->flips. */
++static inline int rsx_sh_fmt(const rsx_sh_acc* a, const char* tag, char* out, size_t n)
++{
++    const double f = a->flips ? (double)a->flips : 1.0;
++    int o = snprintf(out, n,
++        "[sync-hist] %s flips %llu draws %llu (%.0f/flip) | resolve/flip all %.2f (max %llu) hard %.2f (max %llu)"
++        " | per flip: nv0039 %.2f (dirty %.2f) rel406e %.2f (dirty %.2f) rel4097 %.2f (dirty %.2f) flip-dirty %.2f"
++        " | info/flip: report %.2f ref %.2f",
++        tag, (unsigned long long)a->flips, (unsigned long long)a->draws, (double)a->draws / f,
++        (double)a->rp[0] / f, (unsigned long long)a->rp_max[0], (double)a->rp[1] / f, (unsigned long long)a->rp_max[1],
++        (double)a->ev[RSX_SH_NV0039] / f, (double)a->dirty[RSX_SH_NV0039] / f,
++        (double)a->ev[RSX_SH_REL406E] / f, (double)a->dirty[RSX_SH_REL406E] / f,
++        (double)a->ev[RSX_SH_REL4097] / f, (double)a->dirty[RSX_SH_REL4097] / f,
++        (double)a->dirty[RSX_SH_FLIP] / f, (double)a->ev[RSX_SH_REPORT] / f, (double)a->ev[RSX_SH_REF] / f);
++    for (int t = 0; t < RSX_SH_TIERS && o > 0 && (size_t)o < n; t++) {
++        o += snprintf(out + o, n - (size_t)o, " | draws/interval %s n %llu mean %.1f p50 %u p90 %u max %llu hist",
++                      t == 0 ? "all" : "hard", (unsigned long long)a->iv_n[t],
++                      a->iv_n[t] ? (double)a->iv_sum[t] / (double)a->iv_n[t] : 0.0, rsx_sh_pct(a, t, 50),
++                      rsx_sh_pct(a, t, 90), (unsigned long long)a->iv_max[t]);
++        for (unsigned b = 0; b < RSX_SH_BUCKETS && o > 0 && (size_t)o < n; b++)
++            o += snprintf(out + o, n - (size_t)o, "%s%llu", b ? "," : "[", (unsigned long long)a->iv_hist[t][b]);
++        if (o > 0 && (size_t)o < n) o += snprintf(out + o, n - (size_t)o, "]");
++    }
++    if (o > 0 && (size_t)o < n)
++        o += snprintf(out + o, n - (size_t)o, " | chunks/flip %.1f (max %llu) draws/chunk %.1f",
++                      (double)a->chunks / f, (unsigned long long)a->chunk_max,
++                      a->chunks ? (double)a->draws / (double)a->chunks : 0.0);
++    return o;
++}
++
++/* Window line ("window A-B": flips A..B of the run, 0-based), then reset the window. */
++static inline int rsx_sh_line(rsx_sh* s, char* out, size_t n)
++{
++    char tag[64];
++    snprintf(tag, sizeof tag, "window %llu-%llu", (unsigned long long)s->line_from,
++             (unsigned long long)(s->line_from + (s->win.flips ? s->win.flips - 1 : 0)));
++    const int o = rsx_sh_fmt(&s->win, tag, out, n);
++    s->line_from += s->win.flips;
++    memset(&s->win, 0, sizeof s->win);
++    return o;
++}
++
++#endif
+diff --git a/libs/video/rsx_fifo_capture.h b/libs/video/rsx_fifo_capture.h
+new file mode 100644
+index 00000000..fb3e6947
+--- /dev/null
++++ b/libs/video/rsx_fifo_capture.h
+@@ -0,0 +1,264 @@
++/* KZ3 patch 2164 (renderer step 0): FIFO capture file format and its writer/reader. Pure C (stdio only), no game
++ * data, no globals: cellGcmSys.c drives the writer under LD_FIFO_CAPTURE=dir, the host test round-trips it, and the
++ * replay harness of the next round (LD_FIFO_REPLAY, tools/smoke/test_log_replay.c) reads it.
++ * Layout detail: rsx_fifo_capture.h.
++ *
++ * A capture holds GAME DATA (guest memory images and bytes the renderer read). It is written only under work/ and is
++ * never committed; cellGcmSys.c refuses a directory that has no "work" path segment.
++ *
++ * FILE  = header (32 bytes) , record* , END record.
++ *   header: char magic[8] = "KZ3FIFOC"; u32 version; u32 header_size = 32; u32 frame_start; u32 frame_count;
++ *           u32 reserved = 0.  All integers little endian, whatever the host.
++ * RECORD = u32 type; u32 len; u64 seq; u64 check; u8 payload[len].
++ *   seq   = 0,1,2,... strictly increasing by exactly 1 over the file (a dropped or reordered record is an error).
++ *   check = FNV-1a 64 over (type, len, seq as little-endian bytes) then the payload.
++ *   The END record's payload is u64 record_count (records before it) and u64 total_payload_bytes; a file without a
++ *   valid END (truncated, crashed) reads as an error, never as a short capture.
++ * Version history: 1 = this layout.
++ *
++ * Record payloads (u32 fields little endian; "w32" = a 32-bit FIFO / guest word as the guest sees it, numeric value):
++ *   RSX_FC_CONFIG (1)    u32 local_addr, local_size, vm_size, put, getoff, calloff, label_base, ctrl_addr, n_io;
++ *                        n_io x u32 (io_page << 16 | ea_page)  [1 MB IO page -> 1 MB EA page];
++ *                        8 x (u32 set, offset, pitch, width, height)  [display buffers].
++ *   RSX_FC_IMAGE (2)     u32 space, addr, len; bytes.  Initial memory (item e), 64 KB blocks, all-zero blocks left out.
++ *                        space RSX_FC_EA only (addr is a guest effective address).
++ *   RSX_FC_PASS (3)      u32 put, getoff, calloff, pass_no.  A walker pass starts (gcm_rsx_process_fifo_unlocked).
++ *   RSX_FC_CMD (4)       u32 getoff, header_word, n; n x w32 payload.  The command the walker consumed at getoff (item a),
++ *                        after park/patch resolution; a retry of the same getoff (blocked acquire, park re-read) is
++ *                        dropped when its header word is unchanged.  n = 0 for control words (JUMP/CALL/RET/flip word).
++ *   RSX_FC_PASS_END (5)  u32 getoff, calloff; char why[16] (NUL padded: caught-up, flip, park-wait, ...).
++ *   RSX_FC_RANGE (6)     u32 kind, space, addr, len, flags, reserved; u64 fnv1a(bytes); bytes if flags & HAS_BYTES.
++ *                        kind RD_RENDERER = a read through guest_ptr (item b; space/addr = location/offset, len =
++ *                        min_bytes: ASSUMPTION the renderer reads at most that), RD_WALKER / WR_WALKER = the walker's own
++ *                        NV0039/NV3089 source read and destination result (item c; space EA).  Bytes are written the
++ *                        first time a (space, addr, len) is seen and again whenever its digest differs from the last
++ *                        recorded one; otherwise only the digest is recorded.
++ *   RSX_FC_WORD (7)      u32 dir (0 read, 1 write), tag, ea, value.  A guest word the walker read or wrote outside the
++ *                        renderer (labels, get, ref, report words, ring recycle writes, acquire compares: item c).
++ *   RSX_FC_COPY (8)      u32 kind (0 NV0039, 1 NV3089), src_ea, dst_ea, line_len, line_count, pitch_in, pitch_out,
++ *                        format, wb, aux0 (src dma), aux1 (dst dma), aux2 (0).  The geometry of a walker copy; its source
++ *                        bytes and result are the RANGE records around it.  kind 1 (NV3089) continues with 15 more words:
++ *                        in_off, in_fmt, in_sz, in_uv, out_pt, out_sz, clip_pt, clip_sz, dst_offset, dst_dma, dst colour
++ *                        format, ds_dx, dt_dy, fmt, op (line_len/line_count = out_w/out_h).
++ *   RSX_FC_FLIP (9)      u32 buffer, source (0 sink_flip, 1 FEAD word, 2 E920/E924), frame (flips seen so far).
++ *   RSX_FC_SPU_NOTE (10) u32 location, offset, size, async (1 = any-thread SPU DMA note, 0 = walker-side note), thread.
++ *   RSX_FC_DRAIN (11)    u32 tail, head, overflow.  ld_gv_drain ran (item d); the notes between two drains were
++ *                        consumed by it.
++ *   RSX_FC_FRAME (12)    u32 frame, begin (1) or end (0).
++ *   RSX_FC_END (13)      see above. */
++#ifndef RSX_FIFO_CAPTURE_H
++#define RSX_FIFO_CAPTURE_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define RSX_FC_MAGIC "KZ3FIFOC"
++#define RSX_FC_VERSION 1u
++#define RSX_FC_HEADER_SIZE 32u
++#define RSX_FC_REC_HEAD 24u
++
++enum {
++    RSX_FC_CONFIG = 1, RSX_FC_IMAGE, RSX_FC_PASS, RSX_FC_CMD, RSX_FC_PASS_END, RSX_FC_RANGE, RSX_FC_WORD,
++    RSX_FC_COPY, RSX_FC_FLIP, RSX_FC_SPU_NOTE, RSX_FC_DRAIN, RSX_FC_FRAME, RSX_FC_END
++};
++enum { RSX_FC_EA = 0, RSX_FC_LOCAL = 1, RSX_FC_MAIN = 2 };                /* address spaces of a RANGE */
++enum { RSX_FC_RD_RENDERER = 0, RSX_FC_RD_WALKER = 1, RSX_FC_WR_WALKER = 2 };
++enum { RSX_FC_F_NULLPTR = 1, RSX_FC_F_BYTES = 2 };
++enum { RSX_FC_RANGE_HEAD = 32 };
++
++/* ---- little endian helpers ---- */
++static inline void rsx_fc_put32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
++static inline void rsx_fc_put64(uint8_t* p, uint64_t v) { rsx_fc_put32(p, (uint32_t)v); rsx_fc_put32(p + 4, (uint32_t)(v >> 32)); }
++static inline uint32_t rsx_fc_get32(const uint8_t* p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++static inline uint64_t rsx_fc_get64(const uint8_t* p) { return (uint64_t)rsx_fc_get32(p) | (uint64_t)rsx_fc_get32(p + 4) << 32; }
++
++static inline uint64_t rsx_fc_fnv(uint64_t h, const void* data, size_t n)
++{
++    const uint8_t* p = (const uint8_t*)data;
++    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
++    return h;
++}
++#define RSX_FC_FNV_SEED 14695981039346656037ull
++
++/* ---- payload builder (a growing buffer of little endian u32s) ---- */
++typedef struct rsx_fc_buf { uint8_t* p; uint32_t n, cap; int err; } rsx_fc_buf;
++static inline void rsx_fc_buf_free(rsx_fc_buf* b) { free(b->p); memset(b, 0, sizeof *b); }
++static inline void rsx_fc_buf_u32(rsx_fc_buf* b, uint32_t v)
++{
++    if (b->err) return;
++    if (b->n + 4 > b->cap) {
++        uint32_t nc = b->cap ? b->cap * 2 : 256;
++        uint8_t* np = (uint8_t*)realloc(b->p, nc);
++        if (!np) { b->err = 1; return; }
++        b->p = np; b->cap = nc;
++    }
++    rsx_fc_put32(b->p + b->n, v); b->n += 4;
++}
++
++/* ---- writer ---- */
++enum { RSX_FC_DEDUPE_CAP = 1 << 16 };
++typedef struct rsx_fc_slot { uint64_t fnv; uint32_t space, addr, len, used; } rsx_fc_slot;
++typedef struct rsx_fc_writer {
++    FILE* f;
++    uint64_t seq, payload_bytes;
++    int err;                             /* sticky: a failed write; close reports it */
++    rsx_fc_slot* dedupe;                 /* RSX_FC_DEDUPE_CAP slots, open addressing, 8 probes */
++    uint64_t n_range, n_range_bytes;     /* statistics */
++} rsx_fc_writer;
++
++static inline int rsx_fc_w_open(rsx_fc_writer* w, const char* path, uint32_t frame_start, uint32_t frame_count)
++{
++    uint8_t h[RSX_FC_HEADER_SIZE] = {0};
++    memset(w, 0, sizeof *w);
++    w->f = fopen(path, "wb");
++    if (!w->f) return -1;
++    setvbuf(w->f, NULL, _IOFBF, 1u << 20);
++    w->dedupe = (rsx_fc_slot*)calloc(RSX_FC_DEDUPE_CAP, sizeof(rsx_fc_slot));
++    if (!w->dedupe) { fclose(w->f); w->f = NULL; return -1; }
++    memcpy(h, RSX_FC_MAGIC, 8);
++    rsx_fc_put32(h + 8, RSX_FC_VERSION); rsx_fc_put32(h + 12, RSX_FC_HEADER_SIZE);
++    rsx_fc_put32(h + 16, frame_start); rsx_fc_put32(h + 20, frame_count);
++    if (fwrite(h, 1, sizeof h, w->f) != sizeof h) w->err = 1;
++    return 0;
++}
++
++/* One record whose payload is head[hlen] followed by tail[tlen] (either may be empty). */
++static inline int rsx_fc_w_rec2(rsx_fc_writer* w, uint32_t type, const void* head, uint32_t hlen, const void* tail, uint32_t tlen)
++{
++    uint8_t rh[RSX_FC_REC_HEAD], t8[16];
++    const uint32_t len = hlen + tlen;
++    if (!w->f) return -1;
++    rsx_fc_put32(t8, type); rsx_fc_put32(t8 + 4, len); rsx_fc_put64(t8 + 8, w->seq);
++    uint64_t h = rsx_fc_fnv(RSX_FC_FNV_SEED, t8, sizeof t8);
++    if (hlen) h = rsx_fc_fnv(h, head, hlen);
++    if (tlen) h = rsx_fc_fnv(h, tail, tlen);
++    memcpy(rh, t8, 16); rsx_fc_put64(rh + 16, h);
++    if (fwrite(rh, 1, sizeof rh, w->f) != sizeof rh) w->err = 1;
++    if (hlen && fwrite(head, 1, hlen, w->f) != hlen) w->err = 1;
++    if (tlen && fwrite(tail, 1, tlen, w->f) != tlen) w->err = 1;
++    w->seq++; w->payload_bytes += len;
++    return w->err ? -1 : 0;
++}
++static inline int rsx_fc_w_rec(rsx_fc_writer* w, uint32_t type, const void* payload, uint32_t len)
++{
++    return rsx_fc_w_rec2(w, type, payload, len, NULL, 0);
++}
++static inline int rsx_fc_w_words(rsx_fc_writer* w, uint32_t type, const uint32_t* v, unsigned n)
++{
++    uint8_t b[64];
++    if (n > 16) return -1;
++    for (unsigned i = 0; i < n; i++) rsx_fc_put32(b + i * 4, v[i]);
++    return rsx_fc_w_rec(w, type, b, n * 4);
++}
++
++/* A RANGE record. ptr == NULL = the lookup failed (flag NULLPTR, no digest). with_bytes = 0 records the digest only
++ * (walker destinations: both replay paths recompute them). Returns 1 when the bytes were written. */
++static inline int rsx_fc_w_range(rsx_fc_writer* w, uint32_t kind, uint32_t space, uint32_t addr, const void* ptr, uint32_t len, int with_bytes)
++{
++    uint8_t head[RSX_FC_RANGE_HEAD] = {0};
++    uint32_t flags = 0;
++    uint64_t fnv = 0;
++    int bytes = 0;
++    if (!ptr) flags |= RSX_FC_F_NULLPTR;
++    else {
++        fnv = rsx_fc_fnv(RSX_FC_FNV_SEED, ptr, len);
++        if (with_bytes) {
++            const uint64_t k = ((uint64_t)space * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)addr << 20) ^ ((uint64_t)len * 0xC2B2AE3D27D4EB4Full);
++            const uint32_t base = (uint32_t)(k ^ (k >> 29)) & (RSX_FC_DEDUPE_CAP - 1);
++            rsx_fc_slot* hit = NULL;
++            rsx_fc_slot* free_slot = NULL;
++            for (unsigned i = 0; i < 8; i++) {
++                rsx_fc_slot* s = &w->dedupe[(base + i) & (RSX_FC_DEDUPE_CAP - 1)];
++                if (s->used && s->space == space && s->addr == addr && s->len == len) { hit = s; break; }
++                if (!s->used && !free_slot) free_slot = s;
++            }
++            if (!hit) hit = free_slot ? free_slot : &w->dedupe[base];   /* full neighbourhood: evict, the bytes get rewritten */
++            if (!(hit->used && hit->space == space && hit->addr == addr && hit->len == len && hit->fnv == fnv)) {
++                bytes = 1; flags |= RSX_FC_F_BYTES;
++            }
++            hit->used = 1; hit->space = space; hit->addr = addr; hit->len = len; hit->fnv = fnv;
++        }
++    }
++    rsx_fc_put32(head, kind); rsx_fc_put32(head + 4, space); rsx_fc_put32(head + 8, addr); rsx_fc_put32(head + 12, len);
++    rsx_fc_put32(head + 16, flags); rsx_fc_put64(head + 24, fnv);
++    w->n_range++;
++    if (bytes) w->n_range_bytes += len;
++    rsx_fc_w_rec2(w, RSX_FC_RANGE, head, sizeof head, bytes ? ptr : NULL, bytes ? len : 0);
++    return bytes;
++}
++
++/* Writes END and closes. Returns 0 when every write succeeded. */
++static inline int rsx_fc_w_close(rsx_fc_writer* w)
++{
++    uint8_t e[16];
++    int rc = 0;
++    if (!w->f) return -1;
++    rsx_fc_put64(e, w->seq); rsx_fc_put64(e + 8, w->payload_bytes);
++    rsx_fc_w_rec(w, RSX_FC_END, e, sizeof e);
++    if (fclose(w->f) != 0) w->err = 1;
++    rc = w->err ? -1 : 0;
++    w->f = NULL; free(w->dedupe); w->dedupe = NULL;
++    return rc;
++}
++
++/* ---- reader ---- */
++typedef struct rsx_fc_reader {
++    FILE* f;
++    uint8_t* buf; size_t cap;
++    uint64_t next_seq, payload_bytes;
++    uint32_t version, frame_start, frame_count;
++    int ended;
++} rsx_fc_reader;
++typedef struct rsx_fc_rec { uint32_t type, len; uint64_t seq; const uint8_t* p; } rsx_fc_rec;
++
++/* 0 ok; -1 cannot open / short header; -2 bad magic; -3 unsupported version. */
++static inline int rsx_fc_r_open(rsx_fc_reader* r, const char* path)
++{
++    uint8_t h[RSX_FC_HEADER_SIZE];
++    memset(r, 0, sizeof *r);
++    r->f = fopen(path, "rb");
++    if (!r->f) return -1;
++    if (fread(h, 1, sizeof h, r->f) != sizeof h) { fclose(r->f); r->f = NULL; return -1; }
++    if (memcmp(h, RSX_FC_MAGIC, 8) != 0) { fclose(r->f); r->f = NULL; return -2; }
++    r->version = rsx_fc_get32(h + 8);
++    if (r->version != RSX_FC_VERSION || rsx_fc_get32(h + 12) != RSX_FC_HEADER_SIZE) { fclose(r->f); r->f = NULL; return -3; }
++    r->frame_start = rsx_fc_get32(h + 16); r->frame_count = rsx_fc_get32(h + 20);
++    return 0;
++}
++
++/* 1 = a record in *rec (valid until the next call); 0 = clean end (END record read and its counts match);
++ * -1 truncated; -2 checksum mismatch; -3 sequence break; -4 END counts disagree with what was read; -5 out of memory. */
++static inline int rsx_fc_r_next(rsx_fc_reader* r, rsx_fc_rec* rec)
++{
++    uint8_t rh[RSX_FC_REC_HEAD];
++    if (r->ended) return 0;
++    if (fread(rh, 1, sizeof rh, r->f) != sizeof rh) return -1;
++    const uint32_t type = rsx_fc_get32(rh), len = rsx_fc_get32(rh + 4);
++    const uint64_t seq = rsx_fc_get64(rh + 8), check = rsx_fc_get64(rh + 16);
++    if (len > (1u << 28)) return -2;     /* a corrupt length: never allocate on its word alone */
++    if ((size_t)len + 1 > r->cap) {
++        size_t nc = (size_t)len + 1 + 4096;
++        uint8_t* nb = (uint8_t*)realloc(r->buf, nc);
++        if (!nb) return -5;
++        r->buf = nb; r->cap = nc;
++    }
++    if (len && fread(r->buf, 1, len, r->f) != len) return -1;
++    uint64_t h = rsx_fc_fnv(RSX_FC_FNV_SEED, rh, 16);
++    h = rsx_fc_fnv(h, r->buf, len);
++    if (h != check) return -2;
++    if (seq != r->next_seq) return -3;
++    r->next_seq++;
++    rec->type = type; rec->len = len; rec->seq = seq; rec->p = r->buf;
++    if (type == RSX_FC_END) {
++        r->ended = 1;
++        if (len != 16 || rsx_fc_get64(r->buf) != seq || rsx_fc_get64(r->buf + 8) != r->payload_bytes) return -4;
++        return 0;
++    }
++    r->payload_bytes += len;
++    return 1;
++}
++static inline void rsx_fc_r_close(rsx_fc_reader* r) { if (r->f) fclose(r->f); free(r->buf); memset(r, 0, sizeof *r); }
++
++#endif

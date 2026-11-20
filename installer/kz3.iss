@@ -2,7 +2,7 @@
 ;
 ; Compiled with ISCC 6.7.3 under Proton and every wizard page walked headless
 ; (tools/release/wizard_test.sh, payload without the large toolchain parts, a demo build step). Run on native Windows
-; 11 with the full toolchain payload on 2026-10-21 (the install built the game in 422 s and the game reached the menus);
+; 11 with the full toolchain payload (the install built the game in 422 s and the game reached the menus);
 ; the wizard pages were walked headless under Proton only. Needs the release payload (kz3-setup\, ps3recomp\, port\,
 ; toolchain\, licenses\, the launcher "Project Helghast.exe") and the headings font (FontDir, below).
 ;
@@ -28,10 +28,12 @@
 ; none known = the files are installed and the first start of the launcher asks for them (one log line, exit code 0);
 ; a folder given or recorded that fails the presence check, or only some of them, = nothing installed, one log line,
 ; exit code 7. A silent build that does not finish logs one line and still exits 0 (the RESULT line is in the log).
-; Setup types: Recommended asks only for the dump and the update (install folder aside); the EBOOT
-; page shows only when <update>\USRDIR\EBOOT.elf is missing, the fonts come from RPCS3's folder beside the update
-; when it has them, the tasks keep their defaults. Advanced adds the tasks page, the EBOOT and fonts pages and the
-; "Advanced options" page (copy the game files, font copy, FMA, window size, language). Silent:
+; Game files page (no "Setup type" page): a checkbox "Use my RPCS3 install" (setup finds the disc, the update and the
+; EBOOT in the player's RPCS3; the RPCS3 folder page asks only which folder, the three game pages are then skipped)
+; and a checkbox "Customise". Without Customise (Recommended, the default) setup asks only for the dump and the update
+; (install folder aside); the EBOOT page shows only when <update>\USRDIR\EBOOT.elf is missing, the fonts come from
+; RPCS3's folder beside the update when it has them, the tasks keep their defaults. Customise adds the tasks page, the
+; EBOOT and fonts pages and the "Advanced options" page (copy the game files, font copy, FMA, window size, language). Silent:
 ; /TYPE=advanced /COPYDATA=1 /FONTCOPY=0 /FMA=auto|on|off /LOWMEM=auto|on|off /WINDOW=<size> /LANG=<code>.
 ; (/CRASHREPORTS=1 of older scripted installs is ignored: Inno skips parameters nothing reads.)
 ; Look: wizard images and icons from installer\art\ (tools/release/installer_art.py, the
@@ -213,6 +215,13 @@ Name: "checkupdates"; Description: "&Check for new versions: one anonymous reque
 ; order = stream order, so the click does not unpack the whole payload); Inno stores the duplicate data once.
 Source: "{#Payload}\toolchain\python\*"; DestDir: "{tmp}\vcheck\python"; Flags: dontcopy recursesubdirs
 Source: "{#Payload}\kz3-setup\release\version_check.py"; DestDir: "{tmp}\vcheck"; Flags: dontcopy
+; "Use my RPCS3 install" (before anything is installed): rpcs3_import.py and what it imports; the table of known EBOOTs
+; (eboot_ids.json, below) is copied beside firstrun_check.py at the click. Ported from the Killzone 2 port's wizard.
+Source: "{#Payload}\kz3-setup\release\rpcs3_import.py"; DestDir: "{tmp}\vcheck"; Flags: dontcopy
+Source: "{#Payload}\kz3-setup\release\rpcs3_locate.py"; DestDir: "{tmp}\vcheck"; Flags: dontcopy
+Source: "{#Payload}\kz3-setup\release\rpcs3_text.py"; DestDir: "{tmp}\vcheck"; Flags: dontcopy
+Source: "{#Payload}\kz3-setup\release\firstrun_check.py"; DestDir: "{tmp}\vcheck"; Flags: dontcopy
+Source: "{#Payload}\kz3-setup\release\iso9660.py"; DestDir: "{tmp}\vcheck"; Flags: dontcopy
 ; The EBOOT page's version test reads firstrun_check's own table of known EBOOTs (size, SHA-256), not a copy of it
 Source: "{#Payload}\kz3-setup\release\eboot_ids.json"; Flags: dontcopy
 ; run.cmd is the portable zip's entry point (firstrun.py --interactive); the installed copy uses the launcher
@@ -334,7 +343,9 @@ var
   { A query page with its own Browse button: Inno's dir page refuses an empty field ("You must enter a
     full path"), and this page is optional }
   FontPage: TInputQueryWizardPage;
-  TypePage: TInputOptionWizardPage;
+  SourcePage: TInputOptionWizardPage;   { Values[0] = use my RPCS3 install, Values[1] = Customise }
+  RpcsPage: TInputDirWizardPage;
+  Rpcs3Filled: Boolean;                 { the three game paths came from the player's RPCS3 (pages skipped) }
   AdvPage: TWizardPage;
   CopyDataChk, FontCopyChk: TNewCheckBox;
   FmaCombo, MemCombo, WinCombo, LangCombo: TNewComboBox;
@@ -788,11 +799,22 @@ begin
   Result := DumpProblem(Dir, Id) = '';
 end;
 
+{ firstrun_check U4: USRDIR\<Name> holds at least one .pspatch file (the 1.14 update's patch folders; without them the
+  game starts into a black screen, issue #47) }
+function PatchDirOK(Dir, Name: String): Boolean;
+var
+  FR: TFindRec;
+begin
+  Result := FindFirst(AddBackslash(Dir) + 'USRDIR\' + Name + '\*.pspatch', FR);
+  if Result then FindClose(FR);
+end;
+
 function UpdateOK(Dir: String): Boolean;
 begin
   Dir := AddBackslash(Dir);
   Result := FileExists(Dir + 'PARAM.SFO') and FileExists(Dir + 'USRDIR\EBOOT.BIN') and
-    FileExists(Dir + 'USRDIR\added_data_ps3.psarc.edat');
+    FileExists(Dir + 'USRDIR\added_data_ps3.psarc.edat') and
+    PatchDirOK(Dir, 'patch_data_ps3_sp') and PatchDirOK(Dir, 'patch_data_ps3_mp');
 end;
 
 { Why a folder is not the update (pass 64, issues #8 and #10): the path, what is missing or what is there instead;
@@ -818,6 +840,14 @@ begin
     if not FileExists(D + 'USRDIR\added_data_ps3.psarc.edat') then begin
       if Miss <> '' then Miss := Miss + ', ';
       Miss := Miss + 'USRDIR\added_data_ps3.psarc.edat';
+    end;
+    if not PatchDirOK(D, 'patch_data_ps3_sp') then begin
+      if Miss <> '' then Miss := Miss + ', ';
+      Miss := Miss + 'USRDIR\patch_data_ps3_sp (the folder with its .pspatch files)';
+    end;
+    if not PatchDirOK(D, 'patch_data_ps3_mp') then begin
+      if Miss <> '' then Miss := Miss + ', ';
+      Miss := Miss + 'USRDIR\patch_data_ps3_mp (the folder with its .pspatch files)';
     end;
     Result := Dir + ' does not hold ' + Miss;
     if FileExists(D + 'PARAM.SFO') or FileExists(D + 'USRDIR\EBOOT.BIN') then
@@ -1054,7 +1084,7 @@ end;
 
 function IsAdvanced: Boolean;
 begin
-  Result := TypePage.SelectedValueIndex = 1;
+  Result := SourcePage.Values[1];     { the "Customise" checkbox }
 end;
 
 function NewCheck(Page: TWizardPage; ATop: Integer; ACaption: String): TNewCheckBox;
@@ -1148,8 +1178,8 @@ var
   T: String;
 begin
   T := Lowercase(ExpandConstant('{param:TYPE|}'));
-  if T = '' then T := GetPreviousData('SetupType', '');   { an install over an earlier one: its type }
-  if T = 'advanced' then TypePage.SelectedValueIndex := 1 else TypePage.SelectedValueIndex := 0;
+  if T = '' then T := GetPreviousData('SetupType', '');   { an install over an earlier one: its choice }
+  SourcePage.Values[1] := T = 'advanced';
   CopyDataChk.Checked := ExpandConstant('{param:COPYDATA|0}') = '1';
   FontCopyChk.Checked := ExpandConstant('{param:FONTCOPY|1}') <> '0';
   SelectByValue(FmaCombo, Lowercase(ExpandConstant('{param:FMA|}')));
@@ -1307,19 +1337,157 @@ begin
   Log('install folder: the previous folder ' + Prev + ' ' + Why + '; proposing the default');
 end;
 
+{ ---- "Use my RPCS3 install": the logic is tools/release/rpcs3_import.py (host-tested, test_rpcs3_import.py); this only
+  runs it from the temp folder (before anything is installed) and passes the answers on. Results are key=value
+  files. Ported from the Killzone 2 port's installer (same author, MIT). ASSUMPTION: ExtractTemporaryFiles keeps the
+  entries' relative folders (the Check now button already relies on it); the wizard walk under Proton/VM confirms it. }
+function KVAll(Lines: TArrayOfString; Key: String; Sep: String): String;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 0 to GetArrayLength(Lines) - 1 do
+    if Pos(Key + '=', Lines[I]) = 1 then begin
+      if Result <> '' then Result := Result + Sep;
+      Result := Result + Copy(Lines[I], Length(Key) + 2, MaxInt);
+    end;
+end;
+
+function KV(Lines: TArrayOfString; Key: String): String;
+var
+  P: Integer;
+begin
+  Result := KVAll(Lines, Key, #13#10);
+  P := Pos(#13#10, Result);
+  if P > 0 then Result := Copy(Result, 1, P - 1);
+end;
+
+{ Runs rpcs3_import.py with Args and waits for its --out file (the window keeps answering). False = it did not run
+  or stopped on an unexpected error (status=error). Lines holds the result. }
+function Rpcs3Run(Args, Caption: String; var Lines: TArrayOfString): Boolean;
+var
+  Pg: TOutputMarqueeProgressWizardPage;
+  ResFile: String;
+  RC, I: Integer;
+begin
+  Result := False;
+  ResFile := ExpandConstant('{tmp}\rpcs3-result.txt');
+  DeleteFile(ResFile);
+  try
+    ExtractTemporaryFiles('{tmp}\vcheck\*');
+    ExtractTemporaryFile('eboot_ids.json');
+    FileCopy(ExpandConstant('{tmp}\eboot_ids.json'), ExpandConstant('{tmp}\vcheck\eboot_ids.json'), False);
+  except
+    Log('rpcs3_import: could not unpack its files (' + GetExceptionMessage + ')');
+    Exit;
+  end;
+  { the command name only: the arguments hold the player's paths }
+  Log('rpcs3_import: ' + Copy(Args, 1, Pos(' ', Args + ' ') - 1));
+  if not Exec(ExpandConstant('{tmp}\vcheck\python\python.exe'),
+      '-I "' + ExpandConstant('{tmp}\vcheck\rpcs3_import.py') + '" ' + Args + ' --out "' + ResFile + '"', '',
+      SW_HIDE, ewNoWait, RC) then Exit;
+  Pg := CreateOutputMarqueeProgressPage('Your RPCS3', Caption);
+  Pg.Show;
+  try
+    for I := 1 to 3000 do begin     { up to 5 minutes: a sleeping disk spins up first }
+      if FileExists(ResFile) then Break;
+      Pg.Animate;
+      Sleep(100);
+    end;
+  finally
+    Pg.Hide;
+  end;
+  Result := FileExists(ResFile) and LoadStringsFromFile(ResFile, Lines) and (GetArrayLength(Lines) >= 1) and
+    (Pos('status=error', Lines[0]) = 0);
+  if not Result then Log('rpcs3_import: no result, or it stopped on an unexpected error');
+end;
+
+function RpcsLooksRight(Dir: String): Boolean;
+var
+  D: String;
+begin
+  D := AddBackslash(Dir);
+  Result := (Dir = '') or FileExists(D + 'rpcs3.exe') or FileExists(D + 'config\games.yml') or
+    FileExists(D + 'games.yml') or FileExists(D + 'config\vfs.yml') or FileExists(D + 'vfs.yml');
+end;
+
+{ The Next click on the RPCS3 folder page: find RPCS3, read the three game paths from it. True = go on (the three
+  pages are then skipped, or the player chose to pick the folders by hand). False = stay here. }
+function ResolveRpcs3: Boolean;
+var
+  Lines: TArrayOfString;
+  Root, Probs, Msg: String;
+  I: Integer;
+begin
+  Result := False;
+  Rpcs3Filled := False;
+  Root := RpcsPage.Values[0];
+  if Root = '' then begin
+    if not (Rpcs3Run('--detect', 'Looking for your RPCS3...', Lines) and (KV(Lines, 'status') = 'ok')) then begin
+      Result := MsgBox('No RPCS3 folder was found in the usual places. Pick its folder on this page, or pick the ' +
+        'game folders yourself.' + #13#10 + #13#10 + 'Pick the game folders yourself now?', mbInformation,
+        MB_YESNO) = IDYES;
+      if Result then SourcePage.Values[0] := False;
+      Exit;
+    end;
+    Root := KV(Lines, 'root');
+    if MsgBox('Found RPCS3 at ' + Root + #13#10#13#10 + 'Use it for the game files? Setup looks only at Killzone 3 ' +
+        '(BCUS98234, BCES01007, BCAS25008, BCJS30066) in it, in place.', mbConfirmation, MB_YESNO) <> IDYES then Exit;
+  end;
+  if not Rpcs3Run('--resolve --rpcs3 "' + RemoveBackslashUnlessRoot(Root) + '"', 'Looking for Killzone 3 in your RPCS3...',
+      Lines) then begin
+    MsgBox('The RPCS3 lookup did not run. You can pick the game folders yourself (untick the RPCS3 box on the ' +
+      'previous page).', mbError, MB_OK);
+    Exit;
+  end;
+  if KV(Lines, 'status') = 'ok' then begin
+    DumpPage.Values[0] := KV(Lines, 'dump');
+    UpdatePage.Values[0] := KV(Lines, 'update');
+    EbootPage.Values[0] := KV(Lines, 'eboot');
+    Rpcs3Filled := True;
+    Log('rpcs3 import: disc dump, update and EBOOT found in RPCS3');
+    Result := True;
+    Exit;
+  end;
+  Probs := '';
+  for I := 0 to GetArrayLength(Lines) - 1 do
+    if (Pos('problem=', Lines[I]) = 1) and (Pos('|', Lines[I]) < Length(Lines[I])) then   { empty text: the help says it }
+      Probs := Probs + Copy(Lines[I], Pos('|', Lines[I]) + 1, MaxInt) + #13#10;
+  Log('rpcs3 import: ' + KV(Lines, 'status') + ' (' + KVAll(Lines, 'problem', ', ') + ')');
+  if KV(Lines, 'status') = 'not_found' then
+    Msg := 'That folder does not look like an RPCS3 install.'
+  else
+    Msg := Probs + #13#10 + KVAll(Lines, 'help', #13#10#13#10);
+  if MsgBox(Msg + #13#10#13#10 + 'Yes picks the game folders yourself now. No stays here: fix it in RPCS3, then Next ' +
+      'checks again.', mbError, MB_YESNO or MB_DEFBUTTON2) = IDYES then begin
+    SourcePage.Values[0] := False;
+    Result := True;
+  end;
+end;
+
 procedure InitializeWizard;
 begin
   ApplyHeadingFonts;
   DropStalePreviousDir;
-  TypePage := CreateInputOptionPage(wpWelcome, 'Setup type', 'How much do you want to choose?',
-    'Recommended asks only for your game files and uses the defaults. Advanced shows every option.', True, False);
-  TypePage.Add('&Recommended: your disc dump and the 1.14 update, nothing else');
-  TypePage.Add('&Advanced: copy the game files into the install, fonts, CPU, window, language, ' +
-    'shaders, cleanup');
+  { One page for the two choices (no "Setup type" page): Recommended is the default flow; the tasks, fonts and
+    Advanced pages appear only with "Customise" ticked. The RPCS3 checkbox and its folder page are ported from the
+    Killzone 2 port's wizard (same author, MIT). }
+  SourcePage := CreateInputOptionPage(wpLicense, 'Your game files',
+    'Where are your Killzone 3 files?',
+    'Setup needs your own disc dump, the 1.14 update and the decrypted EBOOT. It reads them in place: never ' +
+    'changed, never copied (an ISO is the one exception: its files are copied out of it).', False, False);
+  SourcePage.Add('Use my RPCS3 install (setup finds the disc, the update and the EBOOT for you)');
+  SourcePage.Add('Customise: copy the game files, fonts, CPU, window, language, shaders, cleanup');
+  RpcsPage := CreateInputDirPage(SourcePage.ID, 'Your RPCS3 folder',
+    'Setup looks at Killzone 3 in your RPCS3.',
+    'Pick the folder of your RPCS3 (the one with rpcs3.exe or its config folder). Leave it empty to look in ' +
+    'RPCS3''s usual places; setup asks before it uses one. Setup looks only at Killzone 3 (BCUS98234, BCES01007, ' +
+    'BCAS25008, BCJS30066) in its files, and reads them in place. RPCS3''s documentation: https://rpcs3.net/quickstart', False, '');
+  RpcsPage.Add('RPCS3 folder:');
   DumpPage := CreateInputDirPage(wpSelectTasks, 'Your disc dump',
     'Killzone 3, US disc (BCUS98234; the EU BCES01007, Asian BCAS25008 and Japanese BCJS30066 discs are untested), decrypted.',
     'Pick the folder that holds PS3_GAME (picking PS3_GAME itself also works), or a decrypted .iso file. Setup never ' +
-    'changes it, and reads a folder in place unless you choose to copy it (Advanced); the files of an ISO are copied ' +
+    'changes it, and reads a folder in place unless you choose to copy it (Customise); the files of an ISO are copied ' +
     'out of it into the install folder (about 10 GB).', False, '');
   DumpPage.Add('Disc dump folder (holds PS3_GAME) or decrypted ISO file:');
   DumpIsoBtn := TNewButton.Create(DumpPage);
@@ -1342,7 +1510,7 @@ begin
   UpdatePage := CreateInputDirPage(DumpPage.ID, 'Update 1.14',
     'The port is built on 1.14.',
     'Pick the folder that holds the 1.14 update (named BCUS98234, BCES01007, BCAS25008 or BCJS30066; an update from another region gave the same game data in our tests).' + #13#10 +
-    'RPCS3: after File > Install Packages, it is in RPCS3''s dev_hdd0\game folder.' + #13#10 +
+    'RPCS3: once you install the update in RPCS3 (see its documentation), it is in RPCS3''s dev_hdd0\game folder.' + #13#10 +
     'PS3: copy dev_hdd0\game\<title id> from the console.', False, '');
   UpdatePage.Add('1.14 update folder (named like the disc, e.g. BCUS98234):');
   EbootPage := CreateInputFilePage(UpdatePage.ID, 'Decrypted EBOOT',
@@ -1371,6 +1539,13 @@ begin
   { Install over an earlier version: the folders picked last time }
   LoadGamePaths;
   LoadSetupChoices;
+  { RPCS3 is offered first when its usual folder exists here (display only; rpcs3_import.py does the real search) }
+  if DirExists(ExpandConstant('{userappdata}\rpcs3')) then RpcsPage.Values[0] := ExpandConstant('{userappdata}\rpcs3')
+  else if DirExists(ExpandConstant('{localappdata}\Programs\rpcs3')) then
+    RpcsPage.Values[0] := ExpandConstant('{localappdata}\Programs\rpcs3');
+  SourcePage.Values[0] := RpcsPage.Values[0] <> '';
+  if GetPreviousData('UseRpcs3', '') <> '' then SourcePage.Values[0] := GetPreviousData('UseRpcs3', '') = '1';
+  if GetPreviousData('Rpcs3Dir', '') <> '' then RpcsPage.Values[0] := GetPreviousData('Rpcs3Dir', '');
 
   { Welcome page: "Check now" (one-shot, opt-in by the click) and, after a newer release is found, its page. }
   CheckBtn := TNewButton.Create(WizardForm);
@@ -1416,6 +1591,9 @@ begin
   SetPreviousData(PreviousDataKey, 'UpdateDir', UpdatePage.Values[0]);
   SetPreviousData(PreviousDataKey, 'EbootFile', EbootPage.Values[0]);
   SetPreviousData(PreviousDataKey, 'FontDir', FontPage.Values[0]);
+  if SourcePage.Values[0] then SetPreviousData(PreviousDataKey, 'UseRpcs3', '1')
+  else SetPreviousData(PreviousDataKey, 'UseRpcs3', '0');
+  SetPreviousData(PreviousDataKey, 'Rpcs3Dir', RpcsPage.Values[0]);
   if IsAdvanced then SetPreviousData(PreviousDataKey, 'SetupType', 'advanced')
   else SetPreviousData(PreviousDataKey, 'SetupType', 'recommended');
 end;
@@ -1578,6 +1756,13 @@ begin
       MsgBox(Problem, mbError, MB_OK);
       Result := False;
     end;
+  end else if CurPageID = RpcsPage.ID then begin
+    if not RpcsLooksRight(RpcsPage.Values[0]) then begin
+      MsgBox('This does not look like an RPCS3 folder (rpcs3.exe or config\games.yml is needed). Select the folder ' +
+        'of your RPCS3, or leave it empty to look in the usual places.', mbError, MB_OK);
+      Result := False;
+    end else if not WizardSilent then
+      Result := ResolveRpcs3;
   end else if CurPageID = DumpPage.ID then begin
     { The folder that holds PS3_GAME is used from here on, whichever level was picked }
     DumpPage.Values[0] := ResolveDump(DumpPage.Values[0]);
@@ -1634,8 +1819,10 @@ begin
       { A missing 1.14 update stops here; Next again = check again. }
       MsgBox('The 1.14 update was not found in this folder: ' + UpdateProblem(UpdatePage.Values[0]) + #13#10 + #13#10 +
         'The update folder is the installed update (dev_hdd0\game\BCUS98234, or your region''s id) and holds ' +
-        'PARAM.SFO, USRDIR\EBOOT.BIN and USRDIR\added_data_ps3.psarc.edat (the update''s data archive: the 1.14 menu screens, the multiplayer map scripts ' +
-        'and files that override the disc''s). The port is built on 1.14.' + #13#10 + #13#10 +
+        'PARAM.SFO, USRDIR\EBOOT.BIN, USRDIR\added_data_ps3.psarc.edat (the update''s data archive: the 1.14 menu screens, the multiplayer map scripts ' +
+        'and files that override the disc''s) and the two folders USRDIR\patch_data_ps3_sp and USRDIR\patch_data_ps3_mp with their ' +
+        '.pspatch files. Copy the whole update folder, every folder inside USRDIR: without the patch folders the game starts into a black screen. ' +
+        'The port is built on 1.14.' + #13#10 + #13#10 +
         'Use the 1.14 update from your own console, or the one installed in RPCS3 ' +
         '(see RPCS3''s documentation).' + #13#10 + #13#10 +
         'Then select the folder again and press Next to check again.', mbError, MB_OK);
@@ -1667,9 +1854,13 @@ end;
   install with Inno's "You must enter a full path"); PrepareToInstall checks them instead. }
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  Result := WizardSilent and ((PageID = DumpPage.ID) or (PageID = UpdatePage.ID) or (PageID = EbootPage.ID) or
-    (PageID = FontPage.ID));
-  { Step 9s, Recommended: only the game folders (and the EBOOT when the update has no USRDIR\EBOOT.elf) }
+  Result := WizardSilent and ((PageID = SourcePage.ID) or (PageID = RpcsPage.ID) or (PageID = DumpPage.ID) or
+    (PageID = UpdatePage.ID) or (PageID = EbootPage.ID) or (PageID = FontPage.ID));
+  { The RPCS3 folder page only for the RPCS3 box; the three game pages not when RPCS3 gave all three paths }
+  if (not Result) and (PageID = RpcsPage.ID) then Result := not SourcePage.Values[0];
+  if (not Result) and Rpcs3Filled and SourcePage.Values[0] and
+     ((PageID = DumpPage.ID) or (PageID = UpdatePage.ID) or (PageID = EbootPage.ID)) then Result := True;
+  { Recommended (no "Customise"): only the game folders (and the EBOOT when the update has no USRDIR\EBOOT.elf) }
   if (not Result) and (not IsAdvanced) then
     Result := (PageID = wpSelectTasks) or (PageID = FontPage.ID) or (PageID = AdvPage.ID) or
       ((PageID = EbootPage.ID) and FileExists(EbootPage.Values[0]) and (EbootProblem(EbootPage.Values[0]) = ''));
@@ -1706,7 +1897,8 @@ begin
     Result := 'Silent install stopped: ' + DumpPage.Values[0] + ': ' + DumpProblem(DumpPage.Values[0], Missing)
   else if not UpdateOK(UpdatePage.Values[0]) then
     Result := 'Silent install stopped: not the 1.14 update: ' + UpdateProblem(UpdatePage.Values[0]) + ' (PARAM.SFO, ' +
-      'USRDIR\EBOOT.BIN and USRDIR\added_data_ps3.psarc.edat are needed)'
+      'USRDIR\EBOOT.BIN, USRDIR\added_data_ps3.psarc.edat and the folders USRDIR\patch_data_ps3_sp and ' +
+      'USRDIR\patch_data_ps3_mp with their .pspatch files are needed: copy the whole update folder)'
   else if UpdateIdProblem(UpdatePage.Values[0], DiscIdOf(DumpPage.Values[0])) <> '' then
     Result := 'Silent install stopped: ' + UpdatePage.Values[0] + ': ' +
       UpdateIdProblem(UpdatePage.Values[0], DiscIdOf(DumpPage.Values[0]))

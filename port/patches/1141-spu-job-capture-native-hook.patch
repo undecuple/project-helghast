@@ -6,7 +6,7 @@ spu_drain.c + spu_interp.c) reach the capture too, so a replay can serve the ker
 changes. The job-call bracket closes regardless of host depth for the frame trace and jobcost too (kinds 36/37
 in the frame trace mark the closes the depth test lost and brackets that never closed).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
 index 74d041b..817e527 100644

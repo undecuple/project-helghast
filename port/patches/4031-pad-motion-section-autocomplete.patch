@@ -15,10 +15,13 @@ speed 360, Min 0, Max 200, Initial 180, DisableValue 0), ISA_D_Charge (windows +
 Logs: "[assist] L3+R3 held 0.5 s", "[assist] combo held: valve autocomplete engaged", "[assist] valve sweep push",
 "[assist] valve done n=". Host test: tools/smoke/test_motion_assist.sh.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+Net pass 19: the valve post-hook runs the 4030 hold gate when the autocomplete is not engaged (autocomplete wins when held);
+comment fix: ctrl +0x114 on the charge is the final-trigger byte, the autocomplete still holds it at 1.
+
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (the v0.19.0 chain files where available; originals for the rest, three-way merged where they did not apply).
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 7640675..8993b2a 100644
+index 24190cae..c21d8639 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
 @@ -23,6 +23,7 @@
@@ -56,13 +59,14 @@ index 7640675..8993b2a 100644
  static int pas_mstick_enabled(void)
  {
      static int v = -1;
-@@ -1841,8 +1847,14 @@ static void pad_assist_poll(CellPadData* data)
+@@ -1860,9 +1866,15 @@ static void pad_assist_poll(CellPadData* data)
  {
      const unsigned long long now = pad_now_ms();
      const int vl = pas_valve_live(&s_pas, now), cl = pas_charge_live(&s_pas, now), live = vl || cl;
 -    int dx = 0, dy = 0;
 +    int dx = 0, dy = 0, ev;
      uint8_t bx, by;
+     int m1;
 +    {   /* 4031: ENHANCEMENT, [motion] autocomplete = hold: L3+R3 (packet bits 1 and 2, after the bindings) for 0.5 s */
 +        const unsigned b = (unsigned)data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] | ((unsigned)data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8);
 +        s_pasd.mode = pad_assist_mode();
@@ -70,17 +74,22 @@ index 7640675..8993b2a 100644
 +        if (ev) { printf("[assist] L3+R3 %s (%s)\n", ev > 0 ? "held 0.5 s: autocomplete engaged" : "released", vl ? "valve" : "charge"); fflush(stdout); }
 +    }
      if (!pas_mstick_enabled()) return;
-     pad_mouse_stick_take(&dx, &dy);
-     pas_test_feed(&dx, &dy);
-@@ -1873,9 +1885,10 @@ static void pad_assist_poll(CellPadData* data)
+     m1 = live ? pad_assist_mouse1() : 0;
+     s_pas.m1 = live && m1;       /* the post-hooks read it: the valve hold gate acts only while Mouse1 is held in a section */
+@@ -1903,14 +1915,10 @@ static void pad_assist_poll(CellPadData* data)
      }
  }
  /* The hooks (port/spu kz3_gameplay.h KZ3_HOOK_VALVE_ASSIST / KZ3_HOOK_CHARGE_ASSIST, post-hooks on 1.14 0x61AEB4 and
 - * 0x6126E4): vm = vm_base, ctrl = the controller (r3 on entry). They mark the section the pad layer above reads. */
--int pad_assist_valve_post(uint8_t* vm, uint32_t ctrl) { PasView v; return pas_valve_mark(&s_pas, vm, ctrl, pad_now_ms(), &v); }
+-int pad_assist_valve_post(uint8_t* vm, uint32_t ctrl)
+-{
+-    PasView v;
+-    if (!pas_valve_mark(&s_pas, vm, ctrl, pad_now_ms(), &v)) return 0;
+-    return pas_valve_hold_apply(&s_pas, vm, ctrl, &v);
+-}
 -int pad_assist_charge_post(uint8_t* vm, uint32_t ctrl) { PasView v; return pas_charge_mark(&s_pas, vm, ctrl, pad_now_ms(), &v); }
 + * 0x6126E4): vm = vm_base, ctrl = the controller (r3 on entry). They mark the section the pad layer above reads and,
-+ * while the autocomplete is engaged, drive the controller's outputs. */
++ * while the autocomplete is engaged, drive the controller's outputs; otherwise the valve's hold gate (4030) runs. */
 +int pad_assist_valve_post(uint8_t* vm, uint32_t ctrl) { return pas_valve_post(&s_pas, &s_pasd, vm, ctrl, pad_now_ms()); }
 +int pad_assist_charge_post(uint8_t* vm, uint32_t ctrl) { return pas_charge_post(&s_pas, &s_pasd, vm, ctrl, pad_now_ms()); }
  
@@ -88,7 +97,7 @@ index 7640675..8993b2a 100644
  {
 diff --git a/libs/input/pad_assist_drive.h b/libs/input/pad_assist_drive.h
 new file mode 100644
-index 0000000..18f0f26
+index 00000000..bab8a161
 --- /dev/null
 +++ b/libs/input/pad_assist_drive.h
 @@ -0,0 +1,167 @@
@@ -208,7 +217,7 @@ index 0000000..18f0f26
 +    if (v.fresh) { pas_ratchet_reset(&d->rt); d->v_active = 0; }
 +    if (!pas_engaged(d)) {
 +        if (d->v_active) { d->v_active = 0; pas_ratchet_reset(&d->rt); printf("[assist] valve autocomplete released n=%.3f\n", (double)v.n); }
-+        return 0;
++        return pas_valve_hold_apply(st, vm, ctrl, &v);   /* 4030: hold Mouse1 and move; the game's own pad unaffected */
 +    }
 +    if (d->rt.done) return 0;
 +    rc = pas_ratchet_step(&d->rt, v.n, v.dis, v.hand, v.lo, v.hi, &target, &grab, &ev);
@@ -228,7 +237,7 @@ index 0000000..18f0f26
 +    return 1;
 +}
 +
-+/* Charge post-hook. The arm windows alternate (ISA_D_Charge: centres +-0.7854 rad, ArmStepTime 0), the grab byte is
++/* Charge post-hook. The arm windows alternate (ISA_D_Charge: centres +-0.7854 rad, ArmStepTime 0), the final-trigger byte (+0x114, pass 19: it is the left-Y test, not a grab) is
 + * held, and each window is held long enough for the hand to arrive at MaxRotationSpeed (the hand angle is not read:
 + * ASSUMPTION, the field is not mapped). */
 +static inline int pas_charge_post(PasState* st, PasDrive* d, uint8_t* vm, uint32_t ctrl, unsigned long long now)
@@ -260,7 +269,7 @@ index 0000000..18f0f26
 +
 +#endif
 diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
-index 33a588e..fca1621 100644
+index 33a588e0..fca16215 100644
 --- a/libs/input/pad_keybinds.h
 +++ b/libs/input/pad_keybinds.h
 @@ -30,6 +30,7 @@

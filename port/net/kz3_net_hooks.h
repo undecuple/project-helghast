@@ -47,6 +47,7 @@
 extern "C" {
 #endif
 int pad_prompt_motion(void);   /* cellPad.c (patch 4011): the device in use has motion sensors */
+int pad_kb_last_device_keyboard(void);  /* cellPad.c (patch 2038): the prompts are keycaps */
 int pad_prompt_set_pad(void);  /* cellPad.c (patch 4029): glyph set of the connected pad (PAD_PROMPT_*; keycaps -> the pad's) */
 #ifdef __cplusplus
 }
@@ -141,6 +142,11 @@ static int kz3_net_buttons_on(void)
     if (on < 0) { const char* e = getenv("KZ3_TEXT_BUTTONS"); on = !(e && !strcmp(e, "0")); }
     return on;
 }
+static int kz3_net_valve_hold_on(void)   /* network pass 19: patch 4030's valve gate (KZ3_VALVE_HOLD=0 off) is what the KB+M text promises */
+{
+    const char* e = getenv("KZ3_VALVE_HOLD");
+    return !(e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "no")));
+}
 static int kz3_net_button_set(void)
 {
     return kz3_net_buttons_on() ? pad_prompt_set_pad() : 0;
@@ -174,7 +180,12 @@ static void kz3_net_localizer_post(ppu_context* ctx, uint64_t this_, uint32_t ke
     const Kz3TxTable* t = kz3_net_tx_table();
     int in_tbl = t && kz3_tx_has_key(t, k, n);
     int bset = kz3_net_button_set();                          /* 2 Xbox, 1 PS4/PS5, else the game's PS3 words stay */
+    int kbm_variant = 0;
     const char* stick = (kz3_net_buttons_on() && !pad_prompt_motion()) ? kz3_tx_stick_en(k, n) : NULL;
+    if (stick && pad_kb_last_device_keyboard() && kz3_net_valve_hold_on()) {   /* network pass 19: keyboard and mouse */
+        const char* kbm = kz3_tx_kbm_en(k, n);
+        if (kbm) { stick = kbm; kbm_variant = 1; }
+    }
     if (!in_tbl && !stick && bset != KZ3_TX_SET_XBOX && bset != KZ3_TX_SET_PS4) return;
     uint32_t q = vm_read32(out);
     if (!KZ3_NET_GUEST_PTR_OK(q)) return;
@@ -210,7 +221,7 @@ static void kz3_net_localizer_post(ppu_context* ctx, uint64_t this_, uint32_t ke
     if (stick) {                                              /* network pass 50: the stick variant of a motion tutorial */
         char en[1200];
         char trk[KZ3_TX_KEY_MAX + 8];
-        snprintf(trk, sizeof trk, "stick.%s", k);
+        snprintf(trk, sizeof trk, "%s.%s", kbm_variant ? "kbm" : "stick", k);
         const char* txt = kz3_tr(trk, stick);
         size_t ti = 0;
         for (const char* sp8 = txt; *sp8 && ti + 2 < sizeof en; sp8++) {   /* a real newline from the table = the game's "\n" */
@@ -222,7 +233,7 @@ static void kz3_net_localizer_post(ppu_context* ctx, uint64_t this_, uint32_t ke
             rep = cur;
             rn = (size_t)su;
             static int said_stick;
-            if (said_stick++ < 4) { KZ3_NET_PRINTF("[text] %s: no motion sensors, stick variant shown\n", k); fflush(stdout); }
+            if (said_stick++ < 4) { KZ3_NET_PRINTF("[text] %s: no motion sensors, %s variant shown\n", k, kbm_variant ? "keyboard+mouse" : "stick"); fflush(stdout); }
         }
     }
     if (bset == KZ3_TX_SET_XBOX || bset == KZ3_TX_SET_PS4) {  /* network pass 50: the pad's own button names */

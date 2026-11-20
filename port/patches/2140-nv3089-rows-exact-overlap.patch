@@ -16,7 +16,7 @@ tools/smoke/test_nv3089_rows.sh compares both rules with the per-pixel loop over
 pitches, overlap, wrap): byte-identical, the exact rule never declines what the range rule copied, 2061 more copied.
 Defaults: see the RE notes "Pass 132".
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 index 1bd4bd5..a98fc45 100644

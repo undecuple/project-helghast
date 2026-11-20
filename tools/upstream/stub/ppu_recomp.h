@@ -1,6 +1,6 @@
 /* Stub for host tests without a PPU lift (public CI): the generic preamble that ps3recomp's ppu_lifter.py writes
  * at the top of every ppu_recomp.h (MIT), up to the function table, without the game's function declarations.
- * Copied from a generated header on 2026-10-12; regenerate if the lifter's preamble changes. */
+ * Copied from a generated header; regenerate if the lifter's preamble changes. */
 #pragma once
 #include <stdint.h>
 

@@ -405,7 +405,7 @@ extern "C" void kz3_mouse_look_pre(void* vctx)
             s_eboot = t;
     }
     if (pad_mouse_log_each()) kz3_view_caller_note(lr, C, ctx, s_eboot ? s_eboot->players : 0);
-    /* RSX pass 103: the mounted gun (K4 Frozen Shores' start rides one: runs r103-k4p1/p2). */
+    /* RSX pass 103: the mounted gun (K4 Frozen Shores' start rides one). */
     if (s_eboot && lr == (s_eboot == &kMouse114 ? kMount114 : kMount100).lr) {
         kz3_mouse_mounted(ctx, s_eboot, s_eboot == &kMouse114 ? &kMount114 : &kMount100);
         return;
@@ -698,7 +698,12 @@ static void kz3_keycaps_register(void);   /* below, with the notice fonts */
  * (fit|stretch) / Scaling filter (bilinear|nearest) rows. KZ3_DISPLAY, KZ3_DISPLAY_SCALING, KZ3_DISPLAY_FILTER win for
  * one run, and then nothing is saved (rsx_null_backend.c). */
 #include "rsx_display_mode.h"
+#include "rsx_gfx_page.h"    /* patch 2206: Options > Graphics, the Quality preset */
 #include "rsx_menu_cols.h"   /* patch 2151 */
+static unsigned kz3_gfx_levers(void);   /* patch 2206: the landed Graphics levers (below, with the Bloom override) */
+#ifdef _WIN32
+static int kz3_game_type(void);          /* 0 campaign, 1-3 multiplayer, -1 unknown (the Field of view section below) */
+#endif
 #ifdef _WIN32
 extern "C" int  pad_kb_sibling_path(const wchar_t* name, wchar_t* out, size_t n);   /* cellPad.c (patch 2095) */
 extern "C" void rsx_display_configure(int saved_mode, int saved_scaling, int saved_filter,
@@ -734,6 +739,9 @@ static int s_unf_saved = RSX_UNF_KEEP;
  * values the rows hold are s_mb_* / s_bloom_*; KZ3_MOTION_BLUR on|off|0..100 and KZ3_BLOOM 0..100 win for one run). */
 static volatile LONG s_mb_eff = 100, s_fps_eff = RSX_DM_FPS_30, s_bloom_eff = 100;
 static int s_mb_saved = 100, s_fps_saved = RSX_DM_FPS_30, s_bloom_saved = 100;
+/* Patch 2206: Options > Graphics. s_quality_saved = the state (High / Ultra / Custom) the saved values are in, display.ini
+ * quality; decided from the values by rsx_gfx_classify, so it is never a second truth. */
+static int s_quality_saved = RSX_GFX_HIGH;
 /* Patch 2107: "[pace] fps limit N (vblank tick M ms)" (rsx_dm_fps_pace_line), once at start and on every row change or
  * KZ3_FPS_LIMIT override; the menus and movies stay at the game's 30 (its own Bink background wait), so the line is how a log
  * shows which limit was in force for the levels. */
@@ -789,8 +797,8 @@ static void kz3_display_save(int mode, int scaling, int filter, int vsync)
     InitOnceExecuteOnce(&s_dm_save_once, kz3_dm_lock_init, NULL, NULL);
     EnterCriticalSection(&s_dm_save_lock);
     s_dm_saved[0] = mode; s_dm_saved[1] = scaling; s_dm_saved[2] = filter; s_dm_saved[3] = vsync;
-    int n = rsx_dm_ini_write_ext4(t, sizeof t, mode, scaling, filter, vsync, s_mb_saved, s_fps_saved, s_fov_saved,
-                                  s_h169_saved, s_bloom_saved);
+    int n = rsx_dm_ini_write_ext5(t, sizeof t, mode, scaling, filter, vsync, s_mb_saved, s_fps_saved, s_fov_saved,
+                                  s_h169_saved, s_bloom_saved, s_quality_saved);   /* patch 2206: + quality */
     if (n > 0 && (size_t)n < sizeof t) {   /* patch 2126: When unfocused, maximize, the window */
         rsx_wp w;
         if (!rsx_display_get_window(&w)) w = s_wp_saved;
@@ -812,10 +820,10 @@ static void kz3_display_save(int mode, int scaling, int filter, int vsync)
         FILE* f = _wfopen(p, L"wb");
         ok = f && fwrite(t, 1, (size_t)n, f) == (size_t)n;
         if (f) fclose(f);
-        printf("[display] %ls: mode %s, scaling %s, filter %s, vsync %s, motion blur %d, bloom %d, fps limit %s, fov %s %s\n", p,
+        printf("[display] %ls: mode %s, scaling %s, filter %s, vsync %s, motion blur %d, bloom %d, quality %s, fps limit %s, fov %s %s\n", p,
                rsx_dm_name(mode), rsx_dm_scaling_name(scaling), rsx_dm_filter_name(filter), rsx_dm_vsync_name(vsync),
-               s_mb_saved, s_bloom_saved, rsx_dm_fps_name(s_fps_saved), rsx_dm_fov_name(s_fov_saved, fb, sizeof fb),
-               ok ? "saved" : "NOT saved");
+               s_mb_saved, s_bloom_saved, rsx_gfx_quality_name(s_quality_saved), rsx_dm_fps_name(s_fps_saved),
+               rsx_dm_fov_name(s_fov_saved, fb, sizeof fb), ok ? "saved" : "NOT saved");
     }
     LeaveCriticalSection(&s_dm_save_lock);
     fflush(stdout);
@@ -830,7 +838,7 @@ static void kz3_display_load(void)
 {
     wchar_t p[1100];
     char t[2048];
-    int mode = -1, scaling = -1, filter = -1, vsync = -1;
+    int mode = -1, scaling = -1, filter = -1, vsync = -1, qini = -1;
     if (pad_kb_sibling_path(L"display.ini", p, 1100)) {
         FILE* f = _wfopen(p, L"rb");
         if (f) {
@@ -845,6 +853,7 @@ static void kz3_display_load(void)
             if (mb >= 0) s_mb_saved = mb;
             const int bl = rsx_dm_ini_bloom(t);   /* patch 2121 */
             if (bl >= 0) s_bloom_saved = bl;
+            qini = rsx_dm_ini_quality(t);   /* patch 2206: checked against the values below, never rewritten until a change */
             if (fps > 0) s_fps_saved = fps;
             const int fv = rsx_dm_ini_fov(t);   /* patch 2109 */
             if (fv >= 0) s_fov_saved = fv;
@@ -860,6 +869,14 @@ static void kz3_display_load(void)
                    mb, fps > 0 ? rsx_dm_fps_name(fps) : "(none)");
         }
     }
+    {   /* patch 2206: the preset the saved values are in; a quality that does not match them shows as Custom */
+        rsx_gfx_vals gv = rsx_gfx_table(RSX_GFX_HIGH, kz3_gfx_levers());
+        gv.v[0] = s_bloom_saved;
+        s_quality_saved = rsx_gfx_load_state(qini, &gv, kz3_gfx_levers());
+        if (qini >= 0 && qini != s_quality_saved && qini != RSX_GFX_CUSTOM)
+            printf("[display] display.ini quality = %s does not match the saved settings: shown as %s (file kept as it is)\n",
+                   rsx_gfx_quality_name(qini), rsx_gfx_quality_name(s_quality_saved));
+    }
     if (mode >= 0) s_dm_saved[0] = mode;
     if (scaling >= 0) s_dm_saved[1] = scaling;
     if (filter >= 0) s_dm_saved[2] = filter;
@@ -873,7 +890,18 @@ static void kz3_display_load(void)
     kz3_seq_parse(getenv("KZ3_BLOOM_SEQ"), &s_bloom_seq);
     kz3_seq_parse(getenv("KZ3_MOTION_BLUR_SEQ"), &s_mb_seq);
     if (s_bloom_seq.n || s_mb_seq.n) printf("[display] test sequence: bloom %d steps, motion blur %d steps\n", s_bloom_seq.n, s_mb_seq.n);
-    InterlockedExchange(&s_bloom_eff, ble >= 0 ? ble : s_bloom_saved);
+    /* patch 2206: KZ3_QUALITY=high|ultra for one run (KZ3_BLOOM still wins for its own row). The Graphics page always shows and
+     * edits the SAVED values (kz3_gfx_bridge), not this run's override: the log line below says which preset is in force. */
+    int qbl = -1;
+    {
+        rsx_gfx_vals ev;
+        const int qr = rsx_gfx_env_vals(kz3_gfx_levers(), getenv("KZ3_QUALITY"), &ev);
+        if (qr == 1) qbl = ev.v[0];
+        else if (qr == -1) printf("[display] KZ3_QUALITY=ultra: no Ultra lever has landed, High applies\n");
+        printf("[display] quality %s%s\n", rsx_gfx_quality_name(qr == 1 ? rsx_gfx_classify(&ev, kz3_gfx_levers()) : s_quality_saved),
+               qr == 1 ? " (KZ3_QUALITY)" : "");
+    }
+    InterlockedExchange(&s_bloom_eff, ble >= 0 ? ble : qbl >= 0 ? qbl : s_bloom_saved);
     e = getenv("KZ3_FPS_LIMIT");
     const int fpe = e && *e ? rsx_dm_parse_fps(e) : -1;
     /* Patch 2121: the saved motion_blur value is kept (read and written back) but does not act: skipping the post chain's
@@ -925,6 +953,9 @@ extern "C" int kz3_motion_blur_on(void)
  * table needs the BuildPost row) calls the original and scales the stored float by bloom / 100; nothing at 100. */
 static int s_bloom_override = 0;
 extern "C" void kz3_bloom_override_register(void) { s_bloom_override = 1; }
+/* Patch 2206: the Graphics levers this exe has (Bloom only: the BuildPost override). Render resolution, host anti-aliasing and
+ * texture sharpness are not levers yet, so the Quality row offers High and Custom. */
+static unsigned kz3_gfx_levers(void) { return s_bloom_override ? RSX_GFX_L_BLOOM : 0u; }
 #ifdef KZ3_BLOOM_OVERRIDE
 [[maybe_unused]] static const int s_kz3_bloom_reg = (kz3_bloom_override_register(), 1);
 static void kz3_bloom_body(ppu_context* ctx, void (*orig)(ppu_context*), uint32_t addr)
@@ -932,7 +963,7 @@ static void kz3_bloom_body(ppu_context* ctx, void (*orig)(ppu_context*), uint32_
     const uint32_t vp = (uint32_t)ctx->gpr[5];
     orig(ctx);
 #ifdef _WIN32
-    const int k = kz3_seq_now(&s_bloom_seq, (int)s_bloom_eff);
+    const int k = rsx_gfx_effective_bloom(kz3_seq_now(&s_bloom_seq, (int)s_bloom_eff), kz3_game_type());   /* 2206: High in multiplayer */
 #else
     const int k = 100;
 #endif
@@ -1036,9 +1067,55 @@ static DWORD WINAPI kz3_test_close(LPVOID)
     return 0;
 }
 
+/* Patch 2187 (stutter Task 0, RSX_ATTRIB=1, default off): what the frame thread does between two message pumps. Each
+ * call it makes (drain / present / pump / idle) adds its QPC time to a section; a [pump] gap line then shows where the
+ * gap went, with a QPC stamp that matches the per-present CSV (RSX_PRESENT_QPC_STREAM) and the [pso-await] lines.
+ * Off: one cached int test per call, no QPC read. */
+extern "C" int kz3_vbd_on(void);
+extern "C" void kz3_vbd_late(long long qpc_now, long long qpc_ideal);
+extern "C" void kz3_vbd_pass(int fired);
+extern "C" void kz3_vbd_report(long long qpc_now, double win_s);
+enum { KZ3_SEC_DRAIN, KZ3_SEC_PRESENT, KZ3_SEC_PUMP, KZ3_SEC_IDLE, KZ3_SEC_N };
+static const char* const kz3_sec_name[KZ3_SEC_N] = {"drain", "present", "pump", "idle"};
+static LONGLONG s_sec_q[KZ3_SEC_N], s_sec_max[KZ3_SEC_N];   /* frame thread only */
+static int kz3_attrib_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ATTRIB"); on = e && *e && strcmp(e, "0") != 0; }
+    return on;
+}
+static LONGLONG kz3_sec_begin(void)
+{
+    if (!kz3_attrib_on()) return 0;
+    LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart;
+}
+static void kz3_sec_end(int sec, LONGLONG t0)
+{
+    if (!t0) return;
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    const LONGLONG d = q.QuadPart - t0;
+    s_sec_q[sec] += d;
+    if (d > s_sec_max[sec]) s_sec_max[sec] = d;
+}
+static void kz3_rsx_drain_timed(void)
+{
+    const LONGLONG t = kz3_sec_begin();
+    cellGcm_rsx_process_fifo();
+    kz3_sec_end(KZ3_SEC_DRAIN, t);
+}
+static int kz3_rsx_pump_timed(void)
+{
+    const LONGLONG t = kz3_sec_begin();
+    const int r = kz3_rsx_pump();
+    kz3_sec_end(KZ3_SEC_PUMP, t);
+    return r;
+}
+
 static void present_guest_frame(void)
 {
+    const LONGLONG t_sec = kz3_sec_begin();
     kz3_rsx_present();
+    kz3_sec_end(KZ3_SEC_PRESENT, t_sec);
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
     InterlockedIncrement(&g_frames_presented);
@@ -1084,14 +1161,38 @@ static void kz3_pump_note(int fired)
     s_last = q;
     s_n++;
     if (gap > s_max) s_max = gap;
-    if (gap > 250.0) {
+    /* Patch 2187: with RSX_ATTRIB=1 the line also carries the QPC stamp (end of the gap) and the time the frame thread
+     * spent in each of its calls since the previous pump (ms total/longest call; other = the rest, e.g. guest
+     * handlers run from HLE calls or time outside any timed call), and the threshold drops to RSX_ATTRIB_GAP_MS
+     * (default 50) with up to 400 lines. Without it the lines are exactly as before. */
+    static double s_gap_ms = -1.0;
+    const int attrib = kz3_attrib_on();
+    if (attrib && s_gap_ms < 0) { const char* e = getenv("RSX_ATTRIB_GAP_MS"); s_gap_ms = (e && *e) ? atof(e) : 50.0; }
+    const double thr = attrib ? s_gap_ms : 250.0;
+    const unsigned max_lines = attrib ? 400u : 20u;
+    if (gap > thr) {
         s_long++;
-        if (s_lines++ < 20)
-            fprintf(stderr, "[pump] gap %.0f ms between message pumps (flip=%u, %d vblank tick(s) in that pass)\n", gap,
-                    cellGcm_flip_request_count(), fired);
+        if (s_lines++ < max_lines) {
+            if (attrib) {
+                char sec[256]; int n = 0; double sum = 0.0; int longest = 0;
+                for (int i = 0; i < KZ3_SEC_N; i++) {
+                    const double t = (double)s_sec_q[i] * 1e3 / (double)s_qf.QuadPart, m = (double)s_sec_max[i] * 1e3 / (double)s_qf.QuadPart;
+                    n += snprintf(sec + n, sizeof sec - (size_t)n, " %s=%.1f/%.1f", kz3_sec_name[i], t, m);
+                    sum += t;
+                    if (s_sec_max[i] > s_sec_max[longest]) longest = i;
+                }
+                fprintf(stderr, "[pump] gap %.0f ms between message pumps (flip=%u, %d vblank tick(s) in that pass) qpc=%lld in(ms total/longest):%s other=%.1f longest-call=%s\n",
+                        gap, cellGcm_flip_request_count(), fired, (long long)q.QuadPart, sec, gap > sum ? gap - sum : 0.0, kz3_sec_name[longest]);
+            } else {
+                fprintf(stderr, "[pump] gap %.0f ms between message pumps (flip=%u, %d vblank tick(s) in that pass)\n", gap,
+                        cellGcm_flip_request_count(), fired);
+            }
+        }
     }
+    if (attrib) { memset(s_sec_q, 0, sizeof s_sec_q); memset(s_sec_max, 0, sizeof s_sec_max); }
     const double win = (double)(q.QuadPart - s_win.QuadPart) / (double)s_qf.QuadPart;
     if (win >= 10.0) {
+        if (attrib) kz3_vbd_report(q.QuadPart, win);   /* patch 2187: the [vblank] line of this window */
         fprintf(stderr, "[pump] last %.1f s: %u pumps, longest gap %.0f ms, %u gap(s) over 250 ms\n", win, s_n, s_max, s_long);
         s_win = q; s_n = s_long = 0; s_max = 0.0;
     }
@@ -1118,8 +1219,12 @@ static DWORD WINAPI frame_clock(LPVOID)
      * physics run on the timebase, not on vblanks (the RE notes s.6-7). */
     for (;;) {
         const unsigned tick_ms = kz3_vblank_tick_ms();
-        if (tick_ms < 16) Sleep(1);
-        else cellGcm_park_idle_wait(4);   /* patch 2129 (RSX pass 122): ends early when an SPU PUT releases the park */
+        {
+            const LONGLONG t_idle = kz3_sec_begin();   /* patch 2187 */
+            if (tick_ms < 16) Sleep(1);
+            else cellGcm_park_idle_wait(4);   /* patch 2129 (RSX pass 122): ends early when an SPU PUT releases the park */
+            kz3_sec_end(KZ3_SEC_IDLE, t_idle);
+        }
         ULONGLONG now = GetTickCount64();
 
         /* RSX pass 120 (with patch 2127): vblanks are wall-clock interrupts; a pass that held this thread (a blocked
@@ -1138,8 +1243,23 @@ static DWORD WINAPI frame_clock(LPVOID)
                 next_tick = now;
             }
         }
+        /* Patch 2187 (RSX_ATTRIB=1): shadow QPC clock of the same tick grid (next_tick is GetTickCount64 ms), so each tick's
+         * lateness is measured in QPC against its ideal time. Anchored at the first pass (offset at most one
+         * GetTickCount64 granule: spreads and differences are exact), re-anchored where the grid resyncs. */
+        static LONGLONG s_ideal_q = 0, s_prev_next = 0;
+        const int attrib = kz3_attrib_on();
+        LONGLONG qf_att = 0;
+        if (attrib) {
+            LARGE_INTEGER qa, qfq; QueryPerformanceCounter(&qa); QueryPerformanceFrequency(&qfq); qf_att = qfq.QuadPart;
+            if (!s_ideal_q || (LONGLONG)next_tick != s_prev_next)   /* first pass, or the grid was moved (resync / drop) */
+                s_ideal_q = qa.QuadPart - (LONGLONG)((long long)(now - next_tick)) * qf_att / 1000;
+        }
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
+            if (attrib) {
+                LARGE_INTEGER qa; QueryPerformanceCounter(&qa);
+                kz3_vbd_late(qa.QuadPart, s_ideal_q);
+            }
             cellGcmTickVBlank();
             cellGcmTickFlip();
             /* Present a pending flip BEFORE draining any further. The flip
@@ -1154,18 +1274,20 @@ static DWORD WINAPI frame_clock(LPVOID)
             /* Drain the FIFO every tick. This is what writes the RSX sync-fence
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
-            if (rsx_ok) cellGcm_rsx_process_fifo();
+            if (rsx_ok) kz3_rsx_drain_timed();
             /* RSX pass 117: pump on every tick too, so a catch-up pass does not hold the window's messages back */
             if (rsx_ok && kz3_pump_tick_on()) {
-                if (kz3_rsx_pump() != 0) {
+                if (kz3_rsx_pump_timed() != 0) {
                     kz3_exit_on_window_close();   /* does not return */
                     rsx_ok = 0;
                 }
                 kz3_pump_note(fired + 1);
             }
             next_tick += tick_ms;        /* ~60 Hz (patch 2107: 120 / 240 Hz for the 60 / 120 limits) */
+            if (attrib) s_ideal_q += (LONGLONG)tick_ms * qf_att / 1000;
             fired++;
         }
+        if (attrib) { s_prev_next = (LONGLONG)next_tick; kz3_vbd_pass(fired); }   /* before a resync, so the next pass re-anchors */
         if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
 
         /* Drain at the outer cadence too, not only on the 16 ms tick: titles
@@ -1177,9 +1299,9 @@ static DWORD WINAPI frame_clock(LPVOID)
                 present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
             }
-            cellGcm_rsx_process_fifo();
+            kz3_rsx_drain_timed();
 
-            if (kz3_rsx_pump() != 0) {
+            if (kz3_rsx_pump_timed() != 0) {
                 kz3_exit_on_window_close();   /* does not return */
                 rsx_ok = 0;
                 continue;
@@ -1197,7 +1319,9 @@ static DWORD WINAPI frame_clock(LPVOID)
                 present_guest_frame();
                 last_flip = fc;
             } else if (fc == 0) {
+                const LONGLONG t_sec = kz3_sec_begin();   /* patch 2187 */
                 kz3_rsx_present();
+                kz3_sec_end(KZ3_SEC_PRESENT, t_sec);
             }
         }
     }
@@ -1442,6 +1566,26 @@ static void kz3_mouse_opts_cmd(const char* a, char* reply, size_t cap)
     else pad_mouse_opt_fmt(reply, cap, ads ? z : u);
 }
 
+#ifdef _WIN32
+/* Patch 2206: "kb:gfx <cmd>" from the Graphics page's Lua, and the older "kb:bloom <v>": rsx_gfx_cmd (rsx_gfx_page.h) runs the
+ * command on the saved values; a change is applied at once (the bloom consumer reads s_bloom_eff) and saved. In a multiplayer match
+ * the answers are the High table and nothing is written (the lock). */
+static void kz3_gfx_bridge(const char* a, char* reply, size_t cap)
+{
+    rsx_gfx_state st;
+    st.levers = kz3_gfx_levers();
+    st.v = rsx_gfx_table(RSX_GFX_HIGH, st.levers);
+    st.v.v[0] = s_bloom_saved;
+    st.quality = s_quality_saved;
+    if (rsx_gfx_cmd(&st, a, kz3_game_type(), reply, cap)) {
+        s_bloom_saved = st.v.v[0];
+        InterlockedExchange(&s_bloom_eff, s_bloom_saved);
+        s_quality_saved = st.quality;
+        kz3_display_save_extra();
+    }
+}
+#endif
+
 static void kz3_kb_set(ppu_context* ctx)
 {
     uint32_t ea = (uint32_t)ctx->gpr[4];
@@ -1485,14 +1629,9 @@ static void kz3_kb_set(ppu_context* ctx)
             printf("[kb-page] '%s' -> '%s'\n", cmd, s_kb_reply);
             return;
         }
-        if (!strncmp(cmd, "bloom", 5) && (cmd[5] == 0 || cmd[5] == ' ')) {   /* Bloom row (patch 2121) */
-            const int v = cmd[5] ? rsx_dm_parse_pct(cmd + 6) : -1;
-            if (v >= 0) {
-                InterlockedExchange(&s_bloom_eff, v);
-                s_bloom_saved = v;
-                kz3_display_save_extra();
-            }
-            snprintf(s_kb_reply, sizeof s_kb_reply, "%d", (int)s_bloom_eff);
+        if ((!strncmp(cmd, "gfx", 3) && (cmd[3] == 0 || cmd[3] == ' ')) ||
+            (!strncmp(cmd, "bloom", 5) && (cmd[5] == 0 || cmd[5] == ' '))) {   /* Options > Graphics (patch 2206); the bare "bloom" is patch 2121's */
+            kz3_gfx_bridge(cmd[0] == 'g' ? (cmd[3] ? cmd + 4 : cmd + 3) : cmd, s_kb_reply, sizeof s_kb_reply);
             s_kb_pending = 1;
             printf("[kb-page] '%s' -> '%s'\n", cmd, s_kb_reply);
             return;
@@ -1884,10 +2023,13 @@ static std::string kz3_mouse_page_gum(void)
     return g;
 }
 
-/* The controller row of an options menu, followed by a copy pointing at the Keyboard page and one at the Mouse page. */
-static std::string kz3_kb_link_rows(const std::string& in, int* added)
+/* The controller row of an options menu, followed by a copy pointing at the Keyboard page and one at the Mouse page. Patch 2206:
+ * with `gfx` a copy of the Display row follows that row, labelled Graphics and pointing at graphicssettings.gum (the page
+ * kz3_miss_hook serves); `gfx_added` counts those rows (the Display row is the game's own, so a list without it gets none). */
+static std::string kz3_kb_link_rows(const std::string& in, int* added, bool gfx = false, int* gfx_added = nullptr)
 {
     std::string out = in, low = in;
+    if (gfx_added) *gfx_added = 0;
     for (char& c : low) c = (char)tolower((unsigned char)c);
     *added = 0;
     size_t at = low.find("controllersettings.gum)");
@@ -1917,6 +2059,30 @@ static std::string kz3_kb_link_rows(const std::string& in, int* added)
         low.insert(e + 2, std::string(ins.size(), ' '));
         (*added)++;
         at = low.find("controllersettings.gum)", e + 2 + ins.size());
+    }
+    if (gfx && out.find("graphicssettings.gum") == std::string::npos) {   /* patch 2206 */
+        low = out;
+        for (char& c : low) c = (char)tolower((unsigned char)c);
+        const size_t da = low.find("displaysettings.gum)");
+        const size_t b = da == std::string::npos ? da : low.rfind("<listitem", da);
+        const size_t e = da == std::string::npos ? da : low.find("/>", da);
+        if (b != std::string::npos && e != std::string::npos) {
+            std::string row = out.substr(b, e + 2 - b), lrow = low.substr(b, e + 2 - b);
+            const size_t ls = lrow.find("label=\"");
+            const size_t le = ls == std::string::npos ? ls : lrow.find('"', ls + 7);
+            const size_t us = lrow.find("displaysettings.gum");
+            if (ls != std::string::npos && le != std::string::npos && us != std::string::npos) {
+                std::string copy = row.substr(0, ls) + "label=\"" RSX_GFX_LINK_LABEL "\"" + row.substr(le + 1);
+                const size_t u2 = copy.find(row.substr(us, 19));
+                if (u2 != std::string::npos) copy.replace(u2, 19, "graphicssettings.gum");
+                const size_t id = copy.find(" id=\"");
+                if (id != std::string::npos) copy.erase(id, copy.find('"', id + 5) + 1 - id);
+                const size_t ls2 = out.rfind('\n', b);
+                const std::string indent = ls2 == std::string::npos ? "" : out.substr(ls2 + 1, b - ls2 - 1);
+                out.insert(e + 2, "\n" + indent + copy);
+                if (gfx_added) *gfx_added = 1;
+            }
+        }
     }
     return out;
 }
@@ -2105,6 +2271,39 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
         fflush(stdout);
         return;
     }
+    if (key == KZ3_GEN_GFX) {   /* Options > Graphics (patch 2206): generated, in the game's language, written again after a language change */
+        EnterCriticalSection(&s_kb_vfs_lock);
+        /* two files, one per lock state: opened during a multiplayer match the page has no Default legend (it can change nothing) */
+        const int glk = rsx_gfx_locked(kz3_game_type()) ? 1 : 0;
+        static bool gdone_a[2] = { false, false };
+        static int gdone_lang_a[2] = { 0, 0 };
+        bool& gdone = gdone_a[glk];
+        int& gdone_lang = gdone_lang_a[glk];
+        const std::string gout = s_kb_dir + (glk ? "/graphicssettings_mp.gum" : "/graphicssettings.gum");
+        if (gdone && gdone_lang != kz3_tr_lang()) gdone = false;   /* network pass 45 */
+        if (!gdone) {
+            size_t gn = 0;
+            char* g = rsx_gfx_page_gum_l(kz3_gfx_levers(), glk, &gn);
+            if (g) {
+                std::string pg(g, gn);
+                free(g);
+                int mw = 0, mo = 0;   /* patch 2151: the label column wide enough for the language's longest label, as the Display page */
+                if (rsx_mc_lookup(kz3_tr_lang(), &mw, &mo)) {
+                    size_t cn = 0;
+                    char* cg = rsx_mc_apply(pg.data(), pg.size(), &cn, mw, mo);
+                    if (cg) { pg.assign(cg, cn); free(cg); }
+                }
+                gdone = kz3_write_file(gout, kz3_tr_page(pg));
+                gdone_lang = kz3_tr_lang();
+            }
+            printf("[kb-page] graphicssettings%s.gum %s (levers 0x%x)\n", glk ? "_mp" : "", gdone ? "written" : "NOT written", kz3_gfx_levers());
+        }
+        LeaveCriticalSection(&s_kb_vfs_lock);
+        if (gdone) snprintf(path, cap, "%s", gout.c_str());
+        else if (s_kb_prev_miss) s_kb_prev_miss(path, cap);
+        fflush(stdout);
+        return;
+    }
     bool page = key == KZ3_GEN_KEYBOARD ||
                 (s_kb_page_test && key == KZ3_HC_MAINMENU);
     int link = -1;
@@ -2141,7 +2340,7 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
             FILE* f = fopen(src, "rb");
             std::string text;
             if (f) { char b[4096]; size_t n; while ((n = fread(b, 1, sizeof b, f)) > 0) text.append(b, n); fclose(f); }
-            int added = 0;
+            int added = 0, gfx_rows = 0;
             std::string patched;
             if (link == 6) {   /* patch 2095 (rsx_display_mode.h): the Display mode row */
                 size_t pn = 0;
@@ -2160,7 +2359,7 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
                 if (pg) { patched.assign(pg, pn); free(pg); added = 1; }
             } else
                 patched = text.empty() ? text : link == 5 ? kz3_exit_rows(text, &added)
-                          : link == 7 ? kz3_pause_exit_rows(text, &added) : kz3_kb_link_rows(text, &added);
+                          : link == 7 ? kz3_pause_exit_rows(text, &added) : kz3_kb_link_rows(text, &added, kz3_gfx_levers() != 0, &gfx_rows);
             if (link == 3 && added > 0) { int qa = 0; patched = kz3_pause_exit_rows(patched, &qa); printf("[kb-page] %s: QUIT TO DESKTOP %s\n", key.c_str(), qa ? "added" : "NOT added"); }
             if (link == 7) printf("[kb-page] %s: QUIT TO DESKTOP %s\n", key.c_str(), added ? "added" : "NOT added");
             /* KZ3_TEST_ONLINE_COOP=1 (test only, 2026-10-22): the main menu's Co-op row opens the game's own unreachable
@@ -2180,6 +2379,7 @@ static void kz3_kb_miss_hook(char* path, size_t cap)
             printf("[kb-page] %s: %d %s row(s) added%s\n", key.c_str(), added,
                    link == 6 ? "Display" : link == 5 ? "EXIT GAME" : link == 7 ? "pause-menu" : "Keyboard + Mouse",
                    done[slot] ? "" : " (served unchanged)");
+            if (link >= 0 && link < 4) printf("[kb-page] %s: %d Graphics row(s) added\n", key.c_str(), gfx_rows);   /* patch 2206 */
             if (!done[slot]) { LeaveCriticalSection(&s_kb_vfs_lock); snprintf(path, cap, "%s", src); return; }
         }
     }
@@ -2219,8 +2419,8 @@ static void (*s_vf22_orig)(ppu_context*);
  * 1.14 0x00397CAC; the writer keeps src in r29 and the full angle in f31 across it). game/mode: the game type
  * [[Game + mode] + 0x104], 0 = campaign: the Lua binding IsCampaign (1.14 0x0086B6D8, 1.00 0x00848DF8) returns
  * `type == 0` (the binder table 0x142B640 lists each OPD before its name; IsOnlineGame is the session test 0x0086B6A8),
- * and 1.00's UpdateEntities keys its multiplayer debug draw on types 1-3 (the RE notes s.7.1). Run
- * r103-k2f110 read 0 in the campaign. */
+ * and 1.00's UpdateEntities keys its multiplayer debug draw on types 1-3 (the RE notes s.7.1). A
+ * campaign run read 0 there. */
 struct Kz3AspectVer { uint32_t vf22, lit, store, lr_cam, lr_frustum, lr_fov, game, mode; };
 static constexpr Kz3AspectVer kAspect100 = {0x007E5908u, 0x007E5900u, 0x0038BC14u, 0x0038BC10u, 0x00326840u, 0x0038BB80u,
                                             0x01587880u, 0x768u};
@@ -2233,14 +2433,14 @@ static int s_aspect_on;
  * game's own). The camera writer @0x0038BB08 (1.14 @0x00397C38) computes FieldOfView = 2 atan(tan(half) / A) with
  * half = 0.5 * src[0x40] (authored horizontal FOV at 16:9, degrees) * pi/180 / src[0x44] (zoom) and A = vf22().
  * A setting F (horizontal degrees at 16:9) scales the half angle by F / 80 (the first-person view's src[0x40] on foot
- * and on the K4 mounted gun, runs r103-k2c1 / r103-k4p1; cutscene cameras seen with 90; KZ3_FOV_BASE overrides) and
+ * and on the K4 mounted gun; cutscene cameras seen with 90; KZ3_FOV_BASE overrides) and
  * returns A' = A tan(half) / tan(half'), so zoom (ADS, src[0x44]) stays relative and the aspect handling above is kept.
  * Campaign only (game type 0, co-op included): off in every multiplayer mode, online or Botzone, so online play
  * never gets a wider view than the game's own. KZ3_FOV overrides the saved value for one run. */
 static double kz3_fov_base(void)
 {
     static const double b = [] { const char* e = getenv("KZ3_FOV_BASE"); const double v = e ? atof(e) : 0.0;
-                                 return v >= 30.0 && v <= 150.0 ? v : 80.0; }();   /* runs r103-k2c1, r103-k4p1 */
+                                 return v >= 30.0 && v <= 150.0 ? v : 80.0; }();   /* K2 and K4 measurements */
     return b;
 }
 static int kz3_game_type(void)   /* 0 campaign (incl. co-op), 1-3 multiplayer types, -1 unknown */
@@ -2261,7 +2461,7 @@ static int kz3_game_type(void)   /* 0 campaign (incl. co-op), 1-3 multiplayer ty
  * logic pose + the counts not applied yet, and the logic step still takes every count (no jump back). Nothing else is
  * written: E, the controller, the angles and the accumulator are untouched. Gates (any fails = no rotation):
  *   a  E = ([view+0x2C] - 0xC)->+0xE8 has a whitelisted vptr, 1.14 only: 0x00F46BF8 = the camera the blender
- *      snapshots while on foot (run r105-k2a0, every gameplay frame; ctor 0x005B49C0, stored at 0x005B49E0, right after
+ *      snapshots while on foot (every gameplay frame; ctor 0x005B49C0, stored at 0x005B49E0, right after
  *      FirstPersonCameraEntity's ctor 0x005B44D4; class name not in the RTTI names, ASSUMPTION: the player's first-person
  *      camera class; its vtable shares no slot with 0x00F465C8) and 0x00F465C8 FirstPersonCameraEntity (re-data s.43.1);
  *   b  a look update took counts within the last 4 flips (s_lat, same idle rule as patch 2099);
@@ -2452,7 +2652,7 @@ static void kz3_arms_restore(uint32_t self)
     int same = 1;
     for (int i = 0; i < 16 && same; i++) same = kz3_bef(self + 0x60 + 4 * i) == s_arms_new[i];
     if (same) for (int i = 0; i < 16; i++) kz3_wbef(self + 0x60 + 4 * i, s_arms_orig[i]);
-    /* run r122-j2t: the rep's previous pose +0xA0 is a copy of +0x60 made before this call: give it the game's value too */
+    /* the rep's previous pose +0xA0 is a copy of +0x60 made before this call: give it the game's value too */
     same = 1;
     for (int i = 0; i < 16 && same; i++) same = kz3_bef(self + 0xA0 + 4 * i) == s_arms_new[i];
     if (same) for (int i = 0; i < 16; i++) kz3_wbef(self + 0xA0 + 4 * i, s_arms_orig[i]);
@@ -2518,7 +2718,7 @@ static void kz3_vf28_diag(ppu_context* ctx)
     const uint32_t ent = ml_ok(self) ? ml_r32(self + 0x12C) : 0, loc = ml_local_entity(kMouse114.players);
     { static int s_said; if (!s_said && ml_ok(loc)) { s_said = 1; printf("[vf28] first call: self=0x%08X [self+0x12C]=0x%08X local=0x%08X A=0x%08X B=0x%08X\n", self, ent, loc, A, B); } }
     if (ml_ok(A) && ml_ok(B) && ent && ent == loc) {
-        /* RSX pass 122 run r122-j1: A and B stayed identity on every call (the early-out; 3096 calls in jungle), so the
+        /* RSX pass 122: A and B stayed identity on every call (the early-out; 3096 calls in jungle), so the
          * weapon is not placed from the Camera here; the [hrep] line at the writer logs the rep's own pose instead. */
         s_v28_A = A; s_v28_B = B; s_v28_self = self; s_v28_flip = cellGcm_flip_request_count();
     }
@@ -2526,13 +2726,13 @@ static void kz3_vf28_diag(ppu_context* ctx)
 
 /* Render-time camera interpolation (RSX pass 107, patch 2114 + this hook, ENHANCEMENT candidate, OFF: measured
  * worse; design the RE notes s.50.5 (1), facts the RE notes "Pass 107"). In the camera writer before the
- * pose copy 0x397CE0, src rows 0-3 become lerp(prev, cur, alpha) (cam_interp_pose). Logging run r107-k2log: the
+ * pose copy 0x397CE0, src rows 0-3 become lerp(prev, cur, alpha) (cam_interp_pose). A logging run: the
  * camera Rep (E, vptr 0xF46BF8) has flags 0xB400001B (bit 8: Rep::Update 0x34F5A8 copies Rep+0x60 -> Rep+0xA0 every
  * frame with a step; Rep+0xA0 = the previous frame's Rep+0x60 in 1144/1144 frames), alpha Rep+0x124 is live and equals
  * 1 - (W+0xE8 - W+0x78) / Rep+0x118 (Rep+0x110 = W+0xE8, Rep+0x118 = the slot length 1/30 or 2/30 s). But the Rep pose
  * is NOT the slot state: it is not a copy of the sim entity (+0x128 bit 8 skips 0x34F0D8) and already follows the
  * frame's game time W+0x78, so the lerp shows a mix of two frames and adds error (turn speed cv 0.228 -> 0.373 on
- * r107-k2log's frames, 0.149 -> 0.246 on r107-k2b1). Modes for re-measuring: KZ3_CAM_INTERP=1 the Rep pair
+ * those frames, 0.149 -> 0.246 on another run). Modes for re-measuring: KZ3_CAM_INTERP=1 the Rep pair
  * (Rep+0xA0, Rep+0x60) with alpha Rep+0x124, 2 the sim entity pair (sim+0x60, sim+0xA0, sim = Rep+0x12C) with that
  * alpha, 3 the sim pair with the world-clock alpha; 0 = off (default). Gates: 1.14, E vptr 0xF46BF8, no camera blend,
  * one view per flip, src == the Rep pose, the game's interpolation flag (Rep+0x128 bit 2), no cut (cam_interp_cut:
@@ -2724,7 +2924,7 @@ static const char* kz3_class_name(uint32_t obj)
     return nm;
 }
 /* The active camera's entity (E = the camera Rep the writer blends, E+0x12C = its entity, re-data 174.3) is a
- * scripted camera: the plain CameraEntity (mission_0's opening cinematic, flips ~3510-3960 of run r121-m0f110c: Rep
+ * scripted camera: the plain CameraEntity (mission_0's opening cinematic, flips ~3510-3960 of one run: Rep
  * CameraEntityRep, hfov 90; the player's camera is FirstPersonCameraEntity) or SequenceCameraEntity. Every gameplay
  * camera has its own subclass (FirstPerson*, VehicleInternal*, *FollowCamera*, Flyover*, *DeathCamera*, Spectator*).
  * ASSUMPTION: the plain CameraEntity is used only by scripted sequences (re-data request, RSX pass 121). */
@@ -2732,7 +2932,7 @@ static const char* kz3_class_name(uint32_t obj)
  * [GameWorld]+0x4C (count +0x84, data +0x88, 12-byte entries, first word = the entry's handle, top = last). Only the
  * camera-event classes' start methods push the cinematic cameras (CameraManager::Push 1.14 0x331F04 | 1.00 0x325CC4 at
  * lr 0x704EC4 / 0x700A10 / 0x6F5950 | 1.00 0x6EF8F4 / 0x6EB440 / 0x6E0388), but those calls are direct calls inside the
- * lift (a function-table hook on Push never fires: run r125-m0f110b logged no push), so the start methods themselves
+ * lift (a function-table hook on Push never fires: a run logged no push), so the start methods themselves
  * are wrapped (they are virtual: CameraEventInstance::vf14 1.14 0x704C20, AnimatedCameraEventInstance 0x700D40,
  * AnimatedPlayerCameraEventInstance 0x701FC0, the PlayAnimation-type 0x6F56E4 and its two siblings 0x6F59A4 / 0x6F5AFC)
  * and a new top entry that appears while one runs is recorded. Cinematic = the top entry is a recorded handle; a recorded
@@ -2813,7 +3013,7 @@ static void kz3_cam_fov(ppu_context* ctx)
     const bool src_ok = src >= 0x10000u && src < 0xF0000000u;
     const float h = src_ok ? kz3_bef(src + 0x40) : 0.f, z = src_ok ? kz3_bef(src + 0x44) : 0.f;
     /* f31 = src[0x40] * c0 / src[0x44] (the full angle, c0 = pi/180 at r28+0); the writer halves it with c4 = r28+4
-     * (0.5) before the tan (run r103-k4p1: f31 1.39626 for hfov 80). */
+     * (0.5) before the tan (K4: f31 1.39626 for hfov 80). */
     const uint32_t tbl = (uint32_t)ctx->gpr[28];
     float c4 = tbl >= 0x10000u && tbl < 0xF0000000u ? kz3_bef(tbl + 4) : 0.5f;
     if (!(c4 > 0.1f && c4 < 1.0f)) c4 = 0.5f;

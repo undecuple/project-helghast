@@ -11,7 +11,7 @@ pad_mouse.c. The guest side (GUM context capture, tag walk, SetFocus) is port/kz
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): menu-mouse sent hook at upstream's emit (freshness now finalized earlier upstream, 6eb26c1e).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index e4a3d77..a261e85 100644

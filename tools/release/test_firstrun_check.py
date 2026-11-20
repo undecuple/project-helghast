@@ -80,6 +80,15 @@ def add_update_edat(upd):
     open(os.path.join(upd, "USRDIR", fc.UPDATE_EDAT), "wb").write(b"NPD\0" + b"\0" * 60)
 
 
+def add_update_patches(upd, sp=3, mp=3):
+    """The update's patch folders (U4), a few synthetic files each (count is a WARN below the real 90/268)."""
+    for name, n in (("patch_data_ps3_sp", sp), ("patch_data_ps3_mp", mp)):
+        d = os.path.join(upd, "USRDIR", name)
+        os.makedirs(d, exist_ok=True)
+        for i in range(n):
+            open(os.path.join(d, "%032X.pspatch" % i), "wb").write(b"x")
+
+
 def make_update(root, app_ver="01.14", elf_size=21_228_256, title_id="BCUS98234"):
     u = os.path.join(root, "hdd0", "game", title_id)
     write_sfo(os.path.join(u, "PARAM.SFO"),
@@ -87,6 +96,7 @@ def make_update(root, app_ver="01.14", elf_size=21_228_256, title_id="BCUS98234"
     os.makedirs(os.path.join(u, "USRDIR"))
     open(os.path.join(u, "USRDIR", "EBOOT.BIN"), "wb").write(fc.SELF_MAGIC + b"\0" * 60)
     add_update_edat(u)
+    add_update_patches(u)
     write_elf(os.path.join(u, "USRDIR", "EBOOT.elf"), elf_size)
     return u
 
@@ -137,6 +147,24 @@ def main():
         check("update without the data archive fails U3 naming the file", rc == 1 and "FAIL U3" in out
               and fc.UPDATE_EDAT in out and "menu screens" in out, out)
         check("update with the data archive passes U3", levels(run(["--dump", d, "--update", u] + small)[1], "U3") == {"OK"})
+
+        # U4: patch folders of the update
+        for label, mut, want in (("missing sp", lambda x: shutil.rmtree(os.path.join(x, "USRDIR", "patch_data_ps3_sp")), "patch_data_ps3_sp"),
+                                 ("missing mp", lambda x: shutil.rmtree(os.path.join(x, "USRDIR", "patch_data_ps3_mp")), "patch_data_ps3_mp"),
+                                 ("empty sp", lambda x: [os.remove(os.path.join(x, "USRDIR", "patch_data_ps3_sp", f))
+                                                         for f in os.listdir(os.path.join(x, "USRDIR", "patch_data_ps3_sp"))], "patch_data_ps3_sp")):
+            ux = make_update(os.path.join(tmp, "u4 " + label))
+            mut(ux)
+            rc, out = run(["--dump", d, "--update", ux] + small)
+            check("U4 " + label + " fails naming the folder", rc == 1 and "FAIL U4" in out and want in out
+                  and "copied or extracted incompletely" in out, out)
+            check("U4 " + label + ": the Need line names both patch folders and the copy-it-all advice",
+                  "USRDIR/patch_data_ps3_sp and USRDIR/patch_data_ps3_mp" in out.replace("\\", "/") and "copy the whole update folder" in out, out)
+        okx = run(["--dump", d, "--update", u] + small)[1]
+        check("U4 control: folders present, no FAIL", "FAIL U4" not in okx and levels(okx, "U4") == {"WARN"}, okx)
+        ufull = make_update(os.path.join(tmp, "u4 full"))
+        add_update_patches(ufull, 90, 268)
+        check("U4 full counts: OK for both folders", levels(run(["--dump", d, "--update", ufull] + small)[1], "U4") == {"OK"})
 
         rc, out = run(["--dump", d] + small)
         check("no --update warns", "WARN U0" in out, out)

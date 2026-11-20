@@ -14,7 +14,7 @@ in a chat, streaming) and answers each call from it, instead of OK with nothing 
 ASSUMPTION: the error values (0x8002B703 NOT_INITIALIZED, 0x8002B705 INVALID_ARGUMENT, 0x8002B708 NOT_ACTIVE: SDK header from
 memory, RPCS3 used as reference only) and the InitParam layout beyond the version field (nothing else is written).
 
-Rebased on ps3recomp v0.19.0 (group B, R&C 2026-11-09): on #689 (14a9e9f1, synchronous cellSysutilAvc2Load + setters).
+Rebased on ps3recomp v0.19.0: on #689 (14a9e9f1, synchronous cellSysutilAvc2Load + setters).
 Upstream's accept-all cellSysutilAvc2SetAttribute and Unload are replaced by ours (state-checked); Load (like LoadAsync) sets the loaded state and UnloadAsync clears it; upstream's other setters stay.
 Upstream's libs/network/tests/test_avc2_load.c passes.
 Pass 2: the synchronous cellSysutilAvc2Unload raises no event again, as this patch always said (RPCS3's Unload clears the
