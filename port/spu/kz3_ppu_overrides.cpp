@@ -920,6 +920,80 @@ void func_002093B0(ppu_context* ctx) { kz3_mblur_body(ctx, func_002093B0__lifted
 #endif
 #endif
 
+#if defined(PPU_OVERRIDE_002006C0) || defined(PPU_OVERRIDE_0020C010)
+/* @0x002006C0 (1.14 @0x0020C010) post-chain batch runner = slot 2 of the post item's vtable, called from the 0xEB00
+ * user-command handler with r3 = the post item (the RE notes "0x2006C0", the RE notes "Pass 163").
+ * GPU post plan P1: KZ3_GPU_POST_STEPS (hex, bit n = sequence number n,
+ * default 0) zeroes the run mask of each claimed step's batch before the lifted runner runs, restores it after, and
+ * snapshots the claimed batches' job descriptors into the per-frame plan ring (kz3_gpost_plan_get). A claimed step is
+ * simply not run: there is no GPU side yet (expected: S36 alone leaves idx0 stale). KZ3_GPU_POST_LOG=N logs the
+ * [gpost] line every Nth call and dumps the whole batch list ([gpost-list]) once on the first mismatch.
+ * With both unset the wrapper only calls the lifted runner (no guest access): the job list is the original's. */
+#include "kz3_gpost.h"
+static uint32_t kz3_gp_r32(void*, uint32_t ea) { return vm_read32(ea); }
+static void kz3_gp_w32(void*, uint32_t ea, uint32_t v) { vm_write32(ea, v); }
+static kz3_gpost_plan g_gp_plan;
+static kz3_gpost_saved g_gp_sv;
+static void kz3_gpost_body(ppu_context* ctx, void (*orig)(ppu_context*), kz3_gpost_build build, uint32_t renderer_global)
+{
+    static int s_init = 0, s_logn = 0, s_dumped = 0;
+    static uint64_t s_want = 0;
+    static uint32_t s_calls = 0;
+    if (!s_init) {
+        s_want = kz3_gpost_parse_steps(getenv("KZ3_GPU_POST_STEPS"));
+        const char* l = getenv("KZ3_GPU_POST_LOG");
+        s_logn = l ? atoi(l) : 0;
+        s_init = 1;
+        if (s_want || s_logn)
+            fprintf(stderr, "[gpost] active: steps=0x%llX log=%d build=%s (runner @0x%08X)\n", (unsigned long long)s_want, s_logn,
+                    build == KZ3_GP_BUILD_100 ? "1.00" : "1.14", build == KZ3_GP_BUILD_100 ? 0x2006C0u : 0x20C010u);
+    }
+    if (!s_want && !s_logn) { orig(ctx); return; }
+    kz3_gpost_mem m = { 0, kz3_gp_r32, kz3_gp_w32 };
+    uint32_t item = (uint32_t)ctx->gpr[3];
+    uint32_t renderer = vm_read32(renderer_global);
+    kz3_gpost_begin(&m, build, item, renderer, s_want, &g_gp_plan, &g_gp_sv);
+    orig(ctx);
+    kz3_gpost_end(&m, &g_gp_plan, &g_gp_sv);
+    uint32_t c = s_calls++;
+    int every = s_logn > 0 ? s_logn : 120;
+    /* the first 8 (kz3_gp_step_frames) frames that claimed something always log their steps (a call counter would miss them: the
+     * claimed frames start after the level loads, long after calls 0-1) */
+    static uint32_t s_claimed_frames = 0;
+    const uint32_t kz3_gp_step_frames = 8;
+    const int first_claimed = g_gp_plan.nclaimed && s_claimed_frames++ < kz3_gp_step_frames;
+    if (c < 4 || (c % (uint32_t)every) == 0 || (g_gp_plan.nclaimed && c < 16) || first_claimed) {
+        char line[320];
+        kz3_gpost_format(&g_gp_plan, line, sizeof line);
+        fprintf(stderr, "%s call=%u\n", line, c);
+        if (g_gp_plan.nclaimed) { /* P2: what the snapshot followed and what it rejected */
+            kz3_gpost_format_p2(&g_gp_plan, line, sizeof line);
+            fprintf(stderr, "%s call=%u\n", line, c);
+            if (g_gp_plan.p2.nrej || first_claimed)
+                for (uint32_t k = 0; k < g_gp_plan.p2.nstep && k < 64; k++) {
+                    char sl[360];
+                    kz3_gpost_format_p2_step(&g_gp_plan, k, sl, sizeof sl);
+                    fprintf(stderr, "%s\n", sl);
+                }
+        }
+    }
+    if (s_logn && !g_gp_plan.match && !s_dumped) {
+        s_dumped = 1;
+        for (uint32_t i = 0; i < g_gp_plan.nb; i++) {
+            char line[200];
+            kz3_gpost_format_batch(&g_gp_plan, i, line, sizeof line);
+            fprintf(stderr, "%s\n", line);
+        }
+    }
+}
+#ifdef PPU_OVERRIDE_002006C0
+void func_002006C0(ppu_context* ctx) { kz3_gpost_body(ctx, func_002006C0__lifted, KZ3_GP_BUILD_100, 0x01349D54u); }
+#endif
+#ifdef PPU_OVERRIDE_0020C010
+void func_0020C010(ppu_context* ctx) { kz3_gpost_body(ctx, func_0020C010__lifted, KZ3_GP_BUILD_114, 0x013BE454u); }
+#endif
+#endif
+
 /* Pass 32: RE pass 64's logger hooks (port/kz3/kz3_log.h). HardExit @0x0008AB70 logs the game's own fatal text
  * with its caller; the link resolver @0x000DDFF0 logs each unresolved dependent link (status 8) once per target.
  * 1.14 (switch-114): KZ3_HOOK_HARDEXIT(0008C360), KZ3_HOOK_LINK_RESOLVE(000DFF30), KZ3_HOOK_CRASHDUMP_FIELD(0008CF08). */

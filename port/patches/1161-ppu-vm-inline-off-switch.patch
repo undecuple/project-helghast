@@ -1,0 +1,25 @@
+KZ3 patch 1161: KZ3_VM_INLINE=0 switches the lifted PPU code's inline guest loads and stores off.
+
+Patch 1091's own inline loads were dead code (SPU pass 118); the inline path that runs is ps3recomp's (vm_read*_mm /
+vm_write*_mm with the ppu_mm span, on by default since upstream #574). This switch only sets vm_inline_ok and
+vm_inline_st_ok to 0 at start-up (what an armed read/store diagnostic does), so every lifted load and store takes the
+out-of-line accessor. Unset or any other value: unchanged. Purpose: a same-exe A/B of the shipped inline path
+(SPU pass 161). Not a gameplay switch.
+
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1761,10 +1761,14 @@
+             "PPU_HOTMAP", "PPU_HOTREAD", "PPU_SPINBT", 0 };
+         int d = 0;
+         for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
++        /* KZ3 patch 1161: KZ3_VM_INLINE=0 turns the lifted code's inline guest loads AND stores off (every access takes the
++         * out-of-line vm_read and vm_write functions), so one exe can A/B the inline path that ps3recomp ships on by default. */
++        { const char* ki = getenv("KZ3_VM_INLINE"); if (ki && ki[0] == '0') d = 1; }
+         vm_inline_ok = !d;
+         static const char* const svars[] = { "PPU_WVAL", "PPU_WWATCH", "PT", 0 };
+         int sd = 0;
+         for (int i = 0; svars[i]; i++) if (getenv(svars[i])) sd = 1;
++        { const char* ki = getenv("KZ3_VM_INLINE"); if (ki && ki[0] == '0') sd = 1; }
+         vm_inline_st_ok = !sd;
+     }
+ } s_vm_inline_init;

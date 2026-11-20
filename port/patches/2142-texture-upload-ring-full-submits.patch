@@ -1,5 +1,5 @@
 KZ3 patch 2142 (RSX pass 133): a texture level that does not fit in the 64 MB upload ring submits the command list first instead of being skipped.
-Design and code from the Killzone 2 port (Project Pyrrhus, its patch 6048); both projects are MIT and have the same owner.
+Design and code from the Killzone 2 port (Project Pyrrhus, its patch 6048); both projects are MIT and have the same author.
 
 Symptom (Killzone 2): the first-level sky came out green. create_texture_mipped staged each level in the per-frame
 upload ring (UPLOAD_SIZE) and, when a level did not fit in what was left, hit "break": no copy was recorded, the new D3D12

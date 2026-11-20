@@ -1,0 +1,59 @@
+KZ3 patch 2201 (RSX pass 173): Y16_X16_FLOAT channel order in live-draw (ld_float_tex_mapping) and in patch 2065's compute pass.
+Both were reversed against RPCS3 and the reversals cancelled for KZ3's only use of the format. rsx_live_draw.c:
+- ld_float_tex_mapping: sel_rg {1,0,1,0} (RPCS3's order for the non-float Y16_X16, patch 2014's ASSUMPTION) becomes
+  {0,1,0,1}: RPCS3 VKFormats.cpp get_component_mapping maps Y16_X16_FLOAT {R,G,R,G} in ARGB order, i.e. source A and G
+  read resource component 0 (first memory half = Y, big-endian high half), source R and B read component 1 (X).
+  A true guest-memory Y16_X16_FLOAT texture (decode_guest_texture_float keeps memory order, comp 0 = first half)
+  now presents R = X, G = Y; it presented R = Y, G = X before.
+- the surf-rg16 compute shader (patch 2065, the G-buffer normals target 0x16C0000 read as Y16_X16_FLOAT, remap
+  0x29E4) writes component 0 = Y = half(A<<8 | R) (the high half of the word) and component 1 = X = half(G<<8 | B),
+  as a real Y16_X16_FLOAT surface would hold them. With the new mapping the presented R = X, G = Y for the G-buffer
+  case, byte for byte the result of the old pair: the light-pass normals are unchanged. Changing only one of the
+  two would swap X and Y in the lighting.
+Host test tools/smoke/test_y16x16f.sh (combined mapping on a known G-buffer pixel, a true guest texture, negative
+controls for each half of the change). Not run in the game (no GPU run in this round).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 40c760ec..863687fa 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -4912,13 +4912,17 @@ static ID3D12Resource* decode_guest_texture_float(const rsx_dsp_texture* t, u32
+  * (ARGB order: comp 0 = A, 1 = R, 2 = G, 3 = B; op 0 = zero, 1 = one,
+  * 2 = source). Source channel sel (A,R,G,B) -> D3D component:
+  * W16Z16Y16X16 A=W(3) R=X(0) G=Y(1) B=Z(2); Y16_X16 has two halves and reads
+- * A=Y G=Y, R=X B=X (ASSUMPTION: the RSX's two-channel fill, as RPCS3 maps
+- * Y16_X16[_FLOAT]; KZ3's binds use remap 0x29E4 = (X, Y, 0, 1) and never
+- * select B or A from the source). */
++ * Patch 2201: Y16_X16_FLOAT is {R,G,R,G} in RPCS3's ARGB-ordered component
++ * map (VKFormats.cpp get_component_mapping): source A and G read resource
++ * component 0 (the FIRST memory half = Y, big-endian high half), source R and
++ * B read component 1 (X). So R = X and G = Y. (Until patch 2201 this table was
++ * {1,0,1,0}, RPCS3's order for the non-float Y16_X16, and ld_surface_rg16
++ * wrote component 0 = X; the two reversals cancelled for KZ3's only use.)
++ * KZ3's binds use remap 0x29E4 = (X, Y, 0, 1) and never select B or A. */
+ static u32 ld_float_tex_mapping(u32 base_fmt, u32 remap)
+ {
+     static const u32 sel_rgba[4] = { 3, 0, 1, 2 };
+-    static const u32 sel_rg[4]   = { 1, 0, 1, 0 };
++    static const u32 sel_rg[4]   = { 0, 1, 0, 1 };   /* patch 2201, see above */
+     static const u32 out2comp[4] = { 1, 2, 3, 0 };
+     const u32* sel2d3d = base_fmt == RSX_TEX_FMT_Y16X16_FLOAT ? sel_rg : sel_rgba;
+     u32 mapping = 1u << 12;
+@@ -7793,7 +7797,7 @@ static int zdepth_window(u32 i, u32 w, u32 h)
+  * bound the surface's RGBA8 UNORM view, so the lights read two byte values in [0,1] as the normal. The word is
+  * A<<24 | R<<16 | G<<8 | B (A8R8G8B8 in guest memory, big-endian) and Y16_X16 keeps Y in the high half, so
+  * X = half(G<<8 | B), Y = half(A<<8 | R). A compute pass (the depth-snapshot root signature) writes them to an
+- * R16G16_FLOAT copy, refreshed when the surface's colour_gen changes, whose SRV maps the remap as the float
++ * R16G16_FLOAT copy (component 0 = Y, 1 = X, memory order, patch 2201), refreshed when the surface's colour_gen changes, whose SRV maps the remap as the float
+  * texture path does (ld_float_tex_mapping). Exact for any filter. LD_SURF_RG16=0 = old behaviour (RGBA8 view).
+  * ASSUMPTION: only draws and clears change a surface (colour_gen); a blit into it is not seen. */
+ static int ld_surf_rg16_on(void)
+@@ -7817,7 +7821,7 @@ static int ld_surf_rg16_pso(void)
+         "void main(uint3 id : SV_DispatchThreadID) {\n"
+         "    if (id.x < width && id.y < height) {\n"
+         "        uint4 b = (uint4)round(saturate(surface_bytes.Load(int3(id.xy, 0))) * 255.0);\n"
+-        "        halves[id.xy] = float2(f16tof32((b.y << 8) | b.z), f16tof32((b.w << 8) | b.x));\n"
++        "        halves[id.xy] = float2(f16tof32((b.w << 8) | b.x), f16tof32((b.y << 8) | b.z));\n"
+         "    }\n"
+         "}\n";
+     ID3DBlob* shader = NULL; ID3DBlob* errors = NULL;

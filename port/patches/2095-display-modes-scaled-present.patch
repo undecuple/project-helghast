@@ -1,5 +1,5 @@
 
-Rebased on ps3recomp v0.19.0 (Toro, group C): one conflict in cellPad.c: pad_kb_down_win. Upstream v0.19 reads keys through pad_key_down() (GetAsyncKeyState on the XInput build). The patch's Alt+Enter exclusion (an Enter press with Alt held is not a pad press) is kept and both reads use pad_key_down: pad_key_down(0x12) for Alt (VK_MENU), pad_key_down(vk) for the key. The rest of the patch (pad_kb_sibling_path, rsx_null_backend.c, display-mode files) applied without change. (The original file embeds a raw diff -ruN copy of the change before the git diff; dropped here because git apply would take it as a second patch.)
+Rebased on ps3recomp v0.19.0: one conflict in cellPad.c: pad_kb_down_win. Upstream v0.19 reads keys through pad_key_down() (GetAsyncKeyState on the XInput build). The patch's Alt+Enter exclusion (an Enter press with Alt held is not a pad press) is kept and both reads use pad_key_down: pad_key_down(0x12) for Alt (VK_MENU), pad_key_down(vk) for the key. The rest of the patch (pad_kb_sibling_path, rsx_null_backend.c, display-mode files) applied without change. (The original file embeds a raw diff -ruN copy of the change before the git diff; dropped here because git apply would take it as a second patch.)
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index ea9c1c5b..e4a3d77a 100644

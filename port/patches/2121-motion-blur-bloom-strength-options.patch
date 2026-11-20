@@ -167,7 +167,7 @@ diff -ruN a/libs/video/rsx_display_mode.h b/libs/video/rsx_display_mode.h
 -    out = (char*)malloc(n + nr + nm + nf + nd + nl + nlm + nlf + nt + nlt + 128 + 1);
 +    out = (char*)malloc(n + nr + nm + nb + nf + nd + nl + nlm + nlb + nlf + nt + nlt + 128 + 1);
      if (!out) return NULL;
-     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend (run r103-dpage3):
+     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend:
       * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead.
 @@ -589,8 +665,9 @@
          memcpy(out + o, in, at_row); o += at_row;

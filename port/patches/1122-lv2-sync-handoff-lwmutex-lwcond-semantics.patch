@@ -26,7 +26,7 @@ with; also runs the toolkit's tests/sync_stress suite). Notes the RE notes Pass 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (lv2 core) over #577 in ppu_sysprx.cpp and over upstream's sys_mutex/sys_cond (#474 MUTEX_WATCH=1 idea already in 1122; upstream MUTEX_WATCH=2 and its destroy EBUSY are covered/lost: ours refuses destroy too). Upstream's HLE fast path (9a3fbffd, `ps3_hle_register_fast`) kept, `sys_lwmutex_lock_fast` rewritten on the lv2 core (trylock under the slot lock; held or queued = full handler). `ppu_thread_note_block` (PS3_PRIO_START, opt-in) not called from the lv2 core waits.
 
-Rebased on ps3recomp v0.19.0 (group B, R&C 2026-11-09): ours (lv2 core) over upstream #621 (5d3494a9) and #684 (aca2b25c),
+Rebased on ps3recomp v0.19.0: ours (lv2 core) over upstream #621 (5d3494a9) and #684 (aca2b25c),
 which patched the CRITICAL_SECTION/semaphore code this replaces. Their semantics, checked against the core: contended
 sys_lwmutex_trylock is CELL_EBUSY 0x8001000A (#684; lv2s_trylock_locked), a non-recursive owner's trylock is EDEADLK for
 sys_mutex and sys_lwmutex (#621; lv2s_trylock_locked), sys_lwmutex_t +0x08 = protocol | recursive (#621), the sys_mutex name

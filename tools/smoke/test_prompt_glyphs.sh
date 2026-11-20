@@ -10,10 +10,10 @@ H="$PT/libs/video/rsx_prompt_glyphs.h"
 if [[ ! -f "$H" ]]; then echo "[test_prompt_glyphs] SKIP: no patched toolkit ($H; run tools/ps3recomp-patched.sh)"; exit 0; fi
 O="$ROOT/build/smoke-host/prompt_glyphs"; mkdir -p "$O"
 CC="${CC:-cc}"
-W="-std=c11 -Wall -Wextra -Werror -Wno-unused-function -O2 -I$PT/libs/video"
-$CC $W "$ROOT/tools/smoke/test_prompt_glyphs.c" -o "$O/test_prompt_glyphs" -lm
+W=(-std=c11 -Wall -Wextra -Werror -Wno-unused-function -O2 -I"$PT/libs/video")
+$CC "${W[@]}" "$ROOT/tools/smoke/test_prompt_glyphs.c" -o "$O/test_prompt_glyphs" -lm
 "$O/test_prompt_glyphs" | grep -v "^\[PASS\]"
 if echo "int main(void){return 0;}" | $CC -fsanitize=address,undefined -x c - -o "$O/probe" 2>/dev/null && "$O/probe"; then
-  $CC $W -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$ROOT/tools/smoke/test_prompt_glyphs.c" -o "$O/test_asan" -lm
+  $CC "${W[@]}" -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$ROOT/tools/smoke/test_prompt_glyphs.c" -o "$O/test_asan" -lm
   "$O/test_asan" >/dev/null && echo "[PASS] ASan/UBSan pass" || { echo "[FAIL] ASan/UBSan pass"; exit 1; }
 fi

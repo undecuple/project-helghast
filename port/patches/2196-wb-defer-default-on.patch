@@ -1,0 +1,63 @@
+KZ3 patch 2196 (rsx round, 2026-11-18): LD_WB_DEFER (patch 2185) is now default ON; LD_WB_DEFER=0 restores the synchronous
+write-back. Measured (3 strict A/B pairs): fps_window 18.73 -> 20.60, frames over 50 ms about 320 -> 205
+per run; the one bad run was a pair of whole-process pauses that also occur with the switch off.
+New rsx_wbd_env_on() (unset or anything but a leading '0' = on), used by ld_wbd_mode; the SPU read-hook install in cellGcmSys.c
+uses the same rule. The "ignored" notes (LD_WRITEBACK_BATCH=0, FIFO capture) only print when the switch was set explicitly.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -5911,7 +5911,7 @@
+         if (e && atoi(e) > 0 && spu_set_guest_read_hook) spu_set_guest_read_hook(gcm_spu_read_ea); }
+     {   const char* e = getenv("LD_WB_READ");   /* patch 2184 */
+         const char* d = getenv("LD_WB_DEFER");   /* patch 2185: the GET feed also counts reads of a pending deferred store */
+-        if (((e && atoi(e) > 0) || (d && d[0] && d[0] != '0')) && spu_set_guest_read_hook2) spu_set_guest_read_hook2(gcm_spu_read_ea2); }
++        if (((e && atoi(e) > 0) || !(d && d[0] == '0')) && spu_set_guest_read_hook2) spu_set_guest_read_hook2(gcm_spu_read_ea2); }   /* 2196: unset = on */
+     if (spu_set_guest_write_hook) spu_set_guest_write_hook(gcm_spu_note_pages_ea);   /* 2033; tag 2081 */
+     if (fs_set_guest_write_hook) fs_set_guest_write_hook(gcm_fs_note_pages_ea);   /* patch 2078; tag 2081 */
+ }
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -18787,15 +18787,15 @@
+ {
+     if (g_wbd_mode < 0) {
+         const char* e = getenv("LD_WB_DEFER");
+-        int m = (e && e[0] && e[0] != '0') ? 1 : 0;
++        int m = rsx_wbd_env_on(e) ? 1 : 0;   /* patch 2196: unset = ON, LD_WB_DEFER=0 = off */
+         if (m) { const char* v = getenv("LD_WB_DEFER_VERIFY"); if (v && v[0] && v[0] != '0') m = 2; }
+-        if (m && !ld_wb_batch_enabled()) { fprintf(stderr, "[wb-defer] LD_WB_DEFER ignored: LD_WRITEBACK_BATCH=0\n"); m = 0; }
+-        if (m && g_rsx_fcap_on) { fprintf(stderr, "[wb-defer] LD_WB_DEFER ignored: FIFO capture reads the guest bytes at the store point\n"); m = 0; }
++        if (m && !ld_wb_batch_enabled()) { if (e) fprintf(stderr, "[wb-defer] LD_WB_DEFER ignored: LD_WRITEBACK_BATCH=0\n"); m = 0; }
++        if (m && g_rsx_fcap_on) { if (e) fprintf(stderr, "[wb-defer] LD_WB_DEFER ignored: FIFO capture reads the guest bytes at the store point\n"); m = 0; }
+         const char* n = getenv("LD_WB_READ_N"); if (n && atoi(n) > 0) g_wbd_period = (u32)atoi(n);
+         const char* l = getenv("LD_WB_DEFER_LABEL"); if (l && l[0]) g_wbd_label = (u32)strtoul(l, NULL, 0);
+         rsx_wbd_init(&g_wbd);
+         g_wbd_mode = m;
+-        if (m) fprintf(stderr, "[wb-defer] ON%s, deferring label 0x%X; DIAGNOSTIC (default off)\n", m == 2 ? " + VERIFY" : "", g_wbd_label);
++        if (m) fprintf(stderr, "[wb-defer] ON%s, deferring label 0x%X; default on, LD_WB_DEFER=0 turns it off\n", m == 2 ? " + VERIFY" : "", g_wbd_label);
+     }
+     return g_wbd_mode;
+ }
+diff --git a/libs/video/rsx_wb_defer.h b/libs/video/rsx_wb_defer.h
+--- a/libs/video/rsx_wb_defer.h
++++ b/libs/video/rsx_wb_defer.h
+@@ -1,4 +1,4 @@
+-/* KZ3 patch 2185 (RSX pass 163): the pending-store queue of the deferred guest write-back (LD_WB_DEFER=1, default off).
++/* KZ3 patch 2185 (RSX pass 163): the pending-store queue of the deferred guest write-back (LD_WB_DEFER: default ON since patch 2196, =0 = off).
+  *
+  * Today the walker waits for the GPU at each store point (the idx0 scene copy, the 0x4A release's main surfaces) and
+  * converts the readback buffer into guest memory at once. Deferred, the copy goes into a readback slot and is submitted
+@@ -55,6 +55,12 @@
+ static inline void rsx_wbd_init(rsx_wbd* d) { memset(d, 0, sizeof *d); }
+ 
+ /* ---- readback slots ---- */
++/* Patch 2196: the LD_WB_DEFER switch. Unset = ON, "0" = OFF, anything else = ON. Host test: tools/smoke/test_wb_defer.sh. */
++static inline int rsx_wbd_env_on(const char* v)
++{
++    return !(v && v[0] == '0');
++}
++
+ static inline uint32_t rsx_wbd_free_slots(const rsx_wbd* d)
+ {
+     uint32_t f = 0;

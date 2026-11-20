@@ -1,0 +1,288 @@
+KZ3 patch 2171 (RSX pass 155): capture gaps for the Level 1 replay harness (tools/smoke/test_log_replay.c); renderer step 0.
+Applies on top of 2164-2166. Everything is under LD_FIFO_CAPTURE (off = unchanged call stream: one load + predicted branch per hook).
+- Gap 1: renderer-side guest writes. WORD tag 11 = a report value ld_rb_drain wrote into guest memory (ea = main-memory IO offset + 8);
+  RANGE kind RSX_FC_WR_RENDERER (3) = a surface write-back stored by ld_writeback_surface / ld_rb_store (digest only).
+- Gap 2: SPU_NOTE async field 2 = PPU store note (gcm_ppu_note_pages_ea), async 0 = the walker's own NV0039 note.
+- Gap 3: WORD tags 12 (ring JUMP written by a recycle / segment-next), 13 (command-context word), 14 (put) at the walker's recycle
+  and gcm_fifo_next_segment / the title-ring recycle.
+- Gap 6: rsx_fc_range_check() in rsx_fifo_capture.h, the reader-side digest-vs-bytes check.
+- RD_RENDERER RANGE records carry in their reserved word 1 = read while sink_end ran (g_rsx_fcap_in_draw), 0 = read outside a draw end.
+- rsx_fc_hook: the writer's observer (NULL in the game), the lock-step replay driver's hook.
+Format stays version 1 (new tag/kind values, a formerly zero reserved word).
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 3a5d0bd1..87a5f7c7 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -22,11 +22,13 @@
+ #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+ /* Patch 2164 flags, read by the hooks (one load + predicted branch when off). g_rsx_sh_on: LD_SYNC_HIST=1.
+  * g_rsx_fcap_cfg: LD_FIFO_CAPTURE set and valid (flips are counted); g_rsx_fcap_on: a capture window is open. */
+-volatile int g_rsx_sh_on, g_rsx_fcap_cfg, g_rsx_fcap_on;
++volatile int g_rsx_sh_on, g_rsx_fcap_cfg, g_rsx_fcap_on, g_rsx_fcap_in_draw;   /* in_draw: patch 2171 */
+ _Static_assert(RSX_SH_FLIP == 4 && RSX_SH_REL4097 == 3, "rsx_live_draw.c / rsx_commands.c pass RSX_SH_FLIP / RSX_SH_REL4097 as literals");
+ static void gcm_fcap_pass_begin(u32 put);
+ static void gcm_fcap_cmd(u32 getoff, u32 w_raw, int is_method);
+ static void gcm_fcap_nop_run(u32 getoff, u32 words);
++/* patch 2171: walker-side / ring-callback guest writes as WORD write records (tag 12 ring JUMP, 13 context word, 14 put). */
++#define GCM_FC_WR(tag, ea, val) do { if (g_rsx_fcap_on) rsx_fcap_word(1, (tag), (ea), (val)); } while (0)
+ static void gcm_fcap_pass_end(const char* why, u32 getoff, u32 calloff);
+ static void gcm_fcap_nv3089(int phase);
+ static void gcm_fcap_copy_geom(u32 kind, u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g, u32 h, u32 i, u32 j, u32 k);
+@@ -1784,6 +1786,7 @@ static void nv0039_copy(u32 notify)
+         rsx_live_draw_set_write_source(3u);   /* patch 2081 diagnostic tag: NV0039 */
+         marked = rsx_live_draw_note_guest_write(dl ? 0u : 1u, (u32)(lo_out - (s64)dst) + s_nv0039.off_out,
+                                                 (u32)(hi_out - lo_out));
++        if (g_rsx_fcap_on) rsx_fcap_spu_note(dl ? 0u : 1u, (u32)(lo_out - (s64)dst) + s_nv0039.off_out, (u32)(hi_out - lo_out), 0);   /* patch 2171 */
+         rsx_live_draw_set_write_source(0u);
+     }
+     if (rsx_live_draw_enabled())   /* patch 2017 diagnostic, LD_GUEST_WRITE_DBG=1 */
+@@ -2810,7 +2813,7 @@ void rsx_fcap_range(int kind, int space, u32 addr, const void* p, u32 len, int w
+ {
+     if (!g_rsx_fcap_on) return;
+     AcquireSRWLockExclusive(&s_fc_lock);
+-    if (s_fc_state == 1) rsx_fc_w_range(&s_fc, (u32)kind, (u32)space, addr, p, len, with_bytes);
++    if (s_fc_state == 1) { s_fc.range_tag = (kind == RSX_FC_RD_RENDERER && g_rsx_fcap_in_draw) ? 1u : 0u; rsx_fc_w_range(&s_fc, (u32)kind, (u32)space, addr, p, len, with_bytes); s_fc.range_tag = 0; }
+     ReleaseSRWLockExclusive(&s_fc_lock);
+ }
+ void rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value)
+@@ -4550,6 +4553,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
+                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
+                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
++                GCM_FC_WR(12, jmp_at, 0x20000000u | io_begin); GCM_FC_WR(13, ctx + 0x8, begin);   /* patch 2171 */
++                GCM_FC_WR(14, GCM_CONTROL_GUEST_ADDR + 0, io_begin);
+                 s_fifo_getoff = io_begin;                          /* get */
+                 put = io_begin;
+                 /* Count it as the walker taking the JUMP to begin. The title's
+@@ -4617,9 +4622,11 @@ static void gcm_fifo_next_segment(u32 ctx)
+     const u32 io_cur = gcm_ea2io(cur), io_next = gcm_ea2io(next);
+     if (io_cur == 0xFFFFFFFFu || io_next == 0xFFFFFFFFu || cur > end) return;
+     vm_write32(cur, 0x20000000u | io_next);              /* JUMP -> next segment */
++    GCM_FC_WR(12, cur, 0x20000000u | io_next);           /* patch 2171 */
+     /* The JUMP has to be in memory before `put` lets the walker reach it. */
+     atomic_thread_fence(memory_order_release);
+     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_cur);      /* put: up to the JUMP */
++    GCM_FC_WR(14, GCM_CONTROL_GUEST_ADDR + 0, io_cur);   /* patch 2171 */
+     if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);          /* start the walker now */
+     /* The walker is a whole lap behind only if it is still inside the next
+      * segment. Bounded on no progress, like the recycle wait below. */
+@@ -4639,6 +4646,7 @@ static void gcm_fifo_next_segment(u32 ctx)
+     vm_write32(ctx + 0x0, next);
+     vm_write32(ctx + 0x8, next);
+     vm_write32(ctx + 0x4, next + s_seg_size - 4);
++    GCM_FC_WR(13, ctx + 0x0, next); GCM_FC_WR(13, ctx + 0x8, next); GCM_FC_WR(13, ctx + 0x4, next + s_seg_size - 4);   /* patch 2171 */
+ }
+ 
+ /* Room for `bytes` more at the context's write head. On the segmented ring a
+@@ -4681,12 +4689,14 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+     const u32 back_jumps0 = s_fifo_back_jumps;
+     if (io_begin != 0xFFFFFFFFu) {
+         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
++        GCM_FC_WR(12, current, 0x20000000u | io_begin);         /* patch 2171 */
+         /* The jump has to be in guest memory before `put` moves behind the
+          * walker's `get`. Program order is not enough on arm64: the walker
+          * may observe the new `put`, find `get` != `put`, and read the old
+          * word at `current` before the jump lands there. */
+         atomic_thread_fence(memory_order_release);
+         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
++        GCM_FC_WR(14, GCM_CONTROL_GUEST_ADDR + 0, io_begin);     /* patch 2171 */
+     }
+ 
+     /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
+@@ -4722,6 +4732,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+     }
+ 
+     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
++    GCM_FC_WR(13, ctx_ea + 0x8, begin);                 /* patch 2171 */
+     s_fifo_recycle_waiting = 0;                          /* current no longer reads end */
+ 
+     if (s_recdbg)
+@@ -5505,6 +5516,7 @@ u32 cellGcmResolveOffset(u32 offset)
+ /* KZ3 patch 2033: the walker's own stores through effective addresses (NV3089 blits, NV308A inline writes):
+  * page-level note only (the per-frame hash already saw such writes at the next frame; this keeps the
+  * quiet-texture hashing from skipping them). */
++static PPU_THREAD_LOCAL int s_fc_ppu_kind;   /* patch 2171: 2 while a PPU store note resolves its pages, else 0 */
+ static void gcm_note_pages_ea(u32 ea, u32 size)
+ {
+     if (!size || !rsx_live_draw_enabled()) return;
+@@ -5519,10 +5531,12 @@ static void gcm_note_pages_ea(u32 ea, u32 size)
+         const u32 e = (u32)a;
+         if (e >= s_config.localAddress && e - s_config.localAddress < s_config.localSize) {
+             rsx_live_draw_note_guest_write_pages(0u, e - s_config.localAddress, n);
++            if (s_fc_ppu_kind && g_rsx_fcap_on) rsx_fcap_spu_note(0u, e - s_config.localAddress, n, 2);   /* patch 2171 */
+         } else {
+             const u16 io_page = s_io_address_table[e >> 20];
+             if (io_page != 0xFFFF)
+-                rsx_live_draw_note_guest_write_pages(1u, ((u32)io_page << 20) | (e & 0xFFFFFu), n);
++            {   rsx_live_draw_note_guest_write_pages(1u, ((u32)io_page << 20) | (e & 0xFFFFFu), n);
++                if (s_fc_ppu_kind && g_rsx_fcap_on) rsx_fcap_spu_note(1u, ((u32)io_page << 20) | (e & 0xFFFFFu), n, 2); }   /* patch 2171 */
+         }
+         a = next;
+     }
+@@ -5592,8 +5606,11 @@ static void gcm_ppu_note_pages_ea(uint32_t ea, uint32_t size)
+     if (off < s_config.localSize) {
+         if (size > s_config.localSize - off) size = s_config.localSize - off;
+         rsx_live_draw_note_guest_write_pages(0u, off, size);
++        if (g_rsx_fcap_on) rsx_fcap_spu_note(0u, off, size, 2);   /* patch 2171: PPU store note */
+     } else {
++        s_fc_ppu_kind = 2;
+         gcm_note_pages_ea(ea, size);   /* patch 2083: IO-mapped main memory (location 1) */
++        s_fc_ppu_kind = 0;
+     }
+     if (s_ppu_note_tag) rsx_live_draw_set_write_source(0u);
+ }
+diff --git a/libs/video/rsx_fifo_capture.h b/libs/video/rsx_fifo_capture.h
+index fb3e6947..2f7b3fa6 100644
+--- a/libs/video/rsx_fifo_capture.h
++++ b/libs/video/rsx_fifo_capture.h
+@@ -27,21 +27,31 @@
+  *                        after park/patch resolution; a retry of the same getoff (blocked acquire, park re-read) is
+  *                        dropped when its header word is unchanged.  n = 0 for control words (JUMP/CALL/RET/flip word).
+  *   RSX_FC_PASS_END (5)  u32 getoff, calloff; char why[16] (NUL padded: caught-up, flip, park-wait, ...).
+- *   RSX_FC_RANGE (6)     u32 kind, space, addr, len, flags, reserved; u64 fnv1a(bytes); bytes if flags & HAS_BYTES.
++ *   RSX_FC_RANGE (6)     u32 kind, space, addr, len, flags, tag; u64 fnv1a(bytes); bytes if flags & HAS_BYTES.
++ *                        tag (patch 2171; was reserved 0): RD_RENDERER 1 = read inside sink_end (the draw's own end processing), 0 = read
++ *                        outside a draw end (flush, submit, flip, write-back): the replay attributes it to the last draw end before it.
+  *                        kind RD_RENDERER = a read through guest_ptr (item b; space/addr = location/offset, len =
+  *                        min_bytes: ASSUMPTION the renderer reads at most that), RD_WALKER / WR_WALKER = the walker's own
+- *                        NV0039/NV3089 source read and destination result (item c; space EA).  Bytes are written the
++ *                        NV0039/NV3089 source read and destination result (item c; space EA), WR_RENDERER (patch 2171) = a
++ *                        write-back the renderer stored into guest memory (space 1 local / 2 main, addr = offset, digest only).
++ *                        Bytes are written the
+  *                        first time a (space, addr, len) is seen and again whenever its digest differs from the last
+  *                        recorded one; otherwise only the digest is recorded.
+  *   RSX_FC_WORD (7)      u32 dir (0 read, 1 write), tag, ea, value.  A guest word the walker read or wrote outside the
+  *                        renderer (labels, get, ref, report words, ring recycle writes, acquire compares: item c).
++ *                        Tags (writes unless noted): 1 get at a park, 2 get at a 0x6C, 3 label, 4 get at pass end, 5 GET_REPORT
++ *                        word (words 0 and 1 are a timestamp: a replay ignores their value), 6 ref, 8 acquire compare (read),
++ *                        9 0x1D70/0x1D74 write, 10 report notify (timestamp words), patch 2171: 11 report value written by the
++ *                        renderer's query drain (ea = main-memory IO OFFSET + 8, not an EA), 12 ring JUMP written by a recycle /
++ *                        segment-next, 13 command-context word (ctx+0 begin, +4 end, +8 current), 14 put written by a recycle.
+  *   RSX_FC_COPY (8)      u32 kind (0 NV0039, 1 NV3089), src_ea, dst_ea, line_len, line_count, pitch_in, pitch_out,
+  *                        format, wb, aux0 (src dma), aux1 (dst dma), aux2 (0).  The geometry of a walker copy; its source
+  *                        bytes and result are the RANGE records around it.  kind 1 (NV3089) continues with 15 more words:
+  *                        in_off, in_fmt, in_sz, in_uv, out_pt, out_sz, clip_pt, clip_sz, dst_offset, dst_dma, dst colour
+  *                        format, ds_dx, dt_dy, fmt, op (line_len/line_count = out_w/out_h).
+  *   RSX_FC_FLIP (9)      u32 buffer, source (0 sink_flip, 1 FEAD word, 2 E920/E924), frame (flips seen so far).
+- *   RSX_FC_SPU_NOTE (10) u32 location, offset, size, async (1 = any-thread SPU DMA note, 0 = walker-side note), thread.
++ *   RSX_FC_SPU_NOTE (10) u32 location, offset, size, async (1 = any-thread SPU DMA note, 0 = walker-side NV0039 note,
++ *                        2 = PPU store note, patch 2171), thread.
+  *   RSX_FC_DRAIN (11)    u32 tail, head, overflow.  ld_gv_drain ran (item d); the notes between two drains were
+  *                        consumed by it.
+  *   RSX_FC_FRAME (12)    u32 frame, begin (1) or end (0).
+@@ -64,7 +74,7 @@ enum {
+     RSX_FC_COPY, RSX_FC_FLIP, RSX_FC_SPU_NOTE, RSX_FC_DRAIN, RSX_FC_FRAME, RSX_FC_END
+ };
+ enum { RSX_FC_EA = 0, RSX_FC_LOCAL = 1, RSX_FC_MAIN = 2 };                /* address spaces of a RANGE */
+-enum { RSX_FC_RD_RENDERER = 0, RSX_FC_RD_WALKER = 1, RSX_FC_WR_WALKER = 2 };
++enum { RSX_FC_RD_RENDERER = 0, RSX_FC_RD_WALKER = 1, RSX_FC_WR_WALKER = 2, RSX_FC_WR_RENDERER = 3 };
+ enum { RSX_FC_F_NULLPTR = 1, RSX_FC_F_BYTES = 2 };
+ enum { RSX_FC_RANGE_HEAD = 32 };
+ 
+@@ -106,6 +116,7 @@ typedef struct rsx_fc_writer {
+     int err;                             /* sticky: a failed write; close reports it */
+     rsx_fc_slot* dedupe;                 /* RSX_FC_DEDUPE_CAP slots, open addressing, 8 probes */
+     uint64_t n_range, n_range_bytes;     /* statistics */
++    uint32_t range_tag;                  /* patch 2171: stored in the next RANGE record's reserved word (RD_RENDERER: 1 = read while sink_end ran) */
+ } rsx_fc_writer;
+ 
+ static inline int rsx_fc_w_open(rsx_fc_writer* w, const char* path, uint32_t frame_start, uint32_t frame_count)
+@@ -124,6 +135,11 @@ static inline int rsx_fc_w_open(rsx_fc_writer* w, const char* path, uint32_t fra
+     return 0;
+ }
+ 
++/* Patch 2171: an observer the replay harness (tools/smoke/test_log_replay.c) sets; called after every record the writer
++ * wrote, while the caller still holds its lock (so it may write through the same writer, never take that lock). NULL in the
++ * game: the cost is one load and a predicted branch per capture record, and only under LD_FIFO_CAPTURE. */
++static void (*rsx_fc_hook)(uint32_t type, const void* head, uint32_t hlen, uint32_t tlen);
++
+ /* One record whose payload is head[hlen] followed by tail[tlen] (either may be empty). */
+ static inline int rsx_fc_w_rec2(rsx_fc_writer* w, uint32_t type, const void* head, uint32_t hlen, const void* tail, uint32_t tlen)
+ {
+@@ -139,6 +155,7 @@ static inline int rsx_fc_w_rec2(rsx_fc_writer* w, uint32_t type, const void* hea
+     if (hlen && fwrite(head, 1, hlen, w->f) != hlen) w->err = 1;
+     if (tlen && fwrite(tail, 1, tlen, w->f) != tlen) w->err = 1;
+     w->seq++; w->payload_bytes += len;
++    if (rsx_fc_hook) rsx_fc_hook(type, head, hlen, tlen);   /* patch 2171: replay harness observer, NULL = off */
+     return w->err ? -1 : 0;
+ }
+ static inline int rsx_fc_w_rec(rsx_fc_writer* w, uint32_t type, const void* payload, uint32_t len)
+@@ -182,7 +199,7 @@ static inline int rsx_fc_w_range(rsx_fc_writer* w, uint32_t kind, uint32_t space
+         }
+     }
+     rsx_fc_put32(head, kind); rsx_fc_put32(head + 4, space); rsx_fc_put32(head + 8, addr); rsx_fc_put32(head + 12, len);
+-    rsx_fc_put32(head + 16, flags); rsx_fc_put64(head + 24, fnv);
++    rsx_fc_put32(head + 16, flags); rsx_fc_put32(head + 20, w->range_tag); rsx_fc_put64(head + 24, fnv);
+     w->n_range++;
+     if (bytes) w->n_range_bytes += len;
+     rsx_fc_w_rec2(w, RSX_FC_RANGE, head, sizeof head, bytes ? ptr : NULL, bytes ? len : 0);
+@@ -259,6 +276,17 @@ static inline int rsx_fc_r_next(rsx_fc_reader* r, rsx_fc_rec* rec)
+     r->payload_bytes += len;
+     return 1;
+ }
++/* Patch 2171 (gap 6): a RANGE record whose digest does not match its own bytes was taken while the guest wrote them (the
++ * capture runs beside the guest). Returns 0 = consistent or no bytes to check, 1 = digest/bytes mismatch, 2 = malformed
++ * (payload shorter than head + len). rec must be an RSX_FC_RANGE record. */
++static inline int rsx_fc_range_check(const rsx_fc_rec* rec)
++{
++    if (rec->type != RSX_FC_RANGE || rec->len < RSX_FC_RANGE_HEAD) return 2;
++    const uint32_t len = rsx_fc_get32(rec->p + 12), fl = rsx_fc_get32(rec->p + 16);
++    if (!(fl & RSX_FC_F_BYTES)) return 0;
++    if (rec->len != RSX_FC_RANGE_HEAD + len) return 2;
++    return rsx_fc_fnv(RSX_FC_FNV_SEED, rec->p + RSX_FC_RANGE_HEAD, len) == rsx_fc_get64(rec->p + 24) ? 0 : 1;
++}
+ static inline void rsx_fc_r_close(rsx_fc_reader* r) { if (r->f) fclose(r->f); free(r->buf); memset(r, 0, sizeof *r); }
+ 
+ #endif
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index cf8c6976..d3ef4301 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -14065,6 +14065,7 @@ static void ld_rb_drain(void)
+             if (p) {
+                 p[8] = (u8)(v >> 24); p[9] = (u8)(v >> 16); p[10] = (u8)(v >> 8); p[11] = (u8)v;
+                 g_rb.n_written++; if (!v) g_rb.n_zero++;
++                if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_word(1, 11, g_rb.e[k].off + 8u, v);   /* patch 2171: renderer report write, ea = main-memory IO offset */
+             }
+         }
+         g_rb.tail++;
+@@ -15973,8 +15974,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     const LONGLONG begin = ld_profile_qpc();
+ #endif
+     LDW_T0(draw_t0);
++    if (__builtin_expect(g_rsx_fcap_on, 0)) g_rsx_fcap_in_draw = 1;   /* patch 2171 */
+     if (rsx_perf_draw_on() && draw_t0) ld_pd_draw(r, user, sink_end_impl);   /* patch 2135 */
+     else sink_end_impl(user, r);
++    if (__builtin_expect(g_rsx_fcap_in_draw, 0)) g_rsx_fcap_in_draw = 0;
+     LDW_ADD(RSX_PERF_W_DRAW_T, draw_t0);
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.sink_end_qpc += (u64)(ld_profile_qpc() - begin);
+@@ -18137,6 +18140,7 @@ static int ld_writeback_surface(u32 i, u32 for_off, u32 for_size)
+             }
+         }
+         ok = 1;
++        if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_range(3 /* RSX_FC_WR_RENDERER */, location == 0 ? 1 : 2, sf->offset, gm, (u32)(s1 - s0), 0);   /* patch 2171 */
+         g.surfaces[i].gv_gpu_dirty = 0;
+         ld_pwd_note_writeback(i);   /* patch 2084 */
+         if (ld_gv_enabled()) ld_gv_baseline(&g.surfaces[i]);   /* guest bytes == host now */
+@@ -18242,6 +18246,7 @@ static int ld_rb_store(u32 i, u32 k, u32 for_off, u32 for_size)
+     }
+     D3D12_RANGE wr = {0, 0};
+     g_ld_rb[k]->lpVtbl->Unmap(g_ld_rb[k], 0, &wr);
++    if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_range(3 /* RSX_FC_WR_RENDERER */, sf->location == 0 ? 1 : 2, sf->offset, gm, gp * (sf->h - 1u) + sf->w * (sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u), 0);   /* patch 2171 */
+     g.surfaces[i].gv_gpu_dirty = 0;
+     ld_pwd_note_writeback(i);   /* patch 2084 */
+     if (ld_gv_enabled()) ld_gv_baseline(&g.surfaces[i]);   /* guest bytes == host now */
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 6e162752..a6b1a6b2 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -307,6 +307,7 @@ void      rsx_sync_hist_draw(void);
+ /* patch 2164: LD_FIFO_CAPTURE=dir hooks (rsx_fifo_capture.h). cfg = configured (flip counting), on = a capture window
+  * is open (every other hook). Spaces of a range: 1 = RSX local (location 0), 2 = main through IO (location 1). */
+ extern volatile int g_rsx_fcap_cfg, g_rsx_fcap_on;
++extern volatile int g_rsx_fcap_in_draw;   /* patch 2171: 1 while sink_end runs (RD_RENDERER ranges record it in their reserved word) */
+ int       rsx_fcap_configured(void);
+ void      rsx_fcap_range(int kind, int space, u32 addr, const void* p, u32 len, int with_bytes);
+ void      rsx_fcap_word(int dir, u32 tag, u32 ea, u32 value);

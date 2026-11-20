@@ -1,6 +1,6 @@
 Rebased on ps3recomp v0.18.0 (SPU pass 108): remap on upstream #570's held-button decrement.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (the v0.19.0 chain files where available; originals for the rest, three-way merged where they did not apply).
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index e18987c..4141af8 100644

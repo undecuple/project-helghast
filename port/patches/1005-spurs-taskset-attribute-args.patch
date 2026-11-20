@@ -4,7 +4,7 @@ Rebased on ps3recomp v0.15.0 (SPU pass 81): rebased onto upstream taskset size c
 Spu pass 82: the round-81 rebase put the side table before cellSpursCreateTaskset's closing brace (tsattr_remember and
 the functions after it became nested: "invalid storage class for function"); the brace is back.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 index a094c4e..5624ebc 100644

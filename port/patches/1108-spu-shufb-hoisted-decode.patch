@@ -10,7 +10,7 @@ writes it emits SPU_SHUFB1_DEC(n) at entry and spu_shufb1_h(a, spu__sdN, c) at t
 for 0x80..0xBF and for every normal selector, 0xFF for 0xC0..0xDF, 0x80 for 0xE0..0xFF); a use is
 pshufb(a, idx) | sp, 2 ops. All lifted images: 1,386 of 17,324 shufb1 in 154 functions. Bit-identical to
 spu_shufb(a, a, c): host tests tools/spu/test_spu_shufh.sh (all 256 control bytes in every lane position, random
-vectors, plus the lifter pass on synthetic functions) and, with game data, work/spu/r79/hb.sh (job 255's lifted loop,
+vectors, plus the lifter pass on synthetic functions) and, with game data, a local script (job 255's lifted loop,
 same hashes; host 144.5 -> 129.5 ns per loop iteration). Compile-time switch: -DSPU_SHUFB_HOIST=0 (C flags) = old
 (the lifted source still names spu_shufb1_h, which then is spu_shufb1). Upstream candidate (with 1082).
 

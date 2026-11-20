@@ -1,9 +1,8 @@
 """KZ3-specific knowledge for tools/runprov.py (run provenance) and run comparisons (comparability): the log
 signatures, env prefixes, cache and fixture paths of a kz3.exe run under tools/proton-test.sh. The two tools stay
-game-agnostic and read everything title-specific from PROFILE (the design brief in docs/notes-to-review/diag-tool.md
-asks for exactly this split: core / profile).
+game-agnostic and read everything title-specific from PROFILE (the split is core / profile).
 
-Every entry below was read off the repo or an existing run dir (2026-10-11); the comments say where.
+Every entry below was read off the repo or an existing run dir; the comments say where.
 """
 import re
 import os

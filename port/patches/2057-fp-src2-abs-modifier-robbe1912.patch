@@ -3,7 +3,7 @@ Third-source abs modifier of the fragment decompiler (opt-in LD_SRC2_ABS=1), plu
 decode_src(w3, 0, &s2) ignored DWORD3 bit 18 (SRC2.abs in RPCS3's FP decoder, the same position as SRC1.abs in DWORD2). With the switch on the third source of MAD/LRP-type ops decodes to abs(...). The switch changes shader text, so it is part of the PSO key (tag 0x5A2A, only when on).
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): context only (upstream v0.18.0 changed lines around the hunks; same change).
-Rebased on ps3recomp v0.19.0 (Toro, group C): upstream added per-source input precision modifiers in rsx_fp_decompiler.c (Src.prec, fp_src_prec_clamp, FP_SRCn_PREC_SHIFT, set from DWORD2 after decode_src). The patch's SRC2 abs switch (FP_SRC2_ABS, LD_SRC2_ABS, counter) is kept; its decode_src(w3, abs, &s2) call now precedes upstream's precision block so decode_src's prec reset does not clear s2.prec. Upstream's decode_src(w3, 0, &s2) is replaced by the patch's call (same with the switch off). Abs is applied before the precision clamp in upstream's emit path, as in RPCS3.
+Rebased on ps3recomp v0.19.0: upstream added per-source input precision modifiers in rsx_fp_decompiler.c (Src.prec, fp_src_prec_clamp, FP_SRCn_PREC_SHIFT, set from DWORD2 after decode_src). The patch's SRC2 abs switch (FP_SRC2_ABS, LD_SRC2_ABS, counter) is kept; its decode_src(w3, abs, &s2) call now precedes upstream's precision block so decode_src's prec reset does not clear s2.prec. Upstream's decode_src(w3, 0, &s2) is replaced by the patch's call (same with the switch off). Abs is applied before the precision clamp in upstream's emit path, as in RPCS3.
 
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
 index 6dab2155..ddeb199a 100644

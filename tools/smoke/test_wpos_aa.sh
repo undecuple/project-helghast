@@ -61,11 +61,11 @@ int main(void)
 }
 EOC
 CC="${CC:-cc}"
-W="-std=c11 -Wall -Wno-unused-function -Wno-format-truncation -I$O -I$V -I$PT/include"
-$CC $W -O2 "$O/t.c" "$V/rsx_fp_decompiler.c" -o "$O/t" -lm
+W=(-std=c11 -Wall -Wno-unused-function -Wno-format-truncation -I"$O" -I"$V" -I"$PT/include")
+$CC "${W[@]}" -O2 "$O/t.c" "$V/rsx_fp_decompiler.c" -o "$O/t" -lm
 "$O/t" 2>/dev/null
 if echo "int main(void){return 0;}" | $CC -fsanitize=address,undefined -x c - -o "$O/probe" 2>/dev/null && "$O/probe"; then
-  $CC $W -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$O/t.c" "$V/rsx_fp_decompiler.c" -o "$O/t_asan" -lm
+  $CC "${W[@]}" -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$O/t.c" "$V/rsx_fp_decompiler.c" -o "$O/t_asan" -lm
   "$O/t_asan" >/dev/null 2>&1 && echo "[PASS] ASan/UBSan pass" || { echo "[FAIL] ASan/UBSan pass"; exit 1; }
 fi
 echo "[test_wpos_aa] PASS"

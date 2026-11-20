@@ -1,0 +1,146 @@
+KZ3 patch 2183 (RSX pass 161): LD_CEIL=<list>, measurement-only ceiling probes for the frame-rate buckets (default off,
+never shipped on, the picture may be wrong). New libs/video/rsx_ceil.h (pure parser + once-read mask, host test
+tools/smoke/test_ceil.sh). Tokens: vtx = rsx_vertex_fetch_many returns 1 without converting (plan, refs, remap and the
+ring copy still run); texhash = ld_tex_hash_due always "not due" (no per-frame texture hash, so no redecode either);
+wb = both guest write-backs off (as LD_NV0039_WRITEBACK=0 LD_MAIN_SURFACE_WRITEBACK=0); rb = only the readback wait gone
+(as LD_WB_UNSAFE_NOWAIT=1: the copies are submitted, the stores read the buffers early). wb and rb are shorthands of
+switches that already exist, so one variable names every ceiling of a run. Log line [ceil] once at the first use.
+
+diff --git a/libs/video/rsx_ceil.h b/libs/video/rsx_ceil.h
+new file mode 100644
+index 00000000..7696677a
+--- /dev/null
++++ b/libs/video/rsx_ceil.h
+@@ -0,0 +1,64 @@
++/* KZ3 patch 2183 (RSX pass 161): LD_CEIL=<list>, measurement-only ceiling switches for the frame-rate buckets.
++ * DIAGNOSTIC: the picture may be wrong; never set in a shipped run. Default off (unset/empty = 0).
++ *   vtx     rsx_vertex_fetch_many returns success without converting (the plan, refs, remap and ring copy still run;
++ *           the reserved ring bytes keep whatever they held). Removes the CPU attribute conversion only.
++ *   texhash ld_tex_hash_due always answers "not due": no per-frame content hash of a bound texture, so nothing is
++ *           re-decoded either (changed textures stay stale). New entries still hash and decode once.
++ *   wb      both guest write-backs off (the same as LD_NV0039_WRITEBACK=0 LD_MAIN_SURFACE_WRITEBACK=0): readback
++ *           copy, wait and store gone, and with them the redecode of the copied bytes.
++ *   rb      only the readback WAIT is gone (the same as LD_WB_UNSAFE_NOWAIT=1): the copies are submitted, the stores
++ *           read the buffers early and so write stale bytes; the CPU store cost stays.
++ * Unknown tokens are reported once and ignored. Pure parser, host test tools/smoke/test_ceil.sh. */
++#ifndef RSX_CEIL_H
++#define RSX_CEIL_H
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#define RSX_CEIL_VTX     1u
++#define RSX_CEIL_TEXHASH 2u
++#define RSX_CEIL_WB      4u
++#define RSX_CEIL_RB      8u
++#define RSX_PATCH_2183 1
++#ifndef RSX_CEIL_QUIET_LOG
++#define RSX_CEIL_QUIET_LOG 0   /* a second translation unit defines 1 so the line prints once */
++#endif
++
++/* Mask for a comma/space separated list; *bad = number of unknown tokens (may be NULL). */
++static inline unsigned rsx_ceil_parse(const char* s, unsigned* bad)
++{
++    static const struct { const char* n; unsigned bit; } tab[] = {
++        { "vtx", RSX_CEIL_VTX }, { "texhash", RSX_CEIL_TEXHASH }, { "wb", RSX_CEIL_WB }, { "rb", RSX_CEIL_RB } };
++    unsigned m = 0, nb = 0;
++    while (s && *s) {
++        while (*s == ',' || *s == ' ') s++;
++        const char* e = s;
++        while (*e && *e != ',' && *e != ' ') e++;
++        if (e > s) {
++            unsigned found = 0;
++            for (unsigned i = 0; i < sizeof tab / sizeof tab[0]; i++)
++                if (strlen(tab[i].n) == (size_t)(e - s) && !strncmp(s, tab[i].n, (size_t)(e - s))) { m |= tab[i].bit; found = 1; }
++            if (!found) nb++;
++        }
++        s = e;
++    }
++    if (bad) *bad = nb;
++    return m;
++}
++
++/* The process mask, read once from LD_CEIL (logged once). */
++static inline unsigned rsx_ceil_mask(void)
++{
++    static int have;
++    static unsigned mask;
++    if (!have) {
++        const char* e = getenv("LD_CEIL");
++        unsigned bad = 0;
++        mask = (e && e[0]) ? rsx_ceil_parse(e, &bad) : 0u;
++        if (e && e[0] && !RSX_CEIL_QUIET_LOG)
++            fprintf(stderr, "[ceil] LD_CEIL=%s -> mask 0x%X (%u unknown token(s)); DIAGNOSTIC, picture and timings are not shipping behaviour\n",
++                    e, mask, bad);
++        have = 1;
++    }
++    return mask;
++}
++#endif
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 195ccbb4..56297926 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -116,6 +116,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ #include "rsx_vtx_gpu.h"   /* KZ3 patch 2076 */
+ #include "rsx_upload_ring.h"   /* KZ3 patch 2142: a texture level that does not fit submits the list first */
+ #include "rsx_front_probe.h"   /* KZ3 patch 2172: LD_FRONT_PROBE */
++#include "rsx_ceil.h"   /* KZ3 patch 2183: LD_CEIL ceiling probes (diagnostic) */
+ extern rsx_fp* g_rsx_fp;      /* cellGcmSys.c */
+ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context */
+ #include "rsx_vp_decompiler.h"
+@@ -4053,6 +4054,7 @@ extern int cellGcm_ppu_note_io_span(u32 io, u32 size) __attribute__((weak));   /
+ static int ld_tex_hash_due(u32 location, u32 offset, u32 span, u32 last_hash_frame, u32 quiet, u32* written,
+                            u32* skip_frame, u32* dyn, u32* hash_seq)
+ {
++    if (rsx_ceil_mask() & RSX_CEIL_TEXHASH) return 0;   /* patch 2183 LD_CEIL=texhash: no per-frame hash, no redecode (diagnostic) */
+     const u32 now = (u32)g_ld_ws_seq;
+     g_ld_tc_last_seq = *hash_seq;
+     const int due = ld_tex_hash_due_body(location, offset, span, last_hash_frame, quiet, written, skip_frame, dyn);
+@@ -18468,7 +18470,7 @@ static u32 ld_writeback_batch(const u32* idx_in, u32 n, u32 for_off, u32 for_siz
+              * real run): LD_WB_UNSAFE_NOWAIT=1 submits the copies without waiting
+              * for them, so the stores read the readback buffers early. */
+             static int unsafe = -1;
+-            if (unsafe < 0) { const char* e = getenv("LD_WB_UNSAFE_NOWAIT"); unsafe = e && atoi(e) ? 1 : 0; }
++            if (unsafe < 0) { const char* e = getenv("LD_WB_UNSAFE_NOWAIT"); unsafe = e && atoi(e) ? 1 : 0; if (rsx_ceil_mask() & RSX_CEIL_RB) unsafe = 1; }   /* 2183 */
+             if (unsafe) { g_ld_unsubmitted = 1; ld_submit_nowait(); }
+             else ld_flush(LD_FLUSH_READBACK);
+             g_ld_wb.waits++;
+@@ -18892,7 +18894,7 @@ static ID3D12Resource* ld_gamma_present(u32 i)
+ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+ {
+     static int en = -1;
+-    if (en < 0) { const char* e = getenv("LD_NV0039_WRITEBACK"); en = e ? atoi(e) : 1; }
++    if (en < 0) { const char* e = getenv("LD_NV0039_WRITEBACK"); en = e ? atoi(e) : 1; if (rsx_ceil_mask() & RSX_CEIL_WB) en = 0; }   /* 2183 */
+     if (!en || !g.ready || !size) return 0;
+     const u64 r0 = offset, r1 = r0 + size;
+     u32 done = 0, idx[MAX_SURFACES], n = 0;   /* patch 2120: sized for the whole table, never drops */
+@@ -18938,7 +18940,7 @@ u32 rsx_live_draw_before_guest_sync(void)
+ static u32 ld_before_guest_sync_impl(void)
+ {
+     static int en = -1;
+-    if (en < 0) { const char* e = getenv("LD_MAIN_SURFACE_WRITEBACK"); en = e ? atoi(e) : 1; }
++    if (en < 0) { const char* e = getenv("LD_MAIN_SURFACE_WRITEBACK"); en = e ? atoi(e) : 1; if (rsx_ceil_mask() & RSX_CEIL_WB) en = 0; }   /* 2183 */
+     if (!en || !g.ready) return 0;
+     u32 idx[MAX_SURFACES], n = 0;   /* patch 2120: sized for the whole table, never drops */
+     for (u32 i = 0; i < g.n_surfaces && i < MAX_SURFACES; i++)
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index aedd3af2..4fe3017c 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -1,6 +1,8 @@
+ #include "rsx_vertex_compact.h"
+ #include "rsx_commands.h"
+ #include "rsx_vertex_formats.h"
++#define RSX_CEIL_QUIET_LOG 1
++#include "rsx_ceil.h"   /* patch 2183 */
+ 
+ #include <limits.h>
+ #include <stdio.h>
+@@ -568,6 +570,7 @@ int rsx_vertex_fetch_many(
+ {
+     if (!plan || (!refs && count) || (!out && plan->layout.stride && count))
+         return 0;
++    if (rsx_ceil_mask() & RSX_CEIL_VTX) return 1;   /* patch 2183 LD_CEIL=vtx: conversion skipped, `out` untouched (diagnostic) */
+     const u32 stride = plan->layout.stride;
+     const int cmp32_batch = rsx_vtx_switch(&rsx_vtx_cmp32_batch, "LD_VTX_CMP32");   /* patch 2073 */
+     const int f16_fast = rsx_vtx_switch(&rsx_vtx_f16_fast, "LD_VTX_F16");   /* patch 2074 */

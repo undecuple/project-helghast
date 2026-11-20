@@ -305,7 +305,7 @@ def test_firstrun(tmp, payload_dir):
     text = open(tf).read() if os.path.isfile(tf) else ""
     check("x86_64-w64-mingw32-" in text and "clang" in text and "LLVM_MINGW_ROOT" in text and '"-static"' in text,
           "cmake/llvm-mingw.cmake: prefixed clang, LLVM_MINGW_ROOT, -static")
-    # Stage 0 (2026-10-12): llvm-mingw defaults to Windows 7 headers; the runtime needs 0x602+ declarations.
+    # Stage 0: llvm-mingw defaults to Windows 7 headers; the runtime needs 0x602+ declarations.
     check("_WIN32_WINNT=0x0A00" in text, "cmake/llvm-mingw.cmake: Windows 10 API level (_WIN32_WINNT)")
     real = json.load(open(os.path.join(HERE, "toolchain.json")))
     llvm = next((c for c in real["components"] if c["name"] == "llvm-mingw"), {})

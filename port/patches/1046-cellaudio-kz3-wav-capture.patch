@@ -1,6 +1,6 @@
 KZ3 patch 1046 (SPU pass 34): KZ3_AUDIO_WAV=<file> writes the final cellAudio mix as a float32 WAV with a [audio-wav] start line (sample 0's host time) and samples-vs-elapsed drift lines; checker tools/spu/audio_check.py.
 
-Rebased on ps3recomp v0.19.0 (shared v0.19 group C): upstream moved the raw AUDIO_WAV dump into audio_dump_mix(); the KZ3_AUDIO_WAV block follows that call, unchanged.
+Rebased on ps3recomp v0.19.0: upstream moved the raw AUDIO_WAV dump into audio_dump_mix(); the KZ3_AUDIO_WAV block follows that call, unchanged.
 
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
 index f231ea26..3dd967c6 100644

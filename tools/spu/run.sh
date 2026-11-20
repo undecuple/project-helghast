@@ -60,6 +60,6 @@ if [[ -f "$L" ]]; then python3 tools/kz3_metrics.py "$L" --alive 1 2>&1 | grep -
 # A crash or a non-zero game exit is a result (exit 0 here); proton-test's 2 (refused before the run: a path switch the
 # sandbox cannot use), 4 (the run could not write a requested output), and 5 (a required scripted play failed)
 # are not, so they stop ab-runs.sh, level-run.sh
-# and any chain at the first such run (2026-10-15: a sweep repeated an unwritable template export for eight chapters).
+# and any chain at the first such run (a sweep repeated an unwritable template export for eight chapters).
 if [[ $RC == 2 || $RC == 4 || $RC == 5 ]]; then tail -4 "work/spu/run-$NAME.log" >&2; exit $RC; fi
 exit 0

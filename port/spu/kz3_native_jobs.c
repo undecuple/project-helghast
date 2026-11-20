@@ -27,7 +27,7 @@ const struct kz3_native_job kz3_native_jobs[] = {
     {0, 0, 0},
 };
 
-/* ---- per-function native gates (SPU pass 122, D88-; KZ2's gate design, credited in kz3_native_jobs.h) ----
+/* ---- per-function native gates (SPU pass 122; KZ2's gate design, credited in kz3_native_jobs.h) ----
  * The lifted functions listed in re/spu/native_gates.tsv start with
  *   if (g_kz3_native_gate[slot] && g_kz3_native_gate[slot](ctx)) SPU_RET(ctx);
  * g_kz3_native_gate is defined here, once. A slot is filled when its entry is on (a switch =1, or no switch set and the entry default-on: the Gfx.LightProbes

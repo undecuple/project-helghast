@@ -3,7 +3,7 @@
 # with the job count capped by available memory. Run inside the sandbox:
 #   nix develop .#win --command tools/sandbox.sh -- tools/build-kz3.sh build/kz3-win [extra cmake --build args]
 # Why: a cc1plus on an old 600k-line lifted PPU chunk peaked at 6.7 GB; -j8/-j20 builds next to Proton and RPCS3 ran
-# the 31 GB machine out of memory three times on 2026-10-08 (the kernel killed VS Code). Jobs = (MemAvailable - 8 GB) /
+# the 31 GB machine out of memory three times (the kernel killed VS Code). Jobs = (MemAvailable - 8 GB) /
 # 1.5 GB / slots in use, 1..8 with the 64-chunk lift (patch 3005, 2026-10-11); (MemAvailable - 8 GB) / 4.5 GB, 1..4
 # with an 8-chunk one. Holds a build slot: work/locks/build.lock (slot 0) or build.N.lock (main checkout's work/locks;
 # other worktrees see it writable through the sandbox).
@@ -11,6 +11,12 @@ set -euo pipefail
 DIR="${1:?usage: build-kz3.sh BUILD_DIR [cmake --build args]}"; shift
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/tools/pyresolve.sh"   # PY: python3, else py -3, else python (never the Microsoft Store alias)
+# Disk preflight (a build needs this much room; below it the disk can fill mid-build). KZ3_MIN_FREE_GB=0 skips.
+MINGB="${KZ3_MIN_FREE_GB:-35}"
+if [[ "$MINGB" != 0 ]]; then
+  FREEGB="$(df -Pk . 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"   # the disk the build writes to; unknown (Git Bash): no check
+  [[ -z "$FREEGB" ]] || (( FREEGB >= MINGB )) || { echo "build-kz3: the build disk has only $FREEGB GB free (need $MINGB, KZ3_MIN_FREE_GB; 0 skips). Free space first: tools/trim-runs.py (old runs/builds) or move old runs, caches and decomp output to another drive." >&2; exit 4; }
+fi
 LOCKS="${KZ3_MAIN:-$ROOT}/work/locks"; mkdir -p "$LOCKS"
 # Refuse to build from a patched toolkit older than the patch set (run tools/ps3recomp-patched.sh, or kz3-check.sh,
 # first). KZ3_ALLOW_STALE_PATCHES=1 overrides, for builds that are meant to test an older set.
@@ -23,11 +29,11 @@ if [[ -d "$ROOT/work/ps3recomp-patched" && "${KZ3_ALLOW_STALE_PATCHES:-0}" != 1 
 fi
 # The lifted PPU code must match the override list: a host override (port/spu/kz3_ppu_overrides.cpp) is compiled only
 # when the lift announced PPU_OVERRIDE_<addr>, so a newer ppu_overrides.txt without a relift builds fine with the new
-# hooks silently left out (2026-10-11, SPU pass 32's logger hooks). Refuse; relifting takes minutes (tools/lift.sh).
+# hooks silently left out (SPU pass 32's logger hooks). Refuse; relifting takes minutes (tools/lift.sh).
 # Content, not time (RSX pass 34, 2026-10-11: every rebase that touched ppu_overrides.txt refused a current lift by mtime):
 # the addresses in the list must equal the PPU_OVERRIDE_<addr> announcements of the lift this build compiles
 # (ppu_overrides.h since patch 3005, ppu_recomp.h before). No announcement file = no lift yet: the build says so itself.
-# A build dir not configured yet has no CMakeCache.txt: say so and check the default lift (2026-10-12: the sed's
+# A build dir not configured yet has no CMakeCache.txt: say so and check the default lift (the sed's
 # exit 2 on the missing file ended this script silently under set -e, e.g. a remote build's guards in a fresh
 # checkout; the remote build configures on the server).
 # Which PPU and SPU lift this build dir compiles: its CMakeCache (RECOMP_DIR, KZ3_SPU_DIR) when configured, else the
@@ -64,7 +70,7 @@ if [[ -f "$recomp_l/ppu_recomp.h" && -f "$spu_l/eboot_ver" && "$(tr -d '[:space:
        "or point the build dir at the matching pair" >&2
   exit 3
 fi
-# Regenerate the SPU registration TU when its generator changed since it was written (2026-10-11: SPU pass 30's generator
+# Regenerate the SPU registration TU when its generator changed since it was written (SPU pass 30's generator
 # added kz3_spu_image_names, main's work/spu/gen was older, and kz3.exe failed to link after the merge). Content, not
 # time: the generator stamps its own sha256 in gen/.generator-sha256 (a rebase only touches the mtime); a gen dir
 # without the stamp (written before 2026-10-21) falls back to the mtime test.
@@ -95,7 +101,7 @@ if [[ -f "$ann" && "${KZ3_ALLOW_STALE_LIFT:-0}" != 1 ]]; then
 fi
 # KZ3_BUILD_GUARDS_ONLY=1: run only the guards above and stop (used by a developer's remote build wrapper).
 [[ "${KZ3_BUILD_GUARDS_ONLY:-0}" == 1 ]] && exit 0
-# Build slots (2026-10-11): KZ3_BUILD_SLOTS builds may run at once, one slot each (slot 0 = build.lock, slot 1 =
+# Build slots: KZ3_BUILD_SLOTS builds may run at once, one slot each (slot 0 = build.lock, slot 1 =
 # build.1.lock; tools/agents/slotlock.sh); this build's job count is the free-memory formula below divided by the
 # slots in use (this one included). The default stays 1 on this machine: a compiler on a lifted chunk peaks at
 # 5.3 GB now (sampled 2026-10-11 over the day's builds; 4.5 GB on main's v1.00 chunks), so two builds at -j2 would
@@ -105,15 +111,15 @@ fi
 source "$ROOT/tools/agents/slotlock.sh"
 SLOTS="${KZ3_BUILD_SLOTS:-1}"; [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] || SLOTS=1
 # A parent that already holds a build slot (tools/agents/lock.sh build -- ..., which exports KZ3_HOLDS_build=1 like the
-# ninja shim reads) keeps it for this build: taking another slot here waited on the parent's own lock forever
-# (2026-10-15: two maintainer chains wrapped this script in lock.sh build and sat 90 minutes at flock).
+# ninja shim reads) keeps it for this build: taking another slot here waits on the parent's own lock forever
+# (the build lock is taken twice: a deadlock at flock).
 [[ "${KZ3_HOLDS_build:-0}" == 1 ]] || slot_take "$LOCKS" build "$SLOTS"
 in_use=$(slot_held "$LOCKS" build "$SLOTS"); (( in_use < 1 )) && in_use=1
-# Third OOM (2026-10-08 14:55): -j7 sized from memory free at start (7 cc1plus = ~21.5 GB) plus a Proton run and the
+# Third OOM: -j7 sized from memory free at start (7 cc1plus = ~21.5 GB) plus a Proton run and the
 # desktop grew past 31 GB and the kernel killed VS Code (oom_score_adj 300) before the compilers (200). So: keep an
 # 8 GB reserve, size the jobs by a per-job estimate, cap them, and make this build the kernel's first OOM victim (1000),
 # so a runaway build fails instead of the editor.
-# Per-job estimate (2026-10-11, patch 3005: 64 lifted chunks of 51-73k lines instead of 8 of 600k): a chunk's cc1plus
+# Per-job estimate (patch 3005: 64 lifted chunks of 51-73k lines instead of 8 of 600k): a chunk's cc1plus
 # peaks at 0.66-1.33 GB (RelWithDebInfo, 55 of 64 chunks measured), the largest SPU image at 1.31 GB, an old 600k-line
 # chunk at 6.7 GB (378 s); so 1.5 GB per job, cap 8 (KZ3_BUILD_JOBS_MAX overrides the cap; KZ3_BUILD_JOB_MB the
 # estimate). An 8-chunk lift (no ppu_recomp_table.cpp) keeps 4.5 GB / 4.
@@ -125,7 +131,7 @@ else   # macOS build hosts (docs/BUILDING.md): no /proc; take 60 % of physical m
 fi
 job_mb="${KZ3_BUILD_JOB_MB:-1536}"; jobs_max="${KZ3_BUILD_JOBS_MAX:-8}"
 # The lift this build compiles is the build dir's RECOMP_DIR (a worktree can point it at its own lift, e.g. a separate SPU lift:
-# work/spu/ppu-recomp), not always work/recomp: an old 8-chunk lift there once ran 8 x 3.5 GB jobs (2026-10-11).
+# work/spu/ppu-recomp), not always work/recomp: an old 8-chunk lift there once ran 8 x 3.5 GB jobs.
 recomp="$recomp_l"   # read above (an unconfigured dir: the lift of KZ3_EBOOT_VER)
 if [[ -f "$recomp/ppu_recomp.h" && ! -f "$recomp/ppu_recomp_table.cpp" && -z "${KZ3_BUILD_JOB_MB:-}" ]]; then
   job_mb=4608; jobs_max=4
@@ -138,7 +144,7 @@ if [[ -r "$LOCKS/build-cap" ]] && read -r cap_until cap_jobs < "$LOCKS/build-cap
 fi
 avail_gb=$(( avail_mb / 1024 ))
 echo "build-kz3: $DIR with -j$jobs (${avail_gb} GB available; build slot ${SLOT:-held by the caller}, $in_use of $SLOTS in use)" >&2
-# A build dir that does not exist yet is configured here, for the lifts resolved above (2026-10-21: build-kz3.sh stopped at
+# A build dir that does not exist yet is configured here, for the lifts resolved above (build-kz3.sh stopped at
 # "cmake --build" on a new dir; the 1.14 dir had to be configured by hand with the right -DRECOMP_DIR/-DKZ3_SPU_DIR). The
 # arguments are the documented ones (the testing notes, "KZ3 exe"); other options are cached by cmake.
 if [[ ! -f "$DIR/CMakeCache.txt" ]]; then
@@ -150,7 +156,7 @@ if [[ ! -f "$DIR/CMakeCache.txt" ]]; then
         -DRECOMP_DIR="$recomp_l" -DKZ3_SPU_DIR="$spu_l" >/dev/null || exit 4
   cat "$ROOT/work/ps3recomp-patched/.kz3-patchset" > "$DIR/.kz3-toolkit-stamp" 2>/dev/null || true
 fi
-# ccache (in the .#win shell since 2026-10-09): a re-lift or a branch switch regenerates the 2.5-4.4 GB-per-job lifted After the new-dir configure (2026-11-02: before it, the launcher cmake call ran on a missing dir and set -e ended the script).
+# ccache (in the .#win shell): a re-lift or a branch switch regenerates the 2.5-4.4 GB-per-job lifted After the new-dir configure (before it, the launcher cmake call ran on a missing dir and set -e ended the script).
 # chunks with mostly the same content; ccache serves those from work/ccache instead of recompiling. CCACHE_BASEDIR
 # makes hits independent of the checkout path. KZ3_CCACHE=0 turns it off.
 if command -v ccache >/dev/null && [[ "${KZ3_CCACHE:-1}" != 0 ]]; then
@@ -160,7 +166,7 @@ if command -v ccache >/dev/null && [[ "${KZ3_CCACHE:-1}" != 0 ]]; then
 elif grep -q '^CMAKE_CXX_COMPILER_LAUNCHER:.*=ccache' "$DIR/CMakeCache.txt" 2>/dev/null; then
   cmake -UCMAKE_C_COMPILER_LAUNCHER -UCMAKE_CXX_COMPILER_LAUNCHER "$DIR" >/dev/null   # no ccache here: plain compiler
 fi
-# Re-configure when the patched toolkit changed (queue 9m, SPU pass 46; KZ2's build-kz2.sh does the same): ps3recomp
+# Re-configure when the patched toolkit changed: ps3recomp
 # collects its sources with file(GLOB_RECURSE) without CONFIGURE_DEPENDS, so a patch that adds a source file is never
 # linked from an old cache. The stamp is tools/ps3recomp-patched.sh's .kz3-patchset.
 if [[ -f "$DIR/CMakeCache.txt" ]]; then

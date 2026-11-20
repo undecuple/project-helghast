@@ -10,7 +10,7 @@ link (found by the Ratchet & Clank port, 2026-11-02). Spu pass 138.
   module with stand-ins, gets stand-ins for the striped lock-line API (spu_ll_mask, spu_ll_lock_mask, spu_ll_unlock_mask,
   patch 1056) next to the existing spu_lockline_lock/unlock one.
 
-Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): context only (patch 1112's timespec_compat include
+Rebased on ps3recomp v0.19.0: context only (patch 1112's timespec_compat include
 next to the g_kz3_run_ctx_hook definition in spu_workload.c is gone; v0.19 includes mingw_timespec_get.h further down).
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c

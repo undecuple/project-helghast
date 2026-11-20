@@ -64,6 +64,7 @@ EBOOT_ELF_SIZES = {                    # decrypted EBOOTs the lift fixups were m
     21_228_256: "1.14",
 }
 UPDATE_APP_VER = "01.14"               # ASSUMPTION: the update's PARAM.SFO APP_VER; not read yet (needs disc_info.py on it)
+UPDATE_PATCH_DIRS = {"patch_data_ps3_sp": 90, "patch_data_ps3_mp": 268}   # folder -> .pspatch files in the 1.14 update (the RE notes 8.2)
 UPDATE_EDAT = "added_data_ps3.psarc.edat"   # the update's data archive (the RE notes 8.4), 7,168,019 bytes
 MIN_PSARC_BYTES = 8 << 30              # data_ps3.psarc is 9.6 GB on disc; smaller = truncated dump
 PSARC_MAGIC = b"PSAR"
@@ -472,6 +473,32 @@ def check_update(r, upd, disc_id=None):
         r.fail("U3", f"1.14 update: no USRDIR/{UPDATE_EDAT}. It is the update's data archive (the 1.14 menu screens, the "
                      "multiplayer map scripts and files that override the disc's). The installer's update page asks for the same "
                      "file. Use the complete installed update")
+    check_update_patches(r, upd)
+
+
+def check_update_patches(r, upd):
+    """U4: USRDIR/patch_data_ps3_sp and _mp hold the .pspatch files the game's overlay layers over the disc data
+    (port/kz3/psarc_vfs.cpp stats both folders; without them the log says "added yes, patches no" and the menu stays black).
+    The 1.14 update has 90 (sp) and 268 (mp), all <32 hex>.pspatch. Missing or no .pspatch: FAIL; fewer than expected: WARN."""
+    usr = os.path.join(upd, "USRDIR")
+    bad = []
+    for name, expect in UPDATE_PATCH_DIRS.items():
+        d = os.path.join(usr, name)
+        if not os.path.isdir(d):
+            bad.append(f"the folder USRDIR/{name} is missing")
+            continue
+        n = sum(1 for f in os.listdir(d) if f.lower().endswith(".pspatch") and os.path.isfile(os.path.join(d, f)))
+        if n == 0:
+            bad.append(f"the folder USRDIR/{name} is empty (no .pspatch files)")
+        elif n < expect:
+            r.warn("U4", f"1.14 update: USRDIR/{name} holds {n} patch files, the complete update has {expect}; "
+                         "the update may have been copied incompletely")
+        else:
+            r.ok("U4", f"update patch folder {name} has {n} patch files")
+    if bad:
+        r.fail("U4", "1.14 update: " + "; ".join(bad) + ". The update was copied or extracted incompletely, and the game "
+                     "would start with a black screen. Copy the whole update folder again (every folder inside USRDIR) "
+                     "or reinstall the update")
 
 
 def check_eboot_elf(r, elf, target="1.14", update=None):
@@ -874,7 +901,8 @@ def eboot_found(path):
 DISC_NEED = ("It must be the folder that holds PS3_GAME (with PS3_GAME{s}PARAM.SFO, PS3_GAME{s}USRDIR{s}EBOOT.BIN and "
              "PS3_GAME{s}USRDIR{s}data_ps3.psarc), the PS3_GAME folder itself, or a decrypted .iso file picked as a file")
 UPDATE_NEED = ("It must be the installed 1.14 update folder (dev_hdd0{s}game{s}<title id>), holding PARAM.SFO, "
-               "USRDIR{s}EBOOT.BIN and USRDIR{s}" + UPDATE_EDAT)
+               "USRDIR{s}EBOOT.BIN, USRDIR{s}" + UPDATE_EDAT + " and the two folders USRDIR{s}patch_data_ps3_sp and "
+               "USRDIR{s}patch_data_ps3_mp with their .pspatch files (copy the whole update folder, every folder inside USRDIR)")
 EBOOT_NEED = "It must be EBOOT.elf, the decrypted 1.14 EBOOT of your own copy (see " + GETTING_FILES + ")"
 
 

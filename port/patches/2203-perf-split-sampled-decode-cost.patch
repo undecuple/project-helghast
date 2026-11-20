@@ -1,0 +1,208 @@
+KZ3 patch 2203 (rsx night P0): the perf split no longer adds phantom time to the decode bucket (diagnostic, default off).
+With RSX_PERF_SPLIT=1 RSX_O0=1 every method word paid a QPC push/pop pair in ld_dispatch_timed, two lock xadd O0 counters
+and a per-command meth_t0 QPC pair (about 5-7 ms per flip). Now: (1) decode_d is timed on 1 word in 32 and its self time
+scaled by 32 (taken from the bucket that owned the clock, so the buckets still add up to the walk; the credit goes to decode_d at once, the debit is applied at the pass end, clamped to what
+the bucket accumulated (rest owed to later passes), so no per-flip bucket prints negative); the sampler phase persists across
+walk passes (a per-pass phase never sampled a pass of 31 words or fewer); (2) the O0 m3d and
+m3d_legacy counters are pass-local plain adds flushed at the pass end; (3) the meth_t0 pair is skipped while the split is
+active. New line [perf-split-cost] (words, commands, timed words per flip). Everything is behind g_rsx_split_act and
+g_rsx_o0.on: with the switches off the walker runs the same code as before (one int test per word, as in 2188).
+Host test: tools/smoke/test_perf_split_cost.sh.
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -12,6 +12,12 @@
+ #include "rsx_o0.h"   /* patch 2188: RSX_PERF_SPLIT / RSX_O0 */
+ #include "rsx_views.h"   /* patch 2202 */
+ #include "rsx_legacy_skip.h"   /* patch 2189 */
++static unsigned long long s_o0_m3d_pass, s_o0_m3dl_pass;   /* patch 2203: walker thread only, flushed by gcm_o0_flush_pass */
++static void gcm_o0_flush_pass(void)
++{
++    if (s_o0_m3d_pass) { RSX_O0_ADD(g_rsx_o0.m3d, s_o0_m3d_pass); s_o0_m3d_pass = 0; }
++    if (s_o0_m3dl_pass) { RSX_O0_ADD(g_rsx_o0.m3d_legacy, s_o0_m3dl_pass); s_o0_m3dl_pass = 0; }
++}
+ static rsx_lgs s_lgs;   /* patch 2189: legacy-skip counters, walker thread only */
+ #define GCM_SPLIT_PUSH(tok, b) const int tok = g_rsx_split_act ? rsx_split_push_w(b) : 0
+ #define GCM_SPLIT_POP(tok) do { if (tok && g_rsx_split_act) rsx_split_pop_w(tok); } while (0)
+@@ -2587,6 +2593,11 @@
+ static unsigned long s_split_owner;
+ static volatile long long g_rsx_split_acc[RSX_SB_N];
+ static volatile unsigned long long g_rsx_split_unw, g_rsx_split_ovf;
++static volatile unsigned long long g_rsx_split_words, g_rsx_split_cmds, g_rsx_split_timed;   /* patch 2203 */
++static unsigned long long s_split_words, s_split_cmds, s_split_timed;   /* the pass in progress; owner thread only */
++static unsigned long long s_split_phase;   /* patch 2203: the decode_d sampler phase; NOT reset at the pass end (rsx_split_dsel) */
++static long long s_split_owed[RSX_SB_N];   /* patch 2203: decode_d scale debits not yet taken from their bucket (rsx_split_settle); survives the pass end */
++static const int s_split_dscale = RSX_SPLIT_DSAMPLE;   /* patch 2203: the scale factor of the sampled decode_d (host test: tools/smoke/test_perf_split_cost.c) */
+ #ifdef _WIN32
+ #define RSX_SPLIT_TID() ((unsigned long)GetCurrentThreadId())
+ #else
+@@ -2636,7 +2647,11 @@
+     if (!g_rsx_split_act) return;
+     g_rsx_split_act = 0;
+     rsx_split_end(&s_split, now);
++    rsx_split_settle(&s_split, s_split_owed);   /* patch 2203 */
+     for (int i = 0; i < RSX_SB_N; i++) if (s_split.acc[i]) __atomic_fetch_add(&g_rsx_split_acc[i], s_split.acc[i], __ATOMIC_RELAXED);
++    if (s_split_words) { __atomic_fetch_add(&g_rsx_split_words, s_split_words, __ATOMIC_RELAXED); s_split_words = 0; }
++    if (s_split_cmds) { __atomic_fetch_add(&g_rsx_split_cmds, s_split_cmds, __ATOMIC_RELAXED); s_split_cmds = 0; }
++    if (s_split_timed) { __atomic_fetch_add(&g_rsx_split_timed, s_split_timed, __ATOMIC_RELAXED); s_split_timed = 0; }
+     if (s_split.unwound) { __atomic_fetch_add(&g_rsx_split_unw, s_split.unwound, __ATOMIC_RELAXED); s_split.unwound = 0; }
+     if (s_split.overflow) { __atomic_fetch_add(&g_rsx_split_ovf, s_split.overflow, __ATOMIC_RELAXED); s_split.overflow = 0; }
+ }
+@@ -2650,6 +2665,17 @@
+     if (!g_rsx_split_act || RSX_SPLIT_TID() != s_split_owner) return;
+     rsx_split_pop(&s_split, token, rsx_perf_now());
+ }
++int rsx_split_dpush_w(long long* d0)   /* patch 2203 */
++{
++    if (!g_rsx_split_act || RSX_SPLIT_TID() != s_split_owner) return 0;
++    if (!rsx_split_dsel(&s_split_phase, &s_split_words, &s_split_timed)) return 0;   /* no clock read for an unsampled word */
++    return rsx_split_dpush(&s_split, d0, rsx_perf_now());
++}
++void rsx_split_dpop_w(int token, long long d0)
++{
++    if (!g_rsx_split_act || RSX_SPLIT_TID() != s_split_owner) return;
++    rsx_split_dpop(&s_split, token, d0, s_split_dscale, s_split_owed, rsx_perf_now());
++}
+ static void gcm_split_base(int bucket)
+ {
+     if (g_rsx_split_act && RSX_SPLIT_TID() == s_split_owner) rsx_split_base(&s_split, bucket, rsx_perf_now());
+@@ -3386,6 +3412,10 @@
+                     fprintf(stderr, "%s\n", ln);
+                     rsx_split_fmt_d(ln, sizeof ln, tnow, b); fprintf(stderr, "%s\n", ln);
+                     rsx_split_fmt_o(ln, sizeof ln, tnow, b, unw - unw_prev, ovf - ovf_prev); fprintf(stderr, "%s\n", ln);
++                    { static unsigned long long w_prev, c_prev, t_prev;   /* patch 2203 */
++                      const unsigned long long w = __atomic_load_n(&g_rsx_split_words, __ATOMIC_RELAXED), cm = __atomic_load_n(&g_rsx_split_cmds, __ATOMIC_RELAXED), tm = __atomic_load_n(&g_rsx_split_timed, __ATOMIC_RELAXED);
++                      rsx_split_fmt_cost(ln, sizeof ln, tnow, fl, w - w_prev, cm - c_prev, tm - t_prev); fprintf(stderr, "%s\n", ln);
++                      w_prev = w; c_prev = cm; t_prev = tm; }
+                 }
+                 unw_prev = unw; ovf_prev = ovf;
+             }
+@@ -3669,6 +3699,7 @@
+     if (s_perf_walk_on) rsx_perf_add(RSX_PERF_O_LOCK_T, rsx_perf_now() - t0);   /* patch 2164 */
+     gcm_split_begin(t0);   /* patch 2188 */
+     gcm_rsx_process_fifo_unlocked();
++    gcm_o0_flush_pass();   /* patch 2203 */
+     gcm_split_end(rsx_perf_now());
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+     rsx_perf_add(RSX_PERF_WALK_T, rsx_perf_now() - t0);
+@@ -3799,12 +3830,12 @@
+      * The gate lives here rather than at the call sites because #554 funnelled
+      * every 3D method through this function -- there are two callers, and a
+      * gate at one of them only would be a silent half-measure. */
+-    if (g_rsx_o0.on) {   /* patch 2188: [o0-state] */
+-        RSX_O0_ADD(g_rsx_o0.m3d, 1); g_rsx_o0.legacy_live = legacy_state_live; g_rsx_o0.be_seen = rsx_get_backend() != NULL;
++    if (g_rsx_o0.on) {   /* patch 2188: [o0-state]; patch 2203: m3d / m3d_legacy are pass-local plain adds (no lock xadd per word), flushed at the pass end */
++        s_o0_m3d_pass++; g_rsx_o0.legacy_live = legacy_state_live; g_rsx_o0.be_seen = rsx_get_backend() != NULL;
+     }
+     s_lgs.m3d++;
+     if (legacy_state_live || gcm_legacy_method_has_effect(m)) {
+-        if (g_rsx_o0.on) RSX_O0_ADD(g_rsx_o0.m3d_legacy, 1);
++        if (g_rsx_o0.on) s_o0_m3dl_pass++;
+         if (s_lgs.verify) {   /* patch 2189: shadow run, count the backend callbacks a method outside the list causes */
+             const unsigned long long s0 = g_rsx_lg_rd_state, p0 = g_rsx_lg_rd_param;
+             rsx_process_method(st, m, v);
+@@ -4515,7 +4546,9 @@
+                 s_fifo_getoff += 4 + count * 4;
+                 continue;
+             }
+-            const long long meth_t0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2045: [perf-walk2] */
++            /* patch 2203: no per-command timer pair while the split is active (the split already times the walk; the pair is phantom) */
++            if (g_rsx_split_act) s_split_cmds++;
++            const long long meth_t0 = (s_perf_walk_on && !g_rsx_split_act) ? rsx_perf_now() : 0;   /* patch 2045: [perf-walk2] */
+             static int s1_2d = -1;
+             if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+             /* A run of 3D methods inside one 1 MB IO page, with no per-word
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -17934,9 +17934,10 @@
+ /* Patch 2188: rsx_dispatch_method inside the decode_d bucket (RSX_PERF_SPLIT=1); the sink callbacks it calls open their own. */
+ static void ld_dispatch_timed(u32 method, u32 arg)
+ {
+-    LDS_PUSH(t, RSX_SB_DECODE_D);
++    long long d0 = 0;   /* patch 2203: sampled 1 word in 32 and scaled (rsx_split_scale_d) */
++    const int t = g_rsx_split_act ? rsx_split_dpush_w(&d0) : 0;
+     rsx_dispatch_method(&g.rsx, method, arg);
+-    LDS_POP(t);
++    if (t && g_rsx_split_act) rsx_split_dpop_w(t, d0);
+ }
+ void rsx_live_draw_method(u32 method, u32 arg)
+ {
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -319,6 +319,8 @@
+  * split on; push returns a token (0 = nothing opened) for pop; both ignore any thread but the pass's owner. */
+ extern volatile int g_rsx_split_act;
+ int       rsx_split_push_w(int bucket);
++int       rsx_split_dpush_w(long long* d0);   /* patch 2203: sampled decode_d push (1 word in 32), 0 = not sampled */
++void      rsx_split_dpop_w(int token, long long d0);
+ void      rsx_split_pop_w(int token);
+ int       rsx_perf_split_on(void);             /* RSX_PERF_SPLIT=1 (cached) */
+ int       rsx_perf_o0_on(void);                /* RSX_O0=1 (cached) */
+diff --git a/libs/video/rsx_o0.h b/libs/video/rsx_o0.h
+--- a/libs/video/rsx_o0.h
++++ b/libs/video/rsx_o0.h
+@@ -125,6 +125,62 @@
+         unwound, overflow);
+ }
+ 
++/* Patch 2203: decode_d is timed on 1 word in RSX_SPLIT_DSAMPLE (a push/pop pair on every word added several ms per flip of
++ * phantom to the decode bucket). d0 is acc[DECODE_D] before the sampled word; the word's own decode_d time d is multiplied
++ * by `scale` and the (scale-1)*d extra is taken from the bucket that owned the clock (the unsampled words' time sat there),
++ * so the buckets still add up to the walk. scale 1 = off.
++ * The extra is credited to decode_d at once, but its debit from that bucket is only applied at the pass end (rsx_split_settle),
++ * clamped to what the bucket accumulated this pass (a per-pass bucket never goes below 0, so no per-flip value prints
++ * negative); the part that did not fit stays in owed[] and is debited from a later pass, so the total is kept and only
++ * what is still owed when the run ends is missing. (Debiting at the sample instead cannot work on short passes: the
++ * unsampled words' time of earlier passes is already flushed and the pass-local bucket is too small.) */
++#define RSX_SPLIT_DSAMPLE 32
++static inline void rsx_split_scale_d(rsx_split* s, long long d0, int scale, long long* owed)
++{
++    const long long d = s->acc[RSX_SB_DECODE_D] - d0;
++    if (scale <= 1 || d <= 0 || s->cur == RSX_SB_DECODE_D) return;
++    s->acc[RSX_SB_DECODE_D] += d * (scale - 1);
++    owed[s->cur] += d * (scale - 1);
++}
++/* Debit owed[] from the pass's buckets, never below 0; call once per pass after rsx_split_end, before the flush. */
++static inline void rsx_split_settle(rsx_split* s, long long* owed)
++{
++    for (int i = 0; i < RSX_SB_N; i++) {
++        if (owed[i] <= 0) continue;
++        const long long have = s->acc[i] > 0 ? s->acc[i] : 0, mv = owed[i] < have ? owed[i] : have;
++        s->acc[i] -= mv; owed[i] -= mv;
++    }
++}
++/* The sampler: every word bumps *words (the per-pass count, flushed as a delta) and *phase (the sampler's own counter, which
++ * persists across walk passes: a per-pass phase never samples a pass of fewer than RSX_SPLIT_DSAMPLE words and always
++ * samples the same positions of a longer one). 1 in RSX_SPLIT_DSAMPLE is timed (dsel), opens decode_d and remembers
++ * acc[DECODE_D] in *d0. */
++static inline int rsx_split_dsel(unsigned long long* phase, unsigned long long* words, unsigned long long* timed)   /* 1 = time this word; no clock read otherwise */
++{
++    ++*words;
++    if ((++*phase & (RSX_SPLIT_DSAMPLE - 1u)) != 0) return 0;
++    ++*timed;
++    return 1;
++}
++static inline int rsx_split_dpush(rsx_split* s, long long* d0, long long now)   /* call only when dsel said 1 */
++{
++    *d0 = s->acc[RSX_SB_DECODE_D];
++    return rsx_split_push(s, RSX_SB_DECODE_D, now);
++}
++static inline void rsx_split_dpop(rsx_split* s, int tok, long long d0, int scale, long long* owed, long long now)
++{
++    rsx_split_pop(s, tok, now);
++    rsx_split_scale_d(s, d0, scale, owed);
++}
++/* [perf-split-cost]: what the split itself cost in calls (words seen, commands, words that paid a timer pair). */
++static inline int rsx_split_fmt_cost(char* out, size_t n, double t, long long flips, unsigned long long words,
++                                     unsigned long long cmds, unsigned long long timed)
++{
++    const double f = flips > 0 ? (double)flips : 1.0;
++    return snprintf(out, n, "[perf-split-cost] t=%.0f words=%.0f commands=%.0f timed_words=%.0f sample=1/%d per_flip",
++                    t, (double)words / f, (double)cmds / f, (double)timed / f, RSX_SPLIT_DSAMPLE);
++}
++
+ /* ---- the O0 counters ---------------------------------------------------------------------------------------------- */
+ enum { RSX_O0_RK_RENDERER = 0, RSX_O0_RK_NV0039, RSX_O0_RK_N };
+ #define RSX_O0_PASSES 64

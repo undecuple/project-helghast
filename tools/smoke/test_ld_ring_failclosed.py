@@ -35,6 +35,23 @@ def main():
         (base / 'libs/video/rsx_live_draw.c').write_text(source)
         (base / 'libs/video/rsx_ring_marks.h').write_text(header)
         patch = ROOT / 'port/patches/2157-live-draw-ring-fail-closed.patch'
+        # Later patches (2188's split-bucket push/pop around this wait, and 2190/2195/2196 on top of it) change the context of
+        # 2157's hunks, so the final tree does not reverse 2157 exactly. Reverse the rsx_live_draw.c section of every patch
+        # numbered 2188 and up first, newest first (sections start at "--- a/PATH": some patches have no "diff --git" lines).
+        for later in sorted((ROOT / 'port/patches').glob('*.patch'), reverse=True):
+            if int(later.name.split('-')[0]) < 2188:
+                break
+            keep, on = [], False
+            for ln in later.read_text().splitlines(True):
+                if ln.startswith('diff --git '):
+                    on = False
+                if ln.startswith('--- a/'):
+                    on = ln.split()[1] == 'a/libs/video/rsx_live_draw.c'
+                if on:
+                    keep.append(ln)
+            if keep:
+                r0 = subprocess.run(['patch', '-R', '-s', '-p1', '-d', str(base)], input=''.join(keep), text=True)
+                if r0.returncode: raise SystemExit('test_ld_ring_failclosed: cannot reverse ' + later.name)
         subprocess.run(['patch', '-R', '-s', '-p1', '-d', str(base), '-i', str(patch)], check=True)
         (tmp / 'rsx_ring_marks.h').write_text(header)
 

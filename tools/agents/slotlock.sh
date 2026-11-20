@@ -1,5 +1,5 @@
 # shellcheck shell=bash disable=SC2034
-# Slot locks (2026-10-11): a shared resource with N slots is N flock files in the main checkout's work/locks/.
+# Slot locks: a shared resource with N slots is N flock files in the main checkout's work/locks/.
 # Slot 0 is NAME.lock, the old single lock, so a script that still takes it the old way (a parallel worktree on an older
 # main) simply holds slot 0; slot i > 0 is NAME.i.lock. Sourced by tools/agents/lock.sh, tools/build-kz3.sh,
 # tools/lift.sh and tools/spu/lift_spu.sh; no game data, no network.
@@ -14,20 +14,20 @@
 # exclusive taker takes the slots in order. No starvation of the exclusive taker: while it waits it writes its pid
 # to NAME.exclusive, and shared takers hold off while that pid is alive (the marker is blanked, not deleted, when it
 # is done: parallel worktrees run this inside a sandbox without the main checkout's tools/safe_rm.sh).
-# First come, first served (2026-10-12: a parallel run lost every race for a free gpu slot for 35 min): every taker joins
+# First come, first served (without a queue, one waiter can lose every race for a free slot): every taker joins
 # NAME.queue (one pid per line, edited under NAME.queue.lock; dead pids are dropped on every edit, nothing is deleted)
 # and only the oldest live waiter tries the slots. A taker from an older copy of this file ignores the queue and can
 # still jump it until its worktree is rebased.
-# Waiters are named by a token, not a pid (2026-10-14: every tools/sandbox.sh run has its own pid namespace, so
+# Waiters are named by a token, not a pid (every tools/sandbox.sh run has its own pid namespace, so
 # `kill -0` on another sandbox's pid failed, two sandboxed builds dropped each other from NAME.queue and both spun on
 # an empty queue for an hour). A token is one of 64 files NAME.wJ held with flock while its owner waits; a token is
 # alive while it is locked (the kernel drops the lock when the owner dies, in any namespace). No file is ever removed.
-# Mixed copies (2026-10-19: KZ2's pid-only copy and this one erased each other's entries; all six waiters spun on an
+# Mixed copies (an older pid-only copy of this script and this one would erase each other's entries; waiters would spin on an
 # empty queue with the GPU idle): live numeric pids are kept, a pid in NAME.exclusive is honoured, and a waiter missing
 # from the queue re-joins at the back on its next head check.
 slot_file() { if (( $3 == 0 )); then echo "$1/$2.lock"; else echo "$1/$2.$3.lock"; fi; }
 slot_tok_alive() { ! flock -n "$1/$2.w$3" true 2>/dev/null; }   # DIR NAME J: is token J held by a waiter?
-# Shortest declared job first (2026-10-19, "Queue order"): on while NAME.sjf exists in the
+# Shortest declared job first ("Queue order"): on while NAME.sjf exists in the
 # lock directory (one shared switch, so every waiter agrees; its "age S" line sets the aging limit, default 1200).
 # A waiter declares LOCK_EST_MIN (minutes; lock.sh fills it from --seconds / level-run.sh, else slot_est's default) and
 # its project (LOCK_PROJECT, else from the checkout path); both go into its token file NAME.wJ as "EST JOIN PROJECT".
@@ -39,7 +39,7 @@ slot_est() {   # slot_est NAME: the declared minutes, or the default for NAME
   [[ "$e" =~ ^[0-9]+$ && "$e" -gt 0 ]] && { echo "$e"; return; }
   case "$1" in build) echo 20 ;; gpu) echo 30 ;; *) echo 10 ;; esac
 }
-slot_proj() {   # slot_proj DIR: the waiter's project: LOCK_PROJECT, else KZ2's marker, else DIR/projects.map, else kz3
+slot_proj() {   # slot_proj DIR: the waiter's project: LOCK_PROJECT, else the partner's marker, else DIR/projects.map, else kz3
   [[ -n "${LOCK_PROJECT:-}" ]] && { echo "$LOCK_PROJECT"; return; }
   [[ -n "${KZ2_HELD_LOCKS:-}" ]] && { echo kz2; return; }
   # projects.map (local, not in the repository): one "<path glob><TAB><project>" per line, matched against $PWD
@@ -73,7 +73,7 @@ slot_tok() {   # slot_tok DIR NAME: hold a free token; sets SLOT_TOK (its number
     sleep 1
   done
 }
-# Run history (2026-10-19: record the actual time against the estimate): NAME.history gets "start EPOCH SLOT EST
+# Run history (record the actual time against the estimate): NAME.history gets "start EPOCH SLOT EST
 # PROJECT PID" when a slot is taken and "end EPOCH PID" when that process exits (a small watcher in the holder's own
 # pid namespace, with every inherited descriptor closed so it never holds a slot or a pipe; a sandbox exit kills it, so
 # readers also end a run when a later run takes its slot). Read by watchdog.sh.
@@ -89,8 +89,8 @@ slot_tok_drop() { [[ -n "${SLOT_TOK_FD:-}" ]] && exec {SLOT_TOK_FD}>&-; SLOT_TOK
 slot_excl_waiting() {   # is another process waiting for exclusive use of NAME?
   local t; t="$(cat "$1/$2.exclusive" 2>/dev/null || true)"
   # A marker is written only after its holder left the queue (slot_take_all), so a marked token that is queued again is
-  # a new waiter that reused the number of a holder killed before it cleared the marker: stale (2026-10-20: KZ2's
-  # head waited for "t1" while KZ3's queued t1 waited for the head, 4 runs stuck with the GPU idle).
+  # a new waiter that reused the number of a holder killed before it cleared the marker: stale (otherwise the queue head can wait for that
+  # number while the new waiter waits for the head, and the GPU sits idle).
   if [[ "$t" =~ ^t[0-9]+$ ]]; then [[ "$t" != "t${SLOT_TOK:-x}" ]] && ! grep -qx "$t" "$1/$2.queue" 2>/dev/null \
       && slot_tok_alive "$1" "$2" "${t#t}"
   else [[ "$t" =~ ^[0-9]+$ && "$t" != "$$" ]] && kill -0 "$t" 2>/dev/null; fi   # an old copy's pid marker
@@ -117,7 +117,7 @@ slot_q() {   # slot_q DIR NAME join|leave|head : edit the waiting queue under it
   exec {fd}>&-
 }
 # slot_hold (optional, defined by the caller, e.g. lock.sh): returns 0 while this waiter must not take a slot (a GPU
-# reservation booked after it queued, 2026-11-11: a Toro run waiting in the queue started 26 s into KZ2's booking).
+# reservation booked after it queued: a run waiting in the queue must not start inside a booking).
 # The waiter leaves the queue while held, so a priority or owner run behind it is not stuck, then joins again.
 slot_held_off() {   # slot_held_off DIR NAME
   declare -F slot_hold >/dev/null && slot_hold || return 1

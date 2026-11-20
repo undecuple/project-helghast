@@ -150,7 +150,7 @@ cc -std=gnu17 -O1 -msse4.1 -w -fno-strict-aliasing -ffp-contract=off -DKZ3_NATIV
 if "$OUT/tn" > "$OUT/neg.log" 2>&1; then echo "FAIL negative control not caught"; fail=1; else echo "PASS negative control caught ($(tail -1 "$OUT/neg.log"))"; fi
 # Part 2: the lifted SPU code (game data only)
 if [[ -f $ROOT/work/spu/spu_lift.json && -f $ROOT/work/spu/lift/job_011f9c80/spu_recomp.c ]]; then
-    REC=(); [[ -d $ROOT/work/spu/r122/rec ]] && REC=(--records "$ROOT/work/spu/r122/rec" --records-slot 6)
+    REC=(); [[ -d $ROOT/work/spu/records ]] && REC=(--records "$ROOT/work/spu/records" --records-slot 6)
     out=$(cd "$ROOT" && python3 tools/spu/native_diff.py --slot 20 --trials 2000 "${REC[@]}" 2>&1 | tail -3)
     echo "$out" | grep -q '^PASS' && echo "PASS native_diff slot 20: $(echo "$out" | grep -o 'equal=.*nr=[0-9]*')" || { echo "FAIL native_diff slot 20: $out"; fail=1; }
     out=$(cd "$ROOT" && NATIVE_DIFF_CFLAGS=-DKZ3_NATIVE_NEGCTL python3 tools/spu/native_diff.py --slot 20 --trials 200 2>&1 | tail -2)

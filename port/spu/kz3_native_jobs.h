@@ -1,4 +1,4 @@
-/* kz3_native_jobs.h -- native host versions of hot SPU job code (SPU pass 122, D88-). The per-function gate follows
+/* kz3_native_jobs.h -- native host versions of hot SPU job code (SPU pass 122). The per-function gate follows
  * KZ2's (Killzone 2 port, spu rounds 15-16: re/spu/native_gates.tsv, native_common.c, kz2_native_jobs.c); credit to
  * that project for the design: a check at the top of a lifted SPU function (inserted by tools/spu/lift_spu.py from
  * re/spu/native_gates.tsv). When g_kz3_native_gate[slot] is set and returns 1, the native code did the whole

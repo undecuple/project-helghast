@@ -1,6 +1,6 @@
 Rebased on ps3recomp v0.17.0 (SPU pass 95): partly absorbed: the scan/exit bitsets under the lock-line lock are #388 (KZ3's PR); left: the exit-code notify under the lock, spu_taskset_dump_tracked.
 
-Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): the hunks are the v0.18 ones, unchanged
+Rebased on ps3recomp v0.19.0: the hunks are the v0.18 ones, unchanged
 (the round-2 1022 keeps spu_task2_exit_code_set, so the first hunk is back); context regenerated.
 
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c

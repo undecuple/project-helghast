@@ -64,7 +64,7 @@ other folders) every later marker is stale and the build starts over.
 Exit 0 = built, 1 = a step failed, 2 = usage, 130 = cancelled.
 Pass 12 (stage B, plan 4.11): every step ran through this file on the payload's Windows Python under Proton on
 the 1.00 tree (lift byte-identical to the Linux one apart from CRLF; the exe boots like main's GCC build). The 1.14
-tree (main's default since 2026-10-22) went through it on native Windows 11 on 2026-10-21: the installer built the
+tree (the default) went through it on native Windows 11: the installer built the
 game in 422 s on a 16-core PC and the game reached the menus (docs/PROGRESS.md).
 Weights: stage B at 4 jobs (pass 12, plan 4.11, measured on the 1.00 tree; not re-measured on 1.14); the shader
 step's is an estimate.
@@ -100,7 +100,7 @@ NINJA_RE = re.compile(r"^\[(\d+)/(\d+)\]")
 REASON_MAX = 900       # characters of one REASON line (a message box paragraph, not a log dump; pass 64: an input's
                        # line names its path, what is there and what it must hold)
 
-# Lift constants per EBOOT version (tools/lift.sh: kz3ver.py DEFAULT, 114 on main since 2026-10-22; KZ3_EBOOT_VER=100 selects 1.00). The tree being built
+# Lift constants per EBOOT version (tools/lift.sh: kz3ver.py DEFAULT, 114 by default; KZ3_EBOOT_VER=100 selects 1.00). The tree being built
 # decides which one (tree_eboot_ver, pass 12): its runtime glue (port/) is written for one EBOOT's addresses, so a
 # 1.14 lift under main's 1.00 glue (or the reverse) would build but not boot.
 CODE_END_114 = "0xe753f4"
@@ -1155,7 +1155,7 @@ def lower_priority(run=None):
 
 # Any Windows user folder, also in CMake's object-path form (C_/Users/name/..., ':' and spaces become '_'): the user
 # name is replaced, so a dump in another account's folder or a mangled build path does not put a name in the log
-# (2026-10-21: a tester's log showed both after the home folder itself had been redacted).
+# (a tester's log showed both after the home folder itself had been redacted).
 # Also the JSON/repr-escaped form (doubled backslashes) and the URL-encoded form (%3A, %5C, %2F), reported by
 # @feanor-noldorin (issue #9; KZ2 5b0cf61).
 _SEP = r"(?:\\{1,2}|/|%5C|%2F)"
@@ -1615,8 +1615,9 @@ compiles the game on this computer (5-30 minutes; Ctrl+C stops it, the next star
 and nothing of the game is copied; the files it generates are your own and must not be shared."""
 EBOOT_AGAIN = ("The EBOOT must be the {want} update's one, not the disc's: EBOOT.elf, the decrypted form of EBOOT.BIN in "
                "the update's USRDIR folder ({usrdir}), made from your own copy.")
-UPDATE_HELP = """The 1.14 update is required: use the update from your own console, or the one installed in RPCS3 (see
-RPCS3's documentation). The port also needs EBOOT.elf, the decrypted
+UPDATE_HELP = """The 1.14 update is required, the complete installed folder: PARAM.SFO and the whole USRDIR (EBOOT.BIN,
+added_data_ps3.psarc.edat and the folders patch_data_ps3_sp and patch_data_ps3_mp). Use the update from your
+own console, or the one installed in RPCS3 (see RPCS3's documentation). The port also needs EBOOT.elf, the decrypted
 form of the update's USRDIR/EBOOT.BIN, made from your own copy (this project includes no decryption tools)."""
 # ASSUMPTION: RPCS3's usual game folders (Linux XDG config; Windows: RPCS3 is portable, so only a guess next to the
 # player's profile). Shown as a default only if it exists.
@@ -1867,7 +1868,7 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
                 say("")
                 say(guide)
                 notes.append("# RPCS3 decrypt guidance shown")
-            elif "U0" in text or "U1" in text or "U2" in text or "E1" in text:
+            elif any(c in fails for c in ("U0", "U1", "U2", "U3", "U4", "E1")):   # the FAIL codes, not OK lines (every code is in the text)
                 say("")
                 say(UPDATE_HELP)
             try:
@@ -1890,39 +1891,24 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
         elf = auto
     a.dump, a.update, a.eboot = dump, upd, elf
     say("")
+    # RPCS3 saves are no longer asked about (installer simplification pass 1): the copy stays off, as the old default
+    # answer was no. rpcs3_import.import_saves stays for a caller that asks (the tests, a later settings screen).
     if imp is not None and rp.get("saves"):
-        c, k = imp.import_saves(rp, _save_root(a, root), yes, say)
-        notes.append(f"# RPCS3 saves: copied {c}, kept {k}")
-        say("")
+        notes.append(f"# RPCS3 saves: {len(rp['saves'])} found, not asked about (copy off by default)")
     fd = getattr(a, "font_dir", "") or prev.get("font_dir", "") or font_guess(upd)
     given_font = bool(getattr(a, "check_first", False) and getattr(a, "font_dir_set", False))
-    r = a.font_dir if given_font else ""      # setup's font answer ("-", auto or a folder) is kept
-    while not given_font:
-        r = ask("Your PS3 firmware's dev_flash/data/font folder, e.g. from an emulator install (optional: the game's "
-                "text then uses the PS3's own fonts; Enter = " + (f"{fd}" if fd else "skip") + ", - = none): ")
-        r = r.strip().strip('"')
-        r = "" if r == "-" else os.path.expanduser(r or fd)
-        if not r or has_fonts(r):
-            break
-        say(f"  no SCE-PS3-*.TTF fonts in: {r}")
-        fd = ""
+    # The PS3 fonts are not asked about either (same as the setup's Recommended path): setup's answer ("-", auto or a
+    # folder), else the folder found beside an RPCS3 update or recorded last time, else none.
+    r = a.font_dir if given_font else (fd if fd and has_fonts(fd) else "")
     a.font_dir = os.path.abspath(r) if r else ""
     a.font_dir_set = True     # "-" / no answer = none, not the last run's folder
     notes.append(f"# firmware fonts: {'given' if a.font_dir else 'none'}")
+    # Optional prompts removed (installer simplification pass 1): the version check, the check at every start and the
+    # shader warm-up keep their kz3-install.ini keys and their old default answers (no). --shaders on still warms.
     online = False
-    if yes("Check GitHub for a newer version of the port now? (one anonymous request; nothing about you or the game "
-           "is sent)", False):
-        r = vcheck(port_version(root))
-        notes.append(f"# version check (player asked): status={r['status']} current={r['current']} "
-                     f"latest={r['latest'] or '-'} url={r['url'] or '-'} {r.get('detail', '')}".rstrip())
-        say({"newer": f"  A newer version {r['latest']} is out: {r['url']} (download it there if you want it)",
-             "current": f"  This is the latest version ({r['current']})."}.get(
-            r["status"], "  Could not reach GitHub; carrying on (one line in the log)."))
-        online = yes("Check like this at every start (at most once a day)?", False)
+    notes.append("# optional prompts not asked: version check, every-start check, shader warm-up (defaults: off)")
     choice = getattr(a, "shaders", "auto")
-    shaders = choice != "off" and (choice == "on" or yes(
-        "Warm the shader cache now? The game runs minimised and plays its opening and the start of the first level "
-        "by itself (about 17 minutes the first time). n warms it while you play: the first minutes stutter", False))
+    shaders = choice == "on"
     write_install_ini(root, getattr(a, "portable", None), online, shaders)
     a.shaders = "on" if shaders else "off"
     say("Saves and settings stay in this folder (portable)." if _is_portable(a, root) else "")

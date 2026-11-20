@@ -10,7 +10,7 @@ footer the page composes, "sel R S" + Delete clears the selected cell outside a 
 bound keys.
 Host test: tools/smoke/test_pad_keybinds.sh section 5.
 
-Rebased on ps3recomp v0.19.0 (shared v0.19 group C): context only (pad_kb_down_win now reads upstream's pad_key_down, from 2037's rebase).
+Rebased on ps3recomp v0.19.0: context only (pad_kb_down_win now reads upstream's pad_key_down, from 2037's rebase).
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index 88c6d198..5d24ff05 100644

@@ -1,6 +1,6 @@
 Per-unit guest sampler state in the D3D12 backend, for all 16 fragment texture units (KZ3 RSX, 2026-10-07).
 
-Rebased on ps3recomp v0.19.0 (shared v0.19 group C): upstream #600 (57464600) widened the draw records, SRV window, sampler tables and bind_texture to 16 units; left from 2001 are the cube-map unit mask (dr_cube_mask, vp_get_fp_pso: units 4-15 were sampled as 2D) and the capture dump's per-unit lines, now over all 16 units. The texscale loop stays at 4 (b1 holds rsx_texscale[4]).
+Rebased on ps3recomp v0.19.0: upstream #600 (57464600) widened the draw records, SRV window, sampler tables and bind_texture to 16 units; left from 2001 are the cube-map unit mask (dr_cube_mask, vp_get_fp_pso: units 4-15 were sampled as 2D) and the capture dump's per-unit lines, now over all 16 units. The texscale loop stays at 4 (b1 holds rsx_texscale[4]).
 
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
 index 854739e7..4a53c08f 100644

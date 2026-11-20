@@ -61,7 +61,7 @@ CASES = [  # (line, text that must NOT survive)
 KEEP = ["relative/Users/readme", "/dev_hdd0/game/BCUS98234/USRDIR", "/dev_bdvd/PS3_GAME/x /app_home/y", "build\\logs\\y.txt"]   # unchanged
 INSTALL = r"F:\Apps\KZ3 Port"
 APPDATA = r"D:\Profiles\Qux Name\AppData\Roaming"
-EXPECT = [  # (line, line as the log must hold it): the path rule of pathrules.py (2026-11-02)
+EXPECT = [  # (line, line as the log must hold it): the path rule of pathrules.py
     (r"D:\Games\KZ3\PS3_GAME\USRDIR\EBOOT.BIN", r"<path>\EBOOT.BIN"),
     ("d:/Games/KZ3/x.bin", r"<path>\x.bin"),                                  # mixed case drive, forward slashes
     (r"e:\PS3\BCUS98234", r"<path>\BCUS98234"),

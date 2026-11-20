@@ -1,0 +1,56 @@
+KZ3 patch 2165 (RSX pass 153): pipeline template format v2. rsx_pt_rec gains vp_branch_bits (register 0x1FF8 as patch 2100
+hashes it into the key for vertex programs that test branch bits). ld_pt_note stores xi->vp_branch_bits, ld_pt_build copies it into
+xi.vp_branch_bits before the ld_pso_key_tail check, so records drawn with nonzero bits no longer fail the prewarm key check
+(vertex programs that test branch bits failed the key check: 20 of 371 records in one capture). RSX_PT_VERSION 1 -> 2, record 556 -> 560 bytes; v1 files are refused
+("another format version ... re-export with LD_PSO_TEMPLATE_OUT"). Field placed after rs_words (ASSUMPTION: the field's offset is a
+choice made here; any reader of v2 files must use the same place). Host test tools/smoke/test_pso_template.sh (round trip, v1 refusal,
+key-check negative control).
+
+diff --git a/libs/video/rsx_pso_template.h b/libs/video/rsx_pso_template.h
+--- a/libs/video/rsx_pso_template.h
++++ b/libs/video/rsx_pso_template.h
+@@ -26,7 +26,7 @@
+ #include <string.h>
+ 
+ #define RSX_PT_MAGIC     0x54505A4Bu   /* bytes "KZPT" */
+-#define RSX_PT_VERSION   1u
++#define RSX_PT_VERSION   2u   /* v2 (patch 2165): rsx_pt_rec has vp_branch_bits; v1 files are another format and are refused */
+ /* Bump when the meaning of a record or the way the walker derives the pipeline key changes: a file with another
+  * key version is ignored (its keys would never match, its records would build pipelines nothing asks for). */
+ #define RSX_PT_KEYVER    1u
+@@ -54,6 +54,7 @@
+     uint32_t shadow_mask, argb_mask, unnorm_mask, flags;
+     uint32_t layout_mask, layout_stride, layout_count;
+     uint32_t rs_words;                  /* used words of rs[] (sizeof the walker's render state / 4) */
++    uint32_t vp_branch_bits;            /* v2: register 0x1FF8 as hashed into the key (0 when the VP tests no branch bits) */
+     uint8_t  shadow_zfunc[16];
+     uint16_t argb_remap[16];
+     uint32_t unnorm_dim[16][2];
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -9163,6 +9163,7 @@
+     r->fp_hash = rsx_fp_structural_hash(xi->fp_uc, xi->fp_size, RSX_PT_FP_SEED);
+     r->fp_first = rsx_pt_quick(xi->fp_uc);
+     r->gamma_mask = xi->gamma_mask;
++    r->vp_branch_bits = xi->vp_branch_bits;   /* patch 2165: part of the key (ld_pso_key_tail) */
+     r->vp_instrs = xi->vp_instrs; r->vp_start = xi->vp_start; r->fp_size = xi->fp_size; r->fp_ctrl = xi->fp_ctrl;
+     r->cube_mask = xi->cube_mask; r->vtex_mask = xi->vtex_mask; r->srgb_out = xi->srgb_out;
+     r->shadow_mask = xi->shadow_mask; r->argb_mask = xi->argb_mask; r->unnorm_mask = xi->unnorm_mask;
+@@ -9270,6 +9271,7 @@
+     if (fc < 0) { InterlockedIncrement(&g_pt.failed_xlate); return; }
+     ld_xl_in xi; memset(&xi, 0, sizeof xi);
+     xi.vp_uc = vp->bytes; xi.vp_instrs = r->vp_instrs; xi.vp_start = r->vp_start;
++    xi.vp_branch_bits = r->vp_branch_bits;   /* patch 2165: before the key check, else records drawn with nonzero bits mismatch */
+     xi.layout = masked ? &lay : NULL; xi.vtex_mask = r->vtex_mask;
+     xi.fp_uc = fp->bytes; xi.fp_size = fp->size; xi.fp_ctrl = r->fp_ctrl; xi.cube_mask = r->cube_mask;
+     u8 zf[16]; u16 remap[16]; u32 unn[16][3] = {{0}};   /* copies: the record is packed */
+@@ -9482,7 +9484,7 @@
+     if (!g_ld_pl.opened || !g_ld_pl.on) { fprintf(stderr, "[pso-template] off: the PSO preload is off (LD_PSO_PRELOAD=0)\n"); return; }
+     uint32_t flags = 0;
+     const int rc = rsx_pt_read(g_pt.in_path, &g_pt.in, &g_pt.n_in, &g_pt.n_dropped, &flags);
+-    if (rc) { fprintf(stderr, "[pso-template] cannot use '%s' (%s)\n", g_pt.in_path, rc == -1 ? "missing" : "another format or key version"); return; }
++    if (rc) { fprintf(stderr, "[pso-template] cannot use '%s' (%s)\n", g_pt.in_path, rc == -1 ? "missing" : "another format version (this build reads template v2; v1 files predate patch 2165: re-export with LD_PSO_TEMPLATE_OUT) or key version"); return; }
+     /* Records of another render-state layout cannot be rebuilt. */
+     { u32 k = 0;
+       for (u32 j = 0; j < g_pt.n_in; j++)

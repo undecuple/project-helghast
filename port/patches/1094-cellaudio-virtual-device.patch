@@ -11,7 +11,7 @@ KZ3_AUDIO_VDEV_PERIOD_US = period. Diagnostic only, off by default; nothing is p
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours + upstream's WASAPI underrun count (note: upstream 3bf0233d keeps 60 ms queued and runs the mixer ahead: KZ3 audio timing changes).
 
-Rebased on ps3recomp v0.19.0 (shared v0.19 group C): context only, once 1046 is in.
+Rebased on ps3recomp v0.19.0: context only, once 1046 is in.
 
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
 index c9a5f25d..9aa5be17 100644

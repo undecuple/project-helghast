@@ -106,6 +106,11 @@ int kz3_net_capture_start(uint16_t port, const char* hello_file, const char* onl
 /* The same with a kind: http = 1 starts the SVO HTTP server (request line and header names logged; region list and
  * nplogin.do answered, 404 otherwise). */
 int kz3_net_capture_start_kind(uint16_t port, const char* hello_file, const char* online_id, int http);
+/* Passive loopback listener (rt_passive.c, test only, KZ3_NET_PASSIVE=1): records, sends nothing. */
+void kz3_net_passive_from_env(void (*log)(const char*));
+int kz3_net_passive_open_log(const char* path, void (*log)(const char*));
+int kz3_net_passive_listen(const char* bind_ip, int port, int udp);
+void kz3_net_passive_stop(void);
 /* The region label the capture's region list carries in <name> (escaped); NULL or "" = none. Call before start. */
 void kz3_net_capture_set_region_label(const char* label);
 

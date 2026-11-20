@@ -5,7 +5,7 @@ at g_pad_kb_tr, which port/net/kz3_discord.c sets to the port's lookup (port/net
 port/text/port_ui.tsv); NULL or any other includer of pad_keybinds.h keeps the English text. {0}..{2} are filled by
 pad_kb_fmt (the lookup refuses a translation whose placeholders differ from the English text's).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (the v0.19.0 chain files where available; originals for the rest, three-way merged where they did not apply).
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index 711a85e..17d52a1 100644

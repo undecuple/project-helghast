@@ -1,0 +1,546 @@
+KZ3 patch 2206: Options > Graphics, the page with the Quality preset row. ENHANCEMENT (display; High, the game's own look, is the default).
+New libs/video/rsx_gfx_page.h (platform-free, host test tools/smoke/test_display_mode.c): the lever table, the two preset tables, the Custom rule as a pure function
+(rsx_gfx_classify: values equal the High table = High, the Ultra table = Ultra, else Custom), the load check of display.ini `quality` against the values, the
+multiplayer lock (game type 1..3 answers the High table, saved values untouched), the "kb:gfx <cmd>" bridge commands (quality, bloom, res/aa/sharp, lock, reset) as a
+function on a state the host owns, and the page generator rsx_gfx_page_gum (one select per landed lever, Ultra only when a landed lever's Ultra value differs from High;
+today only Bloom has landed, so the preset row offers High and Custom). rsx_display_mode.h: rsx_dm_ini_quality, rsx_gfx_quality_name/parse, rsx_dm_ini_write_ext5 (the
+quality key beside bloom); the Bloom row leaves the Display page (Options > Display keeps Field of view, Frame rate limit, VSync, ...; RSX_DM_GUM_BLOOM stays as a
+no-op flag) and Display's Reset to defaults sends "gfx reset" so Bloom still resets.
+Not here: no Ultra lever (render resolution, host anti-aliasing, texture sharpness are declared with ESTIMATE Ultra values and stay off until the host passes their bit),
+no motion blur row, FOV and the frame limit stay on Display.
+
+--- a/libs/video/rsx_display_mode.h
++++ b/libs/video/rsx_display_mode.h
+@@ -327,6 +327,21 @@
+     char v[32];
+     return rsx_dm_ini_value(t, "bloom", v, sizeof v) ? rsx_dm_parse_pct(v) : -1;
+ }
++/* KZ3 patch 2206: Options > Graphics, the preset row. display.ini quality = high | ultra | custom (rsx_gfx_page.h has the
++ * tables and the rule that decides the state from the values). KZ3_QUALITY=high|ultra wins for one run. */
++enum { RSX_GFX_HIGH = 0, RSX_GFX_ULTRA = 1, RSX_GFX_CUSTOM = 2 };
++static inline const char* rsx_gfx_quality_name(int q) { return q == RSX_GFX_ULTRA ? "ultra" : q == RSX_GFX_CUSTOM ? "custom" : "high"; }
++static inline int rsx_gfx_quality_parse(const char* s)   /* a preset, or -1 (NULL, empty, unknown: never reads as Ultra) */
++{
++    size_t n;
++    if (!rsx_dm_trim(&s, &n)) return -1;
++    return rsx_dm_ieq(s, n, "high") ? RSX_GFX_HIGH : rsx_dm_ieq(s, n, "ultra") ? RSX_GFX_ULTRA : rsx_dm_ieq(s, n, "custom") ? RSX_GFX_CUSTOM : -1;
++}
++static inline int rsx_dm_ini_quality(const char* t)        /* RSX_GFX_*, -1 missing or unreadable */
++{
++    char v[32];
++    return rsx_dm_ini_value(t, "quality", v, sizeof v) ? rsx_gfx_quality_parse(v) : -1;
++}
+ static inline int rsx_dm_ini_fps(const char* t)            /* 30 | 60 | 120, -1 missing or unreadable */
+ {
+     char v[32];
+@@ -430,7 +445,7 @@
+ #define RSX_DM_DEF_FOV     "default"
+ #define RSX_DM_DEF_UNF     "keep"   /* patch 2126: When unfocused */
+ #define RSX_DM_GUM_MBLUR 1   /* rsx_dm_patch_gum_opts: add the Motion blur row (patch 2107) */
+-#define RSX_DM_GUM_BLOOM 4   /* patch 2121: add the Bloom row */
++#define RSX_DM_GUM_BLOOM 4   /* patch 2121: the Bloom row; patch 2206: no longer adds a row (Options > Graphics has it), kept so callers still compile */
+ #define RSX_DM_GUM_FOV   2   /* rsx_dm_patch_gum_opts: add the Field of view row (patch 2109) */
+ static inline char* rsx_dm_patch_gum_opts(const char* in, size_t n, size_t* out_n, unsigned opts)
+ {
+@@ -485,29 +500,6 @@
+         "\t\t\t\t<selectitem value=\"90\">90%</selectitem>\n"
+         "\t\t\t\t<selectitem value=\"100\">100%</selectitem>\n"
+         "\t\t\t</select>\n\n\t\t\t";
+-    static const char rsx_dm_gum_row_bloom[] =   /* patch 2121: only when the BuildPost hook is in the exe */
+-        "<select id=\"slc_kz3_bloom\" label=\"@tr{disp.bloom|Bloom}\" onchange=\"script(settingscript,KZ3ChangeBloom)\"\n"
+-        "\t\t\t\tdefault-value=\"100\">\n"
+-        "\t\t\t\t<selectitem value=\"0\">0%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"10\">10%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"20\">20%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"30\">30%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"40\">40%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"50\">50%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"60\">60%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"70\">70%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"80\">80%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"90\">90%</selectitem>\n"
+-        "\t\t\t\t<selectitem value=\"100\">100%</selectitem>\n"
+-        "\t\t\t</select>\n\n\t\t\t";
+-    static const char rsx_dm_gum_lua_bloom[] =   /* patch 2121: with the Bloom row only */
+-        "\t\tfunction KZ3BloomOn()\n"
+-        "\t\t\tgRoot:GetTag(\"slc_kz3_bloom\"):SetValue(KZ3DisplayCmd(\"bloom\"))\n"
+-        "\t\tend\n\n"
+-        "\t\tfunction KZ3ChangeBloom(e)\n"
+-        "\t\t\te:SetHandled(true)\n"
+-        "\t\t\tif (gKz3Dm == 1) then KZ3DisplayCmd(\"bloom \"..e:GetSender():GetValue()) end\n"
+-        "\t\tend\n";
+     static const char rsx_dm_gum_row_fov[] =   /* patch 2109: only when the camera hook is installed */
+         "<select id=\"slc_kz3_fov\" label=\"@tr{disp.fov|Field of view}\" onchange=\"script(settingscript,KZ3ChangeFov)\"\n"
+         "\t\t\t\tdefault-value=\"default\">\n"
+@@ -564,7 +556,6 @@
+         "\t\t\tslc_kz3_fps = \"@trl{disp.tip.fps_lvl|Used in missions. Menus and videos stay at 30. Above 30, physics, animation and "
+         "scripted events can run wrong.}\",\n"
+         "\t\t\tslc_kz3_mblur = \"@trl{disp.tip.mblur|Strength of the blur during fast camera movement. 100 is the game's own look, 0 is off.}\",\n"
+-        "\t\t\tslc_kz3_bloom = \"@trl{disp.tip.bloom|Strength of the glow around bright areas. 100 is the game's own look, 0 is off.}\",\n"
+         "\t\t\tslc_kz3_fov = \"@trl{disp.tip.fov|Horizontal field of view in the campaign. Default is the game's own 80.}\",\n"
+         "\t\t\tslc_kz3_unfocused = \"@trl{disp.tip.unfocused|What the game does while its window is in the background: keep running, mute it, or "
+         "open the pause menu.}\"\n"
+@@ -592,7 +583,7 @@
+         "\t\t\tKZ3DisplayCmd(\"unfocused " RSX_DM_DEF_UNF "\")\n"
+         "\t\t\tif (KZ3MBlurOn) then KZ3DisplayCmd(\"motionblur " RSX_DM_DEF_MBLUR "\") end\n"
+         "\t\t\tif (KZ3FovOn) then KZ3DisplayCmd(\"fov " RSX_DM_DEF_FOV "\") end\n"
+-        "\t\t\tif (KZ3BloomOn) then KZ3DisplayCmd(\"bloom " RSX_DM_DEF_BLOOM "\") end\n"
++        "\t\t\tKZ3DisplayCmd(\"gfx reset\")\n"   /* patch 2206: Bloom moved to Options > Graphics; its reset goes through that page's command */
+         "\t\t\tOnPageOn()\n"
+         "\t\tend\n";
+     static const char rsx_dm_gum_lua[] =
+@@ -609,7 +600,6 @@
+         "\t\t\tgRoot:GetTag(\"slc_kz3_unfocused\"):SetValue(KZ3DisplayCmd(\"unfocused\"))\n"
+         "\t\t\tif (KZ3MBlurOn) then KZ3MBlurOn() end\n"
+         "\t\t\tif (KZ3FovOn) then KZ3FovOn() end\n"
+-        "\t\t\tif (KZ3BloomOn) then KZ3BloomOn() end\n"
+         "\t\t\tgKz3Dm = 1\n"
+         "\t\t\tif (KZ3Tooltip) then KZ3Tooltip(nil) end\n"
+         "\t\tend\n\n"
+@@ -668,7 +658,6 @@
+     at_scr = (size_t)(scr - in);
+     at_lua = (size_t)(cd - in);
+     size_t nlm = nm ? sizeof rsx_dm_gum_lua_mb - 1 : 0;
+-    const size_t nb = (opts & RSX_DM_GUM_BLOOM) ? sizeof rsx_dm_gum_row_bloom - 1 : 0, nlb = nb ? sizeof rsx_dm_gum_lua_bloom - 1 : 0;
+     const size_t nf = (opts & RSX_DM_GUM_FOV) ? sizeof rsx_dm_gum_row_fov - 1 : 0, nlf = nf ? sizeof rsx_dm_gum_lua_fov - 1 : 0;
+     /* patch 2110: the tooltip after the list, its Lua, the list's onchange and the reset call */
+     static const char rsx_dm_list_on[] = " onchange=\"script(settingscript,KZ3Tooltip)\"";
+@@ -678,7 +667,7 @@
+     const char* rs = rsx_dm_find(in, n, (size_t)(scr - in), rsx_dm_reset_at);
+     const size_t nt = sizeof rsx_dm_gum_tip - 1, nlt = sizeof rsx_dm_gum_lua_tip - 1;
+     if (!le || le > scr || (rs && rs > cd)) return NULL;
+-    out = (char*)malloc(n + nr + nm + nb + nf + nd + nl + nlm + nlb + nlf + nt + nlt + 128 + 1);
++    out = (char*)malloc(n + nr + nm + nf + nd + nl + nlm + nlf + nt + nlt + 128 + 1);
+     if (!out) return NULL;
+     /* patch 2109: with the Field of view row the list has 12 rows and Brightness ran into the legend:
+      * give the list a height, as the game's long lists have (common/debugoptions.gum), so it scrolls instead.
+@@ -698,8 +687,7 @@
+     }
+     memcpy(out + o, rsx_dm_gum_row, nr); o += nr;
+     memcpy(out + o, rsx_dm_gum_row_fov, nf); o += nf;                  /* patch 2109 */
+-    memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;                   /* patch 2121: Motion blur and Bloom after Field of view */
+-    memcpy(out + o, rsx_dm_gum_row_bloom, nb); o += nb;
++    memcpy(out + o, rsx_dm_gum_row_mb, nm); o += nm;                   /* patch 2121: Motion blur after Field of view (Bloom: patch 2206, Graphics page) */
+     {   /* patch 2110: the tooltip panel right after the list */
+         const size_t at_le = (size_t)(le - in) + 7;
+         memcpy(out + o, in + at_row, at_le - at_row); o += at_le - at_row;
+@@ -718,7 +706,6 @@
+     memcpy(out + o, rsx_dm_gum_lua, nl); o += nl;
+     memcpy(out + o, rsx_dm_gum_lua_mb, nlm); o += nlm;
+     memcpy(out + o, rsx_dm_gum_lua_fov, nlf); o += nlf;
+-    memcpy(out + o, rsx_dm_gum_lua_bloom, nlb); o += nlb;              /* patch 2121 */
+     memcpy(out + o, rsx_dm_gum_lua_tip, nlt); o += nlt;               /* patch 2110 */
+     memcpy(out + o, in + at_lua, n - at_lua); o += n - at_lua;
+     out[o] = 0;
+@@ -761,6 +748,19 @@
+     return k < 0 ? k : o + k;
+ }
+ 
++/* patch 2206: the file with the quality key too (Options > Graphics preset; ext4's reader still parses it) */
++static inline int rsx_dm_ini_write_ext5(char* buf, size_t n, int mode, int scaling, int filter, int vsync, int motion_blur,
++                                        int fps, int fov, int hud169, int bloom, int quality)
++{
++    int o = rsx_dm_ini_write_ext4(buf, n, mode, scaling, filter, vsync, motion_blur, fps, fov, hud169, bloom);
++    if (o < 0 || (size_t)o >= n) return o;
++    const int k = snprintf(buf + o, n - (size_t)o,
++                           "# quality = high | ultra | custom: the Options > Graphics preset. High is the game's own look. A hand-edited\n"
++                           "# value that does not match the settings above shows as custom. KZ3_QUALITY (high | ultra) overrides it for one run.\n"
++                           "quality = %s\n", rsx_gfx_quality_name(quality));
++    return k < 0 ? k : o + k;
++}
++
+ /* KZ3 patch 2096: view aspect (KZ3_ASPECT, ENHANCEMENT, default screen). Screen = the game's camera is set up for the
+  * window's (or the screen's) own aspect (port/kz3/main.cpp hooks GameViewGame::vf22 @0x007E5908: Hor+ above 16:9,
+  * Vert+ below) and every frame drawn with that camera is stretched to the whole client (the guest image stays
+--- /dev/null
++++ b/libs/video/rsx_gfx_page.h
+@@ -0,0 +1,389 @@
++/*
++ * KZ3 patch 2206: Options > Graphics, the page with the Quality preset row. ENHANCEMENT (display; High,
++ * the game's own look, is the default). Platform-free; the host test is tools/smoke/test_display_mode.c.
++ *
++ * The preset row (QUALITY) offers High and Custom, and Ultra only once at least one lever has landed whose Ultra value
++ * differs from High (a value that changes nothing would be a lie): the list is built from the landed levers. Today the only
++ * lever is Bloom (Ultra = High = 100), so the page shows Quality (High / Custom) and Bloom. Render resolution, host
++ * anti-aliasing and texture sharpness are declared with their planned Ultra values (ESTIMATE)
++ * and switch on when the host passes their bit in `levers`; the host passes none of them yet.
++ *
++ * The state is the settings, not a saved flag: High / Ultra / Custom is decided from the values by rsx_gfx_classify (the
++ * Custom rule: values equal the High table = High, the Ultra table = Ultra, else Custom; a change of any preset-driven row
++ * therefore leaves a preset when it stops matching and returns to it when it matches again). Rows that are not preset-driven
++ * (Field of view, Frame rate limit: Options > Display) never change the state.
++ * Multiplayer lock: in a multiplayer match (game type 1..3) every getter answers the High table; the saved values are never
++ * touched by the lock, so leaving the match restores the player's choice.
++ * The page's Lua talks to the host through "kb:gfx <cmd>" (rsx_gfx_cmd below runs the commands on a state the host owns).
++ */
++#ifndef RSX_GFX_PAGE_H
++#define RSX_GFX_PAGE_H
++
++#include "rsx_display_mode.h"
++
++enum { RSX_GFX_L_BLOOM = 1, RSX_GFX_L_RES = 2, RSX_GFX_L_AA = 4, RSX_GFX_L_SHARP = 8 };
++#define RSX_GFX_NLEVERS 4
++#define RSX_GFX_ROWS_MAX 10   /* ASSUMPTION: the options list holds about 10 rows (patch 2109 saw 12 overflow) */
++#define RSX_GFX_LINK_LABEL "@tr{gfx.link|Graphics}"   /* the options lists' link row */
++
++typedef struct { int v[RSX_GFX_NLEVERS]; } rsx_gfx_vals;
++
++typedef struct { int value; const char* text; } rsx_gfx_item;
++typedef struct {
++    unsigned bit;
++    const char* cmd;             /* the bridge command and the row id suffix: slc_kz3_gfx_<cmd> */
++    int high, ultra;             /* the two tables */
++    int when;                    /* 0 applies at once, 1 at the next level load, 2 after restarting the game (ASSUMPTION for 1 and 2) */
++    const char* label;           /* @tr marker */
++    const char* tip;             /* @trl marker */
++    const rsx_gfx_item* items;
++    int nitems;
++} rsx_gfx_lever;
++
++static const rsx_gfx_item rsx_gfx_items_pct[] = {
++    {0, "0%"}, {10, "10%"}, {20, "20%"}, {30, "30%"}, {40, "40%"}, {50, "50%"},
++    {60, "60%"}, {70, "70%"}, {80, "80%"}, {90, "90%"}, {100, "100%"},
++};
++static const rsx_gfx_item rsx_gfx_items_res[] = { {100, "1x"}, {150, "1.5x"} };
++static const rsx_gfx_item rsx_gfx_items_aa[] = { {0, "@tr{disp.v.default|Default}"}, {1, "FXAA"} };
++static const rsx_gfx_item rsx_gfx_items_sharp[] = { {0, "@tr{disp.v.default|Default}"}, {1, "16x"} };
++
++static inline const rsx_gfx_lever* rsx_gfx_lever_at(int i)
++{
++    static const rsx_gfx_lever t[RSX_GFX_NLEVERS] = {
++        { RSX_GFX_L_BLOOM, "bloom", 100, 100, 0, "@tr{disp.bloom|Bloom}",
++          "@trl{disp.tip.bloom|Strength of the glow around bright areas. 100 is the game's own look, 0 is off.}",
++          rsx_gfx_items_pct, 11 },
++        { RSX_GFX_L_RES, "res", 100, 150, 1, "@tr{gfx.res|Render resolution}",
++          "@trl{gfx.tip.res|Draws the picture at a higher resolution. Needs a faster graphics card.}",
++          rsx_gfx_items_res, 2 },
++        { RSX_GFX_L_AA, "aa", 0, 1, 2, "@tr{gfx.aa|Anti-aliasing}",
++          "@trl{gfx.tip.aa|Smooths jagged edges. Default is the game's own method.}",
++          rsx_gfx_items_aa, 2 },
++        { RSX_GFX_L_SHARP, "sharp", 0, 1, 2, "@tr{gfx.sharp|Texture sharpness}",
++          "@trl{gfx.tip.sharp|Keeps distant and slanted surfaces sharp.}",
++          rsx_gfx_items_sharp, 2 },
++    };
++    return (unsigned)i < RSX_GFX_NLEVERS ? &t[i] : (const rsx_gfx_lever*)0;
++}
++
++/* The two tables: every lever's value (a lever that has not landed keeps the High value). */
++static inline rsx_gfx_vals rsx_gfx_table(int quality, unsigned levers)
++{
++    rsx_gfx_vals r;
++    for (int i = 0; i < RSX_GFX_NLEVERS; i++) {
++        const rsx_gfx_lever* l = rsx_gfx_lever_at(i);
++        r.v[i] = quality == RSX_GFX_ULTRA && (levers & l->bit) ? l->ultra : l->high;
++    }
++    return r;
++}
++/* The levers whose Ultra value differs from High among the landed ones; Ultra is offered only when there is one. */
++static inline unsigned rsx_gfx_ultra_levers(unsigned levers)
++{
++    unsigned m = 0;
++    for (int i = 0; i < RSX_GFX_NLEVERS; i++) {
++        const rsx_gfx_lever* l = rsx_gfx_lever_at(i);
++        if ((levers & l->bit) && l->ultra != l->high) m |= l->bit;
++    }
++    return m;
++}
++static inline int rsx_gfx_ultra_offered(unsigned levers) { return rsx_gfx_ultra_levers(levers) != 0; }
++
++static inline int rsx_gfx_same(const rsx_gfx_vals* a, const rsx_gfx_vals* b, unsigned levers)   /* landed levers only */
++{
++    for (int i = 0; i < RSX_GFX_NLEVERS; i++)
++        if ((levers & (1u << i)) && a->v[i] != b->v[i]) return 0;
++    return 1;
++}
++/* The Custom rule (pure): the state the values are in. */
++static inline int rsx_gfx_classify(const rsx_gfx_vals* v, unsigned levers)
++{
++    const rsx_gfx_vals h = rsx_gfx_table(RSX_GFX_HIGH, levers), u = rsx_gfx_table(RSX_GFX_ULTRA, levers);
++    if (rsx_gfx_same(v, &h, levers)) return RSX_GFX_HIGH;
++    if (rsx_gfx_ultra_offered(levers) && rsx_gfx_same(v, &u, levers)) return RSX_GFX_ULTRA;
++    return RSX_GFX_CUSTOM;
++}
++/* Load: `quality` from display.ini (-1 = missing or unknown = High) checked against the saved values. An explicit high or
++ * ultra that the values do not match (a hand-edited file, a lever removed later) shows as Custom; the host does not rewrite
++ * the file until the player changes something. */
++static inline int rsx_gfx_load_state(int ini_quality, const rsx_gfx_vals* v, unsigned levers)
++{
++    const int actual = rsx_gfx_classify(v, levers);
++    const int want = ini_quality < 0 ? RSX_GFX_HIGH : ini_quality;
++    if ((want == RSX_GFX_HIGH || want == RSX_GFX_ULTRA) && want != actual) return RSX_GFX_CUSTOM;
++    return actual;
++}
++/* The multiplayer lock: game type 1..3 (the Field of view test; -1 = no session is not locked). */
++static inline int rsx_gfx_locked(int game_type) { return game_type >= 1 && game_type <= 3; }
++static inline rsx_gfx_vals rsx_gfx_effective(const rsx_gfx_vals* saved, int game_type, unsigned levers)
++{
++    return rsx_gfx_locked(game_type) ? rsx_gfx_table(RSX_GFX_HIGH, levers) : *saved;
++}
++static inline int rsx_gfx_effective_bloom(int saved_bloom, int game_type) { return rsx_gfx_locked(game_type) ? 100 : saved_bloom; }
++/* KZ3_QUALITY=high|ultra for one run: 1 = `out` is that table, 0 = not set or unreadable, -1 = Ultra asked but not offered. */
++static inline int rsx_gfx_env_vals(unsigned levers, const char* env, rsx_gfx_vals* out)
++{
++    const int q = env && *env ? rsx_gfx_quality_parse(env) : -1;
++    if (q == RSX_GFX_HIGH) { *out = rsx_gfx_table(RSX_GFX_HIGH, levers); return 1; }
++    if (q == RSX_GFX_ULTRA) {
++        if (!rsx_gfx_ultra_offered(levers)) return -1;
++        *out = rsx_gfx_table(RSX_GFX_ULTRA, levers);
++        return 1;
++    }
++    return 0;
++}
++
++/* ---- the bridge: "kb:gfx quality [high|ultra|custom]", "bloom [v]", "res|aa|sharp [v]", "lock", "reset" ---- */
++typedef struct { rsx_gfx_vals v; int quality; unsigned levers; } rsx_gfx_state;
++
++static inline void rsx_gfx_apply(rsx_gfx_state* s, int quality)   /* High or Ultra: every landed lever at once */
++{
++    s->v = rsx_gfx_table(quality, s->levers);
++    s->quality = rsx_gfx_classify(&s->v, s->levers);
++}
++static inline int rsx_gfx_lever_parse(int i, const char* s)   /* the value, or -1 */
++{
++    const rsx_gfx_lever* l = rsx_gfx_lever_at(i);
++    if (i == 0) return rsx_dm_parse_pct(s);
++    size_t n;
++    if (!rsx_dm_trim(&s, &n) || !n || n > 6) return -1;
++    char b[8];
++    memcpy(b, s, n); b[n] = 0;
++    char* e;
++    const long x = strtol(b, &e, 10);
++    if (*e) return -1;
++    for (int k = 0; k < l->nitems; k++) if (l->items[k].value == x) return (int)x;
++    return -1;
++}
++/* Runs one command on `st` (saved values); `reply` is what the page's Lua reads back. Returns 1 when the saved values or the
++ * state changed (the host then saves). While locked every answer is the High table and nothing is written. */
++static inline int rsx_gfx_cmd(rsx_gfx_state* st, const char* cmd, int game_type, char* reply, size_t cap)
++{
++    char w[16];
++    size_t k = 0;
++    const char* a = cmd ? cmd : "";
++    while (*a && *a != ' ' && k < sizeof w - 1) w[k++] = *a++;
++    w[k] = 0;
++    while (*a == ' ') a++;
++    const int locked = rsx_gfx_locked(game_type);
++    const rsx_gfx_state before = *st;
++    int changed = 0;
++    if (cap) reply[0] = 0;
++    if (!strcmp(w, "lock")) {
++        snprintf(reply, cap, "%d", locked);
++        return 0;
++    }
++    if (!strcmp(w, "quality")) {
++        if (*a && !locked) {
++            const int q = rsx_gfx_quality_parse(a);
++            if (q == RSX_GFX_HIGH || (q == RSX_GFX_ULTRA && rsx_gfx_ultra_offered(st->levers))) rsx_gfx_apply(st, q);
++            /* custom (or an unknown word, or Ultra that is not offered): nothing changes */
++        }
++        snprintf(reply, cap, "%s", rsx_gfx_quality_name(locked ? RSX_GFX_HIGH : st->quality));
++    } else if (!strcmp(w, "reset")) {
++        if (!locked) rsx_gfx_apply(st, RSX_GFX_HIGH);
++        snprintf(reply, cap, "%s", rsx_gfx_quality_name(locked ? RSX_GFX_HIGH : st->quality));
++    } else {
++        for (int i = 0; i < RSX_GFX_NLEVERS; i++) {
++            const rsx_gfx_lever* l = rsx_gfx_lever_at(i);
++            if (strcmp(w, l->cmd)) continue;
++            if (*a && !locked && (st->levers & l->bit)) {
++                const int x = rsx_gfx_lever_parse(i, a);
++                if (x >= 0) { st->v.v[i] = x; st->quality = rsx_gfx_classify(&st->v, st->levers); }
++            }
++            /* a Bloom value that is not a step of 10 (never from display.ini or KZ3_BLOOM, which round on parse) shows as the
++             * nearest step, so the select always has a matching item; the saved value is not touched */
++            snprintf(reply, cap, "%d", locked || !(st->levers & l->bit) ? l->high : i == 0 ? rsx_dm_pct_round(st->v.v[i]) : st->v.v[i]);
++            break;
++        }
++    }
++    changed = st->quality != before.quality || memcmp(&st->v, &before.v, sizeof st->v) != 0;
++    return changed;
++}
++
++/* ---- the page (malloc'd, NUL-terminated; kz3_tr.h markers in it; the host expands them in the game's language) ---- */
++typedef struct { char* p; size_t n, cap; } rsx_gfx_buf;
++static inline void rsx_gfx_put(rsx_gfx_buf* b, const char* s)
++{
++    const size_t k = strlen(s);
++    if (!b->p) return;
++    if (b->n + k + 1 > b->cap) {
++        size_t c = b->cap * 2 + k + 1;
++        char* q = (char*)realloc(b->p, c);
++        if (!q) { free(b->p); b->p = NULL; return; }
++        b->p = q; b->cap = c;
++    }
++    memcpy(b->p + b->n, s, k + 1);
++    b->n += k;
++}
++static inline void rsx_gfx_putf(rsx_gfx_buf* b, const char* fmt, const char* a, const char* c)
++{
++    char t[1024];
++    snprintf(t, sizeof t, fmt, a, c ? c : "");
++    rsx_gfx_put(b, t);
++}
++static inline int rsx_gfx_page_rows(unsigned levers)
++{
++    int n = 1;
++    for (int i = 0; i < RSX_GFX_NLEVERS; i++) if (levers & (1u << i)) n++;
++    return n;
++}
++/* when: 0 live, 1 next level, 2 restart -> the last sentence of the row's tooltip */
++static inline const char* rsx_gfx_when_marker(int when)
++{
++    return when == 1 ? " @trl{gfx.tip.nextlevel|Applies at the next level load.}"
++         : when == 2 ? " @trl{gfx.tip.restart|Applies after restarting the game.}" : "";
++}
++/* locked: the page is opened while a multiplayer match locks it; it then has no Default legend (nothing on it can change) */
++static inline char* rsx_gfx_page_gum_l(unsigned levers, int locked, size_t* out_n)
++{
++    levers &= (1u << RSX_GFX_NLEVERS) - 1;
++    const int ultra = rsx_gfx_ultra_offered(levers);
++    int later = 0;
++    rsx_gfx_buf b = { (char*)malloc(8192), 0, 8192 };
++    if (!b.p) return NULL;
++    b.p[0] = 0;
++    rsx_gfx_put(&b,
++        "<gum default-focus=\"slc_kz3_gfx_preset\">\n\n"
++        "\t<texture class=\"background\"/>\n"
++        "\t<movie src=\"source:movies/MenuBackground.bik\" persistid=\"movie_back\"/>\n\n"
++        "\t<panel id=\"pnl_main\" class=\"safearea\" scrollable=\"false\"\n"
++        "\t\toncancel=\"back()\" labelcancel=\"@key{menu_legend_back}\"");
++    rsx_gfx_put(&b, locked ? ">\n\n"
++        : "\n\t\tonoptions=\"script(settingscript, SetToDefault)\" labeloptions=\"@key{menu_legend_default}\">\n\n");
++    rsx_gfx_put(&b,
++        "\t\t@include{file:///hudelements/type3.gum}\n\n"
++        "\t\t<text class=\"pagetitle\">@tr{gfx.title|Change the graphics settings}</text>\n"
++        "\t\t<text class=\"sectiontitle\">@key{menu_options}</text>\n\n"
++        /* no width on the list or the rows, like the game's Display page: the per-language column of patch 2151 applies */
++        "\t\t<list id=\"lst_options\" class=\"PEDS\" onchange=\"script(settingscript,KZ3Tooltip)\">\n"
++        "\t\t\t<select id=\"slc_kz3_gfx_preset\" label=\"@tr{gfx.preset|Quality}\" onchange=\"script(settingscript,KZ3ChangeQuality)\"\n"
++        "\t\t\t\tdefault-value=\"high\">\n"
++        "\t\t\t\t<selectitem value=\"high\">@tr{gfx.v.high|High}</selectitem>\n");
++    if (ultra) rsx_gfx_put(&b, "\t\t\t\t<selectitem value=\"ultra\">@tr{gfx.v.ultra|Ultra}</selectitem>\n");
++    rsx_gfx_put(&b, "\t\t\t\t<selectitem value=\"custom\">@tr{gfx.v.custom|Custom}</selectitem>\n\t\t\t</select>\n");
++    for (int i = 0; i < RSX_GFX_NLEVERS; i++) {
++        const rsx_gfx_lever* l = rsx_gfx_lever_at(i);
++        if (!(levers & l->bit)) continue;
++        if (l->when) later = 1;
++        char t[256];
++        snprintf(t, sizeof t,
++                 "\t\t\t<select id=\"slc_kz3_gfx_%s\" label=\"%s\" onchange=\"script(settingscript,KZ3Change_%s)\"\n\t\t\t\tdefault-value=\"%d\">\n",
++                 l->cmd, l->label, l->cmd, l->high);
++        rsx_gfx_put(&b, t);
++        for (int k = 0; k < l->nitems; k++) {
++            snprintf(t, sizeof t, "\t\t\t\t<selectitem value=\"%d\">%s</selectitem>\n", l->items[k].value, l->items[k].text);
++            rsx_gfx_put(&b, t);
++        }
++        rsx_gfx_put(&b, "\t\t\t</select>\n");
++    }
++    rsx_gfx_put(&b,
++        "\t\t</list>\n\n"
++        "\t\t<panel id=\"pnl_kz3_tooltip\" class=\"tooltip\" y=\"440\">\n"
++        "\t\t\t<text id=\"txt_kz3_tooltip\"></text>\n"
++        "\t\t</panel>\n\n"
++        "\t\t@include{file:///common/includes/dialogconfirm.gum}\n"
++        "\t</panel>\n\n"
++        "\t<script id=\"settingscript\">\n<![CDATA[\n"
++        /* the guard stays 0 until OnPageOn has filled the rows and while a refresh sets them: a select fires onchange
++         * when its value is set (the patch 2095 bug) and that must not count as a manual change */
++        "\t\tgKz3G = 0\n\t\tgKz3Lock = 0\n\n"
++        "\t\tgKz3Tip = {\n");
++    rsx_gfx_put(&b, "\t\t\tslc_kz3_gfx_preset = ");
++    rsx_gfx_put(&b, ultra ? "\"@trl{gfx.tip.preset|High is the game's own look. Ultra adds PC picture improvements.}"
++                          : "\"@trl{gfx.tip.preset_high|High is the game's own look. Changing a setting below makes it Custom.}");
++    if (later) rsx_gfx_put(&b, " @trl{gfx.tip.later|Some changes apply later. Each row says when.}");
++    rsx_gfx_put(&b, "\"");
++    for (int i = 0; i < RSX_GFX_NLEVERS; i++) {
++        const rsx_gfx_lever* l = rsx_gfx_lever_at(i);
++        if (!(levers & l->bit)) continue;
++        rsx_gfx_put(&b, ",\n\t\t\tslc_kz3_gfx_");
++        rsx_gfx_put(&b, l->cmd);
++        rsx_gfx_putf(&b, " = \"%s%s\"", l->tip, rsx_gfx_when_marker(l->when));
++    }
++    rsx_gfx_put(&b, "\n\t\t}\n");
++    rsx_gfx_put(&b, ultra ? "\t\tgKz3TipCustom = \"@trl{gfx.tip.custom|Your own mix. Pick High or Ultra to reset the rows below.}\"\n"
++                          : "\t\tgKz3TipCustom = \"@trl{gfx.tip.custom_high|Your own mix. Pick High to reset the rows below.}\"\n");
++    rsx_gfx_put(&b,
++        "\t\tgKz3TipLock = \"@trl{gfx.lock|Fixed to High in multiplayer so everyone sees the same picture.}\"\n\n"
++        "\t\tfunction KZ3Tooltip(e)\n"
++        "\t\t\tlocal item = gRoot:GetTag(\"lst_options\"):GetSelectedItem()\n"
++        "\t\t\tlocal t = nil\n"
++        "\t\t\tif (gKz3Lock == 1) then\n"
++        "\t\t\t\tt = gKz3TipLock\n"
++        "\t\t\telseif (item ~= nil) then\n"
++        "\t\t\t\tt = gKz3Tip[item:GetID()]\n"
++        "\t\t\t\tif (item:GetID() == \"slc_kz3_gfx_preset\" and gRoot:GetTag(\"slc_kz3_gfx_preset\"):GetValue() == \"custom\") then t = gKz3TipCustom end\n"
++        "\t\t\tend\n"
++        "\t\t\tif (t == nil) then t = \"\" end\n"
++        "\t\t\tgRoot:GetTag(\"txt_kz3_tooltip\"):SetValue(t)\n"
++        "\t\tend\n\n"
++        "\t\tfunction KZ3GfxCmd(c)\n"
++        "\t\t\tgPlayerProfile:SetTimeZone(\"kb:gfx \"..c)\n"
++        "\t\t\treturn gPlayerProfile:GetTimeZone()\n"
++        "\t\tend\n\n"
++        "\t\tfunction KZ3GfxShow()\n"
++        "\t\t\tgRoot:GetTag(\"slc_kz3_gfx_preset\"):SetValue(KZ3GfxCmd(\"quality\"))\n");
++    for (int i = 0; i < RSX_GFX_NLEVERS; i++) {
++        const rsx_gfx_lever* l = rsx_gfx_lever_at(i);
++        if (!(levers & l->bit)) continue;
++        rsx_gfx_putf(&b, "\t\t\tgRoot:GetTag(\"slc_kz3_gfx_%s\"):SetValue(KZ3GfxCmd(\"%s\"))\n", l->cmd, l->cmd);
++    }
++    rsx_gfx_put(&b,
++        "\t\tend\n\n"
++        "\t\tfunction KZ3Refresh()\n"
++        "\t\t\tgKz3G = 0\n"
++        "\t\t\tKZ3GfxShow()\n"
++        "\t\t\tgKz3G = 1\n"
++        "\t\t\tKZ3Tooltip(nil)\n"
++        "\t\tend\n\n"
++        "\t\tfunction OnPageOn()\n"
++        "\t\t\tgKz3G = 0\n"
++        "\t\t\tgKz3Lock = 0\n"
++        "\t\t\tif (KZ3GfxCmd(\"lock\") == \"1\") then gKz3Lock = 1 end\n"
++        "\t\t\tKZ3GfxShow()\n"
++        "\t\t\tKZ3Tooltip(nil)\n"
++        "\t\t\tgKz3G = 1\n"
++        "\t\tend\n\n"
++        /* a locked page keeps its rows, and every change snaps back (ASSUMPTION: the game's `enabled` attribute cannot be set
++         * from Lua on a select; to be checked in the first run) */
++        "\t\tfunction KZ3ChangeQuality(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (gKz3G == 1) then\n"
++        "\t\t\t\tif (gKz3Lock == 0) then KZ3GfxCmd(\"quality \"..e:GetSender():GetValue()) end\n"
++        "\t\t\t\tKZ3Refresh()\n"
++        "\t\t\tend\n"
++        "\t\tend\n\n");
++    for (int i = 0; i < RSX_GFX_NLEVERS; i++) {
++        const rsx_gfx_lever* l = rsx_gfx_lever_at(i);
++        if (!(levers & l->bit)) continue;
++        char t[640];
++        snprintf(t, sizeof t,
++                 "\t\tfunction KZ3Change_%s(e)\n"
++                 "\t\t\te:SetHandled(true)\n"
++                 "\t\t\tif (gKz3G == 1) then\n"
++                 "\t\t\t\tif (gKz3Lock == 0) then KZ3GfxCmd(\"%s \"..e:GetSender():GetValue()) end\n"
++                 "\t\t\t\tKZ3Refresh()\n"
++                 "\t\t\tend\n"
++                 "\t\tend\n\n", l->cmd, l->cmd);
++        rsx_gfx_put(&b, t);
++    }
++    rsx_gfx_put(&b,
++        "\t\tfunction SetToDefault()\n"
++        "\t\t\tif (gKz3Lock == 0) then gMenu:DoAction(\"dialog(dlg_confirmdefaults, settingscript, OnDialogClose)\") end\n"
++        "\t\tend\n\n"
++        "\t\tfunction OnDialogClose(e)\n"
++        "\t\t\te:SetHandled(true)\n"
++        "\t\t\tif (e:GetSender():GetValue() == \"yes\") then\n"
++        "\t\t\t\tKZ3GfxCmd(\"reset\")\n"
++        "\t\t\t\tKZ3Refresh()\n"
++        "\t\t\tend\n"
++        "\t\tend\n"
++        "]]>\n\t</script>\n\n</gum>\n");
++    if (!b.p) return NULL;
++    if (out_n) *out_n = b.n;
++    return b.p;
++}
++static inline char* rsx_gfx_page_gum(unsigned levers, size_t* out_n) { return rsx_gfx_page_gum_l(levers, 0, out_n); }
++
++#endif /* RSX_GFX_PAGE_H */

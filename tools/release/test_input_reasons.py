@@ -101,7 +101,8 @@ def main():
         rc, rs, _ = run(["--dump", d, "--update", empty, "--eboot", elf])
         check("empty update folder", rc == 1 and rs[0].startswith(f"1.14 update failed: {empty} holds none of these "
               f"files (the folder is empty). It must be the installed 1.14 update folder") and
-              f"PARAM.SFO, USRDIR{s}EBOOT.BIN and USRDIR{s}{fc.UPDATE_EDAT}" in rs[0], rs)
+              f"PARAM.SFO, USRDIR{s}EBOOT.BIN, USRDIR{s}{fc.UPDATE_EDAT} and the two folders USRDIR{s}patch_data_ps3_sp and "
+              f"USRDIR{s}patch_data_ps3_mp with their .pspatch files" in rs[0], rs)
         check("empty update: disc and EBOOT passed", rs[-1] == "Passed: the disc dump and the decrypted EBOOT.", rs)
         rc, rs, _ = run(["--dump", d, "--update", d, "--eboot", elf])
         check("a disc dump given as the update", rc == 1 and "so it looks like the disc dump, not the update: give it as the disc dump" in rs[0], rs)

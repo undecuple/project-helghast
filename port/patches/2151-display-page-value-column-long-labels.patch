@@ -33,7 +33,7 @@ new file mode 100644
 +    {4, 500, 195}, {20, 500, 195}, {3, 500, 200}, {5, 500, 195}, {6, 500, 195}, {8, 500, 190}, {11, 500, 215},
 +    {12, 500, 190}, {15, 500, 195}, {16, 500, 195}, {17, 500, 225}, {22, 500, 175},
 +};
-+#define RSX_MC_LIST_EXTRA 32   /* the list is wider than its rows by this much on r139-ru-1280c.png (ASSUMPTION) */
++#define RSX_MC_LIST_EXTRA 32   /* the list is wider than its rows by this much in the Russian 1280-wide capture (ASSUMPTION) */
 +
 +/* 1 and the row's width/optionwidth when `lang` needs a wider Display page, else 0 (English and the fitting languages keep the game's look). */
 +static inline int rsx_mc_lookup(int lang, int* width, int* option)

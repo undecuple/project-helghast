@@ -36,7 +36,7 @@ PY
 # Hold the build lock (tools/build-kz3.sh): a build re-globs work/spu, so a lift replacing it mid-build breaks the
 # build with missing files (RSX pass 12, 2026-10-08).
 LOCKS="${KZ3_MAIN:-$ROOT}/work/locks"; mkdir -p "$LOCKS"
-# Every build slot (2026-10-11: KZ3_BUILD_SLOTS builds may run at once; a lift must wait for all of them): tools/agents/slotlock.sh.
+# Every build slot (KZ3_BUILD_SLOTS builds may run at once; a lift must wait for all of them): tools/agents/slotlock.sh.
 source "$ROOT/tools/agents/slotlock.sh"; slot_take_all "$LOCKS" build "${KZ3_BUILD_SLOTS:-1}"
 
 if [[ -e "$PT" ]]; then "$ROOT/tools/safe_rm.sh" "$PT"; fi
@@ -44,7 +44,7 @@ if [[ -e "$OUT/lift" ]]; then "$ROOT/tools/safe_rm.sh" "$OUT/lift"; fi
 mkdir -p "$OUT"
 mkdir -p "$PT"
 tar -C "$SUB" --exclude=.git -cf - . | tar -C "$PT" -xf -
-# Apply from inside the copy with repo discovery stopped above it: in a lane worktree .git is a file pointing
+# Apply from inside the copy with repo discovery stopped above it: in a linked worktree .git is a file pointing
 # into the main checkout, which the sandbox does not mount, so `git apply` must run as a plain patch tool.
 for p in port/patches/*.patch; do
   [[ -e "$p" ]] || continue

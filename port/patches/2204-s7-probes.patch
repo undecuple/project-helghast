@@ -1,0 +1,1039 @@
+KZ3 patch 2204: S7.0 measurement probes (RSX_O0=1, RSX_O0_S7=1): [s7-fill] split of the FILL bucket, [s7-bar] barriers and the overlap bound, [s7-draw] eligibility/bytes/device cache, [s7-page] page census and the resident-page break-even, [s7-ww] write-watch microprobe (RSX_O0_S7_WW=1). Probe only, default off, no behaviour change.
+
+Review fixes: ld_s7_draw runs inside its own split bucket (RSX_SB_X_S7, folded into `other`, printed as s7draw_ms in [s7-fill]); the hash unit cost is measured on a cold 32 MiB buffer in a stride order, not a hot 4 KiB page; clocks is bumped atomically; an unmet acquire is counted once per acquire (re-polls of the same FIFO position are not); the page sampler is a multiply-shift (unbiased for any RSX_O0_S7_PAGE_SAMP).
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -10,6 +10,7 @@
+ 
+ #include "rsx_live_draw.h"
+ #include "rsx_o0.h"   /* patch 2188: RSX_PERF_SPLIT / RSX_O0 */
++#include "rsx_s7p.h"   /* patch 2204: S7.0 probes (RSX_O0_S7) */
+ #include "rsx_views.h"   /* patch 2202 */
+ #include "rsx_legacy_skip.h"   /* patch 2189 */
+ static unsigned long long s_o0_m3d_pass, s_o0_m3dl_pass;   /* patch 2203: walker thread only, flushed by gcm_o0_flush_pass */
+@@ -2610,10 +2611,69 @@ int rsx_perf_split_on(void)
+     if (on < 0) { on = gcm_env_on("RSX_PERF_SPLIT"); if (on) fprintf(stderr, "[perf-split] exclusive walker split on (RSX_PERF_SPLIT=1, patch 2188)\n"); }
+     return on;
+ }
++/* ---------------------------------------------------------------------------
++ * Patch 2204 (S7.0 probes). RSX_O0=1 plus RSX_O0_S7=1: [s7-fill] [s7-bar] [s7-draw] [s7-page] each second (rsx_s7p.h), and once
++ * RSX_O0_S7_WW=1 the write-watch microprobe [s7-ww] at run second RSX_O0_S7_WW_AT on its own regions. Measurement only: no
++ * switch, no hook, no state change when off (every hook is one int/pointer test). Docs: the RE notes "S7.0 probes".
++ * -------------------------------------------------------------------------*/
++rsx_s7p g_rsx_s7p;
++static int s_s7_ww, s_s7_ww_at = 100; static unsigned s_s7_ww_pages = 1280;
++static void gcm_s7_gs_cb(unsigned kind)   /* g_rsx_gs_s7: a walker-thread funnel call; the kind's name decides its class */
++{
++    const rsx_gs_info* gi = rsx_gs_info_of(kind);
++    if (gi && g_rsx_s7p.on) rsx_s7p_barrier_name(&g_rsx_s7p, gi->name);
++}
++static void gcm_s7_init(int o0_on)
++{
++    const char* e = getenv("RSX_O0_S7");   /* patch 2204: diagnostic probe report ([s7-*] lines), default off, needs RSX_O0=1 */
++    if (!e || !*e || *e == '0') return;
++    if (!o0_on) { fprintf(stderr, "[s7] RSX_O0_S7 needs RSX_O0=1: off\n"); return; }
++    if (!rsx_s7p_init(&g_rsx_s7p, rsx_perf_now, getenv("RSX_O0_S7_PAGE_SAMP"))) { fprintf(stderr, "[s7] RSX_O0_S7: table allocation failed: off\n"); return; }   /* patch 2204: diagnostic, hash one page in N (default 4) in the page report */
++    const char* w = getenv("RSX_O0_S7_WW"); s_s7_ww = w && *w && *w != '0';   /* patch 2204: diagnostic, run the write-watch microprobe report once */
++    const char* wa = getenv("RSX_O0_S7_WW_AT"); if (wa && *wa) s_s7_ww_at = atoi(wa);   /* patch 2204: diagnostic, run second of the write-watch probe report (default 100) */
++    const char* wp = getenv("RSX_O0_S7_WW_PAGES"); if (wp && atoi(wp) > 0) s_s7_ww_pages = (unsigned)atoi(wp);   /* patch 2204: diagnostic, pages per region of the write-watch probe report (default 1280) */
++    g_rsx_gs_s7 = gcm_s7_gs_cb;
++    fprintf(stderr, "[o0] S7 probes on (RSX_O0_S7=1 samp=%d ww=%d at=%ds pages=%u, patch 2204; clock unit %.1f ticks, page hash %.0f ticks)\n",
++            g_rsx_s7p.samp, s_s7_ww, s_s7_ww_at, s_s7_ww_pages, g_rsx_s7p.unit_clock, g_rsx_s7p.unit_hash);
++}
++#ifdef _WIN32
++typedef struct { uint8_t* plain; uint8_t* watched; unsigned pages; LARGE_INTEGER f; void** addrs; } s7_ww_ctx;
++static double s7_ww_now(void* c) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return (double)q.QuadPart * 1e6 / (double)((s7_ww_ctx*)c)->f.QuadPart; }
++static void s7_ww_plain(void* c, unsigned p) { volatile uint8_t* b = ((s7_ww_ctx*)c)->plain + (size_t)p * 4096u; *b = (uint8_t)(*b + 1u); }
++static void s7_ww_watched(void* c, unsigned p) { volatile uint8_t* b = ((s7_ww_ctx*)c)->watched + (size_t)p * 4096u; *b = (uint8_t)(*b + 1u); }
++static void s7_ww_reset(void* c) { s7_ww_ctx* x = (s7_ww_ctx*)c; ResetWriteWatch(x->watched, (SIZE_T)x->pages * 4096u); }
++static unsigned s7_ww_query(void* c)
++{
++    s7_ww_ctx* x = (s7_ww_ctx*)c; ULONG_PTR n = x->pages; ULONG gran = 0;
++    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, x->watched, (SIZE_T)x->pages * 4096u, x->addrs, &n, &gran) != 0) return 0xFFFFFFFFu;
++    return (unsigned)n;
++}
++/* once, on the perf thread: 60 rounds each for dirty fractions 100 % and 25 % on a MEM_WRITE_WATCH region and a plain one */
++static void gcm_s7_ww_probe(double changed_per_flip)
++{
++    s7_ww_ctx x; memset(&x, 0, sizeof x); x.pages = s_s7_ww_pages; QueryPerformanceFrequency(&x.f);
++    x.plain = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)x.pages * 4096u, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++    x.watched = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)x.pages * 4096u, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
++    x.addrs = (void**)malloc((size_t)x.pages * sizeof(void*));
++    if (!x.plain || !x.watched || !x.addrs) { fprintf(stderr, "[s7-ww] allocation failed (pages=%u)\n", x.pages); }
++    else {
++        static const rsx_s7p_ww_ops ops = { s7_ww_now, s7_ww_plain, s7_ww_watched, s7_ww_reset, s7_ww_query };
++        rsx_s7p_ww_res a, b; char ln[768];
++        rsx_s7p_ww_run(&ops, &x, x.pages, 60, 100, &a); rsx_s7p_ww_run(&ops, &x, x.pages, 60, 25, &b);
++        rsx_s7p_fmt_ww(ln, sizeof ln, x.pages, 60, 100, &a, 25, &b, changed_per_flip); fprintf(stderr, "%s\n", ln);
++    }
++    if (x.plain) VirtualFree(x.plain, 0, MEM_RELEASE);
++    if (x.watched) VirtualFree(x.watched, 0, MEM_RELEASE);
++    free(x.addrs);
++}
++#else
++static void gcm_s7_ww_probe(double changed_per_flip) { (void)changed_per_flip; fprintf(stderr, "[s7-ww] not supported on this host (needs Win32 MEM_WRITE_WATCH)\n"); }
++#endif
+ int rsx_perf_o0_on(void)
+ {
+     static int on = -1;
+-    if (on < 0) { on = gcm_env_on("RSX_O0"); if (on) rsx_o0v_init(&g_rsx_o0v, getenv("RSX_O0_VTX_RANGE")); g_rsx_o0.on = on; if (on) { fprintf(stderr, "[o0] O0 live counters on (RSX_O0=1, patch 2188); [o0-vtx] range 0x%08llX..0x%08llX (RSX_O0_VTX_RANGE, patch 2195)\n", g_rsx_o0v.lo, g_rsx_o0v.hi); } }
++    if (on < 0) { on = gcm_env_on("RSX_O0"); if (on) rsx_o0v_init(&g_rsx_o0v, getenv("RSX_O0_VTX_RANGE")); g_rsx_o0.on = on; if (on) { fprintf(stderr, "[o0] O0 live counters on (RSX_O0=1, patch 2188); [o0-vtx] range 0x%08llX..0x%08llX (RSX_O0_VTX_RANGE, patch 2195)\n", g_rsx_o0v.lo, g_rsx_o0v.hi); }
++        gcm_s7_init(on); }
+     return on;
+ }
+ /* Patch 2202: RSX_VIEWS=1, the split-screen per-view counter (rsx_views.h). Walker thread only; the instance lives here beside
+@@ -3456,6 +3516,26 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+                 if (++o0_n % 5 == 0) { rsx_o0_tsrc_top(&g_rsx_o0, ln, sizeof ln, tnow, 8); fprintf(stderr, "%s\n", ln); }
+                 memcpy(&prev, &cur, sizeof prev);
+             }
++            if (g_rsx_s7p.on) {   /* patch 2204: the S7.0 probe lines of this second; counters copied under the probe lock, flips = the flip_n delta */
++                static rsx_s7p_ctr sprev; static rsx_s7p_ext eprev; static unsigned sflip_prev; static long long sfill_prev; static int sww_done; static double s_changed_flip;
++                rsx_s7p_ctr scur; rsx_s7p_ext ecur; char ln[2048];
++                rsx_s7p_lock(&g_rsx_s7p); memcpy(&scur, &g_rsx_s7p.c, sizeof scur); rsx_s7p_unlock(&g_rsx_s7p);
++                scur.clocks = __atomic_load_n(&g_rsx_s7p.c.clocks, __ATOMIC_RELAXED);   /* the walker bumps clocks outside the lock, atomically */
++                rsx_live_draw_s7_ext(&ecur);
++                const unsigned sfn = g_rsx_o0.flip_n; const long long sfl = (long long)(sfn - sflip_prev);
++                const long long fill_now = __atomic_load_n(&g_rsx_split_acc[RSX_SB_FILL], __ATOMIC_RELAXED);
++                static long long s7d_prev; const long long s7d_now = __atomic_load_n(&g_rsx_split_acc[RSX_SB_X_S7], __ATOMIC_RELAXED);
++                const double bucket_ms = rsx_perf_split_on() && sfl > 0 ? (double)(fill_now - sfill_prev) * tk / (double)sfl : 0.0;
++                if (sfl > 0) {   /* a second with no flip prints nothing (the counters keep accumulating into the next period) */
++                    rsx_s7p_fmt_fill(ln, sizeof ln, tnow, tk, sfl, bucket_ms, rsx_perf_split_on() ? (double)(s7d_now - s7d_prev) * tk / (double)sfl : 0.0, &scur, &sprev, g_rsx_s7p.unit_clock, g_rsx_s7p.unit_hash); fprintf(stderr, "%s\n", ln);
++                    rsx_s7p_fmt_bar(ln, sizeof ln, tnow, tk, sfl, &scur, &sprev); fprintf(stderr, "%s\n", ln);
++                    rsx_s7p_fmt_draw(ln, sizeof ln, tnow, sfl, &scur, &sprev, &ecur, &eprev); fprintf(stderr, "%s\n", ln);
++                    rsx_s7p_fmt_page(ln, sizeof ln, tnow, tk, sfl, g_rsx_s7p.samp, &scur, &sprev, &ecur, &eprev); fprintf(stderr, "%s\n", ln);
++                    s_changed_flip = (double)rsx_s7p_est(scur.changed - sprev.changed, g_rsx_s7p.samp) / (double)sfl;
++                    sprev = scur; eprev = ecur; sflip_prev = sfn; sfill_prev = fill_now; s7d_prev = s7d_now;
++                }
++                if (s_s7_ww && !sww_done && tnow >= (double)s_s7_ww_at) { sww_done = 1; gcm_s7_ww_probe(s_changed_flip); }   /* once, before the 141-174 s window by default */
++            }
+             { const int was = s_perf_walk_on;
+               s_perf_walk_on = s_perf_prof_a >= 0 && tnow >= s_perf_prof_a && tnow < s_perf_prof_b;
+               if (was && !s_perf_walk_on) rsx_live_draw_perf_dump(); }   /* patch 2045 */
+@@ -4457,6 +4537,7 @@ static void gcm_rsx_process_fifo_body(void)
+                     u32 v = vm_read32(dea);
+                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
+                     if (g_rsx_fcap_on && m == 0x68u) rsx_fcap_word(0, 8, la, vm_read32(la));   /* patch 2164: the acquire's compare */
++                    if (g_rsx_s7p.on && m == 0x68u) rsx_s7p_acq(&g_rsx_s7p, vm_read32(la) == v, la, v, rsx_perf_now(), s_fifo_getoff);   /* patch 2204: met / unmet acquire, an unmet one opens the held epoch */
+                     { static int sn = 0, recdbg = -1; if (recdbg < 0) recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+                       if (recdbg && PS3_LOG_FIRST(sn, 12))
+                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -1061,6 +1061,7 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
+  * region. */
+ unsigned long long g_rsx_gs_n[RSX_GS_N][2];
+ void (*g_rsx_gs_trace)(unsigned kind, uint32_t ea, uint32_t n, int on_walker);
++void (*g_rsx_gs_s7)(unsigned kind);   /* patch 2204 (S7.0): set by cellGcmSys.c only with RSX_O0_S7=1; called for walker-thread kinds */
+ static
+ #ifdef _MSC_VER
+ __declspec(thread)
+@@ -1075,6 +1076,7 @@ static inline void rsx_gs_count(unsigned kind, uint32_t ea, uint32_t n)
+     const int onw = t_rsx_gs_walker;
+     __atomic_fetch_add(&g_rsx_gs_n[kind < RSX_GS_N ? kind : 0][onw ? 0 : 1], 1ull, __ATOMIC_RELAXED);
+     if (__builtin_expect(g_rsx_gs_trace != NULL, 0)) g_rsx_gs_trace(kind, ea, n, onw);
++    if (__builtin_expect(g_rsx_gs_s7 != NULL, 0) && onw) g_rsx_gs_s7(kind);   /* patch 2204 */
+ }
+ /* patch 2197: a walker-thread signal goes to P while RSX_PUB is on (or a host test hooks the trace). Off the walker thread it never does:
+  * the write happens directly, exactly as before (counted as offr). One load of two globals when RSX_PUB is unset. */
+diff --git a/libs/video/rsx_guest_signal.h b/libs/video/rsx_guest_signal.h
+--- a/libs/video/rsx_guest_signal.h
++++ b/libs/video/rsx_guest_signal.h
+@@ -76,6 +76,8 @@ static inline const rsx_gs_info* rsx_gs_info_of(unsigned k)
+ extern unsigned long long g_rsx_gs_n[RSX_GS_N][2];
+ /* host tests only: called for every funnel call with (kind, ea, n bytes or 0, on_walker); NULL = off */
+ extern void (*g_rsx_gs_trace)(unsigned kind, uint32_t ea, uint32_t n, int on_walker);
++/* patch 2204 (S7.0 probe, RSX_O0_S7=1): called with the kind for every walker-thread funnel call; NULL = off (one pointer test) */
++extern void (*g_rsx_gs_s7)(unsigned kind);
+ 
+ /* The walker pass brackets: the thread is "R" between enter and leave (nesting-safe: leave takes enter's return). */
+ int  rsx_gs_walker_enter(void);
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -21,6 +21,7 @@
+ 
+ #include "rsx_live_draw.h"
+ #include "rsx_o0.h"   /* patch 2188 */
++#include "rsx_s7p.h"   /* patch 2204: S7.0 probes */
+ #include "rsx_views.h"   /* patch 2202 */
+ #include "rsx_guest_signal.h"   /* patch 2190: the guest-signal funnel, defined in rsx_commands.c */
+ /* Patch 2188 (RSX_PERF_SPLIT=1): exclusive buckets, rsx_o0.h. One int test when off. LDS_POP also closes anything opened
+@@ -40,6 +41,7 @@
+ int rsx_live_draw_get_present_geometry(rsx_present_geometry* out)
+ { if (out) memset(out, 0, sizeof *out); return 0; }
+ int  rsx_live_draw_enabled(void) { return 0; }
++void rsx_live_draw_s7_ext(void* o) { if (o) memset(o, 0, sizeof(rsx_s7p_ext)); }   /* patch 2204 */
+ int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
+ { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
+ void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
+@@ -3359,6 +3361,7 @@ static ID3D12Resource* ld_vbd_ib(u32 off, u64 bytes)
+ static void ld_flush_body(ld_flush_reason reason)
+ {
+     g_ld_unsubmitted = 0;
++    if (g_rsx_s7p.on) rsx_s7p_barrier(&g_rsx_s7p, RSX_S7P_CLS_CHUNK, -1);   /* patch 2204: a full flush cuts the fill stream */
+     LDW_T0(submit_t0);
+     LDS_PUSH(s_sub, RSX_SB_SUBMIT);   /* patch 2188 */
+ #if defined(YZ_PERF_PROFILE)
+@@ -3423,6 +3426,7 @@ static void ld_flush_body(ld_flush_reason reason)
+           ld_fx_add(LD_FX_LIST, fx); }
+         ld_fx_frame_end();
+         g.upload_used = 0;
++        if (g_rsx_s7p.on) rsx_s7p_ring_reset(&g_rsx_s7p);   /* patch 2204: ring cursor reset (frame slot) */
+         g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+         g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */ g.smp_ring_used = 0;
+         ld_rb_drain();   /* patch 2027: frame N-1 is done */
+@@ -11443,6 +11447,10 @@ static void fetch_batches(void)
+         }
+ }
+ 
++static int s7_ft_failed;   /* patch 2204: a fetch failure inside the s_ft region (the late fetch_ok = 0) */
++static long long s7_fetch_t;   /* patch 2204: walker only, the fetch ticks of the current draw (read by ld_s7_draw) */
++/* Patch 2204: close the plan/fetch pair of one fetch_batches_hoisted call (s7_t0, s7_tp, s7on are its locals); s7_fetch_t = this draw's fetch ticks */
++#define S7_FT_END() do { if (s7on) { const long long s7_n = rsx_s7p_now(&g_rsx_s7p); rsx_s7p_t_add(&g_rsx_s7p, RSX_S7P_T_PLAN, s7_tp - s7_t0); rsx_s7p_t_add(&g_rsx_s7p, RSX_S7P_T_FETCH, s7_n - s7_tp); s7_fetch_t = s7_n - s7_tp; if (!dc.fetch_ok) s7_ft_failed = 1; } } while (0)
+ static void fetch_batches_hoisted(
+     const rsx_vertex_layout_plan* layout, int packed_payload)
+ {
+@@ -11541,6 +11549,8 @@ static void fetch_batches_hoisted(
+     LDW_ADD(RSX_PERF_W_VTX_REMAP_T, remap_t0);
+     LDW_T0(fetch_t0);
+     LDS_PUSH(s_ft, RSX_SB_FILL);   /* patch 2188 */
++    const int s7on = g_rsx_s7p.on; long long s7_t0 = 0, s7_tp = 0;   /* patch 2204: plan (to s7_tp) and fetch (after) ticks */
++    if (s7on) { s7_fetch_t = 0; s7_ft_failed = 0; s7_t0 = rsx_s7p_now(&g_rsx_s7p); }
+     dc.layout = *layout;
+     rsx_vertex_fetch_plan_init(
+         &dc.fetch_plan, &g.rsx, layout,
+@@ -11552,14 +11562,17 @@ static void fetch_batches_hoisted(
+         if (dc.fetch_plan.attr[attr].desc.frequency >= 2)
+             g_ld_divider_fetches += dc.n_refs;
+     }
++    if (s7on) s7_tp = rsx_s7p_now(&g_rsx_s7p);   /* patch 2204 */
+     if (packed_payload && ld_vtx_gpu_on()) {   /* patch 2076 */
+         const int why = rsx_vg_plan(&dc.fetch_plan, g_vg.max_block, &dc.vg_d);
++        if (s7on) s7_tp = rsx_s7p_now(&g_rsx_s7p);   /* patch 2204: rsx_vg_plan is plan time */
+         if (why == RSX_VG_OK && reserve_compact_vertices((u64)dc.n_refs * 4u)) {
+             u32* out = (u32*)dc.compact_verts;
+             for (u32 i = 0; i < dc.n_refs; i++) out[i] = rsx_vg_element(&dc.refs[i]);
+             dc.vg = 1;
+             g_vg.draws++; g_vg.verts += dc.n_refs; g_vg.block_bytes += dc.vg_d.block_bytes;
+             dc.n_verts = dc.n_refs;
++            S7_FT_END();
+             LDS_POP(s_ft);
+             if (fetch_t0) {
+                 LDW_ADD(RSX_PERF_W_VTX_FETCH_T, fetch_t0);
+@@ -11574,13 +11587,13 @@ static void fetch_batches_hoisted(
+     if (packed_payload) {
+         const u64 required = (u64)dc.n_refs * layout->stride;
+         if (!reserve_compact_vertices(required)) {
+-            dc.fetch_ok = 0;
++            dc.fetch_ok = 0; S7_FT_END();
+             return;
+         }
+         if (ld_vtx_batch_on() && layout->stride) {   /* KZ3 patch 2040 */
+             if (!rsx_vertex_fetch_many(
+                     &dc.fetch_plan, dc.refs, dc.n_refs, dc.compact_verts)) {
+-                dc.fetch_ok = 0;
++                dc.fetch_ok = 0; S7_FT_END();
+                 return;
+             }
+         } else
+@@ -11589,7 +11602,7 @@ static void fetch_batches_hoisted(
+                 ? dc.compact_verts + (u64)i * layout->stride : NULL;
+             if (!rsx_vertex_fetch_one(
+                     &dc.fetch_plan, &dc.refs[i], destination)) {
+-                dc.fetch_ok = 0;
++                dc.fetch_ok = 0; S7_FT_END();
+                 return;
+             }
+         }
+@@ -11600,7 +11613,7 @@ static void fetch_batches_hoisted(
+          * writes exactly the original attribute*16 byte offsets.
+          */
+         if (!reserve_legacy_vertices(dc.n_refs)) {
+-            dc.fetch_ok = 0;
++            dc.fetch_ok = 0; S7_FT_END();
+             return;
+         }
+         /* Legacy treats an absent ATTR0 as a failed group, even though other
+@@ -11608,19 +11621,20 @@ static void fetch_batches_hoisted(
+         if (dc.n_refs &&
+             (!dc.fetch_plan.attr[0].desc.type ||
+              !dc.fetch_plan.attr[0].desc.size)) {
+-            dc.fetch_ok = 0;
++            dc.fetch_ok = 0; S7_FT_END();
+             return;
+         }
+         for (u32 i = 0; i < dc.n_refs; i++) {
+             if (!rsx_vertex_fetch_one(
+                     &dc.fetch_plan, &dc.refs[i],
+                     (u8*)&dc.verts[i])) {
+-                dc.fetch_ok = 0;
++                dc.fetch_ok = 0; S7_FT_END();
+                 return;
+             }
+         }
+     }
+     dc.n_verts = dc.n_refs;
++    S7_FT_END();
+     LDS_POP(s_ft);
+     if (fetch_t0) {
+         LDW_ADD(RSX_PERF_W_VTX_FETCH_T, fetch_t0);
+@@ -11701,6 +11715,14 @@ static const char* const g_vdp_name[VDP_N] = { "key", "evict", "valid", "ring",
+     "fill-malloc", "fill-src", "fill-stage", "fill-queue", "fill-drop", "idx" };
+ static long long g_vdp[VDP_N];
+ static u64 g_vdp_src_bytes, g_vdp_src_n;
++/* Patch 2204: cumulative device-cache counters for [s7-draw] / [s7-page] (perf thread; plain u64 reads, as the other reporters) */
++void rsx_live_draw_s7_ext(void* out)
++{
++    rsx_s7p_ext* e = (rsx_s7p_ext*)out;
++    e->dev_fills = (long long)g_vc_st.dev_fills; e->dev_fill_B = (long long)g_vc_st.dev_fill_bytes; e->dyn_skip = (long long)g_vc_st.dyn_skip;
++    e->inval_dyn = (long long)g_vc_st.inval_content_dyn; e->inel_main_verts = (long long)g_vc_st.inel_main_verts;
++    e->src_snap_B = (long long)g_vdp_src_bytes; e->dev_frees = (long long)g_vc_st.dev_frees;
++}
+ static int g_vdp_on = -1;
+ static int ld_vdp_on(void) { if (g_vdp_on < 0) g_vdp_on = getenv("LD_VTX_DEV_PROF") && getenv("LD_VTX_DEV_PROF")[0] == '1'; return g_vdp_on; }
+ #define VDP_T0(name) const long long name = g_vdp_on > 0 ? rsx_perf_now() : 0
+@@ -11998,6 +12020,63 @@ static unsigned ld_o0v_spans(rsx_o0v_span* out, unsigned* nospan)
+     return ns;
+ }
+ 
++/* Patch 2204 (RSX_O0_S7=1): the spans of ld_o0v_spans (same arithmetic, same order) plus the host pointer of each attribute span:
++ * stable_base is the element stable_first, so it is the byte at `off`. Never g.guest_ptr (it would drain 2185 stores). The index
++ * span has no host pointer here (src NULL: its pages are counted, not hashed). */
++static unsigned ld_s7_spans(rsx_s7p_span* out, unsigned* nospan)
++{
++    unsigned ns = 0; *nospan = 0;
++    if (dc.n_idx) {
++        rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
++        const u32 esz = ia.is_u32 ? 4u : 2u;
++        u64 lo = ~0ull, hi = 0;
++        for (u32 i = 0; i < dc.n_idx; i++) {
++            if (!dc.idx[i].count) continue;
++            const u64 a = (u64)ia.offset + (u64)dc.idx[i].first * esz, b = a + (u64)dc.idx[i].count * esz;
++            if (a < lo) lo = a;
++            if (b > hi) hi = b;
++        }
++        if (hi > lo && hi <= 0x100000000ull && ia.location <= 1u) { out[ns].loc = ia.location; out[ns].off = (u32)lo; out[ns].len = (u32)(hi - lo); out[ns].src = NULL; ns++; }
++    }
++    for (u32 slot = 0; slot < dc.layout.count; slot++) {
++        const rsx_vertex_fetch_attr* f = &dc.fetch_plan.attr[dc.layout.attrs[slot]];
++        if (!f->desc.type || !f->desc.size) continue;
++        if (!f->stable_base || f->desc.location > 1u || ns >= RSX_S7P_SPANS) { (*nospan)++; continue; }
++        const u64 a = (u64)dc.fetch_plan.base_offset + f->desc.offset + (u64)f->stable_first * f->stride;
++        const u64 b = (u64)dc.fetch_plan.base_offset + f->desc.offset + (u64)f->stable_last * f->stride + f->elem_size;
++        if (b > 0x100000000ull || b <= a) { (*nospan)++; continue; }
++        out[ns].loc = f->desc.location; out[ns].off = (u32)a; out[ns].len = (u32)(b - a); out[ns].src = f->stable_base; ns++;
++    }
++    return ns;
++}
++
++/* Patch 2204: the draw hook of the S7.0 probes (called only with RSX_O0_S7=1, after LDS_POP(s_vc), so its own cost is outside
++ * the FILL bucket, inside the X_S7 split bucket). Fill draws: the 2076 reason from a local rsx_vg_plan (pure on the plan: it writes only its output, so
++ * dc.vg_d and g_vg stay untouched). A held acquire is checked with one load of the label (vm_read32, no guest_ptr). */
++static void ld_s7_draw(const ld_vc_entry* vc_hit, int vd_hit, u64 payload_B, u64 vb_B, u64 ib_B, long long t_ring, long long t_idx)
++{
++    extern uint32_t vm_read32(uint64_t);
++    rsx_s7p_draw_in di; memset(&di, 0, sizeof di);
++    di.ep = g_rsx_o0.flip_n; di.vc_hit = vc_hit != NULL; di.vg_reason = -1;
++    if (vc_hit) {
++        for (u32 i = 0; i < vc_hit->n_spans && di.n_spans < RSX_S7P_SPANS; i++) {
++            di.sp[di.n_spans].loc = vc_hit->spans[i].loc; di.sp[di.n_spans].off = vc_hit->spans[i].off;
++            di.sp[di.n_spans].len = vc_hit->spans[i].len; di.sp[di.n_spans].src = NULL; di.n_spans++;
++        }
++    } else {
++        di.n_spans = ld_s7_spans(di.sp, &di.nospan);
++        if (ld_vertex_compact_payload() || ld_vertex_hoist_fetch()) {
++            rsx_vg_draw lvg;
++            di.vg_reason = rsx_vg_plan(&dc.fetch_plan, g_vg.max_block ? g_vg.max_block : (8u << 20), &lvg);
++        }
++        di.refs = dc.n_refs; di.payload_B = payload_B; di.t_fetch = s7_fetch_t;
++        di.vb_B = vd_hit ? 0 : vb_B; di.ib_B = vd_hit ? 0 : ib_B;
++    }
++    di.t_ring = t_ring; di.t_idx = t_idx; di.now = rsx_s7p_now(&g_rsx_s7p);
++    if (g_rsx_s7p.held_open) di.held_eq = vm_read32(g_rsx_s7p.held_la) == g_rsx_s7p.held_v;
++    if (g_rsx_s7p.on) rsx_s7p_draw(&g_rsx_s7p, &di);
++}
++
+ static void ld_vd_free_block(ld_vc_entry* e)   /* patch 2092 */
+ {
+     ld_vd_release(e->dev_off, e->dev_len); g_vc_st.dev_frees++;
+@@ -12793,6 +12872,7 @@ static int ld_movie_composite_ui_enabled(void)
+ 
+ static void ld_movie_reset_rings(void)
+ {
++    if (g_rsx_s7p.on) rsx_s7p_ring_reset(&g_rsx_s7p);   /* patch 2204: ring cursor reset (movie) */
+     g.vb_used = 0;
+     g.ib_used = 0;
+     g.cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+@@ -14532,6 +14612,7 @@ static int ld_submit_chunk(void)
+ static void ld_submit_nowait(void)
+ {
+     if (!g.ready || !g_ld_unsubmitted || g_oq.open) return;
++    if (g_rsx_s7p.on) rsx_s7p_barrier(&g_rsx_s7p, RSX_S7P_CLS_CHUNK, -1);   /* patch 2204: a chunk submit cuts the fill stream */
+     LDW_T0(t0);
+     LDS_PUSH(s_sub2, RSX_SB_SUBMIT);   /* patch 2188 */
+     ld_gt_close();   /* patch 2052 */
+@@ -15043,6 +15124,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     LDS_PUSH(s_vp, RSX_SB_VPLAN);   /* patch 2188 */
+     ld_vc_entry* vc_hit = NULL; ld_vc_entry* vc_fill = NULL; int vc_verify = 0;   /* patch 2047 */
+     const int o0v_on = g_rsx_o0.on;   /* patch 2195 */
++    const int s7on = g_rsx_s7p.on; if (s7on) { s7_fetch_t = 0; s7_ft_failed = 0; }   /* patch 2204 */
+     long long o0v_hash = 0, o0v_conv = 0, o0v_up = 0; u64 o0v_hashb = 0;
+     if (ld_vertex_compact_payload() && ld_vc_mode() && !ld_vtx_gpu_on()) {   /* 2076: no payload to cache */
+         const long long o0v_t = o0v_on ? rsx_perf_now() : 0; const u64 o0v_c0 = g_vc_st.cmp_bytes;
+@@ -15074,6 +15156,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     g_ld_profile.total.vertex_fetch_pack_qpc +=
+         (u64)(ld_profile_qpc() - fetch_pack_begin);
+ #endif
++    if (s7on && !vc_hit && s7_ft_failed) rsx_s7p_late_fail(&g_rsx_s7p);   /* patch 2204: the late fetch_ok = 0 (four sites in rsx_vertex_fetch_many, caller side) */
+     if (!dc.n_verts || !dc.fetch_ok) { g_ld_stats.group_drop_fetch++; return; }
+ 
+     /* Preserve validated occurrence order while allowing repeated compact
+@@ -15124,6 +15207,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+          * safe to submit/wait and reuse every transient draw ring here.
+          */
+         ld_flush(LD_FLUSH_VERTEX_RING);
++        if (g_rsx_s7p.on) rsx_s7p_ring_reset(&g_rsx_s7p);   /* patch 2204: ring cursor reset (vertex ring overflow) */
+         g.vb_used = 0;
+         g.ib_used = 0;
+         g.cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+@@ -15134,6 +15218,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     LDW_T0(vcopy_t0);
+     LDS_PUSH(s_vc, RSX_SB_FILL);   /* patch 2188 */
+     const long long o0v_u0 = o0v_on ? rsx_perf_now() : 0;   /* patch 2195 */
++    long long s7_u0 = 0, s7_idx = 0, s7_i0 = 0;   /* patch 2204: ring+index ticks, index part */
++    if (s7on) s7_u0 = rsx_s7p_now(&g_rsx_s7p);
+     if (vc_fill && !vc_hit) g_vc_st.miss_bytes += draw_vb_bytes + draw_ib_bytes;   /* patch 2092 */
+     if (vc_hit) g_vc_st.hit_draw_bytes += draw_vb_bytes + draw_ib_bytes;
+     g_vc_st.all_bytes += draw_vb_bytes + draw_ib_bytes; g_vc_st.all_draws++;
+@@ -15151,17 +15237,23 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     if (vd_hit) {
+         /* patch 2092: bound below */
+     } else if (vc_hit) {   /* patch 2047 */
++        if (s7on) s7_i0 = rsx_s7p_now(&g_rsx_s7p);   /* patch 2204 */
+         if (indexed && draw_ib_bytes)
+             memcpy((u8*)g.ib_mapped + g.ib_used, vc_hit->data + vc_hit->vb_bytes, (size_t)draw_ib_bytes);
++        if (s7on) s7_idx = rsx_s7p_now(&g_rsx_s7p) - s7_i0;   /* patch 2204 */
+     } else if (vc_fill && dc.fetch_ok)
+         ld_vc_after_fetch(vc_fill, vc_verify, prim, vertex_data, (u32)draw_vb_bytes, (u32)draw_ib_bytes, n_tri,
+                           indexed, (u32*)((u8*)g.ib_mapped + g.ib_used));
+     else if (indexed) {
+         VDP_T0(ix_t0);   /* patch 2093 */
++        if (s7on) s7_i0 = rsx_s7p_now(&g_rsx_s7p);   /* patch 2204 */
+         write_topology_indices(
+             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
++        if (s7on) s7_idx = rsx_s7p_now(&g_rsx_s7p) - s7_i0;   /* patch 2204 */
+         VDP_ADD(VDP_IDX, ix_t0);
+     }
++    long long s7_ring = 0;   /* patch 2204: ring copy + vc fill without the index write, closed before the 2195 hook */
++    if (s7on) s7_ring = rsx_s7p_now(&g_rsx_s7p) - s7_u0 - s7_idx;
+     if (o0v_on) {   /* patch 2195: [o0-vtx] classify this draw by its source spans and charge the three stages */
+         o0v_up = rsx_perf_now() - o0v_u0;
+         rsx_o0v_span o0v_sp[RSX_O0V_SPANS]; unsigned o0v_nos = 0, o0v_ns = 0;
+@@ -15175,6 +15267,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                      vd_hit ? 0 : (long long)(draw_vb_bytes + draw_ib_bytes));
+     }
+     LDS_POP(s_vc);
++    if (s7on) {   /* patch 2204: outside the FILL bucket, and in its own split bucket (X_S7, folded into `other`, printed as s7draw_ms in [s7-fill]) so its hashing and lock cost do not land in whatever bucket is open */
++        LDS_PUSH(s_s7, RSX_SB_X_S7);
++        ld_s7_draw(vc_hit, vd_hit, draw_payload_bytes, draw_vb_bytes, draw_ib_bytes, s7_ring, s7_idx);
++        LDS_POP(s_s7);
++    }
+     LDW_ADD(RSX_PERF_W_VTX_T, vcopy_t0);
+     LDW_ADD(RSX_PERF_W_VTX_COPY_T, vcopy_t0);   /* patch 2033 */
+ 
+@@ -15232,7 +15329,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     u32 ps_cb_offset = 0;
+     LDW_T0(pcb_t0);
+     LDS_PUSH(s_pcb, RSX_SB_FILL);   /* patch 2188: constant ring upload = ring copy */
++    long long s7_p0 = 0; if (s7on) s7_p0 = rsx_s7p_tm_begin(&g_rsx_s7p);   /* patch 2204 */
+     const int pcb_ok = ld_upload_pixel_constants(&ps_cb_offset);
++    if (s7on) rsx_s7p_tm_end(&g_rsx_s7p, RSX_S7P_T_PCB, s7_p0);   /* patch 2204 */
+     LDS_POP(s_pcb);
+     LDW_ADD(RSX_PERF_W_CONST_T, pcb_t0);
+     if (!pcb_ok) {
+@@ -16099,6 +16198,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     int cb_reused = 0;
+     LDW_T0(vcb_t0);
+     LDS_PUSH(s_vcb, RSX_SB_FILL);   /* patch 2188 */
++    long long s7_v0 = 0; if (s7on) s7_v0 = rsx_s7p_tm_begin(&g_rsx_s7p);   /* patch 2204 */
+     if (ld_cb_reuse() && ld_cbr_can_reuse(&g_ld_cbr, g.cb_used, CB_BLOCK_ALIGNED, g.rsx.const_gen, xf, sizeof(xf))) {
+         cb_slot = g_ld_cbr.off; cb_reused = 1;   /* patch 2148: the slot already holds these bytes */
+     } else {
+@@ -16107,6 +16207,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         memcpy(cbdst + 512 * 16, xf, sizeof(xf));
+         ld_cbr_filled(&g_ld_cbr, g.cb_used, g.rsx.const_gen, xf, sizeof(xf));
+     }
++    if (s7on) rsx_s7p_tm_end(&g_rsx_s7p, RSX_S7P_T_VCB, s7_v0);   /* patch 2204 */
+     LDS_POP(s_vcb);
+     LDW_ADD(RSX_PERF_W_CONST_T, vcb_t0);
+     if (rsx_perf_walk_on()) rsx_perf_add(cb_reused ? RSX_PERF_W_CB_REUSE_N : RSX_PERF_W_CB_COPY_N, 1);
+@@ -20882,6 +20983,7 @@ static void ld_present_body(u32 buffer_id)
+ #endif
+ 
+     /* new frame: reset per-frame ring cursors */
++    if (g_rsx_s7p.on) rsx_s7p_ring_reset(&g_rsx_s7p);   /* patch 2204: ring cursor reset (new frame) */
+     g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0; ld_cbr_invalidate(&g_ld_cbr);
+     g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */ g.smp_ring_used = 0;
+     ld_rm_clear_slot(g.fr_cur);   /* patch 2153 */
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -346,6 +346,7 @@ void      rsx_live_draw_perf_dump(void);       /* patch 2045: [perf-redecode] wh
+ void      rsx_live_draw_submit_pending(void);  /* patch 2029: submit recorded work, no wait */
+ int       rsx_perf_enabled(void);
+ long long rsx_perf_now(void);                  /* QPC ticks */
++void rsx_live_draw_s7_ext(void* out);          /* patch 2204: fills a rsx_s7p_ext (rsx_s7p.h) with the device-cache counters; zeros off Windows */
+ void      rsx_perf_add(int idx, long long v);  /* no-op unless RSX_PERF=1 */
+ int       rsx_perf_on_gcm_thread(void);        /* caller is the cellGcmInit thread */
+ unsigned long long rsx_perf_draws(void);       /* live-draw groups executed so far */
+diff --git a/libs/video/rsx_o0.h b/libs/video/rsx_o0.h
+--- a/libs/video/rsx_o0.h
++++ b/libs/video/rsx_o0.h
+@@ -35,6 +35,7 @@ enum {
+     RSX_SB_X_SEMA,         /* NV406E semaphore commands (the write-back inside them is WB) */
+     RSX_SB_X_FLIPW,        /* the in-FIFO 0xFEADxxxx flip word */
+     RSX_SB_X_WAITO,        /* fence waits of flushes that are not readbacks */
++    RSX_SB_X_S7,           /* patch 2204: the S7.0 draw hook ld_s7_draw (RSX_O0_S7=1); folds into `other`, printed as s7draw_ms in [s7-fill] */
+     RSX_SB_N
+ };
+ #define RSX_SPLIT_DEPTH 24
+diff --git a/libs/video/rsx_s7p.h b/libs/video/rsx_s7p.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_s7p.h
+@@ -0,0 +1,532 @@
++/* KZ3 patch 2204 (S7.0 probes, RSX_O0=1 + RSX_O0_S7=1): measurement only, no behaviour change.
++ * Pure C11 (stdint/stdio/stdlib/string only; no platform headers, no SIMD, no asm). The walker hooks live in
++ * rsx_live_draw.c, rsx_commands.c (through a function pointer) and cellGcmSys.c; every hook is `if (on)`.
++ * Docs: the RE notes "S7.0 probes". Times are ticks of the injected clock; the formatters take the
++ * tick factor tk (ms per tick). All counters are monotonic; a period is the difference of two copies.
++ * RSX_S7P_TEST_FAULT=N (host-test control builds only) breaks one rule on purpose, N = 1..11. */
++#ifndef RSX_S7P_H
++#define RSX_S7P_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define RSX_S7P_BINS 24             /* log2 histogram bins */
++#define RSX_S7P_EP_TAB 65536u       /* distinct pages per flip: 32768 max, then ovf */
++#define RSX_S7P_EP_MAX 32768u
++#define RSX_S7P_PE_TAB 65536u
++#define RSX_S7P_RF_TAB 4096u
++#define RSX_S7P_SPANS 16
++#define RSX_S7P_NKIND 18
++
++enum { RSX_S7P_CLS_NONE = 0, RSX_S7P_CLS_CHUNK, RSX_S7P_CLS_GATE, RSX_S7P_CLS_GET };
++enum { RSX_S7P_TR_CHUNK = 0, RSX_S7P_TR_NARROW, RSX_S7P_TR_ALL, RSX_S7P_NTR };
++enum { RSX_S7P_T_PLAN = 0, RSX_S7P_T_FETCH, RSX_S7P_T_RING, RSX_S7P_T_IDX, RSX_S7P_T_VCB, RSX_S7P_T_PCB, RSX_S7P_NT };
++/* vg reasons, the order of rsx_vtx_gpu.h (RSX_VG_OK, NO_INPUTS, DIVIDED, UNMAPPED, TYPE, BIG) */
++#define RSX_S7P_NVG 6
++
++/* by_kind order (the print order); names are the funnel names of rsx_guest_signal.h */
++static const char* const rsx_s7p_kind_name[RSX_S7P_NKIND] = {
++    "label", "ref", "report", "sem_be", "copy0039", "copy3089", "store308a", "surf_wb", "wbd_drain", "flip", "usercmd",
++    "present", "notify", "get_jump", "get_rel", "get_end", "report_rb", "resync_label" };
++static inline int rsx_s7p_kind_by_name(const char* nm)
++{
++    if (!nm) return -1;
++    for (int i = 0; i < RSX_S7P_NKIND; i++) if (!strcmp(nm, rsx_s7p_kind_name[i])) return i;
++    return -1;   /* ring_jump, ctx_word, put_recycle, ref_push, report_local: not barriers of this probe */
++}
++static inline int rsx_s7p_kind_class(int kind) { return kind < 0 ? RSX_S7P_CLS_NONE : kind >= 13 && kind <= 15 ? RSX_S7P_CLS_GET : RSX_S7P_CLS_GATE; }
++
++typedef struct { unsigned loc, off, len; const uint8_t* src; } rsx_s7p_span;   /* src: host bytes at `off`, or NULL */
++typedef struct {
++    unsigned ep;                    /* flip number */
++    int vc_hit; unsigned nospan;    /* nospan: attributes without a stable base (inline_nostable when > 0 on a fill) */
++    int vg_reason;                  /* -1 not computed, else 0..5 */
++    unsigned n_spans; rsx_s7p_span sp[RSX_S7P_SPANS];
++    uint64_t refs, vb_B, ib_B, payload_B;
++    long long t_fetch, t_ring, t_idx, now;   /* this draw's fetch/ring/idx ticks (movable time), clock now */
++    int held_eq;                    /* a hold is open and its label now equals the acquired value */
++} rsx_s7p_draw_in;
++
++typedef struct { long long joins, idle, ovl, hist[RSX_S7P_BINS]; } rsx_s7p_trc;
++typedef struct {
++    long long t[RSX_S7P_NT];
++    long long draws, fills, hits, refs, refs_B, clocks, hashed;
++    long long chunks, ring_resets, reuse_barriers, disjoint_barriers, get_only_cuts;
++    rsx_s7p_trc tr[RSX_S7P_NTR];
++    long long by_kind[RSX_S7P_NKIND];
++    long long fills_loc[2], hits_loc[2], inline_nostable, inline_late, vg[RSX_S7P_NVG];
++    long long vb_B, ib_B, payload_B, span_B, size_hist[RSX_S7P_BINS], refs_hist[RSX_S7P_BINS], miss_n, refill_main;
++    long long read_loc[2], same, changed, newp, shape, hit_nohash, acq_met, acq_unmet, held_draws, held_pages, held_ticks, ovf;
++} rsx_s7p_ctr;
++
++typedef struct { uint64_t key; uint32_t f, nar_ep, hold; uint8_t hashed; } rsx_s7p_ep;   /* f = flip + 1 */
++typedef struct { uint64_t key, hash; uint32_t f; uint16_t lo, len; } rsx_s7p_pe;
++
++typedef struct {
++    int on, samp;
++    long long (*clock)(void);
++    volatile int lock;
++    double unit_clock, unit_hash;   /* ticks per clock call, per 4096-byte hash (cold buffer, rsx_s7p_measure_cold; hot 4 KiB if cold_hash is 0) */
++    int cold_hash;
++    rsx_s7p_ctr c;
++    /* tables */
++    rsx_s7p_ep* ep; rsx_s7p_pe* pe; uint64_t* rf; unsigned ep_n, rf_n;
++    unsigned cur_ep; int have_ep;
++    /* trackers (walker only, under the lock) */
++    struct { long long n, m, last; } tr[RSX_S7P_NTR];
++    uint32_t nar_ep; int reuse_flag;
++    /* hold */
++    int held_open; uint32_t held_la, held_v, hold_id; long long held_t0;
++    int acq_key_valid; uint32_t acq_pos, acq_la, acq_v;   /* the last unmet acquire (re-poll dedup) */
++    int misuse; int tm_open;   /* timer nesting misuse counter / open flag */
++} rsx_s7p;
++
++static inline void rsx_s7p_lock(rsx_s7p* s) { while (__atomic_exchange_n(&s->lock, 1, __ATOMIC_ACQUIRE)) { } }
++static inline void rsx_s7p_unlock(rsx_s7p* s) { __atomic_store_n(&s->lock, 0, __ATOMIC_RELEASE); }
++
++static inline uint64_t rsx_s7p_fnv(const uint8_t* p, unsigned n)
++{
++    uint64_t h = 1469598103934665603ull; unsigned i = 0;
++    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 1099511628211ull; }
++    for (; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
++    return h;
++}
++static inline int rsx_s7p_bin(uint64_t n) { int b = 0; while (n > 1 && b < RSX_S7P_BINS - 1) { n >>= 1; b++; } return b; }
++static inline long long rsx_s7p_bin_ub(int b) { return (1ll << (b + 1)) - 1; }
++static inline long long rsx_s7p_pct(const long long* c, const long long* p, int pct)
++{
++    long long tot = 0; for (int i = 0; i < RSX_S7P_BINS; i++) tot += c[i] - (p ? p[i] : 0);
++    if (tot <= 0) return 0;
++    long long cum = 0, need = (tot * pct + 99) / 100;
++    for (int i = 0; i < RSX_S7P_BINS; i++) { cum += c[i] - (p ? p[i] : 0); if (cum >= need) return rsx_s7p_bin_ub(i); }
++    return rsx_s7p_bin_ub(RSX_S7P_BINS - 1);
++}
++/* sample factor: sampled pages x samp = the estimate (samp 0 = no hashing = 0) */
++static inline long long rsx_s7p_est(long long sampled, int samp)
++{
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 4
++    (void)samp; return sampled;
++#else
++    return samp > 0 ? sampled * samp : 0;
++#endif
++}
++static inline int rsx_s7p_sampled(uint64_t key, int samp)
++{
++    if (samp <= 0) return 0;
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 10
++    return (int)(((key * 0x9E3779B97F4A7C15ull) >> 58) % (unsigned)samp) == 0;   /* fault 10: the old 6-bit modulo, biased for samp not a power of two */
++#else
++    /* multiply-shift on the top 32 hash bits: h32 * samp >> 32 is uniform over 0..samp-1 for any samp, so "== 0" selects 1/samp of the
++     * pages to within 2^-32 (a modulo of 6 bits was exact only for powers of two: samp 7 sampled 15.6 % instead of 14.3 %) */
++    const uint64_t h32 = (key * 0x9E3779B97F4A7C15ull) >> 32;
++    return ((h32 * (uint64_t)(unsigned)samp) >> 32) == 0;
++#endif
++}
++
++/* clocks is bumped with an atomic add (the perf thread copies c under the lock, the walker bumps it outside the lock: a plain ++ was a data race) */
++static inline long long rsx_s7p_now(rsx_s7p* s) { __atomic_fetch_add(&s->c.clocks, 1, __ATOMIC_RELAXED); return s->clock ? s->clock() : 0; }
++
++/* Cold unit cost of one 4096-byte hash. A 4 KiB buffer hashed 64 times stays in L1, so it understates what a draw pays reading
++ * guest memory that is not in cache. The buffer here is RSX_S7P_COLD_PAGES pages (32 MiB, beyond the L2/L3 of the target CPUs),
++ * written once, then every page is hashed once in a stride order (an odd stride visits each page exactly once, and defeats the
++ * sequential prefetcher across pages). The result is ticks per page. */
++#define RSX_S7P_COLD_PAGES 8192u   /* power of two (the stride must be coprime to it) */
++static inline unsigned rsx_s7p_cold_page(unsigned i, unsigned pages)
++{
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 9
++    return (unsigned)(((uint64_t)i * 4096u) % pages);   /* fault 9: an even stride, visits only two pages */
++#else
++    return (unsigned)(((uint64_t)i * 4999u) % pages);
++#endif
++}
++static inline double rsx_s7p_measure_cold(long long (*clock)(void), const uint8_t* buf, unsigned pages)
++{
++    volatile uint64_t sink = 0; uint64_t acc = 0;
++    const long long a = clock();
++    for (unsigned i = 0; i < pages; i++) acc += rsx_s7p_fnv(buf + (size_t)rsx_s7p_cold_page(i, pages) * 4096u, 4096);
++    const long long b = clock();
++    sink = acc; (void)sink;
++    return pages ? (double)(b - a) / (double)pages : 0.0;
++}
++
++/* init: parse the sample factor, allocate the tables, measure the unit costs. env_samp NULL/"" = 4. 1 = ok. */
++static inline int rsx_s7p_init(rsx_s7p* s, long long (*clock)(void), const char* env_samp)
++{
++    memset(s, 0, sizeof *s);
++    s->clock = clock; s->samp = 4;
++    if (env_samp && *env_samp) { char* e = NULL; long v = strtol(env_samp, &e, 0); if (e != env_samp && !*e && v >= 0 && v <= 4096) s->samp = (int)v; }
++    s->ep = (rsx_s7p_ep*)calloc(RSX_S7P_EP_TAB, sizeof *s->ep);
++    s->pe = (rsx_s7p_pe*)calloc(RSX_S7P_PE_TAB, sizeof *s->pe);
++    s->rf = (uint64_t*)calloc(RSX_S7P_RF_TAB, sizeof *s->rf);
++    if (!s->ep || !s->pe || !s->rf) { free(s->ep); free(s->pe); free(s->rf); s->ep = NULL; s->pe = NULL; s->rf = NULL; return 0; }
++    if (clock) {
++        static uint8_t buf[4096]; volatile uint64_t sink = 0;
++        long long a = clock(); for (int i = 0; i < 10000; i++) (void)clock();
++        long long b = clock(); s->unit_clock = (double)(b - a) / 10000.0;
++        a = clock(); for (int i = 0; i < 64; i++) sink += rsx_s7p_fnv(buf, 4096) + (uint64_t)i;
++        b = clock(); s->unit_hash = (double)(b - a) / 64.0; (void)sink;   /* the hot fallback (only when the cold buffer cannot be allocated) */
++        uint8_t* cold = (uint8_t*)malloc((size_t)RSX_S7P_COLD_PAGES * 4096u);
++        if (cold) { memset(cold, 0x5A, (size_t)RSX_S7P_COLD_PAGES * 4096u); s->unit_hash = rsx_s7p_measure_cold(clock, cold, RSX_S7P_COLD_PAGES); s->cold_hash = 1; free(cold); }
++    }
++    s->on = 1; s->c.clocks = 0;
++    return 1;
++}
++static inline void rsx_s7p_free(rsx_s7p* s) { free(s->ep); free(s->pe); free(s->rf); s->ep = NULL; s->pe = NULL; s->rf = NULL; s->on = 0; }
++
++/* ---- fill timers: begin/end pairs; walker thread; misuse (end without begin, begin while open) is counted ---- */
++static inline long long rsx_s7p_tm_begin(rsx_s7p* s)
++{
++    if (s->tm_open) s->misuse++;
++    s->tm_open = 1; return rsx_s7p_now(s);
++}
++static inline void rsx_s7p_tm_end(rsx_s7p* s, int which, long long t0)
++{
++    if (!s->tm_open) { s->misuse++; return; }
++    s->tm_open = 0;
++    const long long d = rsx_s7p_now(s) - t0;
++    rsx_s7p_lock(s); s->c.t[which] += d; rsx_s7p_unlock(s);
++}
++/* ticks measured by the caller (plan/fetch pair) */
++static inline void rsx_s7p_t_add(rsx_s7p* s, int which, long long ticks)
++{
++    rsx_s7p_lock(s); s->c.t[which] += ticks; rsx_s7p_unlock(s);
++}
++
++/* ---- barriers ---- */
++static inline void s7p_cut(rsx_s7p* s, int ti, int count_idle)
++{
++    rsx_s7p_trc* ct = &s->c.tr[ti];
++    if (s->tr[ti].n > 0
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 5
++        || 1
++#endif
++    ) {
++        ct->joins++;
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 6
++        ct->ovl += s->tr[ti].m;
++#else
++        ct->ovl += s->tr[ti].m - s->tr[ti].last;
++#endif
++        ct->hist[rsx_s7p_bin((uint64_t)s->tr[ti].n)]++;
++    } else if (count_idle) ct->idle++;
++    s->tr[ti].n = s->tr[ti].m = s->tr[ti].last = 0;
++}
++/* cls: CHUNK (a command-list submit), GATE (guest-visible C event that gates fills), GET. kind: by_kind slot or -1. */
++static inline void rsx_s7p_barrier(rsx_s7p* s, int cls, int kind)
++{
++    if (cls == RSX_S7P_CLS_NONE) return;
++    rsx_s7p_lock(s);
++    if (cls == RSX_S7P_CLS_CHUNK) s->c.chunks++;
++    if (cls != RSX_S7P_CLS_CHUNK && kind >= 0 && kind < RSX_S7P_NKIND) {
++        if (cls == RSX_S7P_CLS_GATE && s->tr[RSX_S7P_TR_NARROW].n > 0) s->c.by_kind[kind]++;
++        if (cls == RSX_S7P_CLS_GET && s->tr[RSX_S7P_TR_ALL].n > 0) { s->c.by_kind[kind]++; s->c.get_only_cuts++; }
++    }
++    if (cls != RSX_S7P_CLS_GET) {
++        if (s->tr[RSX_S7P_TR_NARROW].n > 0) { if (s->reuse_flag) s->c.reuse_barriers++; else s->c.disjoint_barriers++; }
++        s->reuse_flag = 0; s->nar_ep++;
++    }
++    if (cls == RSX_S7P_CLS_CHUNK) s7p_cut(s, RSX_S7P_TR_CHUNK, 1);
++    if (cls != RSX_S7P_CLS_GET) s7p_cut(s, RSX_S7P_TR_NARROW, 1);
++    s7p_cut(s, RSX_S7P_TR_ALL, 1);
++    rsx_s7p_unlock(s);
++}
++/* funnel entry (rsx_commands.c): the name of the kind, walker thread only */
++static inline void rsx_s7p_barrier_name(rsx_s7p* s, const char* name)
++{
++    const int k = rsx_s7p_kind_by_name(name);
++    rsx_s7p_barrier(s, rsx_s7p_kind_class(k), k);
++}
++/* a ring cursor reset (g.vb_used = 0): counted; cuts the trackers only when fills are pending (no idle) */
++static inline void rsx_s7p_ring_reset(rsx_s7p* s)
++{
++    rsx_s7p_lock(s);
++    s->c.ring_resets++;
++    for (int i = 0; i < RSX_S7P_NTR; i++) if (s->tr[i].n > 0) s7p_cut(s, i, 0);
++    rsx_s7p_unlock(s);
++}
++
++/* ---- held pages ---- */
++/* pos = the FIFO position of the acquire. With GCM_SEMA_ACQUIRE=1 an unmet acquire is polled again on every walk pass until it is
++ * met; that is one acquire, so a re-poll of the same (pos, label, value) with no draw in between (a draw clears the key) and no met
++ * acquire in between is not counted again. Two different acquires differ in pos. */
++static inline void rsx_s7p_acq(rsx_s7p* s, int met, uint32_t la, uint32_t v, long long now, uint32_t pos)
++{
++    rsx_s7p_lock(s);
++    if (met) { s->c.acq_met++; s->acq_key_valid = 0; }
++    else {
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 8
++        const int again = 0;   /* fault 8: every poll counts */
++#else
++        const int again = s->acq_key_valid && s->acq_pos == pos && s->acq_la == la && s->acq_v == v;
++#endif
++        s->acq_key_valid = 1; s->acq_pos = pos; s->acq_la = la; s->acq_v = v;
++        if (again) { rsx_s7p_unlock(s); return; }
++        s->c.acq_unmet++;
++        if (!s->held_open) { s->held_open = 1; s->held_la = la; s->held_v = v; s->held_t0 = now; s->hold_id++; }
++    }
++    rsx_s7p_unlock(s);
++}
++static inline void s7p_hold_close(rsx_s7p* s, long long now)
++{
++    if (!s->held_open) return;
++    s->c.held_ticks += now - s->held_t0; s->held_open = 0;
++}
++
++/* ---- pages ---- */
++static inline rsx_s7p_ep* s7p_ep_get(rsx_s7p* s, uint64_t key, int* created)
++{
++    const uint32_t f = s->cur_ep + 1u;
++    unsigned h = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 40) & (RSX_S7P_EP_TAB - 1u);
++    for (unsigned k = 0; k < RSX_S7P_EP_TAB; k++, h = (h + 1u) & (RSX_S7P_EP_TAB - 1u)) {
++        rsx_s7p_ep* e = &s->ep[h];
++        if (e->f == f && e->key == key) { *created = 0; return e; }
++        if (e->f != f) {   /* empty for this flip */
++            if (s->ep_n >= RSX_S7P_EP_MAX) { s->c.ovf++; return NULL; }
++            e->key = key; e->f = f; e->nar_ep = s->nar_ep; e->hold = 0; e->hashed = 0; s->ep_n++; *created = 1; return e;
++        }
++    }
++    s->c.ovf++; return NULL;
++}
++static inline rsx_s7p_pe* s7p_pe_get(rsx_s7p* s, uint64_t key, int* found)
++{
++    const uint32_t ep = s->cur_ep;
++    unsigned h = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 40) & (RSX_S7P_PE_TAB - 1u);
++    rsx_s7p_pe* freeslot = NULL;
++    for (unsigned k = 0; k < 16; k++) {
++        rsx_s7p_pe* e = &s->pe[(h + k) & (RSX_S7P_PE_TAB - 1u)];
++        if (e->key == key) { *found = 1; return e; }
++        if (!freeslot && (e->key == 0 || e->f < ep)) freeslot = e;
++    }
++    *found = 0;
++    if (!freeslot) { s->c.ovf++; freeslot = &s->pe[h]; }
++    freeslot->key = key;
++    return freeslot;
++}
++static inline void s7p_page(rsx_s7p* s, unsigned loc, uint64_t page, unsigned lo, unsigned plen, const uint8_t* srcp, int miss, int held)
++{
++    const uint64_t key = (((uint64_t)(loc & 1u) << 40) | page) + 1ull;
++    int created = 0;
++    rsx_s7p_ep* e = s7p_ep_get(s, key, &created);
++    if (!e) return;
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 1
++    s->c.read_loc[loc & 1u]++;   /* no per-flip dedup */
++#else
++    if (created) s->c.read_loc[loc & 1u]++;
++#endif
++    if (!created && e->nar_ep < s->nar_ep) s->reuse_flag = 1;
++    e->nar_ep = s->nar_ep;
++    if (held && e->hold != s->hold_id) { s->c.held_pages++; e->hold = s->hold_id; }
++    if (!miss) { if (created) s->c.hit_nohash++; return; }
++    if (e->hashed) return;
++    e->hashed = 1;
++    if (!srcp || !rsx_s7p_sampled(key, s->samp)) return;
++    const uint64_t h = rsx_s7p_fnv(srcp, plen);
++    s->c.hashed++;
++    int found = 0;
++    rsx_s7p_pe* pe = s7p_pe_get(s, key, &found);
++    if (found && pe->f == s->cur_ep) {   /* stored in the previous flip */
++        if (pe->lo == lo && pe->len == plen) {
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 3
++            s->c.changed++;
++#else
++            if (pe->hash == h) s->c.same++; else s->c.changed++;
++#endif
++        } else s->c.shape++;
++    } else s->c.newp++;
++    pe->f = s->cur_ep + 1u; pe->lo = (uint16_t)lo; pe->len = (uint16_t)plen; pe->hash = h;
++}
++static inline void s7p_spans(rsx_s7p* s, const rsx_s7p_draw_in* d, int miss, int held)
++{
++    for (unsigned i = 0; i < d->n_spans && i < RSX_S7P_SPANS; i++) {
++        const rsx_s7p_span* sp = &d->sp[i];
++        if (!sp->len) continue;
++        const uint64_t a = sp->off, b = a + sp->len;
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 2
++        const uint64_t last = b >> 12;   /* off by one at an exact boundary */
++#else
++        const uint64_t last = (b - 1) >> 12;
++#endif
++        for (uint64_t p = a >> 12; p <= last; p++) {
++            const uint64_t ps = p << 12, pe_ = ps + 4096u;
++            const uint64_t from = a > ps ? a : ps, to = b < pe_ ? b : pe_;
++            s7p_page(s, sp->loc, p, (unsigned)(from - ps), (unsigned)(to - from), sp->src ? sp->src + (from - a) : NULL, miss, held);
++        }
++    }
++}
++static inline uint64_t s7p_span_key(const rsx_s7p_draw_in* d)
++{
++    uint64_t k = 1469598103934665603ull;
++    for (unsigned i = 0; i < d->n_spans && i < RSX_S7P_SPANS; i++) {
++        k = (k ^ (((uint64_t)(d->sp[i].loc & 1u) << 32) | d->sp[i].off)) * 1099511628211ull; k = (k ^ d->sp[i].len) * 1099511628211ull;
++    }
++    return k | 1ull;
++}
++
++/* One draw that reached the copy (not dropped before it). Walker thread. */
++static inline void rsx_s7p_draw(rsx_s7p* s, const rsx_s7p_draw_in* d)
++{
++    rsx_s7p_lock(s);
++    s->acq_key_valid = 0;   /* the walker moved past any blocked acquire */
++    if (!s->have_ep) { s->cur_ep = d->ep; s->have_ep = 1; s->ep_n = 0; }
++    else if (d->ep != s->cur_ep) {   /* flip fold: new epoch tables, any hold ends */
++        s7p_hold_close(s, d->now); s->cur_ep = d->ep; s->ep_n = 0;
++    }
++    rsx_s7p_ctr* c = &s->c;
++    c->draws++; c->t[RSX_S7P_T_RING] += d->t_ring; c->t[RSX_S7P_T_IDX] += d->t_idx;
++    const int loc0 = d->n_spans ? (int)(d->sp[0].loc & 1u) : 0;
++    const int miss = !d->vc_hit;
++    uint64_t span_B = 0; for (unsigned i = 0; i < d->n_spans && i < RSX_S7P_SPANS; i++) span_B += d->sp[i].len;
++    if (miss) {
++        c->fills++; c->refs += (long long)d->refs; c->refs_B += (long long)d->refs * 8; c->fills_loc[loc0]++;
++        c->vb_B += (long long)d->vb_B; c->ib_B += (long long)d->ib_B; c->payload_B += (long long)d->payload_B; c->span_B += (long long)span_B;
++        c->size_hist[rsx_s7p_bin(d->vb_B + d->ib_B)]++; c->refs_hist[rsx_s7p_bin(d->refs)]++; c->miss_n++;
++        if (d->nospan) c->inline_nostable++;
++        if (d->vg_reason >= 0 && d->vg_reason < RSX_S7P_NVG) c->vg[d->vg_reason]++;
++        if (loc0 == 1 && d->n_spans && s->rf) {
++            const uint64_t key = s7p_span_key(d);
++            unsigned h = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 40) & (RSX_S7P_RF_TAB - 1u); int done = 0;
++            for (unsigned k = 0; k < RSX_S7P_RF_TAB && !done; k++, h = (h + 1u) & (RSX_S7P_RF_TAB - 1u)) {
++                if (s->rf[h] == key) { c->refill_main++; done = 1; }
++                else if (!s->rf[h]) { if (s->rf_n < RSX_S7P_RF_TAB / 4u * 3u) { s->rf[h] = key; s->rf_n++; } else c->ovf++; done = 1; }
++            }
++        }
++        const long long mv = d->t_fetch + d->t_ring + d->t_idx;
++        for (int i = 0; i < RSX_S7P_NTR; i++) { s->tr[i].n++; s->tr[i].m += mv; s->tr[i].last = mv; }
++    } else { c->hits++; c->hits_loc[loc0]++; }
++    int held = 0;
++    if (s->held_open) {
++#if !(defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 7)
++        if (d->held_eq) s7p_hold_close(s, d->now);   /* fault 7: never closes on an equal label */
++#endif
++        if (s->held_open) { held = 1; c->held_draws++; }
++    }
++    s7p_spans(s, d, miss, held);
++    rsx_s7p_unlock(s);
++}
++/* A draw dropped for a late fetch failure (fetch_ok = 0). */
++static inline void rsx_s7p_late_fail(rsx_s7p* s) { rsx_s7p_lock(s); s->c.inline_late++; rsx_s7p_unlock(s); }
++
++/* ---- formatters (pure; return the snprintf length, never write past n) ---- */
++#define S7P_CAT(...) do { if (o > 0 && (size_t)o < n) o += snprintf(out + o, n - (size_t)o, __VA_ARGS__); } while (0)
++#define D7(x) ((double)(c->x - p->x))
++static inline int rsx_s7p_fmt_fill(char* out, size_t n, double t, double tk, long long flips, double bucket_ms,
++                                   double s7_ms, const rsx_s7p_ctr* c, const rsx_s7p_ctr* p, double uc, double uh)
++{
++    const double f = flips > 0 ? (double)flips : 1.0;
++    double m[RSX_S7P_NT]; for (int i = 0; i < RSX_S7P_NT; i++) m[i] = (double)(c->t[i] - p->t[i]) * tk / f;
++    const double mov = m[RSX_S7P_T_FETCH] + m[RSX_S7P_T_RING] + m[RSX_S7P_T_IDX], stay = m[RSX_S7P_T_PLAN] + m[RSX_S7P_T_VCB] + m[RSX_S7P_T_PCB];
++    const double sum = mov + stay;
++    const double err = bucket_ms > 0.0 ? 100.0 * (sum > bucket_ms ? sum - bucket_ms : bucket_ms - sum) / bucket_ms : -1.0;
++    const double probe = (D7(clocks) * uc + D7(hashed) * uh) * tk / f;
++    int o = snprintf(out, n, "[s7-fill] t=%.0f flips=%lld | plan_ms=%.2f fetch_ms=%.2f ring_ms=%.2f idx_ms=%.2f vcb_ms=%.2f pcb_ms=%.2f",
++                     t, flips, m[0], m[1], m[2], m[3], m[4], m[5]);
++    S7P_CAT(" | movable_ms=%.2f stay_ms=%.2f split_sum_ms=%.2f bucket_ms=%.2f sum_err_pct=%.1f", mov, stay, sum, bucket_ms, err);
++    S7P_CAT(" | draws=%.1f fills=%.1f hits=%.1f refs=%.1f refs_B=%.0f probe_ms=%.2f", D7(draws) / f, D7(fills) / f, D7(hits) / f,
++            D7(refs) / f, D7(refs_B) / f, probe);
++#if defined(RSX_S7P_TEST_FAULT) && RSX_S7P_TEST_FAULT == 11
++    (void)s7_ms; S7P_CAT(" s7draw_ms=%.2f", bucket_ms);   /* fault 11: prints the wrong value */
++#else
++    S7P_CAT(" s7draw_ms=%.2f", s7_ms);   /* the ld_s7_draw hook's own time (split bucket X_S7, RSX_PERF_SPLIT=1; 0 without it): outside FILL, in `other` of [perf-split] */
++#endif
++    return o;
++}
++static inline int rsx_s7p_fmt_bar(char* out, size_t n, double t, double tk, long long flips, const rsx_s7p_ctr* c, const rsx_s7p_ctr* p)
++{
++    const double f = flips > 0 ? (double)flips : 1.0, ch = D7(chunks);
++    int o = snprintf(out, n, "[s7-bar] t=%.0f flips=%lld chunks=%.1f ring_resets=%.1f", t, flips, ch / f, D7(ring_resets) / f);
++    static const char* nm[RSX_S7P_NTR] = { "chunk", "narrow", "all" };
++    for (int i = 0; i < RSX_S7P_NTR; i++) {
++        const rsx_s7p_trc* a = &c->tr[i]; const rsx_s7p_trc* b = &p->tr[i];
++        S7P_CAT(" | %s: joins=%.1f idle=%.1f per_chunk=%.2f p50=%lld p95=%lld ovl_ms=%.2f", nm[i], (double)(a->joins - b->joins) / f,
++                (double)(a->idle - b->idle) / f, ch > 0 ? (double)(a->joins - b->joins) / ch : 0.0, rsx_s7p_pct(a->hist, b->hist, 50),
++                rsx_s7p_pct(a->hist, b->hist, 95), (double)(a->ovl - b->ovl) * tk / f);
++        if (i == RSX_S7P_TR_NARROW) S7P_CAT(" reuse=%.1f disjoint=%.1f", D7(reuse_barriers) / f, D7(disjoint_barriers) / f);
++    }
++    S7P_CAT(" | get_only_cuts=%.1f | by_kind:", D7(get_only_cuts) / f);
++    for (int k = 0; k < RSX_S7P_NKIND; k++) S7P_CAT(" %s=%.1f", rsx_s7p_kind_name[k], (double)(c->by_kind[k] - p->by_kind[k]) / f);
++    return o;
++}
++typedef struct { long long dev_fills, dev_fill_B, dyn_skip, inval_dyn, inel_main_verts, src_snap_B, dev_frees; } rsx_s7p_ext;   /* cumulative, from LD */
++static inline int rsx_s7p_fmt_draw(char* out, size_t n, double t, long long flips, const rsx_s7p_ctr* c, const rsx_s7p_ctr* p,
++                                   const rsx_s7p_ext* e, const rsx_s7p_ext* pe)
++{
++    const double f = flips > 0 ? (double)flips : 1.0;
++    int o = snprintf(out, n, "[s7-draw] t=%.0f flips=%lld | fills_loc0=%.1f fills_loc1=%.1f hits_loc0=%.1f hits_loc1=%.1f", t, flips,
++                     (double)(c->fills_loc[0] - p->fills_loc[0]) / f, (double)(c->fills_loc[1] - p->fills_loc[1]) / f,
++                     (double)(c->hits_loc[0] - p->hits_loc[0]) / f, (double)(c->hits_loc[1] - p->hits_loc[1]) / f);
++    S7P_CAT(" | inline_nostable=%.1f inline_late=%.1f", D7(inline_nostable) / f, D7(inline_late) / f);
++    /* print order: ok divided unmapped type big noinput */
++    S7P_CAT(" | vg_ok=%.1f vg_divided=%.1f vg_unmapped=%.1f vg_type=%.1f vg_big=%.1f vg_noinput=%.1f", (double)(c->vg[0] - p->vg[0]) / f,
++            (double)(c->vg[2] - p->vg[2]) / f, (double)(c->vg[3] - p->vg[3]) / f, (double)(c->vg[4] - p->vg[4]) / f,
++            (double)(c->vg[5] - p->vg[5]) / f, (double)(c->vg[1] - p->vg[1]) / f);
++    S7P_CAT(" | vb_B=%.0f ib_B=%.0f payload_B=%.0f span_B=%.0f size_p50=%lld size_p95=%lld refs_p50=%lld refs_p95=%lld", D7(vb_B) / f,
++            D7(ib_B) / f, D7(payload_B) / f, D7(span_B) / f, rsx_s7p_pct(c->size_hist, p->size_hist, 50), rsx_s7p_pct(c->size_hist, p->size_hist, 95),
++            rsx_s7p_pct(c->refs_hist, p->refs_hist, 50), rsx_s7p_pct(c->refs_hist, p->refs_hist, 95));
++    S7P_CAT(" | dev_fills=%.1f dev_fill_B=%.0f refill_main=%.1f dyn_skip=%.1f inval_dyn=%.1f inel_main_verts=%.0f src_snap_B=%.0f dev_frees=%.1f",
++            (double)(e->dev_fills - pe->dev_fills) / f, (double)(e->dev_fill_B - pe->dev_fill_B) / f, D7(refill_main) / f,
++            (double)(e->dyn_skip - pe->dyn_skip) / f, (double)(e->inval_dyn - pe->inval_dyn) / f,
++            (double)(e->inel_main_verts - pe->inel_main_verts) / f, (double)(e->src_snap_B - pe->src_snap_B) / f,
++            (double)(e->dev_frees - pe->dev_frees) / f);
++    return o;
++}
++static inline int rsx_s7p_fmt_page(char* out, size_t n, double t, double tk, long long flips, int samp, const rsx_s7p_ctr* c,
++                                   const rsx_s7p_ctr* p, const rsx_s7p_ext* e, const rsx_s7p_ext* pe)
++{
++    const double f = flips > 0 ? (double)flips : 1.0;
++    const double ch = D7(changed), nw = D7(newp), sm = D7(same);
++    const double churn = ch + sm > 0 ? 100.0 * ch / (ch + sm) : 0.0;
++    const double copyB = (double)rsx_s7p_est((long long)(ch + nw), samp) * 4096.0 / f;
++    const double ringB = ((double)(c->vb_B - p->vb_B) + (double)(c->ib_B - p->ib_B) + (double)(e->dev_fill_B - pe->dev_fill_B)) / f;
++    int o = snprintf(out, n, "[s7-page] t=%.0f flips=%lld samp=%d | read_loc0=%.1f read_loc1=%.1f hashed=%.1f same=%.1f changed=%.1f new=%.1f shape=%.1f hit_nohash=%.1f",
++                     t, flips, samp, (double)(c->read_loc[0] - p->read_loc[0]) / f, (double)(c->read_loc[1] - p->read_loc[1]) / f, D7(hashed) / f, sm / f,
++                     ch / f, nw / f, D7(shape) / f, D7(hit_nohash) / f);
++    S7P_CAT(" | churn_pct=%.1f copy_B_est=%.0f ring_B=%.0f page_vs_ring=%.3f", churn, copyB, ringB, ringB > 0 ? copyB / ringB : 0.0);
++    S7P_CAT(" | acq_met=%.1f acq_unmet=%.1f held_draws=%.1f held_pages=%.1f held_ms=%.2f", D7(acq_met) / f, D7(acq_unmet) / f,
++            D7(held_draws) / f, D7(held_pages) / f, D7(held_ticks) * tk / f);
++    S7P_CAT(" | ovf=%.0f", D7(ovf));
++    return o;
++}
++#undef D7
++
++/* ---- write-watch microprobe aggregation (the platform part supplies the ops) ---- */
++typedef struct {
++    double (*now_us)(void*);
++    void (*store_plain)(void*, unsigned page);
++    void (*store_watched)(void*, unsigned page);
++    void (*reset)(void*);
++    unsigned (*query)(void*);
++} rsx_s7p_ww_ops;
++typedef struct { double base_us_page, first_us_page, again_us_page, arm_us, query_us; unsigned reported; } rsx_s7p_ww_res;
++/* rounds of: plain stores to the dirty pages, arm (reset), first stores, again stores, query. Dirty pages = the first
++ * `frac` percent. Means over the rounds, per dirty page for the store timings. */
++static inline void rsx_s7p_ww_run(const rsx_s7p_ww_ops* ops, void* ctx, unsigned pages, unsigned rounds, unsigned frac, rsx_s7p_ww_res* r)
++{
++    memset(r, 0, sizeof *r);
++    const unsigned dirty = (unsigned)(((unsigned long long)pages * frac) / 100u);
++    if (!rounds || !dirty) return;
++    double base = 0, first = 0, again = 0, arm = 0, qry = 0; unsigned rep = 0;
++    for (unsigned k = 0; k < rounds; k++) {
++        double a = ops->now_us(ctx); for (unsigned i = 0; i < dirty; i++) ops->store_plain(ctx, i); double b = ops->now_us(ctx); base += b - a;
++        a = ops->now_us(ctx); ops->reset(ctx); b = ops->now_us(ctx); arm += b - a;
++        a = ops->now_us(ctx); for (unsigned i = 0; i < dirty; i++) ops->store_watched(ctx, i); b = ops->now_us(ctx); first += b - a;
++        a = ops->now_us(ctx); for (unsigned i = 0; i < dirty; i++) ops->store_watched(ctx, i); b = ops->now_us(ctx); again += b - a;
++        a = ops->now_us(ctx); rep = ops->query(ctx); b = ops->now_us(ctx); qry += b - a;
++    }
++    r->base_us_page = base / rounds / dirty; r->first_us_page = first / rounds / dirty; r->again_us_page = again / rounds / dirty;
++    r->arm_us = arm / rounds; r->query_us = qry / rounds; r->reported = rep;
++}
++static inline int rsx_s7p_fmt_ww(char* out, size_t n, unsigned pages, unsigned rounds, unsigned f1, const rsx_s7p_ww_res* a, unsigned f2,
++                                 const rsx_s7p_ww_res* b, double changed_pages_per_flip)
++{
++    int o = snprintf(out, n, "[s7-ww] pages=%u rounds=%u frac=%u base_us_page=%.4f watch_first_us_page=%.4f watch_again_us_page=%.4f arm_us=%.2f query_us=%.2f reported=%u",
++                     pages, rounds, f1, a->base_us_page, a->first_us_page, a->again_us_page, a->arm_us, a->query_us, a->reported);
++    S7P_CAT(" | frac=%u base_us_page=%.4f watch_first_us_page=%.4f watch_again_us_page=%.4f arm_us=%.2f query_us=%.2f reported=%u", f2,
++            b->base_us_page, b->first_us_page, b->again_us_page, b->arm_us, b->query_us, b->reported);
++    S7P_CAT(" | cost_ms_flip_est=%.3f", a->first_us_page * changed_pages_per_flip / 1000.0);
++    return o;
++}
++#undef S7P_CAT
++extern rsx_s7p g_rsx_s7p;   /* cellGcmSys.c (host tests do not reference it) */
++#endif

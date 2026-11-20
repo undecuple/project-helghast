@@ -1,4 +1,4 @@
-/* kz3_native_post.c -- Gfx.Post kernels as native host code (SPU pass 122, D88-). Default off:
+/* kz3_native_post.c -- Gfx.Post kernels as native host code (SPU pass 122). Default off:
  * KZ3_NATIVE_JOB_POSTMIX=1 (the shared blend), KZ3_NATIVE_JOB_UPSAMPLE=1 (the Upsample RGBA8 row kernel),
  * KZ3_NATIVE_JOB_MOTIONBLUR=1 (the MotionBlur blur row kernel, SPU pass 136), KZ3_NATIVE_JOB_POST=1 (every Gfx.Post
  * gate).
@@ -133,6 +133,55 @@ static inline u128 mb_ldq(const uint8_t* ls, uint32_t a)
     return r;
 }
 
+/* SPU pass 161: the reciprocal estimate pair of one pixel on a scalar. rec = fi(S0, frest(S0)) is the same value in all
+ * four lanes (S0 is splatted), so the four-lane helpers (spu_frest + spu_fi: two table gathers, two double conversions
+ * per lane, ~9 ns/px of 33 in the host timing) did one lane's work four times. frest: sign | (253 - e) << 23 | the 5-bit
+ * table fraction, e == 0 -> sign | 0x7FFFFFFF; fi: the SPU's base - step * y in integers (spu__fi_lane's math; patch 1134
+ * proved it equals the float form for every exponent). When the estimate has exponent 255 (S0 zero or denormal) the
+ * helpers run as before. Equal to spu_fi(s0, spu_frest(s0)) lane 0 for 10^8 random and the edge inputs
+ * (tools/spu/test_r161_mb_fast.sh). */
+static inline uint32_t mb_rec_scalar(uint32_t ra, int* slow)
+{
+    const uint32_t sg = ra & 0x80000000u, e0 = (ra >> 23) & 0xFFu;
+    if (e0 == 0u) { *slow = 1; return 0; }
+    const uint32_t re = e0 >= 253u ? 0u : 253u - e0;
+    const uint32_t rb = sg | (re << 23) | (spu_frest_fraction_lut[(ra >> 18) & 0x1Fu] & 0x7FFFFFu);
+    const uint32_t e = (rb >> 23) & 0xFFu;
+    if (e == 255u) { *slow = 1; return 0; }
+    /* fi on one lane, the helper's float form (patch 1131/1035): base = rb & ~0x3FF, step = the 10-bit field times
+     * 2^(e - 140) in double rounded once to float (negated when base < 0), y = (ra & 0x7FFFF) * 2^-19, base - step * y
+     * with separate multiply and subtract (no contraction: intrinsics, as the helper). */
+    const uint32_t base_bits = rb & 0xFFFFFC00u;
+    float base;
+    memcpy(&base, &base_bits, 4);
+    const uint64_t sc_bits = (uint64_t)(1023 + (int)e - 140) << 52;
+    double sc;
+    memcpy(&sc, &sc_bits, 8);
+    float step = (float)((double)(rb & 0x3FFu) * sc);
+    if (base < 0.0f) step = -step;
+    const float y = (float)(ra & 0x7FFFFu) * 0x1p-19f;
+    const __m128 r = _mm_sub_ss(_mm_set_ss(base), _mm_mul_ss(_mm_set_ss(step), _mm_set_ss(y)));
+    float rf = _mm_cvtss_f32(r);
+    uint32_t rw;
+    memcpy(&rw, &rf, 4);
+    return rw;
+}
+
+/* SPU pass 161: byte 0 of cfltu(q, 165) (u32 of q * 256, saturating at 0 below and 2^32 - 1 above) for four lanes when
+ * no lane has exponent 255 and every q * 256 is below 2^31: q * 256 is an exact power-of-two scaling, cvttps truncates
+ * toward zero like the helper's floor of the clamped double, negatives clamp to 0. Returns 0 (caller runs the helper)
+ * otherwise. */
+static inline int mb_cflt_bytes(__m128 q, __m128i* bytes)
+{
+    const __m128i qi = _mm_castps_si128(q);
+    const __m128i x255 = _mm_cmpeq_epi32(_mm_and_si128(_mm_srli_epi32(qi, 23), _mm_set1_epi32(0xFF)), _mm_set1_epi32(0xFF));
+    const __m128 t = _mm_max_ps(_mm_mul_ps(q, _mm_set1_ps(256.0f)), _mm_setzero_ps());
+    const __m128i big = _mm_castps_si128(_mm_cmpge_ps(t, _mm_set1_ps(2147483648.0f)));
+    if (__builtin_expect(!_mm_testz_si128(_mm_or_si128(x255, big), _mm_or_si128(x255, big)), 0)) return 0;
+    *bytes = _mm_cvttps_epi32(t);
+    return 1;
+}
+
 static const int32_t mb_c[6] = {3020, 2520, 1960, 1400, 840, 280}; /* il immediates at 0x5460.. */
 
 static int mb_blur_row_5460(spu_context* ctx)
@@ -148,17 +197,26 @@ static int mb_blur_row_5460(spu_context* ctx)
         overlaps(dst, 4 * n, (uint32_t)rlo, (uint32_t)(rhi - rlo)) || overlaps(dst, 4 * n, vel, 4 * n + 32))
         return 0;
     const u128 half = spu_splat_u32(0x3F000000u);
+    /* SPU pass 161: the 16-byte output quad is assembled with pshufb (byte 0 of each lane of the 4 pixels' results) and
+     * stored once; b0 -> b0/256 and the S0 splat stay in vector registers (the 4-lane loops and the union round trips
+     * through memory of pass 140 are gone). Same arithmetic, so the same bits (native_diff slots 22/23, test_r136). */
+    /* pkq[p]: low byte of each channel word -> bytes 4p..4p+3 (a table, not _mm_slli_si128(x, 4 * p): clang -O1
+       does not unroll the p loop and needs that shift count to be a constant) */
+    const __m128i pkq[4] = {
+        _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 12, 8, 4, 0),
+        _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 12, 8, 4, 0, -1, -1, -1, -1),
+        _mm_set_epi8(-1, -1, -1, -1, 12, 8, 4, 0, -1, -1, -1, -1, -1, -1, -1, -1),
+        _mm_set_epi8(12, 8, 4, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)};
     for (uint32_t g = 0; g < n / 4; g++) {
         const u128 vq = mb_ldq(ls, vel + 16 * g);
+        __m128i vqi;
+        memcpy(&vqi, &vq, 16);
+        const __m128i b0i = _mm_srli_epi32(vqi, 24);
         u128 b0q;
-        for (int p = 0; p < 4; p++) b0q._u32[p] = vq._u32[p] >> 24;
+        memcpy(&b0q, &b0i, 16);
         const u128 sq = spu_cuflt(b0q, 147); /* b0 / 256 per pixel */
-        uint8_t out[16];
-        /* SPU pass 140: all 48 tap quads of the 4 pixels are loaded first (independent loads the core issues together,
-         * like the SPU loop's software pipeline, which loads a group ahead), then reduced per pixel. Loading per pixel
-         * right before its sum left each pixel's 12 gather loads (rows 6 apart, a pitch of 10-20 KB) waiting on L1
-         * misses one pixel at a time: host timing at a real width (NATIVE_DIFF_TIME=1, tools/spu/native_diff.py)
-         * showed 1.28x the lifted code's time before. The sums are unchanged. */
+        float sqa[4];
+        memcpy(sqa, &sq, 16);
         u128 TT[4][12];
 #pragma GCC unroll 4
         for (int p = 0; p < 4; p++) {
@@ -177,6 +235,7 @@ static int mb_blur_row_5460(spu_context* ctx)
                 TT[p][k] = mb_ldq(ls, (uint32_t)(P + dy * pitch + dx));
             }
         }
+        __m128i outq = _mm_setzero_si128();
 #pragma GCC unroll 4
         for (int p = 0; p < 4; p++) {
             const u128* T = TT[p];
@@ -191,12 +250,25 @@ static int mb_blur_row_5460(spu_context* ctx)
             S = spu_fa(T[2], S);
             S = spu_fa(T[1], S);
             S = spu_fma(T[0], half, S);
-            const u128 s0 = spu_splat_u32(S._u32[0]);
-            const u128 rec = spu_fi(s0, spu_frest(s0));
-            const u128 u = spu_cfltu(spu_fm(spu_fm(S, rec), spu_splat_u32(sq._u32[p])), 165);
-            for (int c = 0; c < 4; c++) out[4 * p + c] = (uint8_t)u._u32[c];
+            uint32_t s0w;
+            memcpy(&s0w, &S, 4);   /* lane 0 of the sum: the estimate pair's input */
+            int slow = 0;
+            const uint32_t rw = mb_rec_scalar(s0w, &slow);
+            u128 rec;
+            if (__builtin_expect(slow, 0)) {
+                const u128 s0 = spu_splat_u32(s0w);
+                rec = spu_fi(s0, spu_frest(s0));
+            } else rec = spu_splat_u32(rw);
+            u128 spl;
+            { const __m128 sp = _mm_set1_ps(sqa[p]); memcpy(&spl, &sp, 16); }
+            const u128 qd = spu_fm(spu_fm(S, rec), spl);
+            __m128i ui;
+            { __m128 qv; memcpy(&qv, &qd, 16);
+              if (!mb_cflt_bytes(qv, &ui)) { const u128 u = spu_cfltu(qd, 165); memcpy(&ui, &u, 16); } }
+            /* low byte of each of the 4 channel words -> bytes 4p..4p+3 */
+            outq = _mm_or_si128(outq, _mm_shuffle_epi8(ui, pkq[p]));
         }
-        memcpy(ls + dst + 16 * g, out, 16);
+        _mm_storeu_si128((__m128i*)(ls + dst + 16 * g), outq);
     }
     return 1;
 }

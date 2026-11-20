@@ -9,7 +9,7 @@ no game run has exercised the exit yet, hence opt-in. "[ts-join] cut-off task N 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream's coherent signal watch + 1066's parked count; 1067's `!cut` on upstream's moved signalled update.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
 index 03eaeb6..7155c89 100644

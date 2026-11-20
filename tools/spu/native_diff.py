@@ -2,7 +2,7 @@
 """Native gate vs lifted function (SPU pass 122; KZ2's native_diff.py design).
 
     nix develop .#re --command tools/sandbox.sh -- python3 tools/spu/native_diff.py \
-        [--slot 0,2,4] [--trials 400] [--records DIR] [--lift work/spu/r122/lift114/lift]
+        [--slot 0,2,4] [--trials 400] [--records DIR] [--lift work/spu/lift114/lift]
 
 For each slot of re/spu/native_gates.tsv (default: all rows whose image is in the lift tree) build
 tools/spu/native_diff_harness.c with the image's lifted spu_recomp.c and port/spu/kz3_native_post.c/kz3_native_dof.c

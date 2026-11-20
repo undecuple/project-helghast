@@ -59,7 +59,7 @@ if [[ -f "$ROOT/.kz3-lane" ]]; then
   if [[ $GPU -eq 1 || ${#EXTRA_RO[@]} -gt 0 ]] && [[ "$LANE_GPU" != 1 ]]; then
     echo "sandbox: lane '$LANE' may not use --gpu or extra binds" >&2; exit 3
   fi
-  # read_dirs (2026-10-16, the kz2 lane: KZ3 agents doing static work for the Killzone 2 port): host folders the
+  # read_dirs (the static-work profile for a related project): host folders the
   # lane reads but never writes, bound read-only from the policy (never from the lane's own arguments).
   while IFS= read -r d; do [[ -n "$d" && -d "$d" ]] && LANE_RO+=("$d"); done < <(python3 -c 'import json,sys
 for d in json.load(open(sys.argv[1]))["lanes"][sys.argv[2]].get("read_dirs", []): print(d)' "$POLICY_MAIN/tools/agents/lanes.json" "$LANE" 2>/dev/null)
@@ -155,7 +155,7 @@ if [[ $GPU -eq 1 ]]; then
   args+=(--ro-bind /run/opengl-driver /run/opengl-driver)
   for d in /dev/nvidia* /dev/dri; do [[ -e $d ]] && args+=(--dev-bind "$d" "$d"); done
   # KZ3_NTSYNC=1: bind the kernel's NT sync device (module ntsync), which GE-Proton 10-10+ then uses instead of fsync.
-  # Opt-in until an A/B decides (2026-11-10); runs without it keep the fsync baseline.
+  # Opt-in until an A/B decides; runs without it keep the fsync baseline.
   [[ ${KZ3_NTSYNC:-0} == 1 && -e /dev/ntsync ]] && args+=(--dev-bind /dev/ntsync /dev/ntsync)
   args+=(--ro-bind-try /sys /sys)
 fi

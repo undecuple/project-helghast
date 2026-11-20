@@ -1,0 +1,786 @@
+KZ3 patch 2185 (RSX pass 163): LD_WB_DEFER=1, the deferred guest write-back (default OFF; unset = the old synchronous
+paths, no new work beyond a few not-taken branches). New libs/video/rsx_wb_defer.h (GPU-free pending-store queue: readback
+slot ownership, oldest-first drain with ONE wait on the newest fence, overlap queries, verify compare, [wb-defer] line,
+published range snapshot; host test tools/smoke/test_wb_defer.sh).
+- Store points (rsx_live_draw.c, ld_writeback_batch(.., defer_ok)): the NV0039 scene copy batch and the 0x4A-release batch of
+  main surfaces (LD_WB_DEFER_LABEL, default 0x4A, set by cellGcmSys around before_guest_sync) record the GPU copy into a
+  readback slot, submit with ld_submit_nowait (ld_oq_close first, as ld_flush does) and queue {fence, slot, destination,
+  frozen geometry, generation, seq}. The surface's gv_gpu_dirty clears at the submit (as the synchronous store clears it).
+  Nothing submitted (no fence advance) = this chunk keeps today's synchronous store, after draining the older entries.
+- The idx0 row copy of nv0039_copy (local 0x1300000 -> main 0x01310400) is queued too when a pending store covers its source
+  (rsx_live_draw_wbd_defer_move, nv0039_rows callback); the rest of nv0039_copy runs as before.
+- ONE drain, gcm_walker_user_command before cellGcmQueueUserCommand (0xEB00): wait the newest fence once, then every store
+  oldest-first (idx0's move after its source surface). Readers drain first: guest_ptr (every renderer read of guest bytes),
+  ld_tsl_prologue and vertex_texture_srv_slot (before their dirty-page checks), nv0039_copy source and destination, the NV3089
+  engine source read, any synchronous write-back batch (reason other), the flip. Readback slots stay taken until their store
+  ran; no free slots = forced drain (reason slot); queue full = drain (reason full).
+- Deferred stores redo the store's side effects at the drain (ld_td_mark, ld_pwd_note_writeback, ld_wbp_store, guest-validate
+  baseline, gv_pending when the surface was drawn since the copy) only while the surface record is still the same one.
+- LD_WB_DEFER_VERIFY=1: also reads each slot at the original point (GPU wait, as today) into a shadow, compares it with the
+  deferred conversion at the drain and counts [wb-defer] mismatches (also: moved rows differing from their source).
+- Not deferred: FIFO capture runs, LD_WRITEBACK_BATCH=0, every sync point but the labelled release.
+- [wb-defer] line every LD_WB_READ_N (default 100) flips: pending_max, pushes, drains, waits, wait_ms, stores, aborted,
+  forced drains by reason, verified, mismatches, bytes_bad, plus the first mismatching (surface, offset) and the racy counters
+  spu_gets_of_pending / spu_writes_into_pending (SPU GET hook now also installed with LD_WB_DEFER).
+- Non-Windows stubs and the two host-test stub files carry the new rsx_live_draw_wbd_* symbols.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index b2c19df..7341321 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1332,6 +1332,7 @@ static void nv3089_engine_read(u32 in_pitch, u32 out_w, u32 out_h)
+     const u32 sy1 = (u32)((nv3089_origin(v0) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20);
+     if (sx1 < sx0 || sy1 < sy0) return;
+     const u32 loc = (s_nv3089.src_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
++    if (rsx_live_draw_enabled()) rsx_live_draw_wbd_touch(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch * (sy1 - sy0) + (sx1 - sx0 + 1u) * 4u);   /* patch 2185 */
+     rsx_draw_engine_guest_read(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
+                                sx1 - sx0 + 1u, sy1 - sy0 + 1u);
+ }
+@@ -1737,6 +1738,29 @@ static int gcm_subch1_nv0039_run(u32 m, int incr, u32 count)
+     return !(last < 0x0180u || m > 0x0188u) || !(last < 0x030Cu || m > 0x0328u);
+ }
+ 
++/* Patch 2185 (LD_WB_DEFER): the row copy of nv0039_copy as a callback, for the copy that has to wait for a pending store of its
++ * source (idx0: local 0x1300000 -> main 0x01310400). p[0..7] = src, dst, len, n, pitch_in, pitch_out, in_inc, out_inc. With
++ * `verify` it returns the number of rows whose destination differs from the source afterwards (disjoint ranges, increments 1). */
++static u32 nv0039_rows(const u32* p, int verify)
++{
++    extern u8* vm_base;
++    const u32 src = p[0], dst = p[1], len = p[2], n = p[3], in_inc = p[6], out_inc = p[7];
++    const s64 pin = (s32)p[4], pout = (s32)p[5];
++    for (u32 y = 0; y < n; y++) {
++        u8* d = vm_base + (u32)((s64)dst + (s64)y * pout);
++        const u8* sp = vm_base + (u32)((s64)src + (s64)y * pin);
++        if (in_inc == 1 && out_inc == 1) memmove(d, sp, len);
++        else for (u32 x = 0; x < len; x++) d[(size_t)x * out_inc] = sp[(size_t)x * in_inc];
++    }
++    u32 bad = 0;
++    const s64 ain = pin < 0 ? -pin : pin, aout = pout < 0 ? -pout : pout;
++    const int disjoint = (s64)dst + (s64)len + (s64)n * aout <= (s64)src || (s64)src + (s64)len + (s64)n * ain <= (s64)dst;
++    if (verify && in_inc == 1 && out_inc == 1 && disjoint)
++        for (u32 y = 0; y < n; y++)
++            if (memcmp(vm_base + (u32)((s64)dst + (s64)y * pout), vm_base + (u32)((s64)src + (s64)y * pin), len)) bad++;
++    return bad;
++}
++
+ static void nv0039_copy(u32 notify)
+ {
+     const u32 len = s_nv0039.line_len, n = s_nv0039.line_count;
+@@ -1766,6 +1790,11 @@ static void nv0039_copy(u32 notify)
+      * surface is created at the destination (unlike NV3089): the CPU/SPU side
+      * owns that copy, and texture binds re-read it from guest memory. */
+     u32 wb = 0;
++    const u32 wbd_so = (u32)(lo_in - (s64)src) + s_nv0039.off_in, wbd_do = (u32)(lo_out - (s64)dst) + s_nv0039.off_out;   /* patch 2185 */
++    if (rsx_live_draw_enabled()) {   /* patch 2185: pending deferred stores that this copy reads or overwrites land first */
++        rsx_live_draw_wbd_touch(sl ? 0u : 1u, wbd_so, (u32)(hi_in - lo_in));
++        rsx_live_draw_wbd_touch(dl ? 0u : 1u, wbd_do, (u32)(hi_out - lo_out));
++    }
+     const uint64_t fp_t0 = g_rsx_fp_on ? RSX_FP_CLOCK() : 0;   /* patch 2172 */
+     if (rsx_live_draw_enabled())
+         wb = rsx_live_draw_writeback_range(sl ? 0u : 1u, (u32)(lo_in - (s64)src) + s_nv0039.off_in,
+@@ -1775,7 +1804,13 @@ static void nv0039_copy(u32 notify)
+     if ((g_rsx_sh_on | g_rsx_fp_on) && rsx_live_draw_enabled()) rsx_sync_hist_event(RSX_SH_NV0039, wb != 0);   /* patch 2164, 2172 */
+     if (g_rsx_fcap_on) rsx_fcap_range(RSX_FC_RD_WALKER, RSX_FC_EA, (u32)lo_in, vm_base + lo_in, (u32)(hi_in - lo_in), 1);   /* patch 2164 */
+     const long long m2mf_t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;   /* patch 2029 */
+-    for (u32 y = 0; y < n; y++) {
++    int wbd_deferred = 0;   /* patch 2185: the row copy waits for a pending store of its source */
++    if (rsx_live_draw_enabled() && rsx_live_draw_wbd_active()) {
++        const u32 wp[8] = { src, dst, len, n, (u32)(s32)pin, (u32)(s32)pout, in_inc, out_inc };
++        wbd_deferred = rsx_live_draw_wbd_defer_move(sl ? 0u : 1u, wbd_so, (u32)(hi_in - lo_in), dl ? 0u : 1u, wbd_do,
++                                                    (u32)(hi_out - lo_out), wp, nv0039_rows);
++    }
++    for (u32 y = 0; y < n && !wbd_deferred; y++) {
+         u8* d = vm_base + (u32)((s64)dst + (s64)y * pout);
+         const u8* sp = vm_base + (u32)((s64)src + (s64)y * pin);
+         if (in_inc == 1 && out_inc == 1) memmove(d, sp, len);
+@@ -1783,7 +1818,7 @@ static void nv0039_copy(u32 notify)
+             for (u32 x = 0; x < len; x++) d[(size_t)x * out_inc] = sp[(size_t)x * in_inc];
+     }
+     if (m2mf_t0) rsx_perf_add(RSX_PERF_W_M2MF_T, rsx_perf_now() - m2mf_t0);
+-    if (!dl && rsx_live_draw_enabled()) rsx_live_draw_wbp_copy_done((u32)(lo_out - (s64)dst) + s_nv0039.off_out, (u32)(hi_out - lo_out));   /* patch 2184: LD_WB_READ, the idx0 store is done */
++    if (!dl && !wbd_deferred && rsx_live_draw_enabled()) rsx_live_draw_wbp_copy_done((u32)(lo_out - (s64)dst) + s_nv0039.off_out, (u32)(hi_out - lo_out));   /* patch 2184: LD_WB_READ, the idx0 store is done */
+     if (g_rsx_fcap_on) {   /* patch 2164: the copy's geometry and the result span (digest only) */
+         rsx_fcap_range(RSX_FC_WR_WALKER, RSX_FC_EA, (u32)lo_out, vm_base + lo_out, (u32)(hi_out - lo_out), 0);
+         gcm_fcap_copy_geom(0, src, dst, len, n, (u32)pin, (u32)pout, s_nv0039.format, wb, s_nv0039.src_dma, s_nv0039.dst_dma, 0);
+@@ -4171,7 +4206,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                     if (m == 0x64u)      s_sema_offset = v;
+                     else if (m == 0x6Cu) {   /* patch 2017: RSX output in main memory first */
+                         { const long long o_bg0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164 */
++                          if (rsx_live_draw_enabled()) rsx_live_draw_wbd_set_site((int)((s_sema_offset & 0xFFFFu) >> 4));   /* patch 2185: the 0x4A release may defer */
+                           const u32 o_bgs = rsx_live_draw_enabled() ? rsx_live_draw_before_guest_sync() : 0;
++                          if (rsx_live_draw_enabled()) rsx_live_draw_wbd_set_site(-1);
+                           if (o_bg0) rsx_perf_add(RSX_PERF_O_SEMA_BGS_T, rsx_perf_now() - o_bg0);
+                           if (g_rsx_sh_on | g_rsx_fp_on) rsx_sync_hist_event(RSX_SH_REL406E, o_bgs != 0); }   /* 2172: fp too */
+                         /* The RSX has fetched past a RELEASE before its
+@@ -5677,7 +5714,8 @@ void cellGcm_spu_guest_write_hook_install(void)
+     {   const char* e = getenv("LD_POST_WB_DIAG");   /* patch 2084 */
+         if (e && atoi(e) > 0 && spu_set_guest_read_hook) spu_set_guest_read_hook(gcm_spu_read_ea); }
+     {   const char* e = getenv("LD_WB_READ");   /* patch 2184 */
+-        if (e && atoi(e) > 0 && spu_set_guest_read_hook2) spu_set_guest_read_hook2(gcm_spu_read_ea2); }
++        const char* d = getenv("LD_WB_DEFER");   /* patch 2185: the GET feed also counts reads of a pending deferred store */
++        if (((e && atoi(e) > 0) || (d && d[0] && d[0] != '0')) && spu_set_guest_read_hook2) spu_set_guest_read_hook2(gcm_spu_read_ea2); }
+     if (spu_set_guest_write_hook) spu_set_guest_write_hook(gcm_spu_note_pages_ea);   /* 2033; tag 2081 */
+     if (fs_set_guest_write_hook) fs_set_guest_write_hook(gcm_fs_note_pages_ea);   /* patch 2078; tag 2081 */
+ }
+@@ -6382,7 +6420,10 @@ static void gcm_usercmd_stats(int coll, u64 wait_ns, int replaced)
+ }
+ static void gcm_walker_user_command(u32 cmd)
+ {
+-    if (rsx_live_draw_enabled()) rsx_live_draw_wbp_usercmd();   /* patch 2184: LD_WB_READ gap to the stores */
++    if (rsx_live_draw_enabled()) {
++        rsx_live_draw_wbd_drain(0 /* RSX_WBD_R_USERCMD */);   /* patch 2185: the one wait; every deferred store lands before 0xEB00 is queued */
++        rsx_live_draw_wbp_usercmd();   /* patch 2184: LD_WB_READ gap to the stores */
++    }
+     const int coll = GCM_USER_PENDING_PEEK() != 0;   /* pass 118 counters */
+     const u64 w0 = coll ? get_timestamp_ns() : 0;
+     for (int spin = 0; spin < 50; spin++) {
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 9b616d9..9f30e3a 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -67,6 +67,12 @@ void rsx_live_draw_wbp_get(u32 l, u32 o, u32 n, u32 i, u32 pc) { (void)l; (void)
+ void rsx_live_draw_wbp_put(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }   /* patch 2184 */
+ void rsx_live_draw_wbp_copy_done(u32 o, u32 n) { (void)o; (void)n; }   /* patch 2184 */
+ void rsx_live_draw_wbp_usercmd(void) {}   /* patch 2184 */
++void rsx_live_draw_wbd_drain(int r) { (void)r; }   /* patch 2185 */
++void rsx_live_draw_wbd_touch(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }   /* patch 2185 */
++int  rsx_live_draw_wbd_active(void) { return 0; }   /* patch 2185 */
++void rsx_live_draw_wbd_set_site(int label) { (void)label; }   /* patch 2185 */
++int  rsx_live_draw_wbd_defer_move(u32 sl, u32 so, u32 sn, u32 dl, u32 d0, u32 dn, const u32* p, u32 (*fn)(const u32*, int))
++{ (void)sl; (void)so; (void)sn; (void)dl; (void)d0; (void)dn; (void)p; (void)fn; return 0; }   /* patch 2185 */
+ void rsx_live_draw_debug_writeback_stats(double* t, u32* b, u32* s, u32* w)
+ { if (t) *t = 0; if (b) *b = 0; if (s) *s = 0; if (w) *w = 0; }
+ int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u32 h)
+@@ -122,6 +128,13 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ #include "rsx_front_probe.h"   /* KZ3 patch 2172: LD_FRONT_PROBE */
+ #include "rsx_ceil.h"   /* KZ3 patch 2183: LD_CEIL ceiling probes (diagnostic) */
+ #include "rsx_wb_probe.h"   /* KZ3 patch 2184: LD_WB_READ / LD_WB_SKIP / LD_WB_HASH (diagnostic) */
++#include "rsx_wb_defer.h"   /* KZ3 patch 2185: LD_WB_DEFER pending-store queue */
++/* patch 2185 state (walker thread, except the published snapshot and the two SPU counters; see guest_ptr below) */
++static rsx_wbd g_wbd;
++static rsx_wbd_snap g_wbd_snap;
++static DWORD g_wbd_owner;
++static volatile LONG g_wbd_spu_gets;   /* SPU DMA GETs that hit a pending store range (should stay 0) */
++static volatile LONG g_wbd_spu_hits;   /* SPU DMA puts that hit a pending store range */
+ extern rsx_fp* g_rsx_fp;      /* cellGcmSys.c */
+ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context */
+ #include "rsx_vp_decompiler.h"
+@@ -849,6 +862,8 @@ static int ld_wbs_skip(const surface_t* sf)
+ /* Any thread: a SPU GET/PUT of main memory (offset space of the surface table). */
+ void rsx_live_draw_wbp_get(u32 location, u32 offset, u32 size, u32 img, u32 pc)
+ {
++    if (__builtin_expect(RSX_WBD_LD(&g_wbd_snap.n) != 0, 0) && rsx_wbd_snap_hit(&g_wbd_snap, location, offset, size))
++        InterlockedIncrement(&g_wbd_spu_gets);   /* patch 2185: an SPU read bytes whose deferred store has not landed (racy snapshot) */
+     if (location != 1u || !ld_wbp_enabled()) return;
+     rsx_wbp_get(&g_wbp, offset, size, ld_wbp_now(), img, pc);
+ }
+@@ -1725,9 +1740,16 @@ static const u8* ld_fc_guest_ptr(void* user, u32 location, u32 offset, u32 min_b
+     if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_range(0 /* RSX_FC_RD_RENDERER */, location == 0 ? 1 : 2, offset, p, min_bytes, 1);
+     return p;
+ }
++/* Patch 2185 (LD_WB_DEFER): guest stores of the write-backs can be pending (g_wbd.n != 0). Every renderer read of guest bytes
++ * goes through guest_ptr, so this is the one place that drains before a read that a pending store covers (walker thread only;
++ * the owner id keeps another thread's guest_ptr from draining). The texture and vertex-texture binds drain earlier still, before
++ * their dirty-page checks (ld_tsl_prologue, vertex_texture_srv_slot): a clean-page verdict needs no guest_ptr call. */
++static void ld_wbd_touch(u32 location, u32 offset, u32 size, int reason);
++static void ld_wbd_flip(void);
+ static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
+ {
+     if (!g.guest_ptr) return NULL;
++    if (__builtin_expect(g_wbd.n != 0, 0)) ld_wbd_touch(location, offset, min_bytes, RSX_WBD_R_TOUCH);
+     return g.guest_ptr(g.guest_user, location, offset, min_bytes);
+ }
+ static u64 fnv1a(const void* data, u32 n, u64 h);
+@@ -5728,6 +5750,7 @@ void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size)
+ {
+     if (!g.ready || !size) return;
+     if (__builtin_expect(g_rsx_fcap_on, 0)) rsx_fcap_spu_note(location, offset, size, 1);   /* patch 2164 */
++    if (__builtin_expect(RSX_WBD_LD(&g_wbd_snap.n) != 0, 0) && rsx_wbd_snap_hit(&g_wbd_snap, location, offset, size)) InterlockedIncrement(&g_wbd_spu_hits);   /* patch 2185: diagnostic, racy snapshot */
+     ld_td_mark(location, offset, size);   /* patch 2033: SPU DMA puts, any thread */
+     if (!ld_gv_enabled()) return;
+     LONG slot;
+@@ -5950,6 +5973,7 @@ static u32 texture_srv_slot_entry(const rsx_dsp_texture* t, u32 i);
+ static u32 texture_srv_slot_new(const rsx_dsp_texture* t);
+ static void ld_tsl_prologue(const rsx_dsp_texture* t)
+ {
++    if (__builtin_expect(g_wbd.n != 0, 0)) ld_wbd_touch(t->location, t->offset, texture_source_span(t), RSX_WBD_R_TOUCH);   /* patch 2185 */
+     if (g_gv_on) ld_gv_drain();   /* patch 2017: explicit writes from other threads */
+     if (g_gv_watch[0].armed | g_gv_watch[1].armed | g_gv_watch[2].armed | g_gv_watch[3].armed |
+         g_gv_watch[4].armed | g_gv_watch[5].armed | g_gv_watch[6].armed | g_gv_watch[7].armed)
+@@ -6427,6 +6451,7 @@ static void write_vertex_texture_srv(u32 index, ID3D12Resource* tex)
+ 
+ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
+ {
++    if (__builtin_expect(g_wbd.n != 0, 0)) ld_wbd_touch(vt->location, vt->offset, (u32)vt->pitch * vt->height, RSX_WBD_R_TOUCH);   /* patch 2185 */
+     for (u32 i = 0; i < g.n_vtex; i++) {
+         vtexcache_t* e = &g.vtex[i];
+         if (e->location != vt->location || e->offset != vt->offset ||
+@@ -12959,6 +12984,7 @@ static void ld_movie_capture_overlay(void)
+     { const u32 sh_dirty = rsx_live_draw_before_guest_sync();   /* patch 2017 */
+       if (__builtin_expect(g_rsx_sh_on | g_rsx_fp_on, 0)) rsx_sync_hist_event(4 /* RSX_SH_FLIP */, sh_dirty != 0); }   /* patch 2164, 2172 */
+     ld_pwd_flip();   /* patch 2084 diagnostic */
++    ld_wbd_flip();   /* patch 2185: safety-net drain, summary */
+     ld_wbp_flip();   /* patch 2184 diagnostic */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+@@ -18538,6 +18564,251 @@ static int ld_rb_store(u32 i, u32 k, u32 for_off, u32 for_size)
+     return 1;
+ }
+ 
++/* ===========================================================================
++ * Patch 2185 (RSX pass 163): LD_WB_DEFER=1 -- deferred guest write-back (default OFF; unset = the loops above unchanged).
++ * The store points (the NV0039 scene copy, the 0x4A release's main surfaces) record their GPU copy into a readback slot and
++ * submit without a wait; the pending entry {fence, slot, destination, geometry, seq} waits in g_wbd (rsx_wb_defer.h). ONE
++ * drain (gcm_walker_user_command, before 0xEB00 is queued) waits the newest fence and stores every entry oldest-first.
++ * Readers of those guest bytes drain first: guest_ptr (all renderer reads), the texture binds (before their dirty-page
++ * checks), NV0039 copies and the NV3089 source read (rsx_live_draw_wbd_touch), the flip. Slots are not reused before
++ * their store ran (forced drain, reason slot). LD_WB_DEFER_VERIFY=1 also reads each slot at the original point (GPU wait,
++ * as today) into a shadow and compares it with the deferred conversion at the drain: [wb-defer] mismatches=N, must be 0.
++ * LD_WB_DEFER_LABEL (default 0x4A) = the label whose release defers the main surfaces. Not deferred (always synchronous):
++ * FIFO capture runs (LD_FIFO_CAPTURE), LD_WRITEBACK_BATCH=0, every other sync point. ASSUMPTION: the SPU post chain
++ * starts only from the 0xEB00 handler (the RE notes pass 188); LD_WB_HASH=1 A/B against the baseline checks it.
++ * ======================================================================== */
++static int g_wbd_mode = -1;        /* 0 off, 1 defer, 2 defer + verify */
++static int g_wbd_site;             /* 1 while a sync point is the deferring label's release */
++static u32 g_wbd_label = 0x4Au;
++static u32 g_wbd_flips, g_wbd_period = 100u;
++static u32 (*g_wbd_move_fn)(const u32*, int);
++
++static int ld_wbd_mode(void)
++{
++    if (g_wbd_mode < 0) {
++        const char* e = getenv("LD_WB_DEFER");
++        int m = (e && e[0] && e[0] != '0') ? 1 : 0;
++        if (m) { const char* v = getenv("LD_WB_DEFER_VERIFY"); if (v && v[0] && v[0] != '0') m = 2; }
++        if (m && !ld_wb_batch_enabled()) { fprintf(stderr, "[wb-defer] LD_WB_DEFER ignored: LD_WRITEBACK_BATCH=0\n"); m = 0; }
++        if (m && g_rsx_fcap_on) { fprintf(stderr, "[wb-defer] LD_WB_DEFER ignored: FIFO capture reads the guest bytes at the store point\n"); m = 0; }
++        const char* n = getenv("LD_WB_READ_N"); if (n && atoi(n) > 0) g_wbd_period = (u32)atoi(n);
++        const char* l = getenv("LD_WB_DEFER_LABEL"); if (l && l[0]) g_wbd_label = (u32)strtoul(l, NULL, 0);
++        rsx_wbd_init(&g_wbd);
++        g_wbd_mode = m;
++        if (m) fprintf(stderr, "[wb-defer] ON%s, deferring label 0x%X; DIAGNOSTIC (default off)\n", m == 2 ? " + VERIFY" : "", g_wbd_label);
++    }
++    return g_wbd_mode;
++}
++
++static int ld_wbd_wait(void* ctx, u64 fence, u64* blocked_ns)
++{
++    (void)ctx; *blocked_ns = 0;
++    if (!g.ready) return 0;
++    const int block = g.fence->lpVtbl->GetCompletedValue(g.fence) < fence;
++    LARGE_INTEGER a, b, f;
++    QueryPerformanceCounter(&a);
++    if (!ld_wait_fence(fence)) return 0;
++    if (!block) return 1;
++    QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
++    *blocked_ns = (u64)((double)(b.QuadPart - a.QuadPart) * 1e9 / (double)f.QuadPart);
++    if (!*blocked_ns) *blocked_ns = 1;
++    return 2;
++}
++
++/* Readback slot -> guest layout rows (the conversion of ld_rb_store, into any destination). 0 = the slot could not be mapped. */
++static int ld_wbd_conv(u32 slot, u32 w, u32 h, u32 fmt, u8* dst, u32 dpitch)
++{
++    const u32 texel = fmt == (u32)DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++    const u32 pitch = (w * texel + 255u) & ~255u;
++    u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * h};
++    if (slot >= LD_RB_SLOTS || !g_ld_rb[slot] || FAILED(g_ld_rb[slot]->lpVtbl->Map(g_ld_rb[slot], 0, &rr, (void**)&px))) return 0;
++    for (u32 y = 0; y < h; y++) {
++        const u8* sp = px + (size_t)y * pitch;
++        u8* dp = dst + (size_t)y * dpitch;
++        if (fmt == (u32)DXGI_FORMAT_R8G8B8A8_UNORM) {
++            for (u32 x = 0; x < w; x++, sp += 4, dp += 4) { dp[0] = sp[3]; dp[1] = sp[0]; dp[2] = sp[1]; dp[3] = sp[2]; }
++        } else if (texel == 8) {
++            for (u32 x = 0; x < w * 4u; x++, sp += 2, dp += 2) { dp[0] = sp[1]; dp[1] = sp[0]; }
++        } else {
++            for (u32 x = 0; x < w; x++, sp += 4, dp += 4) { u32 v; memcpy(&v, sp, 4); v = __builtin_bswap32(v); memcpy(dp, &v, 4); }
++        }
++    }
++    D3D12_RANGE wr = {0, 0};
++    g_ld_rb[slot]->lpVtbl->Unmap(g_ld_rb[slot], 0, &wr);
++    return 1;
++}
++
++/* The deferred store of one surface (what ld_rb_store does at the original point). Geometry was frozen at the submit. */
++static void ld_wbd_store_surf(rsx_wbd_ent* e)
++{
++    const u32 i = e->p[0], w = e->p[1], h = e->p[2], fmt = e->p[3], gp = e->p[4];
++    const u32 texel = fmt == (u32)DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++    u8* gm = (u8*)guest_ptr(e->wloc, e->woff, e->wsize);
++    t_ld_ws = LD_WS_WB;
++    ld_td_mark(e->wloc, e->woff, e->wsize);   /* patch 2033: the walker writes guest bytes (now) */
++    t_ld_ws = 0;
++    int ok = 0;
++    u8* shadow = (u8*)e->user;
++    if (gm) {
++        if (shadow) {   /* verify: the deferred conversion against the one made at the original point */
++            u8* tmp = (u8*)malloc((size_t)w * texel * h);
++            if (tmp && ld_wbd_conv(e->p[10], w, h, fmt, tmp, w * texel))
++                rsx_wbd_cmp(&g_wbd.ver, e->woff, tmp, shadow, w * texel * h);
++            free(tmp);
++        }
++        ok = ld_wbd_conv(e->p[10], w, h, fmt, gm, gp);
++    }
++    free(shadow);
++    surface_t* sf = i < g.n_surfaces ? &g.surfaces[i] : NULL;
++    const u64 tex = (u64)e->p[8] | ((u64)e->p[9] << 32);
++    if (ok && sf && (u64)(uintptr_t)sf->tex == tex && sf->location == e->wloc && sf->offset == e->woff && sf->w == w &&
++        sf->h == h && (u32)sf->fmt == fmt && (sf->pitch ? sf->pitch : sf->w * texel) == gp) {
++        ld_pwd_note_writeback(i);
++        ld_wbp_store(sf);
++        if (ld_gv_enabled()) {
++            ld_gv_baseline(sf);   /* guest bytes == the frozen GPU image now */
++            if (sf->last_write_generation != e->p[7]) sf->gv_pending = 1;   /* drawn again since the copy: the guest bytes are older */
++        }
++    }
++    static int logged;
++    if (logged++ < 8)
++        fprintf(stderr, "[surface-writeback] surface %u:0x%08X %ux%u fmt=%d pitch=%u (deferred, seq %llu)\n",
++                e->wloc, e->woff, w, h, (int)fmt, gp, (unsigned long long)e->seq);
++}
++
++/* The deferred NV0039 row copy (idx0: local 0x1300000 -> main 0x01310400), after the source surface's store. */
++static void ld_wbd_store_move(rsx_wbd_ent* e)
++{
++    const u32 bad = g_wbd_move_fn ? g_wbd_move_fn(e->p, g_wbd_mode == 2) : 0;
++    if (g_wbd_mode == 2) {
++        g_wbd.ver.compared++;
++        if (bad) {
++            g_wbd.ver.mismatches++; g_wbd.ver.bytes_bad += bad;
++            if (g_wbd.ver.nfirst < RSX_WBD_FIRST) { g_wbd.ver.first[g_wbd.ver.nfirst].tag = e->woff; g_wbd.ver.first[g_wbd.ver.nfirst].off = 0; g_wbd.ver.nfirst++; }
++        }
++    }
++    t_ld_ws = 3u;
++    ld_td_mark(e->wloc, e->woff, e->wsize);
++    rsx_live_draw_note_guest_write(e->wloc, e->woff, e->wsize);   /* the texture caches see the bytes that really landed */
++    t_ld_ws = 0;
++    if (e->wloc == 1u) rsx_live_draw_wbp_copy_done(e->woff, e->wsize);   /* patch 2184 probe: the idx0 store is done */
++}
++
++static void ld_wbd_store(void* ctx, rsx_wbd_ent* e)
++{
++    (void)ctx;
++    if (e->kind == RSX_WBD_SURF) ld_wbd_store_surf(e); else ld_wbd_store_move(e);
++}
++
++static u32 ld_wbd_drain(int reason)
++{
++    if (!g_wbd.n) return 0;
++    LDW_T0(st_t0);
++    const u32 r = rsx_wbd_drain(&g_wbd, reason, ld_wbd_wait, ld_wbd_store, NULL);
++    rsx_wbd_snap_publish(&g_wbd_snap, &g_wbd);
++    LDW_ADD(RSX_PERF_W_WB_STORE_T, st_t0);
++    return r;
++}
++
++static void ld_wbd_touch(u32 location, u32 offset, u32 size, int reason)
++{
++    if (g_wbd_owner != GetCurrentThreadId()) return;
++    if (rsx_wbd_touch(&g_wbd, location, offset, size, reason, ld_wbd_wait, ld_wbd_store, NULL))
++        rsx_wbd_snap_publish(&g_wbd_snap, &g_wbd);
++}
++
++static void ld_wbd_push(const rsx_wbd_ent* e)
++{
++    if (!rsx_wbd_push(&g_wbd, e)) { ld_wbd_drain(RSX_WBD_R_FULL); rsx_wbd_push(&g_wbd, e); }
++    g_wbd_owner = GetCurrentThreadId();
++    rsx_wbd_snap_publish(&g_wbd_snap, &g_wbd);
++}
++
++/* One chunk of recorded copies (rec[k] into slots[k]): submit without a wait, queue one entry per surface. */
++static u32 ld_wbd_chunk(const u32* rec, const int* slots, u32 nrec, u32 for_off, u32 for_size)
++{
++    ld_oq_close();   /* as ld_flush does: a query ends in the list it began in */
++    g_ld_unsubmitted = 1;
++    const u64 f0 = g.fence_value;
++    ld_submit_nowait();
++    if (!g.ready) return 0;
++    if (g.fence_value == f0) {   /* nothing was submitted: this chunk keeps today's synchronous store, after the older pending ones */
++        ld_wbd_drain(RSX_WBD_R_NOSUBMIT);
++        ld_flush(LD_FLUSH_READBACK); g_ld_wb.waits++;
++        u32 d = 0;
++        if (g.ready)
++            for (u32 k = 0; k < nrec; k++)
++                d += (u32)ld_rb_store(rec[k], (u32)slots[k], for_off ? for_off : g.surfaces[rec[k]].offset, for_size);
++        for (u32 k = 0; k < nrec; k++) rsx_wbd_slot_put(&g_wbd, slots[k]);
++        return d;
++    }
++    const u64 fence = g.fence_value;
++    if (g_wbd_mode == 2 && !ld_wait_fence(fence)) return 0;   /* verify: the readback is read at the original point too */
++    for (u32 k = 0; k < nrec; k++) {
++        surface_t* sf = &g.surfaces[rec[k]];
++        const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++        const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
++        rsx_wbd_ent e; memset(&e, 0, sizeof e);
++        e.kind = RSX_WBD_SURF; e.slot = slots[k]; e.fence = fence;
++        e.wloc = sf->location; e.woff = sf->offset; e.wsize = gp * (sf->h - 1u) + sf->w * texel;
++        e.p[0] = rec[k]; e.p[1] = sf->w; e.p[2] = sf->h; e.p[3] = (u32)sf->fmt; e.p[4] = gp;
++        e.p[7] = sf->last_write_generation;
++        e.p[8] = (u32)((u64)(uintptr_t)sf->tex & 0xFFFFFFFFu); e.p[9] = (u32)((u64)(uintptr_t)sf->tex >> 32);
++        e.p[10] = (u32)slots[k];
++        if (g_wbd_mode == 2) {
++            u8* sh = (u8*)malloc((size_t)sf->w * texel * sf->h);
++            if (sh && !ld_wbd_conv((u32)slots[k], sf->w, sf->h, (u32)sf->fmt, sh, sf->w * texel)) { free(sh); sh = NULL; }
++            e.user = sh;
++        }
++        sf->gv_gpu_dirty = 0;   /* as the synchronous store clears it; a draw after this submit sets it again */
++        ld_wbd_push(&e);
++    }
++    return nrec;
++}
++
++/* ---- exports ---- */
++void rsx_live_draw_wbd_drain(int reason)
++{
++    if (g_wbd.n && g_wbd_owner == GetCurrentThreadId()) ld_wbd_drain(reason);
++}
++void rsx_live_draw_wbd_touch(u32 location, u32 offset, u32 size)
++{
++    if (g_wbd.n) ld_wbd_touch(location, offset, size, RSX_WBD_R_NV0039);
++}
++int rsx_live_draw_wbd_active(void) { return ld_wbd_mode() != 0; }
++void rsx_live_draw_wbd_set_site(int label)   /* the walker's NV406E release of `label` is about to call before_guest_sync; -1 = done */
++{
++    g_wbd_site = (label >= 0 && ld_wbd_mode() && (u32)label == g_wbd_label) ? 1 : 0;
++}
++/* nv0039_copy: its source range has a pending store, so the row copy has to wait for it. p[0..7] = src, dst, len, n, pitch_in,
++ * pitch_out, in_inc, out_inc (the caller's loop); fn(p, verify) runs it at the drain and returns the rows that differ (verify). */
++int rsx_live_draw_wbd_defer_move(u32 sloc, u32 soff, u32 ssize, u32 dloc, u32 doff, u32 dsize, const u32* p, u32 (*fn)(const u32*, int))
++{
++    if (!ld_wbd_mode() || !rsx_wbd_overlap(&g_wbd, sloc, soff, ssize)) return 0;
++    rsx_wbd_ent e; memset(&e, 0, sizeof e);
++    e.kind = RSX_WBD_MOVE; e.slot = -1;
++    e.wloc = dloc; e.woff = doff; e.wsize = dsize;
++    e.rloc = sloc; e.roff = soff; e.rsize = ssize;
++    memcpy(e.p, p, 8 * sizeof p[0]);
++    g_wbd_move_fn = fn;
++    ld_wbd_push(&e);
++    return 1;
++}
++static void ld_wbd_flip(void)
++{
++    if (g_wbd_mode == 0) return;
++    if (ld_wbd_mode() == 0) return;
++    ld_wbd_drain(RSX_WBD_R_FLIP);   /* nothing the guest sees at a flip may still be pending */
++    if (++g_wbd_flips % g_wbd_period == 0) {
++        char line[512];
++        rsx_wbd_fmt(&g_wbd, g_ld_frames, line, sizeof line);
++        fprintf(stderr, "%s\n", line);
++        const rsx_wbd_ver* v = &g_wbd.ver;
++        for (u32 k = 0; k < v->nfirst; k++) fprintf(stderr, "[wb-defer] mismatch #%u surface 0x%08X offset %u\n", k, v->first[k].tag, v->first[k].off);
++        fprintf(stderr, "[wb-defer] spu_gets_of_pending=%ld (SPU DMA GETs of a pending store's range: stale reads, must be 0) spu_writes_into_pending=%ld (SPU DMA puts there; the deferred store would overwrite them)\n", (long)g_wbd_spu_gets, (long)g_wbd_spu_hits);
++    }
++}
++
+ /* Patch 2120 (diagnostic): log each new maximum of surfaces in one write-back batch (callers: 0 = NV0039 copy
+  * range, 1 = guest sync point). The batch bound is MAX_SURFACES; a line with n > 64 cannot happen. */
+ static void ld_wb_cap_note(u32 n, int caller)
+@@ -18552,7 +18823,10 @@ static void ld_wb_cap_note(u32 n, int caller)
+ 
+ /* Write back surfaces idx[0..n): all copies, one submit + wait, all stores.
+  * Falls back to the per-surface path when LD_WRITEBACK_BATCH=0. */
+-static u32 ld_writeback_batch(const u32* idx_in, u32 n, u32 for_off, u32 for_size)
++static u32 ld_wbd_drain(int reason);
++static u32 ld_wbd_chunk(const u32* rec, const int* slots, u32 nrec, u32 for_off, u32 for_size);
++static int ld_wbd_mode(void);
++static u32 ld_writeback_batch(const u32* idx_in, u32 n, u32 for_off, u32 for_size, int defer_ok)
+ {
+     LARGE_INTEGER t0, t1;
+     QueryPerformanceCounter(&t0);
+@@ -18600,11 +18874,37 @@ static u32 ld_writeback_batch(const u32* idx_in, u32 n, u32 for_off, u32 for_siz
+           }
+           fprintf(stderr, "\n");
+       } }
++    /* Patch 2185: a synchronous batch (another sync point, or the per-surface path) takes readback slots 0.. and must come after
++     * every older pending store (overlap order, slot ownership): drain first. */
++    if (g_wbd.n && !(defer_ok && ld_wbd_mode())) ld_wbd_drain(RSX_WBD_R_OTHER);
+     if (!ld_wb_batch_enabled()) {
+         for (u32 j = 0; j < n; j++) { done += (u32)ld_writeback_surface(idx[j], for_off ? for_off : g.surfaces[idx[j]].offset, for_size); g_ld_wb.waits++; }
+     } else {
++        const int wbd = defer_ok && ld_wbd_mode();   /* patch 2185: off = the loop below unchanged */
+         for (u32 j0 = 0; j0 < n && g.ready; j0 += LD_RB_SLOTS) {
+             u32 rec[LD_RB_SLOTS], nrec = 0;
++            if (wbd) {
++                /* Patch 2185: slots stay taken until their store ran; not enough free ones = drain first (reason slot). */
++                int slots[LD_RB_SLOTS];
++                const u32 cand = n - j0 < LD_RB_SLOTS ? n - j0 : LD_RB_SLOTS;
++                if (rsx_wbd_need_drain_for_slots(&g_wbd, cand)) ld_wbd_drain(RSX_WBD_R_SLOT);
++                for (u32 j = j0; j < n && j < j0 + LD_RB_SLOTS; j++) {
++                    const u32 i = idx[j];
++                    const surface_t* sf = &g.surfaces[i];
++                    const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++                    const u32 gp = sf->pitch ? sf->pitch : sf->w * texel;
++                    if (!sf->tex || gp < sf->w * texel) continue;
++                    if (!guest_ptr(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel)) continue;   /* drains an overlapping pending store */
++                    ld_gv_validate(i);
++                    int s = rsx_wbd_slot_take(&g_wbd);
++                    if (s < 0) { ld_wbd_drain(RSX_WBD_R_SLOT); s = rsx_wbd_slot_take(&g_wbd); }
++                    if (s < 0) continue;
++                    if (ld_rb_record(i, (u32)s)) { rec[nrec] = i; slots[nrec] = s; nrec++; }
++                    else rsx_wbd_slot_put(&g_wbd, s);
++                }
++                if (nrec) done += ld_wbd_chunk(rec, slots, nrec, for_off, for_size);
++                continue;
++            }
+             for (u32 j = j0; j < n && j < j0 + LD_RB_SLOTS; j++) {
+                 const u32 i = idx[j];
+                 const surface_t* sf = &g.surfaces[i];
+@@ -19065,7 +19365,7 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+     }
+     LDW_T0(wb_t0);
+     ld_wb_cap_note(n, 0);
+-    done = ld_writeback_batch(idx, n, offset, size);
++    done = ld_writeback_batch(idx, n, offset, size, 1);
+     if (wb_t0 && n) { LDW_ADD(RSX_PERF_W_WB_NV0039_T, wb_t0); rsx_perf_add(RSX_PERF_W_WB_NV0039_N, 1); }
+     return done;
+ }
+@@ -19100,7 +19400,7 @@ static u32 ld_before_guest_sync_impl(void)
+     if (!n) return 0;
+     ld_wb_cap_note(n, 1);
+     LDW_T0(wb_t0);
+-    const u32 done = ld_writeback_batch(idx, n, 0, 0);   /* patch 2018: one GPU wait */
++    const u32 done = ld_writeback_batch(idx, n, 0, 0, g_wbd_site);   /* patch 2018: one GPU wait; 2185: the 0x4A release may defer */
+     if (wb_t0) { LDW_ADD(RSX_PERF_W_WB_SYNC_T, wb_t0); rsx_perf_add(RSX_PERF_W_WB_SYNC_N, 1); }
+     if (done) {
+         static u64 total; total += done;
+@@ -19608,6 +19908,7 @@ static void ld_present_body(u32 buffer_id)
+     { const u32 sh_dirty = rsx_live_draw_before_guest_sync();   /* patch 2017 */
+       if (__builtin_expect(g_rsx_sh_on | g_rsx_fp_on, 0)) rsx_sync_hist_event(4 /* RSX_SH_FLIP */, sh_dirty != 0); }   /* patch 2164, 2172 */
+     ld_pwd_flip();   /* patch 2084 diagnostic */
++    ld_wbd_flip();   /* patch 2185: safety-net drain, summary */
+     ld_wbp_flip();   /* patch 2184 diagnostic */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 5b29fd1..7ba940b 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -111,6 +111,15 @@ void rsx_live_draw_wbp_get(u32 location, u32 offset, u32 size, u32 img, u32 pc);
+ void rsx_live_draw_wbp_put(u32 location, u32 offset, u32 size);   /* patch 2184 */
+ void rsx_live_draw_wbp_usercmd(void);   /* patch 2184: the walker is about to queue 0xEB00 */
+ void rsx_live_draw_wbp_copy_done(u32 offset, u32 size);   /* patch 2184: an NV0039 copy into main memory finished (idx0) */
++/* Patch 2185 (LD_WB_DEFER, default off): deferred guest write-backs; rsx_wb_defer.h. */
++void rsx_live_draw_wbd_drain(int reason);   /* wait the newest pending fence once, store everything oldest-first (reason 0 = usercmd) */
++void rsx_live_draw_wbd_touch(u32 location, u32 offset, u32 size);   /* a reader of these guest bytes: drain when a pending store covers them */
++int  rsx_live_draw_wbd_active(void);   /* LD_WB_DEFER on (and usable) */
++void rsx_live_draw_wbd_set_site(int label);   /* around before_guest_sync of an NV406E release of `label` (-1 = after) */
++/* nv0039_copy: queue the row copy behind a pending store of its source range; 1 = queued (the caller skips its own copy).
++ * p[0..7] = src, dst, len, n, pitch_in, pitch_out, in_inc, out_inc; fn(p, verify) runs the copy at the drain. */
++int  rsx_live_draw_wbd_defer_move(u32 sloc, u32 soff, u32 ssize, u32 dloc, u32 doff, u32 dsize, const u32* p,
++                                  u32 (*fn)(const u32*, int));
+ /* Patch 2015: before the guest reads [offset, offset+size) of `location`
+  * (an NV0039 copy out of local memory), write every live colour surface that
+  * overlaps it back into guest memory in the RSX layout (A8R8G8B8 as A,R,G,B
+diff --git a/libs/video/rsx_wb_defer.h b/libs/video/rsx_wb_defer.h
+new file mode 100644
+index 0000000..18708bb
+--- /dev/null
++++ b/libs/video/rsx_wb_defer.h
+@@ -0,0 +1,207 @@
++/* KZ3 patch 2185 (RSX pass 163): the pending-store queue of the deferred guest write-back (LD_WB_DEFER=1, default off).
++ *
++ * Today the walker waits for the GPU at each store point (the idx0 scene copy, the 0x4A release's main surfaces) and
++ * converts the readback buffer into guest memory at once. Deferred, the copy goes into a readback slot and is submitted
++ * without a wait; one entry per store stays here until ONE drain waits the newest fence and runs every guest store
++ * oldest-first. This header is the GPU-free bookkeeping: slots, order, forced drains, overlap queries, statistics and
++ * the byte compare of the verify mode (LD_WB_DEFER_VERIFY=1). Host test: tools/smoke/test_wb_defer.sh.
++ * Thread model: every call comes from the walker thread (stores use walker state); the queue has no lock. The only
++ * cross-thread data is the published range snapshot (rsx_wbd_snap), diagnostic and read racily on purpose. */
++#ifndef RSX_WB_DEFER_H
++#define RSX_WB_DEFER_H
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#define RSX_PATCH_2185 1
++#define RSX_WBD_SLOTS 16u
++#define RSX_WBD_CAP 64u
++#define RSX_WBD_FIRST 8u
++
++enum { RSX_WBD_SURF = 1, RSX_WBD_MOVE = 2 };
++/* why a drain happened (the reason is counted; USERCMD is the one the design expects) */
++enum { RSX_WBD_R_USERCMD, RSX_WBD_R_FLIP, RSX_WBD_R_SLOT, RSX_WBD_R_FULL, RSX_WBD_R_TOUCH, RSX_WBD_R_NV0039,
++       RSX_WBD_R_NOSUBMIT, RSX_WBD_R_OTHER, RSX_WBD_R_N };
++static const char* const rsx_wbd_reason_name[RSX_WBD_R_N] = { "usercmd", "flip", "slot", "full", "touch", "nv0039",
++                                                                "nosubmit", "other" };
++
++typedef struct {
++    uint32_t kind;                    /* RSX_WBD_SURF or RSX_WBD_MOVE */
++    int32_t slot;                     /* readback slot held until the store ran, -1 = none */
++    uint64_t fence;                   /* GPU fence value that completes this entry's copy (0 = none) */
++    uint64_t seq;                     /* push order */
++    uint32_t wloc, woff, wsize;       /* guest bytes the store writes (footprint) */
++    uint32_t rloc, roff, rsize;       /* guest bytes the store reads at the drain (MOVE source), rsize 0 = none */
++    uint32_t p[12];                   /* caller payload (surface geometry, copy parameters) */
++    void* user;                       /* caller pointer (verify shadow) */
++} rsx_wbd_ent;
++
++typedef struct {
++    uint64_t compared, mismatches, bytes_bad;
++    uint32_t nfirst;
++    struct { uint32_t tag, off; } first[RSX_WBD_FIRST];   /* first mismatching (surface tag, byte offset) */
++} rsx_wbd_ver;
++
++typedef struct {
++    rsx_wbd_ent q[RSX_WBD_CAP];
++    uint32_t n;                       /* pending entries */
++    uint32_t taken;                   /* bit per readback slot: taken for a record or held by a pending entry */
++    uint64_t seq;
++    uint64_t pending_max, drains, waits, wait_ns, stores, aborted, pushes;
++    uint64_t forced[RSX_WBD_R_N];
++    rsx_wbd_ver ver;
++} rsx_wbd;
++
++static inline void rsx_wbd_init(rsx_wbd* d) { memset(d, 0, sizeof *d); }
++
++/* ---- readback slots ---- */
++static inline uint32_t rsx_wbd_free_slots(const rsx_wbd* d)
++{
++    uint32_t f = 0;
++    for (uint32_t i = 0; i < RSX_WBD_SLOTS; i++) if (!(d->taken & (1u << i))) f++;
++    return f;
++}
++/* Does a record of `need` slots have to drain first? (A slot is not reusable before its store ran.) */
++static inline int rsx_wbd_need_drain_for_slots(const rsx_wbd* d, uint32_t need)
++{
++    return rsx_wbd_free_slots(d) < need;
++}
++static inline int rsx_wbd_slot_take(rsx_wbd* d)
++{
++    for (uint32_t i = 0; i < RSX_WBD_SLOTS; i++)
++        if (!(d->taken & (1u << i))) { d->taken |= 1u << i; return (int)i; }
++    return -1;
++}
++static inline void rsx_wbd_slot_put(rsx_wbd* d, int s)
++{
++    if (s >= 0 && (uint32_t)s < RSX_WBD_SLOTS) d->taken &= ~(1u << (uint32_t)s);
++}
++
++/* ---- queue ---- */
++/* 0 = queue full (the caller drains with RSX_WBD_R_FULL and pushes again). */
++static inline int rsx_wbd_push(rsx_wbd* d, const rsx_wbd_ent* e)
++{
++    if (d->n >= RSX_WBD_CAP) return 0;
++    rsx_wbd_ent* q = &d->q[d->n++];
++    *q = *e;
++    q->seq = ++d->seq;
++    if (q->slot >= 0) d->taken |= 1u << (uint32_t)q->slot;
++    d->pushes++;
++    if (d->n > d->pending_max) d->pending_max = d->n;
++    return 1;
++}
++static inline int rsx_wbd_ranges_hit(uint32_t aloc, uint32_t a0, uint32_t asz, uint32_t bloc, uint32_t b0, uint32_t bsz)
++{
++    if (aloc != bloc) return 0;
++    const uint64_t a1 = (uint64_t)a0 + (asz ? asz : 1u), b1 = (uint64_t)b0 + (bsz ? bsz : 1u);
++    return a0 < b1 && b0 < a1;
++}
++/* Does any pending entry write or read [off, off+size) of `loc`? */
++static inline int rsx_wbd_overlap(const rsx_wbd* d, uint32_t loc, uint32_t off, uint32_t size)
++{
++    for (uint32_t i = 0; i < d->n; i++) {
++        const rsx_wbd_ent* e = &d->q[i];
++        if (rsx_wbd_ranges_hit(e->wloc, e->woff, e->wsize, loc, off, size)) return 1;
++        if (e->rsize && rsx_wbd_ranges_hit(e->rloc, e->roff, e->rsize, loc, off, size)) return 1;
++    }
++    return 0;
++}
++
++/* wait(ctx, fence, &blocked_ns): 0 = failed (device lost), 1 = already complete, 2 = blocked (blocked_ns = time waited).
++ * store(ctx, entry): the guest store of one entry; the slot is freed after it returns. */
++typedef int (*rsx_wbd_wait_fn)(void* ctx, uint64_t fence, uint64_t* blocked_ns);
++typedef void (*rsx_wbd_store_fn)(void* ctx, rsx_wbd_ent* e);
++
++/* Wait the newest pending fence once, then run every store oldest-first. The queue is emptied before the first store
++ * (a hook reached from a store sees nothing pending), so a second drain does nothing. Returns the stores run. */
++static inline uint32_t rsx_wbd_drain(rsx_wbd* d, int reason, rsx_wbd_wait_fn wait, rsx_wbd_store_fn store, void* ctx)
++{
++    const uint32_t n = d->n;
++    if (!n) return 0;
++    rsx_wbd_ent local[RSX_WBD_CAP];
++    memcpy(local, d->q, (size_t)n * sizeof local[0]);
++    d->n = 0;
++    d->drains++;
++    if (reason >= 0 && reason < RSX_WBD_R_N) d->forced[reason]++;
++    uint64_t fence = 0;
++    for (uint32_t i = 0; i < n; i++) if (local[i].fence > fence) fence = local[i].fence;
++    if (fence) {
++        uint64_t blocked = 0;
++        const int rc = wait(ctx, fence, &blocked);
++        if (rc == 2) { d->waits++; d->wait_ns += blocked; }
++        if (!rc) {   /* the GPU is gone: nothing can be stored, release the slots */
++            d->aborted += n;
++            for (uint32_t i = 0; i < n; i++) rsx_wbd_slot_put(d, local[i].slot);
++            return 0;
++        }
++    }
++    /*ORDER*/ for (uint32_t i = 0; i < n; i++) {
++        store(ctx, &local[i]);
++        d->stores++;
++        rsx_wbd_slot_put(d, local[i].slot);
++    }
++    return n;
++}
++/* A reader of [off, off+size) of `loc` is about to look at guest bytes: drain when a pending store covers them. */
++static inline uint32_t rsx_wbd_touch(rsx_wbd* d, uint32_t loc, uint32_t off, uint32_t size, int reason,
++                                     rsx_wbd_wait_fn wait, rsx_wbd_store_fn store, void* ctx)
++{
++    if (!d->n || !rsx_wbd_overlap(d, loc, off, size)) return 0;
++    return rsx_wbd_drain(d, reason, wait, store, ctx);
++}
++
++/* ---- verify mode ---- */
++/* Compare the deferred bytes `a` with the synchronous shadow `b`; tag = surface offset for the log. Returns the number of
++ * differing bytes (0 = equal); counts one mismatch per call that differs and remembers the first (tag, offset) pairs. */
++static inline uint32_t rsx_wbd_cmp(rsx_wbd_ver* v, uint32_t tag, const uint8_t* a, const uint8_t* b, uint32_t n)
++{
++    uint32_t bad = 0, first = 0;
++    v->compared++;
++    /*CMP*/ for (uint32_t i = 0; i < n; i++)
++        if (a[i] != b[i]) { if (!bad) first = i; bad++; }
++    if (bad) {
++        v->mismatches++; v->bytes_bad += bad;
++        if (v->nfirst < RSX_WBD_FIRST) { v->first[v->nfirst].tag = tag; v->first[v->nfirst].off = first; v->nfirst++; }
++    }
++    return bad;
++}
++
++/* The [wb-defer] summary line. */
++static inline int rsx_wbd_fmt(const rsx_wbd* d, uint32_t frame, char* out, size_t cap)
++{
++    int w = snprintf(out, cap, "[wb-defer] f=%u pending_max=%llu pushes=%llu drains=%llu waits=%llu wait_ms=%.3f stores=%llu "
++                     "aborted=%llu forced:", frame, (unsigned long long)d->pending_max, (unsigned long long)d->pushes,
++                     (unsigned long long)d->drains, (unsigned long long)d->waits, (double)d->wait_ns / 1e6,
++                     (unsigned long long)d->stores, (unsigned long long)d->aborted);
++    for (int r = 0; r < RSX_WBD_R_N && w > 0 && (size_t)w < cap; r++)
++        w += snprintf(out + w, cap - (size_t)w, " %s=%llu", rsx_wbd_reason_name[r], (unsigned long long)d->forced[r]);
++    if (w > 0 && (size_t)w < cap)
++        w += snprintf(out + w, cap - (size_t)w, " verified=%llu mismatches=%llu bytes_bad=%llu",
++                      (unsigned long long)d->ver.compared, (unsigned long long)d->ver.mismatches,
++                      (unsigned long long)d->ver.bytes_bad);
++    return w;
++}
++
++/* ---- published ranges (any thread may read, racily, for the diagnostic "an SPU wrote into a pending range") ----
++ * Relaxed atomics so the race is a defined one (TSan-clean): a reader may see a half-updated set, never a torn value. */
++#define RSX_WBD_SNAP 16u
++typedef struct { uint32_t n; uint32_t loc[RSX_WBD_SNAP], off[RSX_WBD_SNAP], size[RSX_WBD_SNAP]; } rsx_wbd_snap;
++#define RSX_WBD_LD(p) __atomic_load_n((p), __ATOMIC_RELAXED)
++#define RSX_WBD_ST(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
++static inline void rsx_wbd_snap_publish(rsx_wbd_snap* s, const rsx_wbd* d)
++{
++    uint32_t m = 0;
++    RSX_WBD_ST(&s->n, 0u);
++    for (uint32_t i = 0; i < d->n && m < RSX_WBD_SNAP; i++) {
++        RSX_WBD_ST(&s->loc[m], d->q[i].wloc); RSX_WBD_ST(&s->off[m], d->q[i].woff); RSX_WBD_ST(&s->size[m], d->q[i].wsize); m++;
++    }
++    RSX_WBD_ST(&s->n, m);
++}
++static inline int rsx_wbd_snap_hit(const rsx_wbd_snap* s, uint32_t loc, uint32_t off, uint32_t size)
++{
++    const uint32_t n = RSX_WBD_LD(&s->n);
++    for (uint32_t i = 0; i < n && i < RSX_WBD_SNAP; i++)
++        if (rsx_wbd_ranges_hit(RSX_WBD_LD(&s->loc[i]), RSX_WBD_LD(&s->off[i]), RSX_WBD_LD(&s->size[i]), loc, off, size)) return 1;
++    return 0;
++}
++#endif

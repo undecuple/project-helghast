@@ -1,0 +1,482 @@
+KZ3 patch 2198 (RSX pass 171, S7.4 of the S7 design, host tests only, nothing calls it): the resident-stream core.
+Pure, API-neutral code for resident raw vertex streams (the GPU reads the guest's raw vertex bytes in place from a pool of
+4 KB blocks, one current block per guest page and write generation), with no D3D12 / Vulkan / Win32 calls, no walker
+types, no switch, and no wiring into the live renderer (S7.5 backends and S7.6 wiring come later).
+  libs/kzr/core/vres/kzr_vres.h        page pool, block lists, walker epochs, acquire hold, fence-safe allocation (spare
+    FIFO + clock), page copies as jobs (copy_seq / done_seq, need_seq for the draw's reads gate), the write generation
+    behind kzr_wgen_ops {collect, arm, clean}, the draw table writer.
+  libs/kzr/core/vres/kzr_vres_decode.h the decode through the block lists, text in the C/HLSL common subset.
+  libs/video/rsx_vtx_res.h             bridge to patch 2076's rsx_vg_draw plan and the HLSL head/tail text (text only).
+Origin: design input from Killzone 2 (patches 6079 rsx_vtx_res.h and 6080, the Killzone 2 port's runtime work): the model, the
+block rules, the epoch stand and the two pass 91b rules (stamp again at record, acquire hold). Rewritten for kzr; credit
+in NOTICE at the public export.
+Host test: tools/smoke/test_vres.sh (decode equal to 2076's over 3,000 draws, 300,000-step residency stress with delayed
+page copies, directed cases, eleven negative controls incl. a stale-reuse shape found in the Killzone 2 port).
+
+diff --git a/libs/kzr/core/vres/kzr_vres.h b/libs/kzr/core/vres/kzr_vres.h
+new file mode 100644
+--- /dev/null
++++ b/libs/kzr/core/vres/kzr_vres.h
+@@ -0,0 +1,356 @@
++/* kzr/core/vres: resident raw vertex streams, the pure core (S7.4).
++ * Pure C11, API-neutral: no D3D12 / Vulkan / Win32 types, no walker types, no game addresses, no switch; nothing in
++ * the walker includes it yet (S7.6 wires it).
++ *
++ * Origin: design input from Killzone 2's patches 6079 (rsx_vtx_res.h, pure residency) and 6080 (its wiring and the
++ * pass 91/91b rules), written by the Killzone 2 port. The structure (page pool of 4 KB blocks, one
++ * current block per guest page, write generation, walker epochs, fence-safe allocation with a spare FIFO and a clock)
++ * and the two pass 91b rules (stamp again at record, acquire hold) are theirs; this file is a rewrite for the kzr
++ * module with the write generation behind an interface and the page copies as jobs. Credit: NOTICE.
++ * Origin headers mark code that came from the Killzone 2 port.
++ *
++ * What it does. The GPU reads raw big-endian guest vertex bytes in place from a pool of 4 KB blocks. Each guest page
++ * in use has one current block, copied once per write generation of the page. A draw passes, per merged span, the
++ * list of its pages' blocks (kzr_vres_write_table); the decode (kzr_vres_decode.h) reads span byte a at pool offset
++ * (list[a >> 12] << 12) | (a & 4095).
++ *
++ * Write generation (interface kzr_wgen_ops). The core never talks to an OS: collect(lo, bytes) makes the generation of
++ * the pages of the range current, arm(entry, lo) is taken after a collect and BEFORE the bytes are read, clean(entry,
++ * lo, bytes) after a collect: no write reached the range since the arm. Adapters: O3's rsx_wgen (producer events) and
++ * O4's OS write watch (KZ2's rsx_tex_ww.h shape: stamps from a clock, arm = clock). The state is shared with other
++ * users of the pages (the texture cache), so a collect for one user must not lose a write for another: the adapter's
++ * stamps, not the core, keep that.
++ *
++ * Epoch stand. A collect is costly (2-3 us in game in the Killzone 2 port), so a page found clean (or copied) stands for the rest of
++ * the walker's epoch: kzr_vres_epoch() is called wherever the walker waits for the guest (park, new put, JUMP/CALL,
++ * ACQUIRE, before_guest_sync, write-back, blit/resolve, flip: the kzr_pub_barrier hook list). A semaphore acquire the
++ * walker passes before its label holds the wanted value is held (kzr_vres_acquire): its producer may write after it,
++ * inside the new epoch, so no page stands until every held label is met (kzr_vres_hold_check, at each draw), which then
++ * ends the epoch. ASSUMPTION (guest-sync rule): the bytes a draw reads are final before the commands holding that
++ * draw become visible to the RSX without a further wait, so no write lands inside an epoch on a page a later draw of
++ * the same epoch reads. verify mode compares every reuse with the checksum of its copy and counts a mismatch as bad.
++ * a Killzone 2 run found 14 stale reuses on this rule (ACQUIRE must end the epoch): the host test has
++ * a negative control modelled on it.
++ *
++ * Fence safety. A block is overwritten only when (a) the frames that referenced it are complete on the GPU: every
++ * block keeps the frame of its last use (kzr_vres_stamp again at record, with the signal value of the list that really
++ * reads it) and allocation takes only blocks with last_use <= completed that were not used in the last min_age frames,
++ * and (b) its page copy has finished: copies may be jobs (S7's PAGE_COPY), the copy callback returns the job's seq
++ * (0 = done on return) and a block is taken only when copy_seq <= done_seq (kzr_vres_copies_done); kzr_vres_map_span
++ * reports the highest copy seq among the blocks it returned (need_seq) for the draw's reads gate. Allocation prefers a
++ * spare block (never used or retired, FIFO in retirement order) and only when none of the first KZR_VRES_SCAN is safe
++ * does a clock hand evict a current page.
++ * Frame contract: frames count from 1 (last_use 0 = never used) and completed < frame.
++ *
++ * Verify with an asynchronous copy: the checksum is taken when the copy is queued; a worker reading later may see
++ * newer bytes, so verify with async copies can report a false bad (ASSUMPTION: verify runs use synchronous copies).
++ *
++ * Walker thread only: no locking (copy_seq / done_seq are plain values passed by the walker thread).
++ * Host test: tools/smoke/test_vres.sh. Its negative controls are mutated copies of this header made by the script from exact-text
++ * substitutions (nothing test-only lives in this file). */
++#ifndef KZR_VRES_H
++#define KZR_VRES_H
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define KZR_VRES_PAGE_SHIFT 12u
++#define KZR_VRES_PAGE (1u << KZR_VRES_PAGE_SHIFT)
++#define KZR_VRES_NONE 0xFFFFFFFFu
++#define KZR_VRES_RETIRED 0xFFFFFFFEu
++#define KZR_VRES_ROW_BYTES 48u                        /* uint4 {base, stride, fmt, lim}, uint4 {pt, 0, 0, 0}, float4 dflt */
++#define KZR_VRES_ROWS 16u
++#define KZR_VRES_TABLE_BYTES (KZR_VRES_ROWS * KZR_VRES_ROW_BYTES)   /* then the spans' block lists (u32 each) */
++#define KZR_VRES_HOLD_MAX 64u                         /* pending unmet acquires tracked */
++#ifndef KZR_VRES_SCAN
++#define KZR_VRES_SCAN 4096u                           /* entries looked at per allocation, in each phase */
++#endif
++
++/* ---- the write generation interface ---- */
++typedef struct kzr_wgen_arm { uint64_t seq; uintptr_t lo; } kzr_wgen_arm;   /* seq 0 = not armed */
++typedef struct kzr_wgen_ops {
++    void* user;
++    int  (*collect)(void* user, uintptr_t lo, uint32_t bytes);                      /* 1 ok, 0 failed */
++    void (*arm)(void* user, kzr_wgen_arm* a, uintptr_t lo);                         /* after collect, before the read */
++    int  (*clean)(void* user, const kzr_wgen_arm* a, uintptr_t lo, uint32_t bytes); /* after collect: 1 = no write since arm */
++} kzr_wgen_ops;
++
++typedef struct kzr_vres_block {
++    uint32_t page;       /* guest page (index from base) this block holds; NONE free, RETIRED old generation */
++    uint32_t last_use;   /* frame of the last draw that referenced the block (0 = never) */
++    uint32_t epoch;      /* walker epoch in which the page was last copied or found clean */
++    uint64_t copy_seq;   /* seq of the page copy job that fills the block (0 = filled on return) */
++    kzr_wgen_arm arm;    /* write-generation arm taken before the copy */
++    uint64_t sum;        /* verify: checksum of the copied bytes */
++} kzr_vres_block;
++
++/* Copy KZR_VRES_PAGE bytes from guest page `src` into pool block `block`; returns the copy's seq (0 = done on return). */
++typedef uint64_t (*kzr_vres_copy_fn)(void* user, uint32_t block, const uint8_t* src);
++
++typedef struct kzr_vres {
++    kzr_wgen_ops wg;
++    uintptr_t base;       /* host address of the watched guest space */
++    uint32_t n_pages;     /* guest pages watched (map entries) */
++    uint32_t* map;        /* n_pages entries: guest page -> block + 1 (0 = not resident) */
++    kzr_vres_block* blocks;
++    uint32_t n_blocks, hand, min_age;
++    uint32_t* spare;      /* n_blocks entries: FIFO of blocks whose page is NONE or RETIRED (exactly those) */
++    uint32_t spare_head, spare_n;
++    uint32_t epoch;       /* starts at 1 */
++    uint64_t done_seq;    /* page copies up to this seq are finished */
++    int verify;
++    kzr_vres_copy_fn copy;
++    void* user;
++    uint64_t maps, collects, reuse_stand, reuse_clean, copies, evicts, retires, alloc_fail, bad, too_big, ww_fail;
++    /* verify split: which rule kept the page (stand: no query; clean: the generation answered clean) and, with peek
++     * set after init, whether the bytes this draw reads differ from the copy the GPU reads (read) or only other bytes
++     * of the page changed (unread). */
++    uint64_t bad_stand, bad_clean, bad_read, bad_unread;
++    const uint8_t* (*peek)(void* user, uint32_t block);   /* the copy of block `block` (verify only), or NULL */
++    /* acquire hold: semaphore acquires passed before their label held the wanted value. While any is pending, or after
++     * the table overflowed (sticky), no page stands: every map queries the generation. */
++    uint32_t hold_n, hold_sticky;
++    uint32_t hold_ea[KZR_VRES_HOLD_MAX], hold_want[KZR_VRES_HOLD_MAX];
++    uint64_t holds, hold_releases, hold_overflow, hold_maps;
++} kzr_vres;
++
++static inline uint64_t kzr_vres_sum(const uint8_t* p)
++{
++    uint64_t h = 0xCBF29CE484222325ull;   /* FNV-1a over 64-bit words */
++    for (uint32_t i = 0; i < KZR_VRES_PAGE; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001B3ull; }
++    return h;
++}
++
++/* map: n_pages entries, blocks / spare: n_blocks entries each, all owned by the caller. base = host address of guest 0. */
++static inline void kzr_vres_init(kzr_vres* s, const kzr_wgen_ops* wg, uintptr_t base, uint32_t n_pages, uint32_t* map,
++                                 kzr_vres_block* blocks, uint32_t* spare, uint32_t n_blocks, kzr_vres_copy_fn copy,
++                                 void* user, int verify)
++{
++    memset(s, 0, sizeof *s);
++    s->wg = *wg; s->base = base; s->n_pages = n_pages; s->map = map; s->blocks = blocks; s->n_blocks = n_blocks;
++    s->copy = copy; s->user = user; s->verify = verify; s->epoch = 1; s->min_age = 2;
++    memset(map, 0, sizeof(uint32_t) * n_pages);
++    s->spare = spare; s->spare_head = 0; s->spare_n = n_blocks;
++    if (!n_blocks) return;   /* a pool of no blocks: every map_span is refused (alloc_fail); the FIFO index arithmetic below is modulo n_blocks */
++    for (uint32_t i = 0; i < n_blocks; i++) {
++        memset(&blocks[i], 0, sizeof blocks[i]); blocks[i].page = KZR_VRES_NONE; spare[i] = i;
++    }
++}
++
++static inline int kzr_vres_in_range(const kzr_vres* s, uintptr_t lo, uint32_t bytes)
++{
++    return bytes && lo >= s->base && lo - s->base + bytes <= ((uint64_t)s->n_pages << KZR_VRES_PAGE_SHIFT);
++}
++
++static inline void kzr_vres_spare_push(kzr_vres* s, uint32_t i)
++{
++    if (!s->n_blocks) return;   /* no FIFO to push to (and no modulo by zero) */
++    s->spare[(s->spare_head + s->spare_n) % s->n_blocks] = i; s->spare_n++;
++}
++
++/* The page copy jobs up to `seq` are finished (monotonic). */
++static inline void kzr_vres_copies_done(kzr_vres* s, uint64_t seq) { if (seq > s->done_seq) s->done_seq = seq; }
++
++/* Safe to overwrite: no in-flight frame reads it, it was not used in the last min_age frames, and its copy is done. */
++static inline int kzr_vres_block_safe(const kzr_vres* s, const kzr_vres_block* b, uint32_t frame, uint32_t completed)
++{
++    if (b->copy_seq > s->done_seq) return 0;
++    return !(b->last_use > completed || (b->last_use && b->last_use + s->min_age > frame));
++}
++
++/* The walker waited for the guest (park, acquire, put refill, flip): stands of the old epoch end. */
++static inline void kzr_vres_epoch(kzr_vres* s) { s->epoch++; }
++
++/* A semaphore acquire at label address `ea` for value `want`; `met` = the label held it when the walker passed. Either
++ * way the epoch ends. Unmet: hold (no stands) until the label holds the value, checked at each draw by
++ * kzr_vres_hold_check. More than KZR_VRES_HOLD_MAX pending: the hold is sticky (counted, never unsound). */
++static inline void kzr_vres_acquire(kzr_vres* s, uint32_t ea, uint32_t want, int met)
++{
++    kzr_vres_epoch(s);
++    if (met) return;
++    s->holds++;
++    for (uint32_t i = 0; i < s->hold_n; i++)
++        if (s->hold_ea[i] == ea && s->hold_want[i] == want) return;
++    if (s->hold_n == KZR_VRES_HOLD_MAX) { s->hold_sticky = 1; s->hold_overflow++; return; }
++    s->hold_ea[s->hold_n] = ea; s->hold_want[s->hold_n] = want; s->hold_n++;
++}
++
++/* At each draw before its map: drop the held acquires whose label now holds the value (`read` returns the label's
++ * value). When the last one goes the epoch ends: pages found clean during the hold were checked before the producer
++ * finished. Returns 1 while the hold is on. */
++static inline int kzr_vres_hold_check(kzr_vres* s, uint32_t (*read)(void* user, uint32_t ea), void* user)
++{
++    if (s->hold_n) {
++        uint32_t k = 0;
++        for (uint32_t i = 0; i < s->hold_n; i++)
++            if (read(user, s->hold_ea[i]) != s->hold_want[i]) {
++                s->hold_ea[k] = s->hold_ea[i]; s->hold_want[k] = s->hold_want[i]; k++;
++            }
++        if (!k && !s->hold_sticky) { kzr_vres_epoch(s); s->hold_releases++; }
++        s->hold_n = k;
++    }
++    return s->hold_n || s->hold_sticky;
++}
++
++/* The draw that mapped `blocks` is recorded in the list that will signal `frame`: keep the newer of the two stamps. */
++static inline void kzr_vres_stamp(kzr_vres* s, const uint32_t* blocks, uint32_t n, uint32_t frame)
++{
++    for (uint32_t i = 0; i < n; i++) {
++        kzr_vres_block* b = &s->blocks[blocks[i]];
++        if (b->last_use < frame) b->last_use = frame;
++    }
++}
++
++/* A safe block: a spare one first (oldest retirement first), else a current page evicted by the clock hand. */
++static inline uint32_t kzr_vres_alloc(kzr_vres* s, uint32_t frame, uint32_t completed)
++{
++    if (!s->n_blocks) { s->alloc_fail++; return KZR_VRES_NONE; }
++    const uint32_t ns = s->spare_n < KZR_VRES_SCAN ? s->spare_n : KZR_VRES_SCAN;
++    for (uint32_t k = 0; k < ns; k++) {
++        uint32_t* e = &s->spare[(s->spare_head + k) % s->n_blocks];
++        const uint32_t i = *e;
++        if (!kzr_vres_block_safe(s, &s->blocks[i], frame, completed)) continue;
++        *e = s->spare[s->spare_head];   /* take it: the head entry fills its place, the head advances */
++        s->spare_head = (s->spare_head + 1u) % s->n_blocks; s->spare_n--;
++        s->blocks[i].page = KZR_VRES_NONE;
++        return i;
++    }
++    const uint32_t nc = s->n_blocks < KZR_VRES_SCAN ? s->n_blocks : KZR_VRES_SCAN;
++    for (uint32_t n = 0; n < nc; n++) {
++        const uint32_t i = s->hand; s->hand = (s->hand + 1u == s->n_blocks) ? 0u : s->hand + 1u;
++        kzr_vres_block* b = &s->blocks[i];
++        if (b->page >= KZR_VRES_RETIRED) continue;   /* spare blocks are taken from the FIFO only */
++        if (!kzr_vres_block_safe(s, b, frame, completed)) continue;
++        if (b->page < KZR_VRES_RETIRED) { s->map[b->page] = 0; s->evicts++; }
++        b->page = KZR_VRES_NONE;
++        return i;
++    }
++    s->alloc_fail++;
++    return KZR_VRES_NONE;
++}
++
++/* Make the pages of host span [lo, lo + bytes) resident and current for a draw of `frame` (`completed` = the last
++ * frame the GPU finished). out[i] = the block of the span's i-th page. need_seq (may be NULL) = the highest copy seq
++ * among the returned blocks: the draw's reads must wait for it. Returns the page count, or -1: too many pages
++ * (> max_pages), the generation failed, or the pool is full; the draw then takes the CPU path (pages already handled
++ * stay consistent). */
++static inline int kzr_vres_map_span(kzr_vres* s, uintptr_t lo, uint32_t bytes, uint32_t frame, uint32_t completed,
++                                    uint32_t* out, uint32_t max_pages, uint64_t* need_seq)
++{
++    s->maps++;
++    if (need_seq) *need_seq = 0;
++    if (!kzr_vres_in_range(s, lo, bytes)) { s->ww_fail++; return -1; }
++    const uint32_t p0 = (uint32_t)((lo - s->base) >> KZR_VRES_PAGE_SHIFT);
++    const uint32_t p1 = (uint32_t)((lo - s->base + bytes - 1u) >> KZR_VRES_PAGE_SHIFT);
++    const uint32_t n = p1 - p0 + 1u;
++    if (n > max_pages) { s->too_big++; return -1; }
++    int need = 0;
++    for (uint32_t p = p0; p <= p1 && !need; p++) {
++        const uint32_t m = s->map[p];
++        need = !m || s->blocks[m - 1u].epoch != s->epoch;
++    }
++    if (!need && (s->hold_n || s->hold_sticky)) { need = 1; s->hold_maps++; }   /* held: no stand */
++    const int stand = !need;   /* every page already current in this epoch: no query */
++    if (need) {
++        s->collects++;
++        if (!s->wg.collect(s->wg.user, s->base + ((uintptr_t)p0 << KZR_VRES_PAGE_SHIFT), n << KZR_VRES_PAGE_SHIFT)) {
++            s->ww_fail++; return -1;
++        }
++    }
++    uint64_t nseq = 0;
++    for (uint32_t p = p0; p <= p1; p++) {
++        const uintptr_t ph = s->base + ((uintptr_t)p << KZR_VRES_PAGE_SHIFT);
++        const uint32_t m = s->map[p];
++        kzr_vres_block* b = m ? &s->blocks[m - 1u] : NULL;
++        int keep = 0;
++        if (b) {
++            if (stand) { keep = 1; s->reuse_stand++; }
++            else if (s->wg.clean(s->wg.user, &b->arm, ph, KZR_VRES_PAGE)) { keep = 1; s->reuse_clean++; }
++            if (keep && s->verify && kzr_vres_sum((const uint8_t*)ph) != b->sum) {
++                s->bad++;
++                if (stand) s->bad_stand++; else s->bad_clean++;
++                if (s->peek) {   /* the span's bytes on this page: [r0, r1) */
++                    const uintptr_t r0 = lo > ph ? lo : ph;
++                    const uintptr_t r1 = lo + bytes < ph + KZR_VRES_PAGE ? lo + bytes : ph + KZR_VRES_PAGE;
++                    const uint8_t* cp = s->peek(s->user, (uint32_t)(b - s->blocks));
++                    if (memcmp(cp + (r0 - ph), (const uint8_t*)r0, (size_t)(r1 - r0))) s->bad_read++;
++                    else s->bad_unread++;
++                }
++                keep = 0;
++            }
++            if (!keep) {
++                b->page = KZR_VRES_RETIRED; s->map[p] = 0; s->retires++;
++                kzr_vres_spare_push(s, (uint32_t)(b - s->blocks));
++            }
++        }
++        if (keep) {
++            b->epoch = s->epoch;
++        } else {
++            if (stand) {   /* only verify gets here without a collect: collect the page so the arm follows one */
++                s->collects++;
++                if (!s->wg.collect(s->wg.user, ph, KZR_VRES_PAGE)) { s->ww_fail++; return -1; }
++            }
++            const uint32_t i = kzr_vres_alloc(s, frame, completed);
++            if (i == KZR_VRES_NONE) return -1;
++            b = &s->blocks[i];
++            s->wg.arm(s->wg.user, &b->arm, ph);   /* after the collect, before the bytes are read */
++            b->copy_seq = s->copy(s->user, i, (const uint8_t*)ph);
++            if (s->verify) b->sum = kzr_vres_sum((const uint8_t*)ph);
++            b->page = p; b->epoch = s->epoch;
++            s->map[p] = i + 1u;
++            s->copies++;
++        }
++        b->last_use = frame;
++        if (b->copy_seq > nseq) nseq = b->copy_seq;
++        out[p - p0] = (uint32_t)(b - s->blocks);
++    }
++    if (need_seq) *need_seq = nseq;
++    return (int)n;
++}
++
++/* ---- the draw table ---- */
++typedef struct kzr_vres_row { uint32_t base, stride, fmt, lim, pt, pad[3]; float dflt[4]; } kzr_vres_row;
++_Static_assert(sizeof(kzr_vres_row) == KZR_VRES_ROW_BYTES, "row is 48 bytes");
++
++/* One attribute row as the plain GPU-fetch plan (patch 2076) describes it: offsets relative to the draw's own block. */
++typedef struct kzr_vres_attr_in { uint32_t base, stride, fmt, lim; float dflt[4]; } kzr_vres_attr_in;
++/* One merged span of that plan: host address, byte count, and the offset the span has in the plan's block. */
++typedef struct kzr_vres_span_in { uintptr_t src; uint32_t bytes, dst; } kzr_vres_span_in;
++
++/* Build the draw table from the plan of a draw (16 attribute rows, n_span spans) and the block lists of its spans
++ * (lists[k] = kzr_vres_map_span's out for span k, npages[k] its count). dst holds KZR_VRES_TABLE_BYTES + 4 * (sum of
++ * npages). Returns the bytes written. Row base / lim become span-relative addresses (from the span's first page), the
++ * same element addresses the plain decode reads, so the decode is unchanged. n_span <= KZR_VRES_ROWS. */
++static inline uint32_t kzr_vres_write_table(const kzr_vres_attr_in* attr, const kzr_vres_span_in* span, uint32_t n_span,
++                                            const uint32_t* const* lists, const uint32_t* npages, uint8_t* dst)
++{
++    uint32_t pt[KZR_VRES_ROWS], off = KZR_VRES_TABLE_BYTES;
++    for (uint32_t k = 0; k < n_span; k++) {
++        pt[k] = off;
++        memcpy(dst + off, lists[k], 4u * npages[k]);
++        off += 4u * npages[k];
++    }
++    for (uint32_t a = 0; a < KZR_VRES_ROWS; a++) {
++        const kzr_vres_attr_in* t = &attr[a];
++        kzr_vres_row r; memset(&r, 0, sizeof r);
++        memcpy(r.dflt, t->dflt, sizeof r.dflt);
++        r.fmt = t->fmt;
++        if (t->fmt & 15u) {
++            uint32_t k = 0;
++            while (k + 1u < n_span && !(t->lim >= span[k].dst && t->lim < span[k].dst + span[k].bytes)) k++;
++            const uint32_t shift = (uint32_t)(span[k].src & (KZR_VRES_PAGE - 1u)) - span[k].dst;
++            r.base = t->base + shift; r.lim = t->lim + shift; r.stride = t->stride; r.pt = pt[k];
++        }
++        memcpy(dst + a * KZR_VRES_ROW_BYTES, &r, sizeof r);
++    }
++    return off;
++}
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* KZR_VRES_H */
+diff --git a/libs/kzr/core/vres/kzr_vres_decode.h b/libs/kzr/core/vres/kzr_vres_decode.h
+new file mode 100644
+--- /dev/null
++++ b/libs/kzr/core/vres/kzr_vres_decode.h
+@@ -0,0 +1,48 @@
++/* kzr/core/vres: the vertex decode through the block lists, as text in the C/HLSL common subset (S7.4). Pure text:
++ * no API call. Origin: Killzone 2 patch 6079 (RSX_VR_SHARED), itself patch 2076's RSX_VG_SHARED with the span's list
++ * offset passed down; see kzr_vres.h for the credit.
++ *
++ * The including side defines VG_FN (function qualifier, empty in C and HLSL), KZR_VRES_RAW(pt, a) (the little-endian
++ * dword of span byte a, a % 4 == 0, read through the draw table's block list at table offset pt), VG_LUT(i) (the decode
++ * table entry as a float) and the types uint, asint, asfloat; the host test compiles it as C, a backend as HLSL / GLSL.
++ * The LUT offsets (65792u, 67840u) are 2076's decode-table layout (11-bit float parts of CMP32 and so on). */
++#ifndef KZR_VRES_DECODE_H
++#define KZR_VRES_DECODE_H
++
++#define KZR_VRES_SHARED(X) X( \
++VG_FN uint kzr_vres_b(uint pt, uint a) { return (KZR_VRES_RAW(pt, a & 0xFFFFFFFCu) >> ((a & 3u) * 8u)) & 255u; } \
++VG_FN uint kzr_vres_be16(uint pt, uint a) { return (kzr_vres_b(pt, a) << 8u) | kzr_vres_b(pt, a + 1u); } \
++VG_FN uint kzr_vres_be32(uint pt, uint a) { \
++    uint w = KZR_VRES_RAW(pt, a & 0xFFFFFFFCu); \
++    if ((a & 3u) != 0u) w = kzr_vres_b(pt, a) | (kzr_vres_b(pt, a + 1u) << 8u) | (kzr_vres_b(pt, a + 2u) << 16u) | (kzr_vres_b(pt, a + 3u) << 24u); \
++    return (w >> 24u) | ((w >> 8u) & 0xFF00u) | ((w << 8u) & 0xFF0000u) | (w << 24u); \
++} \
++VG_FN float kzr_vres_fetch(uint pt, uint base, uint stride, uint fmt, uint lim, float dflt, uint e, uint c) { \
++    uint t = fmt & 15u; \
++    uint n = (fmt >> 4u) & 15u; \
++    uint a = base + e * stride; \
++    if (t == 0u) return dflt; \
++    if (a > lim) a = lim; \
++    if (t == 6u) { \
++        uint w = kzr_vres_be32(pt, a); \
++        if (c == 0u) return VG_LUT(65792u + (w & 0x7FFu)); \
++        if (c == 1u) return VG_LUT(65792u + ((w >> 11u) & 0x7FFu)); \
++        if (c == 2u) return VG_LUT(67840u + (w >> 22u)); \
++        return 1.0f; \
++    } \
++    if (c >= n) return c == 3u ? 1.0f : 0.0f; \
++    if (t == 2u) return asfloat(kzr_vres_be32(pt, a + c * 4u)); \
++    if (t == 3u) { \
++        uint h = kzr_vres_be16(pt, a + c * 2u); \
++        uint x = h & 0x7C00u; \
++        uint mag = ((h & 0x7FFFu) << 13u) + (x == 0x7C00u ? (224u << 23u) : (112u << 23u)); \
++        return asfloat(((h & 0x8000u) << 16u) | (x != 0u ? mag : 0u)); \
++    } \
++    if (t == 4u) return VG_LUT(kzr_vres_b(pt, a + c)); \
++    if (t == 7u) return (float)kzr_vres_b(pt, a + c); \
++    if (t == 1u) return VG_LUT(256u + kzr_vres_be16(pt, a + c * 2u)); \
++    if (t == 5u) return (float)(asint(kzr_vres_be16(pt, a + c * 2u) << 16u) >> 16); \
++    return 0.0f; \
++} )
++
++#endif /* KZR_VRES_DECODE_H */
+diff --git a/libs/video/rsx_vtx_res.h b/libs/video/rsx_vtx_res.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_vtx_res.h
+@@ -0,0 +1,48 @@
++/* KZ3 patch 2198 (S7.4): the resident vertex streams' bridge to the GPU-fetch plan of patch 2076 (rsx_vtx_gpu.h).
++ * The residency itself is libs/kzr/core/vres (pure, API-neutral); this header only (1) instantiates the shared decode
++ * text for a backend, (2) holds the D3D12 shader text declarations (HLSL source, no API call) and (3) converts 2076's
++ * rsx_vg_draw to the core's table input. Nothing includes it yet (S7.6 wires it); no switch.
++ * Origin of the text and the table layout: Killzone 2 patches 6079/6080 (see libs/kzr/core/vres/kzr_vres.h). */
++#ifndef PS3RECOMP_RSX_VTX_RES_H
++#define PS3RECOMP_RSX_VTX_RES_H
++#include "rsx_vtx_gpu.h"
++#include "../kzr/core/vres/kzr_vres.h"
++#include "../kzr/core/vres/kzr_vres_decode.h"
++
++/* The text for the vertex shader, HLSL (t20 the draw table, t21 the decode table, t22 the pool). The shared decode
++ * is KZR_VRES_SHARED(RSX_VG_TEXT) between HEAD and TAIL. A Vulkan backend generates the same text through its own
++ * head (storage buffers) from the same shared macro. */
++#define RSX_VR_HLSL_HEAD \
++    "ByteAddressBuffer vg_raw : register(t20);\n" \
++    "ByteAddressBuffer vg_lut : register(t21);\n" \
++    "ByteAddressBuffer vr_pool : register(t22);\n" \
++    "#define VG_FN\n" \
++    "#define KZR_VRES_RAW(pt, a) vr_pool.Load((vg_raw.Load((pt) + ((a) >> 12u) * 4u) << 12u) | ((a) & 4095u))\n" \
++    "#define VG_LUT(i) asfloat(vg_lut.Load((i) * 4u))\n"
++#define RSX_VR_HLSL_TAIL \
++    "float4 vg_attr(uint i, uint e) {\n" \
++    "    uint r = i * 48u;\n" \
++    "    uint b = vg_raw.Load(r); uint s = vg_raw.Load(r + 4u); uint f = vg_raw.Load(r + 8u); uint l = vg_raw.Load(r + 12u);\n" \
++    "    uint p = vg_raw.Load(r + 16u);\n" \
++    "    return float4(kzr_vres_fetch(p, b, s, f, l, asfloat(vg_raw.Load(r + 32u)), e, 0u),\n" \
++    "                  kzr_vres_fetch(p, b, s, f, l, asfloat(vg_raw.Load(r + 36u)), e, 1u),\n" \
++    "                  kzr_vres_fetch(p, b, s, f, l, asfloat(vg_raw.Load(r + 40u)), e, 2u),\n" \
++    "                  kzr_vres_fetch(p, b, s, f, l, asfloat(vg_raw.Load(r + 44u)), e, 3u));\n" \
++    "}\n"
++_Static_assert(RSX_DSP_NUM_VERTEX_ATTR == KZR_VRES_ROWS, "the draw table has one row per vertex attribute");
++
++/* Convert 2076's plan of a draw to the core's table (spans <= RSX_DSP_NUM_VERTEX_ATTR = 16) and write it. */
++static inline uint32_t rsx_vr_write_table(const rsx_vg_draw* d, const uint32_t* const* lists, const uint32_t* npages,
++                                          uint8_t* dst)
++{
++    kzr_vres_attr_in at[RSX_DSP_NUM_VERTEX_ATTR];
++    kzr_vres_span_in sp[RSX_DSP_NUM_VERTEX_ATTR];
++    for (uint32_t a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
++        at[a].base = d->table[a].base; at[a].stride = d->table[a].stride; at[a].fmt = d->table[a].fmt;
++        at[a].lim = d->table[a].lim; memcpy(at[a].dflt, d->table[a].dflt, sizeof at[a].dflt);
++    }
++    for (uint32_t k = 0; k < d->n_span; k++) { sp[k].src = (uintptr_t)d->span[k].src; sp[k].bytes = d->span[k].bytes; sp[k].dst = d->span[k].dst; }
++    return kzr_vres_write_table(at, sp, d->n_span, lists, npages, dst);
++}
++
++#endif /* PS3RECOMP_RSX_VTX_RES_H */

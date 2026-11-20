@@ -1,0 +1,299 @@
+KZ3 patch 2205 (RSX pass 174): RSX_PERF_DRAW=1 sampled texture-loop split, [texloop-split] (diagnostic, no new switch; RSX_PERF_DRAW off = unchanged).
+Pass 127's timing left the loop's cost unlocated (the RE notes, pass 127: "ASSUMPTION: it sits in the surface/zeta branches
+(zdepth_snapshot copies, surface_window, ld_surface_rg16) and the QPC pairs; sub-timers there decide"). This adds those sub-timers and
+cuts the cost of the timers themselves by sampling: rsx_texloop_split.h (pure C) times one draw in each block of 16 (the draw counter and a fixed-seed
+generator pick its offset in the block, so the sample cannot alias with a draw pattern whose period divides 16; set inside ld_pd_draw around the draw) and the report scales each sampled sum by draws / sampled, so every row reads as us per draw over
+all draws, comparable to the [perf-draw] rows. Buckets (leaves, none nested): enabled units (count), row check, register decode, sampler
+key+slot, plain entry bind (texture_srv_slot and _entry at the three sites), zdepth_snapshot, surface_window, ld_surface_rg16, descriptor
+writes (srv_table + sampler_table, after the loop), whole loop; "other" = loop minus the leaves from row check to rg16. Printed with the
+[perf-draw] report as `[texloop-split]` lines. A non-sampled draw pays one int test per site and reads no clock; outside RSX_PERF_DRAW
+the flag is never set. Host test tools/smoke/test_texloop_split.sh (synthetic draw loop, negative controls).
+Cost of the probe (not removable): a sampled draw pays ~18 clock reads (~0.5 us) inside [perf-draw]'s t1 span, so its mean/p95 move slightly
+(1 draw in 16), and every leaf carries its own timer pair, so "other" is an upper bound. The glue in rsx_live_draw.c is checked by source greps
+and mingw -fsyntax-only, not run: only the pure header is host-tested.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -184,6 +184,7 @@ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context *
+ #include "rsx_pso_keys_hdr.h"   /* patch 2141: key file header with the translator id */
+ #include "rsx_tex_lru.h"        /* patch 2075 */
+ #include "rsx_smp_index.h"      /* patch 2161 */
++#include "rsx_texloop_split.h"   /* patch 2205 */
+ #include "rsx_pso_memo.h"       /* patch 2163 */
+ #include "rsx_pl_lock.h"        /* patch 2182 */
+ #include "rsx_gpupass.h"        /* patch 2086 */
+@@ -4453,6 +4454,12 @@ static void ld_redecode_note(int which, const rsx_dsp_texture* t, u32 span, long
+  * distribution. sink_end() snapshots the stage counters of patches 2029/2033/2045 before and after sink_end_impl
+  * (only this thread adds them while a draw runs, async PSO builds excepted) and bins the per-draw delta in 0.25 us
+  * steps; [perf-draw] prints mean and p95 us per draw. Off: one cached flag test per draw. */
++/* Patch 2205: the sampled texture-loop split (rsx_texloop_split.h), printed as [texloop-split] with the [perf-draw] report.
++ * g_rsx_tls.act is set only around a sampled draw inside ld_pd_draw (RSX_PERF_DRAW=1); everywhere else it is 0, so the timer
++ * sites cost one int test and read no clock. */
++static rsx_tls g_rsx_tls;
++#define LDT_T0(name) const long long name = g_rsx_tls.act ? rsx_perf_now() : 0
++#define LDT_ADD(b, t0) do { if (t0) rsx_tls_add(&g_rsx_tls, (b), rsx_perf_now() - (t0)); } while (0)
+ enum { LD_PD_B = 640 };   /* 0.25 us buckets, 160 us; the last holds the rest */
+ typedef struct { const char* name; int idx; int primary; unsigned long long sum, big; u32 h[LD_PD_B]; } ld_pd_stage;
+ static ld_pd_stage g_pd[] = {
+@@ -4520,7 +4527,9 @@ static void ld_pd_draw(const rsx_dispatch* r, void* user, void (*fn)(void*, cons
+         for (int i = 0; i < LD_PD_W; i++) g_pd_w0[i] = rsx_perf_get(g_pd_widx[i]);
+     }
+     const long long t0 = rsx_perf_now();
++    rsx_tls_begin(&g_rsx_tls);   /* patch 2205 */
+     fn(user, r);
++    rsx_tls_end(&g_rsx_tls);
+     const long long t1 = rsx_perf_now() - t0;
+     long long prim = 0;
+     for (int i = 0; i < LD_PD_N; i++) {
+@@ -4532,6 +4541,25 @@ static void ld_pd_draw(const rsx_dispatch* r, void* user, void (*fn)(void*, cons
+     ld_pd_bin(&g_pd_all, t1, upt); ld_pd_bin(&g_pd_un, t1 - prim, upt);
+     g_pd_draws++; g_pd_f1 = g_ld_frames;
+ }
++/* Patch 2205: one header line and one line per bucket, us per draw over all draws (sampled sums scaled by draws / sampled). */
++static void ld_tls_report(double us_tick, double frames)
++{
++    static const char* const nm[RSX_TLS_NB] = { "enabled units (count)", "row check (all units)", "register decode (row miss)",
++        "sampler key+slot", "plain entry bind", "zdepth_snapshot", "surface_window", "ld_surface_rg16 (Y16X16F)",
++        "descriptor writes (srv+smp table)", "whole texture loop (incl. vertex tex)" };
++    const rsx_tls* t = &g_rsx_tls;
++    if (!t->sampled) return;
++    fprintf(stderr, "[texloop-split] window draws %llu, sampled %llu (1 in %u), scale x%.4f; us/draw over all draws; calls/draw; ms/frame\n",
++            (unsigned long long)t->draws, (unsigned long long)t->sampled, RSX_TLS_PERIOD, rsx_tls_scale(t));
++    for (int b = 0; b < RSX_TLS_NB; b++) {
++        double us, c; rsx_tls_row(t, b, us_tick, &us, &c);
++        if (b == RSX_TLS_EN) fprintf(stderr, "[texloop-split] %-38s %7.3f units/draw\n", nm[b], c);
++        else fprintf(stderr, "[texloop-split] %-38s %7.3f us | %6.3f calls | %6.3f ms/frame\n", nm[b], us, c,
++                     us * (double)t->draws / 1000.0 / frames);
++    }
++    { const double o = rsx_tls_other_us(t, us_tick);
++      fprintf(stderr, "[texloop-split] %-38s %7.3f us | loop minus the listed leaves (vertex textures, memo, bookkeeping)\n", "other", o); }
++}
+ static void ld_pd_report(double tick_ms)
+ {
+     if (!g_pd_started || !g_pd_draws) return;
+@@ -4555,6 +4583,7 @@ static void ld_pd_report(double tick_ms)
+         const double us = (double)(rsx_perf_get(g_pd_widx[i]) - g_pd_w0[i]) * us_tick;
+         fprintf(stderr, "[perf-draw] walker %-46s %7.3f ms/frame %7.3f us/draw\n", g_pd_wname[i], us / 1000.0 / frames, us / n);
+     }
++    ld_tls_report(us_tick, frames);   /* patch 2205 */
+ }
+ 
+ static void ld_trg_report(void);   /* patch 2158 */
+@@ -15475,6 +15504,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     LDW_ADD(RSX_PERF_W_D_SURF_T, surf_t0);
+     LDS_PUSH(s_tl, RSX_SB_TEX);   /* patch 2188 */
+     LDW_T0(texloop_t0);   /* patch 2045: the texture loop, TEX_T binds included */
++    LDT_T0(tlsloop_t0);   /* patch 2205 */
+     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
+     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
+     g_h169_rt_sampled = 0;   /* patch 2113 */
+@@ -15543,7 +15573,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         if (te_mode && u < 16u) {   /* patch 2159: level 1, the unit's registers are unchanged since the row was recorded */
+             rsx_tex_l1* e = &g_ld_te[u];
+             LDW_T0(l1_t0);
++            LDT_T0(l1d_t0);   /* patch 2205 */
+             const int l1_hit = rsx_tex_l1_hit(e, &g.rsx, u, g_ld_surf_gen, g_ld_zgen, g_ld_tex_memo_epoch);
++            LDT_ADD(RSX_TLS_L1, l1d_t0);
+             LDW_ADD(RSX_PERF_W_TL_L1_T, l1_t0);   /* patch 2161 */
+             if (l1_hit) {
+                 int why = 0;
+@@ -15563,8 +15595,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                     texture_mask |= 1u << u;
+                     smp_slots[u] = e->smp;
+                     LDW_T0(tex_t0);
++                    LDT_T0(pl_t0);   /* patch 2205 */
+                     ld_tsl_prologue(&e->t);
+                     slots[u] = texture_srv_slot_entry(&e->t, e->idx);   /* content checks run exactly as without the row */
++                    LDT_ADD(RSX_TLS_PLAIN, pl_t0);
+                     LDW_ADD(RSX_PERF_W_TEX_T, tex_t0);
+                     if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
+                     continue;
+@@ -15597,8 +15631,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 texture_mask |= 1u << u;
+                 smp_slots[u] = m->smp;
+                 LDW_T0(tex_t0);
++                LDT_T0(pl_t0);   /* patch 2205 */
+                 ld_tsl_prologue(&m->t);
+                 slots[u] = texture_srv_slot_entry(&m->t, m->idx);
++                LDT_ADD(RSX_TLS_PLAIN, pl_t0);
+                 LDW_ADD(RSX_PERF_W_TEX_T, tex_t0);
+                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
+                 if (tm_on == 2) ld_tm_hash_spot(&m->t, m->idx, 1);
+@@ -15606,7 +15642,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             }
+         }
+         rsx_dsp_texture t;
+-        { LDW_T0(get_t0); ld_tex_get(u, &t);   /* patch 2159 */
++        { LDW_T0(get_t0); LDT_T0(getd_t0); ld_tex_get(u, &t);   /* patch 2159 */
++          LDT_ADD(RSX_TLS_GET, getd_t0);   /* patch 2205 */
+           LDW_ADD(RSX_PERF_W_TL_GET_T, get_t0); }   /* patch 2161 */
+         /* LD_PS1_BUF0=1 -- DIAGNOSTIC, not a fix. Force a 24-bit PS1 VRAM
+          * bind at buffer 1 (offset 0x4003C0) to sample buffer 0 (0x400000).
+@@ -15631,7 +15668,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             continue;
+         }
+         texture_mask |= 1u << u;
+-        { LDW_T0(smp_t0); u32 skey[4]; sampler_key(&t, skey); smp_slots[u] = sampler_slot(&t, skey);
++        { LDW_T0(smp_t0); LDT_T0(smpd_t0); u32 skey[4]; sampler_key(&t, skey); smp_slots[u] = sampler_slot(&t, skey);
++          LDT_ADD(RSX_TLS_SMP, smpd_t0);   /* patch 2205 */
+           LDW_ADD(RSX_PERF_W_TL_SMP_T, smp_t0); }   /* patch 2161 */
+         /* Pick WHICH surface at this offset to sample.
+          *
+@@ -15883,13 +15921,17 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 g.surfaces[sampled].h * 10u >= g.surfaces[target].h * 9u)
+                 { g_h169_rt_sampled = 1; g_h169_rt_off = g.surfaces[sampled].offset; }
+             {   /* a smaller texture reads the surface's top-left samples, texel for sample */
++                LDT_T0(sw_t0);   /* patch 2205 */
+                 const int sw = surface_window((u32)sampled, &t, alias_dbg);
++                LDT_ADD(RSX_TLS_SWIN, sw_t0);
+                 if (sw >= 0) { slots[u] = (u32)sw; g_ld_bind_surf++; continue; }
+             }
+             slots[u] = SRV_SURFACE_BASE + sampled;
+             g_ld_bind_surf++;
+             if ((t.format & TEX_FMT_BASE_MASK) == RSX_TEX_FMT_Y16X16_FLOAT) {   /* patch 2065 */
++                LDT_T0(rg_t0);   /* patch 2205 */
+                 const int rg = ld_surface_rg16((u32)sampled, t.remap);
++                LDT_ADD(RSX_TLS_RG16, rg_t0);
+                 if (rg >= 0) { slots[u] = (u32)rg; continue; }
+             }
+             int seen = 0;
+@@ -15909,7 +15951,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                     if (g.zdepths[i].location == t.location &&
+                         g.zdepths[i].offset == t.offset &&
+                         (current_zslot != 1 + i || self_zeta_read)) {
+-                        if (zdepth_snapshot(1 + i))
++                        LDT_T0(zs_t0);   /* patch 2205 */
++                        const int zs_ok = zdepth_snapshot(1 + i);
++                        LDT_ADD(RSX_TLS_ZSNAP, zs_t0);
++                        if (zs_ok)
+                             sampled_depth = (int)i;
+                         else {
+                             g_ld_zdepth_srv_reject_no_write++;
+@@ -15954,7 +15999,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                     zdepth_used[n_zdepth_used++] = (u32)sampled_depth;
+             } else {
+                 LDW_T0(tex_t0);
++                LDT_T0(pl_t0);   /* patch 2205 */
+                 slots[u] = texture_srv_slot(&t);
++                LDT_ADD(RSX_TLS_PLAIN, pl_t0);
+                 LDW_ADD(RSX_PERF_W_TEX_T, tex_t0);
+                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
+                 if ((tm_on || te_mode) && g_ld_tsl_index != UINT32_MAX && ld_tm_zalias_free(&t) && ld_tm_surface_free(&t)) {   /* 2136, 2159 */
+@@ -15994,6 +16041,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             g_ld_vtex_unsupported++;
+     }
+     LDS_POP(s_tl);
++    LDT_ADD(RSX_TLS_LOOP, tlsloop_t0);   /* patch 2205 */
++    if (g_rsx_tls.act) rsx_tls_count(&g_rsx_tls, RSX_TLS_EN, (uint64_t)__builtin_popcount(texture_mask));
+     LDW_ADD(RSX_PERF_W_D_TEXLOOP_T, texloop_t0);
+     LDW_T0(desc_t0);   /* patch 2045 */
+     LDS_PUSH(s_desc, RSX_SB_DESC);   /* patch 2188 */
+@@ -16103,10 +16152,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g_ld_sm.h0 = heaps[0]; g_ld_sm.h1 = heaps[1];
+     }
+     LDW_T0(srvtbl_t0);   /* patch 2045 */
++    LDT_T0(dsc1_t0);   /* patch 2205 */
+     const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
++    LDT_ADD(RSX_TLS_DESC, dsc1_t0);
+     LDW_ADD(RSX_PERF_W_D_SRVTBL_T, srvtbl_t0);
+     LDW_T0(smptbl_t0);
++    LDT_T0(dsc2_t0);
+     const D3D12_GPU_DESCRIPTOR_HANDLE stbl = sampler_table(smp_slots);
++    LDT_ADD(RSX_TLS_DESC, dsc2_t0);
+     LDW_ADD(RSX_PERF_W_D_SMPTBL_T, smptbl_t0);
+     D3D12_GPU_DESCRIPTOR_HANDLE vtex_table = {0};
+     if (vtex_mask)
+diff --git a/libs/video/rsx_texloop_split.h b/libs/video/rsx_texloop_split.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_texloop_split.h
+@@ -0,0 +1,88 @@
++/* KZ3 patch 2205 (RSX pass 174): the per-draw texture loop sub-timers of RSX_PERF_DRAW=1, sampled. Pure C (no OS calls, no
++ * globals other than the instance the caller owns), so tools/smoke/test_texloop_split.c builds it on the host. Diagnostics only.
++ *
++ * Why sampled: patches 2161/2135 timed the loop's parts with a QPC pair around every use, on every draw. The loop has up to
++ * 16 units, so that is up to ~40 pairs per draw (~25 ns each) on a ~20 us draw. This one times only every RSX_TLS_PERIOD-th
++ * draw (the draw counter and a fixed-seed generator pick it, not a clock: deterministic) and scales: the report multiplies each
++ * sampled sum by draws / sampled, so a row reads as us per draw over ALL draws, directly comparable to the other [perf-draw] rows. A draw that
++ * is not sampled pays one int test per site (rsx_tls.act == 0) and no clock read. Buckets are leaf stages, none nested in
++ * another (LOOP is the whole loop incl. vertex textures; "other" = LOOP minus the leaves; DESC runs after the loop). A
++ * count-only bucket (EN) holds the enabled units.
++ * Which draw of a block: one draw in each block of RSX_TLS_PERIOD consecutive draws is timed, at a pseudo-random offset (a fixed
++ * LCG seed, high bits), not at a fixed phase. A fixed phase aliases with any draw pattern whose period divides 16 (a frame of
++ * N x 16 draws, a repeated 8-draw group): the same draws are timed every time and the scaled row is biased. The first draw of a
++ * window is always timed (offset 0 for the first block), so a window shorter than a block still has a sample.
++ * Cost of the probe: a sampled draw pays about 18 clock reads (~0.5 us) inside the t1 span of ld_pd_draw, so [perf-draw]'s own
++ * mean and p95 move a little on those draws (1 in 16); and every leaf includes its own pair's overhead, so "other" (loop minus the
++ * listed leaves) is an upper bound of the untimed work, not a measurement of it. */
++#ifndef RSX_TEXLOOP_SPLIT_H
++#define RSX_TEXLOOP_SPLIT_H
++
++#include <stdint.h>
++
++#define RSX_TLS_PERIOD 16u
++enum {
++    RSX_TLS_EN,      /* count only: texture units enabled and bound by the draw (popcount of the loop's texture_mask) */
++    RSX_TLS_L1,      /* row check on every unit (rsx_tex_l1_hit), as RSX_PERF_W_TL_L1_T */
++    RSX_TLS_GET,     /* register decode of a unit that missed the row (ld_tex_get) */
++    RSX_TLS_SMP,     /* sampler key + slot */
++    RSX_TLS_PLAIN,   /* plain texture-cache bind (texture_srv_slot / _entry: keycap, hash decision, decode, LRU) */
++    RSX_TLS_ZSNAP,   /* zdepth_snapshot */
++    RSX_TLS_SWIN,    /* surface_window */
++    RSX_TLS_RG16,    /* ld_surface_rg16 */
++    RSX_TLS_DESC,    /* descriptor writes after the loop: srv_table + sampler_table */
++    RSX_TLS_LOOP,    /* the whole texture loop (RSX_PERF_W_D_TEXLOOP_T's span) */
++    RSX_TLS_NB
++};
++typedef struct {
++    int act;                           /* the current draw is sampled: the timer sites read the clock only when set */
++    uint32_t rng;                      /* the block-offset generator (never reset: a window reset keeps the stream) */
++    uint32_t pick;                     /* the sampled offset inside the current block */
++    uint64_t draws, sampled;           /* draws seen / sampled */
++    long long ticks[RSX_TLS_NB];       /* summed clock ticks of the sampled draws (EN: unused) */
++    uint64_t cnt[RSX_TLS_NB];          /* calls (EN: units) of the sampled draws */
++} rsx_tls;
++
++static inline void rsx_tls_reset(rsx_tls* t)
++{
++    t->act = 0; t->draws = t->sampled = 0; t->pick = 0;
++    for (int i = 0; i < RSX_TLS_NB; i++) { t->ticks[i] = 0; t->cnt[i] = 0; }
++}
++/* One call per draw, before the draw runs: picks the sampled ones (one per block of RSX_TLS_PERIOD draws, the first draw of a
++ * window always). The offset is the high bits of an LCG scaled by multiply-shift (any period, unbiased). */
++static inline int rsx_tls_begin(rsx_tls* t)
++{
++    if (t->draws % RSX_TLS_PERIOD == 0 && t->draws) {
++        t->rng = t->rng * 1664525u + 1013904223u;
++        t->pick = (uint32_t)(((uint64_t)t->rng * RSX_TLS_PERIOD) >> 32);
++    }
++    t->act = (t->draws % RSX_TLS_PERIOD) == t->pick;
++    t->draws++;
++    if (t->act) t->sampled++;
++    return t->act;
++}
++static inline void rsx_tls_end(rsx_tls* t) { t->act = 0; }
++static inline void rsx_tls_add(rsx_tls* t, int b, long long ticks)
++{
++    if (ticks < 0) ticks = 0;
++    t->ticks[b] += ticks; t->cnt[b]++;
++}
++static inline void rsx_tls_count(rsx_tls* t, int b, uint64_t n) { t->cnt[b] += n; }
++/* sampled -> all draws */
++static inline double rsx_tls_scale(const rsx_tls* t) { return t->sampled ? (double)t->draws / (double)t->sampled : 0.0; }
++/* One row, per draw over all draws: microseconds, calls (EN: units). */
++static inline void rsx_tls_row(const rsx_tls* t, int b, double us_per_tick, double* us_draw, double* calls_draw)
++{
++    const double s = rsx_tls_scale(t), n = t->draws ? (double)t->draws : 1.0;
++    *us_draw = (double)t->ticks[b] * us_per_tick * s / n;
++    *calls_draw = (double)t->cnt[b] * s / n;
++}
++/* LOOP minus the leaf buckets inside it (L1..RG16; DESC is after the loop). */
++static inline double rsx_tls_other_us(const rsx_tls* t, double us_per_tick)
++{
++    double lo, c, p = 0.0;
++    rsx_tls_row(t, RSX_TLS_LOOP, us_per_tick, &lo, &c);
++    for (int b = RSX_TLS_L1; b <= RSX_TLS_RG16; b++) { double u; rsx_tls_row(t, b, us_per_tick, &u, &c); p += u; }
++    return lo - p;
++}
++#endif

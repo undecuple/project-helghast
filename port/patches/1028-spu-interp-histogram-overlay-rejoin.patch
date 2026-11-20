@@ -4,7 +4,7 @@ Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream moved the run
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream's SPU_INTERP_STATS entry bump + 1028's SPU_INTERP_HIST wrapper; memo and `spu_lookup_ovl_exact` both.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
 index 2e59c3f..b6fc17f 100644

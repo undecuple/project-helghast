@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The one path-redaction rule of every log the player may post (2026-11-02): the launcher log, the install
+"""The one path-redaction rule of every log the player may post: the launcher log, the install
 (first-run) log with the merged Inno log, the support package, the crash report. The C twin is port/kz3/kz3_log_redact.h
 (the game's log); the Pascal fallback is installer/kz3.iss RedactPaths. All three keep the same cases (see the tests).
 

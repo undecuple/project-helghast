@@ -45,7 +45,7 @@ diff -ruN a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 +    static ULONGLONG s_last_log;
 +    if (on < 0) {
 +        const char* e = getenv("KZ3_PARK_IDLE_WAKE");
-+        on = e && *e == '1';   /* off by default: run r122-j1 saw no PUT wake at all (see the summary line) */
++        on = e && *e == '1';   /* off by default: a run saw no PUT wake at all (see the summary line) */
 +        fprintf(stderr, "[cellGcmSys] park idle wake (patch 2129): %s\n",
 +                on ? "on (KZ3_PARK_IDLE_WAKE=1: the frame thread's sleep ends when an SPU PUT releases the park)" : "off (flat sleep; KZ3_PARK_IDLE_WAKE=1 on)");
 +    }

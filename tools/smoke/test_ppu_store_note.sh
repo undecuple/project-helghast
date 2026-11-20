@@ -4,7 +4,7 @@
 # VM_STORE_NOTE + ppu_store_note*; ppu_lifter.py: PPU_ST_NOTE) into tools/smoke/test_ppu_store_note.cpp, checks
 # which stores note, and times the gate (ns per 8-byte store: plain, gated page clear, gated page noted). No game data.
 #   nix develop .#re --command tools/sandbox.sh -- bash tools/smoke/test_ppu_store_note.sh
-# (KZ3_PATCHED_DIR=<tree> for a scratch tree; the lane could not set the executable bit: committed as 0644)
+# (KZ3_PATCHED_DIR=<tree> for a scratch tree; the executable bit could not be set: committed as 0644)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"

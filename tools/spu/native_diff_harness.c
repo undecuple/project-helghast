@@ -16,6 +16,7 @@
 #include "job_diff_harness.c"
 #undef main
 #include "kz3_native_jobs.h"
+static int g_islong, g_lng_eq, g_lng_dec;   /* pass 160: long K3 states (variant % 41 == 7): compared / declined */
 
 int (*g_kz3_native_gate[64])(spu_context*);
 
@@ -148,13 +149,20 @@ static void synth(spu_context* c, const char* kind, int variant)
          * src or dst 0, g0 = step = +-0 (early return). */
         const int k7 = !strcmp(kind, "snd_k7a");
         const uint32_t half = span / 2;
-        const uint32_t cnt = k7 ? 16 * (1 + rnd() % (variant % 5 == 0 ? 2 : 32)) : 8 * (1 + rnd() % (variant % 5 == 0 ? 2 : 48));
+        /* pass 160: variant % 41 == 7 = a K3 call longer than the kernel's 512-group buffer (n 2056 / 4096 / 12288), source
+         * just above the image (step <= 1 keeps the windows within n floats), dst at the top of the area; mode 2 puts dst
+         * over the LAST windows (the long path must decline), modes 3/8 keep their usual refusals */
+        const int islong = !k7 && variant % 41 == 7;
+        g_islong = islong;
+        uint32_t cnt = k7 ? 16 * (1 + rnd() % (variant % 5 == 0 ? 2 : 32)) : 8 * (1 + rnd() % (variant % 5 == 0 ? 2 : 48));
         const uint32_t sa = area + 0x100 + ((rnd() % (half - 0x4000)) & ~15u), da = area + half + ((rnd() % (half - 0x4000)) & ~15u);
+        if (islong) { static const uint32_t ln[] = {2056, 4096, 12288}; cnt = ln[(variant / 41) % 3]; }
         const int mode = variant % 11, raw = variant % 7 == 3, silent = variant % 6 == 0, den = variant % 13 == 5;
-        const uint32_t len = k7 ? cnt : 4 * cnt + 64;  /* floats to fill at the source (K3: well past the last window) */
+        const uint32_t len = k7 ? cnt : islong ? cnt + 160 : 4 * cnt + 64;  /* floats to fill at the source (K3: well past the last window) */
         uint32_t src = sa, dst = da;
         if (k7 && mode == 0) dst = src;
         if (mode == 1) dst = src + 16 * (1 + rnd() % 8);
+        if (islong) { src = area + 0x100; dst = (area + span - 4 * cnt - 0x100) & ~15u; }
         for (uint32_t i = 0; i < len + 16 && !raw; i++) {
             float f = ((float)(rnd() & 0xFFFFFF) / 8388608.0f) - 1.0f;
             uint32_t b; memcpy(&b, &f, 4);
@@ -181,9 +189,10 @@ static void synth(spu_context* c, const char* kind, int variant)
         } else {
             f0 = (float)(rnd() & 0xFFFF) / 65536.0f * (variant % 4 == 1 ? 64.0f : 1.0f);   /* phase0 */
             f1 = 0.05f + (float)(rnd() & 0xFFFF) / 65536.0f * (variant % 3 == 0 ? 1.0f : 4.0f);   /* step */
+            if (islong && f1 > 1.0f) f1 = 0.05f + (f1 - (float)(int)f1) * 0.95f;
             if (mode == 4) f1 = -f1;
             if (mode == 5) f1 = 0.0f;
-            if (mode == 2) dst = src - 16 + 16 * (rnd() % 8);
+            if (mode == 2) dst = islong ? (src - 12 + 4 * (uint32_t)(f1 * (float)cnt * 0.98f) - 64) & ~15u : src - 16 + 16 * (rnd() % 8);
             if (mode == 3) src += 1 + rnd() % 3;   /* unaligned: declined */
         }
         uint32_t b0, b1; memcpy(&b0, &f0, 4); memcpy(&b1, &f1, 4);
@@ -627,6 +636,8 @@ int main(int argc, char** argv)
         const int r = run_lifted(&A, fn);
         if (r != R_RET) { g_nr++; continue; }
         const int took = e->fn(&B);
+        if (g_islong) { if (took) g_lng_eq++; else g_lng_dec++; }
+        g_islong = 0;
         if (!took) { g_declined++; continue; }
         B.pc = B.gpr[0]._u32[0];
         compare(what, &A, &B);
@@ -638,6 +649,7 @@ int main(int argc, char** argv)
     }
     printf("R slot %d %s %s 0x%X: equal=%d differ=%d declined=%d lifted_nr=%d\n", slot, e->kind, e->image, e->addr,
            g_equal, g_differ, g_declined, g_nr);
+    if (g_lng_eq + g_lng_dec) printf("R long K3 (n 2056/4096/12288): %d run native (compared above), %d declined\n", g_lng_eq, g_lng_dec);
     if (g_tcalls) printf("R time %d calls, %.0f px: lifted %.1f ns/px (%.1f us/call avg), native %.1f ns/px (%.1f us/call avg), native/lifted %.3f\n", g_tcalls, g_tpx, g_tl / g_tpx, g_tl / g_tcalls / 1e3, g_tn / g_tpx, g_tn / g_tcalls / 1e3, g_tn / g_tl);
     if (g_drecs) printf("R derived from %d slot-6 records: %d gather rows\n", g_drecs, g_drows);
     if (!strcmp(e->kind, "lp_light"))

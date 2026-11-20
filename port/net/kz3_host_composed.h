@@ -32,6 +32,7 @@
 /* Pages the port generates (not in the archive, no .pspatch; listed so every key has one home). */
 #define KZ3_GEN_KEYBOARD        "interface/menu/gum/common/keyboardsettings.gum"     /* main.cpp kz3_kb_page_gum */
 #define KZ3_GEN_MOUSE           "interface/menu/gum/common/mousesettings.gum"        /* main.cpp kz3_mouse_page_gum (patch 2101) */
+#define KZ3_GEN_GFX             "interface/menu/gum/common/graphicssettings.gum"     /* main.cpp, rsx_gfx_page.h (patch 2206) */
 #define KZ3_GEN_PADLAYOUT       "interface/menu/gum/common/padlayoutsettings.gum"    /* port/net/kz3_padpage.h (patch 4014) */
 #define KZ3_GEN_PADSET          "interface/menu/gum/common/kz3padsettings.gum"       /* port/net/kz3_prompts_ui.h */
 #define KZ3_GEN_PADLAYOUT2      "interface/menu/gum/common/kz3padlayout2.gum"        /* kz3_padpage.h: vehicles, exo, guns (patch 4023) */

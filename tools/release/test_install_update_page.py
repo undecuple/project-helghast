@@ -39,11 +39,32 @@ check(name == "added_data_ps3.psarc.edat", "firstrun_check.UPDATE_EDAT is the up
 uok = func("UpdateOK")
 check("USRDIR\\" + name in uok and "PARAM.SFO" in uok and "USRDIR\\EBOOT.BIN" in uok and uok.count("FileExists(") == 3,
       "UpdateOK requires PARAM.SFO, EBOOT.BIN and " + name)
+
+
+def patches_ok(c):
+    """Issue #47 (firstrun_check U4): the wizard tests both patch folders for a .pspatch file, names them when missing, and says
+    what to do in the page box and the silent refusal."""
+    def f(n):
+        m = re.search(r"(?:function|procedure) " + n + r"\b.*?\nend;", c, re.S)
+        return m.group(0) if m else ""
+    ok = f("UpdateOK")
+    pd = f("PatchDirOK")
+    prob = f("UpdateProblem")
+    return ("*.pspatch" in pd and "FindFirst" in pd and "FindClose" in pd
+            and all(f"PatchDirOK(Dir, '{n}')" in ok for n in fc.UPDATE_PATCH_DIRS)
+            and all(f"USRDIR\\{n} (the folder with its .pspatch files)" in prob for n in fc.UPDATE_PATCH_DIRS)
+            and c.lower().count("copy the whole update folder") >= 2)
+
+
+check(patches_ok(code), "UpdateOK tests both patch folders for .pspatch (PatchDirOK), UpdateProblem names them, the boxes say what to do")
+mut = code.replace("PatchDirOK(Dir, 'patch_data_ps3_mp')", "True")
+check(not patches_ok(mut), "negative control: UpdateOK without the mp folder test fails the check")
+check(not patches_ok(code.replace("opy the whole update folder", "x")), "negative control: boxes without the advice fail the check")
 up = func("UpdateProblem")
 check("USRDIR\\" + name in up and "Miss := Miss + 'USRDIR\\" + name + "'" in up, "UpdateProblem names the missing " + name)
-check(code.count("USRDIR\\" + name) >= 5 and "PARAM.SFO, USRDIR\\EBOOT.BIN and USRDIR\\" + name in code,
+check(code.count("USRDIR\\" + name) >= 5 and "PARAM.SFO, USRDIR\\EBOOT.BIN, USRDIR\\" + name in code,
       "the update box lists the file as needed")
-check("USRDIR\\EBOOT.BIN and USRDIR\\" + name + " are needed" in code, "the silent-install refusal lists the file as needed")
+check("USRDIR\\EBOOT.BIN, USRDIR\\" + name + " and the folders" in code, "the silent-install refusal lists the file as needed")
 # firstrun_check: the same requirement, as a failure with the reason
 m = re.search(r'r\.(ok|warn|fail)\("U3", f"update data archive present.*?\n    else:\n        r\.(warn|fail)\("U3"', src, re.S)
 check(m is not None and m.group(2) == "fail", "firstrun_check U3 fails (not warns) when the archive is missing")

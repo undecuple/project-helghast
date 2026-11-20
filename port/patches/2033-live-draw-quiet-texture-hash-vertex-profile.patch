@@ -19,7 +19,7 @@ Rebased on ps3recomp v0.15.0 (SPU pass 81): context only, upstream engine-wrote 
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): decode_fast moved to upstream's rsx_vertex_fetch_attr_value (single-vertex path); upstream's attribute-major fetch_many left as is.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 index e2858eb..d508053 100644

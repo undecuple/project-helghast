@@ -26,8 +26,8 @@ while [[ $# -gt 0 ]]; do
     --proton) PROTON_DIR="$2"; shift 2 ;;
     --name) NAME="$2"; shift 2 ;;
     --real-display) REAL=1; shift ;;
-    # --net (sandbox.sh refuses it in a parallel worktree): network for the run, e.g. the telemetry trial
-    # (2026-10-13). The game itself is never run with it.
+    # --net (sandbox.sh refuses it in a parallel worktree): network for the run, e.g. the telemetry trial.
+    # The game itself is never run with it.
     --net) NETARG=(--net); shift ;;
     # --discord (developer use only, temporary test use, 2026-10-22): the Discord socket in the sandbox and
     # wine-discord-ipc-bridge started in the run's prefix before the game (KZ3_DISCORD_BRIDGE = its .exe).
@@ -55,7 +55,7 @@ if [[ -n "${KZ3_PLAY_SCENARIO:-}" ]]; then
   export KZ3_LOG="${KZ3_LOG:+$KZ3_LOG,}cellPad:debug"
 fi
 
-# Path switches preflight (2026-10-15, after a sweep spent 55 GPU minutes writing a template the sandbox could not
+# Path switches preflight (after a sweep spent 55 GPU minutes writing a template the sandbox could not
 # write): every KZ3_/LD_/RSX_ value that is a drive path must be inside this checkout, outputs under work/ or build/.
 python3 "$ROOT/tools/runenv_check.py" "$ROOT" || { echo "proton-test: refused before the run (path switches above)" >&2; exit 2; }
 mkdir -p "$RUN/app" "$RUN/compat" "$RUN/steam" "$(dirname "$SHOT")"
@@ -70,6 +70,14 @@ if command -v python3 >/dev/null; then
     --display "$DISPLAY_KIND" --proton "$PROTON_DIR" --root "$ROOT" || true
 fi
 
+# Host-load log (tools/loadlog.py): one sample per 10 s into $RUN/loadlog.tsv (loadavg, CPU busy %, the top 3 processes
+# outside this run). Sampled HERE, outside the sandbox: bwrap's own pid namespace hides the other processes' /proc.
+LOADLOG_PID=""
+if command -v python3 >/dev/null; then
+  rm -f "$RUN/loadlog.tsv.stop"
+  python3 "$ROOT/tools/loadlog.py" sample "$RUN/loadlog.tsv" --root-pid $$ --interval 10 >/dev/null 2>&1 &
+  LOADLOG_PID=$!
+fi
 X11ARG=(); [[ ${REAL:-0} -eq 1 ]] && X11ARG=(--x11)
 # On the real display under niri, float the game window when it appears: niri throttles a
 # window it does not show (scrolled out of the strip, another workspace) to one frame per second, which voided
@@ -97,12 +105,15 @@ set +e
   bash "$ROOT/tools/proton-inner.sh" "$PROTON_DIR" "$RUN" "$SECONDS_RUN" "$SHOT" "$(basename "$EXE")" "$@"
 RC=$?
 set -e
-# A run whose requested output could not be written failed its purpose: exit 4 so series and chains stop at the first
-# such run instead of repeating it (same 2026-10-15 sweep: eight chapters of "[pso-template] cannot write").
+# A run whose requested output could not be written failed its purpose: exit 4 so a series stops at the first
+# such run instead of repeating it (eight chapters of "[pso-template] cannot write").
 if grep -qE "cannot (write|create)" "$RUN/app/app_stdout.txt" 2>/dev/null; then
   grep -m3 -E "cannot (write|create)" "$RUN/app/app_stdout.txt" >&2
   echo "proton-test: the run could not write a requested output (exit 4)" >&2
   [[ $RC -eq 0 ]] && RC=4
+fi
+if [[ -n "$LOADLOG_PID" ]]; then
+  touch "$RUN/loadlog.tsv.stop"; wait "$LOADLOG_PID" 2>/dev/null || true
 fi
 if command -v python3 >/dev/null; then
   python3 "$ROOT/tools/runprov.py" finish "$RUN" --root "$ROOT" || true

@@ -16,6 +16,10 @@ typedef uint64_t u64; typedef uint32_t u32; typedef long HRESULT; typedef unsign
 #define SMP_TABLE_SIZE 1
 enum { LD_RM_SRV, LD_RM_SMP, LD_RM_PSCB, LD_RM_N };
 enum { RSX_PERF_GPUWAIT_T, RSX_PERF_W_RFW_PSCB_WAIT, RSX_PERF_W_RFW_DESC_WAIT, RSX_PERF_W_RFW_PSCB_AVOID, RSX_PERF_W_RFW_DESC_AVOID };
+/* patch 2188: the split-bucket push/pop around the fence wait; the split is off in this test, so both are no-ops */
+#define RSX_SB_X_WAITO 0
+#define LDS_PUSH(tok, b) const int tok = 0; (void)tok
+#define LDS_POP(tok) do { } while (0)
 static u32 g_ld_frames;
 static u64 f_completed; static HRESULT f_event_hr; static DWORD f_wait_rc; static u64 f_done_after_wait;
 static int f_waits;

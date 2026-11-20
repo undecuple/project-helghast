@@ -1,4 +1,4 @@
-Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): _cellSpursTasksetAttribute2Initialize, cellSpursCreateTaskset2
+Rebased on ps3recomp v0.19.0: _cellSpursTasksetAttribute2Initialize, cellSpursCreateTaskset2
 and cellSpursCreateTask2 are upstream's now (#629 42c0471d / 23066160: Taskset2 registered for exit codes, its two event flags
 created, CreateTask2 takes the TaskAttribute2 context and LS pattern); ours, KZ3_SPURS_TASKSET2_SIZE and our 5th-argument
 `name` ASSUMPTION are dropped (upstream reads that argument as the attribute). Kept: cellSpursTryJoinTask2,

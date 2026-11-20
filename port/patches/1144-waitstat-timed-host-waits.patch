@@ -6,7 +6,7 @@ lv2s_sleep also records how close each timeout lies to the last wake of the same
 the upper bound of the Wine race exposure. Diagnostic only, behaviour unchanged (GetLastError is read before the note).
 Decides which site a fix patch has to cover.
 
-Rebased on ps3recomp v0.19.0 (group B, R&C 2026-11-09): sys_event_queue_receive keeps upstream #622's absolute-deadline loop
+Rebased on ps3recomp v0.19.0: sys_event_queue_receive keeps upstream #622's absolute-deadline loop
 (d813e14c: evt_ms_until, deadline clamped at 2^40 us, the count re-tested before giving up); the waitstat note wraps its
 SleepConditionVariableCS (no GetLastError branch: the loop re-tests). Other files unchanged.
 

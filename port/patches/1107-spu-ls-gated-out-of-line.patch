@@ -8,7 +8,7 @@ noinline, cold copy of the same accessor with the same raw address, so every pro
 path is mov, lea, test, jne, and, vmovdqu, vpshufb (7). The byte swap was already one vpshufb with a constant.
 Bit-identical by construction (same accessor on both sides); host tests tools/spu/test_spu_lscold.sh (randomised LS
 images, addresses at the mask, alignment and WWS-probe boundaries, gate on and off) and, with game data,
-work/spu/r79/hb.sh (job 255's lifted loop, same hashes). Compile-time switch: -DSPU_LS_COLD=0 (C flags) = old.
+a local script (job 255's lifted loop, same hashes). Compile-time switch: -DSPU_LS_COLD=0 (C flags) = old.
 Upstream candidate (with 1082/1100).
 
 --- a/runtime/spu/spu_context.h

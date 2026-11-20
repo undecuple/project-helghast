@@ -5,7 +5,7 @@ FINISHED profile (the maintainer's saves, RE pass 97) from the campaign lobby to
   --gap G (default 3 s) and --start S (default 46 s): spacing between presses and the first press. Under a shared GPU the
   menu pages open late and a 3 s press can land on the previous page; then every later press is one page off and the
   run starts mission_0 (maintainer 2026-10-13, runs lvlr-K1 and lvl-K8). Use --gap 6 --start 52 there.
-Found on saves-explore (2026-10-12): menu-fast's CROSS at 39/40 opens campaignlobby.gum (run clock 41.3 s);
+Found on saves-explore: menu-fast's CROSS at 39/40 opens campaignlobby.gum (run clock 41.3 s);
 its default focus is the DISABLED "Continue Campaign" item (campaign finished), so the 42/43 CROSS retries do nothing.
 DOWN = Select Chapter, DOWN again = New Campaign (a 40-poll DOWN moves exactly one item). Select Chapter -> the level
 list (9 entries, all unlocked), DOWN x K, CROSS -> node page (first menu node focused; --node N adds N DOWNs), CROSS ->

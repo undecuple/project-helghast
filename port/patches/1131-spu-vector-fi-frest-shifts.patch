@@ -2,7 +2,7 @@ KZ3 patch 1131 (SPU pass 110; upstream candidate): fi, frest, frsqest and the pe
 rotm and rotma in SSE4.1 (AVX2 per-lane shifts when built with -mavx2). The helpers were per-lane loops that GCC does
 not vectorize (a table lookup, a branch, a variable shift count): each wrote its four result lanes to the stack and
 the next instruction read the 16-byte vector back, a failed store-to-load forward on x86 (~12-15 cycles per helper
-call, visible in the profile as the instruction after each loop). In K4 (frozen_shores, spu-r110-t1, KZ3_PROF) these
+call, visible in the profile as the instruction after each loop). In K4 (frozen_shores, KZ3_PROF) these
 loops and their reload stalls were ~35 % of the samples of the 3-bone skinning job's hottest function (job_01242c80
 func_5868, 6.2 % of all SPU samples); fi/frest are in the hot functions of jobs 241, 242 and others too.
 
@@ -35,7 +35,7 @@ SSE4.1 and AVX2 builds, with a negative control).
 +/* KZ3 patch 1131 (SPU pass 110): fi in SSE4.1, the same operations as the loop above on four lanes at once. The loop
 + * wrote each lane to memory and the next instruction read the vector back (a failed store-to-load forward on x86,
 + * ~12-15 cycles per helper); fi/frest/frsqest/rotm were ~35 % of the 3-bone skinning job's hottest function
-+ * (job_01242c80 func_5868, K4 profile spu-r110-t1). Same steps: base = rb & 0xFFFFFC00; step = the 10-bit step field
++ * (job_01242c80 func_5868, K4 profile). Same steps: base = rb & 0xFFFFFC00; step = the 10-bit step field
 + * times 2^(exp-140) in double (exact), one rounding to float (cvtpd2ps = the loop's cvtsd2ss), negated when base < 0
 + * (an ordered compare: NaN and -0 keep the sign as the loop); y = (ra & 0x7FFFF) * 2^-19 (exact); base - step * y in
 + * float (mulps/subps, no contraction, as the loop's mulss/subss). Exponent-255 lanes with the patch-1071 recompute on

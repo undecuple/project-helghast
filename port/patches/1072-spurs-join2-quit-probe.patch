@@ -8,7 +8,7 @@ port's guest dump hook g_kz3_j2_guest_dump.
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): both (stop request, then the join2 note).
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): v0.19.0 defines no cellSpursJoinTask2 / TryJoinTask2 / DestroyTaskset2 (#629 added Create/Attribute2/CreateTask2 only; the join names appear in comments, the NID table and a test), so the hook still sits in KZ3 code: it applies on R&C's trimmed 1019 (v019-b), which keeps those three functions and kz3_task2_enabled, and on 1066/1150 (task ids, t_task_gen) in the chain. Behaviour unchanged: KZ3_JOIN2_PROBE=1 dumps at ~3/20/40 s of spinning, off = one NULL pointer test per rdch/rchcnt. Offsets only.
+Rebased on ps3recomp v0.19.0 (SPU pass 153): v0.19.0 defines no cellSpursJoinTask2 / TryJoinTask2 / DestroyTaskset2 (#629 added Create/Attribute2/CreateTask2 only; the join names appear in comments, the NID table and a test), so the hook still sits in KZ3 code: it applies on a trimmed 1019, which keeps those three functions and kz3_task2_enabled, and on 1066/1150 (task ids, t_task_gen) in the chain. Behaviour unchanged: KZ3_JOIN2_PROBE=1 dumps at ~3/20/40 s of spinning, off = one NULL pointer test per rdch/rchcnt. Offsets only.
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 index 63e9cd6..fb43a66 100644

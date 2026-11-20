@@ -68,7 +68,7 @@ tracked-write and full-compare hit rule; no D3D12).
 + * back to the arena only when the fence of the lists that may still read it completes (rsx_vtx_dev.h). Off with
 + * the dumps that read every draw's CPU payload (as 2047) and with LD_GEOM_CAPTURE. Log [vtx-dev]. */
 +#include "rsx_vtx_dev.h"
-+#define LD_VTX_DEV_DEFAULT 1   /* on since 2026-10-20: K4 A/B 6/6 pairs (RSX pass 88 + confirmation), fps_window +0.7 to +1.1 */
++#define LD_VTX_DEV_DEFAULT 1   /* on: K4 A/B 6/6 pairs (RSX pass 88 + confirmation), fps_window +0.7 to +1.1 */
 +#define LD_VD_COPIES 4096u
 +static struct {
 +    rsx_vd_arena a; ID3D12Resource* buf; u64 va; int tried, ok;

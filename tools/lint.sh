@@ -16,7 +16,7 @@ if (( $# )); then files=("$@"); added=("$@"); else
   mapfile -t files < <(git diff --cached --name-only --diff-filter=ACM)
   mapfile -t added < <(git diff --cached --name-only --diff-filter=A)
 fi
-# clang-format only for new files: existing ones differ from the style on 25-50 % of their lines (2026-10-09), and
+# clang-format only for new files: existing ones differ from the style on 25-50 % of their lines, and
 # reformatting them would conflict with every open parallel branch.
 is_added() { local a; for a in "${added[@]}"; do [[ "$a" == "$1" ]] && return 0; done; return 1; }
 py=(); sh=(); cc=()

@@ -1,0 +1,972 @@
+KZ3 patch 2172 (RSX pass 159, renderer step 1 round R1): LD_FRONT_PROBE=1, measurement only (default off: one flag load per
+hook). New GPU-free unit rsx_front_probe.h counts what a front/recorder split would have to snapshot and wait for: TEX bytes
+and spans under the write-generation rule (counter-only, no copies), vertex/index bytes, FP misses (hash model of the front's
+memcmp), main-memory ZPASS reports (class, has_val, OQ_NEVER, last-value hits, and the state-lag model against a mirror
+published at the previous hard point), SYNC_BGS split by the front's drawn_since_wb bit, SYNC_WB, FLIP, draws before an
+async ref publication, and a T = sum max(front+snap, rec) + drain model with the four step-1 gate booleans. One flip per
+LD_FRONT_PROBE_N (default 100) is sampled: guest bytes are copied into a scratch buffer and the indices scanned, both timed,
+and its words are replayed through a second dispatcher instance, timed. Prints [front-probe] lines on stderr. Hooks: ld_td_mark,
+sink_end, after get_pso, rsx_live_draw_report_value, rsx_live_draw_before_guest_sync, rsx_live_draw_present,
+rsx_live_draw_method (LD); nv0039_copy, gcm_ref_publish_one, the sync-hist event sites (CG, RC). Host test
+tools/smoke/test_front_probe.sh.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 87a5f7c7..ede193c0 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -11,6 +11,8 @@
+ #include "rsx_live_draw.h"
+ #include "rsx_nv3089_rows.h"   /* patch 2080 */
+ #include "rsx_sync_hist.h"     /* patch 2164: LD_SYNC_HIST */
++#include "rsx_front_probe.h"   /* patch 2172: LD_FRONT_PROBE */
++#include "rsx_dispatch.h"
+ #include "rsx_fifo_capture.h"  /* patch 2164: LD_FIFO_CAPTURE */
+ #include "rsx_draw_engine.h"
+ #include "rsx_tiling.h"
+@@ -22,7 +24,9 @@
+ #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+ /* Patch 2164 flags, read by the hooks (one load + predicted branch when off). g_rsx_sh_on: LD_SYNC_HIST=1.
+  * g_rsx_fcap_cfg: LD_FIFO_CAPTURE set and valid (flips are counted); g_rsx_fcap_on: a capture window is open. */
+-volatile int g_rsx_sh_on, g_rsx_fcap_cfg, g_rsx_fcap_on, g_rsx_fcap_in_draw;   /* in_draw: patch 2171 */
++volatile int g_rsx_sh_on, g_rsx_fcap_cfg, g_rsx_fcap_on, g_rsx_fcap_in_draw;
++volatile int g_rsx_fp_on;   /* patch 2172: LD_FRONT_PROBE=1 (read once at the first walker pass; the hooks test this one flag) */
++rsx_fp* g_rsx_fp;   /* in_draw: patch 2171 */
+ _Static_assert(RSX_SH_FLIP == 4 && RSX_SH_REL4097 == 3, "rsx_live_draw.c / rsx_commands.c pass RSX_SH_FLIP / RSX_SH_REL4097 as literals");
+ static void gcm_fcap_pass_begin(u32 put);
+ static void gcm_fcap_cmd(u32 getoff, u32 w_raw, int is_method);
+@@ -1762,11 +1766,13 @@ static void nv0039_copy(u32 notify)
+      * surface is created at the destination (unlike NV3089): the CPU/SPU side
+      * owns that copy, and texture binds re-read it from guest memory. */
+     u32 wb = 0;
++    const uint64_t fp_t0 = g_rsx_fp_on ? RSX_FP_CLOCK() : 0;   /* patch 2172 */
+     if (rsx_live_draw_enabled())
+         wb = rsx_live_draw_writeback_range(sl ? 0u : 1u, (u32)(lo_in - (s64)src) + s_nv0039.off_in,
+                                            (u32)(hi_in - lo_in));
++    if (fp_t0 && g_rsx_fp_on) rsx_fp_sync_time(g_rsx_fp, RSX_FP_CLOCK() - fp_t0);   /* patch 2172: SYNC_WB wait time */
+     s_nv0039_wb += wb;
+-    if (g_rsx_sh_on && rsx_live_draw_enabled()) rsx_sync_hist_event(RSX_SH_NV0039, wb != 0);   /* patch 2164 */
++    if ((g_rsx_sh_on | g_rsx_fp_on) && rsx_live_draw_enabled()) rsx_sync_hist_event(RSX_SH_NV0039, wb != 0);   /* patch 2164, 2172 */
+     if (g_rsx_fcap_on) rsx_fcap_range(RSX_FC_RD_WALKER, RSX_FC_EA, (u32)lo_in, vm_base + lo_in, (u32)(hi_in - lo_in), 1);   /* patch 2164 */
+     const long long m2mf_t0 = rsx_perf_walk_on() ? rsx_perf_now() : 0;   /* patch 2029 */
+     for (u32 y = 0; y < n; y++) {
+@@ -2375,6 +2381,7 @@ static void gcm_ref_publish_one(void)
+                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
+     s_ref_qhead = h + 1;
+     g_gcm_ref_pub_count++;
++    if (g_rsx_fp_on) rsx_fp_pub_note(g_rsx_fp);   /* patch 2172: any thread, atomics only */
+ }
+ 
+ /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
+@@ -2577,8 +2584,10 @@ static void gcm_sh_summary(void)
+     fprintf(stderr, "%s\n", line);
+ }
+ void rsx_sync_hist_draw(void) { if (g_rsx_sh_on) rsx_sh_draw(&s_sh); }
++static void gcm_fp_event(int kind, unsigned dirty);
+ void rsx_sync_hist_event(int kind, unsigned dirty)
+ {
++    if (g_rsx_fp_on) gcm_fp_event(kind, dirty);   /* patch 2172 */
+     if (!g_rsx_sh_on) return;
+     if (rsx_sh_event(&s_sh, kind, dirty)) {
+         char line[2048];
+@@ -2587,6 +2596,71 @@ void rsx_sync_hist_event(int kind, unsigned dirty)
+     }
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Patch 2172: LD_FRONT_PROBE=1 (renderer step 1, round R1; LD_FRONT_PROBE_N flips per line, default 100). The counters and
++ * the model are rsx_front_probe.h (host-tested); this block owns the instance, maps the sync-hist events onto its waits
++ * (NV0039 -> SYNC_WB, NV406E 0x6C / NV4097 0x1D70/0x1D74 -> SYNC_BGS, flip -> FLIP), runs the sampled second decode pass at
++ * the sampled flip's end and prints the [front-probe] lines. Nothing here changes what the walker does. Off: one load of
++ * g_rsx_fp_on at every hook.
++ * -----------------------------------------------------------------------*/
++static rsx_dispatch* s_fp_d2;
++/* weak: the host tests that compile the walker without the dispatcher skip the second decode pass (words kept, no time taken) */
++extern void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink) __attribute__((weak));
++extern void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg) __attribute__((weak));
++static void gcm_fp_print_window(rsx_fp* p, const char* tag)
++{
++    char line[3072];
++    rsx_fp_window_line(p, &p->win, tag, line, sizeof line); fprintf(stderr, "%s\n", line);
++    rsx_fp_cost_line(p, line, sizeof line); fprintf(stderr, "%s\n", line);
++    for (uint32_t i = 0; rsx_fp_iv_line(p, i, line, sizeof line); i++) fprintf(stderr, "%s\n", line);
++}
++static void gcm_fp_summary(void)
++{
++    if (!g_rsx_fp_on) return;
++    g_rsx_fp_on = 0;
++    rsx_fp* p = g_rsx_fp;
++    if (p->win_flips) gcm_fp_print_window(p, "window");
++    char line[3072];
++    rsx_fp_window_line(p, &p->tot, "summary", line, sizeof line);
++    fprintf(stderr, "%s\n", line);
++}
++static void gcm_fp_event(int kind, unsigned dirty)
++{
++    rsx_fp* p = g_rsx_fp;
++    int ev;
++    if (kind == RSX_SH_NV0039) ev = RSX_FP_EV_WB;
++    else if (kind == RSX_SH_REL406E || kind == RSX_SH_REL4097) ev = RSX_FP_EV_BGS;
++    else if (kind == RSX_SH_FLIP) ev = RSX_FP_EV_FLIP;
++    else return;
++    const uint64_t t0 = RSX_FP_CLOCK();
++    if (ev == RSX_FP_EV_FLIP && rsx_fp_sampling(p) && p->d2_n && rsx_dispatch_init && rsx_dispatch_method) {   /* the sampled flip: time a second decode pass over its words */
++        if (!s_fp_d2) {
++            static const rsx_dispatch_sink none;
++            s_fp_d2 = (rsx_dispatch*)malloc(sizeof(rsx_dispatch));
++            if (s_fp_d2) rsx_dispatch_init(s_fp_d2, &none);
++        }
++        if (s_fp_d2) {
++            const uint32_t n = p->d2_n;
++            const uint64_t a = RSX_FP_CLOCK();
++            for (uint32_t i = 0; i < n; i++) rsx_dispatch_method(s_fp_d2, p->d2[2u * i], p->d2[2u * i + 1u]);
++            rsx_fp_d2_result(p, RSX_FP_CLOCK() - a, n);
++        }
++    }
++    const int due = rsx_fp_event(p, ev, t0, dirty);
++    if (due) { gcm_fp_print_window(p, "window"); rsx_fp_window_done(p); }
++}
++static void gcm_fp_init_once(void)
++{
++    const char* e = getenv("LD_FRONT_PROBE");
++    if (!(e && *e && *e != '0')) return;
++    const char* n = getenv("LD_FRONT_PROBE_N");
++    g_rsx_fp = rsx_fp_new(n && atoi(n) > 0 ? (uint32_t)atoi(n) : 100u, RSX_FP_CLOCK());
++    if (!g_rsx_fp) return;
++    atexit(gcm_fp_summary);
++    g_rsx_fp_on = 1;
++    fprintf(stderr, "[front-probe] on (LD_FRONT_PROBE=1, one line per %u flips, patch 2172; measurement only, nothing moves to another thread)\n", g_rsx_fp->every);
++}
++
+ /* ---------------------------------------------------------------------------
+  * Patch 2164: LD_FIFO_CAPTURE=dir (+ LD_FIFO_CAPTURE_FRAME=start,count, default 0,1): renderer step 0 capture writer
+  * (format and reader: rsx_fifo_capture.h). Frames are flips
+@@ -2862,6 +2936,7 @@ static void gcm_sh_init_once(void)
+         g_rsx_sh_on = 1;
+         fprintf(stderr, "[sync-hist] on (LD_SYNC_HIST=1, one line per %u flips, patch 2164)\n", s_sh.every);
+     }
++    gcm_fp_init_once();   /* patch 2172 */
+     rsx_fcap_configured();
+ }
+ 
+@@ -4097,7 +4172,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         { const long long o_bg0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164 */
+                           const u32 o_bgs = rsx_live_draw_enabled() ? rsx_live_draw_before_guest_sync() : 0;
+                           if (o_bg0) rsx_perf_add(RSX_PERF_O_SEMA_BGS_T, rsx_perf_now() - o_bg0);
+-                          if (g_rsx_sh_on) rsx_sync_hist_event(RSX_SH_REL406E, o_bgs != 0); }
++                          if (g_rsx_sh_on | g_rsx_fp_on) rsx_sync_hist_event(RSX_SH_REL406E, o_bgs != 0); }   /* 2172: fp too */
+                         /* The RSX has fetched past a RELEASE before its
+                          * semaphore write lands, so a guest that sees the
+                          * label must also see `get` past the command. `get`
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index 81101877..09af4eba 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -542,9 +542,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+       if (method == 0x1D70 || method == 0x1D74) {   /* patch 2017: RSX output in main memory first */
+         extern u32 rsx_live_draw_before_guest_sync(void);
+         extern int rsx_live_draw_enabled(void);
+-        extern volatile int g_rsx_sh_on; extern void rsx_sync_hist_event(int kind, unsigned dirty);   /* patch 2164 */
++        extern volatile int g_rsx_sh_on, g_rsx_fp_on; extern void rsx_sync_hist_event(int kind, unsigned dirty);   /* patch 2164, 2172 */
+         const u32 sh_dirty = rsx_live_draw_enabled() ? rsx_live_draw_before_guest_sync() : 0;
+-        if (g_rsx_sh_on) rsx_sync_hist_event(3 /* RSX_SH_REL4097 */, sh_dirty != 0);
++        if (g_rsx_sh_on | g_rsx_fp_on) rsx_sync_hist_event(3 /* RSX_SH_REL4097 */, sh_dirty != 0);
+       }
+       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
+         extern void vm_write32(uint32_t a, uint32_t v);
+diff --git a/libs/video/rsx_front_probe.h b/libs/video/rsx_front_probe.h
+new file mode 100644
+index 00000000..c40b21c0
+--- /dev/null
++++ b/libs/video/rsx_front_probe.h
+@@ -0,0 +1,565 @@
++/* KZ3 patch 2172 (renderer step 1, round R1): LD_FRONT_PROBE=1 measurement unit. GPU-free, host-tested
++ * (tools/smoke/test_front_probe.sh). Nothing here moves work to another thread: it counts what a front/recorder split
++ * would have to snapshot, wait for and answer, and models its cost.
++ *
++ * Callers (hook sites are listed in the RE notes "Pass 159"): the walker thread for everything except
++ * rsx_fp_note_write (any thread, atomics only) and rsx_fp_pub_note (any thread, atomics only). The instance is calloc'ed.
++ *
++ * WRITE GENERATIONS (a counter-only model, no copies). rsx_fp_note_write bumps a global epoch and stamps every 4 KB page
++ * of the range with it (location 0/1, offsets alias modulo 256 MB). A span's generation is the largest stamp of its pages.
++ * A TEX span "moved" when its generation is newer than the epoch at its last would-be snapshot, or it has none: every
++ * bound span whose generation moved counts, never "once per frame". A bump is counted once, not per draw.
++ *
++ * INTERVALS. A hard interval ends at a would-be hard wait: SYNC_WB (every NV0039 write-back call), SYNC_BGS only when
++ * drawn_since_wb is set, FLIP. drawn_since_wb is set by rsx_fp_draw_rt when the draw's RT registers name a
++ * main-memory colour or depth surface and cleared after a SYNC_BGS/SYNC_WB/FLIP. A SYNC_BGS with the bit clear is an
++ * ordering record only (bgs_ord); bgs_missed counts a clear bit while the recorder's own test found dirty surfaces
++ * (the bit would not have been conservative).
++ *
++ * TIME MODEL: T = sum over intervals of max(front_i + snap_i, rec_i) + drain_i.
++ *   front_raw = wall - draw time - sync time - probe time (the walker's non-draw time, incl. one decode pass);
++ *   snap      = snapshot bytes * measured memcpy ns/B + index bytes * measured scan ns/B (rates from one sampled flip);
++ *   rec       = draw time + sync time + the previous present + dec (second decode pass per draw, from the sampled flip);
++ *   drain_i   = how far a one-recorder queue simulation (draws handed over one by one) ends after max(front+snap, rec),
++ *               plus the sync, i.e. the recorder tail the front still waits for at the wait. MODEL, not measured: today
++ *               recorder == walker, so no drain exists in a run. Rates are 0 until the first sampled flip has closed.
++ */
++#ifndef RSX_FRONT_PROBE_H
++#define RSX_FRONT_PROBE_H
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifndef RSX_FP_CLOCK
++#  ifdef _WIN32
++#    include <windows.h>
++static inline uint64_t rsx_fp_clock_ns(void)
++{
++    static LARGE_INTEGER f; LARGE_INTEGER n;
++    if (!f.QuadPart) QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&n);
++    return (uint64_t)((double)n.QuadPart * 1e9 / (double)f.QuadPart);
++}
++#  else
++#    include <time.h>
++static inline uint64_t rsx_fp_clock_ns(void)
++{
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
++}
++#  endif
++#  define RSX_FP_CLOCK() rsx_fp_clock_ns()
++#endif
++
++/* gate thresholds (a 41.4 ms walk on Frozen Shores) */
++#define RSX_FP_T_GATE_NS       35200000ull       /* 0.85 x 41.4 ms */
++#define RSX_FP_FRONT_GATE_NS   22000000ull
++#define RSX_FP_TEX_GATE_BYTES  (10ull << 20)     /* 10 MiB per flip (ASSUMPTION: MB = MiB) */
++
++enum { RSX_FP_PAGE_SHIFT = 12, RSX_FP_PAGES = 1u << 20, RSX_FP_TAB = 8192, RSX_FP_FPT = 512, RSX_FP_MAXD = 16384,
++       RSX_FP_MAXIV = 48, RSX_FP_SLOTS = 1024, RSX_FP_D2_MAX = 4u << 20, RSX_FP_SCRATCH_MAX = 64u << 20 };
++enum { RSX_FP_EV_WB = 0, RSX_FP_EV_BGS, RSX_FP_EV_FLIP, RSX_FP_EV_N };
++enum { RSX_FP_RC_DFLT = 0, RSX_FP_RC_NEVER, RSX_FP_RC_NOVAL, RSX_FP_RC_VAL };   /* report classes */
++
++typedef struct {
++    uint64_t draws, inl, vtx_unk;                                     /* draws; inline draws (no guest read); draws whose vertex spans are unknown */
++    uint64_t tex_b, tex_n, texb_b, texb_n, tex_surf;                  /* TEX snapshot bytes/spans (moved), bound bytes/spans, GPU-surface binds skipped */
++    uint64_t vtx_b, idx_b, fp_b, fp_miss, fp_n;                       /* vertex span bytes, index bytes, FP bytes copied, FP misses, FP draws */
++    uint64_t rep, rep_dflt, rep_never, rep_noval, rep_val;            /* main-memory ZPASS GET_REPORT by class */
++    uint64_t rep_lag_state, rep_lag_val;                              /* the mirror model: state / has_val differ from a mirror published at the last hard point */
++    uint64_t wb, bgs_hard, bgs_ord, bgs_missed, flips;                /* waits */
++    uint64_t ivs, cross_d, cross_iv, pubs;                            /* intervals; draws before an async ref publication in their interval */
++} rsx_fp_c;
++
++typedef struct {
++    uint32_t ev, draws, rep, rep_first, rep_last;                     /* positions are draw ordinals in the interval */
++    uint64_t tex_b, vtx_b, idx_b, F_ns, R_ns, drain_ns, T_ns;
++} rsx_fp_ivs;
++
++typedef struct { uint32_t f_ns, rec_ns, snap_b, idx_b; } rsx_fp_dr;
++
++typedef struct {
++    rsx_fp_c c;
++    uint64_t T_ns, F_ns, R_ns, drain_ns, wall_ns, drain_k[RSX_FP_EV_N], n_k[RSX_FP_EV_N], tflips;
++    uint64_t tflips_over;                                              /* flips with T above the gate */
++} rsx_fp_w;
++
++typedef struct rsx_fp {
++    uint32_t every, flips_total, win_flips, sampling, sample_flip, rates_known, d2_known, win_no;
++    /* write generations */
++    uint32_t epoch;
++    uint32_t stamp[2][RSX_FP_PAGES];                                   /* 1M pages of 4 KiB = the whole 32-bit offset space: exact, no aliasing */
++    /* span table (texture spans) and fragment-program table: open addressing, power-of-two capacity, grown (rehash) at 50 % load,
++     * allocated at init, touched only by the walker thread (rsx_fp_snap_tex / rsx_fp_snap_fp); other threads only stamp[] */
++    struct rsx_fp_tab_e { uint32_t loc, off, len, snap_epoch, flip_mark, used; } *tab; uint32_t tab_cap, tab_n;
++    struct rsx_fp_fpt_e { uint32_t loc, off, len, used; uint64_t h; } *fpt; uint32_t fpt_cap, fpt_n;
++    uint64_t tab_full, fpt_full;                                       /* overflow counters (stay 0 unless an allocation failed, or RSX_FP_NOGROW) */
++    uint64_t slot_over;                                                /* report slot index >= RSX_FP_SLOTS (dropped from the lag model) */
++    uint64_t tab_grows, fpt_grows;
++    /* interval */
++    uint64_t t_start, probe_total, probe0, pres_t0, carry_ns, draw_t0, draw_probe0, draw_f_ns;
++    uint32_t drawn_since_wb, in_draw, cur_snap_b, cur_idx_b;
++    rsx_fp_c iv;                                                       /* current interval counters */
++    uint64_t iv_rec_ns, iv_sync_ns;
++    uint32_t iv_rep_first, iv_rep_last, iv_pub0;
++    uint64_t iv_draw0;
++    rsx_fp_dr* dr; uint32_t n_dr, dr_cap; uint64_t dr_over;     /* dr grows (walker only); dr_over counts only a failed allocation */
++    uint64_t draws_total;                                              /* walker writes, pub_note reads (atomics) */
++    uint64_t pub_count, pub_draw_mark;                                 /* any thread (atomics) */
++    uint64_t pub_seen_iv;
++    void (*hard_cb)(void*); void* hard_ctx;
++    /* mirror model */
++    uint32_t pub_off[RSX_FP_SLOTS]; uint8_t pub_state[RSX_FP_SLOTS], pub_hv[RSX_FP_SLOTS];
++    /* flip / window / total */
++    rsx_fp_c fl_c; uint64_t fl_T, fl_F, fl_R, fl_drain, fl_wall, fl_drain_k[RSX_FP_EV_N], fl_n_k[RSX_FP_EV_N];
++    rsx_fp_w win, tot;
++    rsx_fp_ivs sv[RSX_FP_MAXIV]; uint32_t n_sv, sv_cap_hit;
++    /* sampled costs and the rates they give */
++    uint64_t samp_cp_ns, samp_cp_b, samp_scan_ns, samp_scan_b, samp_d2_ns, samp_d2_words, samp_d2_draws, samp_flip_draws;
++    double copy_rate, scan_rate, dec_per_draw;                         /* ns per byte / ns per byte / ns per draw */
++    uint8_t* scratch; uint32_t scratch_cap;
++    uint32_t* d2; uint32_t d2_n; uint64_t d2_over;
++    uint64_t n_scratch_skip;
++    uint64_t last_samp_cp_ns, last_samp_cp_b;
++} rsx_fp;
++
++/* ---- lifecycle / flags ---- */
++static inline rsx_fp* rsx_fp_new(uint32_t every, uint64_t now)
++{
++    rsx_fp* p = (rsx_fp*)calloc(1, sizeof *p);
++    if (!p) return NULL;
++    p->every = every ? every : 100u;
++    p->sampling = 1; p->t_start = now;
++    p->dr_cap = RSX_FP_MAXD;
++    p->dr = (rsx_fp_dr*)calloc(p->dr_cap, sizeof(rsx_fp_dr));
++    p->tab_cap = RSX_FP_TAB; p->fpt_cap = RSX_FP_FPT;
++    p->tab = (struct rsx_fp_tab_e*)calloc(p->tab_cap, sizeof *p->tab);
++    p->fpt = (struct rsx_fp_fpt_e*)calloc(p->fpt_cap, sizeof *p->fpt);
++    if (!p->dr || !p->tab || !p->fpt) { free(p->dr); free(p->tab); free(p->fpt); free(p); return NULL; }
++    return p;
++}
++static inline void rsx_fp_free(rsx_fp* p) { if (!p) return; free(p->dr); free(p->tab); free(p->fpt); free(p->scratch); free(p->d2); free(p); }
++static inline int rsx_fp_sampling(const rsx_fp* p) { return p ? (int)p->sampling : 0; }
++static inline void rsx_fp_set_hard_cb(rsx_fp* p, void (*cb)(void*), void* ctx) { p->hard_cb = cb; p->hard_ctx = ctx; }
++static inline void rsx_fp_probe_add(rsx_fp* p, uint64_t ns) { p->probe_total += ns; }
++
++/* ---- write generations (any thread) ---- */
++static inline void rsx_fp_note_write(rsx_fp* p, uint32_t loc, uint32_t off, uint32_t len)
++{
++    if (loc > 1u || !len) return;
++    const uint32_t e = __atomic_add_fetch(&p->epoch, 1u, __ATOMIC_RELAXED);
++    const uint64_t last = (uint64_t)off + len - 1u;
++    uint32_t p0 = off >> RSX_FP_PAGE_SHIFT, p1 = (uint32_t)((last > 0xFFFFFFFFull ? 0xFFFFFFFFull : last) >> RSX_FP_PAGE_SHIFT);
++    for (uint32_t q = p0;; q++) {
++        __atomic_store_n(&p->stamp[loc][q], e, __ATOMIC_RELAXED);
++        if (q == p1) break;
++    }
++}
++static inline uint32_t rsx_fp_span_gen(const rsx_fp* p, uint32_t loc, uint32_t off, uint32_t len)
++{
++    if (loc > 1u || !len) return 0;
++    const uint64_t last = (uint64_t)off + len - 1u;
++    uint32_t p0 = off >> RSX_FP_PAGE_SHIFT, p1 = (uint32_t)((last > 0xFFFFFFFFull ? 0xFFFFFFFFull : last) >> RSX_FP_PAGE_SHIFT), g = 0;
++    for (uint32_t q = p0;; q++) {
++        const uint32_t s = __atomic_load_n(&p->stamp[loc][q], __ATOMIC_RELAXED);
++        if (s > g) g = s;
++        if (q == p1) break;
++    }
++    return g;
++}
++
++static inline uint64_t rsx_fp_fnv(const uint8_t* b, uint32_t n)
++{
++    uint64_t h = 1469598103934665603ull;
++    for (uint32_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
++    return h;
++}
++
++/* ---- sampled copies (only on the sampled flip; bytes may be NULL) ---- */
++static inline void rsx_fp_sample_copy(rsx_fp* p, const uint8_t* bytes, uint32_t len)
++{
++    if (!p->sampling || !bytes || !len) return;
++    if (len > RSX_FP_SCRATCH_MAX) { p->n_scratch_skip++; return; }
++    if (len > p->scratch_cap) {
++        free(p->scratch); p->scratch = (uint8_t*)malloc(len); p->scratch_cap = p->scratch ? len : 0;
++        if (!p->scratch) { p->n_scratch_skip++; return; }
++    }
++    const uint64_t t0 = RSX_FP_CLOCK();
++    memcpy(p->scratch, bytes, len);
++    __asm__ volatile("" : : "r"(p->scratch) : "memory");
++    const uint64_t dt = RSX_FP_CLOCK() - t0;
++    p->samp_cp_ns += dt; p->samp_cp_b += len;   /* the caller's hook time (rsx_fp_probe_add) already holds dt */
++}
++/* the front's index scan: min/max of the (big-endian) indices of the span, timed */
++static inline uint32_t rsx_fp_sample_scan(rsx_fp* p, const uint8_t* bytes, uint32_t len, uint32_t esz)
++{
++    if (!p->sampling || !bytes || !len || (esz != 2 && esz != 4)) return 0;
++    const uint64_t t0 = RSX_FP_CLOCK();
++    uint32_t lo = 0xFFFFFFFFu, hi = 0;
++    for (uint32_t i = 0; i + esz <= len; i += esz) {
++        const uint32_t v = esz == 2 ? ((uint32_t)bytes[i] << 8 | bytes[i + 1])
++                                    : ((uint32_t)bytes[i] << 24 | (uint32_t)bytes[i + 1] << 16 | (uint32_t)bytes[i + 2] << 8 | bytes[i + 3]);
++        if (v < lo) lo = v;
++        if (v > hi) hi = v;
++    }
++    __asm__ volatile("" : : "r"(lo), "r"(hi));
++    const uint64_t dt = RSX_FP_CLOCK() - t0;
++    p->samp_scan_ns += dt; p->samp_scan_b += len;
++    return hi - lo;
++}
++
++/* ---- open-addressed tables (walker thread only; power-of-two capacity, linear probing, grown at 50 % load) ---- */
++static inline uint32_t rsx_fp_hash3(uint32_t loc, uint32_t off, uint32_t len)
++{
++    uint64_t x = ((uint64_t)off << 32 | len) * 0x9E3779B97F4A7C15ull ^ (uint64_t)loc * 0xC2B2AE3D27D4EB4Full;
++    x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32;
++    return (uint32_t)x;
++}
++static inline struct rsx_fp_tab_e* rsx_fp_tab_find(rsx_fp* p, uint32_t loc, uint32_t off, uint32_t len)
++{
++    for (uint32_t k = 0, h = rsx_fp_hash3(loc, off, len) & (p->tab_cap - 1u); k < p->tab_cap; k++, h = (h + 1u) & (p->tab_cap - 1u)) {
++        struct rsx_fp_tab_e* e = &p->tab[h];
++        if (!e->used) return NULL;
++        if (e->loc == loc && e->off == off && e->len == len) return e;
++    }
++    return NULL;
++}
++static inline struct rsx_fp_tab_e* rsx_fp_tab_insert(rsx_fp* p, uint32_t loc, uint32_t off, uint32_t len)
++{
++    if ((p->tab_n + 1u) * 2u > p->tab_cap) {
++#ifdef RSX_FP_NOGROW
++        return NULL;                                                     /* negative control: the old fixed table (it was full at 100 %) */
++#else
++        const uint32_t nc = p->tab_cap * 2u;
++        struct rsx_fp_tab_e* nt = (struct rsx_fp_tab_e*)calloc(nc, sizeof *nt);
++        if (!nt) return NULL;
++        for (uint32_t i = 0; i < p->tab_cap; i++) if (p->tab[i].used) {
++            uint32_t h = rsx_fp_hash3(p->tab[i].loc, p->tab[i].off, p->tab[i].len) & (nc - 1u);
++            while (nt[h].used) h = (h + 1u) & (nc - 1u);
++            nt[h] = p->tab[i];
++        }
++        free(p->tab); p->tab = nt; p->tab_cap = nc; p->tab_grows++;
++#endif
++    }
++    uint32_t h = rsx_fp_hash3(loc, off, len) & (p->tab_cap - 1u);
++    while (p->tab[h].used) h = (h + 1u) & (p->tab_cap - 1u);
++    struct rsx_fp_tab_e* e = &p->tab[h];
++    e->used = 1; e->loc = loc; e->off = off; e->len = len; e->snap_epoch = 0; e->flip_mark = 0xFFFFFFFFu;
++    p->tab_n++;
++    return e;
++}
++static inline struct rsx_fp_fpt_e* rsx_fp_fpt_find(rsx_fp* p, uint32_t loc, uint32_t off)
++{
++    for (uint32_t k = 0, h = rsx_fp_hash3(loc, off, 0) & (p->fpt_cap - 1u); k < p->fpt_cap; k++, h = (h + 1u) & (p->fpt_cap - 1u)) {
++        struct rsx_fp_fpt_e* e = &p->fpt[h];
++        if (!e->used) return NULL;
++        if (e->loc == loc && e->off == off) return e;
++    }
++    return NULL;
++}
++static inline struct rsx_fp_fpt_e* rsx_fp_fpt_insert(rsx_fp* p, uint32_t loc, uint32_t off)
++{
++    if ((p->fpt_n + 1u) * 2u > p->fpt_cap) {
++#ifdef RSX_FP_NOGROW
++        return NULL;
++#else
++        const uint32_t nc = p->fpt_cap * 2u;
++        struct rsx_fp_fpt_e* nt = (struct rsx_fp_fpt_e*)calloc(nc, sizeof *nt);
++        if (!nt) return NULL;
++        for (uint32_t i = 0; i < p->fpt_cap; i++) if (p->fpt[i].used) {
++            uint32_t h = rsx_fp_hash3(p->fpt[i].loc, p->fpt[i].off, 0) & (nc - 1u);
++            while (nt[h].used) h = (h + 1u) & (nc - 1u);
++            nt[h] = p->fpt[i];
++        }
++        free(p->fpt); p->fpt = nt; p->fpt_cap = nc; p->fpt_grows++;
++#endif
++    }
++    uint32_t h = rsx_fp_hash3(loc, off, 0) & (p->fpt_cap - 1u);
++    while (p->fpt[h].used) h = (h + 1u) & (p->fpt_cap - 1u);
++    struct rsx_fp_fpt_e* e = &p->fpt[h];
++    e->used = 1; e->loc = loc; e->off = off; e->len = 0; e->h = 0;
++    p->fpt_n++;
++    return e;
++}
++
++/* ---- snapshot accounting (walker, between draw_begin and draw_end) ---- */
++static inline void rsx_fp_snap_tex(rsx_fp* p, uint32_t loc, uint32_t off, uint32_t len, const uint8_t* bytes)
++{
++    if (!len) return;
++    p->iv.texb_b += len; p->iv.texb_n++;
++    const uint32_t gen = rsx_fp_span_gen(p, loc, off, len);
++    const uint32_t cur_epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
++    int moved = 1;
++    struct rsx_fp_tab_e* e = rsx_fp_tab_find(p, loc, off, len);          /* walker thread only */
++    if (!e) {
++        e = rsx_fp_tab_insert(p, loc, off, len);                         /* first sight counts as moved: a first snapshot must copy */
++        if (!e) p->tab_full++;                                           /* only an allocation failure (or RSX_FP_NOGROW): counted as moved, never stored */
++    } else moved = gen > e->snap_epoch;
++    if (e && moved) e->snap_epoch = cur_epoch;
++    if (!moved) return;
++    p->iv.tex_b += len; p->cur_snap_b += len;
++    if (!e || e->flip_mark != p->flips_total) { p->iv.tex_n++; if (e) e->flip_mark = p->flips_total; }
++    rsx_fp_sample_copy(p, bytes, len);
++}
++static inline void rsx_fp_snap_tex_surface(rsx_fp* p) { p->iv.tex_surf++; }
++static inline void rsx_fp_snap_vtx(rsx_fp* p, uint32_t len, const uint8_t* bytes)
++{ p->iv.vtx_b += len; p->cur_snap_b += len; rsx_fp_sample_copy(p, bytes, len); }
++static inline void rsx_fp_snap_idx(rsx_fp* p, uint32_t len, uint32_t esz, const uint8_t* bytes)
++{ p->iv.idx_b += len; p->cur_snap_b += len; p->cur_idx_b += len; rsx_fp_sample_copy(p, bytes, len); rsx_fp_sample_scan(p, bytes, len, esz); }
++static inline void rsx_fp_snap_fp(rsx_fp* p, uint32_t loc, uint32_t off, uint32_t len, const uint8_t* bytes)
++{
++    if (!len || !bytes) return;
++    p->iv.fp_n++;
++    const uint64_t h = rsx_fp_fnv(bytes, len);
++    int miss = 1;
++    struct rsx_fp_fpt_e* e = rsx_fp_fpt_find(p, loc, off);               /* walker thread only */
++    if (!e) {
++        e = rsx_fp_fpt_insert(p, loc, off);                              /* first sight: a miss (the first copy) */
++        if (!e) p->fpt_full++;
++    } else miss = !(e->len == len && e->h == h);
++    if (e) { e->len = len; e->h = h; }
++    if (miss) { p->iv.fp_miss++; p->iv.fp_b += len; p->cur_snap_b += len; rsx_fp_sample_copy(p, bytes, len); }
++}
++static inline void rsx_fp_note_inline(rsx_fp* p) { p->iv.inl++; }
++static inline void rsx_fp_note_vtx_unknown(rsx_fp* p) { p->iv.vtx_unk++; }
++
++/* ---- draws ---- */
++static inline void rsx_fp_draw_rt(rsx_fp* p, int main_rt) { if (main_rt) p->drawn_since_wb = 1; }
++static inline uint64_t rsx_fp_front_now(const rsx_fp* p, uint64_t now)
++{
++    const uint64_t wall = now > p->t_start ? now - p->t_start : 0;
++    const uint64_t sub = p->iv_rec_ns + p->iv_sync_ns + (p->probe_total - p->probe0);
++    return wall > sub ? wall - sub : 0;
++}
++static inline void rsx_fp_draw_begin(rsx_fp* p, uint64_t now)
++{
++    p->in_draw = 1; p->draw_t0 = now; p->draw_probe0 = p->probe_total; p->draw_f_ns = rsx_fp_front_now(p, now);
++    p->cur_snap_b = 0; p->cur_idx_b = 0;
++}
++static inline void rsx_fp_draw_end(rsx_fp* p, uint64_t now)
++{
++    if (!p->in_draw) return;
++    p->in_draw = 0;
++    const uint64_t wall = now > p->draw_t0 ? now - p->draw_t0 : 0, pr = p->probe_total - p->draw_probe0;
++    const uint64_t rec = wall > pr ? wall - pr : 0;
++    p->iv_rec_ns += rec; p->iv.draws++;
++    __atomic_store_n(&p->draws_total, p->draws_total + 1u, __ATOMIC_RELAXED);
++    if (p->n_dr >= p->dr_cap) {                                           /* grow: the per-draw rows feed the queue simulation, a cap would change T */
++        rsx_fp_dr* nd = (rsx_fp_dr*)realloc(p->dr, (size_t)p->dr_cap * 2u * sizeof(rsx_fp_dr));
++        if (nd) { p->dr = nd; p->dr_cap *= 2u; }
++    }
++    if (p->n_dr < p->dr_cap) {
++        rsx_fp_dr* d = &p->dr[p->n_dr++];
++        d->f_ns = p->draw_f_ns > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)p->draw_f_ns;
++        d->rec_ns = rec > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)rec;
++        d->snap_b = p->cur_snap_b; d->idx_b = p->cur_idx_b;
++    } else p->dr_over++;
++}
++static inline void rsx_fp_sync_time(rsx_fp* p, uint64_t ns) { p->iv_sync_ns += ns; }
++
++/* ---- reports ---- */
++static inline void rsx_fp_pub_begin(rsx_fp* p) { memset(p->pub_state, 0, sizeof p->pub_state); memset(p->pub_hv, 0, sizeof p->pub_hv); memset(p->pub_off, 0, sizeof p->pub_off); }
++static inline void rsx_fp_pub_set(rsx_fp* p, uint32_t idx, uint32_t off, uint32_t state, uint32_t hv)
++{ if (idx >= RSX_FP_SLOTS) p->slot_over++; else { p->pub_off[idx] = off; p->pub_state[idx] = (uint8_t)state; p->pub_hv[idx] = (uint8_t)hv; } }
++/* idx < 0: no slot. cls: RSX_FP_RC_*. state/hv: the slot's state and has_val as of now. */
++static inline void rsx_fp_report(rsx_fp* p, int cls, int idx, uint32_t off, uint32_t state, uint32_t hv)
++{
++    p->iv.rep++;
++    if (cls == RSX_FP_RC_NEVER) p->iv.rep_never++;
++    else if (cls == RSX_FP_RC_NOVAL) p->iv.rep_noval++;
++    else if (cls == RSX_FP_RC_VAL) p->iv.rep_val++;
++    else p->iv.rep_dflt++;
++    const uint32_t pos = p->iv.draws;
++    if (p->iv.rep == 1) p->iv_rep_first = pos;
++    p->iv_rep_last = pos;
++    if (idx >= 0 && (uint32_t)idx >= RSX_FP_SLOTS) p->slot_over++;
++    if (idx >= 0 && (uint32_t)idx < RSX_FP_SLOTS) {
++        if (p->pub_off[idx] != off || p->pub_state[idx] != state) p->iv.rep_lag_state++;
++        else if (p->pub_hv[idx] != hv) p->iv.rep_lag_val++;
++    }
++}
++/* async ref publication (any thread) */
++static inline void rsx_fp_pub_note(rsx_fp* p)
++{
++    __atomic_store_n(&p->pub_draw_mark, __atomic_load_n(&p->draws_total, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
++    __atomic_add_fetch(&p->pub_count, 1u, __ATOMIC_RELAXED);
++}
++
++/* ---- second decode pass buffer (sampled flip) ---- */
++static inline void rsx_fp_word(rsx_fp* p, uint32_t m, uint32_t v)
++{
++    if (!p->sampling) return;
++    if (!p->d2) { p->d2 = (uint32_t*)malloc((size_t)RSX_FP_D2_MAX * 2u * sizeof(uint32_t)); if (!p->d2) { p->d2_over++; return; } }
++    if (p->d2_n >= RSX_FP_D2_MAX) { p->d2_over++; return; }
++    p->d2[2u * p->d2_n] = m; p->d2[2u * p->d2_n + 1u] = v; p->d2_n++;
++}
++static inline void rsx_fp_d2_result(rsx_fp* p, uint64_t ns, uint32_t words)
++{ p->samp_d2_ns = ns; p->samp_d2_words = words; p->d2_n = 0; p->probe_total += ns; }
++
++/* ---- hard points ---- */
++static inline void rsx_fp_close_iv(rsx_fp* p, uint64_t now, int ev)
++{
++    const uint64_t wall = now > p->t_start ? now - p->t_start : 0;
++    const uint64_t probe = p->probe_total - p->probe0;
++    const uint64_t front_raw = rsx_fp_front_now(p, now);
++    const rsx_fp_c* c = &p->iv;
++    const uint64_t snap_b = c->tex_b + c->vtx_b + c->idx_b + c->fp_b;
++    const double cr = p->rates_known ? p->copy_rate : 0.0, sr = p->rates_known ? p->scan_rate : 0.0, dp = p->d2_known ? p->dec_per_draw : 0.0;
++    const uint64_t snap_ns = (uint64_t)((double)snap_b * cr + (double)c->idx_b * sr);
++    const uint64_t dec_ns = (uint64_t)((double)c->draws * dp);
++    const uint64_t F = front_raw + snap_ns;
++    const uint64_t R = p->iv_rec_ns + p->iv_sync_ns + p->carry_ns + dec_ns;
++    const uint64_t base = F > R ? F : R;
++    /* one-recorder queue simulation: the recorder starts the interval busy with the previous present (carry) */
++    double cc = (double)p->carry_ns, cum = 0.0;
++    for (uint32_t j = 0; j < p->n_dr; j++) {
++        cum += (double)p->dr[j].snap_b * cr + (double)p->dr[j].idx_b * sr;
++        const double ready = (double)p->dr[j].f_ns + cum;
++        cc = (cc > ready ? cc : ready) + (double)p->dr[j].rec_ns + dp;
++    }
++    cc = (cc > (double)F ? cc : (double)F) + (double)p->iv_sync_ns;
++    const uint64_t drain = cc > (double)base ? (uint64_t)(cc - (double)base) : 0;
++    const uint64_t T = base + drain;
++    /* async ref publication inside the interval: the draws recorded before the last one */
++    const uint64_t pubs = __atomic_load_n(&p->pub_count, __ATOMIC_RELAXED);
++    uint64_t cross = 0;
++    if (pubs != p->pub_seen_iv) {
++        const uint64_t mark = __atomic_load_n(&p->pub_draw_mark, __ATOMIC_RELAXED);
++        cross = mark > p->iv_draw0 ? mark - p->iv_draw0 : 0;
++        if (cross > c->draws) cross = c->draws;
++        p->iv.cross_iv = 1; p->iv.pubs = pubs - p->pub_seen_iv; p->iv.cross_d = cross;
++    }
++    p->pub_seen_iv = pubs;
++    p->iv.ivs = 1;
++    /* accumulate into the flip */
++    rsx_fp_c* f = &p->fl_c; const uint64_t* a = (const uint64_t*)c; uint64_t* b = (uint64_t*)f;
++    for (size_t k = 0; k < sizeof(rsx_fp_c) / sizeof(uint64_t); k++) b[k] += a[k];
++    p->fl_T += T; p->fl_F += F; p->fl_R += R; p->fl_drain += drain; p->fl_wall += wall > probe ? wall - probe : 0;
++    p->fl_drain_k[ev] += drain; p->fl_n_k[ev]++;
++    if (p->sampling && p->n_sv < RSX_FP_MAXIV) {
++        rsx_fp_ivs* s = &p->sv[p->n_sv++];
++        s->ev = (uint32_t)ev; s->draws = c->draws; s->rep = (uint32_t)c->rep; s->rep_first = p->iv_rep_first; s->rep_last = p->iv_rep_last;
++        s->tex_b = c->tex_b; s->vtx_b = c->vtx_b; s->idx_b = c->idx_b; s->F_ns = F; s->R_ns = R; s->drain_ns = drain; s->T_ns = T;
++    } else if (p->sampling) p->sv_cap_hit++;
++    if (p->sampling) p->samp_flip_draws += c->draws;
++    /* reset the interval */
++    memset(&p->iv, 0, sizeof p->iv);
++    p->iv_rec_ns = 0; p->iv_sync_ns = 0; p->iv_rep_first = p->iv_rep_last = 0; p->n_dr = 0; p->carry_ns = 0;
++    p->probe0 = p->probe_total; p->iv_draw0 = p->draws_total; p->t_start = now;
++    if (p->hard_cb) p->hard_cb(p->hard_ctx);
++}
++static inline void rsx_fp_acc_w(rsx_fp_w* w, const rsx_fp_c* c)
++{ const uint64_t* a = (const uint64_t*)c; uint64_t* b = (uint64_t*)&w->c; for (size_t k = 0; k < sizeof(rsx_fp_c) / sizeof(uint64_t); k++) b[k] += a[k]; }
++
++/* returns 1 when a window line is due (call rsx_fp_window_line, then rsx_fp_window_done) */
++static inline int rsx_fp_event(rsx_fp* p, int ev, uint64_t now, uint32_t dirty)
++{
++    if (ev == RSX_FP_EV_BGS) {
++        if (!p->drawn_since_wb) { p->iv.bgs_ord++; if (dirty) p->iv.bgs_missed++; return 0; }
++        p->iv.bgs_hard++;
++    } else if (ev == RSX_FP_EV_WB) p->iv.wb++;
++    if (ev == RSX_FP_EV_FLIP && p->pres_t0) now = p->pres_t0;   /* the present itself is recorder work, see rsx_fp_present_done */
++    if (ev == RSX_FP_EV_FLIP) p->iv.flips++;
++    rsx_fp_close_iv(p, now, ev);
++    p->drawn_since_wb = 0;
++    if (ev != RSX_FP_EV_FLIP) return 0;
++    /* flip closed */
++    const int was_sample = (int)p->sampling;
++    p->flips_total++; p->win_flips++;
++    rsx_fp_acc_w(&p->win, &p->fl_c); rsx_fp_acc_w(&p->tot, &p->fl_c);
++    if (!was_sample) {
++        rsx_fp_w* ws[2] = { &p->win, &p->tot };
++        for (int i = 0; i < 2; i++) {
++            ws[i]->T_ns += p->fl_T; ws[i]->F_ns += p->fl_F; ws[i]->R_ns += p->fl_R; ws[i]->drain_ns += p->fl_drain; ws[i]->wall_ns += p->fl_wall;
++            ws[i]->tflips++; if (p->fl_T > RSX_FP_T_GATE_NS) ws[i]->tflips_over++;
++            for (int k = 0; k < RSX_FP_EV_N; k++) { ws[i]->drain_k[k] += p->fl_drain_k[k]; ws[i]->n_k[k] += p->fl_n_k[k]; }
++        }
++    } else {                                                    /* the sampled flip yields the rates, not model rows */
++        if (p->samp_cp_b >= 4096) { p->copy_rate = (double)p->samp_cp_ns / (double)p->samp_cp_b; p->rates_known = 1; }
++        if (p->samp_scan_b >= 1024) p->scan_rate = (double)p->samp_scan_ns / (double)p->samp_scan_b;
++        if (p->samp_d2_words && p->samp_flip_draws) { p->dec_per_draw = (double)p->samp_d2_ns / (double)p->samp_flip_draws; p->d2_known = 1; }
++    }
++    memset(&p->fl_c, 0, sizeof p->fl_c);
++    p->fl_T = p->fl_F = p->fl_R = p->fl_drain = p->fl_wall = 0; memset(p->fl_drain_k, 0, sizeof p->fl_drain_k); memset(p->fl_n_k, 0, sizeof p->fl_n_k);
++    if (p->pres_t0 == 0) p->t_start = now;                      /* no present wrapper (movie-mode flip): next interval starts here */
++    const int due = p->win_flips >= p->every;
++    p->sampling = ((p->flips_total % p->every) == 0) ? 1u : 0u;  /* the first flip of a window is the sampled one */
++    return due;
++}
++/* the present wrapper: begin at its start, done at its end */
++static inline void rsx_fp_present_begin(rsx_fp* p, uint64_t now) { p->pres_t0 = now; }
++static inline void rsx_fp_present_done(rsx_fp* p, uint64_t now)
++{
++    if (p->pres_t0) { p->carry_ns = now > p->pres_t0 ? now - p->pres_t0 : 0; p->t_start = now; p->probe0 = p->probe_total; p->pres_t0 = 0; }
++}
++
++/* ---- gates and lines ---- */
++typedef struct { int t, front, lag, tex; double T_ms, F_ms, R_ms, drain_ms, tex_mb; } rsx_fp_gates;
++static inline rsx_fp_gates rsx_fp_gate(const rsx_fp_w* w)
++{
++    rsx_fp_gates g; memset(&g, 0, sizeof g);
++    const double tf = w->tflips ? (double)w->tflips : 1.0, af = w->c.flips ? (double)w->c.flips : 1.0;
++    g.T_ms = (double)w->T_ns / tf / 1e6; g.F_ms = (double)w->F_ns / tf / 1e6; g.R_ms = (double)w->R_ns / tf / 1e6; g.drain_ms = (double)w->drain_ns / tf / 1e6;
++    g.tex_mb = (double)w->c.tex_b / af / 1048576.0;
++    g.t = w->tflips && (double)w->T_ns / tf > (double)RSX_FP_T_GATE_NS;
++    g.front = w->tflips && (double)w->F_ns / tf >= (double)RSX_FP_FRONT_GATE_NS;
++    g.lag = w->c.rep_lag_state > 0;
++    g.tex = w->c.flips && (double)w->c.tex_b / af > (double)RSX_FP_TEX_GATE_BYTES;
++    return g;
++}
++static inline void rsx_fp_window_line(const rsx_fp* p, const rsx_fp_w* w, const char* tag, char* out, size_t n)
++{
++    const rsx_fp_gates g = rsx_fp_gate(w);
++    const double af = w->c.flips ? (double)w->c.flips : 1.0, tf = w->tflips ? (double)w->tflips : 1.0;
++    snprintf(out, n,
++        "[front-probe] %s flips %llu (model flips %llu, rates %s, dec %s): T %.2f ms = max(front+snap %.2f, rec %.2f) + drain %.2f per flip (over-gate flips %llu; drain wb %.2f bgs %.2f flip %.2f ms) |"
++        " tex %.2f MB/flip spans %.1f (bound %.2f MB %.1f, surf-skipped %.1f) vtx %.2f MB idx %.2f MB fp miss %.1f/%.1f (%.0f KB) inline %.1f vtx-unk %.1f |"
++        " draws %.1f ivs %.1f | wait wb %.1f bgs-hard %.1f bgs-ord %.1f bgs-missed %llu flip %.1f |"
++        " zpass reports %.1f (dflt %.1f never %.1f noval %.1f val %.1f) lag-state %llu lag-val %llu |"
++        " cross-draws %.1f in %.1f ivs, pubs %.1f | gates T>35.2ms %d front+snap>=22ms %d report-lag>0 %d tex>10MB %d",
++        tag, (unsigned long long)w->c.flips, (unsigned long long)w->tflips, p->rates_known ? "measured" : "unknown", p->d2_known ? "measured" : "unknown",
++        g.T_ms, g.F_ms, g.R_ms, g.drain_ms, (unsigned long long)w->tflips_over,
++        (double)w->drain_k[RSX_FP_EV_WB] / tf / 1e6, (double)w->drain_k[RSX_FP_EV_BGS] / tf / 1e6, (double)w->drain_k[RSX_FP_EV_FLIP] / tf / 1e6,
++        g.tex_mb, (double)w->c.tex_n / af, (double)w->c.texb_b / af / 1048576.0, (double)w->c.texb_n / af, (double)w->c.tex_surf / af,
++        (double)w->c.vtx_b / af / 1048576.0, (double)w->c.idx_b / af / 1048576.0, (double)w->c.fp_miss / af, (double)w->c.fp_n / af, (double)w->c.fp_b / af / 1024.0,
++        (double)w->c.inl / af, (double)w->c.vtx_unk / af,
++        (double)w->c.draws / af, (double)w->c.ivs / af,
++        (double)w->c.wb / af, (double)w->c.bgs_hard / af, (double)w->c.bgs_ord / af, (unsigned long long)w->c.bgs_missed, (double)w->c.flips / af,
++        (double)w->c.rep / af, (double)w->c.rep_dflt / af, (double)w->c.rep_never / af, (double)w->c.rep_noval / af, (double)w->c.rep_val / af,
++        (unsigned long long)w->c.rep_lag_state, (unsigned long long)w->c.rep_lag_val,
++        (double)w->c.cross_d / af, (double)w->c.cross_iv / af, (double)w->c.pubs / af,
++        g.t, g.front, g.lag, g.tex);
++}
++static inline void rsx_fp_cost_line(const rsx_fp* p, char* out, size_t n)
++{
++    snprintf(out, n, "[front-probe] cost (sampled flip %u): memcpy %.2f MB in %.3f ms = %.2f GB/s (skipped %llu) | index scan %.2f MB in %.3f ms = %.2f GB/s |"
++        " second decode pass %llu words in %.3f ms (%.1f ns/draw over %llu draws, buffer overflow %llu) |"
++        " overflow: tex-table full %llu (grows %llu, spans %u, cap %u) fp-table full %llu (grows %llu, programs %u, cap %u) draw-rows lost %llu (cap %u) pub-slots %llu sv-cap %u scratch-skip %llu",
++        p->sample_flip, (double)p->samp_cp_b / 1048576.0, (double)p->samp_cp_ns / 1e6, p->samp_cp_ns ? (double)p->samp_cp_b / (double)p->samp_cp_ns : 0.0,
++        (unsigned long long)p->n_scratch_skip, (double)p->samp_scan_b / 1048576.0, (double)p->samp_scan_ns / 1e6,
++        p->samp_scan_ns ? (double)p->samp_scan_b / (double)p->samp_scan_ns : 0.0,
++        (unsigned long long)p->samp_d2_words, (double)p->samp_d2_ns / 1e6, p->d2_known ? p->dec_per_draw : 0.0, (unsigned long long)p->samp_flip_draws,
++        (unsigned long long)p->d2_over, (unsigned long long)p->tab_full, (unsigned long long)p->tab_grows, p->tab_n, p->tab_cap,
++        (unsigned long long)p->fpt_full, (unsigned long long)p->fpt_grows, p->fpt_n, p->fpt_cap,
++        (unsigned long long)p->dr_over, p->dr_cap, (unsigned long long)p->slot_over, p->sv_cap_hit, (unsigned long long)p->n_scratch_skip);
++}
++/* one line per interval of the sampled flip: ev W/B/F, draws, reports (first..last draw ordinal), MB, ms */
++static inline int rsx_fp_iv_line(const rsx_fp* p, uint32_t i, char* out, size_t n)
++{
++    if (i >= p->n_sv) return 0;
++    const rsx_fp_ivs* s = &p->sv[i];
++    snprintf(out, n, "[front-probe] iv %u %c draws %u reports %u (draw %u..%u) tex %.2f MB vtx %.2f MB idx %.2f MB | F %.2f R %.2f drain %.2f T %.2f ms",
++             i, s->ev == RSX_FP_EV_WB ? 'W' : s->ev == RSX_FP_EV_BGS ? 'B' : 'F', s->draws, s->rep, s->rep_first, s->rep_last,
++             (double)s->tex_b / 1048576.0, (double)s->vtx_b / 1048576.0, (double)s->idx_b / 1048576.0,
++             (double)s->F_ns / 1e6, (double)s->R_ns / 1e6, (double)s->drain_ns / 1e6, (double)s->T_ns / 1e6);
++    return 1;
++}
++/* after the window line is printed */
++static inline void rsx_fp_window_done(rsx_fp* p)
++{
++    memset(&p->win, 0, sizeof p->win); p->win_flips = 0; p->win_no++; p->n_sv = 0; p->sv_cap_hit = 0;
++    p->samp_cp_ns = p->samp_cp_b = p->samp_scan_ns = p->samp_scan_b = 0; p->samp_flip_draws = 0; p->samp_d2_words = p->samp_d2_ns = 0;
++    p->sample_flip = p->flips_total;
++}
++#endif
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 199e486b..195ccbb4 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -115,6 +115,8 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ #include "rsx_vertex_compact.h"
+ #include "rsx_vtx_gpu.h"   /* KZ3 patch 2076 */
+ #include "rsx_upload_ring.h"   /* KZ3 patch 2142: a texture level that does not fit submits the list first */
++#include "rsx_front_probe.h"   /* KZ3 patch 2172: LD_FRONT_PROBE */
++extern rsx_fp* g_rsx_fp;      /* cellGcmSys.c */
+ static int ld_vtx_gpu_on(void);   /* patch 2076, defined with the draw context */
+ #include "rsx_vp_decompiler.h"
+ 
+@@ -3956,6 +3958,7 @@ static int ld_tex_writer_on(void)
+ static void ld_td_mark(u32 location, u32 offset, u32 size)
+ {
+     if (location > 1u || !size) return;
++    if (__builtin_expect(g_rsx_fp_on, 0)) rsx_fp_note_write(g_rsx_fp, location, offset, size);   /* patch 2172: write generation, any thread */
+     const u64 end = (u64)offset + size - 1u;
+     const u32 p0 = offset >> 16, p1 = (u32)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
+     if (ld_sf_mode()) ld_sf_stamp(g_ld_sf_pg[location], offset, size, (u32)InterlockedIncrement(&g_ld_sf_seq));   /* patch 2137 */
+@@ -12815,7 +12818,7 @@ static void ld_movie_capture_overlay(void)
+     /* A guest flip still marks a new texture-generation boundary even though
+      * the guest surface is not sent to the swap chain. */
+     { const u32 sh_dirty = rsx_live_draw_before_guest_sync();   /* patch 2017 */
+-      if (__builtin_expect(g_rsx_sh_on, 0)) rsx_sync_hist_event(4 /* RSX_SH_FLIP */, sh_dirty != 0); }   /* patch 2164 */
++      if (__builtin_expect(g_rsx_sh_on | g_rsx_fp_on, 0)) rsx_sync_hist_event(4 /* RSX_SH_FLIP */, sh_dirty != 0); }   /* patch 2164, 2172 */
+     ld_pwd_flip();   /* patch 2084 diagnostic */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+@@ -14109,8 +14112,13 @@ static void ld_rb_drain(void)
+  * the value to write now. Marks the queued readback as one that goes to the guest. */
+ u32 rsx_live_draw_report_value(u32 off, u32 dflt)
+ {
+-    if (!g.ready || g_oq.on != 1) return dflt;
++    if (!g.ready || g_oq.on != 1) { if (__builtin_expect(g_rsx_fp_on, 0)) rsx_fp_report(g_rsx_fp, RSX_FP_RC_DFLT, -1, off, 0, 0); return dflt; }
+     const int i = ld_oq_slot(off & 0xFFFFFFu, 0);
++    if (__builtin_expect(g_rsx_fp_on, 0)) {   /* patch 2172: class + the state-lag model, see rsx_front_probe.h */
++        const int cls = i < 0 ? RSX_FP_RC_DFLT : g_oq.slot[i].state == OQ_NEVER ? RSX_FP_RC_NEVER
++                      : g_oq.slot[i].state != OQ_PENDING ? RSX_FP_RC_DFLT : g_oq.slot[i].has_val ? RSX_FP_RC_VAL : RSX_FP_RC_NOVAL;
++        rsx_fp_report(g_rsx_fp, cls, i, off & 0xFFFFFFu, i < 0 ? 0 : g_oq.slot[i].state, i < 0 ? 0 : g_oq.slot[i].has_val);
++    }
+     if (i < 0) return dflt;
+     if (g_oq.slot[i].state == OQ_NEVER) { g_rb.n_never++; return 0u; }
+     if (g_oq.slot[i].state != OQ_PENDING) return dflt;
+@@ -14633,6 +14641,99 @@ static void ld_vr_report(void)
+     memset(&g_ld_vrs, 0, sizeof g_ld_vrs);   /* the previous-draw memo survives (it is the same stream) */
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * KZ3 patch 2172: LD_FRONT_PROBE=1 hooks (walker thread; the unit is rsx_front_probe.h). ld_fp_draw runs after get_pso:
++ * g_ld_fp_units_cur then names the units this draw's fragment program samples. It reads the draw's guest spans the way a
++ * front snapshot would (index span, vertex spans, fragment program, sampled texture spans) and only counts; on the sampled
++ * flip it also copies the bytes into a scratch buffer and scans the indices, timed. Its own time is probe time.
++ * ------------------------------------------------------------------------- */
++static void ld_fp_publish(void* ctx)   /* at every would-be hard point: the mirror a recorder would have published */
++{
++    (void)ctx;
++    rsx_fp* p = g_rsx_fp;
++    rsx_fp_pub_begin(p);
++    if (g_oq.on == 1)
++        for (u32 i = 0; i < LD_OQ_SLOTS && i < RSX_FP_SLOTS; i++)
++            if (g_oq.slot[i].used) rsx_fp_pub_set(p, i, g_oq.slot[i].off, g_oq.slot[i].state, g_oq.slot[i].has_val);
++}
++static void ld_fp_draw(const ld_vc_entry* hit)
++{
++    rsx_fp* p = g_rsx_fp;
++    static int reg;
++    if (!reg) { reg = 1; rsx_fp_set_hard_cb(p, ld_fp_publish, NULL); }
++    const u64 t0 = RSX_FP_CLOCK();
++    const int samp = rsx_fp_sampling(p);
++    if (dc.inl || dc.inl_bytes) rsx_fp_note_inline(p);
++    else {
++        u32 idx_loc = 0, idx_off = 0, idx_len = 0, esz = 0;
++        if (dc.n_idx) {
++            rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
++            esz = ia.is_u32 ? 4u : 2u;
++            u64 lo = ~0ull, hi = 0;
++            for (u32 i = 0; i < dc.n_idx; i++) {
++                if (!dc.idx[i].count) continue;
++                const u64 a = (u64)ia.offset + (u64)dc.idx[i].first * esz, b = a + (u64)dc.idx[i].count * esz;
++                if (a < lo) lo = a;
++                if (b > hi) hi = b;
++            }
++            if (hi > lo && hi <= 0x100000000ull && ia.location <= 1u) { idx_loc = ia.location; idx_off = (u32)lo; idx_len = (u32)(hi - lo); }
++        }
++        if (idx_len) rsx_fp_snap_idx(p, idx_len, esz, samp ? guest_ptr(idx_loc, idx_off, idx_len) : NULL);
++        int unknown = 0;
++        if (hit) {   /* a cache hit has no scan this draw: the entry's spans are the ones its fill computed */
++            for (u32 i = 0; i < hit->n_spans; i++) {
++                const ld_vc_span* sp = &hit->spans[i];
++                if (idx_len && sp->loc == idx_loc && sp->off == idx_off && sp->len == idx_len) continue;
++                rsx_fp_snap_vtx(p, sp->len, samp ? guest_ptr(sp->loc, sp->off, sp->len) : NULL);
++            }
++        } else {     /* same span rule as ld_vc_spans / ld_vr_draw */
++            for (u32 slot = 0; slot < dc.layout.count; slot++) {
++                const rsx_vertex_fetch_attr* f = &dc.fetch_plan.attr[dc.layout.attrs[slot]];
++                if (!f->desc.type || !f->desc.size) continue;
++                if (!f->stable_base || f->desc.location > 1u) { unknown = 1; break; }
++                const u64 a = (u64)dc.fetch_plan.base_offset + f->desc.offset + (u64)f->stable_first * f->stride;
++                const u64 b = (u64)dc.fetch_plan.base_offset + f->desc.offset + (u64)f->stable_last * f->stride + f->elem_size;
++                if (b > 0x100000000ull || b <= a) { unknown = 1; break; }
++                rsx_fp_snap_vtx(p, (u32)(b - a), samp ? guest_ptr(f->desc.location, (u32)a, (u32)(b - a)) : NULL);
++            }
++        }
++        if (unknown) rsx_fp_note_vtx_unknown(p);
++    }
++    { u32 fl = 0; const u32 fo = rsx_dsp_fragment_program(&g.rsx, &fl);
++      const u8* fu = guest_ptr(fl, fo, 16);
++      if (fu) { const u32 fs = rsx_fp_program_size(fu, 0x10000);
++                if (fs) { fu = guest_ptr(fl, fo, fs); if (fu) rsx_fp_snap_fp(p, fl, fo, fs, fu); } } }
++    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
++        if (!((g_ld_fp_units_cur >> u) & 1u)) continue;
++        rsx_dsp_texture t; ld_tex_get(u, &t);
++        if (!t.enabled) continue;
++        const u32 span = texture_source_span(&t);
++        if (!span) continue;
++        int surf = 0;   /* a GPU-resident surface is not read from guest memory */
++        for (u32 i = 0; i < g.n_surfaces && i < MAX_SURFACES; i++)
++            if (g.surfaces[i].tex && g.surfaces[i].location == t.location && g.surfaces[i].offset == t.offset) { surf = 1; break; }
++        if (surf) { rsx_fp_snap_tex_surface(p); continue; }
++        rsx_fp_snap_tex(p, t.location, t.offset, span, samp ? guest_ptr(t.location, t.offset, span) : NULL);
++    }
++    for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {   /* ASSUMPTION: span = pitch * height (or w * h * 4); vertex textures are rare in KZ3 */
++        rsx_dsp_vertex_texture vt; rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
++        if (!vt.enabled) continue;
++        const u32 span = vt.pitch ? vt.pitch * vt.height : vt.width * vt.height * 4u;
++        if (span) rsx_fp_snap_tex(p, vt.location, vt.offset, span, NULL);
++    }
++    rsx_fp_probe_add(p, RSX_FP_CLOCK() - t0);
++}
++/* sink_end wrapper side: the draw's RT registers name a main-memory colour or depth surface => drawn_since_wb */
++static void ld_fp_draw_begin(const rsx_dispatch* r)
++{
++    rsx_dsp_surface sf; rsx_dsp_get_surface(r, &sf);
++    const u32 n = ld_rt_count(sf.color_target);   /* colour targets in use (RT_ENABLE) */
++    int main_rt = sf.zeta_location == RSX_LOCATION_MAIN;   /* conservative: depth counted whether or not it is written */
++    for (u32 i = 0; i < n && i < 4u; i++) main_rt |= sf.color_location[i] == RSX_LOCATION_MAIN;
++    rsx_fp_draw_rt(g_rsx_fp, main_rt);
++    rsx_fp_draw_begin(g_rsx_fp, RSX_FP_CLOCK());
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -14820,6 +14921,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         ld_vertex_mask_signature() ? &used_layout : NULL,
+         ld_vertex_compact_payload() ? (dc.vg ? 2 : 1) : 0);   /* patch 2076: 2 = GPU fetch variant */
+     LDW_ADD(RSX_PERF_W_PSO_T, pso_t0);
++    if (__builtin_expect(g_rsx_fp_on, 0)) ld_fp_draw(vc_hit);   /* patch 2172 */
+     if (dc.vg) {   /* patch 2076: the shader compiler must take the GPU-fetch vertex shaders, or the mode goes off */
+         static u32 vg_ok, vg_fail;
+         if (pso) vg_ok++;
+@@ -16007,10 +16109,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     const LONGLONG begin = ld_profile_qpc();
+ #endif
+     LDW_T0(draw_t0);
++    const int fp_on = __builtin_expect(g_rsx_fp_on, 0);   /* patch 2172 */
++    if (fp_on) ld_fp_draw_begin(r);
+     if (__builtin_expect(g_rsx_fcap_on, 0)) g_rsx_fcap_in_draw = 1;   /* patch 2171 */
+     if (rsx_perf_draw_on() && draw_t0) ld_pd_draw(r, user, sink_end_impl);   /* patch 2135 */
+     else sink_end_impl(user, r);
+     if (__builtin_expect(g_rsx_fcap_in_draw, 0)) g_rsx_fcap_in_draw = 0;
++    if (fp_on && g_rsx_fp_on) rsx_fp_draw_end(g_rsx_fp, RSX_FP_CLOCK());   /* patch 2172 */
+     LDW_ADD(RSX_PERF_W_DRAW_T, draw_t0);
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.sink_end_qpc += (u64)(ld_profile_qpc() - begin);
+@@ -17430,6 +17535,7 @@ void rsx_live_draw_set_display_buffer(
+ 
+ void rsx_live_draw_method(u32 method, u32 arg)
+ {
++    if (__builtin_expect(g_rsx_fp_on, 0) && g_rsx_fp->sampling) rsx_fp_word(g_rsx_fp, method, arg);   /* patch 2172: the sampled flip's words */
+     /* Bounded ingress trace for the a010 live-vs-capture comparison.  Keep the
+      * raw method (including its FIFO subchannel bits) visible: if an SPU-built
+      * command list binds NV4097 on a different subchannel, feeding the raw
+@@ -18820,7 +18926,16 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+  * since its last write-back back to guest memory before the guest can observe
+  * a sync point: NV4097 back-end/texture-read semaphore release, NV406E
+  * semaphore release, flip. LD_MAIN_SURFACE_WRITEBACK=0 disables. */
++static u32 ld_before_guest_sync_impl(void);
+ u32 rsx_live_draw_before_guest_sync(void)
++{
++    if (!__builtin_expect(g_rsx_fp_on, 0)) return ld_before_guest_sync_impl();
++    const u64 t0 = RSX_FP_CLOCK();   /* patch 2172: the sync's own time is recorder-side work in the model */
++    const u32 r = ld_before_guest_sync_impl();
++    rsx_fp_sync_time(g_rsx_fp, RSX_FP_CLOCK() - t0);
++    return r;
++}
++static u32 ld_before_guest_sync_impl(void)
+ {
+     static int en = -1;
+     if (en < 0) { const char* e = getenv("LD_MAIN_SURFACE_WRITEBACK"); en = e ? atoi(e) : 1; }
+@@ -19338,7 +19453,7 @@ static void ld_present_body(u32 buffer_id)
+       g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
+       packets_at_last_frame = g_ld_stats.packets_seen; }
+     { const u32 sh_dirty = rsx_live_draw_before_guest_sync();   /* patch 2017 */
+-      if (__builtin_expect(g_rsx_sh_on, 0)) rsx_sync_hist_event(4 /* RSX_SH_FLIP */, sh_dirty != 0); }   /* patch 2164 */
++      if (__builtin_expect(g_rsx_sh_on | g_rsx_fp_on, 0)) rsx_sync_hist_event(4 /* RSX_SH_FLIP */, sh_dirty != 0); }   /* patch 2164, 2172 */
+     ld_pwd_flip();   /* patch 2084 diagnostic */
+     ld_gv_flip();
+     ld_td_flip();   /* patch 2033 */
+@@ -20165,6 +20280,12 @@ void rsx_live_draw_present(u32 buffer_id)
+     ld_pl_tick();                                   /* patch 2031 */
+     ld_pt_tick();                                   /* patch 2071 */
+     if (ld_pstat_on()) ld_pstat_flush_if_new_minute();   /* patch 2031: close the minute line on flips too */
++    if (__builtin_expect(g_rsx_fp_on, 0)) {   /* patch 2172: the present is recorder work; the flip interval closes where it starts */
++        rsx_fp_present_begin(g_rsx_fp, RSX_FP_CLOCK());
++        ld_present_body(buffer_id);
++        rsx_fp_present_done(g_rsx_fp, RSX_FP_CLOCK());
++        return;
++    }
+     if (!rsx_perf_enabled()) { ld_present_body(buffer_id); return; }
+     const long long t0 = rsx_perf_now();
+     ld_present_body(buffer_id);
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index a6b1a6b2..cbc071ff 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -302,6 +302,7 @@ enum {
+ int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
+ /* patch 2164: LD_SYNC_HIST=1 (P4) hooks, defined in cellGcmSys.c; the flag is 0 unless the switch is set. */
+ extern volatile int g_rsx_sh_on;
++extern volatile int g_rsx_fp_on;   /* patch 2172: LD_FRONT_PROBE=1 */
+ void      rsx_sync_hist_event(int kind, unsigned dirty);   /* kinds: rsx_sync_hist.h RSX_SH_* */
+ void      rsx_sync_hist_draw(void);
+ /* patch 2164: LD_FIFO_CAPTURE=dir hooks (rsx_fifo_capture.h). cfg = configured (flip counting), on = a capture window

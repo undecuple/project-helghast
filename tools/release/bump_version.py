@@ -11,7 +11,7 @@ span may hold a whole link). It adds a CHANGELOG stub `## [X.Y.Z] - DATE (pre-re
 above the newest entry (left alone when that version's section exists), regenerates the site (website.py) and runs
 test_version_agree.py; exit 1 when that fails. Running it with the current version changes nothing. It refuses a
 version that is not a newer X.Y.Z. --check reports what would change and writes nothing. Local tool: no network, no
-git, no push; the result goes through the gate as one commit.
+git, no push; the result is one commit.
 """
 import argparse
 import datetime

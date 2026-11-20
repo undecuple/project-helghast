@@ -5,7 +5,7 @@ holds blocks of disc files the port rewrites (menu pages), FIOS treats a changed
 menu request fails with GUM error 20000 (network pass 41, the RE notes s.35). The hook removes that cache first, as
 FIOS does with a cache it rejects (patch 4018), so FIOS builds a new one. The hook must be quick and must not block.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (group A r152 files, Toro v019-c, R&C v019-b where delivered; originals for the rest, three-way merged where they did not apply).
+Rebased on ps3recomp v0.19.0 (SPU pass 153): hunks unchanged; offsets and context follow the v0.19.0 chain (the v0.19.0 chain files where available; originals for the rest, three-way merged where they did not apply).
 
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
 index b06a7e8..1ab4c41 100644

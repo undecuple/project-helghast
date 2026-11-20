@@ -1,0 +1,576 @@
+KZ3 patch 2191 (host tests only, nothing calls it yet): the first kzr
+code, as the overlay libs/kzr (outside libs/video, so the toolkit's HLE glob does not compile it). Pure C11, no D3D12 /
+Vulkan / Win32 types in the public surface; builds with Linux cc and MinGW.
+  include/kzr/kzr_platform.h + platform/{common,posix,win32}: atomics, threads, per-waiter private events and the epoch
+    event (ps3_evcv pattern: waker sets private events, seq_cst waiter count, kzr_event_signal = fence + load).
+  core/sync/kzr_sync.{h,c}: kzr_token, kzr_seq_publish (sfence + release store), kzr_seq (single-writer allocator),
+    kzr_sync (prep / retire / resolve tokens, pushed[w] / done[w], reads_done with the idle-worker rule, gates),
+    kzr_pub (32-byte record log, in-order retire on R, full log stalls and never drops, barrier hook list).
+Host test: tools/smoke/test_pub.sh (test_pub.c).
+
+diff --git a/libs/kzr/core/sync/kzr_sync.c b/libs/kzr/core/sync/kzr_sync.c
+new file mode 100644
+index 00000000..8726a290
+--- /dev/null
++++ b/libs/kzr/core/sync/kzr_sync.c
+@@ -0,0 +1,146 @@
++#include "kzr_sync.h"
++#include <stdlib.h>
++#include <string.h>
++
++_Static_assert(sizeof(kzr_rec) == 32, "kzr_rec is 32 bytes");
++
++void kzr_sync_init(kzr_sync* s, unsigned n_workers)
++{
++    memset(s, 0, sizeof *s);
++    if (n_workers > KZR_MAX_WORKERS) n_workers = KZR_MAX_WORKERS;
++    s->n_workers = n_workers;
++    kzr_event_init(&s->ev);
++}
++void kzr_sync_destroy(kzr_sync* s) { kzr_event_destroy(&s->ev); }
++
++void kzr_sync_prep_publish(kzr_sync* s, uint64_t seq) { kzr_seq_publish(&s->prep, seq); kzr_event_signal(&s->ev); }
++void kzr_sync_push(kzr_sync* s, unsigned w, uint64_t seq) { kzr_st_rel(&s->pushed[w].v, seq); }
++void kzr_sync_done(kzr_sync* s, unsigned w, uint64_t seq) { kzr_seq_publish(&s->done[w], seq); kzr_event_signal(&s->ev); }
++void kzr_sync_resolve_publish(kzr_sync* s, uint64_t v) { kzr_seq_publish(&s->resolve, v); kzr_event_signal(&s->ev); }
++
++int kzr_sync_reads_done(const kzr_sync* s, uint64_t seq)
++{
++    if (kzr_token_load(&s->prep) < seq) return 0;
++    for (unsigned w = 0; w < s->n_workers; w++) {
++        uint64_t pushed = kzr_token_load(&s->pushed[w]);   /* pushed before done */
++        uint64_t done = kzr_token_load(&s->done[w]);
++#ifdef KZR_SYNC_MUTANT_PINNED   /* mutant: pinned minimum, an idle worker holds every record back */
++        (void)pushed;
++        if (done < seq) return 0;
++#else
++        if (done >= seq || done == pushed) continue;       /* finished, or idle (infinity) */
++        return 0;
++#endif
++    }
++    return 1;
++}
++int kzr_sync_resolve_done(const kzr_sync* s, uint64_t v) { return kzr_token_load(&s->resolve) >= v; }
++
++int kzr_sync_gate_ok(const kzr_sync* s, uint64_t gate, uint64_t seq)
++{
++    unsigned k = KZR_GATE_KIND(gate);
++    if ((k & KZR_GATE_READS) && !kzr_sync_reads_done(s, seq)) return 0;
++    if ((k & KZR_GATE_GPU) && !kzr_sync_resolve_done(s, KZR_GATE_V(gate))) return 0;
++    return 1;
++}
++
++void kzr_sync_wait_gate(kzr_sync* s, kzr_waiter* w, uint64_t gate, uint64_t seq)
++{
++    for (;;) {
++        if (kzr_sync_gate_ok(s, gate, seq)) return;
++        uint64_t seen = kzr_event_prepare(&s->ev);
++        if (kzr_sync_gate_ok(s, gate, seq)) { kzr_event_cancel(&s->ev); return; }
++        kzr_event_wait(&s->ev, seen, w);
++        kzr_event_cancel(&s->ev);
++    }
++}
++
++/* ---- publisher ---- */
++int kzr_pub_init(kzr_pub* p, kzr_sync* s, uint32_t cap, kzr_pub_retire_fn fn, void* ctx)
++{
++    memset(p, 0, sizeof *p);
++    if (!cap) return -1;
++    p->log = (kzr_rec*)calloc(cap, sizeof(kzr_rec));
++    if (!p->log) return -1;
++    p->sync = s; p->cap = cap; p->retire_fn = fn; p->retire_ctx = ctx;
++    kzr_waiter_init(&p->waiter);
++    return 0;
++}
++void kzr_pub_destroy(kzr_pub* p) { kzr_waiter_destroy(&p->waiter); free(p->log); p->log = NULL; }
++
++static inline kzr_rec* pub_at(kzr_pub* p, uint64_t i) { return &p->log[i % p->cap]; }
++
++static void pub_retire_one(kzr_pub* p)
++{
++    kzr_rec* r = pub_at(p, p->head);
++    if (p->retire_fn) p->retire_fn(p->retire_ctx, r);   /* the guest-visible effect */
++    uint64_t seq = r->seq;
++    p->head++;
++    p->st.retired++;
++    kzr_seq_publish(&p->sync->retire, seq);             /* everything <= seq visible to the guest */
++    kzr_event_signal(&p->sync->ev);
++}
++
++unsigned kzr_pub_retire_ready(kzr_pub* p)
++{
++    unsigned n = 0;
++    while (p->head != p->tail) {
++        kzr_rec* h = pub_at(p, p->head);
++        if (!kzr_sync_gate_ok(p->sync, h->gate, h->seq)) {
++#ifdef KZR_SYNC_MUTANT_ORDER   /* mutant: retire the first later record whose gate holds (no head-of-line block) */
++            uint64_t j = p->head + 1;
++            while (j != p->tail && !kzr_sync_gate_ok(p->sync, pub_at(p, j)->gate, pub_at(p, j)->seq)) j++;
++            if (j != p->tail) { kzr_rec t = *h; *h = *pub_at(p, j); *pub_at(p, j) = t; continue; }
++#endif
++            p->st.hol_blocked++;
++            break;
++        }
++        pub_retire_one(p);
++        n++;
++    }
++    return n;
++}
++
++void kzr_pub_push(kzr_pub* p, const kzr_rec* r)
++{
++    if (r->seq <= p->last_seq) abort();   /* seq must increase: a bug in the caller, never a runtime condition */
++    if (p->tail - p->head >= p->cap) {
++#ifdef KZR_SYNC_MUTANT_DROP   /* mutant: a full log drops the record */
++        p->st.stalls++; p->st.dropped++; p->last_seq = r->seq;
++        return;
++#endif
++        p->st.stalls++;
++        while (p->tail - p->head >= p->cap) {
++            if (kzr_pub_retire_ready(p)) continue;
++            kzr_rec* h = pub_at(p, p->head);
++            p->st.stall_waits++;
++            kzr_sync_wait_gate(p->sync, &p->waiter, h->gate, h->seq);
++        }
++    }
++    *pub_at(p, p->tail) = *r;
++    p->tail++;
++    p->last_seq = r->seq;
++    p->st.pushed++;
++}
++
++void kzr_pub_retire_upto(kzr_pub* p, uint64_t seq)
++{
++    for (;;) {
++        kzr_pub_retire_ready(p);
++        if (p->head == p->tail || pub_at(p, p->head)->seq > seq) return;
++        kzr_rec* h = pub_at(p, p->head);
++        kzr_sync_wait_gate(p->sync, &p->waiter, h->gate, h->seq);
++    }
++}
++void kzr_pub_drain(kzr_pub* p) { kzr_pub_retire_upto(p, UINT64_MAX); }
++
++int kzr_pub_add_barrier(kzr_pub* p, kzr_pub_barrier_fn fn, void* ctx)
++{
++    if (p->n_barriers >= KZR_PUB_MAX_BARRIERS) return -1;
++    p->barriers[p->n_barriers].fn = fn; p->barriers[p->n_barriers].ctx = ctx; p->n_barriers++;
++    return 0;
++}
++void kzr_pub_barrier(kzr_pub* p, unsigned kind)
++{
++    for (unsigned i = 0; i < p->n_barriers; i++) p->barriers[i].fn(p->barriers[i].ctx, kind);
++}
+diff --git a/libs/kzr/core/sync/kzr_sync.h b/libs/kzr/core/sync/kzr_sync.h
+new file mode 100644
+index 00000000..d344d83e
+--- /dev/null
++++ b/libs/kzr/core/sync/kzr_sync.h
+@@ -0,0 +1,137 @@
++/* kzr/core/sync: sequence numbers, completion tokens and the ordered publisher.
++ * Pure C, API-neutral: no D3D12 / Vulkan types, no walker types; nothing in the walker calls it yet.
++ *
++ * Threads: R (walker) allocates seqs, pushes ops/records and retires (P is inline on R); workers W publish done
++ * tokens; the GPU side publishes resolve tokens. Tokens have one writer; any thread reads them with acquire loads.
++ */
++#ifndef KZR_SYNC_H
++#define KZR_SYNC_H
++#include "kzr/kzr_platform.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define KZR_MAX_WORKERS 8
++
++/* ---- tokens ---- */
++typedef struct kzr_token { _Alignas(KZR_CACHELINE) kzr_au64 v; } kzr_token;
++static inline uint64_t kzr_token_load(const kzr_token* t) { return kzr_ld_acq(&t->v); }
++
++/* Hook points for tests (default no-ops): KZR_PUB_STORE_HOOK(t) runs right before the publishing store. */
++#ifndef KZR_PUB_STORE_HOOK
++#  define KZR_PUB_STORE_HOOK(t) ((void)(t))
++#endif
++
++/* kzr_seq_publish: sfence, then a release store (design M1). The sfence orders earlier non-temporal stores
++ * (memmove / streaming copies into guest memory or staging) before the token; the release store orders the
++ * ordinary ones. Mutant KZR_SYNC_MUTANT_PUBLISH: relaxed store, no fence. */
++static inline void kzr_seq_publish(kzr_token* t, uint64_t seq)
++{
++#ifndef KZR_SYNC_MUTANT_PUBLISH
++    KZR_SFENCE();
++    KZR_PUB_STORE_HOOK(t);
++    kzr_st_rel(&t->v, seq);
++#else
++    KZR_PUB_STORE_HOOK(t);
++    kzr_st_rlx(&t->v, seq);
++#endif
++}
++
++/* ---- seq allocator: one writer (R), values start at 1; 0 means "nothing" ---- */
++typedef struct kzr_seq { kzr_au64 last; } kzr_seq;
++static inline void kzr_seq_init(kzr_seq* s) { atomic_init(&s->last, 0); }
++static inline uint64_t kzr_seq_alloc(kzr_seq* s)
++{
++    uint64_t v = kzr_ld_rlx(&s->last) + 1;   /* single writer: load + store, no RMW */
++    kzr_st_rlx(&s->last, v);
++    return v;
++}
++static inline uint64_t kzr_seq_last(const kzr_seq* s) { return kzr_ld_rlx(&s->last); }
++
++/* ---- gates ---- */
++enum { KZR_GATE_NONE = 0, KZR_GATE_READS = 1, KZR_GATE_GPU = 2, KZR_GATE_BOTH = 3 };
++#define KZR_GATE(kind, v) (((uint64_t)(kind) << 56) | ((uint64_t)(v) & 0x00FFFFFFFFFFFFFFull))
++#define KZR_GATE_KIND(g) ((unsigned)((g) >> 56))
++#define KZR_GATE_V(g) ((g) & 0x00FFFFFFFFFFFFFFull)
++
++typedef struct kzr_sync {
++    kzr_token prep;                       /* R: everything <= prep is resolved, R-side guest reads done */
++    kzr_token retire;                     /* P: everything <= retire is visible to the guest */
++    kzr_token resolve;                    /* GPU fence value completed, bytes in host scratch */
++    kzr_token pushed[KZR_MAX_WORKERS];    /* R: last seq handed to worker w */
++    kzr_token done[KZR_MAX_WORKERS];      /* W: worker w finished every op <= seq */
++    unsigned n_workers;
++    kzr_event ev;                         /* signalled by every publishing call below */
++} kzr_sync;
++
++void kzr_sync_init(kzr_sync* s, unsigned n_workers);
++void kzr_sync_destroy(kzr_sync* s);
++
++void kzr_sync_prep_publish(kzr_sync* s, uint64_t seq);            /* R */
++void kzr_sync_push(kzr_sync* s, unsigned w, uint64_t seq);         /* R: before the op is queued to w (release store) */
++void kzr_sync_done(kzr_sync* s, unsigned w, uint64_t seq);         /* W: kzr_seq_publish + wake */
++void kzr_sync_resolve_publish(kzr_sync* s, uint64_t v);            /* GPU side: monotone */
++
++/* reads_done(seq): prep >= seq and every worker has finished all ops <= seq, where an idle worker
++ * (done == pushed) counts as infinity. Read order: prep, then pushed, then done (all acquire): every op <= seq was
++ * pushed before prep was published, so a pushed value read after prep covers them. */
++int kzr_sync_reads_done(const kzr_sync* s, uint64_t seq);
++int kzr_sync_resolve_done(const kzr_sync* s, uint64_t v);
++int kzr_sync_gate_ok(const kzr_sync* s, uint64_t gate, uint64_t seq);
++/* Block until the gate holds (event wait, no polling, no timeout). w is the caller's private waiter. */
++void kzr_sync_wait_gate(kzr_sync* s, kzr_waiter* w, uint64_t gate, uint64_t seq);
++
++/* ---- ordered publisher ---- */
++typedef struct kzr_rec {                  /* 32 bytes */
++    uint64_t seq;
++    uint64_t gate;                        /* KZR_GATE(kind, v): kind in the top byte, GPU fence value below */
++    uint32_t ea, val, aux;
++    uint8_t kind, flags;
++    uint16_t n;
++} kzr_rec;
++
++typedef struct kzr_pub_stats {
++    uint64_t pushed, retired;
++    uint64_t stalls;                      /* pushes that found the log full */
++    uint64_t stall_waits;                 /* gate waits taken to make room */
++    uint64_t hol_blocked;                 /* retire_ready calls that stopped at a head whose gate was unmet */
++    uint64_t dropped;                     /* must stay 0 (only the DROP mutant counts here) */
++} kzr_pub_stats;
++
++typedef void (*kzr_pub_retire_fn)(void* ctx, const kzr_rec* r);
++typedef void (*kzr_pub_barrier_fn)(void* ctx, unsigned kind);
++#define KZR_PUB_MAX_BARRIERS 8
++
++typedef struct kzr_pub {
++    kzr_sync* sync;
++    kzr_rec* log;                         /* ring of cap records, owned by R */
++    uint32_t cap;
++    uint64_t head, tail;                  /* monotone counts: head = next to retire, tail = next to push */
++    uint64_t last_seq;
++    kzr_pub_retire_fn retire_fn; void* retire_ctx;
++    struct { kzr_pub_barrier_fn fn; void* ctx; } barriers[KZR_PUB_MAX_BARRIERS];
++    unsigned n_barriers;
++    kzr_waiter waiter;
++    kzr_pub_stats st;
++} kzr_pub;
++
++int kzr_pub_init(kzr_pub* p, kzr_sync* s, uint32_t cap, kzr_pub_retire_fn fn, void* ctx);   /* 0 ok */
++void kzr_pub_destroy(kzr_pub* p);
++/* seq must be strictly increasing. A full log retires in order (blocking on the head's gate) to make room;
++ * it never drops. */
++void kzr_pub_push(kzr_pub* p, const kzr_rec* r);
++/* Retire in strict seq order while the head's gate holds; never blocks. Returns the number retired. */
++unsigned kzr_pub_retire_ready(kzr_pub* p);
++/* Block (event wait) until everything with seq <= seq is retired. */
++void kzr_pub_retire_upto(kzr_pub* p, uint64_t seq);
++void kzr_pub_drain(kzr_pub* p);
++static inline uint32_t kzr_pub_pending(const kzr_pub* p) { return (uint32_t)(p->tail - p->head); }
++/* Barrier hook list (empty; later stages register here). */
++int kzr_pub_add_barrier(kzr_pub* p, kzr_pub_barrier_fn fn, void* ctx);
++void kzr_pub_barrier(kzr_pub* p, unsigned kind);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/libs/kzr/include/kzr/kzr_platform.h b/libs/kzr/include/kzr/kzr_platform.h
+new file mode 100644
+index 00000000..8ee26b8d
+--- /dev/null
++++ b/libs/kzr/include/kzr/kzr_platform.h
+@@ -0,0 +1,113 @@
++/* kzr_platform.h: portable atomics, threads and events for the kzr module (renderer-module-plan s.1).
++ * Pure C11, no D3D12 / Vulkan / Win32 types in the public surface (the Win32 handle is a void*).
++ * C only: <stdatomic.h> atomics are not valid C++ before C++23; a C++ consumer calls the functions in the .c files.
++ *
++ * Events follow the ps3_evcv pattern (KZ3 patch 1148): every waiter owns a private event (kzr_waiter), the waker
++ * sets the private events of the registered waiters, and nobody sleeps in a shared kernel queue. On top of that
++ * the event keeps a seq_cst waiter count (Dekker pair), so a signaller with no waiter pays one fence and one load:
++ *
++ *   waiter:   seen = kzr_event_prepare(ev);        // waiters++ (seq_cst), then epoch
++ *             if (pred()) { kzr_event_cancel(ev); return; }
++ *             kzr_event_wait(ev, seen, &w);        // returns at once if epoch moved since prepare
++ *             kzr_event_cancel(ev);                // waiters--; loop and re-check pred
++ *   signaller: <publish the state pred() reads, release>;  kzr_event_signal(ev);
++ *
++ * kzr_event_signal = seq_cst fence + load waiters, wake_all only when waiters != 0. The fence is what stops the
++ * store-load reorder (signaller reads waiters == 0 while the waiter's pred read still missed the publish).
++ * No raw WaitOnAddress / futex, no timeouts (a timed wait is a later addition: it must unlink the waiter).
++ */
++#ifndef KZR_PLATFORM_H
++#define KZR_PLATFORM_H
++#include <stddef.h>
++#include <stdint.h>
++#include <stdatomic.h>
++#if defined(_WIN32)
++#  define KZR_WIN32 1
++#else
++#  include <pthread.h>
++#endif
++#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
++#  include <xmmintrin.h>
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define KZR_CACHELINE 64
++typedef _Atomic uint64_t kzr_au64;
++typedef _Atomic uint32_t kzr_au32;
++
++/* sfence: orders earlier stores including non-temporal ones before the later store. A test may define KZR_SFENCE
++ * before including this header to trace it. Elsewhere a release fence is the nearest thing. */
++#ifndef KZR_SFENCE
++#  if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
++#    define KZR_SFENCE() _mm_sfence()
++#  else
++#    define KZR_SFENCE() atomic_thread_fence(memory_order_release)
++#  endif
++#endif
++
++static inline uint64_t kzr_ld_acq(const kzr_au64* p) { return atomic_load_explicit((kzr_au64*)p, memory_order_acquire); }
++static inline void kzr_st_rel(kzr_au64* p, uint64_t v) { atomic_store_explicit(p, v, memory_order_release); }
++static inline uint64_t kzr_ld_rlx(const kzr_au64* p) { return atomic_load_explicit((kzr_au64*)p, memory_order_relaxed); }
++static inline void kzr_st_rlx(kzr_au64* p, uint64_t v) { atomic_store_explicit(p, v, memory_order_relaxed); }
++static inline void kzr_fence_seqcst(void) { atomic_thread_fence(memory_order_seq_cst); }
++
++/* ---- threads (test and worker plumbing; the module's own threads come later) ---- */
++typedef struct kzr_thread {
++#ifdef KZR_WIN32
++    void* h;
++#else
++    pthread_t t;
++#endif
++} kzr_thread;
++int kzr_thread_start(kzr_thread* t, void (*fn)(void*), void* arg);   /* 0 on success */
++void kzr_thread_join(kzr_thread* t);
++void kzr_yield(void);
++uintptr_t kzr_thread_id(void);
++
++/* ---- per-waiter private event (auto-reset, latching: a set before the wait is not lost) ---- */
++typedef struct kzr_tevent {
++#ifdef KZR_WIN32
++    void* h;
++#else
++    pthread_mutex_t m;
++    pthread_cond_t c;
++    int flag;
++#endif
++} kzr_tevent;
++void kzr_tevent_init(kzr_tevent* e);
++void kzr_tevent_destroy(kzr_tevent* e);
++void kzr_tevent_set(kzr_tevent* e);
++void kzr_tevent_wait(kzr_tevent* e);   /* blocks until set, then resets */
++
++/* ---- epoch event with waiter count ---- */
++typedef struct kzr_waiter {            /* owned by one waiting thread; must outlive every wait */
++    struct kzr_waiter* next;
++    kzr_tevent te;
++} kzr_waiter;
++void kzr_waiter_init(kzr_waiter* w);
++void kzr_waiter_destroy(kzr_waiter* w);
++
++typedef struct kzr_event {
++    kzr_au32 lock;                     /* spin lock over head (critical sections are a few instructions) */
++    kzr_waiter* head;
++    kzr_au32 waiters;                  /* seq_cst; >0 while a thread is between prepare and cancel */
++    kzr_au64 epoch;                    /* bumped by every wake_all */
++    kzr_au64 n_wake;                   /* diagnostics: wake_all calls that found the count non-zero */
++    kzr_au64 n_signal;                 /* diagnostics: signal calls */
++} kzr_event;
++void kzr_event_init(kzr_event* e);
++void kzr_event_destroy(kzr_event* e);
++uint64_t kzr_event_prepare(kzr_event* e);
++void kzr_event_cancel(kzr_event* e);
++void kzr_event_wait(kzr_event* e, uint64_t seen, kzr_waiter* w);
++int kzr_event_needs_wake(kzr_event* e);   /* seq_cst fence, then waiters != 0 */
++void kzr_event_wake_all(kzr_event* e);
++void kzr_event_signal(kzr_event* e);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/libs/kzr/platform/common/kzr_event.c b/libs/kzr/platform/common/kzr_event.c
+new file mode 100644
+index 00000000..2e762339
+--- /dev/null
++++ b/libs/kzr/platform/common/kzr_event.c
+@@ -0,0 +1,71 @@
++/* kzr_platform events, portable part: the epoch event over per-waiter private events (header comment). The only
++ * platform-specific piece is kzr_tevent, so this logic runs under the Linux host tests and TSan too. */
++#include "kzr/kzr_platform.h"
++
++void kzr_waiter_init(kzr_waiter* w) { w->next = NULL; kzr_tevent_init(&w->te); }
++void kzr_waiter_destroy(kzr_waiter* w) { kzr_tevent_destroy(&w->te); }
++
++void kzr_event_init(kzr_event* e)
++{
++    atomic_init(&e->lock, 0); e->head = NULL; atomic_init(&e->waiters, 0); atomic_init(&e->epoch, 0);
++    atomic_init(&e->n_wake, 0); atomic_init(&e->n_signal, 0);
++}
++void kzr_event_destroy(kzr_event* e) { (void)e; }
++
++static void ev_lock(kzr_event* e)
++{
++    while (atomic_exchange_explicit(&e->lock, 1, memory_order_acquire)) {
++        while (atomic_load_explicit(&e->lock, memory_order_relaxed)) kzr_yield();
++    }
++}
++static void ev_unlock(kzr_event* e) { atomic_store_explicit(&e->lock, 0, memory_order_release); }
++
++uint64_t kzr_event_prepare(kzr_event* e)
++{
++    atomic_fetch_add_explicit(&e->waiters, 1, memory_order_seq_cst);
++    return atomic_load_explicit(&e->epoch, memory_order_seq_cst);
++}
++void kzr_event_cancel(kzr_event* e) { atomic_fetch_sub_explicit(&e->waiters, 1, memory_order_seq_cst); }
++
++void kzr_event_wait(kzr_event* e, uint64_t seen, kzr_waiter* w)
++{
++    ev_lock(e);
++#ifndef KZR_SYNC_MUTANT_NOEPOCH   /* mutant: a wake between prepare and wait is lost */
++    if (atomic_load_explicit(&e->epoch, memory_order_seq_cst) != seen) { ev_unlock(e); return; }
++#else
++    (void)seen;
++#endif
++    w->next = e->head;
++    e->head = w;
++    ev_unlock(e);
++    kzr_tevent_wait(&w->te);
++}
++
++int kzr_event_needs_wake(kzr_event* e)
++{
++#ifndef KZR_SYNC_MUTANT_NOFENCE   /* mutant: signaller may read waiters == 0 before its own publish is visible */
++    kzr_fence_seqcst();
++#endif
++    return atomic_load_explicit(&e->waiters, memory_order_seq_cst) != 0;
++}
++
++void kzr_event_wake_all(kzr_event* e)
++{
++    ev_lock(e);
++    atomic_fetch_add_explicit(&e->epoch, 1, memory_order_seq_cst);
++    kzr_waiter* n = e->head;
++    e->head = NULL;
++    ev_unlock(e);
++    atomic_fetch_add_explicit(&e->n_wake, 1, memory_order_relaxed);
++    while (n) {
++        kzr_waiter* next = n->next;   /* read before the set: the waiter may reuse the node at once */
++        kzr_tevent_set(&n->te);
++        n = next;
++    }
++}
++
++void kzr_event_signal(kzr_event* e)
++{
++    atomic_fetch_add_explicit(&e->n_signal, 1, memory_order_relaxed);
++    if (kzr_event_needs_wake(e)) kzr_event_wake_all(e);
++}
+diff --git a/libs/kzr/platform/posix/kzr_platform_posix.c b/libs/kzr/platform/posix/kzr_platform_posix.c
+new file mode 100644
+index 00000000..6dd41c65
+--- /dev/null
++++ b/libs/kzr/platform/posix/kzr_platform_posix.c
+@@ -0,0 +1,37 @@
++/* kzr_platform: POSIX threads and private events. */
++#include "kzr/kzr_platform.h"
++#ifndef KZR_WIN32
++#include <sched.h>
++#include <stdlib.h>
++
++typedef struct { void (*fn)(void*); void* arg; } kzr_tramp;
++static void* kzr_tramp_main(void* p) { kzr_tramp t = *(kzr_tramp*)p; free(p); t.fn(t.arg); return NULL; }
++int kzr_thread_start(kzr_thread* t, void (*fn)(void*), void* arg)
++{
++    kzr_tramp* tr = (kzr_tramp*)malloc(sizeof *tr);
++    if (!tr) return -1;
++    tr->fn = fn; tr->arg = arg;
++    if (pthread_create(&t->t, NULL, kzr_tramp_main, tr) != 0) { free(tr); return -1; }
++    return 0;
++}
++void kzr_thread_join(kzr_thread* t) { pthread_join(t->t, NULL); }
++void kzr_yield(void) { sched_yield(); }
++uintptr_t kzr_thread_id(void) { return (uintptr_t)pthread_self(); }
++
++void kzr_tevent_init(kzr_tevent* e) { pthread_mutex_init(&e->m, NULL); pthread_cond_init(&e->c, NULL); e->flag = 0; }
++void kzr_tevent_destroy(kzr_tevent* e) { pthread_cond_destroy(&e->c); pthread_mutex_destroy(&e->m); }
++void kzr_tevent_set(kzr_tevent* e)
++{
++    pthread_mutex_lock(&e->m);
++    e->flag = 1;
++    pthread_cond_signal(&e->c);
++    pthread_mutex_unlock(&e->m);
++}
++void kzr_tevent_wait(kzr_tevent* e)
++{
++    pthread_mutex_lock(&e->m);
++    while (!e->flag) pthread_cond_wait(&e->c, &e->m);
++    e->flag = 0;
++    pthread_mutex_unlock(&e->m);
++}
++#endif
+diff --git a/libs/kzr/platform/win32/kzr_platform_win32.c b/libs/kzr/platform/win32/kzr_platform_win32.c
+new file mode 100644
+index 00000000..d1f74542
+--- /dev/null
++++ b/libs/kzr/platform/win32/kzr_platform_win32.c
+@@ -0,0 +1,26 @@
++/* kzr_platform: Win32 threads and private events (auto-reset Win32 events, never a condition variable). */
++#include "kzr/kzr_platform.h"
++#ifdef KZR_WIN32
++#include <windows.h>
++#include <stdlib.h>
++
++typedef struct { void (*fn)(void*); void* arg; } kzr_tramp;
++static DWORD WINAPI kzr_tramp_main(LPVOID p) { kzr_tramp t = *(kzr_tramp*)p; free(p); t.fn(t.arg); return 0; }
++int kzr_thread_start(kzr_thread* t, void (*fn)(void*), void* arg)
++{
++    kzr_tramp* tr = (kzr_tramp*)malloc(sizeof *tr);
++    if (!tr) return -1;
++    tr->fn = fn; tr->arg = arg;
++    t->h = CreateThread(NULL, 0, kzr_tramp_main, tr, 0, NULL);
++    if (!t->h) { free(tr); return -1; }
++    return 0;
++}
++void kzr_thread_join(kzr_thread* t) { WaitForSingleObject((HANDLE)t->h, INFINITE); CloseHandle((HANDLE)t->h); t->h = NULL; }
++void kzr_yield(void) { SwitchToThread(); }
++uintptr_t kzr_thread_id(void) { return (uintptr_t)GetCurrentThreadId(); }
++
++void kzr_tevent_init(kzr_tevent* e) { e->h = CreateEventW(NULL, FALSE, FALSE, NULL); }
++void kzr_tevent_destroy(kzr_tevent* e) { if (e->h) CloseHandle((HANDLE)e->h); e->h = NULL; }
++void kzr_tevent_set(kzr_tevent* e) { SetEvent((HANDLE)e->h); }
++void kzr_tevent_wait(kzr_tevent* e) { WaitForSingleObject((HANDLE)e->h, INFINITE); }
++#endif

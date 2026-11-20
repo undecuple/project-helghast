@@ -7,7 +7,7 @@
  * are bit-identical to the lifted code by construction of the arithmetic; what the native code replaces is the
  * lifted instruction stream (register file in memory, one LS access wrapper per quadword, branch hops).
  *
- *  - lp_kd_42D0 (spec docs/completed/spu-native-specs.md 1.4): 4-nearest-probe search in the implicit kd-tree.
+ *  - lp_kd_42D0 (native kernel spec 1.4): 4-nearest-probe search in the implicit kd-tree.
  *    r3 = S (LS pointer; word 0 = probe count n, word 5 = probe array), r4 = out (quad of 4 node addresses, nearest
  *    first), r5 = query quad (a register, not a pointer). The lifted function also leaves its traversal stack in
  *    the LS (8 bytes per depth at sp-544+32: child index, squared plane distance) and a back-chain quad at sp-544:

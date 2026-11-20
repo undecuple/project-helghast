@@ -152,7 +152,7 @@ def edit(data, unlock_through=None, sixaxis=None, clear_continue=False):
 def check_out(out, src):
     o = Path(out).resolve()
     # The repo's own work/ (KZ3_WORK_DIR for tests), not any path with a "work" part: CI's temp dir is
-    # under the runner's work/_temp, so the old part check let "outside" writes through there (2026-10-11).
+    # under the runner's work/_temp, so the old part check let "outside" writes through there.
     root = Path(os.environ.get("KZ3_WORK_DIR") or Path(__file__).resolve().parents[2] / "work").resolve()
     if not o.is_relative_to(root):
         raise SystemExit(f"{out}: output must be under {root} (never the game's or a run's original)")

@@ -23,6 +23,11 @@ while (( $# )); do
   shift
 done
 
+# Many tests read the patched toolkit (work/ps3recomp-patched, built by tools/ps3recomp-patched.sh, untracked). In a fresh
+# clone or worktree it does not exist yet and those tests fail with a traceback or a SKIP-turned-FAIL; say so once, up front.
+if [[ ! -f "${KZ3_PATCHED_DIR:-work/ps3recomp-patched}/.kz3-patchset" ]]; then
+  echo "run-host-tests: ${KZ3_PATCHED_DIR:-work/ps3recomp-patched} is missing (run tools/ps3recomp-patched.sh first); tests that read it will fail"   # stdout: the summary stays the last line of the combined output
+fi
 D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT
 tests=(); missing=()
 LINUX_ONLY=" "

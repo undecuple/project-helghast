@@ -95,6 +95,19 @@ forks (MIT). Each patch names its source in its header or at the code it took.
 - **robbe1912:** [robbe1912/ps3recomp](https://github.com/robbe1912/ps3recomp) commit 0d03c8b5, from the MotorStorm:
   Monument Valley port (patch 2057):
   - the fragment decoder's third-source absolute modifier.
+- **MatRanc:** [PR #836](https://github.com/sp00nznet/ps3recomp/pull/836) (patch 2200, taken unchanged):
+  - the backend component mapping for Y16_X16_FLOAT textures.
+
+## Other ports
+
+- **Project Vekta** (Gustavo Morinaga and the Project Vekta contributors, MIT; the licence text is in each patch
+  header) (patches 1162, 1163):
+  - SSE2 bodies for the SPU byte absolute-difference and average helpers;
+  - NaN tested first in the lifter's floating-point helpers.
+- **Killzone 2 port** (same author, MIT):
+  - parts of the installer wizard (`installer/kz3.iss`, marked in its comments);
+  - the RPCS3 game locator and parts of the import (`tools/release/rpcs3_locate.py`, `rpcs3_import.py`);
+  - the whole-run present timing stream (patch 2187) and the design of the resident vertex streams (patch 2198).
 
 ## Contributors to this repository
 

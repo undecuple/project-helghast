@@ -33,12 +33,16 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "kz3_psarc_attrib.h"                              /* RSX_ATTRIB=1 line formats (tools/smoke/test_psarc_attrib.sh) */
 #ifdef _WIN32
+#include <windows.h>
 #include <direct.h>
 #define kz3_mkdir(p) _mkdir(p)
 #define kz3_fseek _fseeki64
 #else
 #include <sys/types.h>
+#include <pthread.h>
+#include <time.h>
 #define kz3_mkdir(p) mkdir(p, 0755)
 #define kz3_fseek fseeko
 #endif
@@ -53,7 +57,7 @@ extern "C" void edat_set_cache_dir(const char* dir);                            
 extern "C" void edat_add_klicensee(const uint8_t klic[16]);                          /* patch 5001 */
 extern "C" uint8_t* vm_base;                                                          /* guest memory (main.cpp) */
 static bool g_overlay_on = false;
-/* KZ3_NATIVE_PATCH (default on since 2026-10-27; =0 restores host patching; pass 165, the RE notes s.48): the game's
+/* KZ3_NATIVE_PATCH (default on; =0 restores host patching; pass 165, the RE notes s.48): the game's
  * own FIOS patch layer composes the .pspatch files (as on the PS3), so the guest's patch directories are served from the
  * update and the host overlay applies no patches, except to the menu files the port rewrites (net 38). */
 static bool g_native_patch = false;
@@ -79,6 +83,47 @@ extern "C" void kz3_vfs_follow_patch_set(int set, unsigned lr)
 #endif
 
 namespace {
+
+/* RSX_ATTRIB=1 (read like patch 2187's code: set and not "0"; cached on first use): one [psarc] line per archive open and an
+ * exit summary, on the QPC clock of scratch/present_qpc_<pid>.csv. Off: one cached int test, no clock read. */
+bool attrib_on()
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ATTRIB"); on = e && *e && strcmp(e, "0") != 0; }
+    return on != 0;
+}
+long long attrib_qpc()
+{
+#ifdef _WIN32
+    LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart;
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000000000LL + t.tv_nsec;
+#endif
+}
+long long attrib_hz()
+{
+#ifdef _WIN32
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart;
+#else
+    return 1000000000LL;
+#endif
+}
+unsigned long long attrib_tid()
+{
+#ifdef _WIN32
+    return GetCurrentThreadId();
+#else
+    return (unsigned long long)pthread_self();
+#endif
+}
+kz3_psarc_attrib_stats g_attrib;                            /* updated under g_arc.lock */
+std::unordered_set<std::string> g_attrib_seen;              /* keys whose cached open was logged (under g_arc.lock) */
+void attrib_exit()
+{
+    char b[400];
+    kz3_psarc_attrib_exit_line(b, sizeof b, g_attrib, attrib_hz());
+    fprintf(stderr, "%s\n", b);
+}
 
 struct Entry { uint32_t block; uint64_t size, offset; };
 
@@ -211,7 +256,11 @@ void miss_hook(char* path, size_t cap)
     }
     std::string host = cached;
     struct stat st;
+    const bool att = attrib_on();
+    const long long q_in = att ? attrib_qpc() : 0;
     std::lock_guard<std::mutex> g(g_arc.lock);
+    const long long q_locked = att ? attrib_qpc() : 0;
+    bool inflated = false;
     if (stat(host.c_str(), &st) != 0) {
         std::vector<uint8_t> data;
         if (!read_entry(it->second, data)) {
@@ -231,8 +280,21 @@ void miss_hook(char* path, size_t cap)
         ok = (fclose(o) == 0) && ok;
         if (!ok || rename(tmp.c_str(), host.c_str()) != 0) { remove(tmp.c_str()); return; }
         if (s_logged++ < 64) fprintf(stderr, "[psarc] %s (%zu bytes)\n", g_arc.names[it->second].c_str(), data.size());
+        inflated = true;
     }
     snprintf(path, cap, "%s", host.c_str());
+    if (att) {
+        const long long q_out = attrib_qpc(), hz = attrib_hz();
+        const double wait_ms = kz3_psarc_ticks_ms(q_locked - q_in, hz);
+        const double inflate_ms = inflated ? kz3_psarc_ticks_ms(q_out - q_locked, hz) : 0.0;
+        kz3_psarc_attrib_add(g_attrib, wait_ms, inflate_ms, inflated);
+        if (inflated || g_attrib_seen.insert(key).second) {
+            char b[600];
+            kz3_psarc_attrib_open_line(b, sizeof b, q_out, key.c_str(), g_arc.entries[it->second].size, attrib_tid(),
+                                       wait_ms, inflate_ms, inflated ? "inflate" : "cached");
+            fprintf(stderr, "%s\n", b);
+        }
+    }
 }
 
 }  // namespace
@@ -332,6 +394,7 @@ extern "C" int kz3_psarc_vfs_init(const char* archive, const char* cache_dir)
     for (char& c : g_arc.cache) if (c == '\\') c = '/';
     kz3_mkdir(g_arc.cache.c_str());
     g_ps3_vfs_miss_hook = miss_hook;
+    if (attrib_on()) atexit(attrib_exit);                  /* RSX_ATTRIB=1: the [psarc] exit summary (a killed run has only the open lines) */
     /* Patch set (KZ3_PATCH_SET, the RE notes s.36.12): none = disc archive only (the 1.00 EBOOT), sp / mp = the
      * 1.14 update layered over it (added_data_ps3.psarc.edat + patch_data_ps3_<set>). Unset = follow the EBOOT
      * version: KZ3_EBOOT_VER at run time, else the version this exe was built for (KZ3_EBOOT_VER_DEFAULT, CMake):

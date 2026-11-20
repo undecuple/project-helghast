@@ -1,0 +1,22 @@
+installer/pso-template.bin: origin note
+
+What it is: a shader warm-up list (a graphics pipeline template, format KZPT), derived data made by the port itself. It
+holds pipeline-state hashes and numeric render state: no shader text, no game code. It lets a first start pre-build pipelines
+so shaders do not compile mid-play.
+
+Format: KZPT v2, a 24-byte header (magic KZPT, version 2, record size 560, key version, flags, record count 1695) followed
+by 1695 records of 560 bytes each: 24 + 1695 x 560 = 949,224 bytes, the file size exactly. Layout: tools/smoke/pso_template.py
+(HDR, REC).
+
+How it was made: the runtime writes such a file by itself with LD_PSO_TEMPLATE_OUT=<file> while the game runs. This one
+was written during the maintainer's own play-throughs of eight chapters, from the maintainer's own disc, then merged with
+`tools/smoke/pso_template.py merge` (union by pipeline key: 2855 records from the eight runs, 1695 unique pipelines; inputs
+sorted, records sorted by key, alpha_ref_raw/_format zeroed, vp_start the minimum over duplicates, so the bytes do not depend
+on file order) and checked with `pso_template.py check` (exit 0).
+
+What it contains: pipeline keys, hashes, numeric render-state words and fingerprints of shader programs. The program
+fingerprints are one-way 64-bit hashes. No bytes are copied from game files: no shader microcode, no textures or other asset
+data, no strings.
+
+Status: format v2 (adds vp_branch_bits per record), the version the runtime and tools/release/assemble_payload.py accept.
+sha256 of this version: 6abeacfb442d6f88a45a4d6f0442cba2a5a9a04c3ae9a0f752a54ea0213439ef.

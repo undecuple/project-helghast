@@ -6,7 +6,7 @@ and in menus it does what the game's START does. Closing the window stays WM_CLO
 WM_CLOSE); port/kz3/main.cpp turns window_closed into a clean shutdown (live-draw shutdown, log flush, exit 0).
 Upstream candidate: a title cannot use Esc while the backend eats it, and an accidental Esc ends the session.
 
-Rebased on ps3recomp v0.19.0 (shared v0.19 group C): upstream #612 (24c702ae) made the keyboard fallback portable (PADKEY_* per source: XInput, macOS, SDL); Esc is PADKEY_ESCAPE in each, and the Vulkan backend's SDL Esc-to-quit goes too.
+Rebased on ps3recomp v0.19.0: upstream #612 (24c702ae) made the keyboard fallback portable (PADKEY_* per source: XInput, macOS, SDL); Esc is PADKEY_ESCAPE in each, and the Vulkan backend's SDL Esc-to-quit goes too.
 
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
 index 5f8a2fa2..bdbe0162 100644

@@ -1,6 +1,6 @@
 Rebased on ps3recomp v0.18.0 (SPU pass 108): ours (SDL3 run-time loader, XInput fallback) over upstream's SDL2 backend; upstream's general pieces kept (pad_host_release centred sticks #496, poll lock, ASSIGN_CHANGES status, empty-slot recheck #581, run-time XInput load #494 called from pad_init_backend); upstream's SDL2 rumble/#372 hold code dropped (4010 has its own).
 
-Rebased on ps3recomp v0.19.0 (shared v0.19 group C): upstream #612's SDL keyboard source (PAD_BACKEND_SDL2, which 4010 renames) now takes SDL_GetKeyboardState/SDL_GetKeyboardFocus from the SDL2 the runtime links (window and audio), declared by hand with numeric scancodes.
+Rebased on ps3recomp v0.19.0: upstream #612's SDL keyboard source (PAD_BACKEND_SDL2, which 4010 renames) now takes SDL_GetKeyboardState/SDL_GetKeyboardFocus from the SDL2 the runtime links (window and audio), declared by hand with numeric scancodes.
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index d68ec3ee..9c8faa7e 100644

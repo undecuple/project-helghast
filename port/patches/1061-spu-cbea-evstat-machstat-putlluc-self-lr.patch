@@ -2,7 +2,7 @@ KZ3 patch 1061 (SPU pass 47): three CBEA v1.01 SPU channel semantics (CBEA audit
 
 Rebased on ps3recomp v0.15.0 (SPU pass 81): conflicts with PR289 (IE latch unconditional), its latch hangs the KZ3 level load (notes), ours keeps it opt-in.
 
-Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, owner lane not re-reviewed).
+Rebased on ps3recomp v0.19.0 (SPU pass 154): three-way merge into the v0.19.0 chain, hunks kept as before, context follows v0.19 (chain glue, not re-reviewed).
 
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
 index d868b0c..03eaeb6 100644

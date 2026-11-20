@@ -1,5 +1,5 @@
 KZ3 patch 2144 (RSX pass 133): a draw that samples its own render target reads it even when other surfaces share the address.
-Design and code from the Killzone 2 port (its patch 2097); both projects are MIT and have the same owner.
+Design and code from the Killzone 2 port (its patch 2097); both projects are MIT and have the same author.
 
 Symptom (Killzone 2, pause menu): the whole screen went white. The colour grade draws into a target and samples that same
 target (same address and size); the texture-to-surface lookup skips the bound target and takes the best other surface at

@@ -2,7 +2,7 @@
 # Run a command while holding a shared lock (works across all parallel worktrees).
 #   tools/agents/lock.sh NAME [--exclusive] -- CMD [ARGS...]      NAME: gpu | ghidra | extract | ...
 # Locks live in the main checkout's work/locks/ (see the lock notes section 3).
-# The gpu lock has slots (2026-10-11: two boot runs side by side each kept the solo speed, see
+# The gpu lock has slots (two boot runs side by side each kept the solo speed, see
 # the testing notes "Two runs on the GPU"): KZ3_GPU_SLOTS runs (default 2) hold it at once, one
 # slot each (slot 0 = gpu.lock, slot 1 = gpu.1.lock; tools/agents/slotlock.sh). --exclusive, or KZ3_GPU_EXCLUSIVE=1
 # in the environment, takes every slot: for anything that measures speed (tools/kz3-check.sh's fps baseline,
@@ -18,15 +18,15 @@ MAIN="$ROOT"; [[ -f "$ROOT/.kz3-main" ]] && MAIN="$(cat "$ROOT/.kz3-main")"
 mkdir -p "$MAIN/work/locks"
 # Re-entrant: a command already running under this lock (KZ3_HELD_LOCKS lists the holder's locks, inherited by its
 # children) runs straight away. Without this, lock.sh gpu around kz3-check.sh (which takes gpu itself) deadlocked
-# every worktree's GPU runs (RSX pass 22, 2026-10-09). An inner --exclusive cannot widen an outer shared slot.
+# every worktree's GPU runs. An inner --exclusive cannot widen an outer shared slot.
 [[ " ${KZ3_HELD_LOCKS:-} " == *" $NAME "* ]] && exec "$@"
-# GPU priority (2026-10-11): while the maintainer holds a reservation (tools/agents/gpu-reserve.sh on), other worktrees'
+# GPU priority: while the maintainer holds a reservation (tools/agents/gpu-reserve.sh on), other worktrees'
 # GPU runs wait here before queueing on the lock, so a milestone run (the 1.14 comparison, a merge boot check) goes next.
 # The maintainer's own runs pass KZ3_GPU_PRIO=1.
 # A reservation expires (its "expires EPOCH" line; an old file without one: 120 min after it was written), so a
 # maintainer that died while holding it cannot stall the other worktrees.
 RES="$MAIN/work/locks/gpu.reserved"; T0=$(date +%s)
-# A booking's owner, the "owner" line gpu-reserve.sh writes since 2026-11-11, does not hold its own runs: a caller whose
+# A booking's owner, the "owner" line gpu-reserve.sh writes, does not hold its own runs: a caller whose
 # GPU_RESERVE_OWNER (or LOCK_PROJECT) equals it goes through, so a project can book its window without blocking itself.
 res_live() {
   [[ -f "$RES" ]] || return 1
@@ -36,8 +36,8 @@ res_live() {
   [[ -n "$e" ]] || e=$(( $(stat -c %Y "$RES" 2>/dev/null || echo 0) + 7200 ))
   (( $(date +%s) < e ))
 }
-# A timed booking (the default) also holds builds (2026-11-04): CPU load skews its frame rates. A booking made with
-# --untimed ("timed 0" line, 2026-11-11 lessons round) holds only GPU runs, so CPU-only work shares the window.
+# A timed booking (the default) also holds builds: CPU load skews its frame rates. A booking made with
+# --untimed ("timed 0" line) holds only GPU runs, so CPU-only work shares the window.
 res_holds() { [[ "${KZ3_GPU_PRIO:-0}" != 1 ]] || return 1; [[ "$NAME" == gpu ]] && { res_live; return; }
   [[ "$NAME" == build ]] && ! grep -q "^timed 0" "$RES" 2>/dev/null && res_live; }
 if res_holds; then
@@ -45,14 +45,14 @@ if res_holds; then
   while res_holds; do sleep "${KZ3_RES_POLL_S:-10}"; done
   [[ -f "$RES" ]] && echo "lock.sh: the GPU reservation expired; going ahead" >&2
 fi
-# KZ2 milestone priority (the KZ2 side reaches its next milestone, then priority returns): while
-# the KZ2 maintainer's work/locks/kz2-priority file exists, a KZ3 GPU run waits here as long as a KZ2 run is
-# queued (a gpu.queue token whose gpu.kz2.wJ marker is held, or a pid running in the KZ2 checkout or a kz2-* worktree, or with KZ2_HELD_LOCKS). Our reservation and the maintainer's own runs
-# (KZ3_GPU_PRIO=1) are unaffected; runs already holding a slot are never interrupted. KZ2 deletes the file at its milestone.
+# Partner-project priority (a second project sharing this lock directory may ask for the GPU until its next milestone): while
+# work/locks/kz2-priority exists, a GPU run from this project waits here as long as a partner run is
+# queued (a gpu.queue token whose gpu.kz2.wJ marker is held, or a pid running in the partner checkout or worktree, or with KZ2_HELD_LOCKS). Our reservation and the maintainer's own runs
+# (KZ3_GPU_PRIO=1) are unaffected; runs already holding a slot are never interrupted. The partner deletes the file when it is done.
 kz2_waiting() {
   local p
   for p in $(cat "$MAIN/work/locks/gpu.queue" 2>/dev/null); do
-    # A token tJ is KZ2's while KZ2's lock.sh holds gpu.kz2.wJ beside it (KZ2 3a8eebc, 2026-10-19).
+    # A token tJ belongs to the partner while the partner's lock.sh holds gpu.kz2.wJ beside it.
     if [[ "$p" =~ ^t[0-9]+$ ]]; then ! flock -n "$MAIN/work/locks/gpu.kz2.w${p#t}" true 2>/dev/null && return 0; continue; fi
     case "$(readlink "/proc/$p/cwd" 2>/dev/null)" in "$(dirname "$MAIN")/Killzone 2"*|*/kz2-*) return 0 ;; esac
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q '^KZ2_HELD_LOCKS=' && return 0
@@ -79,7 +79,7 @@ if [[ -z "${LOCK_EST_MIN:-}" ]]; then
     if [[ "${_a[_i]}" == *k4warm.sh && "${_a[_i+2]:-}" =~ ^[0-9]+$ ]]; then LOCK_EST_MIN=$(( _a[_i+2] / 60 + 5 )); break; fi
   done
   # An exclusive GPU run holds the slots through its quiet-machine wait (below), which a build next to it stretches:
-  # RSX pass 86's 200 s k4warm runs held them 15 min against a derived 6 (2026-10-20). Count 6 more minutes for that wait.
+  # Count 6 more minutes for that wait (the derived estimate leaves it out).
   if [[ -n "${LOCK_EST_MIN:-}" && "$NAME" == gpu && ( "${KZ3_GPU_EXCLUSIVE:-0}" == 1 || "${KZ3_GPU_SLOTS:-2}" == 1 ) ]]; then
     LOCK_EST_MIN=$(( LOCK_EST_MIN + 6 ))
   fi
@@ -95,19 +95,23 @@ if (( EXCL || N <= 1 )); then
 else
   slot_take "$MAIN/work/locks" "$NAME" "$N"
 fi
-# Quiet machine for exclusive GPU runs (SPU pass 74, 2026-10-15: two of three A/B pairs ran next to a build, one of them a
+# Quiet machine for exclusive GPU runs (two of three A/B pairs ran next to a build, one of them a
 # release first-run build that held no build lock): wait until no build lock is held, no compiler/linker/lift process
 # runs and the 1-minute load is below KZ3_QUIET_LOAD (default 6), up to KZ3_QUIET_MAX_S (default 3600; 0 = no wait).
 # KZ3_QUIET=1 when reached, 0 when the run started anyway (runcmp refuses perf/ab readings with 0).
 if [[ "$NAME" == gpu ]] && (( EXCL || N <= 1 )); then
-  QT0=$(date +%s); QMAX="${KZ3_QUIET_MAX_S:-3600}"; KZ3_QUIET=0
+  QT0=$(date +%s); QMAX="${KZ3_QUIET_MAX_S:-3600}"; KZ3_QUIET=0; qsaid=""
   while :; do
-    busy=0
+    busy=0; why=""
     for l in "$MAIN"/work/locks/build.lock "$MAIN"/work/locks/build.[0-9].lock; do
-      [[ -e "$l" ]] && ! flock -n "$l" true && busy=1
+      [[ -e "$l" ]] && ! flock -n "$l" true && { busy=1; why="${l##*/} held"; }
     done
-    pgrep -x "${KZ3_QUIET_PROCS:-ninja|ninja.exe|cc1|cc1plus|clang|clang\+\+|ld|ld.lld|lld}" >/dev/null 2>&1 && busy=1
+    pgrep -x "${KZ3_QUIET_PROCS:-ninja|ninja.exe|cc1|cc1plus|clang|clang\+\+|ld|ld.lld|lld}" >/dev/null 2>&1 && { busy=1; why="${why:+$why, }compiler/linker running"; }
     (( busy == 0 )) && awk -v m="${KZ3_QUIET_LOAD:-6}" '{exit !($1 < m)}' /proc/loadavg && { KZ3_QUIET=1; break; }
+    (( busy )) || why="load $(cut -d' ' -f1 /proc/loadavg) >= ${KZ3_QUIET_LOAD:-6}"
+    # Say once (and again when the reason changes) why an exclusive run holds the slots without starting: otherwise
+    # nothing in its log shows the wait, and the history-writer subshell looks like a nested lock.sh.
+    [[ "$why" != "$qsaid" ]] && { echo "lock.sh: $NAME slots held, waiting for a quiet machine ($why; up to ${QMAX}s, KZ3_QUIET_MAX_S)" >&2; qsaid="$why"; }
     (( $(date +%s) - QT0 >= QMAX )) && break
     sleep $(( QMAX < 30 ? 1 : 15 ))
   done

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "repo": "undecuple/project-helghast",
+  "game": {
+    "kind": "folder",
+    "label": "Your own dump of Killzone 3 (US disc BCUS98234 tested): the folder that holds PS3_GAME.",
+    "check": { "file": "PS3_GAME/PARAM.SFO" }
+  },
+  "start": {
+    "program": ["Project Helghast.exe"]
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [{ "path": "{install}/build/kz3.ini" }]
+    }
+  ],
+  "settings": [
+    {
+      "id": "mouse_look",
+      "label": "Mouse look on foot",
+      "in": "main",
+      "choices": [
+        { "label": "On", "set": { "mouse_look": "1" } },
+        { "label": "Off", "set": { "mouse_look": "0" } }
+      ]
+    },
+    {
+      "id": "discord_presence",
+      "label": "Discord status",
+      "in": "main",
+      "advanced": true,
+      "choices": [
+        { "label": "Off", "set": { "discord_presence": "0" } },
+        { "label": "On", "set": { "discord_presence": "1" } }
+      ]
+    }
+  ]
+}

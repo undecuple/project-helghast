@@ -11,7 +11,7 @@ One "[ts-join]" line per join (first 32, then every 64th, and every timeout). Up
 
 Rebased on ps3recomp v0.18.0 (SPU pass 108): upstream's coherent signal watch + 1066's parked count; 1067's `!cut` on upstream's moved signalled update.
 
-Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): the hunks are the v0.18 ones, unchanged;
+Rebased on ps3recomp v0.19.0: the hunks are the v0.18 ones, unchanged;
 context regenerated.
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c

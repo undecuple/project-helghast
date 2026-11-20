@@ -12,7 +12,7 @@ For KZ3's stencil-then-cover text (512x512 glyph cache at 0x3A00000) and the def
 - Polygon offset (fill enable 0xA68, factor 0xA78, units 0xA7C) -> rasterizer SlopeScaledDepthBias/DepthBias.
 - Depth bounds (0x380 enable, 0x384/0x388 min/max) -> DEPTH_STENCIL1/2 DepthBoundsTestEnable in the PSO and
   ID3D12GraphicsCommandList1::OMSetDepthBounds per draw, when D3D12_OPTIONS2.DepthBoundsTestSupported.
-- Blend colour (SET_BLEND_COLOR 0x31C, BLEND_COLOR2 0x368 for FP16 surfaces) -> OMSetBlendFactor per draw
+- Blend colour (SET_BLEND_COLOR 0x31C, BLEND_COLOR2 0x37C for FP16 surfaces) -> OMSetBlendFactor per draw
   (never set before); CONSTANT_ALPHA factors use D3D12_BLEND_ALPHA_FACTOR when D3D12_OPTIONS13 allows.
 - LD_RS_LOG lines also print blend factors/equation, blend colour and alpha-test enable.
 - MRT: IndependentBlendEnable with the per-target blend enable (0x36C bits 1-3) and colour mask (0x370
@@ -37,7 +37,7 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 +#define M_BACK_STENCIL_FUNC_REF  0x0354
 +#define M_BACK_STENCIL_FUNC_MASK 0x0358
 +#define M_BLEND_COLOR            0x031C   /* A8R8G8B8, or R16 | G16 << 16 (half) on FP16 surfaces */
-+#define M_BLEND_COLOR2           0x0368   /* B16 | A16 << 16 (half), FP16 surfaces */
++#define M_BLEND_COLOR2           0x037C   /* B16 | A16 << 16 (half), FP16 surfaces */
 +#define M_BLEND_ENABLE_MRT       0x036C   /* bit n (1..3): blend on for colour target n */
 +#define M_COLOR_MASK_MRT         0x0370   /* nibble n (1..3): A=bit 4n, R=4n+1, G=4n+2, B=4n+3 */
 +#define M_DEPTH_BOUNDS_ENABLE    0x0380

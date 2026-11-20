@@ -336,4 +336,30 @@ static inline const char* kz3_tx_stick_en(const char* key, size_t klen)
     return NULL;
 }
 
+/* ---- Net pass 19: the keyboard-and-mouse variant of the motion tutorials ---------------------------
+ * With keycap prompts (keyboard and mouse in use) and no motion sensors, the pad-stick wording above would name a stick
+ * the player does not have. These name the key to hold through the game's OWN token [ICON group=gamefunction
+ * id=GrabRightHand], which the game's prompt renderer draws as the key cap bound to that action (Mouse1 by default,
+ * G with the Modern layout; ASSUMPTION until seen in game) in the game's own hint font and frame, and say what the mouse
+ * does. Port-made words, no game text. They match the port's behaviour: patch 4030 turns the mouse into the right
+ * stick and, while the grab is held, lets go of it on the valve's return sweep and feeds the charge's final pull
+ * (KZ3_VALVE_HOLD=0 removes the valve claim: the caller then uses the stick wording). "\n" is the two characters the
+ * game's strings carry. */
+static inline const char* kz3_tx_kbm_en(const char* key, size_t klen)
+{
+    static const struct { const char* k; const char* en; } r[] = {
+        { "tutorial_valve",
+          "Hold [ICON group=gamefunction id=GrabRightHand] and move the mouse left and right to turn the valve\\nKeep it held: the valve turns one way only" },
+        { "tutorial_valve_grab",
+          "Hold [ICON group=gamefunction id=GrabRightHand] to grab onto the valve" },
+        { "tutorial_valve_rotate",
+          "Keep [ICON group=gamefunction id=GrabRightHand] held and move the mouse left and right to turn the valve.\\nTurn until the valve dial points all the way down." },
+        { "tutorial_dcharge_rotate",
+          "Hold [ICON group=gamefunction id=GrabRightHand] and move the mouse from side to side to arm the D-Charge\\nKeep it held until the charge is placed" },
+    };
+    for (size_t i = 0; i < sizeof r / sizeof r[0]; i++)
+        if (strlen(r[i].k) == klen && !memcmp(r[i].k, key, klen)) return r[i].en;
+    return NULL;
+}
+
 #endif /* KZ3_TEXT_OVERRIDES_H */

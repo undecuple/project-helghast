@@ -2,7 +2,7 @@
 rem Project Helghast, portable zip: first run.
 rem Asks for your own dump, the 1.14 update and the decrypted EBOOT, checks them, then lifts and compiles the port
 rem here with one progress bar. Saves and settings stay in this folder (portable). The log is written next to this
-rem file (Project-Helghast-firstrun.log). Nothing is downloaded; the optional version check asks first.
+rem file (Project-Helghast-firstrun.log). Nothing is downloaded; the version check and the other optional prompts are not asked (kz3-install.ini keeps their keys, default off).
 rem The window waits for a key only when it was opened by double-clicking this file or when the run failed; started
 rem from a console (or with KZ3_NO_PAUSE set) it returns at once. No parenthesised blocks below: a ")" or "&" in the
 rem folder name would end such a block early.

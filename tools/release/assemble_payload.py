@@ -23,6 +23,7 @@ What goes in (the allowlist, RULES below; nothing else is ever copied):
                   firstrun.py and the launcher copy them to build/fonts/, next to kz3.exe: the runtime's error notice
                   loads them privately from <exe dir>/fonts (RSX pass 38). Missing or changed fonts refuse the payload.
   Project Helghast.exe  with --launcher EXE: the launcher built by tools/release/build_launcher.sh (pass 4)
+  recomplauncher.json (installer/recomplauncher.json: RecompLauncher's profile; no game data)
   README.md, NOTICE.md (from public/), run.cmd (installer/run.cmd, the portable zip's entry; the Inno script
                   excludes it)
 The toolchain (compiler, CMake, Ninja, embeddable Python) is not in the repository. With --toolchain CACHE (the
@@ -115,6 +116,7 @@ RULES = [
     ("public/README.md", "README.md", "file", {}),
     ("public/NOTICE.md", "NOTICE.md", "file", {}),
     ("installer/run.cmd", "run.cmd", "file", {}),
+    ("installer/recomplauncher.json", "recomplauncher.json", "file", {}),   # RecompLauncher format 1, zip top level (test_recomplauncher.py)
 ]
 FONTS = ("Rajdhani-Medium.ttf", "Rajdhani-Bold.ttf")   # the runtime's notice fonts (port/kz3/main.cpp, RSX pass 38)
 FONT_LICENSE = ("OFL-rajdhani.txt", "licenses/Rajdhani-OFL.txt")   # installer_art.py's name -> payload name

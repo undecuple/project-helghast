@@ -1,0 +1,511 @@
+KZ3 patch 2208 (rsx): [o0-lpb], the LightProbe 8x8 block probe (RSX_O0=1; off by default; probe only, no behaviour change).
+Per flip: the 8x8 W16Z16Y16X16F location-1 texture binds (the blocks SPU job 9 writes into the ring 1:0x0005C180-0x00C8F700), distinct offsets,
+new texture-cache entries (recycled = an evicted resource reused), per-bind content hashes, hashes that changed, in-place redecodes vs replaced
+resources, bytes bound, bytes uploaded (new + changed blocks), and the 4 KiB pages of the new/changed blocks as copy spans (contiguous, and merged
+across gaps of up to 16 pages). Per bind: the VP hash and FP location:offset:size (and pipeline key) current for the draw (the pipeline is built before
+the texture loop) and the unit's sampler filter, so "bound with other than point sampling" is a counter (nonpoint, [o0-lpb-use] nonpoint=, [o0-lpb-filt]).
+Output (stderr, walker thread, no locks): `[o0-lpb] flip=N binds= distinct= new= recycled= hashed= changed= inplace= replaced= boundKB= decKB= dpages= dspans=
+dspans16= nonpoint= users=` for the first RSX_O0_LPB_N (default 30) flips that had a block bind; every RSX_O0_LPB_WIN (default 60) flips a
+`[o0-lpb] win flips= active= <field>=avg/max ...` line with run totals, then `[o0-lpb-use] vp= fp= pso= binds= nonpoint=` per consumer and `[o0-lpb-filt]
+min= mag= mips= aniso= point= binds=` per sampler state (cumulative over the run). Off: one predicted-not-taken test of g_rsx_lpb.on per texture bind.
+libs/video/rsx_lpb.h is pure C (host test tools/smoke/test_lpb.sh). ASSUMPTIONS: dirty pages count only blocks the walker hashed as changed or created
+(the clean rules skip some hashes, so it is a lower bound of a page bitmap); 4 KiB pages; point = min NEAREST/NEAREST_NEAREST and mag NEAREST (the
+conservative reading: a mip-linear min filter on a one-level block counts as not point). Not run in the game (no GPU this round).
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -12,6 +12,8 @@
+ #include "rsx_o0.h"   /* patch 2188: RSX_PERF_SPLIT / RSX_O0 */
+ #include "rsx_s7p.h"   /* patch 2204: S7.0 probes (RSX_O0_S7) */
+ #include "rsx_views.h"   /* patch 2202 */
++#include "rsx_lpb.h"   /* patch 2208 */
++static void rsx_lpb_start(void);
+ #include "rsx_legacy_skip.h"   /* patch 2189 */
+ static unsigned long long s_o0_m3d_pass, s_o0_m3dl_pass;   /* patch 2203: walker thread only, flushed by gcm_o0_flush_pass */
+ static void gcm_o0_flush_pass(void)
+@@ -2672,13 +2674,22 @@ static void gcm_s7_ww_probe(double changed_per_flip) { (void)changed_per_flip; f
+ int rsx_perf_o0_on(void)
+ {
+     static int on = -1;
+-    if (on < 0) { on = gcm_env_on("RSX_O0"); if (on) rsx_o0v_init(&g_rsx_o0v, getenv("RSX_O0_VTX_RANGE")); g_rsx_o0.on = on; if (on) { fprintf(stderr, "[o0] O0 live counters on (RSX_O0=1, patch 2188); [o0-vtx] range 0x%08llX..0x%08llX (RSX_O0_VTX_RANGE, patch 2195)\n", g_rsx_o0v.lo, g_rsx_o0v.hi); }
++    if (on < 0) { on = gcm_env_on("RSX_O0"); if (on) { rsx_o0v_init(&g_rsx_o0v, getenv("RSX_O0_VTX_RANGE")); rsx_lpb_start(); } g_rsx_o0.on = on; if (on) { fprintf(stderr, "[o0] O0 live counters on (RSX_O0=1, patch 2188); [o0-vtx] range 0x%08llX..0x%08llX (RSX_O0_VTX_RANGE, patch 2195)\n", g_rsx_o0v.lo, g_rsx_o0v.hi); }
+         gcm_s7_init(on); }
+     return on;
+ }
+ /* Patch 2202: RSX_VIEWS=1, the split-screen per-view counter (rsx_views.h). Walker thread only; the instance lives here beside
+  * g_rsx_o0 (host tests that link rsx_dispatch.c alone never reference it: the hooks are in rsx_live_draw.c). */
+ rsx_views g_rsx_views;
++/* Patch 2208: [o0-lpb], the LightProbe 8x8 block probe (rsx_lpb.h); on with RSX_O0=1. Walker thread only. RSX_O0_LPB_N = per-flip
++ * lines (default 30, active flips only), RSX_O0_LPB_WIN = flips per window line (default 60). */
++rsx_lpb g_rsx_lpb;
++static void rsx_lpb_start(void)
++{
++    const char* n = getenv("RSX_O0_LPB_N"); const char* w = getenv("RSX_O0_LPB_WIN");   /* diagnostic: prints the probe lines */
++    rsx_lpb_init(&g_rsx_lpb, n ? (uint32_t)strtoul(n, NULL, 10) : 30u, w ? (uint32_t)strtoul(w, NULL, 10) : 60u);
++    fprintf(stderr, "[o0-lpb] LightProbe block probe on (RSX_O0=1, patch 2208): %u per-flip lines, window %u flips\n", g_rsx_lpb.max_lines, g_rsx_lpb.win);
++}
+ int rsx_perf_views_on(void)
+ {
+     static int on = -1;
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -23,6 +23,7 @@
+ #include "rsx_o0.h"   /* patch 2188 */
+ #include "rsx_s7p.h"   /* patch 2204: S7.0 probes */
+ #include "rsx_views.h"   /* patch 2202 */
++#include "rsx_lpb.h"   /* patch 2208 */
+ #include "rsx_guest_signal.h"   /* patch 2190: the guest-signal funnel, defined in rsx_commands.c */
+ /* Patch 2188 (RSX_PERF_SPLIT=1): exclusive buckets, rsx_o0.h. One int test when off. LDS_POP also closes anything opened
+  * after its token that an early return left open. */
+@@ -6016,9 +6017,22 @@ static void ld_wbh_bind(const rsx_dsp_texture* t)
+         if (p) fprintf(stderr, "[wb-hash] f=%u %s surf=0x%08X hash=%016llx\n", g_ld_frames, tab[k].n, tab[k].off, (unsigned long long)rsx_wbp_hash64(p, tab[k].size));
+     }
+ }
++/* Patch 2208 ([o0-lpb], RSX_O0=1): the LightProbe 8x8 block probe. The pipeline of this draw is built before the texture loop,
++ * so g_ld_current_pso names the VP/FP that sample the block. */
++static int ld_lpb_block(const rsx_dsp_texture* t)
++{
++    return rsx_lpb_is_block(t->location, t->format, t->width, t->height, t->dimension, t->cubemap);
++}
++static void ld_lpb_bind(const rsx_dsp_texture* t)
++{
++    rsx_lpb_bind(&g_rsx_lpb, t->offset, texture_source_span(t), g_ld_current_pso.vp_hash, g_ld_current_pso.fp_location,
++                 g_ld_current_pso.fp_offset, g_ld_current_pso.fp_size, g_ld_current_pso.key, (uint32_t)g_ld_current_pso.valid,
++                 t->filter, t->control0, t->mipmaps);
++}
+ static u32 texture_srv_slot_entry(const rsx_dsp_texture* t, u32 i)
+ {
+     ld_wbh_bind(t);   /* patch 2184 diagnostic */
++    if (__builtin_expect(g_rsx_lpb.on, 0) && ld_lpb_block(t)) ld_lpb_bind(t);   /* patch 2208 */
+     if (g_rsx_o0.on) rsx_o0_tex_bind(&g_rsx_o0, t->location ? 1u : 0u, t->offset);   /* patch 2188 */
+     const u32 remap = t->remap & 0xFFFF;
+     static int refresh_enabled = -1;
+@@ -6070,6 +6084,7 @@ static u32 texture_srv_slot_entry(const rsx_dsp_texture* t, u32 i)
+             LDW_ADD(RSX_PERF_W_TEX_HASH_T, th_t0);
+             ld_redecode_note(1, t, entry->span, th_t0 ? rsx_perf_now() - th_t0 : 0);   /* patch 2045 diagnostic */
+             if (g_rsx_o0.on) rsx_o0_tex_hash(&g_rsx_o0, t->location ? 1u : 0u, t->offset, readable && hash != entry->content_hash, entry->written != 0);   /* patch 2188 */
++            if (__builtin_expect(g_rsx_lpb.on, 0) && ld_lpb_block(t)) rsx_lpb_hash(&g_rsx_lpb, t->offset, entry->span, readable && hash != entry->content_hash);   /* patch 2208 */
+             ld_tex_hash_note(readable, hash != entry->content_hash, &entry->quiet, &entry->written, &entry->dyn,
+                              t->location, t->offset, t->width, t->height, t->format, entry->span);
+             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
+@@ -6143,6 +6158,7 @@ static u32 texture_srv_slot_entry(const rsx_dsp_texture* t, u32 i)
+                 ld_redecode_note(0, t, entry->span, rd_t0 ? rsx_perf_now() - rd_t0 : 0);   /* patch 2045 diagnostic */
+                 if (replacement) { entry->kc_kind = g_ld_kc_kind; entry->kc_sig = g_ld_kc_sig ^ ld_kc_l1_sig(g_ld_frames); }   /* 2039, 2117 */
+                 if (replacement) entry->raw_argb = g_ld_tex_raw;   /* patch 2046 (constant per format in practice) */
++                if (__builtin_expect(g_rsx_lpb.on, 0) && replacement && ld_lpb_block(t)) rsx_lpb_redecode(&g_rsx_lpb, t->offset, replacement == entry->tex);   /* patch 2208 */
+                 if (replacement && replacement == entry->tex) {
+                     entry->content_hash = hash;   /* same resource, same SRV: nothing to rewrite or retire */
+                     g_ld_tex_inplace_n++;
+@@ -6171,6 +6187,7 @@ static u32 texture_srv_slot_entry(const rsx_dsp_texture* t, u32 i)
+ /* Patch 2136: the new-entry part of texture_srv_slot, unchanged. g_ld_tsl_index = the entry now holding this key. */
+ static u32 texture_srv_slot_new(const rsx_dsp_texture* t)
+ {
++    if (__builtin_expect(g_rsx_lpb.on, 0) && ld_lpb_block(t)) ld_lpb_bind(t);   /* patch 2208 */
+     const u32 sf_at_start = (u32)g_ld_sf_seq;   /* patch 2137 */
+     const u32 remap = t->remap & 0xFFFF;
+     u32 index;
+@@ -6251,6 +6268,7 @@ static u32 texture_srv_slot_new(const rsx_dsp_texture* t)
+     replacement.raw_argb = g_ld_tex_raw;   /* patch 2046 */
+     if (replacement.tex) {
+         texcache_t* entry = &g.textures[index];
++        if (__builtin_expect(g_rsx_lpb.on, 0) && ld_lpb_block(t)) rsx_lpb_new(&g_rsx_lpb, t->offset, replacement.span, evicted && replacement.tex == evicted);   /* patch 2208 */
+         if (evicted && replacement.tex == evicted)
+             g_ld_tex_recycle_n++;   /* patch 2075: same resource, new texels; nothing to retire */
+         else if (evicted)
+@@ -16739,6 +16757,12 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+         char vb[1024]; uint32_t nv;
+         if (rsx_views_flip(&g_rsx_views, vb, sizeof vb, &nv)) fprintf(stderr, "%s\n", vb);
+     }
++    if (__builtin_expect(g_rsx_lpb.on, 0)) {   /* patch 2208: [o0-lpb] per flip (first RSX_O0_LPB_N active flips) and per window */
++        char lb[512], wb[8192]; size_t wl = 0;
++        const size_t ll = rsx_lpb_flip(&g_rsx_lpb, lb, sizeof lb, wb, sizeof wb, &wl);
++        if (ll) fprintf(stderr, "%s\n", lb);
++        if (wl) fwrite(wb, 1, wl, stderr);
++    }
+     if (__builtin_expect(g_rsx_fcap_cfg, 0)) rsx_fcap_flip(buffer_id, 0);   /* patch 2164 */
+     gcm_guest_signal_note(RSX_GS_FLIP, buffer_id, 0u);   /* patch 2190: E6, the renderer sees the flip request */
+     g_ld_flip_requested++;
+diff --git a/libs/video/rsx_lpb.h b/libs/video/rsx_lpb.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_lpb.h
+@@ -0,0 +1,377 @@
++/* KZ3 patch 2208 (rsx): [o0-lpb], the LightProbe 8x8 block probe (RSX_O0=1; off by default; probe only,
++ * no behaviour change). Pure C (no OS calls, no globals other than the instance the caller owns), so tools/smoke/test_lpb.c
++ * builds it on the host. Walker thread only (no locks).
++ *
++ * Question it answers (fps2 report section 1 item 3): is a device-resident store for the SPU job 9 LightProbe blocks safe and
++ * worth it? Per flip it counts the location-1 8x8 W16Z16Y16X16F texture binds, the distinct block offsets, the new texture
++ * cache entries (and how many of those recycled an evicted resource), the per-bind content hashes, the hashes that changed,
++ * the in-place redecodes (the old resource reused: barrier, copy, barrier) against the replaced ones, the bytes bound and the
++ * bytes the decoder had to upload, and the 4 KiB pages holding the new/changed blocks as spans (contiguous, and merged across
++ * gaps of up to 16 pages = one 64 KiB copy). Per draw it records which vertex program and fragment program (and which pipeline)
++ * were current when a block was bound, and the sampler filter the unit used, so "a block is bound with other than point
++ * sampling" is a counter, not a guess. A block = location 1, width 8, height 8, format 0x9A (W16Z16Y16X16_FLOAT, mask 0x9F),
++ * dimension 2, no cubemap.
++ * ASSUMPTIONS: (a) the new/changed blocks are the ones the walker noticed (hash-changed or new); blocks the clean rules did not
++ * re-hash are not counted, so "dirty pages" is a lower bound of what a page bitmap would flag; (b) 4 KiB pages. */
++#ifndef RSX_LPB_H
++#define RSX_LPB_H
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define RSX_LPB_TAB 8192u /* distinct blocks per flip: open addressing, <= RSX_LPB_MAXB used */
++#define RSX_LPB_MAXB 4096u
++#define RSX_LPB_MAXU 32 /* consumers (VP/FP) over the run */
++#define RSX_LPB_MAXF 16 /* distinct sampler filter states over the run */
++#define RSX_LPB_PAGE 4096u
++#define RSX_LPB_GAP 16u /* pages: a gap up to this merges into one copy span */
++
++enum {
++    RSX_LPB_F_NEW = 1,
++    RSX_LPB_F_HASHED = 2,
++    RSX_LPB_F_CHANGED = 4,
++    RSX_LPB_F_INPLACE = 8,
++    RSX_LPB_F_REPLACED = 16,
++    RSX_LPB_F_RECYCLED = 32
++};
++
++typedef struct {
++    uint32_t gen, off, binds, flags, span;
++} rsx_lpb_blk;
++typedef struct {
++    uint64_t vp;
++    uint32_t fp_loc, fp_off, fp_size, valid;
++    uint64_t pso, binds, nonpoint;
++    uint32_t seen_flip;
++} rsx_lpb_use;
++typedef struct {
++    uint32_t minf, magf, mips, aniso;
++    uint64_t binds;
++} rsx_lpb_filt;
++
++enum {
++    RSX_LPB_N_BINDS,
++    RSX_LPB_N_DISTINCT,
++    RSX_LPB_N_NEW,
++    RSX_LPB_N_RECYCLED,
++    RSX_LPB_N_HASHED,
++    RSX_LPB_N_CHANGED,
++    RSX_LPB_N_INPLACE,
++    RSX_LPB_N_REPLACED,
++    RSX_LPB_N_BOUNDKB,
++    RSX_LPB_N_DECKB,
++    RSX_LPB_N_DPAGES,
++    RSX_LPB_N_DSPANS0,
++    RSX_LPB_N_DSPANS16,
++    RSX_LPB_N_NONPOINT,
++    RSX_LPB_N_USERS,
++    RSX_LPB_N_FIELDS
++};
++
++typedef struct {
++    int on;
++    uint32_t max_lines; /* RSX_O0_LPB_N per-flip lines, default 30 */
++    uint32_t win;       /* RSX_O0_LPB_WIN flips per window line, default 60 */
++    uint32_t gen;       /* current flip generation (never 0 in use) */
++    rsx_lpb_blk tab[RSX_LPB_TAB];
++    uint32_t n_distinct, ovf_binds;
++    uint64_t cur[RSX_LPB_N_FIELDS]; /* this flip (n_distinct fields are derived at the flip) */
++    uint32_t nuse_flip;
++    rsx_lpb_use use[RSX_LPB_MAXU];
++    uint32_t n_use, ovf_use;
++    rsx_lpb_filt filt[RSX_LPB_MAXF];
++    uint32_t n_filt, ovf_filt;
++    /* run */
++    uint32_t flips, active_flips, lines, win_flips, win_active;
++    uint64_t sum[RSX_LPB_N_FIELDS], max[RSX_LPB_N_FIELDS]; /* current window */
++    uint64_t tot[RSX_LPB_N_FIELDS], tot_ovf;               /* whole run */
++} rsx_lpb;
++
++static inline void rsx_lpb_init(rsx_lpb* l, uint32_t max_lines, uint32_t win)
++{
++    memset(l, 0, sizeof(*l));
++    l->on = 1;
++    l->gen = 1;
++    l->max_lines = max_lines;
++    l->win = win ? win : 60u;
++}
++
++/* is this texture descriptor a LightProbe block? */
++static inline int rsx_lpb_is_block(uint32_t location, uint32_t format, uint32_t width, uint32_t height,
++                                   uint32_t dimension, uint32_t cubemap)
++{
++    return location == 1u && (format & 0x9Fu) == 0x9Au && width == 8u && height == 8u && dimension == 2u && !cubemap;
++}
++/* point sampling only: min NEAREST (1) or NEAREST_NEAREST (3), mag NEAREST (1). Anything else (including a mip-linear min filter
++ * on a one-level texture) is counted as not point, the conservative answer. TEX_FILTER: min [18:16], mag [26:24]. */
++static inline int rsx_lpb_point(uint32_t filter)
++{
++    const uint32_t minf = (filter >> 16) & 7u, magf = (filter >> 24) & 7u;
++    return (minf == 1u || minf == 3u) && magf == 1u;
++}
++
++static inline rsx_lpb_blk* rsx_lpb_slot(rsx_lpb* l, uint32_t off, int create)
++{
++    uint32_t h = (uint32_t)(((uint64_t)off * 0x9E3779B97F4A7C15ull) >> 40) & (RSX_LPB_TAB - 1u);
++    for (uint32_t k = 0; k < RSX_LPB_TAB; k++, h = (h + 1u) & (RSX_LPB_TAB - 1u)) {
++        rsx_lpb_blk* b = &l->tab[h];
++        if (b->gen == l->gen && b->off == off) return b;
++        if (b->gen != l->gen) {
++            if (!create || l->n_distinct >= RSX_LPB_MAXB) return NULL;
++            b->gen = l->gen;
++            b->off = off;
++            b->binds = 0;
++            b->flags = 0;
++            b->span = 0;
++            l->n_distinct++;
++            return b;
++        }
++    }
++    return NULL;
++}
++
++/* one bind of a block. vp/fp/pso describe the draw (valid = the pipeline of this draw was built); filter/control0/mipmaps = the unit. */
++static inline void rsx_lpb_bind(rsx_lpb* l, uint32_t off, uint32_t span, uint64_t vp, uint32_t fp_loc, uint32_t fp_off,
++                                uint32_t fp_size, uint64_t pso, uint32_t valid, uint32_t filter, uint32_t control0,
++                                uint32_t mips)
++{
++    l->cur[RSX_LPB_N_BINDS]++;
++    rsx_lpb_blk* b = rsx_lpb_slot(l, off, 1);
++    if (b) {
++        b->binds++;
++        b->span = span;
++    } else
++        l->ovf_binds++;
++    const int pt = rsx_lpb_point(filter);
++    if (!pt) l->cur[RSX_LPB_N_NONPOINT]++;
++    uint32_t i = 0;
++    for (; i < l->n_use; i++) {
++        const rsx_lpb_use* u = &l->use[i];
++        if (u->vp == vp && u->fp_loc == fp_loc && u->fp_off == fp_off && u->fp_size == fp_size && u->valid == valid)
++            break;
++    }
++    if (i == l->n_use) {
++        if (l->n_use == RSX_LPB_MAXU) {
++            l->ovf_use++;
++            i = RSX_LPB_MAXU;
++        } else {
++            rsx_lpb_use* u = &l->use[l->n_use++];
++            memset(u, 0, sizeof *u);
++            u->vp = vp;
++            u->fp_loc = fp_loc;
++            u->fp_off = fp_off;
++            u->fp_size = fp_size;
++            u->valid = valid;
++        }
++    }
++    if (i < RSX_LPB_MAXU) {
++        rsx_lpb_use* u = &l->use[i];
++        u->binds++;
++        u->pso = pso;
++        if (!pt) u->nonpoint++;
++        if (u->seen_flip != l->gen) {
++            u->seen_flip = l->gen;
++            l->nuse_flip++;
++        }
++    }
++    const uint32_t minf = (filter >> 16) & 7u, magf = (filter >> 24) & 7u, an = (control0 >> 4) & 7u;
++    uint32_t f = 0;
++    for (; f < l->n_filt; f++)
++        if (l->filt[f].minf == minf && l->filt[f].magf == magf && l->filt[f].mips == mips && l->filt[f].aniso == an)
++            break;
++    if (f == l->n_filt) {
++        if (l->n_filt == RSX_LPB_MAXF) {
++            l->ovf_filt++;
++            return;
++        }
++        rsx_lpb_filt* x = &l->filt[l->n_filt++];
++        memset(x, 0, sizeof *x);
++        x->minf = minf;
++        x->magf = magf;
++        x->mips = mips;
++        x->aniso = an;
++    }
++    l->filt[f].binds++;
++}
++/* a new texture-cache entry for this block was created; recycled = an evicted resource was reused for it */
++static inline void rsx_lpb_new(rsx_lpb* l, uint32_t off, uint32_t span, int recycled)
++{
++    rsx_lpb_blk* b = rsx_lpb_slot(l, off, 1);
++    l->cur[RSX_LPB_N_NEW]++;
++    if (recycled) l->cur[RSX_LPB_N_RECYCLED]++;
++    if (b) {
++        b->flags |= RSX_LPB_F_NEW | (recycled ? RSX_LPB_F_RECYCLED : 0);
++        b->span = span;
++    }
++}
++/* a content hash was taken for an existing entry; changed = it differs from the cached hash */
++static inline void rsx_lpb_hash(rsx_lpb* l, uint32_t off, uint32_t span, int changed)
++{
++    rsx_lpb_blk* b = rsx_lpb_slot(l, off, 1);
++    l->cur[RSX_LPB_N_HASHED]++;
++    if (changed) l->cur[RSX_LPB_N_CHANGED]++;
++    if (b) {
++        b->flags |= RSX_LPB_F_HASHED | (changed ? RSX_LPB_F_CHANGED : 0);
++        b->span = span;
++    }
++}
++/* the changed block was redecoded: inplace = the same resource was reused (no SRV rewrite), else a replacement resource */
++static inline void rsx_lpb_redecode(rsx_lpb* l, uint32_t off, int inplace)
++{
++    rsx_lpb_blk* b = rsx_lpb_slot(l, off, 1);
++    l->cur[inplace ? RSX_LPB_N_INPLACE : RSX_LPB_N_REPLACED]++;
++    if (b) b->flags |= inplace ? RSX_LPB_F_INPLACE : RSX_LPB_F_REPLACED;
++}
++
++static int rsx_lpb_cmp_u32(const void* a, const void* b)
++{
++    const uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
++    return x < y ? -1 : x > y;
++}
++/* pages of [off, off+span) for every new/changed block, sorted unique; returns the page count, runs for gap 0 and gap RSX_LPB_GAP */
++static inline uint32_t rsx_lpb_pages(const rsx_lpb* l, uint32_t* spans0, uint32_t* spans16, uint32_t* declared_bytes)
++{
++    static uint32_t pg[RSX_LPB_MAXB * 2u];
++    uint32_t n = 0, db = 0;
++    for (uint32_t i = 0; i < RSX_LPB_TAB; i++) {
++        const rsx_lpb_blk* b = &l->tab[i];
++        if (b->gen != l->gen || !(b->flags & (RSX_LPB_F_NEW | RSX_LPB_F_CHANGED))) continue;
++        db += b->span;
++        const uint32_t s = b->span ? b->span : 1u;
++        for (uint32_t p = b->off / RSX_LPB_PAGE; p <= (b->off + s - 1u) / RSX_LPB_PAGE && n < RSX_LPB_MAXB * 2u; p++)
++            pg[n++] = p;
++    }
++    *declared_bytes = db;
++    if (!n) {
++        *spans0 = *spans16 = 0;
++        return 0;
++    }
++    qsort(pg, n, sizeof pg[0], rsx_lpb_cmp_u32);
++    uint32_t u = 1, r0 = 1, r16 = 1;
++    for (uint32_t i = 1; i < n; i++) {
++        if (pg[i] == pg[i - 1]) continue;
++        u++;
++        if (pg[i] - pg[i - 1] > 1u) r0++;
++        if (pg[i] - pg[i - 1] > RSX_LPB_GAP + 1u) r16++;
++    }
++    *spans0 = r0;
++    *spans16 = r16;
++    return u;
++}
++
++static const char* const rsx_lpb_names[RSX_LPB_N_FIELDS] = {"binds",   "distinct", "new",      "recycled", "hashed",
++                                                            "changed", "inplace",  "replaced", "boundKB",  "decKB",
++                                                            "dpages",  "dspans",   "dspans16", "nonpoint", "users"};
++
++static inline size_t rsx_lpb_fmt_flip(const rsx_lpb* l, char* buf, size_t cap)
++{
++    size_t n = (size_t)snprintf(buf, cap, "[o0-lpb] flip=%u", l->flips);
++    for (unsigned k = 0; k < RSX_LPB_N_FIELDS && n < cap; k++)
++        n += (size_t)snprintf(buf + n, cap - n, " %s=%llu", rsx_lpb_names[k], (unsigned long long)l->cur[k]);
++    if (l->ovf_binds && n < cap) n += (size_t)snprintf(buf + n, cap - n, " ovf=%u", l->ovf_binds);
++    return n >= cap ? cap - 1 : n;
++}
++static inline size_t rsx_lpb_fmt_win(const rsx_lpb* l, char* buf, size_t cap)
++{
++    const unsigned f = l->win_flips ? l->win_flips : 1u;
++    size_t n = (size_t)snprintf(buf, cap, "[o0-lpb] win flips=%u active=%u", l->win_flips, l->win_active);
++    for (unsigned k = 0; k < RSX_LPB_N_FIELDS && n < cap; k++)
++        n += (size_t)snprintf(buf + n, cap - n, " %s=%.1f/%llu", rsx_lpb_names[k], (double)l->sum[k] / (double)f,
++                              (unsigned long long)l->max[k]);
++    if (n < cap)
++        n += (size_t)snprintf(
++            buf + n, cap - n,
++            " (avg/max per flip) run_binds=%llu run_new=%llu run_changed=%llu run_nonpoint=%llu ovf=%llu",
++            (unsigned long long)l->tot[RSX_LPB_N_BINDS], (unsigned long long)l->tot[RSX_LPB_N_NEW],
++            (unsigned long long)l->tot[RSX_LPB_N_CHANGED], (unsigned long long)l->tot[RSX_LPB_N_NONPOINT],
++            (unsigned long long)l->tot_ovf);
++    return n >= cap ? cap - 1 : n;
++}
++/* "[o0-lpb-use]" lines: every consumer over the run; "[o0-lpb-filt]": every sampler state. Returns the number of lines written (<= maxl),
++ * each followed by '\n' in buf. */
++static inline size_t rsx_lpb_fmt_use(const rsx_lpb* l, char* buf, size_t cap)
++{
++    size_t n = 0;
++    for (unsigned i = 0; i < l->n_use && n < cap; i++) {
++        const rsx_lpb_use* u = &l->use[i];
++        n += (size_t)snprintf(
++            buf + n, cap - n, "[o0-lpb-use] vp=%08llx fp=%s%u:0x%08X/%u pso=%016llx binds=%llu nonpoint=%llu\n",
++            (unsigned long long)(u->vp & 0xFFFFFFFFull), u->valid ? "" : "nopso ", u->fp_loc, u->fp_off, u->fp_size,
++            (unsigned long long)u->pso, (unsigned long long)u->binds, (unsigned long long)u->nonpoint);
++    }
++    for (unsigned i = 0; i < l->n_filt && n < cap; i++) {
++        const rsx_lpb_filt* x = &l->filt[i];
++        n +=
++            (size_t)snprintf(buf + n, cap - n, "[o0-lpb-filt] min=%u mag=%u mips=%u aniso=%u point=%d binds=%llu\n",
++                             x->minf, x->magf, x->mips, x->aniso,
++                             ((x->minf == 1u || x->minf == 3u) && x->magf == 1u) ? 1 : 0, (unsigned long long)x->binds);
++    }
++    if ((l->ovf_use || l->ovf_filt) && n < cap)
++        n += (size_t)snprintf(buf + n, cap - n, "[o0-lpb-use] overflow use=%u filt=%u\n", l->ovf_use, l->ovf_filt);
++    return n >= cap ? cap - 1 : n;
++}
++
++/* The flip: derives the per-flip fields, adds them to the window and the run, writes this flip's line (first max_lines active flips)
++ * into line (returns its length, 0 = none) and, every `win` flips, the window line plus the consumer/filter lines into win_buf
++ * (returns win_len). Resets the per-flip state. A flip with no block bind is not active and prints nothing but still counts for the
++ * window. */
++static inline size_t rsx_lpb_flip(rsx_lpb* l, char* line, size_t cap, char* win_buf, size_t win_cap, size_t* win_len)
++{
++    uint32_t s0 = 0, s16 = 0, dbytes = 0;
++    l->flips++;
++    l->cur[RSX_LPB_N_DISTINCT] = l->n_distinct;
++    l->cur[RSX_LPB_N_USERS] = l->nuse_flip;
++    uint64_t boundb = 0;
++    for (uint32_t i = 0; i < RSX_LPB_TAB; i++)
++        if (l->tab[i].gen == l->gen) boundb += l->tab[i].span;
++    l->cur[RSX_LPB_N_BOUNDKB] = boundb / 1024u;
++    l->cur[RSX_LPB_N_DPAGES] = rsx_lpb_pages(l, &s0, &s16, &dbytes);
++    l->cur[RSX_LPB_N_DSPANS0] = s0;
++    l->cur[RSX_LPB_N_DSPANS16] = s16;
++    l->cur[RSX_LPB_N_DECKB] = dbytes / 1024u;
++    const int active = l->cur[RSX_LPB_N_BINDS] != 0 || l->cur[RSX_LPB_N_NEW] != 0 || l->cur[RSX_LPB_N_HASHED] != 0;
++    size_t n = 0;
++    if (active) {
++        l->active_flips++;
++        l->win_active++;
++        for (unsigned k = 0; k < RSX_LPB_N_FIELDS; k++) {
++            l->sum[k] += l->cur[k];
++            if (l->cur[k] > l->max[k]) l->max[k] = l->cur[k];
++            l->tot[k] += l->cur[k];
++        }
++        l->tot_ovf += l->ovf_binds;
++        if (l->lines < l->max_lines) {
++            n = rsx_lpb_fmt_flip(l, line, cap);
++            l->lines++;
++        }
++    }
++    l->win_flips++;
++    *win_len = 0;
++    if (l->win_flips >= l->win) {
++        if (l->win_active) {
++            size_t w = rsx_lpb_fmt_win(l, win_buf, win_cap);
++            if (w + 2 < win_cap) {
++                win_buf[w++] = '\n';
++                w += rsx_lpb_fmt_use(l, win_buf + w, win_cap - w);
++            }
++            *win_len = w;
++        }
++        l->win_flips = l->win_active = 0;
++        memset(l->sum, 0, sizeof l->sum);
++        memset(l->max, 0, sizeof l->max);
++    }
++    memset(l->cur, 0, sizeof l->cur);
++    l->n_distinct = 0;
++    l->ovf_binds = 0;
++    l->nuse_flip = 0;
++    l->gen++;
++    if (l->gen == 0) {
++        memset(l->tab, 0, sizeof l->tab);
++        l->gen = 1;
++    }
++    return n;
++}
++/* the instance and its switch live in cellGcmSys.c (beside g_rsx_o0) */
++extern rsx_lpb g_rsx_lpb;
++#endif

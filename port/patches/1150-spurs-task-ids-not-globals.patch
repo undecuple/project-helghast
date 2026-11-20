@@ -10,7 +10,7 @@ they were written for). spu_async_run logs "[taskset] MISMATCH" (first 16, then 
 its task's TaskInfo names (TaskInfo at taskset + 0x80 + 48 * task, the ELF EA's low word at +0x14, flags masked): a scheduler fault.
 SPU_TASK_IDS_GLOBAL=1 restores the old hand-over (A/B only). Host test tools/spu/test_r139_task_ids.sh.
 
-Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): builds on #515 (ps3_env_once): spu_async_run's
+Rebased on ps3recomp v0.19.0: builds on #515 (ps3_env_once): spu_async_run's
 YDKJ_MINIMAL_CTX test is `j->taskset_ea && !ps3_env_once("YDKJ_MINIMAL_CTX")`. Upstream's new start path
 (spu_taskset_line_committed -> spu_taskset_start_pending -> spu_taskset_task_exited) dispatches through
 spu_dispatch_async_ids too.

@@ -10,7 +10,7 @@ tools/upstream/test_sys_fs_flags.sh. Applies after 0004 and 1127 (both touch sys
 sp00nznet/ps3recomp PR #620 (open) fixes the same values (CREAT 0000100, EXCL 0000200, TRUNC 0001000, APPEND
 0002000) with EEXIST handling; drop this patch when #620 merges.
 
-Rebased on ps3recomp v0.19.0 (group B pass 2, R&C 2026-11-09, on KZ3's group A r152): builds on #620 (168c94fb): upstream's sys_fs.h
+Rebased on ps3recomp v0.19.0: builds on #620 (168c94fb): upstream's sys_fs.h
 now has the console values (octal) and sys_fs_open answers O_CREAT|O_EXCL on an existing path with EEXIST and creates in the
 fallback only on ENOENT. Dropped: our flag-value fix and EEXIST block. Kept: include/ps3emu/cell_fs_flags.h as the one
 definition (sys_fs.h's octal block, cellFs.h and ppu_fs.cpp include it; same values, plus MSELF), the 'w'/'a' mode without

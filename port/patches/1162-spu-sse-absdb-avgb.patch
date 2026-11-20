@@ -1,0 +1,25 @@
+KZ3 patch 1162: SSE bodies (SSE2 ops under the __SSE4_1__ guard that spu__vi/spu__iv need) for spu_absdb and spu_avgb (the scalar 16-iteration loops stay under SPU_SCALAR_HELPERS).
+
+absdb = (x -sat y) | (y -sat x) per byte, avgb = _mm_avg_epu8 ((x + y + 1) >> 1, the SPU's rounding). Byte-wise, so the lane
+order inside the u128 does not matter. Results are bit-identical to the scalar loops: tools/spu/test_vekta_helpers.sh
+compares both over 3M random and edge inputs (gcc and clang) and has a negative control (a mutated body must FAIL).
+Credit: after project-vekta patch 1002 MIT, Copyright (c) 2026 Gustavo Morinaga and the Project Vekta contributors. Permission notice: Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files, to deal in the Software without restriction, subject to the above copyright notice and this permission notice being included in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. Written here, not copied literally. Full text: the LICENSE file of project-vekta.
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1076,8 +1076,15 @@
+  * MPYHHAU/DFCGT/DFCMGT/XORBI/DFTSV). Completes the lifter's opcode coverage. ---- */
+ static inline u128 spu_eqv(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=~(a._u32[i]^b._u32[i]); return r; }
+ static inline u128 spu_xorbi(u128 a, int32_t imm){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(a._u8[i]^(uint8_t)imm); return r; }
++/* KZ3 patch 1162 (after project-vekta patch 1002): SSE bodies for absdb/avgb (SSE2 ops, under the same __SSE4_1__ guard as spu__vi). Byte-wise, so the lane order inside the
++ * u128 does not matter; SPU_SCALAR_HELPERS keeps the scalar loops (the reference the host test compares against). */
++#if defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
++static inline u128 spu_absdb(u128 a, u128 b)  { const __m128i x = spu__vi(a), y = spu__vi(b); return spu__iv(_mm_or_si128(_mm_subs_epu8(x, y), _mm_subs_epu8(y, x))); }
++static inline u128 spu_avgb(u128 a, u128 b)   { return spu__iv(_mm_avg_epu8(spu__vi(a), spu__vi(b))); }   /* (x + y + 1) >> 1, as the SPU */
++#else
+ static inline u128 spu_absdb(u128 a, u128 b)  { u128 r; for(int i=0;i<16;i++){ uint8_t x=a._u8[i],y=b._u8[i]; r._u8[i]=(uint8_t)(x>y?x-y:y-x); } return r; }
+ static inline u128 spu_avgb(u128 a, u128 b)   { u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(((uint32_t)a._u8[i]+(uint32_t)b._u8[i]+1u)>>1); return r; }
++#endif
+ /* mpyhha/mpyhhau: high-16 x high-16, ACCUMULATE into rt (3-register). */
+ #if defined(__SSE4_1__)
+ static inline u128 spu_mpyhha(u128 a, u128 b, u128 t)  { return spu__iv(_mm_add_epi32(spu__vi(t), _mm_madd_epi16(_mm_andnot_si128(_mm_set1_epi32(0xFFFF), spu__vi(a)), spu__vi(b)))); }

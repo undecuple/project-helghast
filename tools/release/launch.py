@@ -57,6 +57,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -184,8 +185,8 @@ def ctx_for(root, paths):
 
 # ------------------------------------------------------------------------------------------------------ deciding
 def update_problem(update):
-    """"" when the recorded update folder still holds the update (firstrun_check's update checks U1-U3: PARAM.SFO,
-    USRDIR/EBOOT.BIN and the update's data archive), else one plain sentence that names the fix. A folder that exists
+    """"" when the recorded update folder still holds the update (firstrun_check's update checks U1-U4: PARAM.SFO,
+    USRDIR/EBOOT.BIN, the update's data archive and the two patch folders), else one plain sentence that names the fix. A folder that exists
     but was emptied, or replaced by something else, would otherwise build or start into a game that stops at the menu."""
     if not update or not os.path.isdir(update):
         return ""
@@ -197,8 +198,90 @@ def update_problem(update):
     fails = [c["message"] for c in r.checks if c["level"] == "FAIL"]
     if not fails:
         return ""
-    return (f"The 1.14 update folder {update} no longer holds the update ({fails[0]}). "
+    listed = "".join(f"\n- {m}" for m in fails)   # every FAIL, not only the first (issue #47: two patch folders can both be missing)
+    return (f"The 1.14 update folder {update} does not hold the complete update:{listed}\n"
             "Pick the folder of the complete installed update again")
+
+
+# ---------------------------------------------------------------------------------------- the game ended: why (B2)
+GAME_LOG_GLOB = "Killzone3-PC-[0-9]*.log"   # the game's own log; Killzone3-PC-crash-*.txt and the setup/launcher logs differ
+LOG_READ_BYTES = 4_000_000                  # the cause lines are written at start-up; read the head, and the tail for the end
+
+
+def newest_game_log(exe_dir, since):
+    """The game's log file written by this run (<exe dir>/logs, modified at or after `since`, newest first), or ''."""
+    import glob
+    best = ""
+    for p in glob.glob(os.path.join(exe_dir, "logs", GAME_LOG_GLOB)):
+        try:
+            if os.path.getmtime(p) >= since - 2 and (not best or os.path.getmtime(p) > os.path.getmtime(best)):
+                best = p
+        except OSError:
+            pass
+    return best
+
+
+def read_log(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(LOG_READ_BYTES)
+            size = f.seek(0, 2)
+            tail = b""
+            if size > LOG_READ_BYTES:
+                f.seek(max(LOG_READ_BYTES, size - 400_000))
+                tail = f.read()
+        return (head + tail).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+OVERLAY_RX = re.compile(r"^\[overlay\] .*?: added (yes|no), patches (yes|no) -> (on|init FAILED)", re.M)
+NO_DEVICE = "[D3D12] ERROR: no D3D12 device"
+SOFTWARE_RX = re.compile(r"\[D3D12\] device \(.*?\bsoftware=1\b|D3D12 adapter: .*software \(WARP\)")
+
+
+def log_causes(text):
+    """[(code, plain sentence)] for the known causes the game wrote to its log. Pure: the text is the only input.
+    code: no-device, software, patches, added, overlay."""
+    out = []
+    if NO_DEVICE in text:
+        out.append(("no-device", "Windows found no Direct3D 12 graphics device. Install the newest driver for your graphics "
+                                 "card (an NVIDIA card is needed, see the requirements) and start again"))
+    elif SOFTWARE_RX.search(text):
+        out.append(("software", "The game ran on Windows' software renderer (WARP), not on your graphics card, which is far "
+                                "too slow to play. Install the newest graphics driver and start again"))
+    for m in OVERLAY_RX.finditer(text):
+        added, patches, state = m.groups()
+        if patches == "no" or added == "no" or state != "on":
+            what = []
+            if added == "no":
+                what.append("the update's data archive USRDIR\\added_data_ps3.psarc.edat")
+            if patches == "no":
+                what.append("the update's patch folders USRDIR\\patch_data_ps3_sp and USRDIR\\patch_data_ps3_mp")
+            if what:
+                out.append(("patches" if patches == "no" else "added",
+                            "The game did not find " + " and ".join(what) + " in your 1.14 update folder, so the menu stays black. "
+                            "Copy the complete installed update folder (every folder inside USRDIR) and pick it as the update "
+                            "again (Repair, or the first-run questions)"))
+            else:
+                out.append(("overlay", "The game could not load the 1.14 update's files. Pick the complete installed update "
+                                       "folder again"))
+        break
+    return out
+
+
+def game_exit_message(rc, log_path, causes):
+    """The dialog text for a game run that ended, or '' when nothing is worth saying: a clean exit with no known cause, or a
+    console closed by the player. Names the log file and, from the log, the likely cause."""
+    if rc in CONSOLE_CLOSED:
+        return ""
+    bad = [c for c in causes if rc != 0 or c[0] in ("no-device", "patches", "added", "overlay")]   # a clean exit: only black-screen causes
+    if rc == 0 and not bad:
+        return ""
+    head = f"The game closed with code {rc}." if rc != 0 else "The game closed, and its log shows a problem that leaves the screen black."
+    why = "".join(f"\n\n- {t}." for _, t in bad) if bad else "\n\nThe log does not name a cause."
+    where = f"\n\nThe game's log is {log_path}." if log_path else "\n\nNo game log was written (the game stopped before it started its log)."
+    return head + why + where + REPORT
 
 
 def decide(root):
@@ -1355,7 +1438,13 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
     out = tenv.get("LD_PSO_TEMPLATE_OUT") or environ.get("LD_PSO_TEMPLATE_OUT", "")
     if a.export_template and out and os.path.isfile(out):
         os.remove(out)   # an export left by an earlier run must not pass as this run's result
+    started = time.time()
     rc = run(gargv, cwd=cwd, env=child_env)
+    log_path = newest_game_log(os.path.dirname(gargv[0]), started)
+    msg = game_exit_message(rc, log_path, log_causes(read_log(log_path)) if log_path else [])
+    note(root, f"game ended with code {rc}; log {log_path or 'none'}; " + (msg.split("\n")[0] if msg else "no message"))
+    if msg and not a.export_template:
+        ui.info(msg)
     if a.export_template:
         tool = os.path.join(root, TEMPLATE_TOOL)
         if rc == 0 and out and os.path.isfile(out) and run([console_python(), tool, "check", out]) == 0:

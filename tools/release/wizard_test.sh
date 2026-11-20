@@ -63,7 +63,7 @@ proton() { STEAM_COMPAT_DATA_PATH="${KZ3_WT_STATE:-$R13}/compat" steam-run "$PRO
 # Pass 18: wineserver -k needs the prefix (else it stops ~/.wine's server, not Proton's): the game a real walk's
 # Finish started kept running into the next walk and took its key presses
 # (and even so the game windows outlived it in pass 18's batch 3, so the game and launcher processes are also ended
-# by name: the sandbox has its own pid namespace, so this never reaches another lane's run)
+# by name: the sandbox has its own pid namespace, so this never reaches another run)
 wskill() { WINEPREFIX="${1:-${KZ3_WT_STATE:-$R13}/compat/pfx}" steam-run "$PROTON_DIR/files/bin/wineserver" -k >/dev/null 2>&1
   pkill -f 'kz3\.exe|Project Helghast\.exe' 2>/dev/null; true; }
 winpath() { echo "Z:${1//\//\\}"; }
@@ -191,15 +191,17 @@ wizard)
   shot 01-welcome
   # Keyboard only (Alt+letter is unreliable here: it selected the licence text): the welcome page opens with the
   # focus on "Check for a new version" (Space = the click; offline in the sandbox), Return = the default button.
-  # Pass 29 (step 9s): the "Setup type" page after the welcome page. KZ3_WT_TYPE=advanced (default, every page as
-  # before plus the fonts and Advanced options pages) or recommended (no tasks, EBOOT, fonts or Advanced pages: the
-  # marker update has USRDIR\EBOOT.elf). The type list takes Down + Space; KZ3_WT_ADV="keys" acts on the Advanced page.
+  # Installer simplification pass 1: no "Setup type" page. After the licence comes "Your game files" (checkbox 1 =
+  # use my RPCS3 install, checkbox 2 = Customise), then the RPCS3 folder page only when box 1 is ticked, then the
+  # install folder. KZ3_WT_TYPE=advanced (default: ticks Customise: tasks, EBOOT, fonts and Advanced pages) or
+  # recommended (no tasks, EBOOT, fonts or Advanced pages: the marker update has USRDIR\EBOOT.elf).
+  # ASSUMPTION: the test prefix has no RPCS3 folder, so box 1 starts unticked (the wizard ticks it only when
+  # %APPDATA%\rpcs3 or %LOCALAPPDATA%\Programs\rpcs3 exists); the screenshot 02c shows it.
   WT_TYPE="${KZ3_WT_TYPE:-advanced}"
-  key space; sleep "${KZ3_WT_CHECKWAIT:-8}"; shot 02-welcome-checked; key Return; shot 02b-type
-  # An install over one made with Advanced preselects Advanced: Up + Space picks Recommended either way
-  if [[ "$WT_TYPE" == advanced ]]; then key Down space; shot 02c-type-advanced; else key Up space; shot 02c-type-recommended; fi
-  key Return; shot 03-licence
-  key Tab Up; shot 03b-licence-accepted; key Return; shot 04-dir; key Return
+  key space; sleep "${KZ3_WT_CHECKWAIT:-8}"; shot 02-welcome-checked; key Return; shot 03-licence
+  key Tab Up; shot 03b-licence-accepted; key Return; shot 02c-game-files
+  if [[ "$WT_TYPE" == advanced ]]; then key Down space; shot 02d-customise-ticked; fi
+  key Return; shot 04-dir; key Return
   if [[ "$WT_TYPE" == advanced ]]; then
     shot 05-tasks
     if [[ "$FAIL" == tasks ]]; then  # cancel: Escape = Cancel, the "Exit Setup?" box takes y
