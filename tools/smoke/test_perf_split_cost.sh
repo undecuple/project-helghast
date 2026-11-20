@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host test for KZ3 patch 2203 (perf split cost): sampled decode_d recovers a known spin within 5%, the buckets still add up,
+# Host test for KZ3 patch 2203 (perf split cost): sampled decode_d recovers a known spin exactly (virtual clock), the buckets still add up,
 # the negative control (scale factor dropped) must fail, plus static checks that the patched sources keep the three fixes.
 #   nix develop .#ci --command bash -c 'CC=clang tools/smoke/test_perf_split_cost.sh'   (cc is the default)
 set -euo pipefail
@@ -17,7 +17,7 @@ negctl() {   # flag, expected message
     grep -q "$2" "$O/neg.txt" || { echo "[FAIL] negative control $1 failed for the wrong reason (want '$2')"; cat "$O/neg.txt"; exit 1; }
     echo "[test_perf_split_cost] negative control $1 fails as required"
 }
-negctl --negctl 'not within 5%'                 # scale factor dropped
+negctl --negctl 'not exactly the known spin'                 # scale factor dropped
 negctl --negctl-phase 'short passes: timed'     # sampler phase reset every pass (the old code)
 negctl --negctl-clamp 'went negative'           # debit taken at once, unclamped (the old scale_d)
 G="$V/cellGcmSys.c"

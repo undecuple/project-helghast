@@ -1,12 +1,11 @@
 /* Host test for KZ3 patch 2203: the sampled decode_d of the perf split (libs/video/rsx_o0.h: rsx_split_dsel/dpush/dpop/scale_d).
- * A word-sized spin of known duration is run inside the sampled region; the scaled decode_d must come back within 5% of
- * words x spin, and the buckets must still add up to the walk. `--negctl` drops the scale factor (scale 1): the recovered
+ * A word-sized spin of known duration (virtual clock, see vclk) is run inside the sampled region; the scaled decode_d must
+ * come back EXACTLY words x spin (words is a multiple of RSX_SPLIT_DSAMPLE, so timed x scale x spin == words x spin), and the buckets must still add up to the walk. `--negctl` drops the scale factor (scale 1): the recovered
  * value is then about 1/32 of the truth, so the same checks must FAIL (the .sh requires the non-zero exit).
  * Pure C, no game data. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include "rsx_o0.h"
 rsx_o0 g_rsx_o0;
 static int fails;
@@ -19,18 +18,12 @@ static int fails;
             printf("\n");                                                                                              \
         }                                                                                                              \
     } while (0)
-static long long now_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (long long)t.tv_sec * 1000000000ll + t.tv_nsec;
-}
-static void spin_ns(long long ns)
-{
-    const long long e = now_ns() + ns;
-    while (now_ns() < e) {
-    }
-}
+/* Virtual clock: the code under test takes every timestamp as an argument, so the spin is advanced by hand instead of busy
+ * waiting on CLOCK_MONOTONIC. Only 1 word in RSX_SPLIT_DSAMPLE is timed and scaled up, so a real clock lets one preemption of
+ * a sampled word (or a spin overshoot) be magnified 32x: that measured the host scheduler, not patch 2203's arithmetic. */
+static long long vclk;
+static long long now_ns(void) { return vclk; }
+static void spin_ns(long long ns) { vclk += ns; }
 
 /* the walker: per word, own loop work (decode_f, the base bucket) then the dispatch (decode_d) */
 static long long no_owed[RSX_SB_N];
@@ -150,18 +143,20 @@ int main(int argc, char** argv)
         CHECK(s.acc[RSX_SB_DECODE_D] == 3200 * 100, "exact decode_d %lld (want 320000)", s.acc[RSX_SB_DECODE_D]);
         CHECK(s.acc[RSX_SB_DECODE_F] == 3200 * 10, "exact decode_f %lld (want 32000)", s.acc[RSX_SB_DECODE_F]);
     }
-    /* real spin: 20000 words x 5 us in the sampled region, 1 us loop work, a 3 us sink every 7th word */
+    /* virtual spin: 20000 words x 5 us in the sampled region, 1 us loop work, a 3 us sink every 7th word */
     {
         const int n = 20000;
         const long long disp = 5000, loop = 1000, sink = 3000;
         double d, f, err;
         run(scale, n, loop, disp, sink, &d, &f, &err);
         const double want = (double)n * (double)disp, got = d, rel = (got - want) / want;
+        /* exact: n is a multiple of RSX_SPLIT_DSAMPLE, so n/32 timed words x scale 32 x disp == n x disp, and the sinks sit in
+         * their own bucket inside the dispatch, so they never enter the sampled word's decode_d. No tolerance is needed. */
         printf("[test_perf_split_cost] scale=%d decode_d got %.0f ns want %.0f ns (%+.2f%%), decode_f %.0f ns, walk "
                "error %+.4f%%\n",
                scale, got, want, rel * 100.0, f, err * 100.0);
-        CHECK(rel > -0.05 && rel < 0.05, "decode_d not within 5%% of the known spin: %+.2f%%", rel * 100.0);
-        CHECK(err > -0.001 && err < 0.001, "buckets do not add up to the walk: %+.4f%%", err * 100.0);
+        CHECK(n % RSX_SPLIT_DSAMPLE == 0 && got == want, "decode_d not exactly the known spin: %+.2f%%", rel * 100.0);
+        CHECK(err == 0.0, "buckets do not add up to the walk: %+.4f%%", err * 100.0);
     }
     /* the sampler across passes (review of 2203): the phase persists, the per-pass word count is only the flushed delta */
     {
