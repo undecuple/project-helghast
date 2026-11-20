@@ -3,10 +3,25 @@
  * a file and read back. No game data.  usage: test_first_frame <stderr-file> */
 #define _POSIX_C_SOURCE 200809L /* pthread barriers under -std=c11 */
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Window hook for the non-atomic negative control only (the control header calls ff_window() between its check and its set;
+ * the real header never does). While g_ff_win_on is set it holds each caller until two threads are between check and set,
+ * so both have seen "not done" and both print: the broken header is caught every round on any core count, instead of
+ * depending on the scheduler opening that window by chance. Cannot deadlock: nobody leaves before two have arrived, and a
+ * second arrival always happens because the done flag stays 0 until someone leaves. */
+static atomic_int g_ff_win_on, g_ff_win_in;
+__attribute__((unused)) static void ff_window(void)
+{
+    if (!atomic_load(&g_ff_win_on)) return;
+    atomic_fetch_add(&g_ff_win_in, 1);
+    while (atomic_load(&g_ff_win_in) < 2) sched_yield();
+}
 #include "rsx_first_frame.h"
 
 static int fails;
@@ -70,6 +85,8 @@ int main(int argc, char** argv)
     for (unsigned i = 0; i < NTHR; i++) pthread_create(&t[i], NULL, racer, (void*)(uintptr_t)i);
     for (unsigned r = 0; r < ROUNDS; r++) {
         atomic_store(&s_rsx_ff_done, 0); /* fresh state: the first call of this round is the very first */
+        atomic_store(&g_ff_win_in, 0);
+        atomic_store(&g_ff_win_on, 1); /* only the control header calls ff_window() */
         pthread_barrier_wait(&g_go);
         pthread_barrier_wait(&g_done);
     }

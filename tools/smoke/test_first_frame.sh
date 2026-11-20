@@ -2,7 +2,7 @@
 # Host test for KZ3 patch 2199: the default-on "[frame] first frame presented at N ms" line (libs/video/rsx_first_frame.h)
 # prints exactly once; static checks that the patched rsx_live_draw.c calls it only after a successful, non-occluded
 # Present and behind the pending test. Negative controls: a header that prints on every call, one that never prints,
-# a non-atomic check-then-set (if (done == 0 && (done = 1))), and a live-draw copy without the call; each must make the test fail.
+# a non-atomic check-then-set (if (done == 0 && (window, done = 1)); the harness opens the window on purpose, so it is caught on any core count), and a live-draw copy without the call; each must make the test fail.
 # The race part starts 4 threads behind a barrier on the very first call, 20000 rounds with fresh state. No game data.
 #   nix develop .#re --command tools/sandbox.sh -- tools/smoke/test_first_frame.sh
 set -euo pipefail
@@ -51,8 +51,9 @@ rcn=0; run_c "$N" >/dev/null 2>&1 || rcn=$?; if [[ $rcn != 1 ]]; then echo "[FAI
 sed 's/fprintf(stderr, "\[frame\] first frame presented at %llu ms\\n", ms);/(void)ms;/' "$V/rsx_first_frame.h" > "$N/rsx_first_frame.h"
 cmp -s "$V/rsx_first_frame.h" "$N/rsx_first_frame.h" && { echo "[FAIL] control 2 did not change the header"; exit 1; }
 rcn=0; run_c "$N" >/dev/null 2>&1 || rcn=$?; if [[ $rcn != 1 ]]; then echo "[FAIL] negative control 'never prints' passed or did not build (rc $rcn)"; exit 1; fi
-# negative control: check-then-set that is not one atomic step; the racing rounds must catch it, every time (repeated)
-sed 's/if (atomic_exchange(&s_rsx_ff_done, 1) == 0) {/if (s_rsx_ff_done == 0 \&\& (s_rsx_ff_done = 1)) {/' "$V/rsx_first_frame.h" > "$N/rsx_first_frame.h"
+# negative control: check-then-set that is not one atomic step; ff_window() (harness) holds two threads between the check and the set, so
+# the race shows in every round on any core count and the control is caught every run (repeated)
+sed 's/if (atomic_exchange(&s_rsx_ff_done, 1) == 0) {/if (s_rsx_ff_done == 0 \&\& (ff_window(), s_rsx_ff_done = 1)) {/' "$V/rsx_first_frame.h" > "$N/rsx_first_frame.h"
 cmp -s "$V/rsx_first_frame.h" "$N/rsx_first_frame.h" && { echo "[FAIL] control 3 did not change the header"; exit 1; }
 caught=0; tries=${KZ3_FF_TRIES:-5}
 for ((k = 0; k < tries; k++)); do rcn=0; run_c "$N" >"$O/neg_race.out" 2>&1 || rcn=$?; [[ $rcn == 99 ]] && { echo "[FAIL] control build failed"; exit 1; }; [[ $rcn == 1 ]] && caught=$((caught + 1)); done
