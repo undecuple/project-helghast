@@ -3,7 +3,7 @@
 All notable user-facing changes, newest first, in the style of [Keep a Changelog](https://keepachangelog.com/). The
 project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
-## [Unreleased]
+## [0.1.11] - 2026-11-23 (pre-release)
 
 ### Added
 - Options > Graphics: a new page with a Quality preset row. High, the default, is the game's own look; changing a setting on the page turns the preset to Custom. Bloom moved here from the Display page. In multiplayer the page is locked and the game uses the High values. The choice is saved in `display.ini`.
