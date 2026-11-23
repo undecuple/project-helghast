@@ -35,7 +35,7 @@
 <p class="what">A Windows x64 port of the 2011 PS3 game, made by static recompilation: the game&#x27;s PowerPC and SPU code is translated to C ahead of time and compiled into a native PC program, so no CPU emulator runs at play time. The GPU is still translated as it runs (RSX to Direct3D 12); native replacements come step by step.</p>
 <p class="headline">Status: <strong>Partly playable</strong></p>
 <p class="note">You need your own copy of the game. This project ships no game code, data, assets or keys.</p>
-<p class="note">v0.1.10 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
+<p class="note">v0.1.11 is a pre-release; calling a release playable waits for the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>.</p>
 <p class="btns"><a class="btn" href="#status">See the status</a><a class="btn alt" href="https://github.com/undecuple/project-helghast">Source on GitHub</a></p>
 </section>
 <section id="shots" class="sec" aria-labelledby="h-shots">
@@ -287,9 +287,9 @@
 </section>
 <section id="install" class="sec" aria-labelledby="h-install">
 <h2 id="h-install">Install</h2>
-<p class="lede">v0.1.10 pre-release: the installer or the portable zip, built on your PC from your own copy.</p>
-<p class="headline"><strong>v0.1.10 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
-<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.10">v0.1.10</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10 minutes on a fast PC, longer on slower ones. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
+<p class="lede">v0.1.11 pre-release: the installer or the portable zip, built on your PC from your own copy.</p>
+<p class="headline"><strong>v0.1.11 pre-release</strong>, partly playable (see the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/RELEASE-CRITERIA.md">release criteria</a>).</p>
+<p>Download the installer (recommended) or the portable zip from the <a href="https://github.com/undecuple/project-helghast/releases">releases page</a> (the <a href="https://github.com/undecuple/project-helghast/releases/tag/v0.1.11">v0.1.11</a> page lists both). Check the download against SHA256SUMS on the same page. You need your own copy: the disc dump, the 1.14 update and the decrypted EBOOT. The first start recompiles and builds the port on your machine with a bundled compiler, with one progress bar and a full install log; allow about 10 minutes on a fast PC, longer on slower ones. Nothing of the game is shipped or downloaded; your dump is read where it is, never copied.</p>
 <p>You can also build the port from source: <a href="https://github.com/undecuple/project-helghast/blob/main/docs/BUILDING.md">building</a>.</p>
 <h4>What goes online</h4>
 <p>Nothing, unless you ask for it: an optional new-version check (one anonymous request to GitHub, only when you turn it on), an opt-in Discord status (still being tested; the Discord app on your PC shows it, the port sends nothing over the network for it) and online multiplayer only through a self-hosted server you choose. The full list is in the <a href="https://github.com/undecuple/project-helghast/blob/main/docs/PRIVACY.md">privacy page</a>.</p>
@@ -302,14 +302,14 @@
 <section id="changelog" class="promo term">
 <h3>Changelog</h3>
 <ul class="clog">
-<li><time datetime="2026-11-09">11-09</time><span>On Windows, game files with long names could not be written to the port&#x27;s disk cache when the full path went...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The launcher creates `display.ini` (every display setting at its default) and `online.ini` (every key...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The 3-bone vertex skinning of the animation SPU job runs as native code by default with the 1.14 update...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The Options &gt; Display page keeps labels and values apart in languages with long labels: the value column is...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The frame rate limit&#x27;s tooltip on the Options &gt; Display page now says the limit applies in missions, while...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>The log names the frame rate limit in force and its pacing tick (`[pace]` line) at the start and whenever...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>After a language change, the menu pages the port rewrites (the Options pages) are no longer read back from...</span></li>
-<li><time datetime="2026-11-04">11-04</time><span>If the graphics driver cannot hand over the window&#x27;s image for a frame, that frame is skipped and the window...</span></li>
+<li><time datetime="2026-11-23">11-23</time><span>Options &gt; Graphics: a new page with a Quality preset row. High, the default, is the game&#x27;s own look...</span></li>
+<li><time datetime="2026-11-23">11-23</time><span>The release zip includes a `recomplauncher.json` so RecompLauncher can install and start the port.</span></li>
+<li><time datetime="2026-11-23">11-23</time><span>The project website is a console-style front-end menu (sections in a left-hand list, a details panel...</span></li>
+<li><time datetime="2026-11-23">11-23</time><span>Keyboard and mouse handling for the valve and charge motion sections (Flooded Pyrrhus burning gate, for...</span></li>
+<li><time datetime="2026-11-23">11-23</time><span>Optional autocomplete for those sections, off by default: set `autocomplete = hold` under `[motion]` in...</span></li>
+<li><time datetime="2026-11-23">11-23</time><span>When the game ends with an error, or its log shows that the update&#x27;s patch folders or a Direct3D 12 graphics...</span></li>
+<li><time datetime="2026-11-23">11-23</time><span>Setup, the console and the launcher check that the 1.14 update folder holds the two patch folders the game...</span></li>
+<li><time datetime="2026-11-23">11-23</time><span>The depth-of-field gather of the post-processing runs as native code by default with the 1.14 update...</span></li>
 </ul>
 <p class="small">Newest first; the full list is in <a href="https://github.com/undecuple/project-helghast/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
 </section>
