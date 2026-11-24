@@ -143,6 +143,7 @@ port/vfs/test_native_rekey.sh
 tools/smoke/test_cam_interp.sh
 tools/smoke/test_fsr31_motion.sh
 tools/smoke/test_fsr31_inputs.sh
+tools/smoke/test_fsr31_build.sh
 tools/smoke/test_upscale_switch.py
 tools/smoke/test_upscale_config.py
 tools/release/test_stage_fidelityfx.py
