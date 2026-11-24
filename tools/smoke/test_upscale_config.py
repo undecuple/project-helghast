@@ -55,7 +55,7 @@ def main():
     video = args.candidate_sdk / 'libs/video'
     upscale_h = video / 'rsx_upscale.h'
     if not upscale_h.is_file() or 'rsx_upscale_register_backend' not in upscale_h.read_text(encoding='utf-8'):
-        print(f'[test_upscale_config] SKIP: no toolkit with patch 2220 at {args.candidate_sdk} '
+        print(f'[test_upscale_config] SKIP: no toolkit with patch 2290 at {args.candidate_sdk} '
               '(run tools/ps3recomp-patched.sh)')
         return 0
     src = (root / 'port/kz3/main.cpp').read_text(encoding='utf-8').replace('\r\n', '\n')

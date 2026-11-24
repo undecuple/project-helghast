@@ -105,7 +105,7 @@ static void eligibility_tests(void) {
         if(kind==8) bad->desc.Width=0;
         const rsx_present_geometry p=normal_route();
         char name[96];snprintf(name,sizeof name,"%s-upscale-reject-%s",phase?"after":"before",names[kind]);
-        /* An ineligible source is refused before the pipeline. An ineligible upscale result (patch 2221) is refused the same way
+        /* An ineligible source is refused before the pipeline. An ineligible upscale result (patch 2291) is refused the same way
          * and the present falls back to the original image, which scales fine: one blit, one pipeline call, a clean frame. */
         check(name,phase?(blits==1&&!copies&&clears==0&&p.valid&&pipeline_calls==1&&upscale_calls==1&&state_invalidations==1)
                         :(!blits&&!copies&&clears==1&&!p.valid&&pipeline_calls==0&&upscale_calls==0&&state_invalidations==0));

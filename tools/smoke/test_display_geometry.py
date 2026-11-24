@@ -119,7 +119,7 @@ def variants(parts, helpers):
         helpers, {'skipped-present-retains-snapshot'})]
     cases += [('omit-source-eligibility', mutate(parts, 'blit', '!ld_pg_blit_eligible(&sd, &bd) || ', ''),
         helpers, {'before-upscale-reject-typeless'})]
-    # patch 2221: the upscale pass is ld_upscale_present (in the helpers); its result goes through the blit's source check
+    # patch 2291: the upscale pass is ld_upscale_present (in the helpers); its result goes through the blit's source check
     cases += [('omit-upscale-state-invalidation', parts, replace_once(helpers,
         '    LD_SM_INVALIDATE(); /* upscale compute changed command-list bindings, including rejected outputs */\n', ''),
         {'rejected-upscale-output-invalidates-bindings'})]

@@ -1,4 +1,4 @@
-KZ3 patch 2221 (ENHANCEMENT, experimental): publish generic temporal-upscaler inputs from the live renderer.
+KZ3 patch 2291 (ENHANCEMENT, experimental): publish generic temporal-upscaler inputs from the live renderer.
 
 The renderer exposes draw and scene-writeback metadata through optional callbacks. Ports own all game-specific
 recognition and return only generic actions: jitter this draw, snapshot this depth, capture after this draw, or
@@ -593,7 +593,7 @@ index d7086e0..c88953b 100644
      if (rsx_ui_read(&presented_surface->ui, &geometry.hud_kx, &geometry.hud_ky))
          geometry.hud_provenance = RSX_PG_HUD_SURFACE_OWNER;
      ld_dm_sync_size();                                    /* patch 2095: back buffers at the client size */
-+    /* patch 2070: scan-out gamma on the presented surface at its own size, before any upscaler (as before patch 2221).
++    /* patch 2070: scan-out gamma on the presented surface at its own size, before any upscaler (as before patch 2291).
 +     * The upscaler reads the corrected copy, so the shared host-AA texture keeps the surface size every frame and the
 +     * fallback below reuses this copy instead of running gamma again. */
 +    ID3D12Resource* gm_copy = ld_gamma_present_resource(

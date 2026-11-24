@@ -15,7 +15,7 @@ if [[ -z "$CXX_WIN" && "$(c++ -dumpmachine 2>/dev/null)" == *mingw* ]]; then CXX
 if [[ -z "$CXX_WIN" ]]; then
   echo "[test_fsr31_build] SKIP: no MinGW-w64 C++ compiler (run in nix develop .#win)"; exit 0; fi
 if ! grep -qs rsx_upscale_register_backend "$PT/libs/video/rsx_upscale.h" || ! grep -qs rsx_live_upscale_hooks "$PT/libs/video/rsx_live_draw.h"; then
-  echo "[test_fsr31_build] SKIP: toolkit without patches 2220-2221 ($PT; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_fsr31_build] SKIP: toolkit without patches 2290-2291 ($PT; run tools/ps3recomp-patched.sh)"; exit 0; fi
 O="$ROOT/build/smoke-host/fsr31-build"; mkdir -p "$O"
 flags=(-std=c++20 -O2 -Wall -Wextra -Wno-cast-function-type -Wno-switch
        -I"$ROOT/port/kz3" -I"$PT/libs/video" -I"$PT/include" -I"$ROOT/third_party/fidelityfx-sdk/ffx-api/include")

@@ -88,7 +88,7 @@ def main():
         return 0
     live = live_path.read_text(encoding='utf-8').replace('\r\n', '\n')
     if 'static void ld_up_apply_pending(void)\n{' not in live:
-        print('[test_upscale_switch] FAIL: rsx_live_draw.c has no ld_up_apply_pending (patch 2221 is not applied)')
+        print('[test_upscale_switch] FAIL: rsx_live_draw.c has no ld_up_apply_pending (patch 2291 is not applied)')
         return 1
     block, flush = extracted(live)
     harness = (HERE / 'test_upscale_switch.c').read_text(encoding='utf-8').replace('\r\n', '\n')
