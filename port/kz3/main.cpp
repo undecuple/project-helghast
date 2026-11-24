@@ -843,6 +843,14 @@ static void kz3_upscale_apply(void)
             : (float)InterlockedCompareExchange(&s_fsr_sharpness_eff, 0, 0) / 1000.0f);
 }
 
+/* A temporal upscaler is selected: only then does the camera hook keep the pose and projection it needs (review of
+ * PR #27: the bookkeeping ran on every camera update with the upscaler off). */
+static inline bool kz3_upscale_temporal(void)
+{
+    const LONG b = InterlockedCompareExchange(&s_upscale_eff, 0, 0);
+    return b == RSX_UPSCALE_DLAA || b == RSX_UPSCALE_DLSS || b == RSX_UPSCALE_FSR3 || b == RSX_UPSCALE_XESS;
+}
+
 static void kz3_display_save(int mode, int scaling, int filter, int vsync)
 {
     wchar_t p[1100];
@@ -3226,7 +3234,8 @@ static void kz3_cam_fov(ppu_context* ctx)
     if (src_ok && (s_log == 1 || kz3_latch_on())) kz3_cam_latch(ctx, src);   /* RSX pass 105: before the pose copy */
     if (src_ok) kz3_arms_follow(src, cam0, s_log == 1);   /* RSX pass 122 */
 #ifdef _WIN32
-    if (src_ok) {
+    if (!kz3_upscale_temporal()) s_fsr_camera_pending = 0;
+    else if (src_ok) {
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++)
                 s_fsr_camera_pose[i * 4 + j] = kz3_bef(src + 0x10 * i + 4 * j);
@@ -3292,7 +3301,7 @@ static void kz3_vf22_aspect(ppu_context* ctx)   /* GameViewGame::vf22 @0x007E590
         if (s_fov_applied) ctx->fpr[1] = (double)(float)(ctx->fpr[1] * s_fov_k);   /* RSX pass 103 */
         kz3_fov_view_note((uint32_t)ctx->gpr[31], A0, ctx->fpr[1]);   /* RSX pass 121 */
 #ifdef _WIN32
-        if (s_fsr_camera_pending &&
+        if (s_fsr_camera_pending && kz3_upscale_temporal() &&
             s_fsr_camera_view == (uint32_t)ctx->gpr[31]) {
             for (const Kz3FovView& fv : s_fov_views) {
                 if (fv.view == s_fsr_camera_view && fv.vw > 0.0f) {
@@ -3372,7 +3381,7 @@ static void kz3_cam_vf17_hud(ppu_context* ctx)   /* Camera::vf17 0x00329D80 (1.0
         }
     }
 #ifdef _WIN32
-    if (lr == s_fsr_projection_lr &&
+    if (lr == s_fsr_projection_lr && kz3_upscale_temporal() &&
         out >= 0x10000u && out < 0xF0000000u) {
         /*
          * Camera::vf17's second and third floats are the near and far

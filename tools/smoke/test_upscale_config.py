@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""How port/kz3/main.cpp configures the upscaler (review of PR #27, point 1); no game, GPU or Windows binary.
+"""How port/kz3/main.cpp configures the upscaler (review of PR #27, points 1 and 4); no game, GPU or Windows binary.
 
-Extracts kz3_upscale_parse and kz3_upscale_apply from main.cpp, compiles them with the patched toolkit's
-rsx_upscale.c and the harness in test_upscale_config.cpp, and runs the cases. Each mutant puts back one defect the
-review found and must fail the named check: the "fsr 1" / "fsr_1" spellings refused, and FSR 1 given FSR 3.1's
-sharpness instead of RSX_UPSCALE_SHARPNESS.
+Extracts kz3_upscale_parse, kz3_upscale_apply and kz3_upscale_temporal from main.cpp, compiles them with the patched
+toolkit's rsx_upscale.c and the harness in test_upscale_config.cpp, and runs the cases. Each mutant puts back one
+defect the review found and must fail the named check: the "fsr 1" / "fsr_1" spellings refused, FSR 1 given FSR 3.1's
+sharpness instead of RSX_UPSCALE_SHARPNESS, and the camera bookkeeping running with the upscaler off.
 SKIP when the patched toolkit is missing.
 """
 import argparse
@@ -61,6 +61,7 @@ def main():
     src = (root / 'port/kz3/main.cpp').read_text(encoding='utf-8').replace('\r\n', '\n')
     parse = function(src, 'static int kz3_upscale_parse(const char* text)')
     apply = function(src, 'static void kz3_upscale_apply(void)')
+    temporal = function(src, 'static inline bool kz3_upscale_temporal(void)')
     harness = (HERE / 'test_upscale_config.cpp').read_text(encoding='utf-8').replace('\r\n', '\n')
     out = args.out or Path(tempfile.mkdtemp(prefix='kz3-upscale-config-'))
     out.mkdir(parents=True, exist_ok=True)
@@ -76,17 +77,19 @@ def main():
         print('[test_upscale_config] FAIL: kz3_upscale_parse has no fallback to the toolkit names')
         return 1
     cases = [
-        ('candidate', parse, apply, set()),
-        ('port-names-only', toolkit_only, apply, {'fsr-1-spelling', 'fsr_1-spelling'}),
+        ('candidate', parse, apply, temporal, set()),
+        ('port-names-only', toolkit_only, apply, temporal, {'fsr-1-spelling', 'fsr_1-spelling'}),
         ('one-sharpness', parse, replace_once(apply, '''        backend == RSX_UPSCALE_FSR1
             ? s_fsr1_sharpness
-            : (float)''', '        (float)'), {'fsr1-sharpness'}),
+            : (float)''', '        (float)'), temporal, {'fsr1-sharpness'}),
+        ('camera-always', parse, apply, temporal.replace('    const LONG b', '    return true;\n    const LONG b'),
+         {'camera-idle-without-temporal'}),
     ]
     failed = 0
-    for label, p, a, expected in cases:
+    for label, p, a, t, expected in cases:
         source = out / f'{label}.cpp'
         binary = out / (label + ('.exe' if os.name == 'nt' else ''))
-        source.write_text(replace_once(harness, '/* @@EXTRACTED@@ */', '\n'.join((p, a)) + '\n'), encoding='utf-8')
+        source.write_text(replace_once(harness, '/* @@EXTRACTED@@ */', '\n'.join((p, a, t)) + '\n'), encoding='utf-8')
         command = shlex.split(args.cxx) + ['-std=c++17', '-O1', '-Wall', '-Wextra', '-Wno-unused-function',
                                            '-Wno-unused-parameter', '-Wno-missing-field-initializers',
                                            '-Wno-unreachable-code', '-I', str(video), '-I',

@@ -89,6 +89,9 @@ already hold a scene capture or depth snapshot that reads it. The switch waits f
 frame's list is then submitted, the renderer waits for its fence, releases the old context and creates the new
 one. Turning the upscaler off and on again within one frame keeps the context.
 
+The camera hooks keep the pose and projection only while a temporal upscaler is selected; with the upscaler off
+they do no extra work.
+
 ## Frame pipeline
 
 ### 1. Camera publication

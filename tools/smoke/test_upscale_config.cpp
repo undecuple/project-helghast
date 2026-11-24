@@ -1,6 +1,7 @@
-// Host harness for tools/smoke/test_upscale_config.py (review of PR #27, point 1): how port/kz3/main.cpp turns
-// RSX_UPSCALE / display.ini names and sharpness values into the renderer's upscaler request. The driver pastes
-// kz3_upscale_parse and kz3_upscale_apply from main.cpp where the marker line is. No game data, no GPU, no Windows headers.
+// Host harness for tools/smoke/test_upscale_config.py (review of PR #27, points 1 and 4): how port/kz3/main.cpp turns
+// RSX_UPSCALE / display.ini names and sharpness values into the renderer's upscaler request, and when the camera hooks
+// keep FSR 3.1's pose. The driver pastes kz3_upscale_parse, kz3_upscale_apply and kz3_upscale_temporal from main.cpp
+// where the marker line is. No game data, no GPU, no Windows headers.
 #include <stdio.h>
 #include <string.h>
 #include "rsx_upscale.h"
@@ -58,6 +59,17 @@ int main()
     s_upscale_eff = RSX_UPSCALE_FSR3;
     kz3_upscale_apply();
     check("fsr3-sharpness", last_backend == RSX_UPSCALE_FSR3 && last_sharpness > 0.299f && last_sharpness < 0.301f);
+
+    s_upscale_eff = RSX_UPSCALE_NONE;
+    const bool off = kz3_upscale_temporal();
+    s_upscale_eff = RSX_UPSCALE_FSR1;
+    const bool spatial = kz3_upscale_temporal();
+    s_upscale_eff = RSX_UPSCALE_FSR3;
+    const bool fsr3 = kz3_upscale_temporal();
+    s_upscale_eff = RSX_UPSCALE_XESS;
+    const bool xess = kz3_upscale_temporal();
+    check("camera-idle-without-temporal", !off && !spatial);
+    check("camera-kept-for-temporal", fsr3 && xess);
 
     printf("%u checks, %u failed\n", checks, fails);
     return fails ? 1 : 0;
