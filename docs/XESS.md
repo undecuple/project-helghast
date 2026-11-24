@@ -212,6 +212,14 @@ python tools\release\test_xess_runtime.py
 The PowerShell test verifies the DLL hash before copying it beside the test executable. No Intel binary is committed
 or added to a release payload.
 
+What CI covers: `test_xess_runtime.py` runs on Linux and in the `release-tools-windows` job (there, with the
+Authenticode path checks). The same Windows job builds the patched ps3recomp tree, fetches the release's pinned
+llvm-mingw (`fetch_toolchain.py --only llvm-mingw`) and runs `tools/smoke/test_xess_compile.sh` with
+`KZ3_XESS_COMPILE_REQUIRED=1`, which compiles `port/kz3/xess.cpp`, `test_xess.cpp` and `test_xess_temporal.cpp` with
+`-Werror` and fails rather than skips when the tree or compiler is missing. Nothing is linked or run there: running
+the programs needs Intel's DLL and a D3D12 GPU, so `test_xess.ps1` stays a manual test. On the Linux CI shell the
+compile part of `test_xess_compile.sh` skips (no Windows-target compiler); its renderer-boundary checks still run.
+
 ## References
 
 - [Intel XeSS SDK](https://github.com/intel/xess)

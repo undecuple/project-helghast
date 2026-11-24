@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Compile the XeSS adapter and enforce the generic renderer boundary. No game data or GPU.
+# Compile the XeSS adapter (port/kz3/xess.cpp) and the two Windows XeSS test programs, and enforce the generic
+# renderer boundary. No game data or GPU; nothing is linked or run (tools/smoke/test_xess.ps1 runs them by hand, with
+# Intel's DLL and a D3D12 GPU).
+#
+# The Linux CI shell has no Windows-target compiler, so there the compile part SKIPs; CI's release-tools-windows job
+# runs this with the release's own pinned llvm-mingw and KZ3_XESS_COMPILE_REQUIRED=1 (default unset: a missing
+# patched tree or compiler is SKIP; set to 1: either one is FAIL, so a CI step can never pass by skipping).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/tools/pyresolve.sh"
@@ -8,9 +14,16 @@ PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 R="$PT/libs/video/rsx_live_draw.c"
 H="$PT/libs/video/rsx_live_draw.h"
 U="$PT/libs/video/rsx_upscale.h"
-if [[ ! -f "$R" || ! -f "$H" || ! -f "$U" ]]; then
-  echo "[test_xess_compile] SKIP: patched renderer not found ($PT)"
+skip() {
+  if [[ "${KZ3_XESS_COMPILE_REQUIRED:-}" == 1 ]]; then
+    echo "[test_xess_compile] FAIL: $1 (KZ3_XESS_COMPILE_REQUIRED=1)" >&2
+    exit 1
+  fi
+  echo "[test_xess_compile] SKIP: $1"
   exit 0
+}
+if [[ ! -f "$R" || ! -f "$H" || ! -f "$U" ]]; then
+  skip "patched renderer not found ($PT)"
 fi
 
 $PY - "$R" "$H" <<'PY'
@@ -67,11 +80,15 @@ elif [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]] && command -v g++ >
   CXX=g++
 fi
 if [[ -z "$CXX" ]]; then
-  echo "[test_xess_compile] SKIP compile: no Windows-target C++ compiler"
-  exit 0
+  skip "no Windows-target C++ compiler (compile part)"
 fi
+echo "[test_xess_compile] compiler: $("$CXX" --version | head -n 1)"
 mkdir -p "$O"
-"$CXX" -std=c++20 -O2 -Wall -Wextra -Werror -Wno-cast-function-type \
-  -I"$ROOT/port/kz3" -I"$PT/libs/video" -I"$PT/include" \
-  -c "$ROOT/port/kz3/xess.cpp" -o "$O/xess.o"
+# Same flags as test_xess.ps1, compile only.
+for src in port/kz3/xess.cpp tools/smoke/test_xess.cpp tools/smoke/test_xess_temporal.cpp; do
+  "$CXX" -std=c++20 -O2 -Wall -Wextra -Werror -Wno-cast-function-type \
+    -I"$ROOT/port/kz3" -I"$PT/libs/video" -I"$PT/include" \
+    -c "$ROOT/$src" -o "$O/$(basename "$src" .cpp).o"
+  echo "[test_xess_compile] compiled $src"
+done
 echo "[test_xess_compile] PASS"

@@ -43,10 +43,11 @@ jobs:
 
   # The release build runs these tests on windows-latest; a Windows-only failure (path, line-end or registry
   # behaviour) would otherwise only show up when a release is built. Same shell, line endings and python3 shim as
-  # release.yml's installer job. No installer build, no secrets.
+  # release.yml's installer job. No installer build, no secrets. It also compiles the Windows-only XeSS adapter
+  # (port/kz3/xess.cpp) and its test programs with the llvm-mingw the installer bundles, which the Linux job cannot.
   release-tools-windows:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       PYTHONUTF8: "1"
     defaults:
@@ -79,6 +80,20 @@ jobs:
 
       - name: Mission-0 benchmark synthetic tests (Windows)
         run: python3 -B tools/perf/test_mission0.py
+
+      - name: Patches apply to the pinned ps3recomp (Windows)
+        run: bash tools/ps3recomp-patched.sh
+
+      - name: Pinned llvm-mingw (toolchain.json, SHA-256 checked)
+        run: python3 tools/release/fetch_toolchain.py --only llvm-mingw
+
+      - name: XeSS adapter and test programs compile (no GPU, nothing run)
+        # REQUIRED=1: a missing tree or compiler fails the step instead of skipping it.
+        env:
+          KZ3_XESS_COMPILE_REQUIRED: "1"
+        run: |
+          PATH="$PWD/work/release/toolchain-cache/trees/llvm-mingw/bin:$PATH"
+          bash tools/smoke/test_xess_compile.sh
 
   secrets:
     runs-on: ubuntu-latest
