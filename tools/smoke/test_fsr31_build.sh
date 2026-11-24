@@ -11,7 +11,7 @@ CXX_WIN=""
 for c in "${CXX_WIN64:-}" x86_64-w64-mingw32-g++ x86_64-w64-mingw32ucrt-g++; do
   if [[ -n "$c" ]] && command -v "$c" >/dev/null 2>&1; then CXX_WIN="$c"; break; fi
 done
-if [[ -z "$CXX_WIN" && "$(c++ -dumpmachine 2>/dev/null)" == *mingw* ]]; then CXX_WIN=c++; fi   # .#win shell: c++ is the cross compiler
+if [[ -z "$CXX_WIN" && "$(c++ -dumpmachine 2>/dev/null)" == *mingw* ]]; then CXX_WIN="c++"; fi   # .#win shell: c++ is the cross compiler
 if [[ -z "$CXX_WIN" ]]; then
   echo "[test_fsr31_build] SKIP: no MinGW-w64 C++ compiler (run in nix develop .#win)"; exit 0; fi
 if ! grep -qs rsx_upscale_register_backend "$PT/libs/video/rsx_upscale.h" || ! grep -qs rsx_live_upscale_hooks "$PT/libs/video/rsx_live_draw.h"; then
