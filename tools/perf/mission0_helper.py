@@ -32,6 +32,10 @@ import shaders  # noqa: E402
 
 WINDOW_START = 265
 WINDOW_END = 325
+# Movement starts at 145 s and the route runs to 325 s (the benchmark has its own route; the installer's
+# shader prep in tools/release/shaders.py is unchanged).
+MISSION_START = 145
+ROUTE_END = 325
 MAX_FLIP_GAP_MS = 2000
 MAX_PAD_LATENESS = 2.0
 MAX_PAD_ALIGNMENT_ERROR = 2.0
@@ -118,8 +122,17 @@ def _logged_action(line, kind):
             "seconds", round(float(match.group(7)), 2))
 
 
+def profile_route_script():
+    """Mission-0 benchmark route: the installer's menu-fast profile route, but with its own mission
+    start and end, so the installer's shader prep keeps its shorter route."""
+    ev = [(t, f"{m:#06x}") for t, m in shaders.MENU_FAST]
+    ev += shaders.in_level(MISSION_START, ROUTE_END - MISSION_START)
+    ev.sort(key=lambda e: e[0])
+    return "\n".join(f"{t}:{b}" for t, b in ev) + "\n", ROUTE_END
+
+
 def route():
-    script, duration = shaders.route_script("profile")
+    script, duration = profile_route_script()
     events = _script_events(script)
     if not events:
         fail("route_invalid")
@@ -131,7 +144,7 @@ def route():
         fail("route_invalid")
     return {"script": script, "duration_seconds": duration, "window_start": WINDOW_START,
             "window_end": WINDOW_END, "clock": "flip_ms_since_first_flip", "event_count": len(events),
-            "mission_start": shaders.PROFILE_LEVEL_START,
+            "mission_start": MISSION_START,
             "pad_lateness_seconds": MAX_PAD_LATENESS, "pad_alignment_seconds": MAX_PAD_ALIGNMENT_ERROR,
             "sha256": hashlib.sha256(script.encode("utf-8")).hexdigest()}
 
