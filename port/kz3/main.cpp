@@ -796,6 +796,9 @@ static int s_upscale_saved = RSX_UPSCALE_NONE;
 static int s_upscale_env;
 static volatile LONG s_fsr_sharpness_eff = KZ3_FSR31_SHARPNESS_DEFAULT;
 static int s_fsr_sharpness_saved = KZ3_FSR31_SHARPNESS_DEFAULT;
+/* RSX_UPSCALE_SHARPNESS (0 to 2, RCAS stops; default 0.2) is FSR 1's sharpness, as the toolkit read it before this port
+ * configured the upscaler itself (patch 2145); FSR 3.1 keeps its own 0..1 scale (fsr_sharpness, KZ3_FSR_SHARPNESS). */
+static float s_fsr1_sharpness = RSX_UPSCALE_SHARPNESS_DEFAULT;
 static int s_dm_saved[4] = { RSX_DM_WINDOWED, RSX_DM_STRETCH, RSX_DM_BILINEAR, RSX_DM_VSYNC_ON };
 static CRITICAL_SECTION s_dm_save_lock;
 static INIT_ONCE s_dm_save_once = INIT_ONCE_STATIC_INIT;
@@ -811,7 +814,13 @@ static int kz3_upscale_parse(const char* text)
         return RSX_UPSCALE_FSR1;
     if (rsx_dm_ieq(text, n, "fsr3") || rsx_dm_ieq(text, n, "fsr31") ||
         rsx_dm_ieq(text, n, "fsr3.1")) return RSX_UPSCALE_FSR3;
-    return -1;
+    /* the toolkit's own spellings (rsx_upscale_parse_backend: "fsr 1", "fsr_1" and the backend names) */
+    char name[16];
+    if (n >= sizeof name) return -1;
+    memcpy(name, text, n);
+    name[n] = 0;
+    const rsx_upscale_backend b = rsx_upscale_parse_backend(name);
+    return b != RSX_UPSCALE_NONE && rsx_upscale_backend_implemented(b) ? (int)b : -1;
 }
 
 static const char* kz3_upscale_name(int backend)
@@ -825,12 +834,13 @@ static const char* kz3_upscale_name(int backend)
 
 static void kz3_upscale_apply(void)
 {
+    const rsx_upscale_backend backend =
+        (rsx_upscale_backend)InterlockedCompareExchange(&s_upscale_eff, 0, 0);
     rsx_live_draw_set_upscale(
-        (rsx_upscale_backend)InterlockedCompareExchange(
-            &s_upscale_eff, 0, 0),
-        (float)InterlockedCompareExchange(
-            &s_fsr_sharpness_eff, 0, 0) /
-            1000.0f);
+        backend,
+        backend == RSX_UPSCALE_FSR1
+            ? s_fsr1_sharpness
+            : (float)InterlockedCompareExchange(&s_fsr_sharpness_eff, 0, 0) / 1000.0f);
 }
 
 static void kz3_display_save(int mode, int scaling, int filter, int vsync)
@@ -1006,6 +1016,13 @@ static void kz3_display_load(void)
     InterlockedExchange(
         &s_upscale_eff,
         upe >= 0 ? upe : s_upscale_saved);
+    e = getenv("RSX_UPSCALE_SHARPNESS");   /* FSR 1 only; default 0.2 */
+    if (e && *e) {
+        char* end = NULL;
+        const double v = strtod(e, &end);
+        if (end && end != e) s_fsr1_sharpness = rsx_upscale_clamp_sharpness((float)v);
+        else fprintf(stderr, "[upscale] RSX_UPSCALE_SHARPNESS=\"%s\" is not a number: %.1f\n", e, s_fsr1_sharpness);
+    }
     e = getenv("KZ3_FSR_SHARPNESS");
     const int fse = e && *e ? kz3_fsr31_parse_sharpness(e) : -1;
     InterlockedExchange(

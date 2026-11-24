@@ -348,7 +348,13 @@ One-run overrides are:
 ```text
 RSX_UPSCALE=fsr3
 KZ3_FSR_SHARPNESS=0.0..1.0
+RSX_UPSCALE=fsr1
+RSX_UPSCALE_SHARPNESS=0..2
 ```
+
+`RSX_UPSCALE` accepts the same names as the `upscaler` key. `RSX_UPSCALE_SHARPNESS` is FSR 1's RCAS sharpness in
+stops (0 is sharpest, default 0.2), as before this port configured the upscaler itself; `KZ3_FSR_SHARPNESS` is FSR
+3.1's. While `RSX_UPSCALE` is set, the Upscaler row shows the forced backend and does not change it.
 
 The Options page has separate Scaling filter, Upscaler and FSR sharpness rows. Selecting FSR in the Upscaler row
 opens a confirmation dialog that names the camera-derived motion and combined scene/UI limitations. Reset restores
