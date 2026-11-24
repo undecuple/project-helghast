@@ -4,7 +4,9 @@
 Checks, with no game data: every file under licenses/ is listed in licenses/README.md and the reverse; the payload's
 fixed licence names (assemble_payload.py) and the toolchain manifest's license_file entries exist under licenses/;
 each text is byte-identical to its source where that source is present (the repo's LICENSE, the ps3recomp
-submodule, work/release/{sdl3,fonts}, the toolchain cache). A missing source is SKIP, not FAIL.
+submodule, work/release/{sdl3,fonts}, the toolchain cache). A missing source is SKIP, not FAIL. The Intel XeSS texts,
+whose source is only the downloaded SDK archive, are checked against the size and SHA-256 that xess_runtime.py pins
+(always, so a checkout that rewrote their CRLF line endings fails here).
 Run: python3 tools/release/test_licenses_match.py
 """
 import json
@@ -16,6 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import assemble_payload as ap  # noqa: E402
+import xess_runtime as xr  # noqa: E402
 
 
 def pub(rel):
@@ -60,6 +63,15 @@ def main():
             check(same(os.path.join(lic, rel), src), f"{rel} is byte-identical to its source")
         elif rel in have:
             print(f"SKIP {rel}: source not present here")
+
+    for name, pin in xr.FILES.items():
+        if name.endswith(".dll"):
+            continue
+        check(name in have, f"XeSS text {name} exists in licenses/")
+        if name in have:
+            problem = xr.pinned_problem(os.path.join(lic, name), pin, name)
+            check(not problem, f"{name} matches the pinned XeSS SDK {xr.SDK_VERSION} text byte for byte"
+                  + (f" ({problem})" if problem else ""))
 
     with open(os.path.join(HERE, "toolchain.json"), encoding="utf-8") as f:
         comps = json.load(f)["components"]

@@ -3,4 +3,6 @@
 *.png binary
 *.patch -text linguist-generated=true
 re/data/*.tsv linguist-generated=true
-licenses/Intel-XeSS-THIRD-PARTY-NOTICES.txt -whitespace
+# Intel's XeSS licence texts are stored byte for byte as Intel ships them (CRLF): xess_runtime.py pins their
+# SHA-256 and test_licenses_match.py compares the committed copies with those pins.
+licenses/Intel-XeSS-*.txt -text -whitespace
