@@ -49,9 +49,11 @@ int main()
                         kz3_upscale_parse("FSR31") == RSX_UPSCALE_FSR3);
     check("off-names", kz3_upscale_parse("none") == RSX_UPSCALE_NONE && kz3_upscale_parse("off") == RSX_UPSCALE_NONE &&
                        kz3_upscale_parse("0") == RSX_UPSCALE_NONE);
-    check("unregistered-or-unknown-refused", kz3_upscale_parse("xess") < 0 && kz3_upscale_parse("dlss") < 0 &&
-                                             kz3_upscale_parse("bogus") < 0 && kz3_upscale_parse("") < 0 &&
-                                             kz3_upscale_parse("a-very-long-backend-name") < 0);
+    // XeSS is a backend of this port (PR #32, patch 2292): its names parse to RSX_UPSCALE_XESS; whether its runtime is
+    // there is decided later (kz3_display_load falls back to upscaler_previous), not by the parser
+    check("xess-names", kz3_upscale_parse("xess") == RSX_UPSCALE_XESS && kz3_upscale_parse("XeSS-SR") == RSX_UPSCALE_XESS);
+    check("unknown-refused", kz3_upscale_parse("dlss") < 0 && kz3_upscale_parse("bogus") < 0 &&
+                             kz3_upscale_parse("") < 0 && kz3_upscale_parse("a-very-long-backend-name") < 0);
 
     s_upscale_eff = RSX_UPSCALE_FSR1;
     kz3_upscale_apply();
