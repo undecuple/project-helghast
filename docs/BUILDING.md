@@ -218,8 +218,8 @@ mode = windowed
 scaling = stretch
 ; bilinear (default) or nearest
 filter = bilinear
-; off (default) or fsr3 (experimental FSR 3.1 temporal upscaling)
-upscaler = off
+; none (default; off is read the same way) or fsr3 (experimental FSR 3.1 temporal upscaling)
+upscaler = none
 ; FSR RCAS sharpening, 0.0 to 1.0 in steps of 0.1; ignored when the upscaler is off
 fsr_sharpness = 0.2
 ; on (default) or off: off shows each frame as soon as it is ready, which can tear (Options > Display > VSync)

@@ -351,8 +351,9 @@ upscaler = fsr3
 fsr_sharpness = 0.2
 ```
 
-`filter` remains the independent spatial scaling choice, `bilinear` or `nearest`. `upscaler` is `off` by default
-and accepts `fsr3` for the experimental temporal path.
+`filter` remains the independent spatial scaling choice, `bilinear` or `nearest`. `upscaler` is `none` by default
+(the launcher and the Options page write `none`; `off` and `0` are read the same way) and accepts `fsr3` for the
+experimental temporal path. `fsr1` (also `fsr`, `fsr 1`, `fsr_1`) selects the spatial FSR 1 pass.
 
 `fsr_sharpness` is stored as a locale-independent value from `0.0` through `1.0`, rounded to the Options page's
 `0.1` steps. `0.2` is the default. It affects only FSR.
