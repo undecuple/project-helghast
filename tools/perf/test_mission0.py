@@ -222,7 +222,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_existing_route_and_fixed_window(self):
         spec = helper.route()
-        script, duration = helper.shaders.route_script("profile")
+        script, duration = helper.profile_route_script()
         self.assertEqual(spec["script"], script)
         self.assertEqual((spec["duration_seconds"], spec["window_start"], spec["window_end"]),
                          (duration, 265, 325))
