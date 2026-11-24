@@ -1,4 +1,4 @@
-KZ3 patch 3007: stamp scripted-pad delivery and guest flip events from the
+KZ3 patch 3011: stamp scripted-pad delivery and guest flip events from the
 same ps3_ms_now monotonic clock at their production points.  The benchmark can
 therefore align input delivery with the flip window directly, without treating
 cross-thread log-write order as timing evidence.
