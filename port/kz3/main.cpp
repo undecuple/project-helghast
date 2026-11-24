@@ -796,6 +796,13 @@ static volatile LONG s_upscale_eff = RSX_UPSCALE_NONE;
 static int s_upscale_saved = RSX_UPSCALE_NONE;
 static int s_upscale_previous_saved = RSX_UPSCALE_NONE;
 static int s_upscale_env;
+/* The XeSS camera bridge is fed only while XeSS is the upscaler in force, so a run with XeSS off writes no [xess]
+ * camera lines. Turning XeSS on in a running game leaves a gap of more than one flip in the bridge's history, which
+ * resets it (xess_camera.h), so the first XeSS frame starts from fresh history rather than a stale camera. */
+static int kz3_xess_camera_feed_on(void)
+{
+    return (int)InterlockedCompareExchange(&s_upscale_eff, 0, 0) == RSX_UPSCALE_XESS;
+}
 static volatile LONG s_fsr_sharpness_eff = KZ3_FSR31_SHARPNESS_DEFAULT;
 static int s_fsr_sharpness_saved = KZ3_FSR31_SHARPNESS_DEFAULT;
 /* RSX_UPSCALE_SHARPNESS (0 to 2, RCAS stops; default 0.2) is FSR 1's sharpness, as the toolkit read it before this port
@@ -3363,12 +3370,13 @@ static void kz3_vf22_aspect(ppu_context* ctx)   /* GameViewGame::vf22 @0x007E590
                         s_fsr_camera_pose,
                         s_fsr_camera_hfov,
                         fv.vw);
-                    kz3_xess_note_camera(
-                        s_fsr_camera_flip,
-                        s_fsr_camera_view,
-                        s_fsr_camera_pose,
-                        s_fsr_camera_hfov,
-                        fv.vw);
+                    if (kz3_xess_camera_feed_on())
+                        kz3_xess_note_camera(
+                            s_fsr_camera_flip,
+                            s_fsr_camera_view,
+                            s_fsr_camera_pose,
+                            s_fsr_camera_hfov,
+                            fv.vw);
                     break;
                 }
             }
@@ -3450,10 +3458,11 @@ static void kz3_cam_vf17_hud(ppu_context* ctx)   /* Camera::vf17 0x00329D80 (1.0
             cellGcm_flip_request_count(),
             kz3_bef(out + 4),
             kz3_bef(out + 8));
-        kz3_xess_note_camera_planes(
-            cellGcm_flip_request_count(),
-            kz3_bef(out + 4),
-            kz3_bef(out + 8));
+        if (kz3_xess_camera_feed_on())
+            kz3_xess_note_camera_planes(
+                cellGcm_flip_request_count(),
+                kz3_bef(out + 4),
+                kz3_bef(out + 8));
     }
 #endif
     if (lr != s_hudp_lr || out < 0x10000u || out >= 0xF0000000u) return;
