@@ -39,11 +39,11 @@ RSX draw replay
   -> capture opaque-plus-translucent scene color before the post-chain copy
 
 Presentation
+  -> apply the game's scan-out gamma to the presented surface at its own size
   -> consume the current-frame full-size R32_FLOAT depth snapshot
   -> generate R16G16_FLOAT depth-aware camera motion vectors
   -> generate an R8_UNORM reactive mask from the coherent scene captures
   -> dispatch FidelityFX FSR 3.1 into an RGBA8 output
-  -> apply the game's scan-out gamma
   -> use the existing display blit for Fit/Stretch and any final scaling
   -> present
 
@@ -250,14 +250,18 @@ and is returned in `D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE` for the display 
 
 ### 8. Gamma and final display scaling
 
-FSR runs before the existing scan-out gamma pass:
+The existing scan-out gamma pass runs first, on the presented surface at its render size, as it did before the
+upscaler work:
 
 ```text
-scene color -> FSR -> scan-out gamma -> display blit -> swap-chain back buffer
+scene color -> scan-out gamma -> FSR -> display blit -> swap-chain back buffer
 ```
 
-This preserves the port's existing interpretation of `cellVideoOutSetGamma`: gamma is a display operation, not
-part of the temporal input.
+Gamma is the game's `cellVideoOutSetGamma` display curve, applied once per frame. Running it at the render size
+keeps the shared host-AA texture, which the gamma pass writes into, at one size: running it on the upscaled image
+resized that texture between write-back (render size) and present (output size) every frame. If the upscaled image
+cannot be shown, the present falls back to the same corrected copy without a second gamma pass. FSR 3.1 therefore
+accumulates gamma-corrected color; the curve is monotonic, and with the default gamma of 1.0 no pass runs at all.
 
 The requested FSR output is the aspect-correct Fit rectangle or the full Stretch rectangle. Each output dimension
 is capped at three times the fixed render dimension. A larger window first receives at most a 3x FSR output and

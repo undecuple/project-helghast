@@ -109,6 +109,11 @@ static int pipeline_calls, upscale_calls, upscale_enabled, upscale_null, state_i
 static int copies, textures, clears, blits, invalid_copy, invalid_texture, invalid_barrier, swap_calls;
 static ID3D12Resource src_resource, bb_resource, gamma_resource, movie_resource, upload_resource, upscale_resource;
 static ID3D12Resource* gamma_copy;
+/* review of PR #27: gamma runs once, on the presented surface at its own size, and the upscaler reads its output */
+static int gamma_calls;
+static ID3D12Resource* gamma_source;
+static u32 gamma_width, gamma_height;
+static void* upscale_input;
 typedef struct {
     ID3D12Resource* tex;
     rsx_ui_provenance ui;
@@ -175,7 +180,8 @@ static ID3D12Resource* ld_dm_movie_target(u32 w, u32 h)
 static ID3D12Resource* ld_gamma_present_resource(ID3D12Resource* source, D3D12_RESOURCE_STATES state, u32 width, u32 height,
                                                  u32 location, u32 offset)
 {
-    (void)source; (void)state; (void)width; (void)height; (void)location; (void)offset;
+    (void)state; (void)location; (void)offset;
+    gamma_calls++; gamma_source = source; gamma_width = width; gamma_height = height;
     return gamma_copy;
 }
 static void ld_dm_sync_size(void) {}
@@ -230,7 +236,7 @@ static int rsx_upscale_wants_pass(rsx_upscale* up, unsigned iw, unsigned ih, uns
 static int rsx_upscale_evaluate(rsx_upscale* up, const rsx_upscale_eval* ev, rsx_upscale_result* out)
 {
     (void)up;
-    (void)ev;
+    upscale_input = ev->input.resource;
     upscale_calls++;
     out->resource = upscale_null ? NULL : &upscale_resource;
     out->state = D3D12_RESOURCE_STATE_COPY_SOURCE;

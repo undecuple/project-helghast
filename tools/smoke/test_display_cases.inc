@@ -23,6 +23,7 @@ static void reset(unsigned bw,unsigned bh) {
     g.srv_ring_used=0;g.movie_overlay_valid=0;
     pipeline_ok=movie_target_ok=slot_ok=1;present_result=S_OK;
     pipeline_calls=upscale_calls=upscale_enabled=upscale_null=state_invalidations=0;
+    gamma_calls=0;gamma_source=NULL;gamma_width=gamma_height=0;upscale_input=NULL;
     memset(&surface.ui,0,sizeof surface.ui);memset(&g.movie_overlay_ui,0,sizeof g.movie_overlay_ui);
     g_dm_present_n=20;g_dm_wide_n=-1000;g_dm_scaling=s_dm_scaling=RSX_DM_FIT;
     g_dm_filter=s_dm_filter=RSX_DM_BILINEAR;g_aspect=RSX_DM_ASPECT_SCREEN;
@@ -130,6 +131,17 @@ static void eligibility_tests(void) {
     make_resource(&upscale_resource,1920,1080,D3D12_RESOURCE_STATE_COPY_SOURCE);
     upscale_resource.desc.DepthOrArraySize=2;p=normal_route();
     check("rejected-upscale-output-invalidates-bindings",blits==1&&state_invalidations==1);
+    /* Scan-out gamma runs on the 1280x720 surface before the upscaler, which reads the corrected copy; a rejected upscale
+     * result falls back to that same copy without a second gamma pass (the shared host-AA texture keeps one size). */
+    reset(1920,1080);gamma_copy=&gamma_resource;upscale_enabled=1;
+    make_resource(&upscale_resource,1920,1080,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    p=normal_route();
+    check("gamma-before-upscale",gamma_calls==1&&gamma_source==&src_resource&&gamma_width==1280&&gamma_height==720&&
+                                 upscale_input==&gamma_resource&&blits==1&&p.valid);
+    reset(1920,1080);gamma_copy=&gamma_resource;upscale_enabled=1;
+    make_resource(&upscale_resource,1920,1080,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    upscale_resource.desc.DepthOrArraySize=2;p=normal_route();
+    check("upscale-fallback-reuses-gamma",gamma_calls==1&&gamma_width==1280&&blits==1&&p.valid&&!invalid_barrier);
     reset(1920,1080);bb_resource.desc.Format=87; /* BGRA8 RTV is not this PSO's output format. */
     p=normal_route();check("non-rgba8-target-rejected",!blits&&!p.valid&&clears==1&&!pipeline_calls);
 }

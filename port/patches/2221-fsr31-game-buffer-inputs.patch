@@ -5,16 +5,20 @@ recognition and return only generic actions: jitter this draw, snapshot this dep
 suppress host AA before writeback. Command-list and resource handles remain opaque at the interface boundary; no
 KZ3 offsets or pass rules are compiled into ps3recomp.
 
-The selected depth is snapshotted immediately after its draw. Presentation supplies that current-frame snapshot
-and jitter through rsx_upscale, evaluates before scan-out gamma, and safely restores resource states. Temporal
+The selected depth is snapshotted immediately after its draw. Presentation applies scan-out gamma to the presented
+surface at its own size first (as before this patch), then supplies the corrected copy, that current-frame snapshot
+and jitter through rsx_upscale and safely restores resource states. A failed upscale reuses the same corrected copy,
+so the shared host-AA texture keeps one size and gamma runs once per frame. Temporal
 requests use bilinear output geometry and explicit bilinear fallback even when the user selected Nearest. Failed
 upscaled blits fall back to the original image, and incompatible resources are never passed to CopyResource.
 
 Backend changes drain prior GPU work, all shutdown paths destroy the active context, and frame completion resets
 the interface's pre-HUD state. These hooks are shared by the port-owned FSR 3.1 adapter and a later XeSS backend.
 
+Host coverage: tools/smoke/test_display_geometry.py (gamma before the upscaler, fallback without a second gamma pass).
+
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index 5867a3ec..e586061d 100644
+index d7086e0..7e355a6 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
 @@ -102,6 +102,8 @@ int  rsx_live_draw_set_fullscreen(int on) { (void)on; return -1; }   /* patch 20
@@ -516,28 +520,28 @@ index 5867a3ec..e586061d 100644
      rsx_present_geometry geometry; memset(&geometry, 0, sizeof geometry);
      const int present_scaling = ld_dm_scaling_now();
      geometry.hud_kx = geometry.hud_ky = 1.0f;
-@@ -20211,36 +20408,102 @@ static void ld_present_body(u32 buffer_id)
+@@ -20211,36 +20408,95 @@ static void ld_present_body(u32 buffer_id)
      if (rsx_ui_read(&presented_surface->ui, &geometry.hud_kx, &geometry.hud_ky))
          geometry.hud_provenance = RSX_PG_HUD_SURFACE_OWNER;
      ld_dm_sync_size();                                    /* patch 2095: back buffers at the client size */
++    /* patch 2070: scan-out gamma on the presented surface at its own size, before any upscaler (as before patch 2221).
++     * The upscaler reads the corrected copy, so the shared host-AA texture keeps the surface size every frame and the
++     * fallback below reuses this copy instead of running gamma again. */
++    ID3D12Resource* gm_copy = ld_gamma_present_resource(
++        srcimg, D3D12_RESOURCE_STATE_RENDER_TARGET, presented_surface->w, presented_surface->h,
++        presented_surface->location, presented_surface->offset);
++    ID3D12Resource* scene_image = gm_copy ? gm_copy : srcimg;
++    const D3D12_RESOURCE_STATES scene_state =
++        gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET;
 +    u32 output_width = 0, output_height = 0;
 +    ld_up_output_size(&output_width, &output_height);
-+    D3D12_RESOURCE_STATES upscale_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    D3D12_RESOURCE_STATES upscale_state = scene_state;
 +    u32 upscale_width = presented_surface->w, upscale_height = presented_surface->h;
 +    ID3D12Resource* upscale = ld_upscale_present(
-+        srcimg, D3D12_RESOURCE_STATE_RENDER_TARGET,
++        scene_image, scene_state,
 +        output_width, output_height, &upscale_state, &upscale_width, &upscale_height);
-+    ID3D12Resource* scanout = upscale ? upscale : srcimg;
-+    D3D12_RESOURCE_STATES scanout_state =
-+        upscale ? upscale_state : D3D12_RESOURCE_STATE_RENDER_TARGET;
-+    u32 scanout_width = upscale ? upscale_width : presented_surface->w;
-+    u32 scanout_height = upscale ? upscale_height : presented_surface->h;
-+    ID3D12Resource* gm_copy = ld_gamma_present_resource(
-+        scanout, scanout_state, scanout_width, scanout_height,
-+        presented_surface->location, presented_surface->offset);
-+    ID3D12Resource* present_image = gm_copy ? gm_copy : scanout;
-+    D3D12_RESOURCE_STATES present_state =
-+        gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : scanout_state;
++    ID3D12Resource* present_image = upscale ? upscale : scene_image;
++    D3D12_RESOURCE_STATES present_state = upscale ? upscale_state : scene_state;
      const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
      ID3D12Resource* bb = g.backbuf[bbi];
      /* patch 2095: a client of another size gets the image scaled aspect-correct, else the old copy */
@@ -564,15 +568,8 @@ index 5867a3ec..e586061d 100644
 +        static u32 fallback_logs;
 +        if (fallback_logs++ < 4)
 +            fprintf(stderr, "[upscale] display blit failed; using the original image (frame %u)\n", g_ld_frames);
-+        scanout = srcimg;
-+        scanout_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-+        scanout_width = presented_surface->w;
-+        scanout_height = presented_surface->h;
-+        gm_copy = ld_gamma_present_resource(
-+            scanout, scanout_state, scanout_width, scanout_height,
-+            presented_surface->location, presented_surface->offset);
-+        present_image = gm_copy ? gm_copy : scanout;
-+        present_state = gm_copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : scanout_state;
++        present_image = scene_image;
++        present_state = scene_state;
 +        copy_ok = ld_pg_can_copy(present_image, bb);
 +        dm_scaled = !copy_ok &&
 +            ld_dm_blit(
@@ -643,7 +640,7 @@ index 5867a3ec..e586061d 100644
          const rsx_pg_resource d = ld_pg_resource(bb);
          const rsx_dm_rect full = {0, 0, (int)d.width, (int)d.height};
          ld_pg_record(&geometry, bb, full);
-@@ -20349,6 +20612,7 @@ static void ld_present_body(u32 buffer_id)
+@@ -20349,6 +20605,7 @@ static void ld_present_body(u32 buffer_id)
      ld_gv_flip();
      ld_td_flip();   /* patch 2033 */
      ld_vg_frame();  /* patch 2076 */
@@ -651,7 +648,7 @@ index 5867a3ec..e586061d 100644
      g_ld_frames++;
  #if defined(YZ_PERF_PROFILE)
      ld_profile_present(g_ld_frames);
-@@ -21189,7 +21453,10 @@ unsigned long long rsx_perf_fifo_flips(void) { return g_ld_flip_consumed; }
+@@ -21189,7 +21446,10 @@ unsigned long long rsx_perf_fifo_flips(void) { return g_ld_flip_consumed; }
  
  void rsx_live_draw_shutdown(void)
  {
@@ -663,7 +660,7 @@ index 5867a3ec..e586061d 100644
      ld_vertex_diag_emit("shutdown", 1);
      ld_present_measure_dump();
      /* let the GPU drain, then release. (Best-effort; process teardown also
-@@ -21428,7 +21695,7 @@ void rsx_live_draw_shutdown(void)
+@@ -21428,7 +21688,7 @@ void rsx_live_draw_shutdown(void)
          g.depth_snapshot_rootsig->lpVtbl->Release(
              g.depth_snapshot_rootsig);
      if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
@@ -673,7 +670,7 @@ index 5867a3ec..e586061d 100644
      if (g.swap) g.swap->lpVtbl->Release(g.swap);
      if (g_ld_info_queue) {
 diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
-index 568403c5..27f2e576 100644
+index 568403c..27f2e57 100644
 --- a/libs/video/rsx_live_draw.h
 +++ b/libs/video/rsx_live_draw.h
 @@ -31,6 +31,7 @@

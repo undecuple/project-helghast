@@ -52,7 +52,7 @@ game code where it pays off ([roadmap](ROADMAP.md)).
    memory (MLAA, bloom, depth of field) are written back. An opt-in experimental FSR 3.1 path selects the
    full-resolution deferred depth, jitters deferred and depth-tested scene draws, derives camera rotation and
    translation motion from depth, and generates a reactive mask from paired scene-composition captures before
-   temporally upscaling ahead of scan-out gamma. ps3recomp exposes a generic registered-upscaler interface and
+   temporally upscaling the gamma-corrected image (scan-out gamma runs first, at the render size). ps3recomp exposes a generic registered-upscaler interface and
    metadata/action callbacks; the port-owned adapter keeps all KZ3 pass recognition and AMD FidelityFX runtime
    use outside the generic renderer. The separate Upscaler option defaults to Off and falls back to the ordinary
    bilinear presentation path when any required input or capability is unavailable.

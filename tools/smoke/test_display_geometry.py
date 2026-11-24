@@ -123,6 +123,11 @@ def variants(parts, helpers):
     cases += [('omit-upscale-state-invalidation', parts, replace_once(helpers,
         '    LD_SM_INVALIDATE(); /* upscale compute changed command-list bindings, including rejected outputs */\n', ''),
         {'rejected-upscale-output-invalidates-bindings'})]
+    # review of PR #27: gamma at the surface size before the upscaler; a mutant that upscales the raw surface fails
+    cases += [('upscale-before-gamma', mutate(parts, 'normal',
+        '        scene_image, scene_state,\n        output_width, output_height,',
+        '        srcimg, D3D12_RESOURCE_STATE_RENDER_TARGET,\n        output_width, output_height,'),
+        helpers, {'gamma-before-upscale'})]
     cases += [('ignore-surface-owner', mutate(parts, 'normal',
         '    if (rsx_ui_read(&presented_surface->ui, &geometry.hud_kx, &geometry.hud_ky))\n        geometry.hud_provenance = RSX_PG_HUD_SURFACE_OWNER;', ''),
         helpers, {'normal-captures-surface-owner', 'normal-unit-owner-beats-current-wide-global'})]
