@@ -205,6 +205,7 @@ class BenchmarkTests(unittest.TestCase):
                                       {"APP_VER": "01.14", "CATEGORY": "GD", "TITLE": "Synthetic",
                                        "TITLE_ID": "BCUS98234"})
             release_fixture.add_update_edat(str(update))
+            release_fixture.add_update_patches(str(update))
         (update / "USRDIR" / "EBOOT.BIN").write_bytes(b"synthetic-update")
         eboot.write_bytes(b"synthetic-elf")
         (build / "kz3.exe").write_bytes(b"MZ stale installed executable")
