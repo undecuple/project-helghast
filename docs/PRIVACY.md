@@ -9,6 +9,13 @@ Nothing, unless you ask for it. Each item is off until you turn it on, and this 
   repository's latest release, made only when you click "Check now" or tick "Check for new versions" (then at most
   once a day). Nothing about you, your computer or the game is sent; a new installer downloads only when you click it.
 - **Project website** (`site/`): viewing it loads the Rajdhani and Barlow fonts from Google Fonts, which sees your visit. The repository, installer and game do not.
+- **Intel XeSS runtime download** (experimental, only if you choose XeSS as the upscaler): when the launcher
+  finds XeSS selected and its runtime missing or not matching, it asks first and downloads only if you click Yes.
+  It fetches Intel's XeSS SDK 3.0.2 archive (about 73 MiB) from Intel's official GitHub release
+  (`https://github.com/intel/xess/releases/download/v3.0.2/XeSS_SDK_3.0.2.zip`), an ordinary anonymous download
+  that sends nothing about you or the game. The launcher checks the archive's SHA-256, the size and hash of
+  every file it keeps, and Intel's code signature before placing `libxess.dll` and its licence texts beside the game.
+  If you click No, nothing is downloaded and the game keeps the upscaler you had before.
 - **Online multiplayer** (planned): only through a self-hosted server you choose.
 - **Discord status** (optional, off unless you turn it on in Options > Display > Discord status, with "Discord status on or off" in the Start menu, or with `discord_presence = 1` in `kz3.ini`): the port tells the Discord
   app on your own PC what to show on your profile (the activity text, the game's process id and the port's Discord
