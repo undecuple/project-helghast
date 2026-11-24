@@ -51,6 +51,7 @@ def main():
              "licenses/at3_standalone-COPYING.LGPLv2.1.txt": os.path.join(
                  ROOT, "third_party", "ps3recomp", "third_party", "at3_standalone", "COPYING.LGPLv2.1"),
              ap.SDL3_DEST[1]: os.path.join(ROOT, "work", "release", "sdl3", ap.SDL3_SRC[1]),
+             ap.FIDELITYFX_DEST[1]: os.path.join(ROOT, "work", "release", "fidelityfx", ap.FIDELITYFX_SRC[1]),
              ap.FONT_LICENSE[1]: os.path.join(ROOT, "work", "release", "fonts", ap.FONT_LICENSE[0])}
     for dest, src in fixed.items():
         rel = dest[len("licenses/"):]

@@ -141,6 +141,12 @@ tools/smoke/test_mouse_act.sh
 tools/upstream/test_fs_stat_times.sh
 port/vfs/test_native_rekey.sh
 tools/smoke/test_cam_interp.sh
+tools/smoke/test_fsr31_motion.sh
+tools/smoke/test_fsr31_inputs.sh
+tools/smoke/test_fsr31_build.sh
+tools/smoke/test_upscale_switch.py
+tools/smoke/test_upscale_config.py
+tools/release/test_stage_fidelityfx.py
 tools/release/test_licenses_match.py
 tools/release/test_uninstall_covers.py
 tools/release/test_game_ini_keep.py

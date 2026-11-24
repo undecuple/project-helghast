@@ -109,9 +109,15 @@ static int pipeline_calls, upscale_calls, upscale_enabled, upscale_null, state_i
 static int copies, textures, clears, blits, invalid_copy, invalid_texture, invalid_barrier, swap_calls;
 static ID3D12Resource src_resource, bb_resource, gamma_resource, movie_resource, upload_resource, upscale_resource;
 static ID3D12Resource* gamma_copy;
+/* review of PR #27: gamma runs once, on the presented surface at its own size, and the upscaler reads its output */
+static int gamma_calls;
+static ID3D12Resource* gamma_source;
+static u32 gamma_width, gamma_height;
+static void* upscale_input;
 typedef struct {
     ID3D12Resource* tex;
     rsx_ui_provenance ui;
+    u32 w, h, location, offset;   /* the upscale/gamma hooks read the presented surface's size and address */
 } surface_mock;
 static surface_mock surface;
 static const surface_mock* presented_surface = &surface;
@@ -171,15 +177,20 @@ static ID3D12Resource* ld_dm_movie_target(u32 w, u32 h)
     (void)h;
     return movie_target_ok ? &movie_resource : NULL;
 }
-static ID3D12Resource* ld_gamma_present(u32 t)
+static ID3D12Resource* ld_gamma_present_resource(ID3D12Resource* source, D3D12_RESOURCE_STATES state, u32 width, u32 height,
+                                                 u32 location, u32 offset)
 {
-    (void)t;
+    (void)state; (void)location; (void)offset;
+    gamma_calls++; gamma_source = source; gamma_width = width; gamma_height = height;
     return gamma_copy;
 }
 static void ld_dm_sync_size(void) {}
 typedef struct {
     int unused;
 } rsx_upscale;
+typedef struct {
+    int unused;
+} rsx_upscale_image;
 typedef struct {
     void* cmd_list;
     struct {
@@ -188,12 +199,31 @@ typedef struct {
     } input;
     unsigned output_width, output_height;
     float sharpness;
+    const rsx_upscale_image* depth;
+    float jitter_x, jitter_y;
 } rsx_upscale_eval;
 typedef struct {
     void* resource;
     unsigned state;
+    unsigned width, height;
 } rsx_upscale_result;
 static rsx_upscale test_upscale;
+static u32 g_up_jitter_frame = 0xFFFFFFFFu;
+static float g_up_jitter_x, g_up_jitter_y;
+static void ld_up_output_size(u32* width, u32* height)
+{
+    if (width) *width = g_dm_bb_w;
+    if (height) *height = g_dm_bb_h;
+}
+static int ld_up_temporal_requested(void)
+{
+    return 0;
+}
+static const rsx_upscale_image* ld_up_depth_image(rsx_upscale_image* image, u32 width, u32 height)
+{
+    (void)image; (void)width; (void)height;
+    return NULL;
+}
 static rsx_upscale* ld_up_get(void)
 {
     return upscale_enabled ? &test_upscale : NULL;
@@ -206,10 +236,12 @@ static int rsx_upscale_wants_pass(rsx_upscale* up, unsigned iw, unsigned ih, uns
 static int rsx_upscale_evaluate(rsx_upscale* up, const rsx_upscale_eval* ev, rsx_upscale_result* out)
 {
     (void)up;
-    (void)ev;
+    upscale_input = ev->input.resource;
     upscale_calls++;
     out->resource = upscale_null ? NULL : &upscale_resource;
     out->state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    out->width = (unsigned)upscale_resource.desc.Width;
+    out->height = upscale_resource.desc.Height;
     return 1;
 }
 static unsigned rtv_handle(u32 bbi)

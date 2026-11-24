@@ -34,6 +34,10 @@ jobs:
         run: nix develop .#ci --command bash tools/ps3recomp-patched.sh
       - name: Host tests (no game data; list in tools/host-tests.txt)
         run: nix develop .#ci --command bash tools/run-host-tests.sh --gh -j "$(nproc)"
+      - name: FSR 3.1 adapter and its D3D12 test build for Windows (MinGW-w64; skipped in the .#ci shell above)
+        # test_fsr31.ps1 runs the exe on Windows with a GPU and the pinned FidelityFX DLL; CI has neither, so this
+        # catches build breaks only (review of PR #27).
+        run: nix develop .#win --command bash -c 'set -euo pipefail; out="$(bash tools/smoke/test_fsr31_build.sh)"; echo "$out"; grep -q PASS <<<"$out"'
       - name: Project card (.recomp.json) is current
         run: python3 tools/release/recomp_card.py
 
