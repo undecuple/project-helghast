@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Host tests for the consented, pinned XeSS runtime installer."""
 import hashlib
+import http.client
 import os
 import shutil
 import tempfile
+import urllib.request
 import zipfile
 
 import xess_runtime as xr
@@ -312,6 +314,70 @@ def main():
             "PE" in xr.pe_x64_problem(bad_pe),
             "truncated or wrong-architecture DLLs are refused",
         )
+
+        # A connection dropped mid-body: urllib raises http.client.IncompleteRead, which is not an OSError. It must
+        # come out as a failed install with the previous upscaler restored, through the real download_archive.
+        class DroppedResponse:
+            def __init__(self):
+                self.sent = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, _size):
+                if not self.sent:
+                    self.sent = True
+                    return b"partial"
+                raise http.client.IncompleteRead(b"", xr.ARCHIVE_SIZE)
+
+        real_urlopen = urllib.request.urlopen
+        urllib.request.urlopen = lambda *_a, **_k: DroppedResponse()
+        try:
+            set_display(display, "xess", "fsr3")
+            try:
+                state, detail, fallback = xr.prepare_selected(
+                    display,
+                    os.path.join(temp, "dropped"),
+                    FakeUI([True]),
+                    ini_set,
+                    xr.download_archive,
+                    valid_signature,
+                    valid_vc,
+                )
+            except Exception as error:  # noqa: BLE001  (the bug: it escaped)
+                state, detail, fallback = "raised", repr(error), ""
+        finally:
+            urllib.request.urlopen = real_urlopen
+        check(
+            state == "failed"
+            and fallback == "fsr3"
+            and "interrupted" in detail
+            and xr.selected_fallback(display) is None,
+            "a dropped download connection fails cleanly and restores the prior upscaler",
+            detail,
+        )
+
+        # The DLL path must reach Get-AuthenticodeSignature as data. Before, it was passed through -Command, so $
+        # and ` were expanded (a different file was checked) and ' broke the parse. Same answer for every folder.
+        if os.name == "nt":
+            unsigned = b"MZ unsigned test file"
+            results = {}
+            for folder in ("plain", "Games $HOME", "a`b", "x'y", "C$ (x86)"):
+                dll = os.path.join(temp, "sig", folder, "libxess.dll")
+                put(dll, unsigned)
+                results[folder] = xr.verify_authenticode(dll)
+            plain = results["plain"]
+            check(
+                plain.startswith("Authenticode status is ")
+                and all(value == plain for value in results.values()),
+                "Authenticode validation reads the DLL path as data ($, ` and ' in the folder name)",
+                repr(results),
+            )
+        else:
+            print("SKIP Authenticode path quoting: Windows only")
     finally:
         xr.ARCHIVE_SIZE, xr.ARCHIVE_SHA256, xr.FILES = original
         shutil.rmtree(temp, ignore_errors=True)

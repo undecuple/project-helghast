@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Install the optional, pinned Intel XeSS runtime after explicit consent."""
 import hashlib
+import http.client
 import os
 import re
 import shutil
@@ -23,7 +24,10 @@ ARCHIVE_SHA256 = (
 )
 SIGNER_SUBJECT = "CN=Intel Corporation"
 SIGNER_THUMBPRINT = "2B81BFC21940CD420FC263C975FB41A79B643DF4"
-VC_REDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+# Set only in the environment of the PowerShell child that checks the DLL's
+# signature (verify_authenticode); not read from the player's environment.
+AUTHENTICODE_PATH_ENV = "KZ3_XESS_AUTHENTICODE_PATH"
+VC_REDIST_URL ="https://aka.ms/vs/17/release/vc_redist.x64.exe"
 MIN_VC_RUNTIME = (14, 40)
 
 FILES = {
@@ -120,18 +124,23 @@ def verify_authenticode(path):
     powershell = _powershell()
     if not os.path.isfile(powershell):
         return f"Windows PowerShell was not found at {powershell}"
+    # The DLL path travels in an environment variable, never in the command
+    # text: -Command joins its arguments and parses them as PowerShell, so a
+    # game folder whose path holds $, ` or ' would otherwise be expanded or
+    # break the parse. The script itself is a fixed string.
     script = (
-        "& { param([string]$Path) "
+        "$ErrorActionPreference='Stop';"
         "$module=Join-Path $env:SystemRoot "
         "'System32\\WindowsPowerShell\\v1.0\\Modules\\"
         "Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1';"
-        "Import-Module $module -ErrorAction Stop;"
-        "$s=Get-AuthenticodeSignature -LiteralPath $Path;"
+        "Import-Module $module;"
+        f"$s=Get-AuthenticodeSignature -LiteralPath $env:{AUTHENTICODE_PATH_ENV};"
         "[Console]::Out.WriteLine([string]$s.Status);"
         "[Console]::Out.WriteLine([string]$s.SignerCertificate.Subject);"
         "[Console]::Out.WriteLine([string]$s.SignerCertificate.Thumbprint)"
-        " }"
     )
+    env = dict(os.environ)
+    env[AUTHENTICODE_PATH_ENV] = os.path.abspath(path)
     try:
         completed = subprocess.run(
             [
@@ -140,12 +149,12 @@ def verify_authenticode(path):
                 "-NonInteractive",
                 "-Command",
                 script,
-                path,
             ],
             check=False,
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError) as error:
         return f"could not run Authenticode validation ({error})"
@@ -230,18 +239,26 @@ def download_archive(url, destination, timeout=60):
         headers={"User-Agent": "Project-Helghast-XeSS-Installer/1"},
     )
     total = 0
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        with open(destination, "wb") as target:
-            while True:
-                chunk = response.read(1 << 20)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > ARCHIVE_SIZE:
-                    raise ValueError(
-                        f"download exceeded the pinned {ARCHIVE_SIZE:,} bytes"
-                    )
-                target.write(chunk)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open(destination, "wb") as target:
+                while True:
+                    chunk = response.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > ARCHIVE_SIZE:
+                        raise ValueError(
+                            f"download exceeded the pinned {ARCHIVE_SIZE:,} bytes"
+                        )
+                    target.write(chunk)
+    except http.client.HTTPException as error:
+        # A connection dropped mid-body raises IncompleteRead, and a garbled
+        # response other HTTPException subclasses; none of them is an OSError.
+        raise OSError(
+            f"the download was interrupted after {total:,} bytes "
+            f"({type(error).__name__})"
+        ) from error
     if total != ARCHIVE_SIZE:
         raise ValueError(
             f"downloaded {total:,} bytes; expected {ARCHIVE_SIZE:,}"
@@ -404,7 +421,13 @@ def prepare_selected(
         stage_archive(archive_path, stage, signature_check)
         os.remove(archive_path)
         install_staged(stage, destination)
-    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        zipfile.BadZipFile,
+        http.client.HTTPException,
+    ) as error:
         ini_set(display_ini, [("display", "upscaler", fallback)])
         return "failed", str(error), fallback
     finally:
