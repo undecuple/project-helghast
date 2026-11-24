@@ -82,6 +82,13 @@ The operation and callback tables contain no FidelityFX types. The generic rende
 offsets, deferred-pass layout, camera format, capture-pair rules or sharpness setting. Backend teardown runs during
 normal shutdown and device-loss cleanup, and a later renderer initialization recreates the selected backend.
 
+`rsx_live_draw_set_upscale` may be called from any thread (the Options page calls it from the game's thread). The
+request is written under a lock; the render thread picks it up through one interlocked serial. A sharpness change
+applies at once. A backend change never releases the context from the draw path, because the open command list may
+already hold a scene capture or depth snapshot that reads it. The switch waits for the next present flush: the
+frame's list is then submitted, the renderer waits for its fence, releases the old context and creates the new
+one. Turning the upscaler off and on again within one frame keeps the context.
+
 ## Frame pipeline
 
 ### 1. Camera publication
