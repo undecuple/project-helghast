@@ -8,8 +8,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if [[ ! -f "$V/rsx_fp_decompiler.c" || ! -d "$PT/include" ]]; then echo "[test_srgb_output] SKIP: no patched toolkit"; exit 0; fi
-if ! grep -q rsx_fp_apply_srgb_output "$V/rsx_fp_decompiler.h"; then echo "[test_srgb_output] SKIP: toolkit without patch 2055"; exit 0; fi
+if [[ ! -f "$V/rsx_fp_decompiler.c" || ! -d "$PT/include" ]]; then echo "[test_srgb_output] SKIP: no patched toolkit"; exit 77; fi
+if ! grep -q rsx_fp_apply_srgb_output "$V/rsx_fp_decompiler.h"; then echo "[test_srgb_output] SKIP: toolkit without patch 2055"; exit 77; fi
 O="$ROOT/build/smoke-host/srgb_output"; mkdir -p "$O"
 cat > "$O/t.c" <<'EOC'
 #include "rsx_fp_decompiler.h"

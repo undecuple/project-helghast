@@ -22,6 +22,7 @@ project is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEA
 - Online play: an `online.ini` whose server selection is ambiguous, or credentials without a clean configuration, are refused and the game stays offline. The network capture log no longer records tokens, certificate hashes or ticket offsets; `KZ3_NET_CAPTURE_PAYLOAD=1` logs the payload bytes again (#39, thanks @Tzeentchnet).
 
 ### Fixed
+- First-run build steps now check that each step really wrote what it should, not only its exit code, and run in the install folder. When a build program cannot start because a runtime library (DLL) is missing or fails to load (Windows code 0xC0000135, 0xC0000142 and similar, or an "incorrectly installed" message), setup, the console and the launcher name the program and the likely cause (antivirus removal, incomplete install) instead of only showing an exit code. Install folders with spaces are covered by a test.
 - Website: link buttons on the Channels page render as buttons again (and the section dividers have their rule back); the site check now fails when a class used in the page has no style rule.
 - Importing from RPCS3 works when RPCS3 lists Killzone 3 as a single disc image (`.iso`) instead of a folder. The image is checked like one you pick by hand: a decrypted image is offered, an encrypted or unreadable one is refused with the reason.
 

@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 tree = X.trees()[1]
 c_path, h_path = (os.path.join(tree, "libs/system", f) for f in ("cellSysutil.c", "cellSysutil.h"))
 if not os.path.isfile(c_path):
-    print("SKIP: no patched toolkit"); sys.exit(0)
+    print("SKIP: no patched toolkit"); sys.exit(77)
 src, hdr = open(c_path).read(), open(h_path).read()
 fns = [X.function(src, r"static int sysutil_ieq\(") , X.function(src, r"static void sysutil_locale_code\("),
        X.function(src, r"static void sysutil_host_language\("), X.function(src, r"static s32 sysutil_language\(void\)")]

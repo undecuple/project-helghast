@@ -6,7 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 H="${KERN_HDR:-$ROOT/work/ps3recomp-patched/runtime/spu}"
-[[ -f "$H/spurs_kern_sched.h" ]] || { echo "SKIP: no patched toolkit with patch 1074 at $H"; exit 0; }
+[[ -f "$H/spurs_kern_sched.h" ]] || { echo "SKIP: no patched toolkit with patch 1074 at $H"; exit 77; }
 gcc -std=gnu17 -O2 -Wall -Wextra -pthread -I "$H" -o "$O/t_spurs_kern" "$ROOT/tools/spu/test_spurs_kern.c" 2>&1 | grep -m5 -E "error|warning"
 [[ -x "$O/t_spurs_kern" ]] || { echo "FAIL: build"; exit 1; }
 "$O/t_spurs_kern"

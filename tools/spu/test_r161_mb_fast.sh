@@ -5,7 +5,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/host-tests/mb-fast"; mkdir -p "$O"
 T="${SPU_TREE:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$T/runtime/spu/spu_helpers.h" ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -f "$T/runtime/spu/spu_helpers.h" ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 SRC="$ROOT/port/spu/kz3_native_post.c"
 python3 - "$SRC" "$O/mbfast.h" <<'P' || { echo FAIL: extract; exit 1; }
 import sys

@@ -5,7 +5,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${SPU_TREE:-$ROOT/work/ps3recomp-patched}"; H="${SPU_HDR:-$P/runtime/spu}"
-[[ -f "$H/spu_context.h" ]] || { echo "SKIP: no patched toolkit at $H"; exit 0; }
+[[ -f "$H/spu_context.h" ]] || { echo "SKIP: no patched toolkit at $H"; exit 77; }
 grep -q spu_event_raise "$H/spu_context.h" || { echo "FAIL: $H/spu_context.h has no spu_event_raise (patch 1052)"; exit 1; }
 gcc -std=gnu17 -O2 -w -pthread -I "$H" -I "$P/include" -I "$P/runtime/platform" \
     -o "$O/t_event_race" "$ROOT/tools/spu/test_spu_event_race.c" 2>&1 | grep -m5 error

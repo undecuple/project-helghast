@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if [[ ! -f "$V/rsx_vtx_reg.h" ]]; then echo "[test_vtx_reg] SKIP: toolkit without patch 2160 ($V)"; exit 0; fi
+if [[ ! -f "$V/rsx_vtx_reg.h" ]]; then echo "[test_vtx_reg] SKIP: toolkit without patch 2160 ($V)"; exit 77; fi
 O="$ROOT/build/smoke-host/vtx_reg"; mkdir -p "$O/mut"
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -O2 -I"$V" "$ROOT/tools/smoke/test_vtx_reg.c" -o "$O/test_vtx_reg"
 "$O/test_vtx_reg"

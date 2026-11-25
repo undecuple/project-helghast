@@ -1,0 +1,188 @@
+KZ3 patch 1166: the runtime's frameless host setjmp/longjmp on MinGW x64 no longer go through the CRT.
+Port of patch 7066 of a sibling PS3 port by the same maintainer (identical change); credit goes to that patch.
+
+Public issue #58 (exit 0xC0000409 under 1 s, right after the first SPURS workload starts) is probably this: on real
+Windows with Control Flow Guard active, ucrtbase's longjmp calls __except_validate_jump_buffer, which __fastfail(13)s
+when Frame == 0 (seen in a minidump of that sibling port; Wine has no CFG). The runtime's frameless jumps write Frame = 0
+on purpose (_setjmp(buf, NULL): KZ3 patch 1099 SPU halt/drain, 1116 PPU guest setjmp host frames; no RtlUnwindEx over
+lifted frames). ASSUMPTION: #58 has no reporter dump, so the cause is not confirmed.
+
+runtime/platform/host_jmp_win64.h: rc_host_setjmp / rc_host_longjmp, naked ms_abi functions saving and restoring the
+Win64 callee-saved state, no validation and no unwind. Used by ppu_setjmp.h (PPU_SJ_HOST_*), spu_context.h
+(SPU_SETJMP/SPU_LONGJMP), and through them spu_channels.c and spu_drain.c, on MinGW x64 only; other hosts unchanged.
+Every setjmp/longjmp pair on that host uses the new pair (no CRT/new mix). Host test: tools/spu/test_host_jmp_win64.sh.
+Upstream candidate (every ps3recomp title built with MinGW on Windows).
+
+--- a/runtime/ppu/ppu_setjmp.h
++++ b/runtime/ppu/ppu_setjmp.h
+@@ -23,8 +23,10 @@
+ #include <stdint.h>
+ 
+ #if defined(_WIN64) && defined(__MINGW64__)
+-#  define PPU_SJ_HOST_SETJMP(b)    _setjmp((b), NULL)
+-#  define PPU_SJ_HOST_LONGJMP(b, v) longjmp((b), (v))
++/* sibling-port patch 7066: the frameless jump without the CRT (its longjmp refuses Frame == 0 under CFG on Windows). */
++#  include "../platform/host_jmp_win64.h"
++#  define PPU_SJ_HOST_SETJMP(b)    rc_host_setjmp(b)
++#  define PPU_SJ_HOST_LONGJMP(b, v) rc_host_longjmp((b), (v))
+ #elif defined(_WIN32)
+ #  define PPU_SJ_HOST_SETJMP(b)    setjmp(b)
+ #  define PPU_SJ_HOST_LONGJMP(b, v) longjmp((b), (v))
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -46,16 +46,17 @@
+ /* Upstream PR #434 (KZ3 patch 1120): setjmp/longjmp also save and restore the signal mask on POSIX: one
+  * sigprocmask system call per halt, stack reset or task resume. These frames never cross a signal handler, so the
+  * mask is the same at both ends: POSIX hosts use _setjmp/_longjmp. Windows keeps the forms above (patch 1099). */
+-#if SPU_SYSV_ABI && defined(_WIN64) && defined(__MINGW64__)
+-#  define SPU_SETJMP(b) _setjmp((b), NULL)
++/* sibling-port patch 7066: on MinGW x64 the frameless jump runs without the CRT (host_jmp_win64.h): the UCRT's longjmp ends
++ * the process when Frame == 0 and Control Flow Guard is active (Windows, not Wine). Both ends use the pair. */
++#if defined(_WIN64) && defined(__MINGW64__) && defined(__x86_64__)
++#  include "../platform/host_jmp_win64.h"
++#  define SPU_SETJMP(b) rc_host_setjmp(b)
++#  define SPU_LONGJMP(b, v) rc_host_longjmp((b), (v))
+ #elif defined(_WIN32)
+ #  define SPU_SETJMP(b) setjmp(b)
+-#else
+-#  define SPU_SETJMP(b) _setjmp(b)
+-#endif
+-#if defined(_WIN32)
+ #  define SPU_LONGJMP(b, v) longjmp((b), (v))
+ #else
++#  define SPU_SETJMP(b) _setjmp(b)
+ #  define SPU_LONGJMP(b, v) _longjmp((b), (v))
+ #endif
+ 
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -34,11 +34,14 @@
+  * sigprocmask system call per halt, stack reset or task resume. These frames
+  * never cross a signal handler, so the mask is the same at both ends. */
+ #if defined(_WIN32)
+-/* KZ3 patch 1099: Windows keeps spu_context.h's SPU_SETJMP (frameless _setjmp(buf, NULL) on MinGW x64 sysv). */
++/* KZ3 patch 1099: Windows keeps spu_context.h's SPU_SETJMP; sibling-port patch 7066: and its SPU_LONGJMP, the CRT-free pair
++ * on MinGW x64 (a CRT longjmp of a frameless buffer ends the process under CFG). */
+ #ifndef SPU_SETJMP
+ #define SPU_SETJMP(env) setjmp(env)
+ #endif
++#ifndef SPU_LONGJMP
+ #define SPU_LONGJMP(env, v) longjmp(env, v)
++#endif
+ #else
+ #undef SPU_SETJMP
+ #define SPU_SETJMP(env) _setjmp(env)
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -12,11 +12,14 @@
+  * sigprocmask system call per halt, stack reset or task resume. These frames
+  * never cross a signal handler, so the mask is the same at both ends. */
+ #if defined(_WIN32)
+-/* KZ3 patch 1099: Windows keeps spu_context.h's SPU_SETJMP (frameless _setjmp(buf, NULL) on MinGW x64 sysv). */
++/* KZ3 patch 1099: Windows keeps spu_context.h's SPU_SETJMP; sibling-port patch 7066: and its SPU_LONGJMP, the CRT-free pair
++ * on MinGW x64 (a CRT longjmp of a frameless buffer ends the process under CFG). */
+ #ifndef SPU_SETJMP
+ #define SPU_SETJMP(env) setjmp(env)
+ #endif
++#ifndef SPU_LONGJMP
+ #define SPU_LONGJMP(env, v) longjmp(env, v)
++#endif
+ #else
+ #undef SPU_SETJMP
+ #define SPU_SETJMP(env) _setjmp(env)
+--- /dev/null
++++ b/runtime/platform/host_jmp_win64.h
+@@ -0,0 +1,93 @@
++/* host_jmp_win64.h -- frameless host setjmp/longjmp for MinGW x64 (sibling-port patch 7066, 2026-11-17).
++ *
++ * The runtime's host jumps over lifted code are frameless on purpose (patch 1099 / KZ3 1116: no RtlUnwindEx over
++ * lifted frames). They were written as _setjmp(buf, NULL) + the CRT's longjmp. On Windows the UCRT's longjmp first
++ * calls __except_validate_jump_buffer whenever Control Flow Guard is active in the process (Windows turns it on;
++ * Wine does not): it requires StackLimit <= buf.Rsp <= StackBase and buf.Frame != 0, and ends the process with
++ * __fastfail(FAST_FAIL_INVALID_SET_OF_CONTEXT = 13) otherwise. A frameless buffer has Frame == 0, so the first such
++ * jump killed every game on Windows (issue #22: ucrtbase 10.0.19041.3636, longjmp+0x14 ->
++ * __except_validate_jump_buffer+0x3c, read from the user's minidump and Microsoft's public symbols). Proton never
++ * showed it.
++ *
++ * These two functions do what the CRT's frameless path did -- save and restore the Win64 callee-saved state
++ * (rbx rbp rsi rdi r12-r15, rsp, the return rip, MXCSR, the x87 control word, xmm6-xmm15) -- without the CRT, so
++ * there is no validation and no unwind. Layout inside a jmp_buf (256 bytes, 16-aligned on MinGW x64): 0 rbx,
++ * 8 rsp (after return), 16 rbp, 24 rsi, 32 rdi, 40 r12, 48 r13, 56 r14, 64 r15, 72 rip, 80 mxcsr, 84 fpcw,
++ * 96..255 xmm6-xmm15. ms_abi is fixed so sysv_abi callers (the lifted SPU code) call them the same way. */
++#ifndef HOST_JMP_WIN64_H
++#define HOST_JMP_WIN64_H
++#if defined(_WIN64) && defined(__MINGW64__) && defined(__x86_64__)
++#include <setjmp.h>
++#ifdef __cplusplus
++static_assert(sizeof(jmp_buf) >= 256, "host_jmp_win64: jmp_buf too small");
++#else
++_Static_assert(sizeof(jmp_buf) >= 256, "host_jmp_win64: jmp_buf too small");
++#endif
++
++__attribute__((naked, ms_abi, returns_twice, unused))
++static int rc_host_setjmp(void* buf)
++{
++    __asm__ volatile(
++        "movq %rbx, 0(%rcx)\n\t"
++        "leaq 8(%rsp), %rdx\n\t"
++        "movq %rdx, 8(%rcx)\n\t"
++        "movq %rbp, 16(%rcx)\n\t"
++        "movq %rsi, 24(%rcx)\n\t"
++        "movq %rdi, 32(%rcx)\n\t"
++        "movq %r12, 40(%rcx)\n\t"
++        "movq %r13, 48(%rcx)\n\t"
++        "movq %r14, 56(%rcx)\n\t"
++        "movq %r15, 64(%rcx)\n\t"
++        "movq (%rsp), %rdx\n\t"
++        "movq %rdx, 72(%rcx)\n\t"
++        "stmxcsr 80(%rcx)\n\t"
++        "fnstcw 84(%rcx)\n\t"
++        "movdqu %xmm6, 96(%rcx)\n\t"
++        "movdqu %xmm7, 112(%rcx)\n\t"
++        "movdqu %xmm8, 128(%rcx)\n\t"
++        "movdqu %xmm9, 144(%rcx)\n\t"
++        "movdqu %xmm10, 160(%rcx)\n\t"
++        "movdqu %xmm11, 176(%rcx)\n\t"
++        "movdqu %xmm12, 192(%rcx)\n\t"
++        "movdqu %xmm13, 208(%rcx)\n\t"
++        "movdqu %xmm14, 224(%rcx)\n\t"
++        "movdqu %xmm15, 240(%rcx)\n\t"
++        "xorl %eax, %eax\n\t"
++        "ret\n\t");
++}
++
++__attribute__((naked, ms_abi, noreturn, unused))
++static void rc_host_longjmp(void* buf, int val)
++{
++    __asm__ volatile(
++        "movl %edx, %eax\n\t"
++        "testl %eax, %eax\n\t"
++        "jnz 1f\n\t"
++        "incl %eax\n\t"
++        "1:\n\t"
++        "movq 0(%rcx), %rbx\n\t"
++        "movq 16(%rcx), %rbp\n\t"
++        "movq 24(%rcx), %rsi\n\t"
++        "movq 32(%rcx), %rdi\n\t"
++        "movq 40(%rcx), %r12\n\t"
++        "movq 48(%rcx), %r13\n\t"
++        "movq 56(%rcx), %r14\n\t"
++        "movq 64(%rcx), %r15\n\t"
++        "ldmxcsr 80(%rcx)\n\t"
++        "fnclex\n\t"
++        "fldcw 84(%rcx)\n\t"
++        "movdqu 96(%rcx), %xmm6\n\t"
++        "movdqu 112(%rcx), %xmm7\n\t"
++        "movdqu 128(%rcx), %xmm8\n\t"
++        "movdqu 144(%rcx), %xmm9\n\t"
++        "movdqu 160(%rcx), %xmm10\n\t"
++        "movdqu 176(%rcx), %xmm11\n\t"
++        "movdqu 192(%rcx), %xmm12\n\t"
++        "movdqu 208(%rcx), %xmm13\n\t"
++        "movdqu 224(%rcx), %xmm14\n\t"
++        "movdqu 240(%rcx), %xmm15\n\t"
++        "movq 8(%rcx), %rsp\n\t"
++        "jmpq *72(%rcx)\n\t");
++}
++#endif
++#endif

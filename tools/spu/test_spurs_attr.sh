@@ -7,7 +7,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 T="${SPU_TREE:-$ROOT/work/ps3recomp-patched}"
-[[ -d "$T/libs/spurs" ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -d "$T/libs/spurs" ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 [[ -f "$T/libs/spurs/kz3_spurs_attr.h" ]] || { echo "FAIL: $T has no patch 1062 (libs/spurs/kz3_spurs_attr.h)"; exit 1; }
 gcc -std=gnu17 -O2 -Wall -Wextra -I "$T/libs/spurs" -o "$O/t_spurs_attr" "$ROOT/tools/spu/test_spurs_attr.c" 2>&1 | grep -m5 -E "error|warning"
 [[ -x "$O/t_spurs_attr" ]] || { echo "FAIL: build"; exit 1; }

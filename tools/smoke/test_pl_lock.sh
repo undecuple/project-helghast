@@ -7,8 +7,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-[[ -d "$V" ]] || { echo "[test_pl_lock] SKIP: no patched toolkit ($V)"; exit 0; }
-[[ -f "$V/rsx_pl_lock.h" ]] || { echo "[test_pl_lock] SKIP: toolkit without patch 2182"; exit 0; }
+[[ -d "$V" ]] || { echo "[test_pl_lock] SKIP: no patched toolkit ($V)"; exit 77; }
+[[ -f "$V/rsx_pl_lock.h" ]] || { echo "[test_pl_lock] SKIP: toolkit without patch 2182"; exit 77; }
 O="$ROOT/build/smoke-host/pl_lock"; mkdir -p "$O"
 CCX="${CC:-cc}"
 SAN=""

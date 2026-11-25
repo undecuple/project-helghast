@@ -8,8 +8,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -d "$PT/libs/video" ]] || { echo "[test_vres] SKIP: no patched toolkit ($PT)"; exit 0; }
-[[ -f "$PT/libs/kzr/core/vres/kzr_vres.h" ]] || { echo "[test_vres] SKIP: toolkit without patch 2198"; exit 0; }
+[[ -d "$PT/libs/video" ]] || { echo "[test_vres] SKIP: no patched toolkit ($PT)"; exit 77; }
+[[ -f "$PT/libs/kzr/core/vres/kzr_vres.h" ]] || { echo "[test_vres] SKIP: toolkit without patch 2198"; exit 77; }
 O="$ROOT/build/smoke-host/vres"; mkdir -p "$O"
 CCX="${CC:-cc}"
 FL=(-std=gnu11 -Wall -Wextra -Werror -O2 -g "-I$PT/libs/video" "-I$PT/include")   # array: the repo path has a space

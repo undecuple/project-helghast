@@ -6,7 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/r162t"
 CAPS="${SKIN_CAPS:-$ROOT/work/spu/capture/r121}"
-[[ -d "$CAPS" && -d "$ROOT/work/spu/lift/job_01242c80" && -f "$ROOT/work/ps3recomp-patched/runtime/spu/spu_helpers.h" ]] || { echo "SKIP: no captures, lift or patched toolkit"; exit 0; }
+[[ -d "$CAPS" && -d "$ROOT/work/spu/lift/job_01242c80" && -f "$ROOT/work/ps3recomp-patched/runtime/spu/spu_helpers.h" ]] || { echo "SKIP: no captures, lift or patched toolkit"; exit 77; }
 out="$(python3 "$ROOT/tools/spu/skin_census.py" "$CAPS" --out "$O" 2>&1)"; rc=$?
 echo "$out" | tail -8
 [[ $rc -eq 0 ]] || { echo "FAIL: census rc=$rc"; exit 1; }

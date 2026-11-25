@@ -10,8 +10,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 source "$ROOT/tools/smoke/pub_srcs.inc"; pub_src_args "$V" "$PT/libs/kzr"   # patch 2197: the harness links the publisher
-if [[ ! -f "$V/cellGcmSys.c" || ! -d "$PT/include" ]]; then echo "[test_log_replay] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
-if ! grep -q rsx_fc_range_check "$V/rsx_fifo_capture.h" 2>/dev/null; then echo "[test_log_replay] SKIP: toolkit without patch 2171"; exit 0; fi
+if [[ ! -f "$V/cellGcmSys.c" || ! -d "$PT/include" ]]; then echo "[test_log_replay] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
+if ! grep -q rsx_fc_range_check "$V/rsx_fifo_capture.h" 2>/dev/null; then echo "[test_log_replay] SKIP: toolkit without patch 2171"; exit 77; fi
 O="$ROOT/build/smoke-host/log_replay"; rm -rf "$O"; mkdir -p "$O/work"
 CF=(-std=gnu17 -O1 -g -w -I "$PT/include" -I "$V" -ffunction-sections -fdata-sections "-Wl,--gc-sections" -pthread -lm)
 EXTRA_SRC=(); [[ -f "$V/rsx_tiling.c" ]] && EXTRA_SRC=("$V/rsx_tiling.c")

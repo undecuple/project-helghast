@@ -10,8 +10,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 K="$PT/libs/kzr"
-[[ -d "$PT/libs/video" ]] || { echo "[test_pub] SKIP: no patched toolkit ($PT)"; exit 0; }
-[[ -f "$K/core/sync/kzr_sync.h" ]] || { echo "[test_pub] SKIP: toolkit without patch 2191"; exit 0; }
+[[ -d "$PT/libs/video" ]] || { echo "[test_pub] SKIP: no patched toolkit ($PT)"; exit 77; }
+[[ -f "$K/core/sync/kzr_sync.h" ]] || { echo "[test_pub] SKIP: toolkit without patch 2191"; exit 77; }
 O="$ROOT/build/smoke-host/pub"; mkdir -p "$O"
 CCX="${CC:-cc}"
 FL=(-std=gnu11 -Wall -Wextra -Werror -O1 -g -I"$K/include" -I"$K")

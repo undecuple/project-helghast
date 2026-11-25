@@ -12,8 +12,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$P/tools/ppu_lifter.py" ]] || { echo "SKIP: no patched toolkit"; exit 0; }
-grep -q "KZ3_PPU_CTX_RESTRICT" "$P/tools/ppu_lifter.py" || { echo "SKIP: patch 1165 not in $P"; exit 0; }
+[[ -f "$P/tools/ppu_lifter.py" ]] || { echo "SKIP: no patched toolkit"; exit 77; }
+grep -q "KZ3_PPU_CTX_RESTRICT" "$P/tools/ppu_lifter.py" || { echo "SKIP: patch 1165 not in $P"; exit 77; }
 O="$ROOT/work/spu/t_ctxr"; "$ROOT/tools/safe_rm.sh" "$O" 2>/dev/null; mkdir -p "$O/neg/tools"
 cat > "$O/lift.py" <<'PY'
 import os, sys

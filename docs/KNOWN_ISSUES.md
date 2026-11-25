@@ -12,7 +12,7 @@ linked below yet because none has been filed for these yet. If you hit one of th
 | Problem | Where it shows | Workaround | Status |
 |---|---|---|---|
 | [Exclusive full screen: not yet confirmed on native Windows](#fullscreen) | Options > Display > Fullscreen, `mode = fullscreen` in `display.ini` | borderless full screen (Alt+Enter, F11 or maximize) | fix built, awaiting a native Windows check |
-| [Frame rate below 30 in heavy scenes (about 16-22 measured)](#frame-rate) | in levels, both Proton and native Windows | none | open |
+| [Frame rate below 30 in heavy scenes (about 24 measured in one busy scene)](#frame-rate) | in levels, both Proton and native Windows | none | open |
 | [Audio is slightly short of real time and breaks up now and then](#audio-stutter) | in levels | none known | open |
 | [Windows and sky in far views look flat white](#flat-white) | far views in levels | none | open |
 | [Keyboard input intermittent under Steam/Proton](#keyboard-proton) | Steam with Proton | use a controller | open, cause not confirmed |
@@ -37,14 +37,15 @@ issue with the game log. Status: fix built, awaiting a native Windows check.
 
 ## Frame rate
 
-Levels run at about 16-22 frames per second, where the game's own target is 30. One measured 50-second window of Frozen
-Shores (131-180 s after launch) runs at about 22-23 frames/s (means of alternated runs, 2026-10-27; in-level figures, not
-menus); the slowest 1 % of frames run at about 13-14 frames/s. A loading screen before a level sometimes stalls for a few
+The game's own target is 30 frames per second. A busy window of Frozen Shores (levels.single_player.frozen_shores, 141-174 s
+after launch) runs at about 24 frames/s (23.7, 24.4 and 24.5 in three runs on 2026-11-24, exe sha256 883febf4 built from
+commit 22b78eba, 1.14 update, under Proton; in-level figures, not menus). Other scenes can run slower. A loading screen before a level sometimes stalls for a few
 seconds; the cause found is the video decoder threads running on efficiency cores of hybrid CPUs, so they are kept on
 performance cores (`KZ3_SPU_PCORES=0` turns that off). No frame-rate effect was measured and the stall itself was not
 seen in those runs, so it is not called fixed. The first visit to a level is slower while shaders build (the README's
 performance row has the numbers). The limits are the renderer's command processing and the SPU job code; the PS3
-emulator RPCS3 holds 30 on the same scene and machine, so 30 is reachable. Split-screen co-op runs at a mean of about
+emulator RPCS3 0.0.42 measured 23.1 and 23.9 frames/s on the same scene and machine with Write Color Buffers on, and
+20.9 and 21.5 with it off (2026-11-12, 450-525 s after launch; with it off the picture renders noise). Split-screen co-op runs at a mean of about
 26 frames/s (2026-10-22). Status: open, being worked on.
 
 ## Audio stutter

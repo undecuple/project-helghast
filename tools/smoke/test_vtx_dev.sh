@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 H="$PT/libs/video/rsx_vtx_dev.h"
-if [[ ! -f "$H" ]]; then echo "[test_vtx_dev] SKIP: no patched toolkit ($H; run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$H" ]]; then echo "[test_vtx_dev] SKIP: no patched toolkit ($H; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/vtx_dev"; mkdir -p "$O"
 CC="${CC:-cc}"
 $CC -std=c11 -Wall -Wextra -Werror -O2 ${KZ3_SAN:+-fsanitize=address,undefined -fno-omit-frame-pointer} \

@@ -85,6 +85,87 @@ static void test_order_wait(void)
     CHECK(rsx_wbd_drain(&D, RSX_WBD_R_FLIP, fake_wait, fake_store, NULL) == 1 && D.waits == 1 && wait_calls == 2 && D.forced[RSX_WBD_R_FLIP] == 1);
 }
 
+/* ---- patch 2212 (LD_WB_DEFER_4097): the K4 per-flip sequence on the real queue with fake wait/store callbacks ----
+ * Per flip: the NV0039 scene copy defers (SURF idx0 + MOVE), a clean soft release does nothing, the 0x4A NV4097 release with four dirty
+ * main-memory surfaces either defers them (site) or drains first (reason OTHER) and runs its own synchronous batch (one more wait),
+ * then the 0xEB00 user command drains, then the flip drains. Today (switch off) = 2 waits per flip, other=1; on = 1 wait, usercmd=1. */
+static uint32_t kind_log[RSX_WBD_CAP], woff_log[RSX_WBD_CAP], nkind;
+static void model_store(void* ctx, rsx_wbd_ent* e) { kind_log[nkind] = e->kind; woff_log[nkind] = e->woff; nkind++; fake_store(ctx, e); }
+static int model_drain(rsx_wbd* d, int reason) { return (int)rsx_wbd_drain(d, reason, fake_wait, model_store, NULL); }
+static uint64_t sync_waits;
+static void model_scene_copy(rsx_wbd* d, uint64_t fence)
+{
+    CHECK(record(d, 0x11, fence, 1, 0x1000, 64) >= 0);                     /* idx0 SURF */
+    rsx_wbd_ent m; memset(&m, 0, sizeof m); m.kind = RSX_WBD_MOVE; m.slot = -1; m.fence = fence; m.wloc = 0; m.woff = 0x2000; m.wsize = 32;
+    m.rloc = 1; m.roff = 0x1000; m.rsize = 64; CHECK(rsx_wbd_push(d, &m));   /* the row copy */
+}
+static const uint32_t surf_off[4] = { 0x3000, 0x3100, 0x3200, 0x3300 };
+/* the 0x4A release: ndirty main surfaces */
+static void model_release_4097(rsx_wbd* d, int label, int sw, int ndirty, uint64_t fence)
+{
+    const int site = rsx_wbd_site_defer(1, 0x4A, label, 1, sw);
+    if (!ndirty) return;                                                    /* clean: before_guest_sync returns before the batch */
+    if (rsx_wbd_batch_drain_first(d->n, site, 1)) model_drain(d, RSX_WBD_R_OTHER);
+    if (!site) { sync_waits++; if (fence > completed) completed = fence; }   /* the synchronous batch: one readback wait */
+    for (int i = 0; i < ndirty; i++) {
+        if (site) CHECK(record(d, (uint8_t)(0x20 + i), fence, 1, surf_off[i], 64) >= 0);
+        else { memset(&guest[1][surf_off[i]], 0x20 + i, 64); }   /* synchronous batch */
+    }
+}
+static void model_flip(rsx_wbd* d, int sw, int label, uint64_t base)
+{
+    model_scene_copy(d, base + 1);
+    model_release_4097(d, 0x40, sw, 0, base + 2);                           /* a soft release */
+    model_release_4097(d, label, sw, 4, base + 2);
+    model_drain(d, RSX_WBD_R_USERCMD);                                      /* the 0xEB00 user command */
+    model_drain(d, RSX_WBD_R_FLIP);
+}
+static void test_site4097(void)
+{
+    /* the predicate */
+    CHECK(rsx_wbd_site_defer(1, 0x4A, 0x4A, 1, 1) == 1);
+    CHECK(rsx_wbd_site_defer(1, 0x4A, 0x4A, 1, 0) == 0);                    /* switch off: today's behaviour */
+    CHECK(rsx_wbd_site_defer(1, 0x4A, 0x4A, 0, 0) == 1);                    /* NV406E path as patch 2185 wired it */
+    CHECK(rsx_wbd_site_defer(1, 0x4A, 0x49, 1, 1) == 0 && rsx_wbd_site_defer(1, 0x4A, 0x4B, 1, 1) == 0);   /* label filter */
+    CHECK(rsx_wbd_site_defer(1, 0x4A, -1, 1, 1) == 0 && rsx_wbd_site_defer(0, 0x4A, 0x4A, 1, 1) == 0);
+    CHECK(rsx_wbd_batch_drain_first(2, 0, 1) == 1 && rsx_wbd_batch_drain_first(2, 1, 1) == 0 && rsx_wbd_batch_drain_first(0, 0, 1) == 0
+          && rsx_wbd_batch_drain_first(2, 1, 0) == 1);
+    /* switch off (golden control, today): the release drains the scene copy (other=1) and waits again for its own batch */
+    reset(); rsx_wbd_init(&D); nkind = 0; sync_waits = 0;
+    model_flip(&D, 0, 0x4A, 10);
+    CHECK(D.forced[RSX_WBD_R_OTHER] == 1 && D.forced[RSX_WBD_R_USERCMD] == 0 && D.drains == 1);
+    CHECK(D.waits + sync_waits == 2 && D.pushes == 2 && D.stores == 2);
+    /* switch on: one drain at the user command, one wait, six stores oldest-first */
+    reset(); rsx_wbd_init(&D); nkind = 0; sync_waits = 0;
+    model_flip(&D, 1, 0x4A, 10);
+    CHECK(D.forced[RSX_WBD_R_OTHER] == 0 && D.forced[RSX_WBD_R_USERCMD] == 1 && D.forced[RSX_WBD_R_FLIP] == 0 && D.drains == 1);
+    CHECK(D.waits == 1 && sync_waits == 0 && D.stores == 6 && D.pushes == 6 && D.pending_max == 6 && nkind == 6);
+    CHECK(kind_log[0] == RSX_WBD_SURF && woff_log[0] == 0x1000 && kind_log[1] == RSX_WBD_MOVE && woff_log[1] == 0x2000);   /* the MOVE after the idx0 store */
+    for (int i = 0; i < 4; i++) CHECK(kind_log[2 + i] == RSX_WBD_SURF && woff_log[2 + i] == surf_off[i]);
+    for (int i = 0; i < 4; i++) CHECK(guest[1][surf_off[i]] == 0x20 + i && guest[1][surf_off[i] + 63] == 0x20 + i);
+    CHECK(last_waited_fence == 12);                                          /* the newest, which covers the scene-copy fence 11 */
+    /* another label (or a clean release) stays synchronous even with the switch on */
+    reset(); rsx_wbd_init(&D); nkind = 0; sync_waits = 0;
+    model_flip(&D, 1, 0x4B, 10);
+    CHECK(D.forced[RSX_WBD_R_OTHER] == 1 && D.waits + sync_waits == 2);
+    /* safety: a reader of a deferred main surface between the release and the user command drains first (touch) and sees the GPU bytes */
+    reset(); rsx_wbd_init(&D); nkind = 0; sync_waits = 0;
+    model_scene_copy(&D, 11); model_release_4097(&D, 0x4A, 1, 4, 12);
+    CHECK(guest[1][surf_off[2]] == 0);                                       /* still stale: not stored yet */
+    CHECK(rsx_wbd_touch(&D, 1, surf_off[2] + 8, 16, RSX_WBD_R_TOUCH, fake_wait, model_store, NULL) == 6);
+    CHECK(guest[1][surf_off[2]] == 0x22 && D.forced[RSX_WBD_R_TOUCH] == 1 && D.waits == 1);
+    model_drain(&D, RSX_WBD_R_USERCMD);
+    CHECK(D.forced[RSX_WBD_R_USERCMD] == 0 && D.waits == 1);                 /* nothing left to wait for */
+    /* an SPU GET of a pending range is counted while pending, not after the drain */
+    reset(); rsx_wbd_init(&D); nkind = 0; sync_waits = 0;
+    rsx_wbd_snap snap; memset(&snap, 0, sizeof snap);
+    model_scene_copy(&D, 11); model_release_4097(&D, 0x4A, 1, 4, 12);
+    rsx_wbd_snap_publish(&snap, &D);
+    CHECK(rsx_wbd_snap_hit(&snap, 1, surf_off[1], 16) != 0);
+    model_drain(&D, RSX_WBD_R_USERCMD); rsx_wbd_snap_publish(&snap, &D);
+    CHECK(rsx_wbd_snap_hit(&snap, 1, surf_off[1], 16) == 0);
+}
+
 static void test_slots(void)
 {
     reset(); rsx_wbd_init(&D);
@@ -185,10 +266,42 @@ static void test_race(void)
     CHECK(!rsx_wbd_snap_hit(&SN, 1, 0x4000, 0x100));
 }
 
+
+/* Patch 2212 label hold: the label store of a deferred release is published only after the bytes landed. */
+static rsx_wbd_hold H;
+static uint32_t pub_ea[16], pub_val[16], pub_n, stores_at_pub[16];
+static void fake_publish(uint32_t ea, uint32_t val) { pub_ea[pub_n] = ea; pub_val[pub_n] = val; stores_at_pub[pub_n] = (uint32_t)nstore; pub_n++; }
+static void test_label_hold(void)
+{
+    /* the release records 4 surfaces; the label store is held; nothing published before the drain */
+    reset(); rsx_wbd_init(&D); memset(&H, 0, sizeof H); pub_n = 0;
+    for (int i = 0; i < 4; i++) record(&D, (uint8_t)(0x30 + i), 20 + i, 1, 0x1000u * (uint32_t)(i + 1), 64);
+    CHECK(rsx_wbd_hold_try(&H, D.n, 1, 0xE0000A4u, 0x1u) == 1 && H.held == 1);
+    CHECK(rsx_wbd_hold_flush(&H, D.n, RSX_WBD_R_OTHER, fake_publish) == 0 && pub_n == 0);   /* queue not empty: still held */
+    rsx_wbd_drain(&D, RSX_WBD_R_USERCMD, fake_wait, fake_store, NULL);
+    CHECK(rsx_wbd_hold_flush(&H, D.n, RSX_WBD_R_USERCMD, fake_publish) == 1);
+    CHECK(pub_n == 1 && pub_ea[0] == 0xE0000A4u && pub_val[0] == 1u && stores_at_pub[0] == 4);   /* all 4 stores ran before the label */
+    CHECK(H.published == 1 && H.flush_by[RSX_WBD_R_USERCMD] == 1 && H.n == 0);
+    CHECK(rsx_wbd_hold_flush(&H, D.n, RSX_WBD_R_FLIP, fake_publish) == 0 && pub_n == 1);     /* nothing twice */
+    /* not armed (switch off or another label) or nothing pending: stored at once, never held */
+    CHECK(rsx_wbd_hold_try(&H, 4, 0, 1, 1) == 0 && rsx_wbd_hold_try(&H, 0, 1, 1, 1) == 0 && H.held == 1);
+    /* order of two held labels, and the full table refuses a 17th */
+    memset(&H, 0, sizeof H); pub_n = 0;
+    for (uint32_t i = 0; i < RSX_WBD_HOLD_MAX; i++) CHECK(rsx_wbd_hold_try(&H, 1, 1, 0x100 + i, i) == 1);
+    CHECK(rsx_wbd_hold_try(&H, 1, 1, 0x999, 9) == 0);
+    CHECK(rsx_wbd_hold_flush(&H, 0, RSX_WBD_R_SLOT, fake_publish) == RSX_WBD_HOLD_MAX && pub_ea[0] == 0x100 && pub_ea[15] == 0x10F);
+    /* negative control (the old behaviour, a label stored at the release): a reader that sees the label finds 0 stores done */
+    reset(); rsx_wbd_init(&D); pub_n = 0;
+    for (int i = 0; i < 4; i++) record(&D, (uint8_t)(0x30 + i), 20 + i, 1, 0x1000u * (uint32_t)(i + 1), 64);
+    fake_publish(0xE0000A4u, 1u);                       /* what the code did before the hold */
+    CHECK(stores_at_pub[0] == 0 && guest[1][0x1000] == 0);   /* the bytes are not there yet: the lost-update / stale-read window */
+    rsx_wbd_drain(&D, RSX_WBD_R_USERCMD, fake_wait, fake_store, NULL);
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1 && !strcmp(argv[1], "race")) { test_race(); printf("[test_wb_defer] race stress %s\n", fails ? "FAIL" : "PASS"); return fails != 0; }
-    test_env_default(); test_order_wait(); test_slots(); test_overlap(); test_abort(); test_verify(); test_race();
+    test_env_default(); test_order_wait(); test_site4097(); test_label_hold(); test_slots(); test_overlap(); test_abort(); test_verify(); test_race();
     printf("[test_wb_defer] %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

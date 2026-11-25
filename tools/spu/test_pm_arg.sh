@@ -14,7 +14,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 F="$P/runtime/spu/spurs_policy.c"
-[[ -f "$F" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
+[[ -f "$F" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
 sites="$(grep -c 'gpr\[4\]\._u32\[0\] = .*wkl_data' "$F")"
 [[ "$sites" -ge 1 ]] || { echo "FAIL: no r4-from-wkl_data site in $F"; exit 1; }
 badsite="$(grep -n -A1 'gpr\[4\]\._u32\[0\] = .*wkl_data' "$F" | grep -v -e '_u32\[0\] = (uint32_t)(wkl_data >> 32);' \

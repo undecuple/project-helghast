@@ -5,5 +5,5 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 out=$(python3 "$ROOT/tools/spu/native_diff.py" --slot 8,9,12,13 --trials 200 2>&1); rc=$?
 echo "$out" | tail -4
-case "$out" in *SKIP*) exit 0;; esac
+case "$out" in *SKIP*) exit 77;; esac
 [[ $rc -eq 0 ]] && echo "PASS" || { echo "FAIL"; exit 1; }

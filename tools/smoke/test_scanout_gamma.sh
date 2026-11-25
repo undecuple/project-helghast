@@ -8,8 +8,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 RL="$PT/libs/video/rsx_live_draw.c"
-if [[ ! -f "$RL" ]]; then echo "[test_scanout_gamma] SKIP: no patched toolkit"; exit 0; fi
-if ! grep -q ld_gamma_present "$RL"; then echo "[test_scanout_gamma] SKIP: toolkit without patch 2070"; exit 0; fi
+if [[ ! -f "$RL" ]]; then echo "[test_scanout_gamma] SKIP: no patched toolkit"; exit 77; fi
+if ! grep -q ld_gamma_present "$RL"; then echo "[test_scanout_gamma] SKIP: toolkit without patch 2070"; exit 77; fi
 f=0; ck() { if grep -Eq "$2" "$3"; then echo "ok: $1"; else echo "FAIL: $1"; f=1; fi; }
 ck "shader pow(c, gamma_exp)" 'pow\(max\(c\.rgb, 0\.0\), gamma_exp\)' "$RL"
 ck "exponent is gamma, not 1/gamma" 'const float inv = gm, pad' "$RL"

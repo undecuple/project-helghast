@@ -10,9 +10,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -d "$V" ]]; then
-  echo "[test_ld_ring_marks] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_ld_ring_marks] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 if [[ ! -f "$V/rsx_ring_marks.h" ]]; then
-  echo "[test_ld_ring_marks] SKIP: toolkit without patch 2153"; exit 0; fi
+  echo "[test_ld_ring_marks] SKIP: toolkit without patch 2153"; exit 77; fi
 O="$ROOT/build/smoke-host/ld_ring_marks"; mkdir -p "$O"
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -O2 -I"$V" "$ROOT/tools/smoke/test_ld_ring_marks.c" -o "$O/t"
 "$O/t" | tail -8

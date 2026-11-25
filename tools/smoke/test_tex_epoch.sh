@@ -7,8 +7,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/rsx_dispatch.c" || ! -d "$PT/include" ]]; then
-  echo "[test_tex_epoch] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
-if [[ ! -f "$V/rsx_tex_epoch.h" ]]; then echo "[test_tex_epoch] SKIP: toolkit without patch 2159"; exit 0; fi
+  echo "[test_tex_epoch] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
+if [[ ! -f "$V/rsx_tex_epoch.h" ]]; then echo "[test_tex_epoch] SKIP: toolkit without patch 2159"; exit 77; fi
 O="$ROOT/build/smoke-host/tex_epoch"; mkdir -p "$O"
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -Wno-unused-function -O2 -I"$V" -I"$PT/include" \
   "$ROOT/tools/smoke/test_tex_epoch.c" "$V/rsx_dispatch.c" -o "$O/test_tex_epoch" -lm

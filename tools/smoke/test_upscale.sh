@@ -9,7 +9,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/rsx_upscale.c" || ! -f "$V/fsr1/ffx_fsr1.h" ]]; then
-  echo "[test_upscale] SKIP: toolkit without patch 2145 ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_upscale] SKIP: toolkit without patch 2145 ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/upscale"; mkdir -p "$O"
 python3 "$ROOT/tools/smoke/fsr1_embed.py" --check "$V/fsr1" || { echo "[test_upscale] FAIL: fsr1_embed.h is not what the headers generate"; exit 1; }
 echo "[test_upscale] fsr1_embed.h matches the vendored headers"

@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="${KZ3_VTX_DIR:-$PT/libs/video}"
-if [[ ! -f "$V/rsx_wb_probe.h" ]]; then echo "[test_wb_probe] SKIP: toolkit without patch 2184 ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$V/rsx_wb_probe.h" ]]; then echo "[test_wb_probe] SKIP: toolkit without patch 2184 ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/wb_probe"; mkdir -p "$O/mut"
 CC="${CC:-cc}"
 W="-std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -pthread"

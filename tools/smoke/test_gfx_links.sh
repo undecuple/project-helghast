@@ -6,7 +6,7 @@
 set -euo pipefail
 D="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$D/work/ps3recomp-patched}"
-if [[ ! -f "$PT/libs/video/rsx_gfx_page.h" ]]; then echo "[test_gfx_links] SKIP: no patched toolkit with patch 2206 (run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$PT/libs/video/rsx_gfx_page.h" ]]; then echo "[test_gfx_links] SKIP: no patched toolkit with patch 2206 (run tools/ps3recomp-patched.sh)"; exit 77; fi
 CXX="${CXX:-c++}"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 sed -n '/^static std::string kz3_kb_link_rows/,/^}/p' "$D/port/kz3/main.cpp" > "$T/fn.inc"

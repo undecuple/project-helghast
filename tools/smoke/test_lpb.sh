@@ -8,8 +8,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -d "$PT/libs/video" ]] || { echo "[test_lpb] SKIP: no patched toolkit ($PT)"; exit 0; }
-[[ -f "$PT/libs/video/rsx_lpb.h" ]] || { echo "[test_lpb] SKIP: toolkit without patch 2208"; exit 0; }
+[[ -d "$PT/libs/video" ]] || { echo "[test_lpb] SKIP: no patched toolkit ($PT)"; exit 77; }
+[[ -f "$PT/libs/video/rsx_lpb.h" ]] || { echo "[test_lpb] SKIP: toolkit without patch 2208"; exit 77; }
 O="$ROOT/build/smoke-host/lpb"; mkdir -p "$O"
 CCX="${CC:-cc}"
 SRC="$ROOT/tools/smoke/test_lpb.c"

@@ -9,7 +9,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$P/runtime/spu/spu_context.h" ]] || { echo "SKIP: no patched toolkit at $P (run tools/ps3recomp-patched.sh)"; exit 0; }
+[[ -f "$P/runtime/spu/spu_context.h" ]] || { echo "SKIP: no patched toolkit at $P (run tools/ps3recomp-patched.sh)"; exit 77; }
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 cat > "$T/main.c" <<'C'
 #include <stdio.h>

@@ -8,9 +8,9 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -d $T/runtime/spu ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -d $T/runtime/spu ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 [[ -f $T/runtime/spu/tests/test_spu_poison_scan.c ]] || { echo "FAIL: test_spu_poison_scan.c missing (patch 1121 not applied?)"; exit 1; }
-[[ $(uname -s) == Linux* || $(uname -s) == Darwin* ]] || { echo "SKIP: needs a lazily committed 1 GiB mapping"; exit 0; }
+[[ $(uname -s) == Linux* || $(uname -s) == Darwin* ]] || { echo "SKIP: needs a lazily committed 1 GiB mapping"; exit 77; }
 OUT="$(mktemp -d)"; fail=0
 cat > "$OUT/stub.c" <<'C'
 #include <stdint.h>

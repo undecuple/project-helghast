@@ -6,7 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -d $T/runtime/ppu ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -d $T/runtime/ppu ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 [[ -f $T/tools/test_ppu_guest_call_stack.py ]] || { echo "FAIL: test_ppu_guest_call_stack.py missing (patch 1126 not applied?)"; exit 1; }
 fail=0
 out="$(python3 "$T/tools/test_ppu_guest_call_stack.py" 2>&1)" || fail=1

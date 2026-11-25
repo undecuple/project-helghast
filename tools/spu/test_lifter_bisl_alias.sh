@@ -8,7 +8,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$P/tools/spu_lifter.py" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
+[[ -f "$P/tools/spu_lifter.py" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
 O="$ROOT/work/spu/t_bisl"; "$ROOT/tools/safe_rm.sh" "$O" 2>/dev/null; mkdir -p "$O/neg/tools"
 python3 - "$O/t.bin" <<'PY'
 import struct, sys

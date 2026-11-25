@@ -7,7 +7,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 T="${SPU_TREE:-$ROOT/work/ps3recomp-patched}"
 S="$T/runtime/syscalls/sys_timer.c"
-[[ -f "$S" ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -f "$S" ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 grep -q "KZ3 patch 9633 begin" "$S" || { echo "FAIL: $T has no patch 9633"; exit 1; }
 grep -q 'GetSystemTimePreciseAsFileTime(&ft)' "$S" || { echo "FAIL: Windows branch does not read FILETIME"; exit 1; }
 sed -n '/KZ3 patch 9633 begin/,/KZ3 patch 9633 end/p' "$S" > "$O/walltime_block.h"

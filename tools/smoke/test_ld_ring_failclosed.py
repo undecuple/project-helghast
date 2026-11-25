@@ -15,6 +15,8 @@ def extract(source):
         if not m:
             raise SystemExit(f'FAIL: cannot extract {n}')
         out.append(m.group())
+        if n == 'ld_wait_fence':   # patch 2211: the per-site wrapper (a perf counter around ld_wait_fence); the unit sees a forwarding stub
+            out.append('static int ld_wait_fence_s(int site, u64 v) { (void)site; return ld_wait_fence(v); }\n')
     return '\n'.join(out)
 
 

@@ -6,7 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-if ! grep -q "spu__byteperm_ref" "$P/runtime/spu/spu_helpers.h" 2>/dev/null; then echo "SKIP: $P has no patch 1133"; exit 0; fi
+if ! grep -q "spu__byteperm_ref" "$P/runtime/spu/spu_helpers.h" 2>/dev/null; then echo "SKIP: $P has no patch 1133"; exit 77; fi
 rc=0
 for isa in "-msse4.1 -mfma" "-msse4.1 -mfma -mavx2" "-mno-sse4.1"; do
   rm -f "$O/t_r111_vec"

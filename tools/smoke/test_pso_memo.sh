@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if [[ ! -f "$V/rsx_pso_memo.h" ]]; then echo "[test_pso_memo] SKIP: toolkit without patch 2163 (run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$V/rsx_pso_memo.h" ]]; then echo "[test_pso_memo] SKIP: toolkit without patch 2163 (run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/pso_memo"; mkdir -p "$O"
 CC="${CC:-cc}"
 W=(-std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter -I"$V" -I"$PT/include")

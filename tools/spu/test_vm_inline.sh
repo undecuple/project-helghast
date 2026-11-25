@@ -8,7 +8,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 T="${SPU_TREE:-$ROOT/work/ps3recomp-patched}"
 L="$T/tools/ppu_lifter.py"
-[[ -f "$L" ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -f "$L" ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 grep -q "KZ3 patch 1091 begin" "$L" || { echo "FAIL: $T has no patch 1091"; exit 1; }
 sed -n '/KZ3 patch 1091 begin/,/KZ3 patch 1091 end/p' "$L" > "$O/vmi_block.h"
 rm -f "$O/t_vm_inline"

@@ -1,0 +1,188 @@
+KZ3 patch 2211 (RSX pass 175): fence waits by call site and the [perf-split-w] line (RSX_PERF=1 + RSX_PERF_SPLIT=1; a counter, default behaviour unchanged).
+
+rsx_wait_split.h (pure) names the walker's fence waits: wbdrain (ld_wbd_wait, LD_WB_DEFER drains), pslot (present path slot N-1), ring (descriptor/PS-constant ring wrap), idle, resize, verify, flush_rb, flush_other. ld_wait_fence_s wraps ld_wait_fence and the ld_flush wait adds to RSX_PERF_WS_*; cellGcmSys.c prints one [perf-split-w] line per window after [perf-split-o]: ms/flip and waits/flip per site, wait_other/rbwait buckets, gap (sites minus those buckets), unwait (other minus wait_other), gpuwait and wb_sync side by side (wb_sync contains the drain's fence wait: one wait, four counters), named/rest/sum/walk/diff, gpu= (poller wall per list) and lists/flip. Host test tools/smoke/test_wait_split.sh. NOT built or run in the game.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 0ebe764..822ddca 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -15,6 +15,7 @@
+ #include "rsx_lpb.h"   /* patch 2208 */
+ #include "rsx_walk_trivial.h"   /* patch 2209 */
+ #include "rsx_diag_delay.h"   /* patch 2210 */
++#include "rsx_wait_split.h"   /* patch 2211 */
+ static void rsx_lpb_start(void);
+ #include "rsx_legacy_skip.h"   /* patch 2189 */
+ static unsigned long long s_o0_m3d_pass, s_o0_m3dl_pass;   /* patch 2203: walker thread only, flushed by gcm_o0_flush_pass */
+@@ -3531,6 +3532,13 @@ static DWORD WINAPI rsx_perf_thread(LPVOID unused)
+                     fprintf(stderr, "%s\n", ln);
+                     rsx_split_fmt_d(ln, sizeof ln, tnow, b); fprintf(stderr, "%s\n", ln);
+                     rsx_split_fmt_o(ln, sizeof ln, tnow, b, unw - unw_prev, ovf - ovf_prev); fprintf(stderr, "%s\n", ln);
++                    { double wm[RSX_WS_N], wc[RSX_WS_N];   /* patch 2211: fence waits by site, and the sum check */
++                      _Static_assert(RSX_PERF_WS_TL - RSX_PERF_WS_T0 + 1 == RSX_WS_N, "RSX_PERF_WS_* slots vs RSX_WS_N");
++                      for (int i = 0; i < RSX_WS_N; i++) { wm[i] = (double)d[RSX_PERF_WS_T0 + i] * tk / (double)fl; wc[i] = (double)d[RSX_PERF_WS_N0 + i] / (double)fl; }
++                      rsx_ws_fmt(ln, sizeof ln, tnow, fl, wm, wc, b, (double)tot * tk / (double)fl, (double)d[RSX_PERF_GPUWAIT_T] * tk / (double)fl,
++                                 (double)d[RSX_PERF_W_WB_SYNC_T] * tk / (double)fl, d[RSX_PERF_S_GPU_N] ? (double)d[RSX_PERF_S_GPU_T] * tk / (double)fl : -1.0,
++                                 (double)d[RSX_PERF_S_GPU_N] / (double)fl);
++                      fprintf(stderr, "%s\n", ln); }
+                     { static unsigned long long w_prev, c_prev, t_prev;   /* patch 2203 */
+                       const unsigned long long w = __atomic_load_n(&g_rsx_split_words, __ATOMIC_RELAXED), cm = __atomic_load_n(&g_rsx_split_cmds, __ATOMIC_RELAXED), tm = __atomic_load_n(&g_rsx_split_timed, __ATOMIC_RELAXED);
+                       rsx_split_fmt_cost(ln, sizeof ln, tnow, fl, w - w_prev, cm - c_prev, tm - t_prev); fprintf(stderr, "%s\n", ln);
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index c1afd9e..e7eaa5b 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2553,6 +2553,7 @@ enum { LD_RM_SRV, LD_RM_SMP, LD_RM_PSCB, LD_RM_N };
+ static rsx_ring_marks g_ld_rm[2][LD_RM_N];
+ static unsigned long long g_ld_rm_wait_n[LD_RM_N], g_ld_rm_avoid_n[LD_RM_N], g_ld_rm_bad_n, g_ld_rm_fallback_n;
+ static int ld_wait_fence(u64 v);
++static int ld_wait_fence_s(int site, u64 v);   /* patch 2211: ld_wait_fence + the per-site time counter */
+ static void ld_oq_close(void);
+ static void ld_submit_nowait(void);
+ static u32 g_ld_unsubmitted;
+@@ -2599,7 +2600,7 @@ static int ld_rm_ensure(int r, u64 end)
+         g_ld_rm_wait_n[r]++;
+         if (rsx_perf_walk_on()) rsx_perf_add(r == LD_RM_PSCB ? RSX_PERF_W_RFW_PSCB_WAIT : RSX_PERF_W_RFW_DESC_WAIT, 1);
+     }
+-    if (!ld_wait_fence(f)) return 0;
++    if (!ld_wait_fence_s(2 /*RSX_WS_RING*/, f)) return 0;
+     rsx_rm_acquire(m, end);
+     return 1;
+ }
+@@ -2888,6 +2889,15 @@ static int ld_wait_fence(u64 v)
+     }
+     return 1;
+ }
++/* Patch 2211: site ids are RSX_WS_* of rsx_wait_split.h (kept as numbers here: that header is only included by cellGcmSys.c). */
++static int ld_wait_fence_s(int site, u64 v)
++{
++    if (!rsx_perf_enabled()) return ld_wait_fence(v);
++    const long long t0 = rsx_perf_now();
++    const int r = ld_wait_fence(v);
++    rsx_perf_add(RSX_PERF_WS_T0 + site, rsx_perf_now() - t0); rsx_perf_add(RSX_PERF_WS_N0 + site, 1);
++    return r;
++}
+ static void ld_fr_release_retired(u32 i)
+ {
+     struct ld_frame_slot* f = &g.fr[i];
+@@ -2899,7 +2909,7 @@ static void ld_fr_release_retired(u32 i)
+  * offset 0) must not race a frame still in flight. */
+ static void ld_wait_idle(void)
+ {
+-    if (g.ready && g.fif_n > 1) ld_wait_fence(g.fence_value);
++    if (g.ready && g.fif_n > 1) ld_wait_fence_s(3 /*IDLE*/, g.fence_value);
+ }
+ 
+ static void ld_oq_close(void);   /* patch 2025 */
+@@ -3499,7 +3509,7 @@ static void ld_flush_body(ld_flush_reason reason)
+                (size_t)g.n_retired_textures * sizeof(f->retired[0]));
+         f->n_retired = g.n_retired_textures;
+         g.n_retired_textures = 0;
+-        { LD_FX_T0(fx); if (!ld_wait_fence(g.fr[nxt].fence)) return; ld_fx_add(LD_FX_FENCE, fx); }   /* patch 2125 */
++        { LD_FX_T0(fx); if (!ld_wait_fence_s(1 /*PRESENT_SLOT*/, g.fr[nxt].fence)) return; ld_fx_add(LD_FX_FENCE, fx); }   /* patch 2125 */
+         { LD_FX_T0(fx); ld_drain_info_queue("flush"); ld_fx_add(LD_FX_INFO, fx); }
+         { LD_FX_T0(fx); ld_fr_release_retired(nxt); ld_fx_add(LD_FX_REL, fx); }
+         ld_fr_load(nxt);
+@@ -3541,6 +3551,7 @@ static void ld_flush_body(ld_flush_reason reason)
+           WaitForSingleObject(g.fence_event, INFINITE);
+           LDS_POP(s_fw);
+           rsx_perf_add(RSX_PERF_GPUWAIT_T, rsx_perf_now() - w0);
++          rsx_perf_add(RSX_PERF_WS_T0 + (reason == LD_FLUSH_READBACK ? 6 : 7), rsx_perf_now() - w0); rsx_perf_add(RSX_PERF_WS_N0 + (reason == LD_FLUSH_READBACK ? 6 : 7), 1);   /* patch 2211 */
+           if (rsx_perf_walk_on())   /* patch 2029: which flushes wait */
+               rsx_perf_add(reason == LD_FLUSH_READBACK ? RSX_PERF_W_WAIT_RB_T : RSX_PERF_W_WAIT_OTHER_T,
+                            rsx_perf_now() - w0); }
+@@ -17305,7 +17316,7 @@ static void ld_dm_sync_size(void)
+     if (g_dm_force_resize && g_dm_resizes < 64)
+         fprintf(stderr, "[display] ResizeBuffers after a fullscreen transition (%ux%u, frame %u)\n", w, h, g_ld_frames);
+     g_dm_force_resize = 0;
+-    ld_wait_fence(g.fence_value);                 /* every submitted list that used a back buffer is done */
++    ld_wait_fence_s(4 /*RESIZE*/, g.fence_value);                 /* every submitted list that used a back buffer is done */
+     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++)
+         if (g.backbuf[i]) { g.backbuf[i]->lpVtbl->Release(g.backbuf[i]); g.backbuf[i] = NULL; }
+     const HRESULT hr = g.swap->lpVtbl->ResizeBuffers(g.swap, LD_SWAP_BUFFERS, w, h, DXGI_FORMAT_UNKNOWN, ld_swap_flags());
+@@ -19061,7 +19072,7 @@ static int ld_wbd_wait(void* ctx, u64 fence, u64* blocked_ns)
+     const int block = g.fence->lpVtbl->GetCompletedValue(g.fence) < fence;
+     LARGE_INTEGER a, b, f;
+     QueryPerformanceCounter(&a);
+-    if (!ld_wait_fence(fence)) return 0;
++    if (!ld_wait_fence_s(0 /*WBD_DRAIN*/, fence)) return 0;
+     if (!block) return 1;
+     QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
+     *blocked_ns = (u64)((double)(b.QuadPart - a.QuadPart) * 1e9 / (double)f.QuadPart);
+@@ -19202,7 +19213,7 @@ static u32 ld_wbd_chunk(const u32* rec, const int* slots, u32 nrec, u32 for_off,
+         return d;
+     }
+     const u64 fence = g.fence_value;
+-    if (g_wbd_mode == 2 && !ld_wait_fence(fence)) return 0;   /* verify: the readback is read at the original point too */
++    if (g_wbd_mode == 2 && !ld_wait_fence_s(5 /*VERIFY*/, fence)) return 0;   /* verify: the readback is read at the original point too */
+     for (u32 k = 0; k < nrec; k++) {
+         surface_t* sf = &g.surfaces[rec[k]];
+         const u32 texel = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index ec7bfc5..a16e685 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -312,6 +312,8 @@ enum {
+     RSX_PERF_O_EOP_T, RSX_PERF_O_EOP_SUB_T, RSX_PERF_O_PW_T, RSX_PERF_O_PW_N,
+     /* patch 2188 (RSX_PERF_SPLIT=1): GPU busy ticks / lists seen by the RSX_PERF_GPU=1 fence poller (the gpu= key of [perf-split]) */
+     RSX_PERF_S_GPU_T, RSX_PERF_S_GPU_N,
++    /* patch 2211: fence waits by call site (rsx_wait_split.h, RSX_WS_*), ticks then counts */
++    RSX_PERF_WS_T0, RSX_PERF_WS_TL = RSX_PERF_WS_T0 + 7, RSX_PERF_WS_N0, RSX_PERF_WS_NL = RSX_PERF_WS_N0 + 7,
+     RSX_PERF_COUNT
+ };
+ int       rsx_perf_walk_on(void);              /* patch 2029: inside the RSX_PERF_PROF window */
+diff --git a/libs/video/rsx_wait_split.h b/libs/video/rsx_wait_split.h
+new file mode 100644
+index 0000000..063e6f1
+--- /dev/null
++++ b/libs/video/rsx_wait_split.h
+@@ -0,0 +1,49 @@
++/* KZ3 patch 2211 (RSX pass 175): the walker's fence waits by call site, and the [perf-split-w] line. Pure C (time is passed in).
++ * The [perf-split] buckets charge every fence wait to X_WAITO (`wait_other`, inside `other`) or RBWAIT; this says WHICH wait it
++ * was, and checks that the printed buckets add up to the walk. Counted with RSX_PERF=1 (a counter, nothing changes otherwise).
++ * Findings of the round (the RE notes "Pass 175"):
++ *  - wb_sync (the write-back sync time in [perf-walk]) CONTAINS the deferred-store drain's fence wait (WBD_DRAIN) and so does
++ *    gpuwait (all fence waits) and wait_other: one wait, four counters. The line prints them side by side.
++ *  - gpu= is the RSX_PERF_GPU=1 poller's wall time per submitted list (submit to the poll that saw the fence), not GPU execution. */
++#ifndef RSX_WAIT_SPLIT_H
++#define RSX_WAIT_SPLIT_H
++#include "rsx_o0.h"
++enum {
++    RSX_WS_WBD_DRAIN = 0,   /* ld_wbd_wait: a deferred write-back store waits for its list (LD_WB_DEFER drains, any reason) */
++    RSX_WS_PRESENT_SLOT,    /* ld_flush present path: the slot N-1 fence before the walker records frame N+1 */
++    RSX_WS_RING,            /* descriptor / pixel-constant ring wrap (ld_rm_*, LD_RING_FENCE_WAIT) */
++    RSX_WS_IDLE,            /* ld_wait_idle: CPU writes outside the rings */
++    RSX_WS_RESIZE,          /* display resize: every list that used a back buffer */
++    RSX_WS_VERIFY,          /* LD_WB_DEFER_VERIFY readback at the original point */
++    RSX_WS_FLUSH_RB,        /* ld_flush LD_FLUSH_READBACK (bucket RBWAIT) */
++    RSX_WS_FLUSH_OTHER,     /* ld_flush, any other reason (bucket X_WAITO) */
++    RSX_WS_N
++};
++static const char* const rsx_ws_name[RSX_WS_N] = { "wbdrain", "pslot", "ring", "idle", "resize", "verify", "flush_rb", "flush_other" };
++
++/* ms/flip per site -> the line. b[] = the window's split buckets in ms/flip (RSX_SB_*), walk = their ms/flip total.
++ * waits = all sites; gap = waits - (wait_other + rbwait): a wait outside the walker pass, or a timer that does not cover one.
++ * sum = named buckets (decode..park) + every bucket the main line folds into `other`; diff = walk - sum (0 by construction,
++ * so a non-zero diff means the buckets were not read from one window). unwait = `other` minus wait_other: the unnamed time
++ * that is not a fence wait. */
++static inline int rsx_ws_fmt(char* out, size_t n, double t, long long flips, const double* ws_ms, const double* ws_cnt,
++                             const double* b, double walk, double gpuwait, double wb_sync, double gpu, double gpu_lists)
++{
++    double waits = 0, rest = 0;
++    for (int i = 0; i < RSX_WS_N; i++) waits += ws_ms[i];
++    rest = b[RSX_SB_OTHER];
++    for (int i = RSX_SB_NAMED; i < RSX_SB_N; i++) rest += b[i];
++    const double named = rsx_split_named_sum(b), sum = named + rest;
++    const double wait_other = b[RSX_SB_X_WAITO], rbwait = b[RSX_SB_RBWAIT];
++    int o = snprintf(out, n, "[perf-split-w] t=%.0f flips=%lld", t, flips);
++    for (int i = 0; i < RSX_WS_N && o > 0 && (size_t)o < n; i++)
++        o += snprintf(out + o, n - (size_t)o, " %s=%.2f/%.2f", rsx_ws_name[i], ws_ms[i], ws_cnt[i]);   /* ms per flip / waits per flip */
++    if (o > 0 && (size_t)o < n)
++        o += snprintf(out + o, n - (size_t)o,
++            " waits=%.2f | wait_other=%.2f rbwait=%.2f gap=%.2f unwait=%.2f | gpuwait=%.2f wb_sync=%.2f"
++            " | named=%.2f rest=%.2f sum=%.2f walk=%.2f diff=%.2f | gpu=%.2f lists=%.2f",
++            waits, wait_other, rbwait, waits - wait_other - rbwait, rest - wait_other, gpuwait, wb_sync,
++            named, rest, sum, walk, walk - sum, gpu, gpu_lists);
++    return o;
++}
++#endif

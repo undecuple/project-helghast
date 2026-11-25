@@ -7,9 +7,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="${KZ3_ZCLEAR_DIR:-$PT/libs/video}"
 if [[ ! -f "$V/rsx_dispatch.h" || ! -d "$PT/include" ]]; then
-  echo "[test_zclear] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_zclear] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 if ! grep -q rsx_dsp_zclear_decode "$V/rsx_dispatch.h"; then
-  echo "[test_zclear] SKIP: toolkit without patch 2041 (no rsx_dsp_zclear_decode)"; exit 0; fi
+  echo "[test_zclear] SKIP: toolkit without patch 2041 (no rsx_dsp_zclear_decode)"; exit 77; fi
 O="$ROOT/build/smoke-host/zclear"; mkdir -p "$O"
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -Wno-unused-function -O2 -I"$V" -I"$PT/include" \
   "$ROOT/tools/smoke/test_zclear.c" -o "$O/test_zclear" -lm

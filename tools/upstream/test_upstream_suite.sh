@@ -16,7 +16,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 P="${NEW_TREE:-$ROOT/work/ps3recomp-patched}"
-[[ -d "$P/tools" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
+[[ -d "$P/tools" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
 rc=0; n=0
 STUB="$(mktemp -d)"; trap 'rm -rf "$STUB"' EXIT
 cat > "$STUB/kz3_note_stub.h" <<'H'

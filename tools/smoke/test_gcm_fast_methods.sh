@@ -10,9 +10,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/cellGcmSys.c" || ! -d "$PT/include" ]]; then
-  echo "[test_gcm_fast_methods] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_gcm_fast_methods] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 if ! grep -q gcm_fast_methods "$V/cellGcmSys.c"; then
-  echo "[test_gcm_fast_methods] SKIP: toolkit without patch 2149"; exit 0; fi
+  echo "[test_gcm_fast_methods] SKIP: toolkit without patch 2149"; exit 77; fi
 O="$ROOT/build/smoke-host/gcm_fast_methods"; mkdir -p "$O"
 CF=(-std=gnu17 -O1 -g -w -I "$PT/include" -I "$V" -ffunction-sections -fdata-sections "-Wl,--gc-sections" -pthread -lm)
 EXTRA_SRC=(); [[ -f "$V/rsx_tiling.c" ]] && EXTRA_SRC=("$V/rsx_tiling.c")   # an array, so a checkout path with spaces stays one word

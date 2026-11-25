@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if [[ ! -f "$V/rsx_gfx_page.h" ]]; then echo "[test_gfx_mutants] SKIP: no patched toolkit with patch 2206 ($V/rsx_gfx_page.h; run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$V/rsx_gfx_page.h" ]]; then echo "[test_gfx_mutants] SKIP: no patched toolkit with patch 2206 ($V/rsx_gfx_page.h; run tools/ps3recomp-patched.sh)"; exit 77; fi
 CC="${CC:-cc}"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 W=(-std=c11 -Wall -Wextra -O1)

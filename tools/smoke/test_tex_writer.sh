@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 if [[ ! -f "$PT/libs/video/rsx_tex_writer.h" ]]; then
-  echo "[test_tex_writer] SKIP: no patched toolkit with 2083 (run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_tex_writer] SKIP: no patched toolkit with 2083 (run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/tex_writer"; mkdir -p "$O"
 def=(); [[ ${1:-} == --old ]] && def=(-DOLD_RULE)
 gcc -std=gnu11 -O2 -Wall -Werror "${def[@]}" -I "$PT/libs/video" -o "$O/test_tex_writer" "$ROOT/tools/smoke/test_tex_writer.c"

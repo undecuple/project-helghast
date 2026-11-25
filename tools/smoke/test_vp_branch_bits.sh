@@ -11,11 +11,11 @@ PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 D="${KZ3_VP_DIR:-$V}"
 if [[ ! -f "$D/rsx_vp_decompiler.c" || ! -f "$V/rsx_test_programs.h" || ! -d "$PT/include" ]]; then
-  echo "[test_vp_branch_bits] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_vp_branch_bits] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 OLD=""
 if [[ ${KZ3_VP_OLD:-} == 1 ]]; then OLD=-DKZ3_TEST_OLD
 elif ! grep -q rsx_vp_set_branch_bits "$D/rsx_vp_decompiler.h"; then
-  echo "[test_vp_branch_bits] SKIP: toolkit without patch 2100 (no rsx_vp_set_branch_bits)"; exit 0; fi
+  echo "[test_vp_branch_bits] SKIP: toolkit without patch 2100 (no rsx_vp_set_branch_bits)"; exit 77; fi
 O="$ROOT/build/smoke-host/vp_branch_bits"; mkdir -p "$O"
 CC="${CC:-cc}"
 W=(-std=c11 -Wall -Wextra -Werror -Wno-unused-function -Wno-format-truncation -I"$D" -I"$V" -I"$PT/include" ${OLD:+"$OLD"})

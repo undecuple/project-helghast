@@ -4,7 +4,7 @@
 #   nix develop --command tools/sandbox.sh -- tools/spu/test_r98_jobcost_load.sh [N=10] [B=2 x nproc]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/jc-tests"
-[[ -x "$O/t_jobcost" ]] || { echo "SKIP: build first with tools/spu/test_r98_jobcost.sh"; exit 0; }
+[[ -x "$O/t_jobcost" ]] || { echo "SKIP: build first with tools/spu/test_r98_jobcost.sh"; exit 77; }
 N="${1:-10}"; B="${2:-$(( $(nproc) * 2 ))}"
 rm -f "$O"/load_*.log
 burners=()

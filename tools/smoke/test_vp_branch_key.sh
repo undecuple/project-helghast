@@ -11,9 +11,9 @@ PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 D="${KZ3_VP_DIR:-$V}"
 if [[ ! -f "$D/rsx_vp_decompiler.c" || ! -d "$PT/include" ]]; then
-  echo "[test_vp_branch_key] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_vp_branch_key] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 if ! grep -q rsx_vp_key_branch_base "$D/rsx_vp_decompiler.h"; then
-  echo "[test_vp_branch_key] SKIP: toolkit without patch 2077 (no rsx_vp_key_branch_base)"; exit 0; fi
+  echo "[test_vp_branch_key] SKIP: toolkit without patch 2077 (no rsx_vp_key_branch_base)"; exit 77; fi
 O="$ROOT/build/smoke-host/vp_branch_key"; mkdir -p "$O"
 CC="${CC:-cc}"
 # -Wno-format-truncation: the toolkit decompiler's own snprintf into a 256-byte buffer warns under -O2 fortify

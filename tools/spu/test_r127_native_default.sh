@@ -6,7 +6,7 @@
 # without the patched toolkit.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f $T/runtime/spu/spu_drain.c ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -f $T/runtime/spu/spu_drain.c ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 CC="${CC:-cc}"; S="$ROOT/tools/spu"
 $CC -std=gnu17 -O1 -w -msse4.1 -ffp-contract=off -I "$T/runtime/spu" -I "$T/include" -I "$T/runtime" -I "$ROOT/port/spu" -I "$S" \

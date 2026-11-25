@@ -9,8 +9,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -d "$PT/libs/video" ]] || { echo "[test_y16x16f] SKIP: no patched toolkit ($PT)"; exit 0; }
-grep -q "patch 2201" "$PT/libs/video/rsx_live_draw.c" 2>/dev/null || { echo "[test_y16x16f] SKIP: toolkit without patch 2201"; exit 0; }
+[[ -d "$PT/libs/video" ]] || { echo "[test_y16x16f] SKIP: no patched toolkit ($PT)"; exit 77; }
+grep -q "patch 2201" "$PT/libs/video/rsx_live_draw.c" 2>/dev/null || { echo "[test_y16x16f] SKIP: toolkit without patch 2201"; exit 77; }
 O="$ROOT/build/smoke-host/y16x16f"; mkdir -p "$O"
 CCX="${CC:-cc}"
 SRC="$ROOT/tools/smoke/test_y16x16f.c"

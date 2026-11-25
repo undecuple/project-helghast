@@ -5,7 +5,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${PS3RECOMP_PATCHED:-$ROOT/work/ps3recomp-patched}"
-[[ -d $T/runtime/spu ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -d $T/runtime/spu ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 OUT="$(mktemp -d)"
 fail=0
 SRC="runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c runtime/spu/spu_workload.c

@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if [[ ! -f "$V/rsx_fp_decompiler.c" || ! -d "$PT/include" ]]; then echo "[test_fp_tc89] SKIP: no patched toolkit"; exit 0; fi
+if [[ ! -f "$V/rsx_fp_decompiler.c" || ! -d "$PT/include" ]]; then echo "[test_fp_tc89] SKIP: no patched toolkit"; exit 77; fi
 if ! grep -q '"input.tc8"' "$V/rsx_fp_decompiler.c"; then echo "[test_fp_tc89] FAIL: toolkit without PR #328 (9328)"; exit 1; fi
 O="$ROOT/build/smoke-host/fp_tc89"; mkdir -p "$O"
 cat > "$O/t.c" <<'EOC'

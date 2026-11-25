@@ -7,7 +7,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/host-tests/vm-inline-off"; mkdir -p "$O"
 T="${SPU_TREE:-$ROOT/work/ps3recomp-patched}"; L="$T/runtime/ppu/ppu_loader.cpp"
-grep -q "KZ3 patch 1161" "$L" 2>/dev/null || { echo "SKIP: no patched toolkit with patch 1161 at $T"; exit 0; }
+grep -q "KZ3 patch 1161" "$L" 2>/dev/null || { echo "SKIP: no patched toolkit with patch 1161 at $T"; exit 77; }
 { echo '#include <cstdio>'; echo '#include <cstdlib>'
   sed -n '/^extern "C" int vm_inline_ok = 0;/,/^} s_vm_inline_init;/p' "$L" | sed 's/^extern "C" int \(vm_inline[a-z_]*\) = 0;/extern "C" { int \1 = 0; }/'
   echo 'int main() { printf("%d %d\n", vm_inline_ok, vm_inline_st_ok); return 0; }'; } > "$O/vmi_off.cpp"

@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if ! grep -qs rsx_o0v_fmt "$V/rsx_o0.h"; then echo "[test_o0_vtx] SKIP: no patched toolkit with patch 2195 ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+if ! grep -qs rsx_o0v_fmt "$V/rsx_o0.h"; then echo "[test_o0_vtx] SKIP: no patched toolkit with patch 2195 ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/o0-vtx"; mkdir -p "$O"
 CC="${CC:-cc}"
 $CC -std=c11 -Wall -Wextra -Werror -O2 -I"$V" "$ROOT/tools/smoke/test_o0_vtx.c" -o "$O/t" -lm

@@ -10,9 +10,9 @@ PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 G="${KZ3_VTX_GPU_DIR:-$V}"
 if [[ ! -f "$V/rsx_vertex_compact.c" || ! -d "$PT/include" ]]; then
-  echo "[test_vtx_gpu] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_vtx_gpu] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 if [[ ! -f "$G/rsx_vtx_gpu.h" ]]; then
-  echo "[test_vtx_gpu] SKIP: toolkit without patch 2076 (no rsx_vtx_gpu.h)"; exit 0; fi
+  echo "[test_vtx_gpu] SKIP: toolkit without patch 2076 (no rsx_vtx_gpu.h)"; exit 77; fi
 O="$ROOT/build/smoke-host/vtx_gpu"; mkdir -p "$O"
 CC="${CC:-cc}"
 W=(-std=c11 -Wall -Wextra -Werror -Wno-unused-function -I"$G" -I"$V" -I"$PT/include")

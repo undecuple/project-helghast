@@ -1,0 +1,203 @@
+KZ3 patch 2213 (RSX pass 176): LD_SMP_RING_NODRAIN=1 (default off; 2 = also count tables without a fence at the wrap): a full sampler ring wraps without draining the queue.
+
+Cause (read from the code and the profiling logs, NOT run in the game): flush_other in [perf-split-w] is the full-queue drain of the draw path when the sampler descriptor ring (128 tables x 16 samplers, the D3D12 2048-sampler heap limit) is full and the draw's table is new: sampler_table_needs_flush -> ld_rm_try_wrap fails (LD_RING_FENCE_WAIT off) -> ld_flush(LD_FLUSH_DESCRIPTOR_RING), a Signal+wait of the fence just submitted, which also absorbs the whole GPU backlog (queue is in order). Evidence: [perf-flush] 'wraps smp N' equals 'descring' flush count in all three series-1123 logs (probe-g2 295/295, p1 157/157, a1 206/206); srv/up/vtx/cb/pscb wraps 0; no [ld-ring] line (switch off). flush_other 0.3-1.9 ms/flip at 0.27-0.67 waits/flip in the sampled [perf-split-w] lines (the 3-4 ms seen earlier is the per-wait cost).
+
+Why not just LD_RING_FENCE_WAIT=1: its marks (patch 2155 rsx_rm_submit_live) keep the whole allocated prefix live through every submit, so after a wrap the first reuse waits for the fence of the submit that closed the wrap = the drain again, and it also wraps the SRV ring. This patch uses exact per-table stamps instead: sampler_table() is called once per draw (hit or take) and the table is read only by that draw's list (root table set directly, no memo), so rsx_smp_use.h marks a table UNSUB when a draw of the open list binds it, ld_rm_note_submit (the common submit hook, all three submit paths) turns UNSUB into the submit's fence, and ld_smp_take waits for the newest binding fence of the table it overwrites (fence value cached, GetCompletedValue only when needed; the wait goes through ld_wait_fence_s site RING, so [perf-split-w] ring and the RFW_DESC_WAIT/AVOID perf counters stay truthful).
+
+Change: rsx_live_draw.c draw path: when only the sampler ring is full and the switch is on, ld_smp_wrap_nodrain() (ld_oq_close + ld_submit_nowait; an open query falls back to the old drain, counted) replaces the drain and only g.smp_ring_used is reset; the SRV ring and g_srv_desc_gen are left alone. Not combined with LD_RING_FENCE_WAIT=1 (that path keeps its own marks). rsx_smp_use.h is new and pure. Fail closed: a failed fence wait returns LD_TAKE_FAIL as patch 2157 does. A table still UNSUB when it is about to be overwritten (a ring reset without a submit, as ld_movie_reset_rings) has no fence: counted (unfenced_at_take), no wait, same as the old code.
+
+Expected effect: the descring drain disappears; the walker still waits at the first takes after the wrap if the GPU has not reached the chunk that last bound table k (bounded above by the old drain). Estimate 0.3-1.9 ms/flip walker time at K4, ~+0.5..2 fps if walker-bound. Verify in a run: [perf-flush] descring ~0 with 'wraps smp' unchanged, [ld-ring] smp-nodrain wraps>0, fallback=0, unfenced_at_wrap=0 (LD_SMP_RING_NODRAIN=2), unfenced_at_take small, flush_other and ring waits in [perf-split-w], and a pixel-identical screenshot against the off side. Host test: tools/smoke/test_smp_nodrain.sh.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2550,6 +2550,7 @@
+  * range waits only for the newest fence that read that range. The vertex, vertex-constant and upload rings still drain
+  * (open items, rsx notes pass 144). Default off: the old full drain. */
+ #include "rsx_ring_marks.h"
++#include "rsx_smp_use.h"   /* patch 2213 */
+ enum { LD_RM_SRV, LD_RM_SMP, LD_RM_PSCB, LD_RM_N };
+ static rsx_ring_marks g_ld_rm[2][LD_RM_N];
+ static unsigned long long g_ld_rm_wait_n[LD_RM_N], g_ld_rm_avoid_n[LD_RM_N], g_ld_rm_bad_n, g_ld_rm_fallback_n;
+@@ -2626,6 +2627,70 @@
+         rsx_perf_add(rings[0] == LD_RM_PSCB ? RSX_PERF_W_RFW_PSCB_AVOID : RSX_PERF_W_RFW_DESC_AVOID, 1);
+     return 1;
+ }
++/* Patch 2213: LD_SMP_RING_NODRAIN=1 (default off; 2 = also count the tables found without a fence at the wrap). When only the sampler ring
++ * is full (the SRV ring is not), the draw path submits the open list and restarts the sampler cursor at 0 instead of
++ * ld_flush(LD_FLUSH_DESCRIPTOR_RING) (a full queue drain = [perf-flush] descring = flush_other). The take of table k then waits only for
++ * the newest fence that bound k (rsx_smp_use.h), normally a chunk submitted much earlier, not for the list just submitted.
++ * Not with LD_RING_FENCE_WAIT=1 (that path wraps both descriptor rings with its own marks). The SRV ring and every other ring drain as before. */
++static rsx_smp_use g_ld_smpu;
++static int g_ld_smpnd_mode = -1;
++static unsigned long long g_ld_smpnd_wraps, g_ld_smpnd_waits, g_ld_smpnd_fallback, g_ld_smpnd_unsub_wrap;
++static u64 g_ld_smpnd_done;   /* newest fence value seen completed (avoids a GetCompletedValue per take) */
++static int ld_smp_nodrain_on(void)
++{
++    if (g_ld_smpnd_mode < 0) {
++        const char* e = getenv("LD_SMP_RING_NODRAIN");
++        g_ld_smpnd_mode = (e && e[0] && e[0] != '0') ? (e[0] == '2' ? 2 : 1) : 0;
++        rsx_smpu_init(&g_ld_smpu);
++        if (g_ld_smpnd_mode)
++            fprintf(stderr, "[ld-ring] LD_SMP_RING_NODRAIN=%d: a full sampler ring wraps without a queue drain (per-table fences%s; patch 2213)\n",
++                    g_ld_smpnd_mode, g_ld_smpnd_mode == 2 ? ", counting unfenced tables at the wrap" : "");
++    }
++    return g_ld_smpnd_mode;
++}
++/* Every submit of g.list (next to ld_rm_note_submit): the tables the open list bound complete with this fence. */
++static void ld_smp_note_submit(u64 fence)
++{
++    if (ld_smp_nodrain_on() > 0) rsx_smpu_submit(&g_ld_smpu, fence);
++}
++/* The draw that records through sampler table `t` (hit or take). */
++static void ld_smp_bind(u32 t)
++{
++    if (ld_smp_nodrain_on() > 0) rsx_smpu_bind(&g_ld_smpu, g.fr_cur & 1u, t);
++}
++/* The cursor is about to overwrite table `t`: wait for the fence of its newest binding. 1 = free, 0 = the wait failed (fail closed). */
++static int ld_smp_ensure_table(u32 t)
++{
++    if (ld_smp_nodrain_on() <= 0) return 1;
++    const u64 f = rsx_smpu_need(&g_ld_smpu, g.fr_cur & 1u, t);
++    if (!f || f <= g_ld_smpnd_done) return 1;
++    const u64 c = g.fence->lpVtbl->GetCompletedValue(g.fence);
++    if (c > g_ld_smpnd_done) g_ld_smpnd_done = c;
++    if (f <= g_ld_smpnd_done) return 1;
++    g_ld_smpnd_waits++;
++    if (rsx_perf_walk_on()) rsx_perf_add(RSX_PERF_W_RFW_DESC_WAIT, 1);
++    if (!ld_wait_fence_s(2 /*RSX_WS_RING*/, f)) return 0;
++    if (f > g_ld_smpnd_done) g_ld_smpnd_done = f;
++    return 1;
++}
++/* Sampler-only wrap without a drain: submit the open list (a query left open cannot be split: 0 = the caller drains as before). */
++static int ld_smp_wrap_nodrain(void)
++{
++    if (!ld_smp_nodrain_on() || ld_ring_fence_wait_on() || !g.ready) return 0;
++    ld_oq_close();
++    g_ld_unsubmitted = 1;
++    ld_submit_nowait();
++    if (g_ld_unsubmitted) {
++        if (++g_ld_smpnd_fallback <= 8) fprintf(stderr, "[ld-ring] smp-nodrain: list not submitted (open query?): the wrap drains as before n=%llu\n", g_ld_smpnd_fallback);
++        return 0;
++    }
++    if (g_ld_smpnd_mode == 2) g_ld_smpnd_unsub_wrap += rsx_smpu_unsub_count(&g_ld_smpu, g.fr_cur & 1u, SMP_RING_TABLES);
++    if ((++g_ld_smpnd_wraps & 255u) == 1u && g_ld_smpnd_wraps <= 1025u)
++        fprintf(stderr, "[ld-ring] smp-nodrain wraps=%llu waits=%llu fallback=%llu unfenced_at_wrap=%llu unfenced_at_take=%llu\n", g_ld_smpnd_wraps,
++                g_ld_smpnd_waits, g_ld_smpnd_fallback, g_ld_smpnd_unsub_wrap, (unsigned long long)g_ld_smpu.unsub_seen);
++    if (rsx_perf_walk_on()) rsx_perf_add(RSX_PERF_W_RFW_DESC_AVOID, 1);
++    return 1;
++}
+ #define LD_TAKE_FAIL 0xFFFFFFFFu   /* patch 2157: no descriptor table was allocated (failed wait, lost device) */
+ static u32 ld_srv_take(void)
+ {
+@@ -2635,6 +2700,8 @@
+ static u32 ld_smp_take(void)
+ {
+     if (!g.ready || !ld_rm_ensure(LD_RM_SMP, (u64)g.smp_ring_used + 1u)) return LD_TAKE_FAIL;
++    if (!ld_smp_ensure_table(g.smp_ring_used)) return LD_TAKE_FAIL;   /* patch 2213 */
++    ld_smp_bind(g.smp_ring_used);                                      /* patch 2213: the draw that takes it binds it */
+     return g.smp_ring_used++ * SMP_TABLE_SIZE;
+ }
+ 
+@@ -2751,6 +2818,7 @@
+             g.smp_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(
+                 g.smp_heap, &cached);
+             cached.ptr += (u64)(i * SMP_TABLE_SIZE) * g.smp_step;
++            ld_smp_bind(i);   /* patch 2213: this draw reads the table again */
+             return cached;
+         }
+     }
+@@ -3486,6 +3554,7 @@
+     const u64 v = ++g.fence_value;
+     ld_gm_note(v);   /* patch 2051 */
+     ld_rm_note_submit(v);   /* patch 2153 */
++    ld_smp_note_submit(v);   /* patch 2213 */
+     const HRESULT signal_hr =
+         g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+     if (FAILED(signal_hr)) {
+@@ -14782,6 +14851,7 @@
+     const u64 v = ++g.fence_value;
+     ld_gm_note(v);   /* patch 2051 */
+     ld_rm_note_submit(v);   /* patch 2153 */
++    ld_smp_note_submit(v);   /* patch 2213 */
+     const HRESULT signal_hr = g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+     if (FAILED(signal_hr)) {
+         fprintf(stderr, "[d3d-fail] queue Signal (chunk) hr=0x%08lX frame=%u\n",
+@@ -16179,14 +16249,16 @@
+          * before recycling its shader-visible heap entries. Texture upload
+          * commands recorded while resolving slots are also completed here;
+          * no render-state command for this draw has been recorded yet. */
+-        {   /* patch 2153: LD_RING_FENCE_WAIT=1 submits and waits later only for the fence that read a reused range */
++        int smp_only = 0;
++        if (smp_ring_full && ld_smp_wrap_nodrain()) smp_only = 1;   /* patch 2213: LD_SMP_RING_NODRAIN, the SRV ring is not touched */
++        else {   /* patch 2153: LD_RING_FENCE_WAIT=1 submits and waits later only for the fence that read a reused range */
+             static const int rm_desc[2] = { LD_RM_SRV, LD_RM_SMP };
+             if (!ld_rm_try_wrap(rm_desc, 2)) {
+                 ld_flush(LD_FLUSH_DESCRIPTOR_RING);
+                 if (!g.ready) return;
+             }
+         }
+-        g.srv_ring_used = 0; g_srv_desc_gen++;   /* patch 2045: the memo's bases are reused */
++        if (!smp_only) { g.srv_ring_used = 0; g_srv_desc_gen++; }   /* patch 2045: the memo's bases are reused */
+         g.smp_ring_used = 0;
+     }
+ 
+diff --git a/libs/video/rsx_smp_use.h b/libs/video/rsx_smp_use.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_smp_use.h
+@@ -0,0 +1,54 @@
++/* rsx_smp_use.h - KZ3 patch 2213 (LD_SMP_RING_NODRAIN): last-use fence per sampler-ring table.
++ *
++ * The sampler ring (128 tables of 16 samplers, one shader-visible heap per frame slot) is written linearly and recycled
++ * when it is full. The old recycle drained the whole queue (ld_flush(LD_FLUSH_DESCRIPTOR_RING), the "flush_other" wait).
++ * Patch 2155's (range, fence) marks cannot replace it: they keep the whole allocated prefix live through every submit, so
++ * the first reuse waits for the fence of the submit that closed the wrap, which is the drain again. The sampler table
++ * is only read by the draw that bound it (sampler_table() is called once per draw, hit or take), so an exact per-table
++ * stamp is possible: the table is marked UNSUB when a draw of the open command list binds it, the submit hook turns every
++ * UNSUB into that submit's fence, and a table is overwritten only after the fence of its newest binding completed.
++ * Pure bookkeeping, no D3D12 types: tools/smoke/test_smp_nodrain.sh builds it on the host. */
++#ifndef RSX_SMP_USE_H
++#define RSX_SMP_USE_H
++#include <stdint.h>
++#include <string.h>
++#define RSX_PATCH_2213 1
++#define RSX_SMPU_CAP 128u
++#define RSX_SMPU_SLOTS 2u
++#define RSX_SMPU_UNSUB (~(uint64_t)0)   /* bound by a draw of the open (unsubmitted) list */
++
++typedef struct {
++    uint64_t f[RSX_SMPU_SLOTS][RSX_SMPU_CAP];   /* 0 = never bound / retired, UNSUB = in the open list, else the submit's fence */
++    uint64_t unsub_seen;                         /* a table about to be overwritten was still in the open list (no fence to wait for) */
++} rsx_smp_use;
++
++static inline void rsx_smpu_init(rsx_smp_use* u) { memset(u, 0, sizeof *u); }
++/* A draw of the open list binds table `t` of frame slot `slot` (a cache hit counts, it reads the table again). */
++static inline void rsx_smpu_bind(rsx_smp_use* u, uint32_t slot, uint32_t t)
++{
++    if (t < RSX_SMPU_CAP) u->f[slot % RSX_SMPU_SLOTS][t] = RSX_SMPU_UNSUB;
++}
++/* The open list was submitted with `fence`: every table it bound now completes with that fence. */
++static inline void rsx_smpu_submit(rsx_smp_use* u, uint64_t fence)
++{
++    for (uint32_t s = 0; s < RSX_SMPU_SLOTS; s++)
++        for (uint32_t t = 0; t < RSX_SMPU_CAP; t++)
++            /*SUBMIT*/ if (u->f[s][t] == RSX_SMPU_UNSUB) u->f[s][t] = fence;
++}
++/* The cursor is about to overwrite table `t`: the fence that must have completed first (0 = none). A table still in the open list
++ * has no fence: counted, nothing to wait for (the wrap submits first, so this only happens on a reset without a wrap). */
++static inline uint64_t rsx_smpu_need(rsx_smp_use* u, uint32_t slot, uint32_t t)
++{
++    if (t >= RSX_SMPU_CAP) return 0;
++    const uint64_t f = u->f[slot % RSX_SMPU_SLOTS][t];
++    if (f == RSX_SMPU_UNSUB) { u->unsub_seen++; return 0; }
++    return f;
++}
++/* Tables of `slot` below `n` still without a fence (must be 0 right after the wrap's submit). */
++static inline uint32_t rsx_smpu_unsub_count(const rsx_smp_use* u, uint32_t slot, uint32_t n)
++{
++    uint32_t c = 0;
++    for (uint32_t t = 0; t < n && t < RSX_SMPU_CAP; t++) if (u->f[slot % RSX_SMPU_SLOTS][t] == RSX_SMPU_UNSUB) c++;
++    return c;
++}
++#endif

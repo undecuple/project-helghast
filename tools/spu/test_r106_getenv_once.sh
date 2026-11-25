@@ -9,7 +9,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -d $T/runtime/spu ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -d $T/runtime/spu ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 grep -q "KZ3_ENV_ON" "$T/runtime/syscalls/sys_semaphore.c" || { echo "FAIL: patch 1127 not applied"; exit 1; }
 fail=0; pass=0
 # file  name  per-name getenv calls allowed (the one-time reads; v0.18.0, SPU pass 108: upstream 634871d1 caches

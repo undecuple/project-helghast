@@ -61,7 +61,7 @@ def fake_repo(root):
                 "work/ps3recomp-patched/LICENSE", "work/ps3recomp-patched/CMakeLists.txt",
                 "work/ps3recomp-patched/.kz3-patchset", "work/ps3recomp-patched/tools/ppu_lifter.py",
                 "work/ps3recomp-patched/runtime/a.c", "work/ps3recomp-patched/tests/sync/CMakeLists.txt",
-                "work/ps3recomp-patched/third_party/at3_standalone/COPYING.LGPLv2.1", "work/ps3recomp-patched/libs/video/fsr1/LICENSE.txt",
+                "work/ps3recomp-patched/third_party/at3_standalone/COPYING.LGPLv2.1", "work/ps3recomp-patched/libs/video/fsr1/LICENSE.txt", "work/ps3recomp-patched/third_party/smaa/LICENSE.txt",
                 "work/ps3recomp-patched/fw_spu/spu_libsre/lifted/x.c", "work/ps3recomp-patched/scratch/junk.cpp",
                 "work/ps3recomp-patched/docs/a.md", "work/recomp/ppu_0001.c", "work/analysis/functions.json",
                 "build/kz3-win/kz3.exe", "Game/PS3_GAME/PARAM.SFO", "docs/in-progress/porting-status.md"):
@@ -79,6 +79,11 @@ def fake_repo(root):
     put(root, "work/release/sdl3/SDL3.dll", fake_dll(3 << 20))   # over the 2 MiB binary cap on purpose
     put(root, "work/release/sdl3/LICENSE.txt", "Copyright (C) 1997-2026 Sam Lantinga\n")
     put(root, "installer/art/art.json", json.dumps({"format": 1, "fonts_sha256": pins}))
+    ndata = b"\0\1\0\0NotoSans" + bytes(64)
+    put(root, "work/release/fonts/NotoSans-Regular.ttf", ndata)
+    put(root, "work/release/fonts/OFL-notosans.txt", "SIL OPEN FONT LICENSE Version 1.1\n")
+    put(root, "installer/art/fonts-extra.json", json.dumps({"format": 1, "sha256": {
+        "NotoSans-Regular.ttf": hashlib.sha256(ndata).hexdigest()}}))
 
 
 def fake_dll(size, machine=0x8664, flags=0x2000):
@@ -139,10 +144,11 @@ def main():
                 "cmake/mingw-w64.cmake",
                 "ps3recomp/LICENSE", "ps3recomp/CMakeLists.txt", "ps3recomp/.kz3-patchset",
                 "ps3recomp/tools/ppu_lifter.py", "ps3recomp/runtime/a.c", "ps3recomp/tests/sync/CMakeLists.txt",
-                "ps3recomp/third_party/at3_standalone/COPYING.LGPLv2.1", "ps3recomp/libs/video/fsr1/LICENSE.txt", "licenses/LICENSE.txt",
-                "licenses/ps3recomp-LICENSE.txt", "licenses/at3_standalone-COPYING.LGPLv2.1.txt", "licenses/FidelityFX-FSR1-LICENSE.txt",
+                "ps3recomp/third_party/at3_standalone/COPYING.LGPLv2.1", "ps3recomp/libs/video/fsr1/LICENSE.txt", "ps3recomp/third_party/smaa/LICENSE.txt", "licenses/LICENSE.txt",
+                "licenses/ps3recomp-LICENSE.txt", "licenses/at3_standalone-COPYING.LGPLv2.1.txt", "licenses/FidelityFX-FSR1-LICENSE.txt", "licenses/SMAA-LICENSE.txt",
                 "README.md", "NOTICE.md", "recomplauncher.json", "run.cmd", "manifest.json", "VERSION.txt",
                 "fonts/Rajdhani-Medium.ttf", "fonts/Rajdhani-Bold.ttf", "licenses/Rajdhani-OFL.txt",
+                "fonts/NotoSans-Regular.ttf", "licenses/NotoSans-OFL.txt",
                 "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt"}
         check(got == want, "payload holds exactly the allowlisted files",
               f"extra {sorted(got - want)} missing {sorted(want - got)}")
@@ -268,6 +274,38 @@ def main():
         check(rc == 1 and "OFL text" in txt, "fonts without their OFL text are refused", txt)
         with open(medium, "wb") as f:
             f.write(orig)
+
+        # Noto Sans Regular (Cyrillic/Greek fallback, issue #60): pinned in installer/art/fonts-extra.json
+        noto = os.path.join(fdir, "NotoSans-Regular.ttf")
+        pinf = os.path.join(repo, "installer", "art", "fonts-extra.json")
+        with open(noto, "rb") as f:
+            norig = f.read()
+        with open(noto, "wb") as f:
+            f.write(norig + b"x")
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 1 and "NotoSans-Regular.ttf: SHA-256 differs" in txt, "a Noto font that differs from its pin is refused", txt)
+        with open(noto, "wb") as f:
+            f.write(norig)
+        with open(pinf, encoding="utf-8") as f:
+            pj = json.load(f)
+        with open(pinf, "w", encoding="utf-8") as f:
+            json.dump({"format": 1, "sha256": {"NotoSans-Regular.ttf": ""}}, f)
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 1 and "NotoSans-Regular.ttf: no SHA-256 pin" in txt, "an empty Noto pin refuses the payload", txt)
+        with open(pinf, "w", encoding="utf-8") as f:
+            json.dump(pj, f)
+        os.remove(noto)
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 1 and "NotoSans-Regular.ttf" in txt and "MISSING" in txt, "a missing Noto font is refused", txt)
+        with open(noto, "wb") as f:
+            f.write(norig)
+        os.remove(os.path.join(fdir, "OFL-notosans.txt"))
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 1 and "Noto's OFL text" in txt, "Noto without its OFL text is refused", txt)
+        with open(os.path.join(fdir, "OFL-notosans.txt"), "w") as f:
+            f.write("SIL OPEN FONT LICENSE Version 1.1\n")
+        rc, txt = run(["--repo", repo, "--dry-run"])
+        check(rc == 0, "the payload is accepted again with Noto restored", txt)
 
         # SDL3.dll (pads, patch 4010): required, 64-bit PE DLL, own size cap, its licence text beside it
         sdir = os.path.join(repo, "work", "release", "sdl3")

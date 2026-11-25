@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/rsx_fp_decompiler.c" || ! -f "$V/rsx_live_draw.c" || ! -d "$PT/include" ]]; then
-  echo "[test_fp_deriv] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_fp_deriv] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 if ! grep -q '^static int ld_deriv_scale_apply(' "$V/rsx_live_draw.c"; then
   echo "[test_fp_deriv] FAIL: toolkit without patch 2143 (no ld_deriv_scale_apply)"; exit 1; fi
 O="$ROOT/build/smoke-host/fp_deriv"; mkdir -p "$O"

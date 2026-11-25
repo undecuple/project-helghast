@@ -8,8 +8,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 SRC="$PT/libs/video/rsx_live_draw.c"
-if [[ ! -f "$SRC" ]]; then echo "[test_blend_color2] SKIP: no patched toolkit ($SRC; run tools/ps3recomp-patched.sh)"; exit 0; fi
-if ! grep -q 'define M_BLEND_COLOR2' "$SRC"; then echo "[test_blend_color2] SKIP: toolkit without patch 2006"; exit 0; fi
+if [[ ! -f "$SRC" ]]; then echo "[test_blend_color2] SKIP: no patched toolkit ($SRC; run tools/ps3recomp-patched.sh)"; exit 77; fi
+if ! grep -q 'define M_BLEND_COLOR2' "$SRC"; then echo "[test_blend_color2] SKIP: toolkit without patch 2006"; exit 77; fi
 O="$ROOT/build/smoke-host/blend_color2"; mkdir -p "$O"
 
 # static assertions on the source

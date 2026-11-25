@@ -376,6 +376,32 @@ def handle_moved_root(ctx, steps):
 
 
 
+# A child that cannot load a runtime library (vekta issue 94: a program ended with code 0 and wrote nothing after a
+# "runtime DLL" error; here the code is read too, never only "non-zero"). Windows NTSTATUS values of the loader.
+DLL_CODES = {0xC0000135: "a library (DLL) it needs was not found",                      # STATUS_DLL_NOT_FOUND
+             0xC0000142: "a library (DLL) it needs failed to start",                    # STATUS_DLL_INIT_FAILED
+             0xC000007B: "it or a library it needs is the wrong kind for this Windows",  # STATUS_INVALID_IMAGE_FORMAT
+             0xC0000139: "a library it needs lacks a function it calls"}                # STATUS_ENTRYPOINT_NOT_FOUND
+DLL_TEXT = re.compile(r"incorrectly installed|\.dll\b[^\n]{0,80}(was not found|not found|is missing|could not be loaded"
+                      r"|failed to load)|(cannot|can't|unable to) (find|load) [^\n]{0,80}\.dll|code execution cannot proceed",
+                      re.I)
+DLL_ADVICE = ("Usually the antivirus removed or blocked a file of the bundled toolchain, or the install is incomplete: "
+              "add the install folder to the antivirus exceptions, then reinstall Project Helghast and run it again.")
+
+
+def child_dll_problem(prog, rc, text=""):
+    """-> a player message naming the program when its exit code is a Windows library-load failure or its output says
+    one (even with exit code 0), else "". prog: the program's path or name."""
+    name = os.path.basename(str(prog)) or str(prog)
+    code = (rc or 0) & 0xFFFFFFFF
+    if code in DLL_CODES:
+        return f"{name} could not start: {DLL_CODES[code]} (Windows code 0x{code:08X}). {DLL_ADVICE}"
+    m = next((ln.strip() for ln in str(text).splitlines() if DLL_TEXT.search(ln)), "")
+    if m:
+        return f"{name} reported a runtime library problem: {m[:140]}. {DLL_ADVICE}"
+    return ""
+
+
 @dataclass
 class Step:
     name: str                                   # short id, also the marker file name
@@ -388,6 +414,7 @@ class Step:
     after: Callable[[Ctx], None] | None = None  # in-process work after the commands (record, stamp)
     keys: tuple = ()                            # extra fingerprint parts its marker depends on (Ctx.parts)
     optional: bool = False                      # a failure is logged, the result stays ok (the port is built)
+    outputs: Callable[[Ctx], list] = lambda c: []   # files that must exist once its commands ended 0 (an exit code alone proves nothing)
 
 
 def _h16(text):
@@ -885,7 +912,7 @@ def eboot_stat(path):
         return None
 
 
-NOTICE_FONTS = ("Rajdhani-Medium.ttf", "Rajdhani-Bold.ttf")
+NOTICE_FONTS = ("Rajdhani-Medium.ttf", "Rajdhani-Bold.ttf", "NotoSans-Regular.ttf")   # + the Cyrillic/Greek fallback (#60)
 
 
 SDL3_PAYLOAD = "runtime/SDL3.dll"
@@ -906,7 +933,7 @@ def place_sdl3(root, build):
 
 
 def place_fonts(root, build):
-    """Copy <root>/fonts/Rajdhani-*.ttf (shipped in the payload, assemble_payload FONTS) to <build>/fonts/, next to
+    """Copy <root>/fonts/Rajdhani-*.ttf and NotoSans-Regular.ttf (shipped in the payload, assemble_payload FONTS) to <build>/fonts/, next to
     kz3.exe: the runtime's error notice loads them privately from <exe dir>\\fonts (RSX pass 38; without them it
     falls back to the Windows UI font). Copies only a missing or different-size file; -> names copied. Called after
     every build and by the launcher before each start (an install from before the fonts shipped gets them too)."""
@@ -1004,15 +1031,21 @@ def write_game_ini(c):
 
 STEPS = [   # weights: % of stage B at 4 jobs (pass 12, plan 4.11): load 20 s, ppu 30, SPU pass 103, compile 312 of 469 s
     Step("check", "Checking the game files", 1, cmd_check, always=True, after=after_check),
-    Step("load", "Loading the EBOOT", 4, cmd_load, clean=lambda c: [c.b("analysis")]),
+    Step("load", "Loading the EBOOT", 4, cmd_load, clean=lambda c: [c.b("analysis")],
+         outputs=lambda c: [c.b("analysis", "EBOOT.imports.json"), c.b("analysis", "functions.json")]),
     Step("inventory", "Finding SPU programs", 1, cmd_inventory,
-         clean=lambda c: [c.b("analysis", "jobmods"), c.b("analysis", "spu_images")]),
-    Step("ppu-lift", "Lifting PPU code", 7, cmd_ppu_lift, clean=lambda c: [c.b("recomp")], keys=("lift",)),
-    Step("spu-lift", "Lifting SPU code", 22, cmd_spu_lift, clean=lambda c: [c.b("spu")], keys=("lift",)),
+         clean=lambda c: [c.b("analysis", "jobmods"), c.b("analysis", "spu_images")],
+         outputs=lambda c: [c.b("analysis", "jobmods.tsv"), c.b("analysis", "imports.tsv")]),
+    Step("ppu-lift", "Lifting PPU code", 7, cmd_ppu_lift, clean=lambda c: [c.b("recomp")], keys=("lift",),
+         outputs=lambda c: [c.b("recomp", "ppu_recomp.h")]),
+    Step("spu-lift", "Lifting SPU code", 22, cmd_spu_lift, clean=lambda c: [c.b("spu")], keys=("lift",),
+         outputs=lambda c: [c.b("spu", "gen")]),
     # configure re-runs in place (no clean of obj\): a runtime-only update then recompiles only what changed
     # (ninja, with prepare_sources' touch of the changed payload files); a changed toolchain empties obj\.
-    Step("configure", "Configuring the build", 1, cmd_configure, clean=prepare_sources, keys=("lift", "runtime")),
-    Step("compile", "Compiling", 63, cmd_compile, ninja=True, keys=("lift", "runtime")),
+    Step("configure", "Configuring the build", 1, cmd_configure, clean=prepare_sources, keys=("lift", "runtime"),
+         outputs=lambda c: [c.b("obj", "build.ninja")]),
+    Step("compile", "Compiling", 63, cmd_compile, ninja=True, keys=("lift", "runtime"),
+         outputs=lambda c: [c.b("obj", "kz3.exe")]),
     Step("stamp", "Finishing", 1, lambda c: [], after=after_stamp, keys=("lift", "runtime")),
 ]
 
@@ -1400,17 +1433,26 @@ class Runner:
             return True
         return False
 
+    last_prog = ""
+    last_out = ()
+
     def run_cmd(self, i, argv):
         step = self.steps[i]
         self.log.write(f"$ {subprocess.list2cmdline(argv)}")
+        self.last_prog = argv[0]
+        self.last_out = []
         t = time.monotonic()
         kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
         captured = []
+        # a known working directory: the install folder, never whatever the launcher or a shortcut happened to start in
+        cwd = self.ctx.root if os.path.isdir(self.ctx.root) else None
         try:
             self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                         encoding="utf-8", errors="replace", bufsize=1, env=self.ctx.env(), **kw)
+                                         encoding="utf-8", errors="replace", bufsize=1, env=self.ctx.env(), cwd=cwd, **kw)
         except OSError as e:
-            self.emit(f"cannot start {argv[0]}: {e}")
+            line = f"cannot start {argv[0]}: {e}"
+            self.emit(line)
+            captured.append(line)
             return 127, captured
         try:
             for line in self.proc.stdout:
@@ -1434,6 +1476,7 @@ class Runner:
         finally:
             self.proc = None
         self.log.write(f"# exit {rc} after {time.monotonic() - t:.1f} s")
+        self.last_out = captured
         return rc, captured
 
     def stop_child(self):
@@ -1488,6 +1531,15 @@ class Runner:
                             return self.failed(step.name, bad)
                     if not step.ninja:
                         self.progress(i, 10 if iso_copy else 1000 if step.name == "check" else k + 1, units)
+                if not failed:
+                    gone = [p for p in step.outputs(ctx) if not os.path.exists(p)]
+                    if gone:   # exit 0 and nothing written (vekta 94): say what is missing, and a library problem if the output names one
+                        names = ", ".join(os.path.relpath(p, ctx.root) if path_under(p, ctx.root) is not None else p for p in gone)
+                        self.emit(f"step {step.name} failed: exit 0 but no {names}")
+                        dll = child_dll_problem(self.last_prog, 0, "\n".join(self.last_out))
+                        return self.failed(step.name, dll or (
+                            f"the step \"{step.label}\" ended without an error but did not write {names}. "
+                            "Run the setup again; if it happens again, send the log."))
                 if step.after and not failed:
                     try:
                         step.after(ctx)
@@ -1553,6 +1605,9 @@ class Runner:
                     return fails
             except (ValueError, AttributeError, KeyError, TypeError):
                 pass
+        dll = child_dll_problem(self.last_prog, rc, "\n".join(out))
+        if dll:
+            return [dll]
         lines = [ln.strip() for ln in out if ln.strip()]
         last = next((ln for ln in reversed(lines) if re.search(r"\berror\b", ln, re.I)), lines[-1] if lines else "")
         head = f"the step \"{step.label}\" failed (exit {rc})"
@@ -1752,6 +1807,9 @@ def _version_check(current):
     return version_check.check(current)
 
 
+MAX_REASK = 5     # identical empty answers in a row to a question that has no default = input ended
+
+
 def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_check_files, vcheck=_version_check):
     """Fill a.dump/a.update/a.eboot from the player's answers; True = build now, False = quit. Lines for the install
     log go to `notes` (main writes them, redacted, after the log header)."""
@@ -1785,9 +1843,15 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
     def folder(q, default, need_dir=True, iso=False, inside=()):
         """A folder (need_dir) or a file. For a file, a folder answer is searched for the `inside` names (relative
         paths, in order): players give the folder that holds EBOOT.elf as often as the file itself."""
+        same = 0
         while True:
             r = ask(f"{q}" + (f" [{default}]" if default else "") + ": ").strip().strip('"')
             r = os.path.expanduser(r or default or "")
+            # A source that only ever answers "" (closed stdin wrapped by a caller, a script) would re-ask for ever
+            # and fill `out`; the same invalid answer MAX_REASK times in a row is the end of the input.
+            same = same + 1 if not r else 0
+            if same >= MAX_REASK:
+                raise EOFError(f"no answer to: {q}")
             if not r and not need_dir:
                 return ""
             if r and (os.path.isdir(r) or (iso and os.path.isfile(r) and r.lower().endswith(".iso"))
@@ -1895,7 +1959,8 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
     # answer was no. rpcs3_import.import_saves stays for a caller that asks (the tests, a later settings screen).
     if imp is not None and rp.get("saves"):
         notes.append(f"# RPCS3 saves: {len(rp['saves'])} found, not asked about (copy off by default)")
-    fd = getattr(a, "font_dir", "") or prev.get("font_dir", "") or font_guess(upd)
+    fd = (getattr(a, "font_dir", "") or earlier_fonts(os.path.abspath(a.build or os.path.join(root, "build")))
+          or font_guess(upd))
     given_font = bool(getattr(a, "check_first", False) and getattr(a, "font_dir_set", False))
     # The PS3 fonts are not asked about either (same as the setup's Recommended path): setup's answer ("-", auto or a
     # folder), else the folder found beside an RPCS3 update or recorded last time, else none.
@@ -1974,6 +2039,25 @@ def has_fonts(d):
         return any(n.upper().startswith("SCE-PS3-") and n.upper().endswith(".TTF") for n in os.listdir(d))
     except OSError:
         return False
+
+
+def earlier_fonts(build):
+    """The font folder of an earlier install (build/paths.json: the copy in <build>/fonts/ps3, else the folder the copy
+    came from) when it still holds the fonts, else "". An upgrade keeps the player's fonts this way (issue #60)."""
+    try:
+        prev = _la().load_json(os.path.join(build, "paths.json")) or {}
+    except (OSError, ValueError):
+        return ""
+    for k in ("font_dir", "font_src"):
+        d = prev.get(k, "")
+        if d and has_fonts(d):
+            return d
+    return ""
+
+
+def font_auto(update, build):
+    """The "auto" font answer: the earlier install's folder first, then RPCS3's folder beside the update, else none."""
+    return earlier_fonts(build) or font_guess(update)
 
 
 def font_guess(update):
@@ -2165,14 +2249,17 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     ap.add_argument("--shaders", choices=("auto", "on", "off"), default="auto",
                     help="the optional Prepare shaders step after the build (auto = kz3-install.ini, default off)")
     a = ap.parse_args(argv)
+    font_is_auto = False
     if a.font_dir == "-":     # the wizard's empty font page: none, not the last build's folder
         a.font_dir, a.font_dir_set = "", True
-    elif a.font_dir == "auto":   # the wizard's Recommended type (step 9s): RPCS3's folder beside the update, if any
-        a.font_dir, a.font_dir_set = font_guess(a.update), True
+    elif a.font_dir == "auto":   # the wizard's Recommended type (step 9s): resolved below, once the install is healed
+        a.font_dir, a.font_dir_set, font_is_auto = "", True, True
     if not a.dump and not a.interactive:
         ap.error("--dump is required (or --interactive)")
     root = os.path.abspath(a.root)
     heal_moved_paths(root, os.path.abspath(a.build or os.path.join(root, "build")))   # before anything reads paths.json
+    if font_is_auto:   # the earlier install's folder (an upgrade), else RPCS3's beside the update, else none
+        a.font_dir = font_auto(a.update, os.path.abspath(a.build or os.path.join(root, "build")))
     notes, quit_early = [], False
     if a.interactive and not a.dry_run:
         try:

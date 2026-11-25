@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/rsx_display_mode.h" ]]; then
-  echo "[test_display_mode] SKIP: no patched toolkit with patch 2095 ($V/rsx_display_mode.h; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_display_mode] SKIP: no patched toolkit with patch 2095 ($V/rsx_display_mode.h; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/display_mode"; mkdir -p "$O"
 CC="${CC:-cc}"
 W=(-std=c11 -Wall -Wextra -Werror -I"$V")

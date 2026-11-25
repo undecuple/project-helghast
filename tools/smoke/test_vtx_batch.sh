@@ -9,9 +9,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="${KZ3_VTX_DIR:-$PT/libs/video}"
 if [[ ! -f "$V/rsx_vertex_compact.c" || ! -d "$PT/include" ]]; then
-  echo "[test_vtx_batch] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_vtx_batch] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 if ! grep -q rsx_vertex_fetch_many "$V/rsx_vertex_compact.h"; then
-  echo "[test_vtx_batch] SKIP: toolkit without patch 2040 (no rsx_vertex_fetch_many)"; exit 0; fi
+  echo "[test_vtx_batch] SKIP: toolkit without patch 2040 (no rsx_vertex_fetch_many)"; exit 77; fi
 O="$ROOT/build/smoke-host/vtx_batch"; mkdir -p "$O"
 CC="${CC:-cc}"
 W=(-std=c11 -Wall -Wextra -Werror -Wno-unused-function -I"$V" -I"$PT/libs/video" -I"$PT/include")

@@ -1247,8 +1247,9 @@ begin
   else Result := ExpandConstant('{app}\game\EBOOT.elf');
 end;
 
-{ The font answer firstrun.py gets: "-" = no fonts (not the last build folder), "auto" = Recommended: the RPCS3
-  dev_flash\data\font folder beside the update, if any; else the picked folder }
+{ The font answer firstrun.py gets: "-" = no fonts (not the last build folder), "auto" = Recommended: the
+  earlier install's font folder (build\paths.json, issue #60), else the RPCS3 dev_flash\data\font folder beside the
+  update, if any (firstrun.py font_auto) }
 function BuildFontArg: String;
 begin
   Result := FontPage.Values[0];

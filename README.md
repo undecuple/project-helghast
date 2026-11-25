@@ -34,7 +34,7 @@
 
 A native PC port of Killzone 3, made by static recompilation on ps3recomp; you need your own US disc (BCUS98234) dump and the 1.14 update. It is not an emulator and not a rewrite ([how it works](docs/HOW-IT-WORKS.md)).
 
-**Status: partly playable.** Version <!-- version -->0.1.11<!-- /version -->, a pre-release: levels load and play at about 16-22 frames/s (target 30) with known bugs, and the campaign has not been played start to finish. Details: [docs/STATUS.md](docs/STATUS.md); what a release must meet to be called playable: [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
+**Status: partly playable.** Version <!-- version -->0.1.11<!-- /version -->, a pre-release: levels load and play at about 24 frames/s in a busy Frozen Shores window (target 30) with known bugs, and the campaign has not been played start to finish. Details: [docs/STATUS.md](docs/STATUS.md); what a release must meet to be called playable: [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 Screenshots of the current build, by milestone: [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md).
 
@@ -48,7 +48,7 @@ Screenshots of the current build, by milestone: [docs/SCREENSHOTS.md](docs/SCREE
 | Linux | the Windows exe under Proton (GE-Proton / Proton Experimental) | D3D12 through vkd3d-proton | verified: most of the testing, including the first level for 10+ minutes (16 of 16 test runs clean) and all nine chapters loading and playing for minutes | Intel Core i7-12700KF, NVIDIA GeForce RTX 4060 (driver 595.112), GE-Proton 11-7 |
 | Linux, native | native build | Vulkan | planned | - |
 
-"Verified" means a run on that setup; "implemented" means the code is in but not run there; "planned" means neither. Speed figures (about 22-23 frames/s in a busy Frozen Shores window, 1920x1080, means of alternated runs on 2026-10-27, under Proton) are in [docs/STATUS.md](docs/STATUS.md). Feature by feature: [docs/FEATURES.md](docs/FEATURES.md).
+"Verified" means a run on that setup; "implemented" means the code is in but not run there; "planned" means neither. Speed figures (about 24 frames/s in a busy Frozen Shores window, three runs on 2026-11-24, under Proton) are in [docs/STATUS.md](docs/STATUS.md). Feature by feature: [docs/FEATURES.md](docs/FEATURES.md).
 
 <p align="center"><img src="docs/assets/divider-rule.png" width="900" alt=""></p>
 
@@ -76,7 +76,7 @@ Do not install into a OneDrive folder. Saves and settings: [docs/INSTALL.md](doc
 
 Display, input and frame-rate settings are in the game's Options menu; the list is in [docs/FEATURES.md](docs/FEATURES.md).
 
-- Speed is below the PS3's: about 16-22 frames/s in levels, target 30.
+- Speed is below the PS3's: about 24 frames/s in a busy Frozen Shores window (2026-11-24), target 30.
 - Audio stutters now and then in levels.
 - Windows and sky in far views look flat white.
 - Split-screen co-op: the two views sit slightly out of place and the right-hand view can flicker.

@@ -15,5 +15,5 @@ int g_kz3_wacct;
 void* g_kz3_wtrace;
 __attribute__((weak)) unsigned long long g_rsx_game_frame_marks[1024];
 int spu_taskset_round_busy(unsigned* ts, unsigned* tid) { (void)ts; (void)tid; return 0; }
-Z(rsx_live_draw_wbd_drain) Z(rsx_live_draw_wbd_touch) Z(rsx_live_draw_wbd_active) Z(rsx_live_draw_wbd_set_site) Z(rsx_live_draw_wbd_defer_move)   /* patch 2185 */
+Z(rsx_live_draw_wbd_drain) Z(rsx_live_draw_wbd_touch) Z(rsx_live_draw_wbd_active) Z(rsx_live_draw_wbd_set_site) Z(rsx_live_draw_wbd_set_site_4097) Z(rsx_live_draw_wbd_hold_label) Z(rsx_live_draw_wbd_idle) Z(rsx_live_draw_wbd_defer_move)   /* patch 2185 */
 #include "test_gs_stubs.inc"

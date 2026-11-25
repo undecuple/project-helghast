@@ -8,7 +8,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; HERE="$ROOT/tools/spu"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$P/runtime/ppu/ppu_loader.cpp" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
+[[ -f "$P/runtime/ppu/ppu_loader.cpp" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
 O="$ROOT/work/spu/t_resv"; "$ROOT/tools/safe_rm.sh" "$O" 2>/dev/null; mkdir -p "$O"
 CXX="${CXX:-c++}"; command -v "$CXX" >/dev/null || CXX=g++
 build() {  # build TREE OUTDIR -> OUTDIR/t

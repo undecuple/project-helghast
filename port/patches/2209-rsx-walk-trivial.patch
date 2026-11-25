@@ -1,0 +1,219 @@
+KZ3 patch 2209 (RSX pass 174): RSX_WALK_TRIVIAL=1, the trivial-walker measurement switch (default off, diagnostic, never shipped).
+
+The walker still consumes the FIFO and keeps labels, semaphores, reports and guest copies in order (cellGcmSys.c untouched in behaviour),
+but the live-draw sink drops every begin / draw / inline array / indexed draw / end / clear (counted) and a flip is consumed without
+presenting. Prints [walk-trivial] once at arm (naming what happens to the guest write-backs: GPU-output write-backs surf_wb, wbd_drain,
+report_rb never run because no surface or query exists; render-target guest bytes stay as last written, NOT zero-filled) and once per
+second (flips, methods, dropped draws/clears, released labels/reports, guest copies, GPU write-backs run (expected 0) and requests seen).
+Pure core libs/video/rsx_walk_trivial.h, host test tools/smoke/test_walk_trivial.sh. Purpose: main-thread compute and SPU floors without
+the walker (U1/U2). NOT run in the game.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 4eddb72f..5b865a53 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -13,6 +13,7 @@
+ #include "rsx_s7p.h"   /* patch 2204: S7.0 probes (RSX_O0_S7) */
+ #include "rsx_views.h"   /* patch 2202 */
+ #include "rsx_lpb.h"   /* patch 2208 */
++#include "rsx_walk_trivial.h"   /* patch 2209 */
+ static void rsx_lpb_start(void);
+ #include "rsx_legacy_skip.h"   /* patch 2189 */
+ static unsigned long long s_o0_m3d_pass, s_o0_m3dl_pass;   /* patch 2203: walker thread only, flushed by gcm_o0_flush_pass */
+@@ -2840,6 +2841,29 @@ int rsx_perf_draw_on(void)
+                   if (on) fprintf(stderr, "[perf-draw] per-draw stage distribution on (RSX_PERF_DRAW=1, patch 2135)\n"); }
+     return on && s_perf_walk_on;
+ }
++/* Patch 2209: RSX_WALK_TRIVIAL=1 (rsx_walk_trivial.h). The instance lives here; rsx_live_draw.c installs the dropping sink when it is on. */
++rsx_wt g_rsx_wt;
++int rsx_walk_trivial_on(void)
++{
++    static int done;
++    if (!done) {   /* first call is the single-threaded sink install */
++        done = 1; rsx_wt_init(&g_rsx_wt, getenv("RSX_WALK_TRIVIAL"));   /* patch 2209: diagnostic, default off, the walker drops every draw and clear and the present */
++        if (g_rsx_wt.on) { char b[1536]; rsx_wt_arm_line(b, sizeof b); fprintf(stderr, "%s\n", b); }
++    }
++    return g_rsx_wt.on;
++}
++void rsx_wt_flip_report(void)
++{
++    if (!g_rsx_wt.on) return;
++    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
++    unsigned long long g[RSX_GS_N];
++    for (unsigned k = 0; k < RSX_GS_N; k++) g[k] = __atomic_load_n(&g_rsx_gs_n[k][0], __ATOMIC_RELAXED) + __atomic_load_n(&g_rsx_gs_n[k][1], __ATOMIC_RELAXED);
++    char b[1024];
++    if (rsx_wt_tick(&g_rsx_wt, rsx_perf_now(), (long long)f.QuadPart, g[RSX_GS_LABEL] + g[RSX_GS_RESYNC_LABEL] + g[RSX_GS_SEM_BE],
++                    g[RSX_GS_REPORT] + g[RSX_GS_REPORT_LOCAL], g[RSX_GS_SURF_WB] + g[RSX_GS_WBD_DRAIN] + g[RSX_GS_REPORT_RB],
++                    g[RSX_GS_COPY_0039] + g[RSX_GS_COPY_3089] + g[RSX_GS_STORE_308A], b, sizeof b))
++        fprintf(stderr, "%s\n", b);
++}
+ void rsx_perf_add(int idx, long long v)
+ {
+     if (rsx_perf_enabled() && idx >= 0 && idx < RSX_PERF_COUNT)
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 3f37e0ce..e25f4167 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -21,6 +21,7 @@
+ 
+ #include "rsx_live_draw.h"
+ #include "rsx_o0.h"   /* patch 2188 */
++#include "rsx_walk_trivial.h"   /* patch 2209 */
+ #include "rsx_s7p.h"   /* patch 2204: S7.0 probes */
+ #include "rsx_views.h"   /* patch 2202 */
+ #include "rsx_lpb.h"   /* patch 2208 */
+@@ -16840,6 +16841,26 @@ static void ldsx_flip(void* user, const rsx_dispatch* r, u32 arg) { LDS_PUSH(t,
+ static void ldsx_report(void* user, const rsx_dispatch* r, u32 m, u32 arg) { LDS_PUSH(t, RSX_SB_X_REPORT); sink_report(user, r, m, arg); LDS_POP(t); }
+ static void ldsx_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count) { LDS_PUSH(t, RSX_SB_X_SINK); sink_draw_arrays(u, r, first, count); LDS_POP(t); }
+ static void ldsx_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count) { LDS_PUSH(t, RSX_SB_X_SINK); sink_draw_index(u, r, first, count); LDS_POP(t); }
++extern rsx_wt g_rsx_wt;   /* patch 2209 (cellGcmSys.c) */
++/* Patch 2209 (RSX_WALK_TRIVIAL=1): the dropping sink. Every call is counted and does nothing else. */
++static void wt_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; }
++static void wt_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count) { (void)u; (void)r; (void)first; (void)count; }
++static void wt_inline_array(void* u, const rsx_dispatch* r, const u8* data, u32 bytes) { (void)u; (void)r; (void)data; (void)bytes; }
++static void wt_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count) { (void)u; (void)r; (void)first; (void)count; }
++static void wt_end(void* u, const rsx_dispatch* r) { (void)u; (void)r; RSX_WT_ADD(&g_rsx_wt, draws, 1); }
++static void wt_clear(void* u, const rsx_dispatch* r, u32 mask) { (void)u; (void)r; (void)mask; RSX_WT_ADD(&g_rsx_wt, clears, 1); }
++static void wt_flip(void* u, const rsx_dispatch* r, u32 arg)   /* the guest-visible flip bookkeeping of sink_flip, without the present */
++{
++    (void)u; (void)r;
++    const u32 buffer_id = arg & 7u;
++    gcm_guest_signal_note(RSX_GS_FLIP, buffer_id, 0u);
++    g_ld_flip_requested++;
++    g_ld_last_requested_buffer = buffer_id;
++    g_ld_flip_consumed++;
++    g_ld_last_consumed_buffer = buffer_id;
++    RSX_WT_ADD(&g_rsx_wt, flips, 1);
++    rsx_wt_flip_report();
++}
+ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+ {
+     (void)user; (void)r;
+@@ -18072,6 +18093,10 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     if (rsx_perf_split_on()) {   /* patch 2188 */
+         sink.flip = ldsx_flip; sink.report = ldsx_report; sink.draw_arrays = ldsx_draw_arrays; sink.draw_index_array = ldsx_draw_index;
+     }
++    if (rsx_walk_trivial_on()) {   /* patch 2209: diagnostic, drop every draw and clear and the present; applied last so it wins over the split wrappers */
++        sink.clear = wt_clear; sink.begin = wt_begin; sink.end = wt_end; sink.draw_arrays = wt_draw_arrays;
++        sink.inline_array = wt_inline_array; sink.draw_index_array = wt_draw_index; sink.flip = wt_flip;
++    }
+     rsx_dispatch_init(&g.rsx, &sink);
+ 
+     g.ready = 1;
+@@ -18119,6 +18144,7 @@ static void ld_dispatch_timed(u32 method, u32 arg)
+ }
+ void rsx_live_draw_method(u32 method, u32 arg)
+ {
++    if (__builtin_expect(g_rsx_wt.on, 0)) RSX_WT_ADD(&g_rsx_wt, methods, 1);   /* patch 2209 */
+     if (__builtin_expect(g_rsx_views.on, 0)) rsx_views_word(&g_rsx_views);   /* patch 2202 */
+     if (__builtin_expect(g_rsx_fp_on, 0) && g_rsx_fp->sampling) rsx_fp_word(g_rsx_fp, method, arg);   /* patch 2172: the sampled flip's words */
+     /* Bounded ingress trace for the a010 live-vs-capture comparison.  Keep the
+@@ -19257,6 +19283,7 @@ static u32 ld_wbd_chunk(const u32* rec, const int* slots, u32 nrec, u32 for_off,
+ static int ld_wbd_mode(void);
+ static u32 ld_writeback_batch(const u32* idx_in, u32 n, u32 for_off, u32 for_size, int defer_ok)
+ {
++    if (__builtin_expect(g_rsx_wt.on, 0)) RSX_WT_ADD(&g_rsx_wt, wb_req, 1);   /* patch 2209: a request seen; with no surface it finds nothing to read back */
+     LARGE_INTEGER t0, t1;
+     QueryPerformanceCounter(&t0);
+     if (g_wbp_on > 0) g_wbp_batch_t0 = ld_wbp_now();   /* patch 2184 */
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 568403c5..7f8c1b0d 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -346,6 +346,8 @@ void      rsx_live_draw_perf_dump(void);       /* patch 2045: [perf-redecode] wh
+ void      rsx_live_draw_submit_pending(void);  /* patch 2029: submit recorded work, no wait */
+ int       rsx_perf_enabled(void);
+ long long rsx_perf_now(void);                  /* QPC ticks */
++int       rsx_walk_trivial_on(void);           /* patch 2209: RSX_WALK_TRIVIAL=1 (read once, at the sink install) */
++void      rsx_wt_flip_report(void);            /* patch 2209: the once-a-second [walk-trivial] line, called from the trivial flip */
+ void rsx_live_draw_s7_ext(void* out);          /* patch 2204: fills a rsx_s7p_ext (rsx_s7p.h) with the device-cache counters; zeros off Windows */
+ void      rsx_perf_add(int idx, long long v);  /* no-op unless RSX_PERF=1 */
+ int       rsx_perf_on_gcm_thread(void);        /* caller is the cellGcmInit thread */
+diff --git a/libs/video/rsx_walk_trivial.h b/libs/video/rsx_walk_trivial.h
+new file mode 100644
+index 00000000..3fa8bf6a
+--- /dev/null
++++ b/libs/video/rsx_walk_trivial.h
+@@ -0,0 +1,82 @@
++/* KZ3 patch 2209 (RSX pass 174): RSX_WALK_TRIVIAL=1, the trivial-walker measurement switch (default off, diagnostic, never shipped).
++ * Pure C (no OS calls, no globals): the caller owns the instance, passes the clock and the guest-signal counters in, and a host
++ * test builds it. Walker thread only for the counters (relaxed atomics, the report may read them from the flip callback).
++ *
++ * What the switch does (the glue is in rsx_live_draw.c): the walker still consumes the FIFO and keeps labels, semaphores, reports
++ * and guest copies in order (all of that is in cellGcmSys.c and untouched), but the live-draw sink drops every begin / draw /
++ * inline array / indexed draw / end / clear (counted), and a flip is consumed (the guest's flip status advances) without
++ * presenting. Purpose: main-thread compute and SPU floors without the walker (U1/U2 of fps-path-60).
++ *
++ * Guest write-backs that need GPU output, exactly: surf_wb (kind 19, colour-surface write-back), wbd_drain (kind 20, deferred
++ * store) and report_rb (kind 11, the renderer's query-drain value). With no draw there is no surface and no query, so none of
++ * them has anything to read back: they do not run (counted, expected 0) and the guest bytes stay as the guest or an SPU last
++ * wrote them. Nothing is zero-filled and nothing is faked; the line says so. NV0039/NV3089/NV308A copies run on guest memory as
++ * before; one whose source is a render target reads those stale guest bytes. */
++#ifndef RSX_WALK_TRIVIAL_H
++#define RSX_WALK_TRIVIAL_H
++#include <stddef.h>
++#include <stdio.h>
++
++typedef struct {
++    int on;
++    unsigned long long methods, draws, clears, flips, wb_req;   /* bumped by the glue (relaxed atomics) */
++    long long t_last;                                           /* ticks of the last report */
++    unsigned long long p_methods, p_draws, p_clears, p_flips, p_wb_req;
++    unsigned long long p_labels, p_reports, p_gpuwb, p_copies;
++    int announced;
++} rsx_wt;
++
++/* the switch: set and not "0" */
++static inline int rsx_wt_parse(const char* e) { return e && *e && *e != '0'; }
++static inline void rsx_wt_init(rsx_wt* w, const char* env)
++{
++    *w = (rsx_wt){0};
++    w->on = rsx_wt_parse(env);
++}
++#define RSX_WT_ADD(w, f, n) __atomic_fetch_add(&(w)->f, (unsigned long long)(n), __ATOMIC_RELAXED)
++
++/* the line printed once at arm */
++static inline size_t rsx_wt_arm_line(char* b, size_t cap)
++{
++    return (size_t)snprintf(b, cap,
++        "[walk-trivial] on (RSX_WALK_TRIVIAL=1, patch 2209): the walker consumes the FIFO and keeps labels, semaphores, reports and "
++        "guest copies in order, but records and submits NO draw or clear (sink begin/draw/end/clear dropped and counted); a flip is "
++        "consumed (guest flip status advances) and not presented. GPU-output write-backs (surf_wb, wbd_drain, report_rb) never run "
++        "(no surface, no query exists): render-target guest bytes stay as the guest or an SPU last wrote them, NOT zero-filled, NOT "
++        "GPU output; NV0039/NV3089/NV308A copies run on guest memory and read those stale bytes from a render-target source. The "
++        "picture is blank: diagnostic only, never shipped");
++}
++
++/* one report line from the deltas of the last period */
++static inline size_t rsx_wt_fmt(char* b, size_t cap, double secs, unsigned long long flips, unsigned long long methods,
++                                unsigned long long draws, unsigned long long clears, unsigned long long labels,
++                                unsigned long long reports, unsigned long long gpuwb, unsigned long long copies,
++                                unsigned long long wb_req)
++{
++    return (size_t)snprintf(b, cap,
++        "[walk-trivial] %.2fs flips=%llu methods=%llu | dropped draws=%llu clears=%llu | released labels/sems=%llu reports=%llu "
++        "| guest copies (on guest memory)=%llu | GPU write-backs run=%llu (expected 0; requests seen=%llu, no GPU output, no zero-fill)",
++        secs, flips, methods, draws, clears, labels, reports, copies, gpuwb, wb_req);
++}
++
++/* Once per second at most: fills `b` and returns its length, or 0 when no report is due. now/freq are clock ticks; the five
++ * counters are the cumulative g_rsx_gs_n values the glue sums (walker side): labels = label+resync_label+sem_be, reports =
++ * report+report_local, gpuwb = surf_wb+wbd_drain+report_rb, copies = copy0039+copy3089+store308a. */
++static inline size_t rsx_wt_tick(rsx_wt* w, long long now, long long freq, unsigned long long labels,
++                                 unsigned long long reports, unsigned long long gpuwb, unsigned long long copies, char* b, size_t cap)
++{
++    if (!w->on || freq <= 0) return 0;
++    if (w->t_last == 0) { w->t_last = now; return 0; }
++    if (now - w->t_last < freq) return 0;
++    const double secs = (double)(now - w->t_last) / (double)freq;
++    const unsigned long long m = __atomic_load_n(&w->methods, __ATOMIC_RELAXED), d = __atomic_load_n(&w->draws, __ATOMIC_RELAXED),
++        c = __atomic_load_n(&w->clears, __ATOMIC_RELAXED), f = __atomic_load_n(&w->flips, __ATOMIC_RELAXED),
++        r = __atomic_load_n(&w->wb_req, __ATOMIC_RELAXED);
++    const size_t n = rsx_wt_fmt(b, cap, secs, f - w->p_flips, m - w->p_methods, d - w->p_draws, c - w->p_clears,
++                                labels - w->p_labels, reports - w->p_reports, gpuwb - w->p_gpuwb, copies - w->p_copies, r - w->p_wb_req);
++    w->p_flips = f; w->p_methods = m; w->p_draws = d; w->p_clears = c; w->p_wb_req = r;
++    w->p_labels = labels; w->p_reports = reports; w->p_gpuwb = gpuwb; w->p_copies = copies;
++    w->t_last = now;
++    return n;
++}
++#endif

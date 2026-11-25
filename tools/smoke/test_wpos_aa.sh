@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/rsx_fp_decompiler.c" || ! -f "$V/rsx_live_draw.c" || ! -d "$PT/include" ]]; then
-  echo "[test_wpos_aa] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_wpos_aa] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 if ! grep -q '^static int ld_wpos_aa_apply(' "$V/rsx_live_draw.c"; then
   echo "[test_wpos_aa] FAIL: toolkit without patch 2088 (no ld_wpos_aa_apply)"; exit 1; fi
 O="$ROOT/build/smoke-host/wpos_aa"; mkdir -p "$O"

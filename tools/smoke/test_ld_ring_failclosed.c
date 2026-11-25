@@ -45,6 +45,8 @@ static rsx_ring_marks* ld_rm(int r) { return &g_ld_rm[g.fr_cur & 1u][r]; }
 static int ld_wait_fence(u64 v);
 static void ld_oq_close(void) { oq_open = 0; }
 static void ld_submit_nowait(void) { if (!g.ready || !g_ld_unsubmitted || oq_open) return; g_ld_unsubmitted = 0; }
+static int ld_smp_ensure_table(u32 t) { (void)t; return 1; }   /* patch 2213: the per-table fence (off here) */
+static void ld_smp_bind(u32 t) { (void)t; }
 #include "shipped.h"
 
 static int failures;

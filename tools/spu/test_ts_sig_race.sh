@@ -9,7 +9,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$P/runtime/spu/spu_workload.c" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
+[[ -f "$P/runtime/spu/spu_workload.c" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
 T=runtime/spu/tests/test_spurs_signalled_atomic.c
 [[ -f "$P/$T" ]] || { echo "FAIL: $T not in $P (patch 9340 missing)"; exit 1; }
 grep -q 'spu_signalled_update' "$P/runtime/spu/spu_workload.c" \

@@ -15,7 +15,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/t_ts_be"; mkdir -p "$O/libs/spurs" "$O/runtime/ppu"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 F="$P/libs/spurs/cellSpurs.c"
-[[ -f "$F" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
+[[ -f "$F" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
 fail=0
 native="$(grep -nE '\btaskset->[a-zA-Z_]+' "$F" | grep -vE '^[0-9]+:[[:space:]]*(\*|/\*|//)')"
 if [[ -n "$native" ]]; then echo "FAIL: native CellSpursTaskset field access in $F:"; echo "$native" | head -5; fail=1

@@ -145,7 +145,7 @@ def check(tree, unbounded=False):
 
 old_t, new_t = X.trees()
 if not os.path.exists(os.path.join(new_t, "libs/system/kz3_psf.h")):
-    print("SKIP: tree under test has no kz3_psf.h (patch 3010 not applied)"); sys.exit(0)
+    print("SKIP: tree under test has no kz3_psf.h (patch 3010 not applied)"); sys.exit(77)
 ok_new, why_new = check(new_t)
 ok_old, why_old = check(old_t)
 ok_ctl, why_ctl = check(new_t, unbounded=True)

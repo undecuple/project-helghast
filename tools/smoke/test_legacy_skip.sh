@@ -14,7 +14,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 source "$ROOT/tools/smoke/pub_srcs.inc"; pub_src_args "$V" "$PT/libs/kzr"   # patch 2197: the harness links the publisher
-if [[ ! -f "$V/rsx_legacy_skip.h" ]]; then echo "[test_legacy_skip] SKIP: no patched toolkit with patch 2189 ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$V/rsx_legacy_skip.h" ]]; then echo "[test_legacy_skip] SKIP: no patched toolkit with patch 2189 ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/legacy-skip"; rm -rf "$O"; mkdir -p "$O/work"
 CC="${CC:-cc}"; rc=0
 fail() { echo "[test_legacy_skip] FAIL: $*"; rc=1; }

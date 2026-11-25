@@ -128,6 +128,27 @@ if [[ -f "$ROOT/.kz3-main" ]]; then
     [[ -d "$MAIN/.git" ]] && args+=(--ro-bind "$MAIN/.git" "$MAIN/.git")
   fi
 fi
+# Any other git worktree (a scratch worktree without .kz3-main): its .git file
+# points into the owning checkout's .git; bind that read-only too, or git inside fails with "not a git repository"
+# (exit 128; tools/lift.sh in such a worktree, 2026-11-24).
+# The .git file is writable from inside the sandbox, so nothing is taken from it. The only git dir ever bound is
+# the real .git directory of the nearest checkout that CONTAINS this worktree (a scratch worktree nested inside the
+# main checkout), found from ROOT's own path: not a symlink, resolving to itself, outside any work/ or build/ tree,
+# under ~/Projects, with HEAD, objects and worktrees/. Lane worktrees keep the .kz3-main block above.
+if [[ -f "$ROOT/.git" && ! -L "$ROOT/.git" && ! -f "$ROOT/.kz3-main" ]]; then
+  a="$(dirname -- "$ROOT")"
+  while [[ "$a" == "$HOME/Projects/"?* ]]; do
+    if [[ -e "$a/.git" ]]; then
+      g="$a/.git"
+      if [[ -d "$g" && ! -L "$g" && "$(realpath -e -- "$g" 2>/dev/null)" == "$g" && "$g" != */work/* && "$g" != */build/* \
+            && -f "$g/HEAD" && -d "$g/objects" && -d "$g/worktrees" ]]; then
+        args+=(--ro-bind "$g" "$g")
+      fi
+      break
+    fi
+    a="$(dirname -- "$a")"
+  done
+fi
 # Static data on a slower drive: work/extracted and work/move-when-done may be links into one approved folder, named
 # (resolved, one line) in ~/.config/kz3/static-root, outside the repo. Bind only those two targets, read-only, so the
 # links resolve; nothing else on that drive. No file, no static binds.

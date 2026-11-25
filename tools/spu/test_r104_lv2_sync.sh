@@ -8,7 +8,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -d $T/runtime/syscalls ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -d $T/runtime/syscalls ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 T="$(cd "$T" && pwd)"
 ITERS="${ITERS:-50}"; OUT="$(mktemp -d)"; fail=0
 CC="${CC:-cc}"; CXX="${CXX:-c++}"

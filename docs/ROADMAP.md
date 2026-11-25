@@ -12,7 +12,7 @@ Where each feature of the PS3 game stands today, and the port-only features with
 |---|---|
 | ✅ | Boots, menus, movies, first-boot flow, saves the profile |
 | ✅ | First level runs and renders its real scene (deferred lighting, shadows, depth of field, effects) |
-| 🔧 | **Performance:** levels run at about 16-22 frames/s today (about 22-23 in a busy Frozen Shores window); the goal is a steady 30 fps (the renderer's command walker and the SPU job code are the limits). With the shipped pipeline list (on by default) a first visit's busy minute runs at about 16.5 frames/s with little stutter |
+| 🔧 | **Performance:** a busy Frozen Shores window runs at about 24 frames/s today (2026-11-24, details in docs/STATUS.md); the goal is a steady 30 fps (the renderer's command walker and the SPU job code are the limits). With the shipped pipeline list (on by default) a first visit's busy minute runs at about 16.5 frames/s with little stutter |
 | ✅ | **In-level HUD** (ammo counter, crosshair, objectives): drawn in level 2; in the first level's opening the game itself shows only the objective marker and reticle |
 | ✅ | **In-level play by hand:** a hand-played session with a real controller walked, aimed, fired, crouched, reloaded and threw grenades; pause, quit to the menu and Continue work |
 | 🔧 | **Audio:** the engine fills its output in the level; it stutters now and then |

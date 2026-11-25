@@ -14,7 +14,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 source "$ROOT/tools/smoke/pub_srcs.inc"; pub_src_args "$V" "$PT/libs/kzr"   # patch 2197: the harness links the publisher
-if [[ ! -f "$V/rsx_guest_signal.h" ]]; then echo "[test_guest_signal_order] SKIP: no patched toolkit with patch 2190 ($V)"; exit 0; fi
+if [[ ! -f "$V/rsx_guest_signal.h" ]]; then echo "[test_guest_signal_order] SKIP: no patched toolkit with patch 2190 ($V)"; exit 77; fi
 O="$ROOT/build/smoke-host/gs-order"; rm -rf "$O"; mkdir -p "$O/work"
 rc=0; fail() { echo "[test_guest_signal_order] FAIL: $*"; rc=1; }
 L="$ROOT/tools/smoke/guest_signal_lint.py"

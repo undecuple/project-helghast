@@ -1,0 +1,211 @@
+KZ3 patch 2210 (RSX pass 174): KZ3_DIAG_DELAY=main:N|walk:N (N in ms, default off, diagnostic, never shipped).
+
+A QPC busy-wait of N ms once per frame: main = at the guest thread flip call (gcm_flip_request, the thread that issues the flip; its host
+thread id is printed), walk = once per flip on the walker (live-draw flip callback). Prints [diag-delay] at arm and per second (count,
+mean injected ms as measured, asked ms). Pure core libs/video/rsx_diag_delay.h, host test tools/smoke/test_diag_delay.sh. Purpose: the
+conversion slope dFrame/dDelay (U3). NOT run in the game.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 5b865a53..4ccbe82a 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -14,6 +14,7 @@
+ #include "rsx_views.h"   /* patch 2202 */
+ #include "rsx_lpb.h"   /* patch 2208 */
+ #include "rsx_walk_trivial.h"   /* patch 2209 */
++#include "rsx_diag_delay.h"   /* patch 2210 */
+ static void rsx_lpb_start(void);
+ #include "rsx_legacy_skip.h"   /* patch 2189 */
+ static unsigned long long s_o0_m3d_pass, s_o0_m3dl_pass;   /* patch 2203: walker thread only, flushed by gcm_o0_flush_pass */
+@@ -2864,6 +2865,29 @@ void rsx_wt_flip_report(void)
+                     g[RSX_GS_COPY_0039] + g[RSX_GS_COPY_3089] + g[RSX_GS_STORE_308A], b, sizeof b))
+         fprintf(stderr, "%s\n", b);
+ }
++/* Patch 2210: KZ3_DIAG_DELAY=main:N|walk:N (rsx_diag_delay.h). Initialised on the first guest flip call (before any walker flip). */
++rsx_dd g_rsx_dd;
++static void gcm_dd_init_once(void)
++{
++    static int done;
++    if (done) return;
++    done = 1;
++    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
++    char m[512]; rsx_dd_init(&g_rsx_dd, getenv("KZ3_DIAG_DELAY"), (long long)f.QuadPart, rsx_perf_now, m, sizeof m);   /* patch 2210: diagnostic, default off, main:N or walk:N ms busy-wait once per frame */
++    if (m[0]) fprintf(stderr, "%s\n", m);
++}
++void rsx_dd_hook(int side)
++{
++    if (!g_rsx_dd.on) return;
++#ifdef _WIN32
++    const unsigned tid = (unsigned)GetCurrentThreadId();
++#else
++    const unsigned tid = 0;
++#endif
++    rsx_dd_inject(&g_rsx_dd, side, tid);
++    char b[512];
++    if (rsx_dd_tick(&g_rsx_dd, b, sizeof b)) fprintf(stderr, "%s\n", b);
++}
+ void rsx_perf_add(int idx, long long v)
+ {
+     if (rsx_perf_enabled() && idx >= 0 && idx < RSX_PERF_COUNT)
+@@ -5340,6 +5364,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+ {
+     rsx_perf_add(RSX_PERF_FLIPS, 1);
+     if (g_rsx_o0.on) g_rsx_o0.flip_n++;   /* patch 2188 */
++    gcm_dd_init_once();   /* patch 2210 */
++    if (__builtin_expect(g_rsx_dd.on, 0)) rsx_dd_hook(RSX_DD_MAIN);   /* patch 2210: the guest thread's flip call, once per frame */
+     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
+      * which answers "did it ever flip?" and not "is it still flipping, and how
+      * fast?" -- the question that matters when a title stops appearing on
+diff --git a/libs/video/rsx_diag_delay.h b/libs/video/rsx_diag_delay.h
+new file mode 100644
+index 00000000..4c6863bb
+--- /dev/null
++++ b/libs/video/rsx_diag_delay.h
+@@ -0,0 +1,99 @@
++/* KZ3 patch 2210 (RSX pass 174): KZ3_DIAG_DELAY=main:N|walk:N, the delay-injection switch (N in ms, default off, diagnostic,
++ * never shipped). Pure C: the caller owns the instance and supplies the clock; a host test builds it with a fake clock.
++ *
++ * A QPC busy-wait of N ms, once per frame: "main" at the guest thread's flip call (gcm_flip_request, the thread that issues the
++ * flip: its host thread id is printed at the first hit), "walk" once per flip on the walker thread (the live-draw flip
++ * callback). Purpose: the conversion slope dFrame/dDelay (U3 of fps-path-60): run N = 0, 1, 2, 4 ms and read the frame time.
++ * A busy-wait (not a sleep) so the thread keeps its core and the delay is the elapsed time, which the line reports as measured.
++ * Both sides may be given, comma separated (main:2,walk:1). Any malformed spec turns the switch off with a line saying why. */
++#ifndef RSX_DIAG_DELAY_H
++#define RSX_DIAG_DELAY_H
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum { RSX_DD_MAIN = 0, RSX_DD_WALK = 1, RSX_DD_N = 2 };
++typedef struct {
++    double ms[RSX_DD_N];                   /* requested delay per side; 0 = off */
++    unsigned long long count[RSX_DD_N];    /* injections (relaxed atomics) */
++    unsigned long long ticks[RSX_DD_N];    /* measured elapsed ticks summed */
++    unsigned long long p_count[RSX_DD_N], p_ticks[RSX_DD_N];
++    long long t_last;                      /* ticks of the last report (compare-exchanged, one printer per period) */
++    long long freq;
++    long long (*now)(void);
++    unsigned first_tid[RSX_DD_N];
++    int on;
++    char err[96];
++} rsx_dd;
++
++/* spec -> ms per side; 0 on success (at least one side > 0), -1 malformed (err filled). Unset or empty = -2 (off, no message). */
++static inline int rsx_dd_parse(const char* s, double out[RSX_DD_N], char* err, size_t ecap)
++{
++    out[0] = out[1] = 0.0;
++    if (!s || !*s) return -2;
++    const char* p = s;
++    while (*p) {
++        int side;
++        if (!strncmp(p, "main:", 5)) { side = RSX_DD_MAIN; p += 5; }
++        else if (!strncmp(p, "walk:", 5)) { side = RSX_DD_WALK; p += 5; }
++        else { snprintf(err, ecap, "expected main:N or walk:N at '%.12s'", p); return -1; }
++        char* e = NULL;
++        const double v = strtod(p, &e);
++        if (e == p || v < 0.0 || v > 1000.0) { snprintf(err, ecap, "bad N (0..1000 ms) at '%.12s'", p); return -1; }
++        out[side] = v;
++        p = e;
++        if (*p == ',') p++;
++        else if (*p) { snprintf(err, ecap, "trailing text '%.12s'", p); return -1; }
++    }
++    if (out[0] <= 0.0 && out[1] <= 0.0) { snprintf(err, ecap, "N must be > 0"); return -1; }
++    return 0;
++}
++static inline int rsx_dd_init(rsx_dd* d, const char* spec, long long freq, long long (*now)(void), char* msg, size_t cap)
++{
++    memset(d, 0, sizeof *d);
++    d->freq = freq; d->now = now;
++    const int r = rsx_dd_parse(spec, d->ms, d->err, sizeof d->err);
++    if (r == 0) {
++        d->on = 1;
++        snprintf(msg, cap, "[diag-delay] on (KZ3_DIAG_DELAY=%s, patch 2210): busy-wait main=%.3f ms once per guest flip call, walk=%.3f ms once per walker flip; diagnostic only", spec, d->ms[0], d->ms[1]);
++    } else if (r == -1) {
++        snprintf(msg, cap, "[diag-delay] KZ3_DIAG_DELAY=%s ignored: %s (use main:N or walk:N, N in ms)", spec, d->err);
++    } else if (cap) msg[0] = 0;
++    return d->on;
++}
++/* inject the delay of one side now; returns the measured ticks (0 when the side is off). `tid` is remembered at the first hit. */
++static inline long long rsx_dd_inject(rsx_dd* d, int side, unsigned tid)
++{
++    if (!d->on || side < 0 || side >= RSX_DD_N || d->ms[side] <= 0.0) return 0;
++    const long long t0 = d->now(), want = (long long)(d->ms[side] * (double)d->freq / 1000.0);
++    long long t = t0;
++    while (t - t0 < want) t = d->now();
++    const long long el = t - t0;
++    if (__atomic_fetch_add(&d->count[side], 1ull, __ATOMIC_RELAXED) == 0) d->first_tid[side] = tid;
++    __atomic_fetch_add(&d->ticks[side], (unsigned long long)el, __ATOMIC_RELAXED);
++    return el;
++}
++/* once a second at most: line into b, length returned, 0 when none due (or another thread took the period) */
++static inline size_t rsx_dd_tick(rsx_dd* d, char* b, size_t cap)
++{
++    if (!d->on) return 0;
++    const long long now = d->now();
++    long long last = __atomic_load_n(&d->t_last, __ATOMIC_RELAXED);
++    if (last == 0) { __atomic_compare_exchange_n(&d->t_last, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); return 0; }
++    if (now - last < d->freq) return 0;
++    if (!__atomic_compare_exchange_n(&d->t_last, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 0;
++    size_t n = 0;
++    n += (size_t)snprintf(b + n, cap - n, "[diag-delay] %.2fs", (double)(now - last) / (double)d->freq);
++    static const char* const nm[RSX_DD_N] = { "main", "walk" };
++    for (int s = 0; s < RSX_DD_N; s++) {
++        if (d->ms[s] <= 0.0 || n >= cap) continue;
++        const unsigned long long c = __atomic_load_n(&d->count[s], __ATOMIC_RELAXED), t = __atomic_load_n(&d->ticks[s], __ATOMIC_RELAXED);
++        const unsigned long long dc = c - d->p_count[s], dt = t - d->p_ticks[s];
++        n += (size_t)snprintf(b + n, cap - n, " | %s: count=%llu mean injected=%.3f ms (asked %.3f, total %llu, tid %u)", nm[s], dc,
++                              dc ? (double)dt * 1000.0 / (double)d->freq / (double)dc : 0.0, d->ms[s], c, d->first_tid[s]);
++        d->p_count[s] = c; d->p_ticks[s] = t;
++    }
++    return n < cap ? n : cap - 1;
++}
++#endif
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index e25f4167..c1afd9e2 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -22,6 +22,7 @@
+ #include "rsx_live_draw.h"
+ #include "rsx_o0.h"   /* patch 2188 */
+ #include "rsx_walk_trivial.h"   /* patch 2209 */
++#include "rsx_diag_delay.h"   /* patch 2210 */
+ #include "rsx_s7p.h"   /* patch 2204: S7.0 probes */
+ #include "rsx_views.h"   /* patch 2202 */
+ #include "rsx_lpb.h"   /* patch 2208 */
+@@ -16842,6 +16843,7 @@ static void ldsx_report(void* user, const rsx_dispatch* r, u32 m, u32 arg) { LDS
+ static void ldsx_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count) { LDS_PUSH(t, RSX_SB_X_SINK); sink_draw_arrays(u, r, first, count); LDS_POP(t); }
+ static void ldsx_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count) { LDS_PUSH(t, RSX_SB_X_SINK); sink_draw_index(u, r, first, count); LDS_POP(t); }
+ extern rsx_wt g_rsx_wt;   /* patch 2209 (cellGcmSys.c) */
++extern rsx_dd g_rsx_dd;   /* patch 2210 (cellGcmSys.c) */
+ /* Patch 2209 (RSX_WALK_TRIVIAL=1): the dropping sink. Every call is counted and does nothing else. */
+ static void wt_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; }
+ static void wt_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count) { (void)u; (void)r; (void)first; (void)count; }
+@@ -16853,6 +16855,7 @@ static void wt_flip(void* u, const rsx_dispatch* r, u32 arg)   /* the guest-visi
+ {
+     (void)u; (void)r;
+     const u32 buffer_id = arg & 7u;
++    if (__builtin_expect(g_rsx_dd.on, 0)) rsx_dd_hook(RSX_DD_WALK);   /* patch 2210 */
+     gcm_guest_signal_note(RSX_GS_FLIP, buffer_id, 0u);
+     g_ld_flip_requested++;
+     g_ld_last_requested_buffer = buffer_id;
+@@ -16865,6 +16868,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+ {
+     (void)user; (void)r;
+     const u32 buffer_id = arg & 7u;
++    if (__builtin_expect(g_rsx_dd.on, 0)) rsx_dd_hook(RSX_DD_WALK);   /* patch 2210: once per walker flip */
+     if (__builtin_expect(g_rsx_views.on, 0)) {   /* patch 2202: one [views] line per flip that had draws */
+         char vb[1024]; uint32_t nv;
+         if (rsx_views_flip(&g_rsx_views, vb, sizeof vb, &nv)) fprintf(stderr, "%s\n", vb);
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 7f8c1b0d..ec7bfc52 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -348,6 +348,7 @@ int       rsx_perf_enabled(void);
+ long long rsx_perf_now(void);                  /* QPC ticks */
+ int       rsx_walk_trivial_on(void);           /* patch 2209: RSX_WALK_TRIVIAL=1 (read once, at the sink install) */
+ void      rsx_wt_flip_report(void);            /* patch 2209: the once-a-second [walk-trivial] line, called from the trivial flip */
++void      rsx_dd_hook(int side);               /* patch 2210: KZ3_DIAG_DELAY busy-wait + [diag-delay] line; side = RSX_DD_MAIN / RSX_DD_WALK */
+ void rsx_live_draw_s7_ext(void* out);          /* patch 2204: fills a rsx_s7p_ext (rsx_s7p.h) with the device-cache counters; zeros off Windows */
+ void      rsx_perf_add(int idx, long long v);  /* no-op unless RSX_PERF=1 */
+ int       rsx_perf_on_gcm_thread(void);        /* caller is the cellGcmInit thread */

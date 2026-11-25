@@ -62,6 +62,8 @@ def payload(tmp):
     put(root, "fonts/Rajdhani-Medium.ttf", b"\0\1\0\0" + bytes(500))
     put(root, "fonts/Rajdhani-Bold.ttf", b"\0\1\0\0" + bytes(600))
     put(root, "licenses/Rajdhani-OFL.txt", "SIL OPEN FONT LICENSE Version 1.1\n")
+    put(root, "fonts/NotoSans-Regular.ttf", b"\0\1\0\0" + bytes(700))
+    put(root, "licenses/NotoSans-OFL.txt", "SIL OPEN FONT LICENSE Version 1.1\n")
     pe = bytearray(64) + b"PE\0\0" + (0x8664).to_bytes(2, "little") + bytes(16) + (0x2000).to_bytes(2, "little")
     pe[:2], pe[60:64] = b"MZ", (64).to_bytes(4, "little")      # a minimal 64-bit PE DLL header (assemble_payload.pe_x64_problem)
     put(root, "runtime/SDL3.dll", bytes(pe) + bytes(3 << 20))  # a real SDL3.dll is ~5 MB: over the 2 MiB binary cap
@@ -92,7 +94,7 @@ def main():
             names = [i.filename for i in infos]
             same = all(z.read(f"Project Helghast/{rel}") == open(p, "rb").read() for rel, p in pz.walk(root))
         check(names == sorted(names) and all(n.startswith("Project Helghast/") for n in names)
-              and len(names) == 13 and "Project Helghast/manifest.json" in names, "sorted entries under the top folder",
+              and len(names) == 15 and "Project Helghast/manifest.json" in names, "sorted entries under the top folder",
               names)
         check({"Project Helghast/runtime/SDL3.dll", "Project Helghast/licenses/SDL3-LICENSE.txt"} <= set(names),
               "SDL3.dll and its licence are in the zip", names)
@@ -127,6 +129,10 @@ def main():
         refused("no run.cmd", lambda r: os.remove(os.path.join(r, "run.cmd")), "run.cmd: missing", remanifest=True)
         refused("no notice font", lambda r: os.remove(os.path.join(r, "fonts", "Rajdhani-Medium.ttf")),
                 "fonts/Rajdhani-Medium.ttf: missing", remanifest=True)
+        refused("no Noto font", lambda r: os.remove(os.path.join(r, "fonts", "NotoSans-Regular.ttf")),
+                "fonts/NotoSans-Regular.ttf: missing", remanifest=True)
+        refused("no Noto licence", lambda r: os.remove(os.path.join(r, "licenses", "NotoSans-OFL.txt")),
+                "licenses/NotoSans-OFL.txt: missing", remanifest=True)
         refused("no font licence", lambda r: os.remove(os.path.join(r, "licenses", "Rajdhani-OFL.txt")),
                 "licenses/Rajdhani-OFL.txt: missing", remanifest=True)
         refused("no SDL3.dll", lambda r: os.remove(os.path.join(r, "runtime", "SDL3.dll")),

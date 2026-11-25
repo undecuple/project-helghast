@@ -7,8 +7,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${PS3RECOMP_PATCHED:-$ROOT/work/ps3recomp-patched}"
 PATCH="$ROOT/port/patches/9375-upstream-pr375-draw-engine-sparse-texture-rehash.patch"
-[[ -f $T/libs/video/rsx_draw_engine.c && -f $PATCH ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
-grep -q eng_texture_sparse_hash "$T/libs/video/rsx_draw_engine.c" || { echo "SKIP: patched toolkit lacks 9375 (run tools/ps3recomp-patched.sh)"; exit 0; }
+[[ -f $T/libs/video/rsx_draw_engine.c && -f $PATCH ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
+grep -q eng_texture_sparse_hash "$T/libs/video/rsx_draw_engine.c" || { echo "SKIP: patched toolkit lacks 9375 (run tools/ps3recomp-patched.sh)"; exit 77; }
 OUT="$(mktemp -d)"
 fail=0
 SRC="libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c

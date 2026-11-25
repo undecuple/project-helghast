@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/rsx_window_place.h" ]]; then
-  echo "[test_window_place] SKIP: no patched toolkit with patch 2126 ($V/rsx_window_place.h; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_window_place] SKIP: no patched toolkit with patch 2126 ($V/rsx_window_place.h; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/window_place"; mkdir -p "$O"
 CC="${CC:-cc}"
 W=(-std=c11 -Wall -Wextra -Werror -I"$V")

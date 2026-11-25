@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 H="$PT/libs/input/pad_assist.h"
-if [[ ! -f "$H" ]]; then echo "[test_motion_assist] SKIP: toolkit without patch 4030"; exit 0; fi
+if [[ ! -f "$H" ]]; then echo "[test_motion_assist] SKIP: toolkit without patch 4030"; exit 77; fi
 O="$ROOT/build/smoke-host/motion_assist"; mkdir -p "$O"
 cc -std=c11 -Wall -Wextra -Werror -Wno-unused-function -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
   -I"$PT/libs/input" "$ROOT/tools/smoke/test_motion_assist.c" -o "$O/t" -lm

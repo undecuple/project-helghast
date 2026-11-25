@@ -6,7 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${PS3RECOMP_PATCHED:-$ROOT/work/ps3recomp-patched}"
-[[ -d $T/libs ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -d $T/libs ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 OUT="$(mktemp -d)"; fail=0
 V=libs/video
 if (cd "$T" && ${CC:-cc} -std=gnu17 -w -I include -I $V -o "$OUT/t_rsx" $V/tests/test_rsx_draw_engine.c $V/rsx_draw_engine.c \

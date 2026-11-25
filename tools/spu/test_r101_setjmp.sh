@@ -8,7 +8,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/r101t"; mkdir -p "$O"
 T="${SPU_TREE:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$T/tools/ppu_lifter.py" ]] || { echo "SKIP: no toolkit at $T"; exit 0; }
+[[ -f "$T/tools/ppu_lifter.py" ]] || { echo "SKIP: no toolkit at $T"; exit 77; }
 python3 "$ROOT/tools/spu/test_r101_setjmp_gen.py" "$T" "$O" || { echo "FAIL: lift"; exit 1; }
 rm -f "$O/t_sj"
 ${CXX:-g++} -std=gnu++17 -O2 -pthread -Wno-unused-function -I "$O" -I "$T/runtime/ppu" -o "$O/t_sj" \

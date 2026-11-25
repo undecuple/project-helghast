@@ -1,0 +1,11 @@
+{
+ "format": 1,
+ "note": "Fonts that ship in the payload but are not art fonts (art.json is rewritten from the art fonts only). A pin is the SHA-256 of the file as fetched by tools/release/installer_art.py --fetch-fonts; an empty pin refuses the payload until it is filled in.",
+ "sources": {
+  "NotoSans-Regular.ttf": "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSans/full/ttf/NotoSans-Regular.ttf",
+  "OFL-notosans.txt": "https://raw.githubusercontent.com/notofonts/latin-greek-cyrillic/main/OFL.txt"
+ },
+ "sha256": {
+  "NotoSans-Regular.ttf": "f5f552c8c5edb61fe6efb824baf4d4de47b1a8689ab4925ff43f7bd6a4ebece5"
+ }
+}

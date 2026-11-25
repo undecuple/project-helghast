@@ -7,7 +7,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -d $T/runtime/spu ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -d $T/runtime/spu ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 OUT="$(mktemp -d)"; fail=0
 # KZ3 patch 1032's job accounting and wait-trace hooks, called from spu_channels.c paths the test does not reach (off).
 cat > "$OUT/stub.c" <<'C'

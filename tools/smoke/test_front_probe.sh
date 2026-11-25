@@ -9,8 +9,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 source "$ROOT/tools/smoke/pub_srcs.inc"; pub_src_args "$V" "$PT/libs/kzr"   # patch 2197: the harness links the publisher
-if [[ ! -f "$V/cellGcmSys.c" || ! -d "$PT/include" ]]; then echo "[test_front_probe] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
-if [[ ! -f "$V/rsx_front_probe.h" ]]; then echo "[test_front_probe] SKIP: toolkit without patch 2172"; exit 0; fi
+if [[ ! -f "$V/cellGcmSys.c" || ! -d "$PT/include" ]]; then echo "[test_front_probe] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
+if [[ ! -f "$V/rsx_front_probe.h" ]]; then echo "[test_front_probe] SKIP: toolkit without patch 2172"; exit 77; fi
 O="$ROOT/build/smoke-host/front_probe"; mkdir -p "$O"
 rc=0
 gcc -std=gnu17 -O1 -g -Wall -Wno-unused-function -I "$V" -pthread "$ROOT/tools/smoke/test_front_probe.c" -o "$O/unit" || { echo "[test_front_probe] FAIL: unit build"; exit 1; }

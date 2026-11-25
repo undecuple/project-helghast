@@ -10,8 +10,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/t_rm_layout"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 H="$P/runtime/spu/spu_context.h"; C="$P/runtime/spu/spu_channels.c"
-[[ -f "$H" && -f "$C" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
-command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "SKIP: no x86_64-w64-mingw32-gcc (nix develop .#win)"; exit 0; }
+[[ -f "$H" && -f "$C" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
+command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "SKIP: no x86_64-w64-mingw32-gcc (nix develop .#win)"; exit 77; }
 fail=0
 MAC="$(sed -n '/^#if defined(_WIN32) && defined(__GNUC__) && !defined(SPU_NO_READ_MOSTLY)$/,/^#endif$/p' "$H")"
 FEN="$(sed -n '/^#if defined(_WIN32) && defined(__GNUC__) && !defined(SPU_NO_READ_MOSTLY)$/,/^#endif$/p' "$C")"

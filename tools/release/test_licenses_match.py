@@ -28,6 +28,36 @@ def same(a, b):
         return fa.read() == fb.read()
 
 
+def font_rows_missing(notice, fonts):
+    """Payload font files whose family name has no row in NOTICE.md (audit 2026-11-25: Noto Sans shipped unlisted)."""
+    rows = [ln.lower() for ln in notice.splitlines() if ln.startswith("|")]
+    out = []
+    for f in fonts:
+        fam = re.split(r"[-_.]", f)[0].lower()
+        if fam == "notosans":
+            fam = "noto sans"
+        if not any(fam in r for r in rows):
+            out.append(f)
+    return out
+
+
+def notice_pin(notice):
+    """(tag, commit) the ps3recomp row of NOTICE.md says it is pinned at, or None."""
+    m = re.search(r"pinned at (v[0-9][0-9.]*), commit ([0-9a-f]{7,40})", notice)
+    return m.groups() if m else None
+
+
+def pin_matches(pin, gitlink, tag):
+    """The NOTICE pin names the gitlink commit (prefix) and, when the submodule is at a tag, that tag."""
+    return bool(pin) and gitlink.startswith(pin[1]) and (tag is None or tag == pin[0])
+
+
+def git(*args):
+    import subprocess
+    r = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
 def main():
     bad = 0
 
@@ -51,7 +81,10 @@ def main():
              "licenses/at3_standalone-COPYING.LGPLv2.1.txt": os.path.join(
                  ROOT, "third_party", "ps3recomp", "third_party", "at3_standalone", "COPYING.LGPLv2.1"),
              ap.SDL3_DEST[1]: os.path.join(ROOT, "work", "release", "sdl3", ap.SDL3_SRC[1]),
-             ap.FONT_LICENSE[1]: os.path.join(ROOT, "work", "release", "fonts", ap.FONT_LICENSE[0])}
+             ap.FONT_LICENSE[1]: os.path.join(ROOT, "work", "release", "fonts", ap.FONT_LICENSE[0]),
+             ap.NOTO_LICENSE[1]: os.path.join(ROOT, "work", "release", "fonts", ap.NOTO_LICENSE[0]),
+             "licenses/SMAA-LICENSE.txt": os.path.join(ROOT, "third_party", "ps3recomp", "third_party", "smaa",
+                                                       "LICENSE.txt")}
     for dest, src in fixed.items():
         rel = dest[len("licenses/"):]
         check(rel in have, f"payload name {dest} exists in licenses/")
@@ -73,6 +106,23 @@ def main():
         elif c.get("license_globs"):
             got = [h for h in have if h.startswith(c["group"] + "/" + c["name"] + "-tree-")]
             check(bool(got), f"{c['name']}: a tree licence text ({c['license_globs']}) exists in licenses/")
+    with open(pub("NOTICE.md"), encoding="utf-8") as f:
+        notice = f.read()
+    fonts = list(ap.FONTS) + [ap.NOTO_FONT]
+    check(not font_rows_missing(notice, fonts), f"every payload font has a NOTICE.md row ({font_rows_missing(notice, fonts)} missing)")
+    check(font_rows_missing(notice.replace("Noto Sans", "Nope"), fonts) == [ap.NOTO_FONT],
+          "control: a NOTICE without the Noto Sans row is caught")
+    link = git("ls-tree", "HEAD", "third_party/ps3recomp")
+    sub = os.path.join(ROOT, "third_party", "ps3recomp")
+    if link and "commit" in link and os.path.exists(os.path.join(sub, ".git")):
+        sha = link.split()[2]
+        tag = git("-C", sub, "describe", "--tags", "--exact-match", "HEAD") if git("-C", sub, "rev-parse", "HEAD") == sha else None
+        pin = notice_pin(notice)
+        check(pin_matches(pin, sha, tag), f"NOTICE.md ps3recomp pin {pin} matches the gitlink {sha[:7]} (tag {tag})")
+        check(not pin_matches(("v0.0.0", "0000000"), sha, tag), "control: a wrong pin is caught")
+        check(not pin_matches(None, sha, tag), "control: a NOTICE without a pin is caught")
+    else:
+        print("SKIP NOTICE pin: no git checkout with the ps3recomp submodule here")
     print("PASS" if not bad else f"FAIL ({bad})")
     return 1 if bad else 0
 

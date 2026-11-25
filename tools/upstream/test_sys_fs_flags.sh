@@ -13,7 +13,7 @@ P=""
 for d in ${NEW_TREE:+"$NEW_TREE"} work/ps3recomp-patched; do
   [[ -f "$d/runtime/syscalls/sys_fs.c" ]] && { P="$d"; break; }
 done
-[[ -n "$P" ]] || { echo "SKIP test_sys_fs_flags: no patched toolkit here (run tools/ps3recomp-patched.sh)"; exit 0; }
+[[ -n "$P" ]] || { echo "SKIP test_sys_fs_flags: no patched toolkit here (run tools/ps3recomp-patched.sh)"; exit 77; }
 [[ -f "$P/include/ps3emu/cell_fs_flags.h" ]] \
   || echo "note: $P has no include/ps3emu/cell_fs_flags.h (no patch 1139; rerun tools/ps3recomp-patched.sh): expect FAIL"
 CC="${CC:-cc}"

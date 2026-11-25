@@ -6,7 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$P/libs/font/cellFont.c" ]] || { echo "SKIP: no patched toolkit at $P (run tools/ps3recomp-patched.sh)"; exit 0; }
+[[ -f "$P/libs/font/cellFont.c" ]] || { echo "SKIP: no patched toolkit at $P (run tools/ps3recomp-patched.sh)"; exit 77; }
 grep -q 'cellFontInitializeWithRevision(u64' "$P/libs/font/cellFont.c" || { echo "FAIL: $P/libs/font/cellFont.c defines no cellFontInitializeWithRevision"; exit 1; }
 O="$ROOT/work/upstream-tests/font2060"; mkdir -p "$O"
 D="-DKZ3_FONT_NO_COMMIT -DKZ3_FONT_POOL_BASE=0x80000u -DKZ3_FONT_POOL_SIZE=0x40000u"

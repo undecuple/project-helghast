@@ -5,8 +5,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$P/runtime/spu/spu_context.h" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
-grep -q 'KZ3 patch 1107' "$P/runtime/spu/spu_context.h" || { echo "SKIP: patch 1107 not in $P"; exit 0; }
+[[ -f "$P/runtime/spu/spu_context.h" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
+grep -q 'KZ3 patch 1107' "$P/runtime/spu/spu_context.h" || { echo "SKIP: patch 1107 not in $P"; exit 77; }
 rc=0
 for cold in 1 0; do
   rm -f "$O/t_spu_lscold"

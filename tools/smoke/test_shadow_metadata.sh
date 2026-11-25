@@ -8,9 +8,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/rsx_fp_decompiler.c" || ! -d "$PT/include" ]]; then
-  echo "[test_shadow_metadata] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_shadow_metadata] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 if ! grep -q rsx_fp_shadow_desc "$V/rsx_fp_decompiler.h"; then
-  echo "[test_shadow_metadata] SKIP: toolkit without patch 2050"; exit 0; fi
+  echo "[test_shadow_metadata] SKIP: toolkit without patch 2050"; exit 77; fi
 O="$ROOT/build/smoke-host/shadow_metadata"; mkdir -p "$O"
 ${CC:-cc} -std=c11 -Wall -O1 -I"$V" -I"$PT/include" "$ROOT/tools/smoke/test_shadow_metadata.c" \
   "$V/rsx_fp_decompiler.c" -o "$O/test_shadow_metadata" -lm

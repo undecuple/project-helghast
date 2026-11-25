@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if [[ ! -f "$V/rsx_o0.h" ]]; then echo "[test_perf_split] SKIP: no patched toolkit with patch 2188 ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$V/rsx_o0.h" ]]; then echo "[test_perf_split] SKIP: no patched toolkit with patch 2188 ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/perf-split"; mkdir -p "$O"
 CC="${CC:-cc}"
 $CC -std=c11 -Wall -Wextra -Werror -O2 -I"$V" "$ROOT/tools/smoke/test_perf_split.c" -o "$O/t" -lm

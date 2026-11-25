@@ -278,7 +278,8 @@ def game_exit_message(rc, log_path, causes):
     bad = [c for c in causes if rc != 0 or c[0] in ("no-device", "patches", "added", "overlay")]   # a clean exit: only black-screen causes
     if rc == 0 and not bad:
         return ""
-    head = f"The game closed with code {rc}." if rc != 0 else "The game closed, and its log shows a problem that leaves the screen black."
+    dll = fr.child_dll_problem("The game (kz3.exe)", rc)
+    head = (f"The game closed with code {rc}. {dll}" if dll else f"The game closed with code {rc}.") if rc != 0 else "The game closed, and its log shows a problem that leaves the screen black."
     why = "".join(f"\n\n- {t}." for _, t in bad) if bad else "\n\nThe log does not name a cause."
     where = f"\n\nThe game's log is {log_path}." if log_path else "\n\nNo game log was written (the game stopped before it started its log)."
     return head + why + where + REPORT
@@ -1203,6 +1204,10 @@ def did_not_finish(rc, what):
     """The dialog line for a first-run/rebuild child that ended with rc != 0 (release pass 51: X on the console window)."""
     if rc in CONSOLE_CLOSED:
         what += " (its window was closed before it finished; finished steps are kept, open the program again to continue)"
+    if rc not in CONSOLE_CLOSED:
+        dll = fr.child_dll_problem("The build program (Python)", rc)   # the console's own program; its loader failure is named
+        if dll:
+            return f"{what} (code {rc}). {dll}"
     return f"{what} (code {rc})" if rc not in CONSOLE_CLOSED else what
 
 

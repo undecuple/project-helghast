@@ -9,7 +9,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if [[ ! -f "$V/rsx_first_frame.h" ]]; then echo "[test_first_frame] SKIP: no patched toolkit with patch 2199 ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$V/rsx_first_frame.h" ]]; then echo "[test_first_frame] SKIP: no patched toolkit with patch 2199 ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/first-frame"; mkdir -p "$O"
 CC="${CC:-cc}"
 

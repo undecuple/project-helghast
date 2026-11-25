@@ -5,8 +5,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$P/runtime/spu/spu_helpers.h" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
-grep -q 'KZ3 patch 1108' "$P/runtime/spu/spu_helpers.h" || { echo "SKIP: patch 1108 not in $P"; exit 0; }
+[[ -f "$P/runtime/spu/spu_helpers.h" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
+grep -q 'KZ3 patch 1108' "$P/runtime/spu/spu_helpers.h" || { echo "SKIP: patch 1108 not in $P"; exit 77; }
 rc=0
 for f in "" "-DSPU_SHUFB_HOIST=0"; do
   rm -f "$O/t_spu_shufh"

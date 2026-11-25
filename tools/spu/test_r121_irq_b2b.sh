@@ -5,7 +5,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -f $T/runtime/spu/spu_drain.c ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -f $T/runtime/spu/spu_drain.c ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 grep -q g_spu_irq_b2b "$T/runtime/spu/spu_drain.c" || { echo "FAIL: $T has no patch 1142"; exit 1; }
 OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 cat > "$OUT/main.c" <<'C'

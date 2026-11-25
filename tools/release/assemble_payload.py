@@ -16,12 +16,15 @@ What goes in (the allowlist, RULES below; nothing else is ever copied):
   ps3recomp/      work/ps3recomp-patched (plan item 1: the patched toolkit, tools/ps3recomp-patched.sh) without
                   fw_spu/ (Sony firmware modules and code lifted from them: never shipped), scratch/, docs/, packaging/,
                   .github/
-  licenses/       our LICENSE, ps3recomp's LICENSE, at3_standalone's COPYING.LGPLv2.1, FidelityFX FSR 1's LICENSE.txt
+  licenses/       our LICENSE, ps3recomp's LICENSE, at3_standalone's COPYING.LGPLv2.1, FidelityFX FSR 1's LICENSE.txt,
+                  SMAA's LICENSE.txt
   fonts/          Rajdhani-Medium.ttf and Rajdhani-Bold.ttf (SIL OFL 1.1) from --fonts DIR (default
                   <repo>/work/release/fonts, filled by installer_art.py --fetch-fonts; never committed), each checked
                   against its SHA-256 pinned in installer/art/art.json, and their OFL text as licenses/Rajdhani-OFL.txt.
                   firstrun.py and the launcher copy them to build/fonts/, next to kz3.exe: the runtime's error notice
                   loads them privately from <exe dir>/fonts (RSX pass 38). Missing or changed fonts refuse the payload.
+                  Also NotoSans-Regular.ttf (SIL OFL 1.1, the Cyrillic/Greek fallback of the game's font chain, issue #60),
+                  pinned in installer/art/fonts-extra.json, with licenses/NotoSans-OFL.txt; copied to build/fonts/ too.
   Project Helghast.exe  with --launcher EXE: the launcher built by tools/release/build_launcher.sh (pass 4)
   recomplauncher.json (installer/recomplauncher.json: RecompLauncher's profile; no game data)
   README.md, NOTICE.md (from public/), run.cmd (installer/run.cmd, the portable zip's entry; the Inno script
@@ -113,6 +116,7 @@ RULES = [
     (TOOLKIT + "/third_party/at3_standalone/COPYING.LGPLv2.1", "licenses/at3_standalone-COPYING.LGPLv2.1.txt",
      "file", {}),
     (TOOLKIT + "/libs/video/fsr1/LICENSE.txt", "licenses/FidelityFX-FSR1-LICENSE.txt", "file", {}),   # patch 2145 (MIT)
+    (TOOLKIT + "/third_party/smaa/LICENSE.txt", "licenses/SMAA-LICENSE.txt", "file", {}),   # the smaa/ tree ships inside ps3recomp\ (MIT)
     ("public/README.md", "README.md", "file", {}),
     ("public/NOTICE.md", "NOTICE.md", "file", {}),
     ("installer/run.cmd", "run.cmd", "file", {}),
@@ -120,6 +124,12 @@ RULES = [
 ]
 FONTS = ("Rajdhani-Medium.ttf", "Rajdhani-Bold.ttf")   # the runtime's notice fonts (port/kz3/main.cpp, RSX pass 38)
 FONT_LICENSE = ("OFL-rajdhani.txt", "licenses/Rajdhani-OFL.txt")   # installer_art.py's name -> payload name
+# Noto Sans Regular (SIL OFL 1.1): the Cyrillic/Greek fallback the runtime's cellFont chain loads from <exe dir>/fonts
+# (patch 5005 looks for NotoSans-Regular.ttf there; issue #60). Its pin lives in installer/art/fonts-extra.json, apart
+# from art.json (installer_art.py rewrites art.json from the art fonts only).
+NOTO_FONT = "NotoSans-Regular.ttf"
+NOTO_LICENSE = ("OFL-notosans.txt", "licenses/NotoSans-OFL.txt")
+NOTO_PINS = "installer/art/fonts-extra.json"
 SDL3_DEST = ("runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt")   # payload names: the DLL (firstrun.place_sdl3 copies it next to
 SDL3_SRC = ("SDL3.dll", "LICENSE.txt")                          # kz3.exe) and SDL's zlib licence; names inside --sdl3 DIR
 SDL3_MAX_BYTES = 16 << 20                                       # a DLL is exempt from the 2 MiB binary cap, not from this one
@@ -313,6 +323,25 @@ def collect_fonts(repo, fonts_dir):
         files.append((FONT_LICENSE[1], lic))
     else:
         bad.append(f"{lic} (the fonts' OFL text; run tools/release/installer_art.py --fetch-fonts)")
+    try:
+        with open(os.path.join(repo, *NOTO_PINS.split("/")), encoding="utf-8") as f:
+            npin = json.load(f).get("sha256", {}).get(NOTO_FONT, "")
+    except (OSError, ValueError) as e:
+        return files, bad + [f"{NOTO_PINS}: {e}"]
+    p = os.path.join(fonts_dir, NOTO_FONT)
+    if not os.path.isfile(p) or os.path.islink(p):
+        bad.append(f"{p} (the Cyrillic/Greek fallback; run tools/release/installer_art.py --fetch-fonts)")
+    elif not npin:
+        bad.append(f"{NOTO_FONT}: no SHA-256 pin in {NOTO_PINS}")
+    elif sha256(p) != npin:
+        bad.append(f"{NOTO_FONT}: SHA-256 differs from the pin in {NOTO_PINS}")
+    else:
+        files.append(("fonts/" + NOTO_FONT, p))
+    nl = os.path.join(fonts_dir, NOTO_LICENSE[0])
+    if os.path.isfile(nl) and not os.path.islink(nl):
+        files.append((NOTO_LICENSE[1], nl))
+    else:
+        bad.append(f"{nl} (Noto's OFL text; run tools/release/installer_art.py --fetch-fonts)")
     return files, bad
 
 

@@ -1,0 +1,397 @@
+KZ3 probe (re-data round, walker plan B-E0, 2026-11-23): engine-seam probe KZ3_E0=1, default off.
+
+Question it answers: is there a seam above the GCM FIFO where the engine's draw records can be read instead of every
+FIFO method? (1) which SPU job PUT each push-buffer word into the RSX IO range (writer tag = job image + job number, and
+the reserving PPU caller when kz3_e0_resv is wired), (2) what job image 218 (Gfx.PB.Geometry, 1.14 lift) is given and
+GETs: argument words and every DMA GET with its first words, (3) method-word / draw mix of the tagged push-buffer words.
+
+Switch family KZ3_E0_*: KZ3_E0=1 (master), KZ3_E0_WINDOW=lo,hi (seconds since start), KZ3_E0_IO=lo-hi (hex EA, default
+40000000-50000000), KZ3_E0_IMG (default 218), KZ3_E0_CALLS (job dumps per second, default 1), KZ3_E0_GETS (GETs dumped
+per call, default 128), KZ3_E0_PUTS (PUT lines per second, default 24), KZ3_E0_GETW (bytes of each GET shown, default 256). Output tags [e0], [e0-hole], [e0-md], [e0-job5].
+
+Off path: one static constructor reads KZ3_E0 and returns when it is unset, empty or 0; nothing is installed (the patch 1141
+pointers stay null, g_spu_jhook_on stays 0), no existing line is changed. spu_e0.h holds the stateless parts (push-buffer
+word scanner, env parsers, hole table) and is tested on the host alone (tools/assets/test_e0_probe.sh). Not combinable with
+KZ3_JOB_CAPTURE / KZ3_NATIVE_JOB (same hook pointers; the probe warns).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -4231,6 +4231,243 @@
+             (unsigned long long)v._u64[1]);
+ }
+ 
++
++/* ---- KZ3 patch 3012: engine-seam probe (walker plan B-E0), KZ3_E0=1 -----------------------------------------------
++ * Default off. With KZ3_E0 unset the constructor below reads one environment variable and returns: no pointer is set
++ * and no hook runs (the early-out is the whole off path). On, it installs three observers through the patch 1141 hooks
++ * (g_spu_jhook_open/close for the job bracket, g_spu_jcap_xfer for every DMA element) and prints, per second:
++ *   [e0-hole] per job image: PUTs into the RSX IO range (KZ3_E0_IO), their bytes, push-buffer words parsed from them,
++ *             the PUT's reserving caller when a PPU hole was registered (kz3_e0_resv); the first KZ3_E0_PUTS PUTs of a
++ *             second are printed one by one (ea, size, tag, first words)
++ *   [e0-md]   push-buffer word classes over all tagged PUTs: words, method headers, draws, DRAW_ARRAYS / INDEX, and the
++ *             per-class data words (vertex constants, vertex program, texture, vertex arrays, draw, other)
++ *   [e0-job5] inside KZ3_E0_WINDOW (seconds since process start) for the job image KZ3_E0_IMG (default 218 = Gfx.PB.Geometry
++ *             in the 1.14 lift): the job entry registers, the argument block it is given (LS) and every GET it issues
++ *             (lsa, ea, size, first words), at most KZ3_E0_CALLS calls per second and KZ3_E0_GETS GETs per call.
++ * Not combinable with KZ3_JOB_CAPTURE / KZ3_NATIVE_JOB (they replace the same hook pointers; the probe warns once). The
++ * job bracket is the policy module's (image 2) branch into the job code buffer: LS[0x1320] = code buffer, LS[0x12E0] = job
++ * number (the KZ3 title layout, the same words patch 1085 reads). */
++#include "spu_e0.h"
++extern int spu_overlay_match_sig(const uint8_t hdr[16]);
++#define E0_MAXIMG 512
++struct e0_img { uint64_t puts, bytes; struct e0_pb pb; uint64_t inhole; };
++static struct {
++    int on;
++    double w_lo, w_hi;                  /* KZ3_E0_WINDOW seconds since start (default: always) */
++    uint32_t io_lo, io_hi;              /* KZ3_E0_IO */
++    int dump_img;                       /* KZ3_E0_IMG */
++    int calls_per_s, gets_per_call, puts_per_s, get_bytes;
++    uint64_t t0;
++    long last_sec;                      /* the second last summarised (CAS) */
++    long dump_sec; int dump_n;          /* calls dumped in dump_sec */
++    long put_sec; int put_n;            /* PUT lines printed in put_sec */
++    volatile int lk;                    /* guards the holes table */
++    struct e0_holes holes;
++    int warned;
++    struct e0_img img[E0_MAXIMG + 1];   /* [0] = outside a job call */
++    struct e0_img prev[E0_MAXIMG + 1];
++    uint64_t resv, resv_bad;
++} g_e0;
++static SPU_THREAD_LOCAL struct { int img; uint32_t jobnum; int dump; int gets; struct e0_pb pb[1]; uint64_t next_ea; } t_e0;
++
++static double e0_secs(void) { return (double)(kz3_wacct_now() - g_e0.t0) * 1e-9; }
++static int e0_be32(const uint8_t* p) { return (int)((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]); }
++
++static void e0_xfer(spu_context* ctx, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd);
++static void e0_summary(long sec)
++{
++    uint64_t tw = 0, th = 0, td = 0, tdraw = 0;
++    struct e0_pb all; memset(&all, 0, sizeof all);
++    for (int i = 0; i <= E0_MAXIMG; i++) {
++        const uint64_t dp = g_e0.img[i].puts - g_e0.prev[i].puts;
++        if (!dp) continue;
++        struct e0_pb d; memset(&d, 0, sizeof d);
++        const struct e0_pb *a = &g_e0.img[i].pb, *b = &g_e0.prev[i].pb;
++        d.words = a->words - b->words; d.hdrs = a->hdrs - b->hdrs; d.data = a->data - b->data; d.nops = a->nops - b->nops;
++        d.jmp = a->jmp - b->jmp; d.call = a->call - b->call; d.ret = a->ret - b->ret; d.bad = a->bad - b->bad;
++        d.draws = a->draws - b->draws; d.darr = a->darr - b->darr; d.didx = a->didx - b->didx; d.inl = a->inl - b->inl;
++        for (int k = 0; k < E0_NC; k++) d.cls[k] = a->cls[k] - b->cls[k];
++        fprintf(stderr, "[e0-hole] t=%ld img=%d puts=%llu bytes=%llu words=%u hdrs=%u draws=%u bad=%u inhole=%llu\n", sec, i,
++                (unsigned long long)dp, (unsigned long long)(g_e0.img[i].bytes - g_e0.prev[i].bytes), d.words, d.hdrs, d.draws,
++                d.bad, (unsigned long long)(g_e0.img[i].inhole - g_e0.prev[i].inhole));
++        if (d.words && d.bad * 20 > d.words) fprintf(stderr, "[e0-hole] t=%ld img=%d data-like (bad words > 5%%): not counted in [e0-md]\n", sec, i);
++        else e0_pb_add(&all, &d);
++        g_e0.prev[i] = g_e0.img[i];
++    }
++    if (!g_e0.warned && g_spu_jcap_xfer != e0_xfer) { g_e0.warned = 1; fprintf(stderr, "[e0] warning: another probe replaced the DMA observer (KZ3_JOB_CAPTURE?): PUT tags are lost\n"); }
++    tw = all.words; th = all.hdrs; td = all.data; tdraw = all.draws;
++    if (!tw) return;
++    /* draws = 0 prints ratios as -1 (no division by zero in the line) */
++    fprintf(stderr,
++            "[e0-md] t=%ld words=%llu hdrs=%llu data=%llu nops=%u jmp=%u call=%u ret=%u draws=%llu darr=%u didx=%u inl=%u "
++            "vconst=%u vp=%u tex=%u varr=%u draw=%u other=%u words_per_draw=%.1f hdrs_per_draw=%.1f nondraw_share=%.3f\n",
++            sec, (unsigned long long)tw, (unsigned long long)th, (unsigned long long)td, all.nops, all.jmp, all.call, all.ret,
++            (unsigned long long)tdraw, all.darr, all.didx, all.inl, all.cls[E0_C_VCONST], all.cls[E0_C_VP], all.cls[E0_C_TEX],
++            all.cls[E0_C_VARR], all.cls[E0_C_DRAW], all.cls[E0_C_OTHER], tdraw ? (double)tw / (double)tdraw : -1.0,
++            tdraw ? (double)th / (double)tdraw : -1.0, td ? 1.0 - (double)all.cls[E0_C_DRAW] / (double)td : -1.0);
++    fflush(stderr);
++}
++
++static void e0_tick(void)
++{
++    const long sec = (long)e0_secs();
++    long last = g_e0.last_sec;
++    if (sec > last && __atomic_compare_exchange_n(&g_e0.last_sec, &last, sec, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) e0_summary(sec);
++}
++
++static int e0_dump_allowed(void)
++{
++    const double t = e0_secs();
++    if (t < g_e0.w_lo || t > g_e0.w_hi) return 0;
++    const long sec = (long)t;
++    long cur = g_e0.dump_sec;
++    if (cur != sec) {
++        if (!__atomic_compare_exchange_n(&g_e0.dump_sec, &cur, sec, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return 0;
++        __atomic_store_n(&g_e0.dump_n, 0, __ATOMIC_RELEASE);
++    }
++    return __atomic_add_fetch(&g_e0.dump_n, 1, __ATOMIC_ACQ_REL) <= g_e0.calls_per_s;
++}
++
++static void e0_words(const uint8_t* p, uint32_t n)
++{
++    for (uint32_t i = 0; i + 4 <= n; i += 4) fprintf(stderr, " %08X", (uint32_t)e0_be32(p + i));
++}
++
++static void (SPU_ABI *e0_open(spu_context* ctx, uint32_t lr, void (SPU_ABI *fn)(spu_context*)))(spu_context*)
++{
++    (void)lr;
++    const uint32_t cb = (uint32_t)e0_be32(&ctx->ls[0x1320]);
++    const int img = cb >= 0x4000 && cb + 16 <= SPU_LS_SIZE ? spu_overlay_match_sig(&ctx->ls[cb]) : 0;
++    t_e0.img = img > 0 && img < E0_MAXIMG ? img : 0;
++    t_e0.jobnum = (uint32_t)e0_be32(&ctx->ls[0x12E0]);
++    memset(t_e0.pb, 0, sizeof t_e0.pb);
++    t_e0.next_ea = 0;
++    t_e0.dump = 0;
++    if (t_e0.img == g_e0.dump_img && e0_dump_allowed()) {
++        t_e0.dump = 1; t_e0.gets = 0;
++        const uint32_t r3 = ctx->gpr[3]._u32[0] & SPU_LS_MASK;   /* ASSUMPTION: r3 = LS pointer to the job info block, [r3+0x20] = LS pointer to 8 argument words (job_01189100 0x40A4) */
++        const uint32_t p = r3 + 0x20 + 4 <= SPU_LS_SIZE ? (uint32_t)e0_be32(&ctx->ls[r3 + 0x20]) & SPU_LS_MASK : 0;
++        fprintf(stderr, "[e0-job5] t=%.2f img=%d jobnum=0x%08X spu=%u r3=%08X r4=%08X r5=%08X infoblk[r3..+0x40]:",
++                e0_secs(), t_e0.img, t_e0.jobnum, ctx->spu_id, ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0]);
++        if (r3 + 0x40 <= SPU_LS_SIZE) e0_words(&ctx->ls[r3], 0x40);
++        fprintf(stderr, " args@%05X:", p);
++        if (p && p + 0x20 <= SPU_LS_SIZE) {
++            e0_words(&ctx->ls[p], 0x20);
++            /* every argument word that looks like a main-memory EA: the first 0xC0 bytes behind it (guest, big-endian) */
++            extern uint8_t* vm_base;
++            for (int k = 0; k < 8 && vm_base; k++) {
++                const uint32_t w = (uint32_t)e0_be32(&ctx->ls[p + 4 * k]);
++                if (w >= 0x10000u && w < 0x2FFFFF00u && !(w & 3u)) {
++                    fprintf(stderr, "\n[e0-job5]   arg%d ea=%08X:", k, w);
++                    e0_words(vm_base + w, 0xC0);
++                }
++            }
++        }
++        fprintf(stderr, "\n");
++        fflush(stderr);
++    }
++    return fn;
++}
++
++static void e0_close(spu_context* ctx)
++{
++    (void)ctx;
++    if (t_e0.dump) { fprintf(stderr, "[e0-job5] end img=%d gets=%d\n", t_e0.img, t_e0.gets); fflush(stderr); }
++    t_e0.img = 0; t_e0.dump = 0;
++    e0_tick();
++}
++
++static void e0_xfer(spu_context* ctx, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd)
++{
++    if (!size) return;
++    if (mfc_is_get(cmd)) {
++        if (t_e0.dump && t_e0.gets++ < g_e0.gets_per_call) {
++            const uint32_t l = lsa & SPU_LS_MASK, n = size < (uint32_t)g_e0.get_bytes ? size : (uint32_t)g_e0.get_bytes;
++            fprintf(stderr, "[e0-job5] get#%d lsa=%05X ea=%08X size=%u cmd=%02X:", t_e0.gets, l, (uint32_t)ea, size, cmd);
++            if (l + n <= SPU_LS_SIZE) e0_words(&ctx->ls[l], n & ~3u);
++            fprintf(stderr, "\n");
++        }
++        return;
++    }
++    if (!mfc_is_put(cmd) || (uint32_t)ea < g_e0.io_lo || (uint32_t)ea >= g_e0.io_hi) return;
++    const uint32_t l = lsa & SPU_LS_MASK;
++    const int img = t_e0.img;
++    struct e0_pb loc; memset(&loc, 0, sizeof loc);
++    if (t_e0.next_ea && (uint32_t)ea != t_e0.next_ea) memset(t_e0.pb, 0, sizeof t_e0.pb);   /* not contiguous with the last PUT: restart the scan at a header */
++    t_e0.next_ea = (uint32_t)ea + size;
++    const uint32_t n = size < 0x4000 && l + size <= SPU_LS_SIZE ? size : 0;
++    struct e0_pb before = t_e0.pb[0];
++    if (n) e0_pb_feed(&t_e0.pb[0], &ctx->ls[l], n);
++    /* the delta of this PUT */
++    loc.words = t_e0.pb[0].words - before.words; loc.hdrs = t_e0.pb[0].hdrs - before.hdrs; loc.data = t_e0.pb[0].data - before.data;
++    loc.nops = t_e0.pb[0].nops - before.nops; loc.jmp = t_e0.pb[0].jmp - before.jmp; loc.call = t_e0.pb[0].call - before.call;
++    loc.ret = t_e0.pb[0].ret - before.ret; loc.bad = t_e0.pb[0].bad - before.bad; loc.draws = t_e0.pb[0].draws - before.draws;
++    loc.darr = t_e0.pb[0].darr - before.darr; loc.didx = t_e0.pb[0].didx - before.didx; loc.inl = t_e0.pb[0].inl - before.inl;
++    for (int k = 0; k < E0_NC; k++) loc.cls[k] = t_e0.pb[0].cls[k] - before.cls[k];
++    uint32_t hole_lr = 0;
++    int inhole = 0;
++    while (__atomic_exchange_n(&g_e0.lk, 1, __ATOMIC_ACQUIRE)) { }
++    inhole = g_e0.holes.n && e0_hole_find(&g_e0.holes, (uint32_t)ea, &hole_lr);
++    __atomic_store_n(&g_e0.lk, 0, __ATOMIC_RELEASE);
++    __atomic_fetch_add(&g_e0.img[img].puts, 1, __ATOMIC_RELAXED);
++    __atomic_fetch_add(&g_e0.img[img].bytes, size, __ATOMIC_RELAXED);
++    __atomic_fetch_add(&g_e0.img[img].inhole, inhole, __ATOMIC_RELAXED);
++    /* the totals are updated field by field (relaxed): the summary is a diagnostic, not an invariant */
++    uint32_t* dst = (uint32_t*)&g_e0.img[img].pb;
++    const uint32_t* src = (const uint32_t*)&loc;
++    for (size_t i = 0; i < sizeof(struct e0_pb) / 4; i++) if (i >= 3) __atomic_fetch_add(&dst[i], src[i], __ATOMIC_RELAXED);
++    const long sec = (long)e0_secs();
++    long ps = g_e0.put_sec;
++    if (ps != sec && __atomic_compare_exchange_n(&g_e0.put_sec, &ps, sec, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) __atomic_store_n(&g_e0.put_n, 0, __ATOMIC_RELEASE);
++    if (__atomic_add_fetch(&g_e0.put_n, 1, __ATOMIC_RELAXED) <= g_e0.puts_per_s) {
++        fprintf(stderr, "[e0-hole] put t=%.2f img=%d job=0x%08X spu=%u ea=%08X size=%u lsa=%05X words=%u draws=%u hole_caller=%08X w0..3:", e0_secs(),
++                img, t_e0.jobnum, ctx->spu_id, (uint32_t)ea, size, l, loc.words, loc.draws, inhole ? hole_lr : 0u);
++        if (n >= 16) e0_words(&ctx->ls[l], 16);
++        fprintf(stderr, "\n");
++    }
++}
++
++/* PPU entry point for the reservation hook (port/spu glue, the RE notes s.6): called after
++ * 0x5BB58 returned. `lr` = the caller's link (identifies Geometry / Forward / Lights / shadow), `pool_ea` = the pool
++ * descriptor the call got (r3 = view+0x10: [+0]=segments, [+4]=segment size, ...), `hole_ea` = the return value (0 = none). */
++void kz3_e0_resv(uint32_t lr, uint32_t pool_ea, uint32_t hole_ea)
++{
++    extern uint8_t* vm_base;
++    if (!g_e0.on) return;
++    if (!hole_ea || !vm_base) { __atomic_fetch_add(&g_e0.resv_bad, 1, __ATOMIC_RELAXED); return; }
++    const uint32_t size = (uint32_t)e0_be32(vm_base + pool_ea + 4);
++    while (__atomic_exchange_n(&g_e0.lk, 1, __ATOMIC_ACQUIRE)) { }
++    e0_hole_add(&g_e0.holes, hole_ea, size, lr);
++    __atomic_store_n(&g_e0.lk, 0, __ATOMIC_RELEASE);
++    const uint64_t n = __atomic_add_fetch(&g_e0.resv, 1, __ATOMIC_RELAXED);
++    const double t = e0_secs();
++    if (t >= g_e0.w_lo && t <= g_e0.w_hi && (n <= 64 || (n & 63) == 0))
++        fprintf(stderr, "[e0-hole] resv#%llu t=%.2f caller=%08X pool=%08X hole=%08X size=%u\n", (unsigned long long)n, t, lr, pool_ea, hole_ea, size);
++}
++
++/* The one early-out of the off path: KZ3_E0 unset/empty/0 -> return before anything is set. */
++static void __attribute__((constructor)) kz3_e0_init(void)
++{
++    if (!e0_switch_on(getenv("KZ3_E0"))) return;
++    g_e0.t0 = kz3_wacct_now();
++    g_e0.w_lo = 0; g_e0.w_hi = 1e18;
++    e0_parse_window(getenv("KZ3_E0_WINDOW"), &g_e0.w_lo, &g_e0.w_hi);
++    g_e0.io_lo = 0x40000000u; g_e0.io_hi = 0x50000000u;
++    e0_parse_range(getenv("KZ3_E0_IO"), &g_e0.io_lo, &g_e0.io_hi);
++    g_e0.dump_img = getenv("KZ3_E0_IMG") ? atoi(getenv("KZ3_E0_IMG")) : 218;
++    g_e0.calls_per_s = getenv("KZ3_E0_CALLS") ? atoi(getenv("KZ3_E0_CALLS")) : 1;
++    g_e0.gets_per_call = getenv("KZ3_E0_GETS") ? atoi(getenv("KZ3_E0_GETS")) : 128;
++    g_e0.get_bytes = getenv("KZ3_E0_GETW") ? atoi(getenv("KZ3_E0_GETW")) : 256;
++    g_e0.puts_per_s = getenv("KZ3_E0_PUTS") ? atoi(getenv("KZ3_E0_PUTS")) : 24;
++    g_e0.on = 1;
++    g_spu_jcap_xfer = e0_xfer;
++    g_spu_jhook_open = e0_open;
++    g_spu_jhook_close = e0_close;
++    g_spu_jhook_on = 1;
++    fprintf(stderr, "[e0] probe on (KZ3_E0, KZ3 patch 3012): window %.0f-%.0f s, IO %08X-%08X, dump image %d, %d call(s)/s, %d GET(s)/call\n",
++            g_e0.w_lo, g_e0.w_hi > 1e17 ? -1.0 : g_e0.w_hi, g_e0.io_lo, g_e0.io_hi, g_e0.dump_img, g_e0.calls_per_s, g_e0.gets_per_call);
++}
++
+ #ifdef __cplusplus
+ }
+ #endif
+\ No newline at end of file
+diff --git a/runtime/spu/spu_e0.h b/runtime/spu/spu_e0.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/spu/spu_e0.h
+@@ -0,0 +1,128 @@
++/* spu_e0.h -- KZ3 patch 3012: engine-seam probe (walker plan B-E0), pure helpers.
++ *
++ * Everything here is stateless or takes its state by pointer, so a host test can include it alone (no runtime, no
++ * game). The runtime half (hooks, per-second summary, the PPU entry point kz3_e0_resv) is in spu_channels.c.
++ * Switch family KZ3_E0_* (all default off; KZ3_E0=1 turns the probe on): see the RE notes.
++ *
++ * e0_pb: a scanner for NV4097 push-buffer words as an SPU job PUTs them (big-endian words). It counts words, method
++ * headers, draws and per-class data words. A PUT may end inside a method, so the scanner keeps `rem` (data words still
++ * owed) across calls; feed a job's puts to one scanner in order. ASSUMPTION: the first word fed is a header.
++ */
++#ifndef SPU_E0_H
++#define SPU_E0_H
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum { E0_C_VCONST, E0_C_VP, E0_C_TEX, E0_C_VARR, E0_C_DRAW, E0_C_OTHER, E0_NC };
++
++struct e0_pb {
++    uint32_t rem, method, noninc;                       /* open method: data words owed, next method, non-increment */
++    uint32_t words, hdrs, data, nops, jmp, call, ret, bad;
++    uint32_t draws;                                     /* SET_BEGIN_END (0x1808) with a non-zero primitive: draw groups */
++    uint32_t darr, didx, inl;                           /* data words of DRAW_ARRAYS 0x1814, DRAW_INDEX_ARRAY 0x1824, INLINE_ARRAY 0x1818 */
++    uint32_t cls[E0_NC];                                /* data words per class */
++};
++
++static inline int e0_class(uint32_t m)
++{
++    if (m >= 0x1F00 && m < 0x2000) return E0_C_VCONST;   /* SET_TRANSFORM_CONSTANT 0x1F00.. */
++    if (m >= 0x0B80 && m < 0x0C00) return E0_C_VP;       /* SET_TRANSFORM_PROGRAM 0x0B80.. */
++    if (m >= 0x1A00 && m < 0x1C00) return E0_C_TEX;      /* texture and sampler registers */
++    if (m >= 0x1680 && m < 0x1700) return E0_C_VARR;     /* vertex data array offsets/formats */
++    if (m == 0x1808 || m == 0x1814 || m == 0x1818 || m == 0x1824) return E0_C_DRAW;
++    return E0_C_OTHER;
++}
++
++static inline void e0_pb_word(struct e0_pb* s, uint32_t w)
++{
++    s->words++;
++    if (s->rem) {
++        const uint32_t m = s->method;
++        s->rem--;
++        s->data++;
++        s->cls[e0_class(m)]++;
++        if (m == 0x1808 && w != 0) s->draws++;
++        else if (m == 0x1814) s->darr++;
++        else if (m == 0x1824) s->didx++;
++        else if (m == 0x1818) s->inl++;
++        if (!s->noninc) s->method = m + 4;
++        return;
++    }
++    if (w == 0) { s->nops++; return; }
++    if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) { s->jmp++; return; }   /* old and new JUMP */
++    if ((w & 3u) == 2u) { s->call++; return; }
++    if (w == 0x00020000u) { s->ret++; return; }
++    if ((w & 0xA0030003u) == 0) {                         /* method header: count<<18 | method (4-aligned, 13 bits) */
++        s->rem = (w >> 18) & 0x7FF;
++        s->method = w & 0x1FFC;
++        s->noninc = (w & 0x40000000u) != 0;
++        s->hdrs++;
++        return;
++    }
++    s->bad++;
++}
++
++static inline void e0_pb_feed(struct e0_pb* s, const uint8_t* be, uint32_t nbytes)
++{
++    for (uint32_t i = 0; i + 4 <= nbytes; i += 4)
++        e0_pb_word(s, (uint32_t)be[i] << 24 | (uint32_t)be[i + 1] << 16 | (uint32_t)be[i + 2] << 8 | be[i + 3]);
++}
++
++static inline void e0_pb_add(struct e0_pb* d, const struct e0_pb* s)   /* totals only (not the open-method state) */
++{
++    d->words += s->words; d->hdrs += s->hdrs; d->data += s->data; d->nops += s->nops; d->jmp += s->jmp;
++    d->call += s->call; d->ret += s->ret; d->bad += s->bad; d->draws += s->draws; d->darr += s->darr;
++    d->didx += s->didx; d->inl += s->inl;
++    for (int i = 0; i < E0_NC; i++) d->cls[i] += s->cls[i];
++}
++
++/* "lo,hi" or "lo-hi" seconds (decimal, fractions allowed); returns 1 when parsed. */
++static inline int e0_parse_window(const char* s, double* lo, double* hi)
++{
++    char* d;
++    if (!s || !*s) return 0;
++    const double a = strtod(s, &d);
++    if (d == s || (*d != ',' && *d != '-')) return 0;
++    char* e;
++    const double b = strtod(d + 1, &e);
++    if (e == d + 1 || b < a) return 0;
++    *lo = a; *hi = b;
++    return 1;
++}
++
++/* "lo-hi" hex effective addresses; returns 1 when parsed. */
++static inline int e0_parse_range(const char* s, uint32_t* lo, uint32_t* hi)
++{
++    char* d;
++    if (!s || !*s) return 0;
++    const unsigned long a = strtoul(s, &d, 16);
++    if (d == s || *d != '-') return 0;
++    char* e;
++    const unsigned long b = strtoul(d + 1, &e, 16);
++    if (e == d + 1 || b <= a) return 0;
++    *lo = (uint32_t)a; *hi = (uint32_t)b;
++    return 1;
++}
++
++/* Reserved holes (PPU side, 0x5BB58 callers): a small ring; a PUT inside one carries the reserving caller's link. */
++#define E0_HOLES 256
++struct e0_holes { uint32_t n; struct { uint32_t ea, size, lr; } h[E0_HOLES]; };
++static inline void e0_hole_add(struct e0_holes* t, uint32_t ea, uint32_t size, uint32_t lr)
++{
++    const uint32_t i = t->n++ % E0_HOLES;
++    t->h[i].ea = ea; t->h[i].size = size; t->h[i].lr = lr;
++}
++static inline int e0_hole_find(const struct e0_holes* t, uint32_t ea, uint32_t* lr)   /* newest first */
++{
++    const uint32_t n = t->n < E0_HOLES ? t->n : E0_HOLES;
++    for (uint32_t k = 0; k < n; k++) {
++        const uint32_t i = (t->n - 1 - k) % E0_HOLES;
++        if (ea >= t->h[i].ea && ea - t->h[i].ea < t->h[i].size) { if (lr) *lr = t->h[i].lr; return 1; }
++    }
++    return 0;
++}
++
++/* The master switch: unset, empty or "0" is off. */
++static inline int e0_switch_on(const char* v) { return v && *v && !(v[0] == '0' && !v[1]); }
++#endif

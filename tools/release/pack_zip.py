@@ -34,6 +34,8 @@ NOT_LISTED = {"manifest.json", "VERSION.txt"}      # written by assemble_payload
 REQUIRED = ("run.cmd", "manifest.json", "VERSION.txt",
             # the runtime's error-notice fonts and their licence (assemble_payload FONTS; RSX pass 38)
             "fonts/Rajdhani-Medium.ttf", "fonts/Rajdhani-Bold.ttf", "licenses/Rajdhani-OFL.txt",
+            # the Cyrillic/Greek fallback of the cellFont chain and its licence (issue #60)
+            "fonts/NotoSans-Regular.ttf", "licenses/NotoSans-OFL.txt",
             # SDL3 for the pads (patch 4010) and its licence (assemble_payload SDL3_DEST)
             "runtime/SDL3.dll", "licenses/SDL3-LICENSE.txt",
             # the port UI text table the runtime reads from <exe dir>\lang (net 45)

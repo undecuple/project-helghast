@@ -9,7 +9,7 @@ PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 [[ -d "$PT" ]] && PT="$(cd "$PT" && pwd)"
 T="$PT/libs/video/tests/test_gcm_legacy_state_filter.c"
 if [[ ! -f "$T" ]] || ! grep -q gcm_perf_flush_line "$PT/libs/video/cellGcmSys.c"; then
-  echo "[test_gcm_r137] SKIP: toolkit without patch 2147 or without the legacy-state-filter test ($PT; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_gcm_r137] SKIP: toolkit without patch 2147 or without the legacy-state-filter test ($PT; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/gcm_r137"; mkdir -p "$O"
 gcc -std=gnu17 -O1 -g -Wall -Wno-unused-function -Wno-unused-variable -I "$PT/include" -I "$PT/libs/video" -DLEGACY_TEST_C="\"$T\"" \
     "$ROOT/tools/smoke/test_gcm_r137.c" -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread -lm -o "$O/t"

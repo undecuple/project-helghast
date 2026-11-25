@@ -5,7 +5,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/toc-test"; mkdir -p "$O"
 T="${HT_TREE:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$T/runtime/ppu/ppu_hle.cpp" ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -f "$T/runtime/ppu/ppu_hle.cpp" ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 rm -f "$O/t_hle_fast_toc"
 (cd "$T" && g++ -std=gnu++17 -O1 -w -I "$ROOT/tools/spu/toc_fast_stub" -I include -I runtime -I runtime/ppu -I runtime/platform -I runtime/diag \
    "$ROOT/tools/spu/test_hle_fast_toc.cpp" runtime/ppu/ppu_hle.cpp -pthread -o "$O/t_hle_fast_toc" 2>&1 | grep -m8 "error\|undefined")

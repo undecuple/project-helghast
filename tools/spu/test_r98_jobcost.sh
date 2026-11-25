@@ -6,8 +6,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/jc-tests"; mkdir -p "$O"
 T="${JC_TREE:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$T/runtime/spu/spu_channels.c" ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
-grep -q kz3_jobcost_init_once "$T/runtime/spu/spu_channels.c" || { echo "SKIP: $T has no patch 1114"; exit 0; }
+[[ -f "$T/runtime/spu/spu_channels.c" ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
+grep -q kz3_jobcost_init_once "$T/runtime/spu/spu_channels.c" || { echo "SKIP: $T has no patch 1114"; exit 77; }
 B="$(grep -o 'B="[^"]*"' "$ROOT/tools/spu/test_lr_lastcheck.sh" | sed 's/^B="//; s/"$//') runtime/spu/spu_channels.c"
 extra=""; [[ -f "$T/runtime/diag/kz3_wait_acct.c" ]] && extra="runtime/diag/kz3_wait_acct.c -I runtime/diag"
 rm -f "$O/t_jobcost"

@@ -9,7 +9,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
-[[ -d "$P/runtime" ]] || { echo "SKIP: no patched toolkit at $P (run tools/ps3recomp-patched.sh)"; exit 0; }
+[[ -d "$P/runtime" ]] || { echo "SKIP: no patched toolkit at $P (run tools/ps3recomp-patched.sh)"; exit 77; }
 T="$P/runtime/spu/tests/test_spurs_taskset_bits_atomic.c"
 [[ -f "$T" ]] || { echo "FAIL: $T missing (ps3recomp older than v0.17.0?)"; exit 1; }
 rc=0; ran=0

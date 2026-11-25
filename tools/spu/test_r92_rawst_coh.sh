@@ -7,5 +7,5 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 if [[ ! -f "$PT/tools/ppu_lifter.py" ]]; then
-  echo "[test_r92_rawst_coh] SKIP: no patched toolkit (run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_r92_rawst_coh] SKIP: no patched toolkit (run tools/ps3recomp-patched.sh)"; exit 77; fi
 python3 "$ROOT/tools/spu/test_r92_rawst_coh.py" "$PT" "$ROOT/build/smoke-host/r92_rawst_coh"

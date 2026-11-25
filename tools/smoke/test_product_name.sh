@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 if [[ ! -f "$PT/libs/input/pad_keybinds.h" ]] || ! grep -q PS3RECOMP_PRODUCT_NAME "$PT/libs/input/pad_keybinds.h"; then
-  echo "[test_product_name] SKIP: no patched toolkit with patch 2146 (run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_product_name] SKIP: no patched toolkit with patch 2146 (run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/product_name"; mkdir -p "$O"
 CC="${CC:-cc}"
 W=(-std=c11 -Wall -Wextra -Werror -Wno-unused-function -O1 -I"$PT/libs/input" -I"$PT/libs/video")

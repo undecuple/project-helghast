@@ -10,7 +10,7 @@ P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 F="$P/runtime/spu/spu_channels.c"; PF="$ROOT/port/patches/1103-spu-decrementer-overflow.patch"
 if [[ -f "$F" ]] && grep -q kz3-dec-ticks "$F"; then SRC="$F"
 elif [[ -f "$PF" ]]; then SRC="$PF"
-else echo "SKIP: neither patched toolkit nor $PF"; exit 0; fi
+else echo "SKIP: neither patched toolkit nor $PF"; exit 77; fi
 { echo '#include <stdint.h>'; echo '#include <stdio.h>'; echo '#define SPU_DECREMENTER_HZ 79800000ull'
   sed -n '/kz3-dec-ticks begin/,/kz3-dec-ticks end/p' "$SRC" | sed 's/^+//'
   cat <<'C'

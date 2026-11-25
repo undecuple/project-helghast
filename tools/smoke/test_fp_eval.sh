@@ -5,5 +5,5 @@
 #   nix develop .#re --command tools/sandbox.sh -- tools/smoke/test_fp_eval.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-python3 -c 'import numpy' 2>/dev/null || { echo "[test_fp_eval] SKIP: python3 without numpy"; exit 0; }
+python3 -c 'import numpy' 2>/dev/null || { echo "[test_fp_eval] SKIP: python3 without numpy"; exit 77; }
 python3 "$ROOT/tools/smoke/test_fp_eval.py"

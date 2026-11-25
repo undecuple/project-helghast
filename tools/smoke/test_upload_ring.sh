@@ -8,7 +8,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if [[ ! -f "$V/rsx_live_draw.c" ]]; then echo "[test_upload_ring] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$V/rsx_live_draw.c" ]]; then echo "[test_upload_ring] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 [[ -f "$V/rsx_upload_ring.h" ]] || { echo "[test_upload_ring] FAIL: toolkit without patch 2142 (no rsx_upload_ring.h)"; exit 1; }
 O="$ROOT/build/smoke-host/upload_ring"; mkdir -p "$O"
 cat > "$O/t.c" <<'EOC'

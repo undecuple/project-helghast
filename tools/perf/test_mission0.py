@@ -231,7 +231,11 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(spec["clock"], "flip_ms_since_first_flip")
 
     def test_windows_ci_invokes_synthetic_process_fixture(self):
-        workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        # the private checkout keeps the public GitHub files under public/ (the export moves them to the root)
+        ci = REPO / ".github" / "workflows" / "ci.yml"
+        if not ci.exists():
+            ci = REPO / "public" / ".github" / "workflows" / "ci.yml"
+        workflow = ci.read_text(encoding="utf-8")
         windows = workflow.split("  release-tools-windows:", 1)[1].split("\n  secrets:", 1)[0]
         self.assertIn("runs-on: windows-latest", windows)
         self.assertRegex(windows, r"(?m)^\s+run:\s*python3 -B tools/perf/test_mission0\.py\s*$")

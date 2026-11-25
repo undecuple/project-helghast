@@ -13,15 +13,15 @@ PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 source "$ROOT/tools/smoke/pub_srcs.inc"   # patch 2197: the harness links the publisher (pub_src_args per tree, in build)
 P="$(ls "$ROOT"/port/patches/2190-*.patch 2>/dev/null | head -1)"
-if [[ ! -f "$V/rsx_guest_signal.h" || -z "$P" ]]; then echo "[test_guest_mem_diff] SKIP: no patched toolkit with patch 2190"; exit 0; fi
+if [[ ! -f "$V/rsx_guest_signal.h" || -z "$P" ]]; then echo "[test_guest_mem_diff] SKIP: no patched toolkit with patch 2190"; exit 77; fi
 REL="build/smoke-host/gs-memdiff"; O="$ROOT/$REL"; rm -rf "$O"; mkdir -p "$O/work" "$O/base/libs"
 cp -a "$V" "$O/base/libs/video"; ln -s "$PT/runtime" "$O/base/runtime"; ln -s "$PT/include" "$O/base/include"
 # patch 2197 sits on top of the funnel (it routes the funnel through the publisher): reverse it first (its video files only), then patch 2190
 P97="$(ls "$ROOT"/port/patches/2197-*.patch 2>/dev/null | head -1)"
 if [[ -n "$P97" ]]; then
-  (cd "$ROOT" && git apply -R --include="$REL/base/libs/video/*" --whitespace=nowarn --directory="$REL/base" "$P97" >"$O/revert97.log" 2>&1) || { echo "[test_guest_mem_diff] SKIP: patch 2197 does not reverse on this tree ($(head -1 "$O/revert97.log" | cut -c1-120)); re-baseline the test"; exit 0; }
+  (cd "$ROOT" && git apply -R --include="$REL/base/libs/video/*" --whitespace=nowarn --directory="$REL/base" "$P97" >"$O/revert97.log" 2>&1) || { echo "[test_guest_mem_diff] SKIP: patch 2197 does not reverse on this tree ($(head -1 "$O/revert97.log" | cut -c1-120)); re-baseline the test"; exit 77; }
 fi
-(cd "$ROOT" && git apply -R --whitespace=nowarn --directory="$REL/base" "$P" >"$O/revert.log" 2>&1) || { echo "[test_guest_mem_diff] SKIP: patch 2190 does not reverse on this tree ($(head -1 "$O/revert.log" | cut -c1-120)); re-baseline the test"; exit 0; }
+(cd "$ROOT" && git apply -R --whitespace=nowarn --directory="$REL/base" "$P" >"$O/revert.log" 2>&1) || { echo "[test_guest_mem_diff] SKIP: patch 2190 does not reverse on this tree ($(head -1 "$O/revert.log" | cut -c1-120)); re-baseline the test"; exit 77; }
 [[ ! -f "$O/base/libs/video/rsx_guest_signal.h" ]] || { echo "[test_guest_mem_diff] FAIL: the baseline still has the funnel header"; exit 1; }
 rc=0; fail() { echo "[test_guest_mem_diff] FAIL: $*"; rc=1; }
 build() { # tree-root out [extra gcc args]

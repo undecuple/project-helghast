@@ -14,7 +14,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"; K="$PT/libs/kzr"
 # a missing toolkit is a FAIL (the test proves nothing), unless KZ3_ALLOW_SKIP=1; the final line then reads SKIP
-nokit() { if [[ "${KZ3_ALLOW_SKIP:-0}" == 1 ]]; then echo "[test_pub_locks] SKIP: $1 (KZ3_ALLOW_SKIP=1)"; exit 0; fi; echo "[test_pub_locks] FAIL: $1 (run tools/ps3recomp-patched.sh, or KZ3_ALLOW_SKIP=1 to skip)"; exit 1; }
+nokit() { if [[ "${KZ3_ALLOW_SKIP:-0}" == 1 ]]; then echo "[test_pub_locks] SKIP: $1 (KZ3_ALLOW_SKIP=1)"; exit 77; fi; echo "[test_pub_locks] FAIL: $1 (run tools/ps3recomp-patched.sh, or KZ3_ALLOW_SKIP=1 to skip)"; exit 1; }
 [[ -d "$V" ]] || nokit "no patched toolkit ($PT)"
 [[ -f "$V/rsx_pub.c" ]] || nokit "toolkit without patch 2197"
 O="$ROOT/build/smoke-host/pub-locks"; mkdir -p "$O"

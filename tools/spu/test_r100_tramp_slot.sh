@@ -7,7 +7,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/r100t"; mkdir -p "$O"
 T="${SPU_TREE:-$ROOT/work/ps3recomp-patched}"
 L="$T/tools/ppu_lifter.py"
-[[ -f "$L" ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -f "$L" ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 grep -q "PPU_TRAMP_TEB" "$L" || { echo "FAIL: $L has no patch 1115"; exit 1; }
 python3 - "$L" "$O/preamble.h" <<'PY' || { echo "FAIL: preamble block"; exit 1; }
 import sys, re

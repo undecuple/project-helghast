@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Runs every test in tools/host-tests.txt from the repo root (call inside `nix develop .#ci`, after
 # tools/ps3recomp-patched.sh). Prints one line per test and a summary; exit 1 if any failed.
+#   Exit codes of a test: 0 = pass, 77 = SKIP (automake convention: the test could not run here, e.g. no patched toolkit,
+#   no compiler), anything else = FAIL. Skips are counted separately and named in the summary; they do not fail the run
+#   unless a limit is set: HOST_TESTS_MAX_SKIP=N (or --max-skip N) fails the run when more than N tests skipped;
+#   HOST_TESTS_SKIP_ALLOW=FILE (or --skip-allow FILE, one test path per line, # comments) fails the run when a test
+#   skips that is not in the file. Both are for CI, where nothing but the known Linux-only/optional tests may skip.
+#   --max-skip N / --skip-allow FILE   see above
 #   --gh   wrap each test's output in GitHub Actions log groups (CI)
 #   -q     print only failures and the summary
 #   -j N   run up to N tests at the same time (default 1; CI passes the core count). Output stays per test and in
@@ -11,22 +17,27 @@
 #   (Git Bash, MSYS, macOS) they are skipped, not failed.
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
-GH=0; Q=0; J=1
+GH=0; Q=0; J=1; MAXSKIP="${HOST_TESTS_MAX_SKIP:-}"; SKIPALLOW="${HOST_TESTS_SKIP_ALLOW:-}"
 while (( $# )); do
   case "$1" in
     --gh) GH=1;;
     -q) Q=1;;
     -j) shift; J="${1:-}"; [[ "$J" =~ ^[1-9][0-9]*$ ]] || { echo "-j needs a positive number" >&2; exit 2; };;
+    --max-skip) shift; MAXSKIP="${1:-}";;
+    --skip-allow) shift; SKIPALLOW="${1:-}";;
     -j[1-9]*) J="${1#-j}"; [[ "$J" =~ ^[0-9]+$ ]] || { echo "unknown option $1" >&2; exit 2; };;
     *) echo "unknown option $1" >&2; exit 2;;
   esac
   shift
 done
 
+[[ -z "$MAXSKIP" || "$MAXSKIP" =~ ^[0-9]+$ ]] || { echo "--max-skip needs a number" >&2; exit 2; }
+[[ -z "$SKIPALLOW" || -f "$SKIPALLOW" ]] || { echo "skip allowlist $SKIPALLOW not found" >&2; exit 2; }
 # Many tests read the patched toolkit (work/ps3recomp-patched, built by tools/ps3recomp-patched.sh, untracked). In a fresh
-# clone or worktree it does not exist yet and those tests fail with a traceback or a SKIP-turned-FAIL; say so once, up front.
+# clone or worktree it does not exist yet. Only the stamp file is checked here (not that it matches the patch set): the
+# tests that need a patch SKIP themselves (exit 77) when it is absent, the rest may fail; the SKIP count in the summary shows it.
 if [[ ! -f "${KZ3_PATCHED_DIR:-work/ps3recomp-patched}/.kz3-patchset" ]]; then
-  echo "run-host-tests: ${KZ3_PATCHED_DIR:-work/ps3recomp-patched} is missing (run tools/ps3recomp-patched.sh first); tests that read it will fail"   # stdout: the summary stays the last line of the combined output
+  echo "run-host-tests: ${KZ3_PATCHED_DIR:-work/ps3recomp-patched} is missing (run tools/ps3recomp-patched.sh first); tests that need it will SKIP (exit 77) or fail"   # stdout: the summary stays the last line of the combined output
 fi
 D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT
 tests=(); missing=()
@@ -51,16 +62,20 @@ add_list() {   # add_list FILE STRICT(1 = a missing test fails)
   done < "$1"
 }
 add_list tools/host-tests.txt 1
+[[ -f tools/host-tests-extra.txt ]] && add_list tools/host-tests-extra.txt 1
 [[ -f tools/host-tests-private.txt ]] && add_list tools/host-tests-private.txt 0
 
-n=${#tests[@]}; failed=(); printed=0; running=0
+n=${#tests[@]}; failed=(); skipped=(); printed=0; running=0
 # Prints the finished tests that come next in list order (a test's .rc file appears when it is done).
 flush() {
   local t rc
   while (( printed < n )) && [[ -e "$D/$printed.rc" ]]; do
     t="${tests[printed]}"; rc="$(<"$D/$printed.rc")"
     if (( GH )); then echo "::group::$t"; cat "$D/$printed.out"; echo "::endgroup::"; fi
-    if (( rc )); then
+    if (( rc == 77 )); then
+      skipped+=("$t")
+      if (( ! GH && ! Q )); then echo "SKIP $t"; fi
+    elif (( rc )); then
       failed+=("$t")
       if (( ! GH )); then echo "FAIL $t"; { grep -E "^(FAIL|not ok|Error|error:)" "$D/$printed.out" | head -10; tail -5 "$D/$printed.out"; }; fi
     elif (( ! Q && ! GH )); then echo "ok   $t"; fi
@@ -76,5 +91,12 @@ for i in "${!tests[@]}"; do
 done
 while (( running > 0 )); do wait -n; running=$((running - 1)); flush; done
 flush
-echo "host tests: $((n - ${#failed[@]}))/$((n + ${#missing[@]})) pass${failed:+; failed: ${failed[*]}}${missing:+; listed but missing: ${missing[*]}}"
-(( ${#failed[@]} == 0 && ${#missing[@]} == 0 ))
+bad_skip=()
+if [[ -n "$SKIPALLOW" ]]; then
+  allow=" $(grep -vE '^\s*(#|$)' "$SKIPALLOW" | tr -d '\r' | tr '\n' ' ') "
+  for t in ${skipped[@]+"${skipped[@]}"}; do [[ "$allow" == *" $t "* ]] || bad_skip+=("$t"); done
+fi
+over=0; [[ -n "$MAXSKIP" ]] && (( ${#skipped[@]} > MAXSKIP )) && over=1
+npass=$((n - ${#failed[@]} - ${#skipped[@]}))
+echo "host tests: $npass/$((n + ${#missing[@]})) pass, ${#skipped[@]} skipped${skipped:+ (${skipped[*]})}${failed:+; failed: ${failed[*]}}${missing:+; listed but missing: ${missing[*]}}${bad_skip:+; skipped but not in the allowlist: ${bad_skip[*]}}$( (( over )) && echo "; more than $MAXSKIP skipped")"
+(( ${#failed[@]} == 0 && ${#missing[@]} == 0 && ${#bad_skip[@]} == 0 && over == 0 ))

@@ -6,7 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 T="${SPU_TREE:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$T/runtime/syscalls/sys_memory.c" ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -f "$T/runtime/syscalls/sys_memory.c" ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 grep -q "sys_memory_reserve_window" "$T/runtime/syscalls/sys_memory.c" || { echo "FAIL: $T has no patch 1113"; exit 1; }
 rm -f "$O/t_mapper_window"
 (cd "$T" && ${CC:-gcc} -std=gnu17 -O1 -w -pthread -I . -I include -o "$O/t_mapper_window" \

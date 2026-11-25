@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
-if [[ ! -f "$V/rsx_present_stream.h" ]]; then echo "[test_stutter_diag] SKIP: no patched toolkit with patch 2187 ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
+if [[ ! -f "$V/rsx_present_stream.h" ]]; then echo "[test_stutter_diag] SKIP: no patched toolkit with patch 2187 ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/stutter-diag"; mkdir -p "$O"
 CC="${CC:-cc}"
 $CC -std=c11 -Wall -Wextra -Werror -O2 -I"$V" "$ROOT/tools/smoke/test_stutter_diag.c" -o "$O/t" -lpthread

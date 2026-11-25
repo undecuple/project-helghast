@@ -31,7 +31,7 @@ The port is a native Windows x64 program using Direct3D 12. Developed on Linux a
 | **Controller** | keyboard and mouse | a gamepad (XInput; DualShock/DualSense through Steam Input) | Keyboard and mouse work in the menus and in levels (mouse look; sensitivity under Options > Mouse). In the confirmation dialogs the mouse hovers in Exit game, Quit to desktop and Reset to defaults and clicks in Exit game and Reset to defaults; other dialogs are not checked with the mouse yet. Button prompts follow the device in use: PS3, PS4/PS5, Xbox or keyboard keys (Options > Controller > Button prompts). Keyboard and mouse count as their own controller when a pad is connected, so split-screen co-op can be played with one pad plus the keyboard and mouse (the keys act for player 1 until the game gives the keyboard a player); two pads work as before. |
 
 Current measured performance (2026-10-27, RTX 4060, under Proton): the menus run at the game's own 30 fps; levels
-run at about 16-22 frames/s depending on the chapter (a busy Frozen Shores window about 22-23), so these rows are still provisional. They will be replaced by
+run at about 24 frames/s in a busy Frozen Shores window (23.7-24.5 in three runs on 2026-11-24, exe built from commit 22b78eba), so these rows are still provisional. They will be replaced by
 measured numbers once the level runs at speed.
 
 ## Hardware to build the port yourself

@@ -201,6 +201,7 @@ def main():
         # 8. main(): game start, build offers; the notice fonts go next to kz3.exe (RSX pass 38)
         write(os.path.join(root, "fonts", "Rajdhani-Medium.ttf"), "medium")
         write(os.path.join(root, "fonts", "Rajdhani-Bold.ttf"), "bold")
+        write(os.path.join(root, "fonts", "NotoSans-Regular.ttf"), "noto")
         calls = []
 
         def run(argv, **kw):
@@ -377,7 +378,7 @@ def main():
         os.remove(st)
         stamp(record(root, dump, update, eboot))
         bf = os.path.join(root, "build", "fonts")
-        check(sorted(os.listdir(bf)) == ["Rajdhani-Bold.ttf", "Rajdhani-Medium.ttf"]
+        check(sorted(os.listdir(bf)) == ["NotoSans-Regular.ttf", "Rajdhani-Bold.ttf", "Rajdhani-Medium.ttf"]
               and open(os.path.join(bf, "Rajdhani-Bold.ttf")).read() == "bold", "8 notice fonts placed in build/fonts")
         check(fr.place_fonts(root, os.path.join(root, "build")) == [], "8 fonts already in place: nothing copied")
         write(os.path.join(root, "lang", "port_ui.tsv"), "k\ten\n")

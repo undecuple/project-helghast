@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 T="${TMPDIR:-/tmp}/crash_loc.$$"; mkdir -p "$T/include/ps3emu"; trap 'rm -rf "$T"' EXIT
 awk '/^\+\+\+ b\/include\/ps3emu\/crash_loc.h/{on=1;getline;next} /^diff --git/{on=0} on&&/^\+/{print substr($0,2)}' \
   "$ROOT"/port/patches/1011-*.patch > "$T/include/ps3emu/crash_loc.h"
-[[ -s "$T/include/ps3emu/crash_loc.h" ]] || { echo "SKIP: header not found in patch 1011"; exit 0; }
+[[ -s "$T/include/ps3emu/crash_loc.h" ]] || { echo "SKIP: header not found in patch 1011"; exit 77; }
 CC_HOST=""; for c in gcc cc; do command -v $c >/dev/null && { CC_HOST=$c; break; }; done
 if [[ -n "$CC_HOST" ]]; then
   "$CC_HOST" -std=c11 -Wall -Wextra -I"$T/include" "$ROOT/tools/spu/test_crash_loc.c" -o "$T/t" && "$T/t"

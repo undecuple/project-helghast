@@ -22,8 +22,6 @@ tools/upstream/test_pad_script_v2.py
 tools/release/test_firstrun_check.py
 tools/release/test_version_agree.py
 tools/test_features.py
-tools/test_kz3_metrics.py
-tools/perf/test_mission0.py
 tools/spu/test_kz3_gameplay.sh
 tools/release/test_firstrun.py
 tools/release/test_rpcs3_import.py
@@ -240,3 +238,12 @@ tools/smoke/test_no_path_split.sh
 tools/smoke/test_gfx_mutants.sh
 tools/smoke/test_gfx_links.sh
 tools/smoke/test_gfx_callsites.sh
+tools/smoke/test_diag_probes.sh
+tools/smoke/test_wait_split.sh
+tools/release/test_child_checks.py
+tools/release/test_font_carry.py
+tools/release/test_fetch_noto.py
+tools/spu/test_host_jmp_win64.sh
+tools/smoke/test_smp_nodrain.sh
+tools/test_kz3_metrics.py
+tools/perf/test_mission0.py

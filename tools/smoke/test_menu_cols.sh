@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"
 if [[ ! -f "$V/rsx_menu_cols.h" ]]; then
-  echo "[test_menu_cols] SKIP: no patched toolkit with patch 2151 ($V/rsx_menu_cols.h; run tools/ps3recomp-patched.sh)"; exit 0; fi
+  echo "[test_menu_cols] SKIP: no patched toolkit with patch 2151 ($V/rsx_menu_cols.h; run tools/ps3recomp-patched.sh)"; exit 77; fi
 O="$ROOT/build/smoke-host/menu_cols"; mkdir -p "$O"
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -I"$V" \
   "$ROOT/tools/smoke/test_menu_cols.c" -o "$O/test_menu_cols"

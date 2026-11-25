@@ -21,7 +21,7 @@ PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="$PT/libs/video"; K="$PT/libs/kzr"
 source "$ROOT/tools/smoke/pub_srcs.inc"
 if [[ ! -f "$V/rsx_pub.c" ]]; then
-  if [[ "${KZ3_ALLOW_SKIP:-0}" == 1 ]]; then echo "[test_pub_replay] SKIP: no patched toolkit with patch 2197 ($V) (KZ3_ALLOW_SKIP=1)"; exit 0; fi
+  if [[ "${KZ3_ALLOW_SKIP:-0}" == 1 ]]; then echo "[test_pub_replay] SKIP: no patched toolkit with patch 2197 ($V) (KZ3_ALLOW_SKIP=1)"; exit 77; fi
   echo "[test_pub_replay] FAIL: no patched toolkit with patch 2197 ($V); run tools/ps3recomp-patched.sh, or KZ3_ALLOW_SKIP=1 to skip"; exit 1
 fi
 REL="build/smoke-host/pub-replay"; O="$ROOT/$REL"; rm -rf "$O"; mkdir -p "$O/work"
@@ -152,7 +152,7 @@ RCAP="${KZ3_FIFO_CAPTURE:-$ROOT/work/captures/fifo-capture.kz3fc}"
 if [[ -f "$RCAP" ]]; then one playthrough "$RCAP"; else echo "[test_pub_replay] SKIP playthrough: no capture ($RCAP)"; fi
 if [[ $rc != 0 ]]; then echo "[test_pub_replay] FAIL"; exit 1; fi
 if [[ $SKIPS -gt 0 ]]; then
-  if [[ "${KZ3_ALLOW_SKIP:-0}" == 1 ]]; then echo "[test_pub_replay] SKIP ($SKIPS check(s) skipped, KZ3_ALLOW_SKIP=1; the default-off identity was NOT proven)"; exit 0; fi
+  if [[ "${KZ3_ALLOW_SKIP:-0}" == 1 ]]; then echo "[test_pub_replay] SKIP ($SKIPS check(s) skipped, KZ3_ALLOW_SKIP=1; the default-off identity was NOT proven)"; exit 77; fi
   echo "[test_pub_replay] FAIL: $SKIPS check(s) skipped (set KZ3_ALLOW_SKIP=1 to accept)"; exit 1
 fi
 echo "[test_pub_replay] PASS"

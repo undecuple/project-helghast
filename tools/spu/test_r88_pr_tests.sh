@@ -6,7 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 T="${PS3RECOMP_PATCHED:-$ROOT/work/ps3recomp-patched}"
-[[ -d $T/libs ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -d $T/libs ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 OUT="$(mktemp -d)"   # under the sandbox's private /tmp
 fail=0
 # Open: test_gcm_flip_status (#354) and test_dialog_callbacks (#360) do not link as one TU (they need runtime stubs).

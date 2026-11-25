@@ -54,9 +54,14 @@ FIX=port/spu/ppu_lift_fixups-$VER.txt; [[ -f "$FIX" ]] || FIX=re/data/overrides/
 "$ROOT/tools/ps3recomp-patched.sh"
 
 mkdir -p "$AN" "$OUT"
+# ppu_loader.py names its outputs after the ELF (EBOOT-114.elf -> EBOOT-114.imports.json); the existing 1.14
+# analysis dir predates that and holds EBOOT.*.json. Use whichever exists, the ELF stem first (a fresh 1.14
+# lift failed with "No such file: EBOOT.imports.json", 2026-11-24).
+STEM="$(basename "$ELF" .elf)"; [[ -f "$AN/$STEM.imports.json" || ! -f "$AN/$STEM.imports.json" ]] || STEM=EBOOT
 if [[ ! -f "$AN/functions.json" ]]; then
   python3 "$PT/tools/ppu_loader.py" "$ELF" -o "$AN/"
-  python3 "$PT/tools/find_functions.py" "$ELF" --seed-json "$AN/EBOOT.functions.json" \
+  STEM="$(basename "$ELF" .elf)"
+  python3 "$PT/tools/find_functions.py" "$ELF" --seed-json "$AN/$STEM.functions.json" \
     --output "$AN/functions.json"
 fi
 
@@ -77,7 +82,7 @@ fi
 # The lifter removes stale chunk files itself, after writing (no `find -delete` here: that would reset every mtime).
 KZ3_LIFT_CHUNKS="${KZ3_LIFT_CHUNKS:-64}"
 python3 "$PT/tools/ppu_lifter.py" "$ELF" --functions "$FUNCS" \
-  --hle-stubs "$AN/EBOOT.imports.json" --toc "$TOC" --code-end "$CODE_END" \
+  --hle-stubs "$AN/$STEM.imports.json" --toc "$TOC" --code-end "$CODE_END" \
   --overrides "$OVR" -j 4 --chunks "$KZ3_LIFT_CHUNKS" --output "$OUT" > "$OUT/lift.log" 2>&1
 grep -m5 'jump-table hint' "$OUT/lift.log" || true
 tail -5 "$OUT/lift.log"

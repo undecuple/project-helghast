@@ -7,7 +7,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu/ll-tests"; mkdir -p "$O"
 T="${LL_TREE:-$ROOT/work/ps3recomp-patched}"
-[[ -f "$T/runtime/spu/spu_coherency.c" ]] || { echo "SKIP: no patched toolkit at $T"; exit 0; }
+[[ -f "$T/runtime/spu/spu_coherency.c" ]] || { echo "SKIP: no patched toolkit at $T"; exit 77; }
 B="runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spurs_policy.c runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c runtime/platform/win32_compat.c"
 extra=""; [[ -f "$T/runtime/diag/kz3_wait_acct.c" ]] && extra="runtime/diag/kz3_wait_acct.c -I runtime/diag"
 rc=0

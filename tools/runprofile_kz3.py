@@ -38,7 +38,8 @@ PROFILE = {
     "pso_keys_magic": 0x4C505350,
     "pso_library": "pso_library.bin",
     # Env the runtime reads (prefixes); names that look like secrets are redacted.
-    "env_prefixes": ("KZ3_", "LD_", "RSX_", "PAD_", "GCM_", "SPU_"),
+    # VKD3D_ added 2026-11-24: VKD3D_CONFIG A/Bs (upload_hvv) must show in run.json, or runcmp sees both sides as equal.
+    "env_prefixes": ("KZ3_", "LD_", "RSX_", "PAD_", "GCM_", "SPU_", "VKD3D_"),
     "secret_re": re.compile(r"(token|secret|password|passwd|webhook|apikey|api_key|credential)", re.I),
     # tools/proton-inner.sh sets these when unset (the logger writes to stdout, no error box): part of every run.
     "env_defaults": {"KZ3_LOG_STDOUT": "1", "KZ3_NO_ERROR_BOX": "1"},

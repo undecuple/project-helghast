@@ -1,0 +1,232 @@
+KZ3 patch 2212 (RSX pass 176, revised after review): LD_WB_DEFER_4097=1 (default off) wires the "defer the 0x4A release" site of patch 2185 into the NV4097 0x1D70/0x1D74 handler, where KZ3 really releases label 0x4A, and holds the label store until the deferred bytes have landed.
+
+Cause (read from the code and the profiling logs, NOT run in the game): patch 2185 set the deferral site only in the NV406E 0x6C block (cellGcmSys.c). KZ3 releases label 0x4A as NV4097 SET_SEMAPHORE_OFFSET(0x1D6C)=0x4A0 then 0x1D74, so the site never ran and the release drained the scene-copy fence at once (reason other=909 of 909 drains in profiling run g2).
+
+Change: (1) rsx_commands.c brackets rsx_live_draw_before_guest_sync() of the 0x1D70/0x1D74 branch with rsx_live_draw_wbd_set_site_4097(label) / (-1). (2) Label hold (review finding: the label used to become visible to the PPU/SPU before the 4 main surfaces were stored): the three gcm_guest_signal(RSX_GS_SEM_BE) stores of that handler first ask rsx_live_draw_wbd_hold_label(); when the release deferred and stores are pending, the store (ea, val) is queued in rsx_wbd_hold (rsx_wb_defer.h) and published, in order, as soon as the pending-store queue is empty: after any ld_wbd_drain (user command 0xEB00, flip, slot, full, other), after a touch that empties the queue, and at the walker's end of pass (cellGcmSys.c, next to rsx_live_draw_submit_pending) so a label never waits for a command that is not in the ring yet. A PPU or SPU that waits for label 0x4A therefore sees it only after the bytes are in guest memory, as on hardware where the label follows the surface write. No PPU read hook is needed: the guest cannot order a read of these ranges after the release without the label. 16 held labels max; a 17th publishes the older ones first.
+
+Counters: [wb-defer] 4097: releases_deferred, labels_held, labels_published and the drain reason that published them (held must equal published at run end).
+
+Corrected estimate: this does NOT remove the walker's GPU wait. The wbdrain wait (scene-copy fence) moves from the 0x4A release to the 0xEB00 user command, which also waits for the 4 surface copies; the old second synchronous batch waited for the same GPU work. What is saved is the second wait's submit-to-wake latency and any walker work between the release and 0xEB00: upper bound flush_rb, 0.3-0.4 ms/flip in profiling runs g2 and p1, realistically 0.1-0.3 ms (about +0.1 fps, inside run noise). Treat this as a structural step: with the label hold the label store, the stores and the user command are one ordered completion that a later change can move to a worker so the walker records the next frame during the wait (that is where a real gain would be). Not default-on.
+
+Required before any default-on: a run with LD_WB_DEFER_4097=1 LD_WB_DEFER_VERIFY=1 LD_WB_HASH=1 giving mismatches=0, spu_gets_of_pending=0, spu_writes_into_pending=0, labels_held=labels_published, and the main-surface ranges hash-equal at the 0xEB00 point against the switch-off baseline. Patch 2185 never deferred this label in KZ3 (the site was unwired), so the deferral has never run on real KZ3 data; the baseline counters of s123 (spu_*=0) were taken with only the NV0039 stores pending.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 822ddca..890f727 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -5010,6 +5010,7 @@ static void gcm_rsx_process_fifo_body(void)
+      * recorded so far instead of letting it sit until the next sync point. */
+     { const long long o_sb0 = s_perf_walk_on ? rsx_perf_now() : 0;   /* patch 2164: submit inside the end-of-pass row */
+       if (strcmp(why, "flip") != 0 && rsx_live_draw_enabled()) rsx_live_draw_submit_pending();
++      if (rsx_live_draw_enabled()) { extern void rsx_live_draw_wbd_idle(void); rsx_live_draw_wbd_idle(); }   /* patch 2212: a held 0x4A label must not wait for a user command that is not in the ring yet */
+       if (o_sb0) rsx_perf_add(RSX_PERF_O_EOP_SUB_T, rsx_perf_now() - o_sb0); }
+ 
+     /* Publish progress: get chases put; ref advances at most ONE queued fence
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index baf619b..c948e31 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -532,6 +532,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+       } }
+     { static u32 s_sem_ctx = 0;
+       u32 s_sem_off = g_rsx_sem_off_4097;   /* KZ3 patch 1007: exported */
++      extern int rsx_live_draw_wbd_hold_label(u32 ea, u32 val);   /* patch 2212: 1 = the label store waits for the deferred bytes */
+       if (method == 0x01A4) {
+           if (data != s_sem_ctx) { static int _l = 0; if (_l++ < 8)
+               fprintf(stderr, "[RSX] semaphore context dma = 0x%08X\n", data); }
+@@ -546,7 +547,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         extern u32 rsx_live_draw_before_guest_sync(void);
+         extern int rsx_live_draw_enabled(void);
+         extern volatile int g_rsx_sh_on, g_rsx_fp_on; extern void rsx_sync_hist_event(int kind, unsigned dirty);   /* patch 2164, 2172 */
++        extern void rsx_live_draw_wbd_set_site_4097(int label);   /* patch 2212: KZ3 releases label 0x4A as 0x1D6C=0x4A0 + 0x1D74 */
++        if (rsx_live_draw_enabled()) rsx_live_draw_wbd_set_site_4097((int)((s_sem_off & 0xFFFFu) >> 4));
+         const u32 sh_dirty = rsx_live_draw_enabled() ? rsx_live_draw_before_guest_sync() : 0;
++        if (rsx_live_draw_enabled()) rsx_live_draw_wbd_set_site_4097(-1);
+         if (g_rsx_sh_on | g_rsx_fp_on) rsx_sync_hist_event(3 /* RSX_SH_REL4097 */, sh_dirty != 0);
+       }
+       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
+@@ -554,7 +558,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         u32 ea = gcm_io_offset_to_ea(s_sem_off);
+         u32 val = method == 0x1D74 ? data
+                 : (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+-        if (ea) gcm_guest_signal(RSX_GS_SEM_BE, ea, val);   /* patch 2190: E4, kind 9 */
++        if (ea && !rsx_live_draw_wbd_hold_label(ea, val)) gcm_guest_signal(RSX_GS_SEM_BE, ea, val);   /* patch 2190: E4, kind 9; 2212: held until the deferred bytes landed */
+         return 0;
+       }
+       if (method == 0x1D70) {
+@@ -566,6 +570,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+          * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
+          * Apply the same swap the hardware does so the pre-swap cancels out. */
+         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
++        if (!rsx_live_draw_wbd_hold_label(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val))   /* patch 2212 */
+         gcm_guest_signal(RSX_GS_SEM_BE, VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);   /* patch 2190: E4, kind 9 */
+         { static u32 seen[64]; static int ns = 0; int k = 0;   /* TEMP: distinct release offsets */
+           for (; k < ns; k++) if (seen[k] == s_sem_off) break;
+@@ -579,6 +584,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+          * (SET_SEMAPHORE_OFFSET 0x4A0, then 0x1D74), right before the G-buffer clears
+          * Counted only; key on the offset, not the value. */
+         if (s_sem_off == 0x4A0u) g_rsx_game_frame_marks++;
++        if (!rsx_live_draw_wbd_hold_label(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data))   /* patch 2212 */
+         gcm_guest_signal(RSX_GS_SEM_BE, VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);   /* patch 2190: E4, kind 9 */
+         return 0;
+       } }
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index d6ec625..9687440 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -83,6 +83,9 @@ void rsx_live_draw_wbd_drain(int r) { (void)r; }   /* patch 2185 */
+ void rsx_live_draw_wbd_touch(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }   /* patch 2185 */
+ int  rsx_live_draw_wbd_active(void) { return 0; }   /* patch 2185 */
+ void rsx_live_draw_wbd_set_site(int label) { (void)label; }   /* patch 2185 */
++void rsx_live_draw_wbd_set_site_4097(int label) { (void)label; }   /* patch 2212 */
++int  rsx_live_draw_wbd_hold_label(u32 ea, u32 val) { (void)ea; (void)val; return 0; }   /* patch 2212 */
++void rsx_live_draw_wbd_idle(void) {}   /* patch 2212 */
+ int  rsx_live_draw_wbd_defer_move(u32 sl, u32 so, u32 sn, u32 dl, u32 d0, u32 dn, const u32* p, u32 (*fn)(const u32*, int))
+ { (void)sl; (void)so; (void)sn; (void)dl; (void)d0; (void)dn; (void)p; (void)fn; return 0; }   /* patch 2185 */
+ void rsx_live_draw_debug_writeback_stats(double* t, u32* b, u32* s, u32* w)
+@@ -19075,13 +19078,18 @@ static void ld_wbd_store(void* ctx, rsx_wbd_ent* e)
+     if (e->kind == RSX_WBD_SURF) ld_wbd_store_surf(e); else ld_wbd_store_move(e);
+ }
+ 
++static void ld_wbd_publish_one(u32 ea, u32 val) { gcm_guest_signal(RSX_GS_SEM_BE, ea, val); }   /* patch 2212: a held label store */
++static rsx_wbd_hold g_wbd_hold;
++static int g_wbd_arm;   /* patch 2212: the release that just ran its sync point deferred (its label store is held) */
++static u32 g_wbd_rel4097;
+ static u32 ld_wbd_drain(int reason)
+ {
+-    if (!g_wbd.n) return 0;
++    if (!g_wbd.n) { rsx_wbd_hold_flush(&g_wbd_hold, 0, reason, ld_wbd_publish_one); return 0; }
+     LDW_T0(st_t0);
+     LDS_PUSH(s_wb3, RSX_SB_WB);   /* patch 2188 */
+     const u32 r = rsx_wbd_drain(&g_wbd, reason, ld_wbd_wait, ld_wbd_store, NULL);
+     rsx_wbd_snap_publish(&g_wbd_snap, &g_wbd);
++    rsx_wbd_hold_flush(&g_wbd_hold, g_wbd.n, reason, ld_wbd_publish_one);   /* patch 2212: the bytes have landed, now the guest may see the label */
+     LDS_POP(s_wb3);
+     LDW_ADD(RSX_PERF_W_WB_STORE_T, st_t0);
+     return r;
+@@ -19091,8 +19099,10 @@ static void ld_wbd_touch(u32 location, u32 offset, u32 size, int reason)
+ {
+     rsx_pub_check_owner("2185 pending-store touch from a thread that is not P's owner");   /* patch 2197 (C7): counted, behaviour unchanged */
+     if (g_wbd_owner != GetCurrentThreadId()) return;
+-    if (rsx_wbd_touch(&g_wbd, location, offset, size, reason, ld_wbd_wait, ld_wbd_store, NULL))
++    if (rsx_wbd_touch(&g_wbd, location, offset, size, reason, ld_wbd_wait, ld_wbd_store, NULL)) {
+         rsx_wbd_snap_publish(&g_wbd_snap, &g_wbd);
++        rsx_wbd_hold_flush(&g_wbd_hold, g_wbd.n, reason, ld_wbd_publish_one);   /* patch 2212 */
++    }
+ }
+ 
+ static void ld_wbd_push(const rsx_wbd_ent* e)
+@@ -19157,7 +19167,37 @@ void rsx_live_draw_wbd_touch(u32 location, u32 offset, u32 size)
+ int rsx_live_draw_wbd_active(void) { return ld_wbd_mode() != 0; }
+ void rsx_live_draw_wbd_set_site(int label)   /* the walker's NV406E release of `label` is about to call before_guest_sync; -1 = done */
+ {
+-    g_wbd_site = (label >= 0 && ld_wbd_mode() && (u32)label == g_wbd_label) ? 1 : 0;
++    g_wbd_site = rsx_wbd_site_defer(ld_wbd_mode(), g_wbd_label, label, 0, 0);
++}
++/* Patch 2212: the same for a release that arrives as NV4097 0x1D70/0x1D74 (rsx_commands.c); needs LD_WB_DEFER_4097=1 (read once). */
++static int ld_wbd4097_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("LD_WB_DEFER_4097");
++        on = (e && e[0] && e[0] != '0') ? 1 : 0;
++        if (on && ld_wbd_mode()) fprintf(stderr, "[wb-defer] LD_WB_DEFER_4097=1: the NV4097 release of label 0x%X defers its write-back too (patch 2212)\n", g_wbd_label);
++    }
++    return on;
++}
++void rsx_live_draw_wbd_set_site_4097(int label)
++{
++    const int was = g_wbd_site;
++    g_wbd_site = rsx_wbd_site_defer(ld_wbd_mode(), g_wbd_label, label, 1, label >= 0 ? ld_wbd4097_on() : 0);
++    if (label >= 0) g_wbd_arm = 0;
++    else if (was) { g_wbd_arm = g_wbd.n != 0; g_wbd_rel4097++; }   /* label < 0 = the sync point returned; `was` = it was the deferring release */
++}
++/* rsx_commands.c, where the label store of an NV4097 release goes out: 1 = held until the queue is empty (the caller skips it). */
++int rsx_live_draw_wbd_hold_label(u32 ea, u32 val)
++{
++    const int armed = g_wbd_arm; g_wbd_arm = 0;
++    if (armed && g_wbd_hold.n >= RSX_WBD_HOLD_MAX) ld_wbd_drain(RSX_WBD_R_OTHER);   /* full: publish the older ones first (the queue empties) */
++    return rsx_wbd_hold_try(&g_wbd_hold, g_wbd.n, armed && g_wbd_owner == GetCurrentThreadId(), ea, val);
++}
++/* The walker is about to idle: a held label must not wait for a user command that has not been written yet. */
++void rsx_live_draw_wbd_idle(void)
++{
++    if (g_wbd_hold.n && g_wbd_owner == GetCurrentThreadId()) ld_wbd_drain(RSX_WBD_R_OTHER);
+ }
+ /* nv0039_copy: its source range has a pending store, so the row copy has to wait for it. p[0..7] = src, dst, len, n, pitch_in,
+  * pitch_out, in_inc, out_inc (the caller's loop); fn(p, verify) runs it at the drain and returns the rows that differ (verify). */
+@@ -19184,6 +19224,11 @@ static void ld_wbd_flip(void)
+         fprintf(stderr, "%s\n", line);
+         const rsx_wbd_ver* v = &g_wbd.ver;
+         for (u32 k = 0; k < v->nfirst; k++) fprintf(stderr, "[wb-defer] mismatch #%u surface 0x%08X offset %u\n", k, v->first[k].tag, v->first[k].off);
++        fprintf(stderr, "[wb-defer] 4097: releases_deferred=%u labels_held=%llu labels_published=%llu by usercmd=%llu flip=%llu slot=%llu full=%llu touch=%llu nv0039=%llu nosubmit=%llu other=%llu (the 0x4A label store goes out after its bytes landed; held=published must hold)\n",
++                g_wbd_rel4097, (unsigned long long)g_wbd_hold.held, (unsigned long long)g_wbd_hold.published,
++                (unsigned long long)g_wbd_hold.flush_by[RSX_WBD_R_USERCMD], (unsigned long long)g_wbd_hold.flush_by[RSX_WBD_R_FLIP], (unsigned long long)g_wbd_hold.flush_by[RSX_WBD_R_SLOT],
++                (unsigned long long)g_wbd_hold.flush_by[RSX_WBD_R_FULL], (unsigned long long)g_wbd_hold.flush_by[RSX_WBD_R_TOUCH], (unsigned long long)g_wbd_hold.flush_by[RSX_WBD_R_NV0039],
++                (unsigned long long)g_wbd_hold.flush_by[RSX_WBD_R_NOSUBMIT], (unsigned long long)g_wbd_hold.flush_by[RSX_WBD_R_OTHER]);
+         fprintf(stderr, "[wb-defer] spu_gets_of_pending=%ld (SPU DMA GETs of a pending store's range: stale reads, must be 0) spu_writes_into_pending=%ld (SPU DMA puts there; the deferred store would overwrite them)\n", (long)g_wbd_spu_gets, (long)g_wbd_spu_hits);
+     }
+ }
+@@ -19256,7 +19301,7 @@ static u32 ld_writeback_batch(const u32* idx_in, u32 n, u32 for_off, u32 for_siz
+       } }
+     /* Patch 2185: a synchronous batch (another sync point, or the per-surface path) takes readback slots 0.. and must come after
+      * every older pending store (overlap order, slot ownership): drain first. */
+-    if (g_wbd.n && !(defer_ok && ld_wbd_mode())) ld_wbd_drain(RSX_WBD_R_OTHER);
++    if (rsx_wbd_batch_drain_first(g_wbd.n, defer_ok, ld_wbd_mode())) ld_wbd_drain(RSX_WBD_R_OTHER);
+     if (!ld_wb_batch_enabled()) {
+         for (u32 j = 0; j < n; j++) { done += (u32)ld_writeback_surface(idx[j], for_off ? for_off : g.surfaces[idx[j]].offset, for_size); g_ld_wb.waits++; }
+     } else {
+diff --git a/libs/video/rsx_wb_defer.h b/libs/video/rsx_wb_defer.h
+index 0638575..9f40540 100644
+--- a/libs/video/rsx_wb_defer.h
++++ b/libs/video/rsx_wb_defer.h
+@@ -61,6 +61,49 @@ static inline int rsx_wbd_env_on(const char* v)
+     return !(v && v[0] == '0');
+ }
+ 
++/* Patch 2212 (LD_WB_DEFER_4097, default off): does the sync point that releases `label` (-1 = none) defer its main-memory
++ * write-back? `label` must be the configured one; a release that arrives as NV4097 0x1D70/0x1D74 (is_4097; KZ3 releases 0x4A
++ * that way, NV406E 0x6C is the other path) also needs the switch. Patch 2185 only wired the NV406E path, so the 0x4A release
++ * of KZ3 never deferred and drained the scene-copy fence at once (reason OTHER). Host test: tools/smoke/test_wb_defer.sh. */
++static inline int rsx_wbd_site_defer(int mode, uint32_t cfg_label, int label, int is_4097, int sw4097)
++{
++    if (label < 0 || !mode || (uint32_t)label != cfg_label) return 0;
++    if (is_4097 && !sw4097) return 0;
++    return 1;
++}
++/* ld_writeback_batch: a batch that does not defer has to run after every older pending store (slot ownership, overlap order). */
++static inline int rsx_wbd_batch_drain_first(uint32_t pending, int defer_ok, int mode)
++{
++    return pending && !(defer_ok && mode);
++}
++
++/* Patch 2212, label hold: a release that defers its write-back must not become visible to the PPU/SPU before the bytes land
++ * (the label is the guest's only signal that the surface bytes are final). The label store (ea, val) is held with the queue and
++ * published, in order, as soon as the queue is empty again (any drain, touch or the walker's end of pass). `pending` = the
++ * queue length at the time. Host test: tools/smoke/test_wb_defer.sh. */
++#define RSX_WBD_HOLD_MAX 16
++typedef struct {
++    uint32_t n, ea[RSX_WBD_HOLD_MAX], val[RSX_WBD_HOLD_MAX];
++    uint64_t held, published, flush_by[RSX_WBD_R_N];   /* flush_by[reason]: label stores published by a drain of that reason */
++} rsx_wbd_hold;
++/* 1 = held (the caller must not store the label); 0 = store it now (nothing pending, or the release did not defer). */
++static inline int rsx_wbd_hold_try(rsx_wbd_hold* h, uint32_t pending, int armed, uint32_t ea, uint32_t val)
++{
++    if (!armed || !pending || h->n >= RSX_WBD_HOLD_MAX) return 0;
++    h->ea[h->n] = ea; h->val[h->n] = val; h->n++; h->held++;
++    return 1;
++}
++/* Called after every point that can empty the queue; publishes only when `pending` is 0. Returns the number published. */
++static inline uint32_t rsx_wbd_hold_flush(rsx_wbd_hold* h, uint32_t pending, int reason, void (*publish)(uint32_t ea, uint32_t val))
++{
++    if (pending || !h->n) return 0;
++    const uint32_t n = h->n;
++    for (uint32_t i = 0; i < n; i++) publish(h->ea[i], h->val[i]);
++    h->n = 0; h->published += n;
++    if (reason >= 0 && reason < RSX_WBD_R_N) h->flush_by[reason] += n;
++    return n;
++}
++
+ static inline uint32_t rsx_wbd_free_slots(const rsx_wbd* d)
+ {
+     uint32_t f = 0;

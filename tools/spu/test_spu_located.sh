@@ -9,7 +9,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 C="$P/runtime/spu/spu_channels.c"
-[[ -f "$C" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
+[[ -f "$C" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
 SNIP="$(sed -n '/kz3-loc begin/,/kz3-loc end/p' "$C" | sed '1d;$d')"
 [[ -n "$SNIP" ]] || { echo "FAIL: kz3-loc block not found in $C (patch 1078 missing)"; exit 1; }
 fail=0
@@ -72,7 +72,7 @@ int main(int argc, char** argv)
 }
 C
 CC="$(command -v cc || command -v gcc || command -v clang)"
-[[ -n "$CC" ]] || { echo "SKIP: no C compiler"; exit 0; }
+[[ -n "$CC" ]] || { echo "SKIP: no C compiler"; exit 77; }
 "$CC" -std=c11 -O1 -Wall -Wno-unused-function -o "$O/t_spu_located" "$O/t_spu_located.c" 2>&1 | head -20
 [[ -x "$O/t_spu_located" ]] || { echo "FAIL: build"; exit 1; }
 "$O/t_spu_located" | grep -v '^\[spu-loc\]' || fail=1

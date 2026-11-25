@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 I="$PT/libs/input"
-if ! grep -q pad_look_acc_take_until "$I/pad_mouse.h" 2>/dev/null; then echo "[test_pump_tick] SKIP: toolkit without patch 2108"; exit 0; fi
+if ! grep -q pad_look_acc_take_until "$I/pad_mouse.h" 2>/dev/null; then echo "[test_pump_tick] SKIP: toolkit without patch 2108"; exit 77; fi
 O="$ROOT/build/smoke-host/pump_tick"; mkdir -p "$O"
 cc -std=c11 -O1 -Wall -Wextra -fsanitize=address,undefined -I"$I" "$ROOT/tools/smoke/test_pump_tick.c" -lm -o "$O/t"
 "$O/t"

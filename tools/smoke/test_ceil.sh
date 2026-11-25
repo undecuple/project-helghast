@@ -7,8 +7,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PT="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 V="${KZ3_VTX_DIR:-$PT/libs/video}"
 if [[ ! -f "$V/rsx_vertex_compact.c" || ! -d "$PT/include" ]]; then
-  echo "[test_ceil] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 0; fi
-if [[ ! -f "$V/rsx_ceil.h" ]]; then echo "[test_ceil] SKIP: toolkit without patch 2183"; exit 0; fi
+  echo "[test_ceil] SKIP: no patched toolkit ($V; run tools/ps3recomp-patched.sh)"; exit 77; fi
+if [[ ! -f "$V/rsx_ceil.h" ]]; then echo "[test_ceil] SKIP: toolkit without patch 2183"; exit 77; fi
 O="$ROOT/build/smoke-host/ceil"; mkdir -p "$O"
 CC="${CC:-cc}"
 W=(-std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -I"$V" -I"$PT/libs/video" -I"$PT/include")

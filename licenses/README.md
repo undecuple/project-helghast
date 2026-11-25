@@ -8,7 +8,9 @@ credits list is [NOTICE.md](../NOTICE.md). Nothing here covers the game itself, 
 - `ps3recomp-LICENSE.txt`: MIT, ps3recomp, the recompiler and runtime source that is built on the player's machine (payload folder `ps3recomp\`).
 - `at3_standalone-COPYING.LGPLv2.1.txt`: LGPL-2.1, the standalone ATRAC3/ATRAC3plus decoder inside ps3recomp's source (payload folder `ps3recomp\third_party\at3_standalone\`).
 - `SDL3-LICENSE.txt`: zlib, SDL3 (`SDL3.dll` in `runtime\`, unmodified; gamepads, rumble and motion sensors).
+- `SMAA-LICENSE.txt`: MIT, SMAA (Jimenez et al.), the `smaa/` shader sources inside ps3recomp's tree (payload folder `ps3recomp\third_party\smaa\`).
 - `Rajdhani-OFL.txt`: SIL Open Font License 1.1, the Rajdhani fonts (`fonts\`, and embedded in the installer's headings).
+- `NotoSans-OFL.txt`: SIL Open Font License 1.1, Noto Sans Regular (`fonts\`, the fallback for Cyrillic and Greek text in the game's own font chain).
 - `llvm-mingw/llvm-mingw-LICENSE.txt`: ISC, the llvm-mingw build scripts (bundled compiler, `toolchain\llvm-mingw\`).
 - `llvm-mingw/llvm-mingw-tree-LICENSE.TXT`: Apache-2.0 WITH LLVM-exception, as shipped inside the llvm-mingw package (clang, lld, compiler-rt, libc++, libunwind).
 - `llvm-mingw/LLVM-LICENSE.txt`: the same LLVM licence from the LLVM project at the pinned version.

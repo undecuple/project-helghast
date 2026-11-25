@@ -4,7 +4,7 @@
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"; [[ "$P" = /* ]] || P="$ROOT/$P"
-[[ -f "$P/runtime/ppu/ppu_fs.cpp" ]] || { echo "SKIP: $P has no runtime/ppu/ppu_fs.cpp (run tools/ps3recomp-patched.sh)"; exit 0; }
+[[ -f "$P/runtime/ppu/ppu_fs.cpp" ]] || { echo "SKIP: $P has no runtime/ppu/ppu_fs.cpp (run tools/ps3recomp-patched.sh)"; exit 77; }
 RH="$ROOT/tools/upstream/stub"
 O="$(mktemp -d)"; trap 'rm -rf "$O"' EXIT
 INC=(-I "$RH" -I "$P" -I "$P/include" -I "$P/runtime" -I "$P/runtime/ppu" -I "$P/runtime/memory" -I "$P/libs")

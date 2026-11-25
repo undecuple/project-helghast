@@ -97,9 +97,11 @@ jobs:
       - name: Toolkit (ps3recomp at its pinned commit with port/patches applied)
         run: tools/ps3recomp-patched.sh
 
-      - name: Fonts (Rajdhani Medium + Bold, SIL OFL; hash-checked against installer/art/art.json)
+      - name: Fonts (Rajdhani Medium + Bold and Noto Sans Regular, SIL OFL; hash-checked against installer/art/art.json and fonts-extra.json)
         # setup's headings and the game's error notice (payload fonts/, assemble_payload.py checks the pins again)
-        run: python3 tools/release/installer_art.py --fetch-fonts
+        run: |
+          python3 tools/release/installer_art.py --fetch-fonts
+          python3 tools/release/fetch_noto.py
 
       - name: Toolchain (llvm-mingw, Python, CMake, Ninja; SHA-256 checked)
         run: python3 tools/release/fetch_toolchain.py

@@ -12,7 +12,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ3_PATCHED_DIR:-$ROOT/work/ps3recomp-patched}"
 C="$P/libs/video/cellGcmSys.c"
-[[ -f "$C" ]] || { echo "SKIP: no patched toolkit at $P"; exit 0; }
+[[ -f "$C" ]] || { echo "SKIP: no patched toolkit at $P"; exit 77; }
 grep -q 's_ea2io_fast' "$C" || { echo "FAIL: patch 1101 missing from $C"; exit 1; }
 fail=0
 # 1. writers keep the table and the list together

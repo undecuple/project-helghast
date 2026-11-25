@@ -6,6 +6,6 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="$ROOT/work/ps3recomp-patched"; H="${NID_HDR:-$P/runtime/ppu}"
-[[ -f "$H/kz3_nid_index.h" && -f "$P/include/ps3emu/nid.h" ]] || { echo "SKIP: no patched toolkit with patch 1055 at $H"; exit 0; }
+[[ -f "$H/kz3_nid_index.h" && -f "$P/include/ps3emu/nid.h" ]] || { echo "SKIP: no patched toolkit with patch 1055 at $H"; exit 77; }
 gcc -std=gnu17 -O2 -Wall -pthread -I "$H" -I "$P/include" -o "$O/t_nid_index" "$ROOT/tools/spu/test_nid_index.c" 2>&1 | grep -m5 -E "error|warning"
 "$O/t_nid_index"

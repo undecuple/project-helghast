@@ -7,6 +7,6 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="$ROOT/work/ps3recomp-patched"; H="${LWC_HDR:-$P/runtime/ppu}"
-[[ -f "$H/kz3_lwcond_fifo.h" ]] || { echo "SKIP: no kz3_lwcond_fifo.h at $H (patch 1059 not applied / no patched toolkit)"; exit 0; }
+[[ -f "$H/kz3_lwcond_fifo.h" ]] || { echo "SKIP: no kz3_lwcond_fifo.h at $H (patch 1059 not applied / no patched toolkit)"; exit 77; }
 gcc -std=gnu17 -O2 -w -pthread -I "$H" -o "$O/t_lwcond_fifo" "$ROOT/tools/spu/test_lwcond_fifo.c" 2>&1 | grep -m5 error
 "$O/t_lwcond_fifo" "$@"
