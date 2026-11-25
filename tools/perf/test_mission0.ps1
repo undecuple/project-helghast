@@ -524,7 +524,7 @@ try {
             }
             foreach ($item in @(@("SDL3.dll", "install-sdl"), @("install-only.dll", "install-dll"),
                                  @("lang\port_ui.tsv", "repository-language"), @("fonts\Rajdhani-Medium.ttf", "medium"),
-                                 @("fonts\Rajdhani-Bold.ttf", "bold"))) {
+                                 @("fonts\Rajdhani-Bold.ttf", "bold"), @("fonts\NotoSans-Regular.ttf", "noto"))) {
                 Assert-Fixture ([IO.File]::ReadAllText((Join-Path $app $item[0])) -eq $item[1])
             }
             if ($script:FakeBootstrapOutcome -in @("process_crashed", "process_timeout", "shutdown_timeout")) {
@@ -585,7 +585,7 @@ try {
             Assert-Fixture ($Info.Arguments -ceq $expectedArgs)
             foreach ($item in @(@("SDL3.dll", "install-sdl"), @("install-only.dll", "install-dll"),
                                  @("lang\port_ui.tsv", "repository-language"), @("fonts\Rajdhani-Medium.ttf", "medium"),
-                                 @("fonts\Rajdhani-Bold.ttf", "bold"))) {
+                                 @("fonts\Rajdhani-Bold.ttf", "bold"), @("fonts\NotoSans-Regular.ttf", "noto"))) {
                 Assert-Fixture ([IO.File]::ReadAllText((Join-Path $app $item[0])) -eq $item[1])
             }
             Assert-Fixture (-not (Test-Path -LiteralPath (Join-Path $app "developer-only.dll")))
@@ -771,6 +771,7 @@ try {
         [IO.File]::WriteAllText((Join-Path $root "runtime\SDL3.dll"), "install-sdl")
         [IO.File]::WriteAllText((Join-Path $root "fonts\Rajdhani-Medium.ttf"), "medium")
         [IO.File]::WriteAllText((Join-Path $root "fonts\Rajdhani-Bold.ttf"), "bold")
+        [IO.File]::WriteAllText((Join-Path $root "fonts\NotoSans-Regular.ttf"), "noto")   # firstrun NOTICE_FONTS carries the Noto fallback too
         [IO.File]::WriteAllText((Join-Path $build "install-only.dll"), "install-dll")
         [IO.File]::WriteAllText((Join-Path $developerDir "developer-only.dll"), "do-not-stage")
         $portableStamp = Join-Path $build "build-stamp.json"
