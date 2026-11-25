@@ -4,7 +4,8 @@ vekta issue 94: a program that ended with code 0 after a runtime-DLL error and w
 
 1. Install folder with spaces ("Project Helghast Test/sub dir"): every command the real STEPS build keeps each path a
    single argv element (checked on the argv lists), survives subprocess.list2cmdline and a Windows-style split of the
-   resulting string, and the child runs in the install folder. Negative control: the same commands joined with plain
+   resulting string (the splitter follows the Windows backslash rules), no path argument ends in a separator, and the
+   child runs in the install folder. Negative control: the same commands joined with plain
    spaces (unquoted) are detected as split.
 2. Child checks: a child that exits 0 but writes none of the step's declared files fails the step and names the files;
    the same child writing them passes. A child that exits 0xC0000135 (STATUS_DLL_NOT_FOUND) or says "incorrectly installed"
@@ -35,10 +36,24 @@ def check(cond, what):
 
 
 def win_split(line):
-    """CommandLineToArgvW for the cases that matter here: whitespace separates, double quotes group (no backslash runs
-    before quotes occur in our paths)."""
-    out, cur, q, has = [], "", False, False
-    for ch in line:
+    """CommandLineToArgvW / MSVCRT rules: whitespace separates outside quotes, double quotes group; 2n backslashes
+    before a quote give n backslashes and the quote toggles, 2n+1 give n backslashes and a literal quote; other
+    backslashes are literal."""
+    out, cur, q, has, i = [], "", False, False, 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\":
+            n = 0
+            while i < len(line) and line[i] == "\\":
+                n, i = n + 1, i + 1
+            if i < len(line) and line[i] == '"':
+                cur += "\\" * (n // 2)
+                if n % 2:
+                    cur, i = cur + '"', i + 1
+            else:
+                cur += "\\" * n
+            has = True
+            continue
         if ch == '"':
             q, has = not q, True
         elif ch in " \t" and not q:
@@ -47,6 +62,7 @@ def win_split(line):
             cur, has = "", False
         else:
             cur += ch
+        i += 1
     if has or cur:
         out.append(cur)
     return out
@@ -94,6 +110,11 @@ def part1(tmp):
         line = subprocess.list2cmdline(a)
         back = win_split(line)
         check(back == a, f"1 list2cmdline round trip keeps {a[:2]}: {[e for e in back if e not in a][:2]}")
+        trail = [e for e in a[1:] if os.path.isabs(e) and e.endswith(("/", "\\"))]
+        check(not trail, f"1 no path argument ends in a separator (a trailing backslash before a closing quote): {trail[:2]}")
+    # the Windows splitter follows the backslash rules (a path ending in a backslash survives list2cmdline)
+    for t in (["C:\\a b\\dir\\", "x"], ['say "hi"', "C:\\p\\"], ["a\\\\b", "c d\\\\"]):
+        check(win_split(subprocess.list2cmdline(t)) == t, f"1 splitter round trip {t}")
     # the CMake side: each path variable the configure passes is read quoted in the CMake files (a space in a path
     # otherwise splits a list)
     for rel in ("cmake/llvm-mingw.cmake", "port/kz3/CMakeLists.txt"):

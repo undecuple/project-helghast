@@ -481,7 +481,7 @@ def stage_eboot(c):
 def cmd_load(c):
     pt, an = c.ps3recomp, c.b("analysis")
     staged = stage_eboot(c)
-    return [[*c.py, os.path.join(pt, "tools", "ppu_loader.py"), staged, "-o", an + os.sep],
+    return [[*c.py, os.path.join(pt, "tools", "ppu_loader.py"), staged, "-o", an],
             [*c.py, os.path.join(pt, "tools", "find_functions.py"), c.eboot,
              "--seed-json", os.path.join(an, "EBOOT.functions.json"), "--output", os.path.join(an, "functions.json")]]
 
